@@ -1,0 +1,61 @@
+# -*- coding: utf-8 -*-
+"""
+Combat & Defense Module
+Monitors health drop and target enemy bar; fights back when attacked.
+"""
+
+import time
+import random
+import cv2
+import numpy as np
+from core.input_driver import InputDriver
+from core.vision import Vision
+
+class CombatSystem:
+    def __init__(self, vision: Vision, driver: InputDriver):
+        self.vision = vision
+        self.driver = driver
+        self.in_combat = False
+        self.last_attack_time = 0
+
+    def check_under_attack(self):
+        """
+        Detects if player is being attacked:
+        1. Checks target bar (red health bar at top-center/top-left for enemies)
+        2. Or detects rapid health bar depletion
+        """
+        # Top-center enemy target frame zone: typically y: 3% to 12%, x: 35% to 65%
+        screen_bgr = self.vision.grab_screen(grayscale=False)
+        h, w, _ = screen_bgr.shape
+        target_roi = screen_bgr[int(h*0.03):int(h*0.12), int(w*0.35):int(w*0.65)]
+        
+        # Red enemy health bar in HSV
+        hsv = cv2.cvtColor(target_roi, cv2.COLOR_BGR2HSV)
+        red_mask1 = (hsv[:,:,0] >= 0) & (hsv[:,:,0] <= 10) & (hsv[:,:,1] > 120) & (hsv[:,:,2] > 120)
+        red_mask2 = (hsv[:,:,0] >= 170) & (hsv[:,:,0] <= 180) & (hsv[:,:,1] > 120) & (hsv[:,:,2] > 120)
+        red_pixels = np.sum(red_mask1 | red_mask2)
+
+        # If red target bar exists, we are targeting/attacked by a hostile
+        if red_pixels > 80:
+            return True
+        return False
+
+    def fight_back_step(self):
+        """
+        Simulates player combat rotation:
+        Attacks target using basic attack, skills (1, 2, 3), and right-click.
+        """
+        now = time.time()
+        if now - self.last_attack_time < 0.4:
+            return
+
+        actions = [
+            lambda: self.driver.human_click(button='right'),
+            lambda: self.driver.press_key('1'),
+            lambda: self.driver.press_key('2'),
+            lambda: self.driver.press_key('3'),
+            lambda: self.driver.press_key('tab') # Target next enemy if needed
+        ]
+        chosen = random.choice(actions)
+        chosen()
+        self.last_attack_time = now
