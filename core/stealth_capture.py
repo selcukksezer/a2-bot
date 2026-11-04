@@ -170,7 +170,10 @@ class DXGIDesktopCapture:
         sct = getattr(self._thread_local, "sct", None)
         if sct is None:
             try:
-                sct = mss.mss()
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    sct = mss.mss()
                 self._thread_local.sct = sct
             except Exception as exc:
                 logger.error("Unable to create thread-local MSS instance: %s", exc)

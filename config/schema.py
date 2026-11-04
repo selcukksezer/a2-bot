@@ -261,13 +261,61 @@ class BreakSettings:
 
 
 @dataclass
+class HotkeysSettings:
+    toggle_menu_f9: str = "f9"
+    record_node_f8: str = "f8"
+    emergency_exit: str = "esc"
+
+    def validate(self) -> "HotkeysSettings":
+        self.toggle_menu_f9 = str(self.toggle_menu_f9 or "f9").strip().lower() or "f9"
+        self.record_node_f8 = str(self.record_node_f8 or "f8").strip().lower() or "f8"
+        self.emergency_exit = str(self.emergency_exit or "esc").strip().lower() or "esc"
+        return self
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "HotkeysSettings":
+        if not isinstance(data, dict):
+            return cls().validate()
+        return cls(
+            toggle_menu_f9=str(data.get("toggle_menu_f9", "f9")),
+            record_node_f8=str(data.get("record_node_f8", "f8")),
+            emergency_exit=str(data.get("emergency_exit", "esc")),
+        ).validate()
+
+
+@dataclass
+class DisplaySettings:
+    ui_proportion: str = "Medium"
+    monitor_idx: int = 1
+
+    def validate(self) -> "DisplaySettings":
+        self.ui_proportion = str(self.ui_proportion or "Medium").strip() or "Medium"
+        try:
+            self.monitor_idx = max(1, min(8, int(self.monitor_idx)))
+        except (TypeError, ValueError):
+            self.monitor_idx = 1
+        return self
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DisplaySettings":
+        if not isinstance(data, dict):
+            return cls().validate()
+        return cls(
+            ui_proportion=str(data.get("ui_proportion", "Medium")),
+            monitor_idx=int(data.get("monitor_idx", 1)),
+        ).validate()
+
+
+@dataclass
 class BotSettings:
     gathering: GatheringSettings = field(default_factory=GatheringSettings)
     route: RouteSettings = field(default_factory=RouteSettings)
     breaks: BreakSettings = field(default_factory=BreakSettings)
+    hotkeys: HotkeysSettings = field(default_factory=HotkeysSettings)
+    display: DisplaySettings = field(default_factory=DisplaySettings)
     active_region: str = "Altgard"
     active_route: str = "Dredgion Crash Site"
-    version: str = "v1.6.15"
+    version: str = "v2.0"
 
     def validate(self) -> "BotSettings":
         if not isinstance(self.gathering, GatheringSettings):
@@ -290,6 +338,20 @@ class BotSettings:
             )
         else:
             self.breaks.validate()
+
+        if not isinstance(self.hotkeys, HotkeysSettings):
+            self.hotkeys = HotkeysSettings.from_dict(
+                self.hotkeys if isinstance(self.hotkeys, dict) else {}
+            )
+        else:
+            self.hotkeys.validate()
+
+        if not isinstance(self.display, DisplaySettings):
+            self.display = DisplaySettings.from_dict(
+                self.display if isinstance(self.display, dict) else {}
+            )
+        else:
+            self.display.validate()
 
         # Keep harvests_per_node synchronized between gathering and route
         if self.gathering.harvests_per_node != self.route.harvests_per_node:
@@ -341,9 +403,11 @@ class BotSettings:
                 gathering=GatheringSettings.from_dict(gathering_data),
                 route=RouteSettings.from_dict(route_data),
                 breaks=BreakSettings.from_dict(breaks_data),
+                hotkeys=HotkeysSettings.from_dict(data.get("hotkeys", {})),
+                display=DisplaySettings.from_dict(data.get("display", {})),
                 active_region=str(data.get("active_region", "Altgard")),
                 active_route=str(data.get("active_route", "Dredgion Crash Site")),
-                version=str(data.get("version", "v1.6.15")),
+                version=str(data.get("version", "v2.0")),
             )
             return instance.validate()
         except Exception as exc:

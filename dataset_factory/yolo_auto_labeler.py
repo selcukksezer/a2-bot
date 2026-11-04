@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 Dataset Factory Sub-Agent 2: Multi-Class 3D + Minimap Automatic Bounding Box & YOLO `.txt` Labeler
 ==================================================================================================
 Automatically generates high-precision, normalized YOLO format labels
@@ -217,7 +217,7 @@ def map_material_name_to_yolo_class_id(material_name: str, default_id: int = 3) 
 
 
 class YOLOAutoLabeler:
-    """
+    r"""
     Multi-Class 3D + Minimap Automatic Bounding Box & YOLO `.txt` Labeler.
 
     Automatically detects and generates normalized `[0.000000, 1.000000]` YOLO bounding boxes for:

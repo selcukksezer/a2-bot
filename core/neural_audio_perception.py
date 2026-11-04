@@ -231,19 +231,30 @@ class ONNXYolo3DDetector:
         # 1. Try ONNXRuntime first (passing raw bytes avoids Windows non-ASCII path issues)
         if _HAS_ONNXRUNTIME and ort is not None:
             try:
+                if hasattr(ort, "set_default_logger_severity"):
+                    ort.set_default_logger_severity(3)
                 avail = ort.get_available_providers()
                 providers: List[str] = []
                 if self.prefer_gpu:
-                    for p in (
-                        "TensorrtExecutionProvider",
-                        "CUDAExecutionProvider",
-                        "DmlExecutionProvider",
-                    ):
-                        if p in avail:
-                            providers.append(p)
+                    has_cuda_runtime = False
+                    try:
+                        import torch
+                        has_cuda_runtime = bool(torch.cuda.is_available())
+                    except Exception:
+                        has_cuda_runtime = False
+                    if has_cuda_runtime:
+                        for p in (
+                            "CUDAExecutionProvider",
+                            "DmlExecutionProvider",
+                        ):
+                            if p in avail:
+                                providers.append(p)
+                    elif "DmlExecutionProvider" in avail:
+                        providers.append("DmlExecutionProvider")
                 providers.append("CPUExecutionProvider")
 
                 sess_opts = ort.SessionOptions()
+                sess_opts.log_severity_level = 3
                 sess_opts.graph_optimization_level = (
                     ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 )

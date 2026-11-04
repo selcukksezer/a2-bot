@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 50-Point Spec Computer Vision Filters (core/vision_filters.py)
 
 Implements Items 1 to 5:
@@ -428,7 +428,7 @@ class FeatherNegativeFilter:
 # ITEM 2: 5-Stage Multi-Scale Pyramid 3D Winged Gather Crest (\Y/) Detector
 # ==============================================================================
 class Pyramid3DCrestDetector:
-    """
+    r"""
     Item 2 — Aria ve Mela İçin Perspektif Ölçekli 3B Amblem (`\Y/`) Tespiti (`Pyramid3DCrestDetector`).
 
     Detects the 3D white winged gather crest (`templates/world_gather_crest.png`) floating above

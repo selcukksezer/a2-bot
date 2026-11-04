@@ -110,26 +110,65 @@ def deduplicate_loggers() -> None:
 
 logger = setup_logging()
 
-# Core imports (Agents 1-7 & 11-25)
+# Core imports (Agents 1-7 & 11-25 + Enterprise Suite & 50-Point Vision/Navigation Guards)
 from config.schema import SettingsManager
 from core.behavioral_guard import BehavioralStealthGuard
 from core.capture import ScreenCapture
 from core.combat_recovery import CombatRecovery
+from core.depth_glide_navigator import (
+    GlideWaypointController,
+    MonocularDepthObstacleAvoidance,
+)
+from core.dpi_focus_guard import (
+    DPIScalingSynchronizer,
+    ForegroundFocusGuard,
+    RouteBackupManager,
+    SelfHealingTemplateTuner,
+)
+from core.dry_run_simulator import DryRunReplaySimulator
+from core.economy_broker import (
+    AutoCraftingMorphQueue,
+    SessionProfitSimulator,
+    TradeBrokerPriceScanner,
+)
 from core.explorer_mode import ExplorerModeController
 from core.human_timing import HumanTimingEngine, OrganicAntiAFK
+from core.incident_recorder import IncidentRecorder, MobileTokenAuthenticator
 from core.input_driver import InputController
 from core.material_scanner import MaterialScanner
 from core.minimap_scanner import MinimapScanner
+from core.multi_char_scheduler import (
+    AltCharacterManager,
+    AutomationTaskScheduler,
+    PetAndBuffManager,
+)
+from core.neural_audio_perception import AudioLoopbackFFTAnalyzer, ONNXYolo3DDetector
 from core.ocr_distance import AdaptivePreprocessor, GameHUDReader
 from core.opsec_crypto import LocalVaultCrypto, NativeWin32HotkeyManager, PanicAlertSystem
+from core.patch_normalizer import (
+    HighResROICropper,
+    MinimapOrientationGuard,
+    MotionBlurGate,
+    SobelClahePatchNormalizer,
+    WatershedClusterSeparator,
+)
 from core.path_optimizer import RouteOptimizer
 from core.questlog_importer import QuestlogImporter
 from core.route_manager import RouteManager
 from core.sequential_router import SequentialRoutePlanner
+from core.skill_bar_reader import MicroCameraLookAround, SkillBarReader
 from core.state_machine import BotMode, BotState, BotWorker
 from core.stealth_capture import AdaptiveFramePacer, DXGIDesktopCapture, StealthOverlayManager
 from core.telemetry import TelemetryEngine
+from core.uac_elevator import ensure_admin_elevation, is_admin
 from core.vision import VisionEngine
+from core.vision_filters import (
+    DynamicInteractionKeyReader,
+    FeatherNegativeFilter,
+    MonsterCircularityFilter,
+    NameplateHSVIsolator,
+    Pyramid3DCrestDetector,
+)
 from core.watchdog import BotWatchdog, SupportDiagnostics
 from core.windmouse_humanizer import BiometricClickGenerator, PhysicalInputGuard, WindMouseEngine
 
@@ -261,6 +300,38 @@ class GatherionOrchestrator(QObject):
         self.panic_system = PanicAlertSystem()
         self.watchdog = BotWatchdog(recovery_callback=self._on_watchdog_recovery)
 
+        # 5.5 Initialize Enterprise Vision Filters, Patch Normalizer, Economy, Audio/YOLO, Multi-Char & 3D Depth Guards
+        self.admin_elevated: bool = bool(is_admin())
+        self.dpi_guard = DPIScalingSynchronizer()
+        self.focus_monitor = ForegroundFocusGuard()
+        self.route_backup_mgr = RouteBackupManager()
+        self.template_tuner = SelfHealingTemplateTuner()
+        self.feather_filter = FeatherNegativeFilter()
+        self.pyramid_crest_detector = Pyramid3DCrestDetector()
+        self.dynamic_key_reader = DynamicInteractionKeyReader()
+        self.monster_circ_filter = MonsterCircularityFilter()
+        self.nameplate_isolator = NameplateHSVIsolator()
+        self.minimap_orientation_guard = MinimapOrientationGuard()
+        self.patch_lighting_normalizer = SobelClahePatchNormalizer()
+        self.roi_cropper = HighResROICropper()
+        self.watershed_separator = WatershedClusterSeparator()
+        self.motion_blur_guard = MotionBlurGate()
+        self.skill_bar_monitor = SkillBarReader()
+        self.micro_camera_look = MicroCameraLookAround()
+        self.incident_recorder = IncidentRecorder()
+        self.mobile_token_auth = MobileTokenAuthenticator()
+        self.dry_run_simulator = DryRunReplaySimulator()
+        self.broker_scanner = TradeBrokerPriceScanner()
+        self.crafting_controller = AutoCraftingMorphQueue()
+        self.economy_calculator = SessionProfitSimulator()
+        self.yolo_detector = ONNXYolo3DDetector()
+        self.audio_analyzer = AudioLoopbackFFTAnalyzer()
+        self.alt_char_mgr = AltCharacterManager()
+        self.task_scheduler = AutomationTaskScheduler()
+        self.pet_buff_mgr = PetAndBuffManager()
+        self.depth_avoider = MonocularDepthObstacleAvoidance()
+        self.glide_pilot = GlideWaypointController()
+
         # 6. Initialize UI Windows (Agents 8, 9, 10, 12, 13, 20)
         self.overlay = OverlayHUD()
         self.overlay.setWindowTitle(f"{self.APP_TITLE} — Oyun İçi Durum Paneli")
@@ -301,6 +372,35 @@ class GatherionOrchestrator(QObject):
         self.worker.biometric_clicker = self.biometric_clicker
         self.worker.behavioral_guard = self.behavioral_guard
         self.worker.panic_system = self.panic_system
+        self.worker.dpi_guard = self.dpi_guard
+        self.worker.focus_monitor = self.focus_monitor
+        self.worker.route_backup_mgr = self.route_backup_mgr
+        self.worker.template_tuner = self.template_tuner
+        self.worker.feather_filter = self.feather_filter
+        self.worker.pyramid_crest_detector = self.pyramid_crest_detector
+        self.worker.dynamic_key_reader = self.dynamic_key_reader
+        self.worker.monster_circ_filter = self.monster_circ_filter
+        self.worker.nameplate_isolator = self.nameplate_isolator
+        self.worker.minimap_orientation_guard = self.minimap_orientation_guard
+        self.worker.patch_lighting_normalizer = self.patch_lighting_normalizer
+        self.worker.roi_cropper = self.roi_cropper
+        self.worker.watershed_separator = self.watershed_separator
+        self.worker.motion_blur_guard = self.motion_blur_guard
+        self.worker.skill_bar_monitor = self.skill_bar_monitor
+        self.worker.micro_camera_look = self.micro_camera_look
+        self.worker.incident_recorder = self.incident_recorder
+        self.worker.mobile_token_auth = self.mobile_token_auth
+        self.worker.dry_run_simulator = self.dry_run_simulator
+        self.worker.broker_scanner = self.broker_scanner
+        self.worker.crafting_controller = self.crafting_controller
+        self.worker.economy_calculator = self.economy_calculator
+        self.worker.yolo_detector = self.yolo_detector
+        self.worker.audio_analyzer = self.audio_analyzer
+        self.worker.alt_char_mgr = self.alt_char_mgr
+        self.worker.task_scheduler = self.task_scheduler
+        self.worker.pet_buff_mgr = self.pet_buff_mgr
+        self.worker.depth_avoider = self.depth_avoider
+        self.worker.glide_pilot = self.glide_pilot
 
         # 8. Connect Signals & Hotkeys
         self._connect_signals()
@@ -951,6 +1051,9 @@ class GatherionOrchestrator(QObject):
 
 
 def main() -> int:
+    if "--elevate" in sys.argv:
+        ensure_admin_elevation(dry_run=False)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 

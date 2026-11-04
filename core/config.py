@@ -1,80 +1,43 @@
 # -*- coding: utf-8 -*-
 """
-Global Configuration & Settings Manager
-Persists bot configuration, hotkeys, combat settings, and UI preferences.
+Unified Configuration Adapter (core/config.py)
+Redirects legacy ConfigManager callers to the canonical `config/settings.json` (`SettingsManager`).
 """
 
-import os
 import json
+import os
+from typing import Any, Dict
 
-CONFIG_FILE = "config.json"
+from config.schema import SettingsManager
 
-DEFAULT_CONFIG = {
-    "gathering": {
-        "min_f_interval": 1.5,
-        "max_f_interval": 3.0,
-        "test_mode": False,
-        "show_overlay": True
-    },
-    "route": {
-        "rest_after_visit_min": 5,
-        "gathered_nodes_join_route": True,
-        "time_to_reach_node_sec": 60,
-        "reclick_interval_sec": 10,
-        "exploration_gather": True,
-        "max_failures_before_wait": 10,
-        "pause_after_idle_min": 15,
-        "fight_back_when_attacked": True
-    },
-    "breaks": {
-        "enabled": False,
-        "interval_min": 60,
-        "interval_jitter_min": 10,
-        "duration_min": 10,
-        "duration_jitter_min": 2
-    },
-    "hotkeys": {
-        "toggle_menu_f9": "f9",
-        "record_node_f8": "f8",
-        "emergency_exit": "esc"
-    },
-    "display": {
-        "ui_proportion": "Medium",
-        "monitor_idx": 1
-    }
-}
+CONFIG_FILE = os.path.join("config", "settings.json")
+
 
 class ConfigManager:
-    def __init__(self, config_path=CONFIG_FILE):
+    """Unified wrapper over `config/settings.json` (`SettingsManager`)."""
+
+    def __init__(self, config_path: str = CONFIG_FILE) -> None:
+        if os.path.basename(str(config_path)) == "config.json" and not os.path.exists(str(config_path)):
+            config_path = CONFIG_FILE
         self.config_path = config_path
-        self.config = self.load()
+        self._mgr = SettingsManager(settings_path=self.config_path)
+        self.config: Dict[str, Any] = self.load()
 
-    def load(self):
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # merge with defaults for any missing keys
-                    cfg = DEFAULT_CONFIG.copy()
-                    for k, v in data.items():
-                        if isinstance(v, dict) and k in cfg:
-                            cfg[k].update(v)
-                        else:
-                            cfg[k] = v
-                    return cfg
-            except Exception as e:
-                print(f"[ConfigManager] Ayar okuma hatası: {e}")
-        return DEFAULT_CONFIG.copy()
+    def load(self) -> Dict[str, Any]:
+        settings_obj = self._mgr.load()
+        self.config = settings_obj.to_dict()
+        return self.config
 
-    def save(self):
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump(self.config, f, indent=4, ensure_ascii=False)
+    def save(self) -> bool:
+        from config.schema import BotSettings
 
-    def get(self, section, key, default=None):
-        return self.config.get(section, {}).get(key, default)
+        self._mgr.settings = BotSettings.from_dict(self.config)
+        return self._mgr.save(self._mgr.settings)
 
-    def set(self, section, key, value):
-        if section not in self.config:
-            self.config[section] = {}
-        self.config[section][key] = value
-        self.save()
+    def get(self, section: str, key: Any = None, default: Any = None) -> Any:
+        return self._mgr.get(section, key, default)
+
+    def set(self, section: str, key: str, value: Any) -> bool:
+        ok = self._mgr.set(section, key, value)
+        self.config = self._mgr.settings.to_dict()
+        return ok

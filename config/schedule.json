@@ -1,0 +1,62 @@
+{
+  "updated_at": 1793830706.7059882,
+  "entries": [
+    {
+      "name": "19:00 Akşam Rotası Başlangıcı",
+      "start_hhmm": "19:00",
+      "end_hhmm": "21:30",
+      "action": "run_route",
+      "target_region": "",
+      "target_route": "All",
+      "days_of_week": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "enabled": true,
+      "priority": 10
+    },
+    {
+      "name": "21:30 Dünya Bossu (World Boss) / Etkinlik Molası",
+      "start_hhmm": "21:30",
+      "end_hhmm": "22:15",
+      "action": "town_wait_event",
+      "target_region": "Town_Sanctum",
+      "target_route": "All",
+      "days_of_week": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "enabled": true,
+      "priority": 30
+    },
+    {
+      "name": "22:15 Gece Toplama Devamı",
+      "start_hhmm": "22:15",
+      "end_hhmm": "23:59",
+      "action": "run_route",
+      "target_region": "",
+      "target_route": "All",
+      "days_of_week": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "enabled": true,
+      "priority": 10
+    }
+  ]
+}

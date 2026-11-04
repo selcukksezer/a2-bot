@@ -248,6 +248,95 @@ class BotWorker(QThread):
             "core.navigation_intel", "MaplessMicroNavigator"
         )
 
+        # Enterprise Suite & 50-Point Vision/Navigation Subsystems
+        self.dpi_guard: Any = self._init_optional_subsystem(
+            "core.dpi_focus_guard", "DPIScalingSynchronizer"
+        )
+        self.focus_monitor: Any = self._init_optional_subsystem(
+            "core.dpi_focus_guard", "ForegroundFocusGuard"
+        )
+        self.route_backup_mgr: Any = self._init_optional_subsystem(
+            "core.dpi_focus_guard", "RouteBackupManager"
+        )
+        self.template_tuner: Any = self._init_optional_subsystem(
+            "core.dpi_focus_guard", "SelfHealingTemplateTuner"
+        )
+        self.feather_filter: Any = self._init_optional_subsystem(
+            "core.vision_filters", "FeatherNegativeFilter"
+        )
+        self.pyramid_crest_detector: Any = self._init_optional_subsystem(
+            "core.vision_filters", "Pyramid3DCrestDetector"
+        )
+        self.dynamic_key_reader: Any = self._init_optional_subsystem(
+            "core.vision_filters", "DynamicInteractionKeyReader"
+        )
+        self.monster_circ_filter: Any = self._init_optional_subsystem(
+            "core.vision_filters", "MonsterCircularityFilter"
+        )
+        self.nameplate_isolator: Any = self._init_optional_subsystem(
+            "core.vision_filters", "NameplateHSVIsolator"
+        )
+        self.minimap_orientation_guard: Any = self._init_optional_subsystem(
+            "core.patch_normalizer", "MinimapOrientationGuard"
+        )
+        self.patch_lighting_normalizer: Any = self._init_optional_subsystem(
+            "core.patch_normalizer", "SobelClahePatchNormalizer"
+        )
+        self.roi_cropper: Any = self._init_optional_subsystem(
+            "core.patch_normalizer", "HighResROICropper"
+        )
+        self.watershed_separator: Any = self._init_optional_subsystem(
+            "core.patch_normalizer", "WatershedClusterSeparator"
+        )
+        self.motion_blur_guard: Any = self._init_optional_subsystem(
+            "core.patch_normalizer", "MotionBlurGate"
+        )
+        self.skill_bar_monitor: Any = self._init_optional_subsystem(
+            "core.skill_bar_reader", "SkillBarReader"
+        )
+        self.micro_camera_look: Any = self._init_optional_subsystem(
+            "core.skill_bar_reader", "MicroCameraLookAround"
+        )
+        self.incident_recorder: Any = self._init_optional_subsystem(
+            "core.incident_recorder", "IncidentRecorder"
+        )
+        self.mobile_token_auth: Any = self._init_optional_subsystem(
+            "core.incident_recorder", "MobileTokenAuthenticator"
+        )
+        self.dry_run_simulator: Any = self._init_optional_subsystem(
+            "core.dry_run_simulator", "DryRunReplaySimulator"
+        )
+        self.broker_scanner: Any = self._init_optional_subsystem(
+            "core.economy_broker", "TradeBrokerPriceScanner"
+        )
+        self.crafting_controller: Any = self._init_optional_subsystem(
+            "core.economy_broker", "AutoCraftingMorphQueue"
+        )
+        self.economy_calculator: Any = self._init_optional_subsystem(
+            "core.economy_broker", "SessionProfitSimulator"
+        )
+        self.yolo_detector: Any = self._init_optional_subsystem(
+            "core.neural_audio_perception", "ONNXYolo3DDetector"
+        )
+        self.audio_analyzer: Any = self._init_optional_subsystem(
+            "core.neural_audio_perception", "AudioLoopbackFFTAnalyzer"
+        )
+        self.alt_char_mgr: Any = self._init_optional_subsystem(
+            "core.multi_char_scheduler", "AltCharacterManager"
+        )
+        self.task_scheduler: Any = self._init_optional_subsystem(
+            "core.multi_char_scheduler", "AutomationTaskScheduler"
+        )
+        self.pet_buff_mgr: Any = self._init_optional_subsystem(
+            "core.multi_char_scheduler", "PetAndBuffManager"
+        )
+        self.depth_avoider: Any = self._init_optional_subsystem(
+            "core.depth_glide_navigator", "MonocularDepthObstacleAvoidance"
+        )
+        self.glide_pilot: Any = self._init_optional_subsystem(
+            "core.depth_glide_navigator", "GlideWaypointController"
+        )
+
         # Sync initial driver flags
         self._sync_input_driver_state()
 
@@ -1416,6 +1505,25 @@ class BotWorker(QThread):
             except Exception as tel_exc:
                 logger.debug("Telemetry record_gather error: %s", tel_exc)
 
+        # Enterprise Economy Calculator, Respawn Predictor & Multi-Character Quota Tracking
+        if self.economy_calculator is not None and hasattr(self.economy_calculator, "record_gather"):
+            try:
+                self.economy_calculator.record_gather(str(rtype), count=1)
+            except Exception as eco_exc:
+                logger.debug("Economy calculator record_gather skipped: %s", eco_exc)
+
+        if self.respawn_predictor is not None and node_id is not None and hasattr(self.respawn_predictor, "record_gather"):
+            try:
+                self.respawn_predictor.record_gather(int(node_id))
+            except Exception as rsp_exc:
+                logger.debug("Respawn predictor record_gather skipped: %s", rsp_exc)
+
+        if self.alt_char_mgr is not None and hasattr(self.alt_char_mgr, "record_gather"):
+            try:
+                self.alt_char_mgr.record_gather(count=1)
+            except Exception as alt_exc:
+                logger.debug("Alt character record_gather skipped: %s", alt_exc)
+
         if depleted:
             self.active_node = None
             self._walk_start_time = 0.0
@@ -1519,10 +1627,22 @@ class BotWorker(QThread):
             )
 
     def _register_node_failure(self) -> None:
-        """Increments failed_in_row and triggers wait_min_after_failed cooldown if limit reached."""
+        """Increments failed_in_row, captures incident snapshot, and triggers wait_min_after_failed cooldown if limit reached."""
         self.failed_in_row += 1
         max_failed = int(self._get_cfg("max_failed_in_row", 10) or 10)
         wait_min = float(self._get_cfg("wait_min_after_failed", 5) or 5)
+
+        if not bool(self._get_cfg("test_mode", False)) and self.incident_recorder is not None:
+            try:
+                frame_bgr = self._grab_frame(grayscale=False)
+                if frame_bgr is not None and hasattr(self.incident_recorder, "record_incident"):
+                    self.incident_recorder.record_incident(
+                        frame_bgr,
+                        reason=f"NODE_FAIL_{self.failed_in_row}",
+                        metadata={"active_node": str(self._extract_node_id(self.active_node))},
+                    )
+            except Exception as inc_exc:
+                logger.debug("Incident snapshot skipped: %s", inc_exc)
 
         if max_failed > 0 and self.failed_in_row >= max_failed:
             self._failure_wait_until = time.time() + (wait_min * 60.0)
@@ -2249,10 +2369,24 @@ class BotWorker(QThread):
 
     def _press_gather_key(self) -> None:
         self.f_pressed_count += 1
+        target_key = str(self._get_cfg("gather_key", "f") or "f").strip().lower()
         if not bool(self._get_cfg("test_mode", False)) and self.input_driver is not None:
             try:
+                if target_key == "auto" and self.dynamic_key_reader is not None:
+                    frame_bgr = self._grab_frame(grayscale=False)
+                    if frame_bgr is not None and hasattr(self.dynamic_key_reader, "decide_interaction_key"):
+                        decided = self.dynamic_key_reader.decide_interaction_key(frame_bgr)
+                        if isinstance(decided, dict):
+                            target_key = str(decided.get("key", "f")).lower()
+                        elif isinstance(decided, str) and decided.lower() in ("f", "e"):
+                            target_key = decided.lower()
+                if target_key not in ("f", "e"):
+                    target_key = "f"
+
                 self._last_bot_key_time = time.time()
-                if hasattr(self.input_driver, "send_gather_key"):
+                if target_key == "e" and hasattr(self.input_driver, "press_key"):
+                    self.input_driver.press_key("e")
+                elif hasattr(self.input_driver, "send_gather_key"):
                     self.input_driver.send_gather_key()
                 elif hasattr(self.input_driver, "press_f"):
                     self.input_driver.press_f()
@@ -2260,7 +2394,7 @@ class BotWorker(QThread):
                     self.input_driver.press_key("f")
             except Exception as exc:
                 logger.error("Failed to send gather key F: %s", exc)
-        self._emit_log("Pressed F")
+        self._emit_log("Pressed F" if target_key != "e" else "Pressed E")
 
     def _press_key(self, key: str) -> None:
         if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:

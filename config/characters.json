@@ -1,0 +1,48 @@
+{
+  "active_slot_index": 1,
+  "updated_at": 1793830706.7028842,
+  "characters": [
+    {
+      "slot_index": 1,
+      "name": "AnaToplayici",
+      "level": 55,
+      "region_name": "Verteron",
+      "route_name": "All",
+      "daily_gather_limit": 400,
+      "gathered_today": 0,
+      "energy_depleted": false,
+      "last_rotated_ts": 0.0,
+      "last_reset_date": "2026-11-05",
+      "remaining_quota": 400,
+      "available": true
+    },
+    {
+      "slot_index": 2,
+      "name": "YanKarakter_1",
+      "level": 52,
+      "region_name": "Altgard",
+      "route_name": "All",
+      "daily_gather_limit": 400,
+      "gathered_today": 0,
+      "energy_depleted": false,
+      "last_rotated_ts": 0.0,
+      "last_reset_date": "2026-11-05",
+      "remaining_quota": 400,
+      "available": true
+    },
+    {
+      "slot_index": 3,
+      "name": "YanKarakter_2",
+      "level": 50,
+      "region_name": "Eltnen",
+      "route_name": "All",
+      "daily_gather_limit": 400,
+      "gathered_today": 0,
+      "energy_depleted": false,
+      "last_rotated_ts": 0.0,
+      "last_reset_date": "2026-11-05",
+      "remaining_quota": 400,
+      "available": true
+    }
+  ]
+}
