@@ -757,6 +757,26 @@ class AltCharacterManager:
                 "reason_tr": reason_tr,
             }
 
+    def get_scheduler_health_summary(self) -> Dict[str, Any]:
+        """Returns a health summary of characters, active character name, and rotation history."""
+        try:
+            with self._lock:
+                act = self.get_active_character()
+                return {
+                    "total_characters": len(self._characters),
+                    "active_character_name": act.name if act else "Main",
+                    "active_slot_index": int(self.active_slot_index),
+                    "rotation_count": len(self.rotation_history),
+                }
+        except Exception as exc:
+            logger.debug("get_scheduler_health_summary warning: %s", exc)
+            return {
+                "total_characters": 0,
+                "active_character_name": "Main",
+                "active_slot_index": 1,
+                "rotation_count": 0,
+            }
+
 
 # ============================================================================
 # 2. HAFTALIK / GÜNLÜK OTOMASYON TAKVİMİ (AUTOMATION TASK SCHEDULER)

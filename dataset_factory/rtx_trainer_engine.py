@@ -1677,6 +1677,47 @@ echo ===========================================================================
         return self.bat_script_path
 
     # ------------------------------------------------------------------
+    def verify_exported_onnx_gpu_ready(self) -> Dict[str, Any]:
+        """
+        Checks whether `models/yolov8n_gatherion.onnx` exists, its size in bytes,
+        and whether `ONNXYolo3DDetector` loads it with `CUDAExecutionProvider`
+        (wrapped in try/except), without modifying existing training/export logic.
+        """
+        onnx_path = self.onnx_export_path
+        exists = onnx_path.exists()
+        size_bytes = int(onnx_path.stat().st_size) if exists else 0
+
+        cuda_loaded = False
+        detector_backend = "none"
+        error_msg: Optional[str] = None
+
+        try:
+            from core.neural_audio_perception import ONNXYolo3DDetector
+            # Initialize detector targeting the exported ONNX model, forcing GPU/CUDA
+            detector = ONNXYolo3DDetector(
+                model_path=str(onnx_path),
+                prefer_gpu=True,
+            )
+            detector_backend = getattr(detector, "backend_name", "unknown")
+            # Check if CUDA execution provider is active in onnxruntime session or backend
+            if hasattr(detector, "_ort_session") and detector._ort_session is not None:
+                providers = detector._ort_session.get_providers()
+                if any("CUDAExecutionProvider" in p for p in providers):
+                    cuda_loaded = True
+            elif "cuda" in detector_backend.lower() or detector_backend == "onnxruntime_cuda":
+                cuda_loaded = True
+        except Exception as exc:
+            error_msg = str(exc)
+
+        return {
+            "onnx_path": str(onnx_path),
+            "exists": exists,
+            "size_bytes": size_bytes,
+            "cuda_loaded": cuda_loaded,
+            "detector_backend": detector_backend,
+            "error": error_msg,
+        }
+
     # Live Inference Helper on Trained Custom Detector
     # ------------------------------------------------------------------
     def predict_roi(

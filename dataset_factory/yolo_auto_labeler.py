@@ -232,6 +232,37 @@ class YOLOAutoLabeler:
     - `11`: `minimap_monster_dot` (`Minimap Yuvarlak Canavar Noktası • - Negatif Sınıf`)
     """
 
+    def get_vision_filters_status(self) -> Dict[str, bool]:
+        """
+        Returns a dictionary showing whether `FeatherNegativeFilter`,
+        `Pyramid3DCrestDetector`, and `MonsterCircularityFilter` are available,
+        wrapped in try/except blocks.
+        """
+        status = {
+            "FeatherNegativeFilter": False,
+            "Pyramid3DCrestDetector": False,
+            "MonsterCircularityFilter": False,
+        }
+        try:
+            from core.vision_filters import FeatherNegativeFilter
+            status["FeatherNegativeFilter"] = FeatherNegativeFilter is not None
+        except Exception:
+            pass
+
+        try:
+            from core.vision_filters import Pyramid3DCrestDetector
+            status["Pyramid3DCrestDetector"] = Pyramid3DCrestDetector is not None
+        except Exception:
+            pass
+
+        try:
+            from core.vision_filters import MonsterCircularityFilter
+            status["MonsterCircularityFilter"] = MonsterCircularityFilter is not None
+        except Exception:
+            pass
+
+        return status
+
     def __init__(
         self,
         vision_engine: Optional[VisionEngine] = None,

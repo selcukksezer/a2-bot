@@ -198,6 +198,17 @@ class MaterialScanner:
                 return img
         return None
 
+    def estimate_material_kinah_value(self, material_name: str, count: int = 1) -> int:
+        """Estimate the Kinah value for a given material and count by querying EconomyBroker."""
+        try:
+            from core.economy_broker import TradeBrokerPriceScanner
+            scanner = TradeBrokerPriceScanner(auto_save=False)
+            unit_price = scanner.get_price(material_name, default=12000)
+            return int(unit_price * max(1, int(count)))
+        except Exception as exc:
+            logger.warning("Failed to estimate material kinah value for %s: %s", material_name, exc)
+            return int(12000 * max(1, int(count)))
+
     def scan_frame_for_materials(
         self, frame_bgr: np.ndarray
     ) -> list[DetectedMaterial]:
