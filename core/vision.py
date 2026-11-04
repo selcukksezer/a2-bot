@@ -1576,6 +1576,67 @@ class VisionEngine:
             logger.debug("find_player_on_map fallback to center: %s", exc)
             return self.screen_w // 2, self.screen_h // 2
 
+    # ------------------------------------------------------------------
+    # 6. Advanced Vision Filters Integration (core.vision_filters)
+    # ------------------------------------------------------------------
+    def _ensure_vision_filters(self) -> bool:
+        if getattr(self, "_vf_loaded", False):
+            return True
+        try:
+            from core.vision_filters import (
+                DynamicInteractionKeyReader,
+                FeatherNegativeFilter,
+                MonsterCircularityFilter,
+                NameplateHSVIsolator,
+                Pyramid3DCrestDetector,
+            )
+            self._feather_filter = FeatherNegativeFilter()
+            self._pyramid_detector = Pyramid3DCrestDetector()
+            self._key_reader = DynamicInteractionKeyReader()
+            self._monster_filter = MonsterCircularityFilter()
+            self._nameplate_isolator = NameplateHSVIsolator()
+            self._vf_loaded = True
+            return True
+        except Exception as exc:
+            logger.debug("vision_filters lazy init warning: %s", exc)
+            return False
+
+    def detect_pyramid_3d_crests(
+        self, frame: Optional[Union[np.ndarray, str, os.PathLike]] = None
+    ) -> List[Dict[str, Any]]:
+        """Detects 3D pyramid gather crests using Pyramid3DCrestDetector alongside standard 3D crest detection."""
+        img_bgr = self._coerce_frame(frame, grayscale=False)
+        if img_bgr is None or img_bgr.size == 0:
+            return []
+        results = list(self.detect_3d_gather_crests(img_bgr))
+        if self._ensure_vision_filters() and hasattr(self, "_pyramid_detector"):
+            try:
+                py_hits = self._pyramid_detector.detect_pyramid_crests(img_bgr)
+                if isinstance(py_hits, list):
+                    for hit in py_hits:
+                        if isinstance(hit, dict) and "x" in hit and "y" in hit:
+                            results.append(hit)
+            except Exception as exc:
+                logger.debug("detect_pyramid_3d_crests warning: %s", exc)
+        return results
+
+    def detect_dynamic_gather_key(
+        self, frame: Optional[Union[np.ndarray, str, os.PathLike]] = None, default_key: str = "F"
+    ) -> str:
+        """Reads the active interaction key ('F', 'E', 'G') inside the [F Gather] pill."""
+        img_bgr = self._coerce_frame(frame, grayscale=False)
+        if img_bgr is None or img_bgr.size == 0 or not self._ensure_vision_filters():
+            return default_key
+        try:
+            res = self._key_reader.read_interaction_key(img_bgr)
+            if isinstance(res, dict):
+                return str(res.get("key") or default_key)
+            if isinstance(res, str) and res.strip():
+                return res.strip().upper()
+        except Exception as exc:
+            logger.debug("detect_dynamic_gather_key warning: %s", exc)
+        return default_key
+
 
 # Backward-compatible class alias required across existing modules
 Vision = VisionEngine

@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.telemetry import TelemetryEngine
+from core.economy_broker import SessionProfitSimulator, TradeBrokerPriceScanner, format_kinah_tr
 
 logger = logging.getLogger("AnalyticsDialog")
 if not logger.handlers:
@@ -284,13 +285,28 @@ class AnalyticsDialog(QDialog):
         telemetry: Optional[TelemetryEngine] = None,
         parent: Optional[QWidget] = None,
         telemetry_engine: Optional[TelemetryEngine] = None,
+        economy_calculator: Optional[Any] = None,
+        economy_broker: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(parent)
         resolved_tel = telemetry if telemetry is not None else telemetry_engine
         self.telemetry = resolved_tel if resolved_tel is not None else TelemetryEngine()
+
+        # Ekonomi hesaplayıcı / simülatör çözünürlüğü (Fallback: SessionProfitSimulator)
+        resolved_econ = economy_calculator if economy_calculator is not None else economy_broker
+        if resolved_econ is not None:
+            if hasattr(resolved_econ, "get_session_economy_summary") and callable(resolved_econ.get_session_economy_summary):
+                self.economy_calculator = resolved_econ
+            elif hasattr(resolved_econ, "scan_broker_window") or hasattr(resolved_econ, "get_price"):
+                self.economy_calculator = SessionProfitSimulator(price_scanner=resolved_econ)
+            else:
+                self.economy_calculator = SessionProfitSimulator()
+        else:
+            self.economy_calculator = SessionProfitSimulator()
+
         self.setWindowTitle("Telemetri ve Performans Analizi")
-        self.resize(900, 650)
+        self.resize(950, 700)
         self.setStyleSheet(
             """
             QDialog {
@@ -367,20 +383,36 @@ class AnalyticsDialog(QDialog):
         header_row.addWidget(self.session_info_lbl)
         root_layout.addLayout(header_row)
 
-        # 1) Üstte 4 Özet KPI Kartı
-        kpi_layout = QHBoxLayout()
-        kpi_layout.setSpacing(12)
+        # 1) Üstte KPI Kartları (2 Satır: Gather Telemetry + Economic Telemetry)
+        kpi_container = QVBoxLayout()
+        kpi_container.setSpacing(8)
+
+        kpi_row1 = QHBoxLayout()
+        kpi_row1.setSpacing(12)
 
         self.card_gathered = KPICard("TOPLAM TOPLANAN", "0", "Toplam hasat edilen materyal", "#38bdf8")
         self.card_rate = KPICard("SAATLİK TOPLAMA HIZI", "0.0", "Anlık saatlik toplama hızı", "#10b981")
         self.card_success = KPICard("BAŞARI ORANI", "%100.0", "0 başarısız deneme", "#f59e0b")
         self.card_walk = KPICard("ORT. YÜRÜME SÜRESİ", "0.00sn", "Ortalama navigasyon süresi", "#a855f7")
 
-        kpi_layout.addWidget(self.card_gathered)
-        kpi_layout.addWidget(self.card_rate)
-        kpi_layout.addWidget(self.card_success)
-        kpi_layout.addWidget(self.card_walk)
-        root_layout.addLayout(kpi_layout)
+        kpi_row1.addWidget(self.card_gathered)
+        kpi_row1.addWidget(self.card_rate)
+        kpi_row1.addWidget(self.card_success)
+        kpi_row1.addWidget(self.card_walk)
+
+        kpi_row2 = QHBoxLayout()
+        kpi_row2.setSpacing(12)
+
+        self.card_kinah_total = KPICard("OTURUM KİNAH / ALTIN", "0", "Tahmini toplam değer", "#eab308")
+        self.card_kinah_rate = KPICard("SAATLİK KİNAH HIZI", "0/sa", "Beklenen saatlik kazanç", "#34d399")
+
+        kpi_row2.addWidget(self.card_kinah_total)
+        kpi_row2.addWidget(self.card_kinah_rate)
+        kpi_row2.addStretch(2)
+
+        kpi_container.addLayout(kpi_row1)
+        kpi_container.addLayout(kpi_row2)
+        root_layout.addLayout(kpi_container)
 
         # 2) Ortada QPainter Canlı Verim Grafiği
         self.chart_widget = LiveThroughputChart(self)
@@ -451,10 +483,11 @@ class AnalyticsDialog(QDialog):
         return f"{hrs:02d}:{mins:02d}:{secs:02d}"
 
     def refresh_metrics(self) -> None:
-        """TelemetryEngine üzerinden canlı verileri çekip kartları, grafiği ve tabloyu günceller."""
+        """TelemetryEngine ve SessionProfitSimulator / TradeBrokerPriceScanner üzerinden canlı verileri çekip kartları, grafiği ve tabloyu günceller."""
         try:
             metrics = self.telemetry.get_live_metrics()
-            duration_str = self._format_duration(float(metrics.get("session_duration_sec", 0.0)))
+            duration_sec = float(metrics.get("session_duration_sec", 0.0))
+            duration_str = self._format_duration(duration_sec)
             combats = int(metrics.get("combat_count", 0))
             failures = int(metrics.get("failed_total", 0))
             gathered = int(metrics.get("gathered_total", 0))
@@ -462,6 +495,35 @@ class AnalyticsDialog(QDialog):
             success_pct = float(metrics.get("success_rate_pct", 100.0))
             avg_walk = float(metrics.get("avg_walk_sec", 0.0))
             avg_match = float(metrics.get("avg_match_pct", 0.0))
+
+            # Detaylı tablodan materyalleri ekonomi hesaplayıcısına senkronize et
+            rows = metrics.get("detailed_breakdown", [])
+            if self.economy_calculator is not None and hasattr(self.economy_calculator, "record_gather"):
+                try:
+                    for row in rows:
+                        res_type = str(row.get("resource_type", ""))
+                        cnt = int(row.get("count", 0))
+                        if res_type and cnt > 0 and hasattr(self.economy_calculator, "gathered_counts"):
+                            self.economy_calculator.gathered_counts[res_type] = max(
+                                self.economy_calculator.gathered_counts.get(res_type, 0),
+                                cnt
+                            )
+                except Exception as e:
+                    logger.debug(f"Ekonomi senkronizasyon uyarısı: {e}")
+
+            # Canlı Türk ekonomi telemetrisi (Tahmini Oturum Kinah/Gold değeri ve Saatlik Kinah hızı)
+            econ_summary = {}
+            if self.economy_calculator is not None and hasattr(self.economy_calculator, "get_session_economy_summary"):
+                try:
+                    effective_hrs = max(1.0 / 3600.0, duration_sec / 3600.0)
+                    econ_summary = self.economy_calculator.get_session_economy_summary(elapsed_hours=effective_hrs)
+                except Exception as e:
+                    logger.error(f"Ekonomi özeti alınırken hata: {e}")
+
+            net_kinah = int(econ_summary.get("net_kinah_earned", 0))
+            fmt_net = str(econ_summary.get("formatted_net_kinah", format_kinah_tr(net_kinah)))
+            kinah_hr = int(econ_summary.get("kinah_per_hour", 0))
+            fmt_hr = str(econ_summary.get("formatted_kinah_per_hour", format_kinah_tr(kinah_hr)))
 
             self.session_info_lbl.setText(
                 f"Oturum: {duration_str}  |  Savaşlar: {combats}  |  Hatalar: {failures}"
@@ -472,10 +534,12 @@ class AnalyticsDialog(QDialog):
             self.card_success.update_card(f"%{success_pct:.1f}", f"{failures} başarısız deneme")
             self.card_walk.update_card(f"{avg_walk:.2f}sn", f"Temizlenen savaş: {combats}")
 
+            self.card_kinah_total.update_card(f"{fmt_net}", "Tahmini Toplam Kinah / Altın")
+            self.card_kinah_rate.update_card(f"{fmt_hr}/sa", "Saatlik Kinah Kazanç Hızı")
+
             buckets = metrics.get("hourly_buckets", [])
             self.chart_widget.set_buckets(buckets)
 
-            rows = metrics.get("detailed_breakdown", [])
             self._populate_table(rows)
         except Exception as exc:
             logger.error(f"refresh_metrics sırasında hata: {exc}", exc_info=True)
@@ -545,11 +609,13 @@ class AnalyticsDialog(QDialog):
             logger.error(f"on_save_json hatası: {exc}", exc_info=True)
 
     def on_reset_stats(self) -> None:
-        """Oturum istatistiklerini sıfırlar ve ekranı yeniler."""
+        """Oturum istatistiklerini ve ekonomi verilerini sıfırlar ve ekranı yeniler."""
         try:
             self.telemetry.reset_session()
+            if self.economy_calculator is not None and hasattr(self.economy_calculator, "reset_session"):
+                self.economy_calculator.reset_session()
             self.refresh_metrics()
-            logger.info("Kullanıcı tarafından oturum istatistikleri sıfırlandı.")
+            logger.info("Kullanıcı tarafından oturum istatistikleri ve ekonomi verileri sıfırlandı.")
         except Exception as exc:
             logger.error(f"on_reset_stats hatası: {exc}", exc_info=True)
 

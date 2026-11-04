@@ -1425,10 +1425,44 @@ class MobileRemoteServer:
             except Exception as exc:
                 logger.debug("Bellek istatistiği okuma uyarısı: %s", exc)
 
-        # 6. Tunnel Info & Recent Logs (last 60 entries)
+        # 6. Tunnel Info, Enterprise Telemetry & Recent Logs (last 60 entries)
         conn_info = self.get_connection_info()
         with self._log_lock:
             recent_logs = list(self._log_buffer)[-60:]
+
+        enterprise_info: Dict[str, Any] = {
+            "kinah_total": 0,
+            "kinah_per_hour": 0,
+            "audio_active": False,
+            "active_character": "Main",
+            "glide_ready": False,
+            "yolo_active": False,
+            "yolo_provider": "CPU",
+        }
+        try:
+            orch = self.orchestrator
+            ec = getattr(orch, "economy_calculator", None) or getattr(w, "economy_calculator", None)
+            if ec is not None and hasattr(ec, "get_session_summary"):
+                s_sum = ec.get_session_summary()
+                if isinstance(s_sum, dict):
+                    enterprise_info["kinah_total"] = int(s_sum.get("total_profit_kinah", s_sum.get("net_kinah", 0)) or 0)
+                    enterprise_info["kinah_per_hour"] = int(s_sum.get("kinah_per_hour", 0) or 0)
+            aud = getattr(orch, "audio_confirm", None) or getattr(w, "audio_confirm", None)
+            if aud is not None:
+                enterprise_info["audio_active"] = True
+            mc = getattr(orch, "multi_char_scheduler", None) or getattr(w, "multi_char_scheduler", None)
+            if mc is not None:
+                enterprise_info["active_character"] = str(getattr(mc, "active_character_name", "Main") or "Main")
+            gp = getattr(orch, "glide_pilot", None) or getattr(w, "glide_pilot", None)
+            if gp is not None:
+                enterprise_info["glide_ready"] = True
+            vis = self.vision
+            yd = getattr(vis, "yolo_detector", None) if vis is not None else None
+            if yd is not None:
+                enterprise_info["yolo_active"] = bool(getattr(yd, "has_custom_model", False))
+                enterprise_info["yolo_provider"] = str(getattr(yd, "backend_type", "CPU") or "CPU")
+        except Exception as exc:
+            logger.debug("Enterprise telemetry aggregation warning: %s", exc)
 
         hp_clamped = round(max(0.0, min(1.0, hp_ratio)), 3)
         mp_clamped = round(max(0.0, min(1.0, mp_ratio)), 3)
@@ -1530,6 +1564,7 @@ class MobileRemoteServer:
                 "ntfy_topic": conn_info["ntfy_topic"],
                 "qr_url": conn_info["qr_url"],
             },
+            "enterprise": enterprise_info,
             "recent_logs": recent_logs,
         }
 

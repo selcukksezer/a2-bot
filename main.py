@@ -784,6 +784,8 @@ class GatherionOrchestrator(QObject):
             self.open_analytics_dialog()
         elif act == "calibrate":
             self.open_calibration_wizard()
+        elif act in ("yolo_factory", "yolov8_factory", "dataset_factory"):
+            self.open_yolo_factory_dialog()
         elif act in ("open_log", "log"):
             self.open_log_file()
         elif act in ("guide", "stuck_guide"):

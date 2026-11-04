@@ -478,11 +478,12 @@ class F9Menu(QWidget):
         self._add_separator(layout)
 
         # -----------------------------------------------------------------
-        # 5. Harita, Radar, Analiz, Kalibrasyon, Ayarlar & Destek Araçları
+        # 5. Harita, Radar, Analiz, Kalibrasyon, YOLO Fabrikası, Ayarlar & Destek Araçları
         # -----------------------------------------------------------------
         self._add_row(layout, "radar", "Canlı Radar & Haritalama", "D")
         self._add_row(layout, "analytics", "İstatistik & Analiz", "V")
         self._add_row(layout, "calibrate", "Kalibrasyon Sihirbazı", "K")
+        self._add_row(layout, "yolo_factory", "YOLO Veri Fabrikası & RTX Eğitim Merkezi", "Y")
         self._add_row(layout, "settings", "Ayarlar (Haritayı Göster & Noktalar)...", "S")
         self._add_row(layout, "open_log", "Günlük Kaydını Aç (Log)", "L")
         self._add_row(layout, "guide", "Kullanım Kılavuzu (Yardım)", "I")
@@ -900,6 +901,7 @@ class F9Menu(QWidget):
         D -> Canlı Radar & Haritalama (radar)
         V -> İstatistik & Analiz (analytics)
         K -> Kalibrasyon Sihirbazı (calibrate)
+        Y -> YOLO Veri Fabrikası & RTX Eğitim Merkezi (yolo_factory)
         S -> Ayarlar (settings)
         L -> Günlük Kaydını Aç (open_log)
         I -> Kullanım Kılavuzu (guide)
@@ -928,6 +930,8 @@ class F9Menu(QWidget):
             self._trigger_action("analytics")
         elif key == Qt.Key.Key_K:
             self._trigger_action("calibrate")
+        elif key == Qt.Key.Key_Y:
+            self._trigger_action("yolo_factory")
         elif key == Qt.Key.Key_S:
             self._trigger_action("settings")
         elif key == Qt.Key.Key_L:

@@ -25,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
+from core.patch_normalizer import MinimapOrientationGuard, SobelClahePatchNormalizer
+
 try:
     import winsound
 except ImportError:
@@ -531,6 +533,7 @@ class RouteManager:
         base_dir: str = "routes",
         default_rest_sec: int = DEFAULT_REST_SEC,
         meters_per_pixel: float = 0.28,
+        **kwargs: Any,
     ) -> None:
         # Geriye dönük uyumluluk: eğer ilk argüman bir .json dosya yoluysa dizinini al
         if base_dir.lower().endswith(".json"):
@@ -541,6 +544,8 @@ class RouteManager:
         self.base_dir: str = resolved_base
         self.default_rest_sec: int = int(default_rest_sec)
         self.meters_per_pixel: float = float(meters_per_pixel)
+        self.patch_normalizer: SobelClahePatchNormalizer = kwargs.get("patch_normalizer") or SobelClahePatchNormalizer()
+        self.orientation_guard: MinimapOrientationGuard = kwargs.get("orientation_guard") or MinimapOrientationGuard()
 
         # Toplam hasat ve ardışık hata sayaçları
         self.total_gathered: int = 0
@@ -2124,6 +2129,14 @@ class RouteManager:
         if os.path.isfile(disk_patch):
             try:
                 patch_gray = _safe_imread_gray(disk_patch)
+                patch_color = None
+                try:
+                    raw_p = np.fromfile(disk_patch, dtype=np.uint8)
+                    if raw_p.size > 0:
+                        patch_color = cv2.imdecode(raw_p, cv2.IMREAD_COLOR)
+                except Exception:
+                    patch_color = cv2.imread(disk_patch, cv2.IMREAD_COLOR)
+
                 if (
                     patch_gray is not None
                     and patch_gray.size > 0
@@ -2138,6 +2151,34 @@ class RouteManager:
                         target_x = int(max_loc[0] + pw // 2)
                         target_y = int(max_loc[1] + ph // 2)
                         used_fallback = False
+
+                    # Sobel+CLAHE and MinimapOrientationGuard integration (e.g. if raw grayscale template score is between 0.55 and 0.69)
+                    if (0.55 <= confidence <= 0.69) or (confidence < float(match_threshold)):
+                        try:
+                            template_bgr = patch_color if patch_color is not None else cv2.cvtColor(patch_gray, cv2.COLOR_GRAY2BGR)
+                            if self.orientation_guard is not None:
+                                template_bgr = self.orientation_guard.normalize_patch_to_north(template_bgr)
+
+                            sc_score, (sc_cx, sc_cy) = self.patch_normalizer.match_normalized_patch(
+                                search_roi_bgr=open_map_frame,
+                                template_bgr=template_bgr,
+                            )
+                            if sc_score > confidence:
+                                confidence = float(max(0.0, min(1.0, sc_score)))
+                                target_x = int(sc_cx)
+                                target_y = int(sc_cy)
+                                if confidence >= float(match_threshold) or sc_score > 0.55:
+                                    used_fallback = False
+                                    logger.info(
+                                        "Düğüm #%d için Sobel+CLAHE normalizasyon skoru ile iyileştirildi: score=%.2f at (%d, %d)",
+                                        resolved_node.id,
+                                        confidence,
+                                        target_x,
+                                        target_y,
+                                    )
+                        except Exception as sc_exc:
+                            logger.debug("SobelClahePatchNormalizer secondary match failed: %s", sc_exc)
+
             except Exception as exc:
                 logger.error("Düğüm #%d için şablon eşleştirme hatası: %s", resolved_node.id, exc)
 
