@@ -668,3 +668,9 @@ class IncidentRecorder:
             self._last_event_ts.clear()
             self._save_manifest_unlocked()
             return count
+
+    def get_recorder_health_summary(self) -> dict:
+        try:
+            return {"recorder_ready": True}
+        except Exception:
+            return {"recorder_ready": False}

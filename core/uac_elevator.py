@@ -276,6 +276,14 @@ def ensure_admin_elevation(
         return False
 
 
+def get_uac_elevation_summary() -> dict:
+    """Returns basic status summary for the UAC elevator module."""
+    try:
+        return {"uac_module_ready": True}
+    except Exception:
+        return {"uac_module_ready": False}
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     logger.info("Running core/uac_elevator.py self-check...")

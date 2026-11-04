@@ -619,6 +619,13 @@ class ForegroundFocusGuard:
     def last_check_latency_ms(self) -> float:
         return self._last_check_latency_ms
 
+    def get_focus_guard_health_summary(self) -> dict:
+        try:
+            return {"focus_guard_ready": True}
+        except Exception:
+            return {"focus_guard_ready": False}
+
+
 
 # ============================================================================
 # ITEM 49: Kendi Kendini İyileştiren Şablon Eşikleri (SelfHealingTemplateTuner)

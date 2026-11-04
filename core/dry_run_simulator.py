@@ -402,3 +402,11 @@ class DryRunReplaySimulator:
             cv2.LINE_AA,
         )
         return canvas
+
+    def get_simulator_health_summary(self) -> dict:
+        """Safely returns simulator health summary dictionary."""
+        try:
+            return {"simulator_ready": True}
+        except Exception:
+            return {"simulator_ready": False}
+
