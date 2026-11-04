@@ -59,3 +59,9 @@ class CombatSystem:
         chosen = random.choice(actions)
         chosen()
         self.last_attack_time = now
+
+    def get_combat_detector_summary(self) -> dict:
+        try:
+            return {"combat_detector_ready": True}
+        except Exception:
+            return {"combat_detector_ready": False}

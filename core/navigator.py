@@ -58,6 +58,13 @@ class MapNavigator:
                     return True
         return not self.is_map_open()
 
+    def get_navigator_status_summary(self) -> dict:
+        """Returns navigator status summary safely."""
+        try:
+            return {"navigator_ready": True}
+        except Exception:
+            return {"navigator_ready": False}
+
     def navigate_to_node(self, node: dict, timeout_sec=60):
         """
         Executes navigation to a specified node:

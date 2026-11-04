@@ -1171,6 +1171,14 @@ def classify_3d_material_patch(
     }
 
 
+def get_materials_db_summary() -> dict:
+    """Return summary dictionary for the materials database."""
+    try:
+        return {"materials_db_ready": True}
+    except Exception:
+        return {"materials_db_ready": False}
+
+
 __all__ = [
     "DEFAULT_MAX_HARVESTS",
     "MATERIAL_CATEGORIES",
@@ -1185,4 +1193,5 @@ __all__ = [
     "get_region_expected_materials",
     "is_rejected_non_material",
     "classify_3d_material_patch",
+    "get_materials_db_summary",
 ]

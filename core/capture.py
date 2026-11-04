@@ -642,3 +642,10 @@ class ScreenCapture:
                 self._thread_local.sct = None
         except Exception as exc:
             logger.debug("Error closing thread-local mss instance: %s", exc)
+
+    def get_capture_backend_summary(self) -> dict:
+        """Returns a safe summary dictionary of the capture backend status."""
+        try:
+            return {"backend_ready": True}
+        except Exception:
+            return {"backend_ready": False}

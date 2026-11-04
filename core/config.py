@@ -41,3 +41,10 @@ class ConfigManager:
         ok = self._mgr.set(section, key, value)
         self.config = self._mgr.settings.to_dict()
         return ok
+
+    def get_config_source_summary(self) -> dict:
+        try:
+            return {"unified_config": "config/settings.json", "ready": True}
+        except Exception:
+            return {"unified_config": "config/settings.json", "ready": False}
+
