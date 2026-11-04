@@ -1,0 +1,10 @@
+{
+  "topic": "gatherion_tr_b0955974",
+  "command_topic": "gatherion_tr_b0955974_cmd",
+  "server_url": "https://ntfy.sh",
+  "enabled": true,
+  "publish_interval_sec": 30.0,
+  "web_topic_url": "https://ntfy.sh/gatherion_tr_b0955974",
+  "web_command_url": "https://ntfy.sh/gatherion_tr_b0955974_cmd",
+  "updated_at": 1793819174
+}

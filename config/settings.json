@@ -1,0 +1,46 @@
+{
+    "gathering": {
+        "f_interval_min": 1.5,
+        "f_interval_max": 3.0,
+        "test_mode": false,
+        "show_overlay": true,
+        "harvests_per_node": 3,
+        "inter_harvest_delay_min": 0.6,
+        "inter_harvest_delay_max": 1.4,
+        "retry_on_extraction_fail": true,
+        "max_retries_per_harvest_stage": 2,
+        "gather_key": "f"
+    },
+    "route": {
+        "rest_minutes": 5,
+        "climb_air_max_sec": 10,
+        "gathered_join_active_route": true,
+        "fly_unreachable": true,
+        "check_odyle_minimap": true,
+        "reclick_node_sec": 10,
+        "time_to_reach_sec": 60,
+        "gather_on_the_way": false,
+        "wait_min_after_failed": 5,
+        "max_failed_in_row": 10,
+        "remove_node_after_failures": 0,
+        "pause_after_no_gather_min": 15,
+        "fight_back": true,
+        "fight_stop_gather_sec": 3,
+        "harvests_per_node": 3,
+        "minimap_auto_record": true,
+        "minimap_ignore_monsters": true,
+        "minimap_auto_filter_check": true,
+        "minimap_cluster_stack_bonus": true,
+        "hybrid_3d_and_minimap_record": true,
+        "auto_record_3d_crests": true
+    },
+    "breaks": {
+        "break_every_min": 0,
+        "break_every_variance": 1,
+        "break_lasts_min": 10,
+        "break_lasts_variance": 1
+    },
+    "active_region": "Altgard",
+    "active_route": "Dredgion Crash Site",
+    "version": "v1.6.15"
+}

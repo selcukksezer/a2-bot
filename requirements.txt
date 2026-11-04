@@ -1,9 +1,9 @@
 PyQt6>=6.6.0
-mss>=10.0.0
-PyDirectInput>=1.0.4
-keyboard>=0.13.5
 opencv-python>=4.8.0
+mss>=9.0.1
 numpy>=1.24.0
-pillow>=10.0.0
+pydirectinput>=1.0.4
+keyboard>=0.13.5
+Pillow>=10.0.0
 pywin32>=306
 winshell>=0.6

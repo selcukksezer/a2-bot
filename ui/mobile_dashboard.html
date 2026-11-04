@@ -1,0 +1,2820 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f17" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Bot Kumanda" />
+  <title>A2 Ultra Mobil Komuta Merkezi (PWA)</title>
+  <style>
+    :root {
+      --bg-main: #0b0f17;
+      --bg-card: rgba(17, 24, 39, 0.86);
+      --bg-card-solid: #111827;
+      --bg-elevated: rgba(31, 41, 55, 0.78);
+      --border-glass: rgba(255, 255, 255, 0.08);
+      --border-highlight: rgba(6, 182, 212, 0.35);
+      --text-main: #f3f4f6;
+      --text-muted: #9ca3af;
+      --text-dim: #6b7280;
+      --emerald: #10b981;
+      --emerald-glow: rgba(16, 185, 129, 0.25);
+      --cyan: #06b6d4;
+      --cyan-glow: rgba(6, 182, 212, 0.25);
+      --amber: #f59e0b;
+      --amber-glow: rgba(245, 158, 11, 0.25);
+      --crimson: #ef4444;
+      --crimson-glow: rgba(239, 68, 68, 0.3);
+      --purple: #8b5cf6;
+      --radius-lg: 16px;
+      --radius-md: 12px;
+      --radius-sm: 8px;
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+
+    html, body {
+      background-color: var(--bg-main);
+      background-image:
+        radial-gradient(circle at 12% 8%, rgba(6, 182, 212, 0.10), transparent 38%),
+        radial-gradient(circle at 88% 15%, rgba(16, 185, 129, 0.08), transparent 40%),
+        radial-gradient(circle at 50% 90%, rgba(139, 92, 246, 0.07), transparent 45%);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+      min-height: 100vh;
+      overflow-x: hidden;
+      padding-bottom: calc(78px + var(--safe-bottom));
+    }
+
+    /* Üst Durum Çubuğu (Sticky Header) */
+    .top-header {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(11, 15, 23, 0.88);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border-glass);
+      padding: 10px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .header-row-1 {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .brand-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 800;
+      font-size: 15px;
+      letter-spacing: 0.3px;
+      color: #fff;
+    }
+
+    .brand-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--emerald);
+      box-shadow: 0 0 10px var(--emerald);
+      animation: pulseDot 1.8s infinite ease-in-out;
+    }
+
+    .brand-dot.paused {
+      background: var(--amber);
+      box-shadow: 0 0 10px var(--amber);
+      animation: none;
+    }
+
+    .brand-dot.offline {
+      background: var(--crimson);
+      box-shadow: 0 0 10px var(--crimson);
+      animation: none;
+    }
+
+    @keyframes pulseDot {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.28); opacity: 0.65; }
+    }
+
+    .header-badges {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+      border: 1px solid var(--border-glass);
+      background: rgba(31, 41, 55, 0.75);
+      color: var(--text-main);
+      white-space: nowrap;
+    }
+
+    .badge.running {
+      background: rgba(16, 185, 129, 0.16);
+      border-color: rgba(16, 185, 129, 0.45);
+      color: #34d399;
+    }
+
+    .badge.paused {
+      background: rgba(245, 158, 11, 0.16);
+      border-color: rgba(245, 158, 11, 0.45);
+      color: #fbbf24;
+    }
+
+    .badge.harvesting {
+      background: rgba(6, 182, 212, 0.18);
+      border-color: rgba(6, 182, 212, 0.5);
+      color: #22d3ee;
+    }
+
+    .badge.danger {
+      background: rgba(239, 68, 68, 0.18);
+      border-color: rgba(239, 68, 68, 0.5);
+      color: #f87171;
+    }
+
+    .header-row-2 {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      gap: 8px;
+    }
+
+    .sub-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(17, 24, 39, 0.9);
+      padding: 2px 8px;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+
+    /* Ana Konteyner ve Sekmeler */
+    .container {
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .tab-pane {
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+      animation: fadeIn 0.18s ease-out;
+    }
+
+    .tab-pane.active {
+      display: flex;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Kart Tasarımı */
+    .card {
+      background: var(--bg-card);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-glass);
+      border-radius: var(--radius-lg);
+      padding: 14px;
+      box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .card-title {
+      font-size: 13.5px;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      letter-spacing: 0.2px;
+    }
+
+    .card-subtitle {
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+
+    /* Canlı Ekran İzleyici */
+    .stream-controls-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .segmented-group {
+      display: inline-flex;
+      background: rgba(11, 15, 23, 0.85);
+      padding: 3px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-glass);
+      gap: 3px;
+    }
+
+    .seg-btn {
+      background: transparent;
+      color: var(--text-muted);
+      border: none;
+      padding: 5px 9px;
+      border-radius: 6px;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .seg-btn.active {
+      background: var(--cyan);
+      color: #041318;
+      font-weight: 700;
+      box-shadow: 0 2px 8px var(--cyan-glow);
+    }
+
+    .stream-viewport {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #05080d;
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      border: 1px solid rgba(6, 182, 212, 0.28);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      touch-action: manipulation;
+    }
+
+    .stream-viewport.minimap-aspect {
+      aspect-ratio: 4 / 3;
+      max-height: 290px;
+    }
+
+    .stream-viewport.tap-active {
+      border-color: var(--emerald);
+      box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.35);
+      cursor: crosshair;
+    }
+
+    #liveStreamImg {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      pointer-events: none;
+    }
+
+    .stream-overlay-info {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      display: flex;
+      gap: 6px;
+      pointer-events: none;
+    }
+
+    .stream-pill {
+      background: rgba(11, 15, 23, 0.82);
+      backdrop-filter: blur(6px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #e5e7eb;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 10.5px;
+      font-weight: 600;
+    }
+
+    .tap-ripple {
+      position: absolute;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      border: 2px solid var(--emerald);
+      background: rgba(16, 185, 129, 0.25);
+      transform: translate(-50%, -50%) scale(0.4);
+      pointer-events: none;
+      animation: rippleAnim 0.55s ease-out forwards;
+    }
+
+    @keyframes rippleAnim {
+      to {
+        transform: translate(-50%, -50%) scale(1.8);
+        opacity: 0;
+      }
+    }
+
+    .tap-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: rgba(11, 15, 23, 0.65);
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-glass);
+    }
+
+    .toggle-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .toggle-switch input {
+      display: none;
+    }
+
+    .slider {
+      width: 38px;
+      height: 21px;
+      background: #374151;
+      border-radius: 999px;
+      position: relative;
+      transition: 0.2s;
+    }
+
+    .slider::after {
+      content: "";
+      width: 17px;
+      height: 17px;
+      background: #fff;
+      border-radius: 50%;
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      transition: 0.2s;
+    }
+
+    .toggle-switch input:checked + .slider {
+      background: var(--emerald);
+    }
+
+    .toggle-switch input:checked + .slider::after {
+      transform: translateX(17px);
+    }
+
+    /* 3x Materyal Toplama Halkası & Durum Kartı */
+    .harvest-cycle-box {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 12px;
+      align-items: center;
+      background: rgba(11, 15, 23, 0.55);
+      padding: 12px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border-glass);
+    }
+
+    .ring-wrapper {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .harvest-steps {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .step-node {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 12px;
+      background: #1f2937;
+      color: var(--text-muted);
+      border: 2px solid #374151;
+      transition: all 0.25s ease;
+    }
+
+    .step-node.done {
+      background: rgba(16, 185, 129, 0.2);
+      border-color: var(--emerald);
+      color: #34d399;
+      box-shadow: 0 0 10px var(--emerald-glow);
+    }
+
+    .step-node.current {
+      background: rgba(6, 182, 212, 0.25);
+      border-color: var(--cyan);
+      color: #22d3ee;
+      box-shadow: 0 0 12px var(--cyan-glow);
+      transform: scale(1.1);
+    }
+
+    .ring-caption {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--cyan);
+      text-align: center;
+    }
+
+    .stats-mini-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+
+    .mini-stat {
+      background: rgba(31, 41, 55, 0.55);
+      padding: 7px 8px;
+      border-radius: var(--radius-sm);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      text-align: center;
+    }
+
+    .mini-stat-label {
+      font-size: 10px;
+      color: var(--text-muted);
+      display: block;
+    }
+
+    .mini-stat-val {
+      font-size: 14px;
+      font-weight: 800;
+      color: #fff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    /* Can & Mana Çubukları */
+    .bars-container {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .bar-row {
+      display: flex;
+       flex-direction: column;
+      gap: 4px;
+    }
+
+    .bar-label-line {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11.5px;
+      font-weight: 700;
+    }
+
+    .progress-track {
+      width: 100%;
+      height: 10px;
+      background: rgba(11, 15, 23, 0.9);
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.3s ease;
+    }
+
+    .progress-fill.hp {
+      background: linear-gradient(90deg, #dc2626, #10b981);
+    }
+
+    .progress-fill.mp {
+      background: linear-gradient(90deg, #2563eb, #06b6d4);
+    }
+
+    /* Uzaktan Müdahale Tuş Takımı */
+    .btn-grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+    }
+
+    .btn-grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 11px 10px;
+      border-radius: var(--radius-md);
+      font-size: 12.5px;
+      font-weight: 700;
+      border: 1px solid var(--border-glass);
+      background: var(--bg-elevated);
+      color: var(--text-main);
+      cursor: pointer;
+      transition: transform 0.1s ease, background 0.15s ease, border-color 0.15s ease;
+      text-align: center;
+    }
+
+    .btn:active {
+      transform: scale(0.96);
+    }
+
+    .btn-emerald {
+      background: rgba(16, 185, 129, 0.18);
+      border-color: rgba(16, 185, 129, 0.48);
+      color: #34d399;
+    }
+
+    .btn-amber {
+      background: rgba(245, 158, 11, 0.18);
+      border-color: rgba(245, 158, 11, 0.48);
+      color: #fbbf24;
+    }
+
+    .btn-cyan {
+      background: rgba(6, 182, 212, 0.18);
+      border-color: rgba(6, 182, 212, 0.48);
+      color: #22d3ee;
+    }
+
+    .btn-crimson {
+      background: rgba(239, 68, 68, 0.22);
+      border-color: rgba(239, 68, 68, 0.6);
+      color: #fca5a5;
+    }
+
+    .btn-mode.active {
+      background: linear-gradient(135deg, rgba(6, 182, 212, 0.32), rgba(16, 185, 129, 0.28));
+      border-color: var(--cyan);
+      color: #fff;
+      box-shadow: 0 0 14px var(--cyan-glow);
+    }
+
+    .btn-panic {
+      width: 100%;
+      padding: 14px;
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+      background: linear-gradient(135deg, #b91c1c, #ef4444);
+      color: #fff;
+      border: 1px solid #f87171;
+      box-shadow: 0 4px 18px var(--crimson-glow);
+    }
+
+    /* Sekme 2: Canlı Harita & Düğümler */
+    .radar-canvas-wrap {
+      position: relative;
+      width: 100%;
+      height: 300px;
+      background:
+        radial-gradient(circle at center, rgba(6, 182, 212, 0.08) 0%, rgba(5, 8, 13, 0.96) 75%);
+      border-radius: var(--radius-md);
+      border: 1px solid rgba(6, 182, 212, 0.3);
+      overflow: hidden;
+    }
+
+    #routeRadarCanvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      touch-action: none;
+    }
+
+    .radar-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .legend-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+    }
+
+    .search-input {
+      width: 100%;
+      background: rgba(11, 15, 23, 0.9);
+      border: 1px solid var(--border-glass);
+      color: var(--text-main);
+      padding: 10px 12px;
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      outline: none;
+    }
+
+    .search-input:focus {
+      border-color: var(--cyan);
+    }
+
+    .node-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 360px;
+      overflow-y: auto;
+    }
+
+    .node-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 12px;
+      background: rgba(11, 15, 23, 0.65);
+      border: 1px solid var(--border-glass);
+      border-radius: var(--radius-sm);
+    }
+
+    .node-item.active-target {
+      border-color: var(--cyan);
+      background: rgba(6, 182, 212, 0.1);
+    }
+
+    .node-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .node-title {
+      font-weight: 700;
+      font-size: 13px;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .node-coords {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    /* Sekme 3: İstatistik & Telemetri */
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+    }
+
+    .metric-box {
+      background: rgba(11, 15, 23, 0.65);
+      border: 1px solid var(--border-glass);
+      border-radius: var(--radius-md);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .metric-title {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .metric-value {
+      font-size: 20px;
+      font-weight: 800;
+      color: #fff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .metric-sub {
+      font-size: 10.5px;
+      color: var(--emerald);
+    }
+
+    .sparkline-wrap {
+      width: 100%;
+      height: 140px;
+      background: rgba(11, 15, 23, 0.75);
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border-glass);
+      padding: 8px;
+      position: relative;
+    }
+
+    #sparklineCanvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    /* Sekme 4: Ayarlar & Canlı Log */
+    .form-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .form-row:last-child {
+      border-bottom: none;
+    }
+
+    .form-label {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .form-label-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #fff;
+    }
+
+    .form-label-desc {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .form-control {
+      background: rgba(11, 15, 23, 0.9);
+      border: 1px solid var(--border-glass);
+      color: #fff;
+      padding: 7px 10px;
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      font-weight: 600;
+      min-width: 90px;
+      text-align: center;
+    }
+
+    .terminal-box {
+      background: #06090f;
+      border: 1px solid rgba(6, 182, 212, 0.25);
+      border-radius: var(--radius-md);
+      padding: 10px;
+      height: 290px;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11.5px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      user-select: text;
+    }
+
+    .log-line {
+      line-height: 1.4;
+      word-break: break-word;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+
+    .log-line.info { color: #d1d5db; }
+    .log-line.warn { color: #fbbf24; background: rgba(245, 158, 11, 0.08); }
+    .log-line.error { color: #f87171; background: rgba(239, 68, 68, 0.12); }
+    .log-line.harvest { color: #34d399; background: rgba(16, 185, 129, 0.08); }
+
+    /* Alt Navigasyon Çubuğu (Thumb-Friendly Bottom Nav) */
+    .bottom-nav {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 120;
+      background: rgba(11, 15, 23, 0.94);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      border-top: 1px solid var(--border-glass);
+      padding: 6px 8px calc(6px + var(--safe-bottom));
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 4px;
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    .nav-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      padding: 6px 4px;
+      border-radius: var(--radius-sm);
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .nav-btn .nav-icon {
+      font-size: 18px;
+      line-height: 1;
+    }
+
+    .nav-btn.active {
+      color: var(--cyan);
+      background: rgba(6, 182, 212, 0.12);
+      font-weight: 700;
+    }
+
+    /* Bildirim (Toast) */
+    .toast-container {
+      position: fixed;
+      top: 76px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 200;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      width: 92%;
+      max-width: 420px;
+      pointer-events: none;
+    }
+
+    .toast {
+      background: rgba(17, 24, 39, 0.95);
+      backdrop-filter: blur(10px);
+      border: 1px solid var(--cyan);
+      color: #fff;
+      padding: 10px 14px;
+      border-radius: var(--radius-md);
+      font-size: 12.5px;
+      font-weight: 600;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      animation: fadeIn 0.2s ease-out;
+    }
+
+    /* Item 36: Acil Durum Alarm Banner & Header Butonları */
+    .header-tool-btn {
+      background: rgba(31, 41, 55, 0.85);
+      border: 1px solid var(--border-glass);
+      color: var(--text-main);
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s ease;
+    }
+    .header-tool-btn:active {
+      transform: scale(0.95);
+    }
+    .header-tool-btn.muted {
+      border-color: rgba(239, 68, 68, 0.5);
+      color: #fca5a5;
+    }
+    .alarm-emergency-banner {
+      display: none;
+      background: linear-gradient(90deg, rgba(185, 28, 28, 0.95), rgba(239, 68, 68, 0.92));
+      border: 1px solid #fca5a5;
+      color: #fff;
+      padding: 8px 12px;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      font-weight: 800;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      box-shadow: 0 0 18px var(--crimson-glow);
+      animation: pulseAlarmBanner 0.9s infinite alternate;
+    }
+    .alarm-emergency-banner.active {
+      display: flex;
+    }
+    @keyframes pulseAlarmBanner {
+      from { opacity: 1; transform: scale(1); }
+      to { opacity: 0.82; transform: scale(0.992); }
+    }
+
+    /* Item 40: Picture-in-Picture (PiP) Minimap Overlay */
+    .pip-minimap-box {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 28%;
+      max-width: 150px;
+      min-width: 96px;
+      aspect-ratio: 1 / 1;
+      border-radius: 10px;
+      overflow: hidden;
+      border: 2px solid var(--cyan);
+      background: rgba(5, 8, 13, 0.92);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.65);
+      z-index: 15;
+      transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+    .pip-minimap-box.hidden {
+      display: none;
+    }
+    .pip-minimap-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      pointer-events: none;
+    }
+    .pip-minimap-label {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: rgba(11, 15, 23, 0.82);
+      color: #22d3ee;
+      font-size: 9.5px;
+      font-weight: 700;
+      text-align: center;
+      padding: 2px 4px;
+    }
+
+    /* Item 37: Uzaktan Kamera Döndürme ve Kurtarma Joystick'i */
+    .joystick-pad-wrap {
+      background: rgba(11, 15, 23, 0.65);
+      border: 1px solid var(--border-glass);
+      border-radius: var(--radius-md);
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .joystick-dpad-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      max-width: 340px;
+      margin: 0 auto;
+      width: 100%;
+    }
+    .joy-btn {
+      padding: 12px 8px;
+      border-radius: var(--radius-md);
+      font-size: 12.5px;
+      font-weight: 800;
+      background: rgba(31, 41, 55, 0.9);
+      border: 1px solid rgba(6, 182, 212, 0.32);
+      color: #fff;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+      transition: transform 0.08s ease, background 0.15s ease;
+    }
+    .joy-btn:active {
+      transform: scale(0.93);
+      background: rgba(6, 182, 212, 0.28);
+    }
+    .joy-btn .joy-sub {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+    .joy-btn.cam-btn {
+      background: rgba(139, 92, 246, 0.18);
+      border-color: rgba(139, 92, 246, 0.45);
+      color: #ddd6fe;
+    }
+    .joy-btn.jump-btn {
+      background: rgba(6, 182, 212, 0.22);
+      border-color: var(--cyan);
+      color: #22d3ee;
+    }
+
+    /* Item 39: Olay Anı Ekran Görüntüsü Galerisi (Incident Snapshots) */
+    .incident-gallery-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+    }
+    @media (max-width: 420px) {
+      .incident-gallery-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    .incident-card {
+      background: rgba(11, 15, 23, 0.78);
+      border: 1px solid var(--border-glass);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      cursor: pointer;
+      transition: border-color 0.15s ease, transform 0.12s ease;
+    }
+    .incident-card:active {
+      transform: scale(0.98);
+    }
+    .incident-card.critical {
+      border-color: rgba(239, 68, 68, 0.55);
+    }
+    .incident-card.warning {
+      border-color: rgba(245, 158, 11, 0.5);
+    }
+    .incident-thumb {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #05080d;
+      object-fit: cover;
+      display: block;
+    }
+    .incident-meta {
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .incident-top-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    .incident-desc {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.35;
+    }
+
+    /* Item 38: 256-Bit QR Güvenlik Anahtarı Modalı & Tam Ekran Görsel Modalı */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 300;
+      background: rgba(5, 8, 13, 0.85);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .modal-backdrop.open {
+      display: flex;
+    }
+    .modal-box {
+      width: 100%;
+      max-width: 440px;
+      background: var(--bg-card-solid);
+      border: 1px solid var(--border-highlight);
+      border-radius: var(--radius-lg);
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Üst Durum Çubuğu -->
+  <header class="top-header">
+    <div class="header-row-1">
+      <div class="brand-title">
+        <span id="connDot" class="brand-dot"></span>
+        <span>A2 MOBİL KOMUTA</span>
+      </div>
+      <div class="header-badges">
+        <span id="stateBadge" class="badge running">ÇALIŞIYOR</span>
+        <span id="sseBadge" class="badge" title="Canlı Veri Akışı (SSE / Polling)">📡 SSE</span>
+        <span id="latencyBadge" class="badge">⚡ 14 ms</span>
+        <span id="resBadge" class="badge">2560x1440</span>
+        <button type="button" id="alarmMuteBtn" class="header-tool-btn" onclick="toggleAlarmMute()" title="Sesli ve Titreşimli Acil Durum Alarmı">
+          🔔 Alarm Açık
+        </button>
+        <button type="button" id="alarmTestBtn" class="header-tool-btn" onclick="triggerEmergencyAlarm('test', 'Test Alarmı: Ses ve Titreşim Kontrolü', true)" title="Acil Durum Sirenini ve Titreşimi Test Et">
+          🔊 Test
+        </button>
+        <button type="button" id="tokenModalBtn" class="header-tool-btn" onclick="openTokenModal()" title="256-Bit QR Güvenlik Anahtarı Ayarı">
+          🔐 Anahtar
+        </button>
+      </div>
+    </div>
+    <div class="header-row-2">
+      <span id="activeActionText">Durum: Rota taranıyor ve materyal aranıyor...</span>
+      <span id="uptimePill" class="sub-pill">Süre: 00:00:00</span>
+    </div>
+    <!-- Item 36: Acil Durum Sesli & Titreşimli Alarm Uyarısı -->
+    <div id="alarmEmergencyBanner" class="alarm-emergency-banner">
+      <span id="alarmBannerText">🚨 KRİTİK ACİL DURUM ALARMI!</span>
+      <button type="button" class="header-tool-btn" style="background:#fff; color:#991b1b;" onclick="stopEmergencyAlarm()">
+        Sustur
+      </button>
+    </div>
+  </header>
+
+  <!-- Bildirim Kutusu -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <!-- Ana İçerik -->
+  <main class="container">
+
+    <!-- ================= SEKME 1: CANLI EKRAN & KUMANDA ================= -->
+    <section id="tab-live" class="tab-pane active">
+
+      <!-- Canlı Oyun Ekranı & Sağ Üst Minimap İzleyici -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📺 Canlı Oyun Ekranı & Minimap İzleyici</div>
+            <div class="card-subtitle">Bilgisayar ekranını canlı izleyin veya dokunarak tıklayın</div>
+          </div>
+        </div>
+
+        <div class="stream-controls-bar">
+          <div class="segmented-group" id="streamModeGroup">
+            <button type="button" class="seg-btn active" data-stream-mode="full">Tam Ekran Canlı Görüntü</button>
+            <button type="button" class="seg-btn" data-stream-mode="minimap">Sağ Üst Minimap Yakın Çekim</button>
+          </div>
+          <div class="segmented-group" id="streamFpsGroup">
+            <button type="button" class="seg-btn" data-fps-ms="500">0.5s</button>
+            <button type="button" class="seg-btn active" data-fps-ms="1000">1s</button>
+            <button type="button" class="seg-btn" data-fps-ms="2000">2s</button>
+            <button type="button" class="seg-btn" data-fps-ms="0">Durdur</button>
+          </div>
+          <button type="button" id="pipToggleBtn" class="seg-btn active" style="border:1px solid var(--border-highlight);" onclick="togglePipMinimap()">
+            🖼️ PiP Minimap: Açık
+          </button>
+        </div>
+
+        <div id="streamViewport" class="stream-viewport">
+          <img id="liveStreamImg" src="/api/frame.jpg?mode=full" alt="Canlı Oyun Görüntüsü" />
+          <div class="stream-overlay-info">
+            <span id="streamModePill" class="stream-pill">Tam Ekran (2560x1440)</span>
+            <span id="streamClickCoordsPill" class="stream-pill" style="display:none;">Tık: -</span>
+          </div>
+          <!-- Item 40: Picture-in-Picture (PiP) Minimap Overlay -->
+          <div id="pipMinimapOverlay" class="pip-minimap-box" title="Sağ Üst Minimap Canlı PiP Önizleme">
+            <img id="pipMinimapImg" src="/api/frame.jpg?mode=minimap" alt="PiP Minimap" />
+            <div class="pip-minimap-label">PiP MİNİMAP</div>
+          </div>
+        </div>
+
+        <div class="tap-toolbar">
+          <label class="toggle-switch">
+            <input type="checkbox" id="tapToClickToggle" />
+            <span class="slider"></span>
+            <span>👆 Dokunmatik Tıklama Modu (PC Ekranına Tıkla)</span>
+          </label>
+          <span id="tapStatusHint" style="font-size:11px; color:var(--text-muted);">Kapalı</span>
+        </div>
+      </div>
+
+      <!-- 3x Materyal Toplama Halkası & Durum Kartı -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🔄 3x Materyal Toplama Halkası & Durum Kartı</div>
+          <span id="nodeBadge" class="badge harvesting">Düğüm #0</span>
+        </div>
+
+        <div class="harvest-cycle-box">
+          <div class="ring-wrapper">
+            <div class="harvest-steps">
+              <div id="stepNode1" class="step-node done">1/3</div>
+              <div id="stepNode2" class="step-node current">2/3</div>
+              <div id="stepNode3" class="step-node">3/3</div>
+            </div>
+            <div id="harvestCycleLabel" class="ring-caption">Toplama Döngüsü: 2/3</div>
+          </div>
+
+          <div class="stats-mini-grid">
+            <div class="mini-stat">
+              <span class="mini-stat-label">Aktif Düğüm</span>
+              <span id="statActiveNode" class="mini-stat-val">#0</span>
+            </div>
+            <div class="mini-stat">
+              <span class="mini-stat-label">Toplam Toplanan</span>
+              <span id="statTotalGathered" class="mini-stat-val">0</span>
+            </div>
+            <div class="mini-stat">
+              <span class="mini-stat-label">Saatlik Hız</span>
+              <span id="statHourlyRate" class="mini-stat-val">0/s</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Can (HP) ve Mana (MP) Barları -->
+        <div class="bars-container">
+          <div class="bar-row">
+            <div class="bar-label-line">
+              <span>❤️ Can Durumu (HP)</span>
+              <span id="hpValueText">100%</span>
+            </div>
+            <div class="progress-track">
+              <div id="hpBarFill" class="progress-fill hp" style="width: 100%;"></div>
+            </div>
+          </div>
+
+          <div class="bar-row">
+            <div class="bar-label-line">
+              <span>💧 Mana / Enerji Durumu (MP)</span>
+              <span id="mpValueText">100%</span>
+            </div>
+            <div class="progress-track">
+              <div id="mpBarFill" class="progress-fill mp" style="width: 100%;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Uzaktan Müdahale Tuş Takımı (Remote Control Pad) -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🎮 Uzaktan Müdahale Tuş Takımı</div>
+            <div class="card-subtitle">Bota anında telefondan müdahale edin veya mod değiştirin</div>
+          </div>
+        </div>
+
+        <!-- Temel Kontrol Tuşları -->
+        <div class="btn-grid-2">
+          <button type="button" class="btn btn-amber" onclick="sendBotAction('pause')">⏸ Duraklat (F9)</button>
+          <button type="button" class="btn btn-emerald" onclick="sendBotAction('resume')">▶ Devam Et (Resume)</button>
+          <button type="button" class="btn btn-cyan" onclick="sendBotAction('record_f8')">📍 F8 Konum Kaydet</button>
+          <button type="button" class="btn" onclick="sendBotAction('skip_node')">⏭ Düğümü Atla (Skip)</button>
+        </div>
+
+        <!-- Çalışma Modu Seçici -->
+        <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-top:2px;">Çalışma Modu Seçimi:</div>
+        <div class="btn-grid-3" id="modeButtonsGroup">
+          <button type="button" class="btn btn-mode" data-bot-mode="gather" onclick="changeBotMode('gather')">🌾 Sadece Topla</button>
+          <button type="button" class="btn btn-mode active" data-bot-mode="route" onclick="changeBotMode('route')">🗺️ Rotayı Başlat</button>
+          <button type="button" class="btn btn-mode" data-bot-mode="explore" onclick="changeBotMode('explore')">🧭 Oto-Keşif (3B+Minimap)</button>
+        </div>
+
+        <!-- Item 37: Uzaktan Kurtarma & Kamera Kumandası (Joystick Pad) -->
+        <div class="joystick-pad-wrap">
+          <div style="display:flex; align-items:center; justify-content:space-between;">
+            <span style="font-size:12.5px; font-weight:800; color:#fff;">🕹️ Uzaktan Kurtarma & Kamera Kumandası (Joystick Pad)</span>
+            <span class="badge" style="font-size:10px;">Anlık Müdahale</span>
+          </div>
+
+          <div class="joystick-dpad-grid">
+            <button type="button" class="joy-btn cam-btn" onclick="sendCameraRotate('left')">
+              <span>↶ Kamera Sol</span>
+              <span class="joy-sub">Sol Bakış</span>
+            </button>
+            <button type="button" class="joy-btn" onclick="sendKeyPress('w')">
+              <span>⬆️ W (İleri)</span>
+              <span class="joy-sub">İleri Yürü</span>
+            </button>
+            <button type="button" class="joy-btn cam-btn" onclick="sendCameraRotate('right')">
+              <span>↷ Kamera Sağ</span>
+              <span class="joy-sub">Sağ Bakış</span>
+            </button>
+
+            <button type="button" class="joy-btn" onclick="sendKeyPress('a')">
+              <span>⬅️ A (Sol)</span>
+              <span class="joy-sub">Sola Kay</span>
+            </button>
+            <button type="button" class="joy-btn jump-btn" onclick="sendKeyPress('space')">
+              <span>🚀 Space (Zıpla)</span>
+              <span class="joy-sub">Engel Aş</span>
+            </button>
+            <button type="button" class="joy-btn" onclick="sendKeyPress('d')">
+              <span>➡️ D (Sağ)</span>
+              <span class="joy-sub">Sağa Kay</span>
+            </button>
+
+            <button type="button" class="joy-btn" onclick="sendKeyPress('f')">
+              <span>✋ F (Topla)</span>
+              <span class="joy-sub">Etkileşim</span>
+            </button>
+            <button type="button" class="joy-btn" onclick="sendKeyPress('s')">
+              <span>⬇️ S (Geri)</span>
+              <span class="joy-sub">Geri Çekil</span>
+            </button>
+            <button type="button" class="joy-btn" onclick="sendKeyPress('m')">
+              <span>🗺️ M (Harita)</span>
+              <span class="joy-sub">Harita Aç/Kapat</span>
+            </button>
+          </div>
+
+          <div class="btn-grid-2">
+            <button type="button" class="btn btn-cyan" onclick="triggerAutoUnstuckMacro()">
+              ⚡ Oto-Kurtar (Jump+Strafe)
+            </button>
+            <button type="button" class="btn" onclick="sendKeyPress('e')">
+              ✨ E (Alternatif Topla)
+            </button>
+          </div>
+        </div>
+
+        <!-- Acil Durdur Butonu -->
+        <button type="button" class="btn btn-panic" onclick="triggerEmergencyStop()">
+          🚨 ACİL DURDUR (PANİK KORUMASI)
+        </button>
+      </div>
+
+    </section>
+
+    <!-- ================= SEKME 2: CANLI HARİTA & DÜĞÜMLER ================= -->
+    <section id="tab-map" class="tab-pane">
+
+      <!-- Item 40: Mobil Üzerinden Rota, Bölge ve Sıralama Modu Değiştirme -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🌍 Mobil Bölge, Rota ve Sıralama Modu Değiştirici</div>
+            <div class="card-subtitle">Aktif harita bölgesini, rotayı ve döngü dizilimini uzaktan değiştirin</div>
+          </div>
+          <span id="activeRegionPill" class="badge running">Altgard</span>
+        </div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span class="form-label-title">Aktif Bölge (Region)</span>
+            <span class="form-label-desc">Materyal toplanacak oyun bölgesi</span>
+          </div>
+          <select id="mobileRegionSelect" class="form-control" style="min-width:170px;">
+            <option value="Altgard">Altgard</option>
+            <option value="Verteron">Verteron</option>
+            <option value="Pilgrim's Ridge">Pilgrim's Ridge</option>
+            <option value="Western Altamia Highland">Western Altamia Highland</option>
+            <option value="Morheim">Morheim</option>
+            <option value="Eltnen">Eltnen</option>
+            <option value="Beluslan">Beluslan</option>
+            <option value="Heiron">Heiron</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span class="form-label-title">Aktif Rota (Route)</span>
+            <span class="form-label-desc">Bölge içerisindeki alt rota veya koridor</span>
+          </div>
+          <select id="mobileRouteSelect" class="form-control" style="min-width:170px;">
+            <option value="All">All (Tüm Düğümler)</option>
+            <option value="Dredgion Crash Site">Dredgion Crash Site</option>
+            <option value="Altgard Fortress Loop">Altgard Fortress Loop</option>
+            <option value="Pilgrim Ore Corridor">Pilgrim Ore Corridor</option>
+            <option value="Western Highland Loop">Western Highland Loop</option>
+            <option value="Verteron Citadel Ring">Verteron Citadel Ring</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span class="form-label-title">Sıralama Modu (Sort Mode)</span>
+            <span class="form-label-desc">Düğümler arası yürüyüş ve dönüş geometrisi</span>
+          </div>
+          <select id="mobileSortModeSelect" class="form-control" style="min-width:170px;">
+            <option value="smooth_loop">Smooth Loop / Dairesel Döngü</option>
+            <option value="walk_path">Walk Path / Yürüyüş Koridoru</option>
+          </select>
+        </div>
+
+        <button type="button" class="btn btn-cyan" style="width:100%; padding:12px;" onclick="switchMobileRegionRoute()">
+          🔄 Bölge, Rota ve Sıralama Modunu Uygula
+        </button>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🧭 Canlı 2B Rota Radarı & Koridor Haritası</div>
+            <div class="card-subtitle">Sıralı koridor okları (0 → 1 → 2) ve 3x toplama durumları</div>
+          </div>
+          <span id="totalNodesCountBadge" class="badge">0 Düğüm</span>
+        </div>
+
+        <div class="radar-canvas-wrap">
+          <canvas id="routeRadarCanvas" width="600" height="320"></canvas>
+        </div>
+
+        <div class="radar-legend">
+          <span class="legend-item"><span class="legend-dot" style="background:#10b981;"></span> Aktif (Hazır)</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#f59e0b;"></span> Dinleniyor (5dk Geri Sayım)</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#ef4444;"></span> Başarısız</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#06b6d4;"></span> Minimap/3B Oto-Kayıt</span>
+        </div>
+
+        <div class="btn-grid-2">
+          <button type="button" class="btn btn-emerald" onclick="sendBotAction('reset_all_nodes')">⚡ Tüm Düğümleri Uyandır</button>
+          <button type="button" class="btn btn-cyan" onclick="sendBotAction('optimize_route', { mode: document.getElementById('mobileSortModeSelect')?.value || 'smooth_loop' })">📐 Sıralı Rotayı Optimize Et</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📋 Kayıtlı Materyal Düğümleri Listesi</div>
+        </div>
+
+        <input type="text" id="nodeSearchInput" class="search-input" placeholder="Düğüm #ID, kaynak (Minimap/3B/F8) veya durum ara..." oninput="renderNodesList()" />
+
+        <div id="nodesListContainer" class="node-list">
+          <!-- JS ile dinamik doldurulur -->
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ================= SEKME 3: İSTATİSTİK & TELEMETRİ ================= -->
+    <section id="tab-stats" class="tab-pane">
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📊 Keşif, Toplama & Sistem Telemetrisi</div>
+            <div class="card-subtitle">Gerçek zamanlı performans ve oto-kayıt sayaçları</div>
+          </div>
+        </div>
+
+        <div class="telemetry-grid">
+          <div class="metric-box">
+            <span class="metric-title">Minimap'ten Kaydedilen</span>
+            <span id="metricMinimapSaved" class="metric-value">0</span>
+            <span class="metric-sub">Sağ Üst Minimap Oto-Keşif</span>
+          </div>
+
+          <div class="metric-box">
+            <span class="metric-title">3B Dünyadan (Aria/Mela) Kaydedilen</span>
+            <span id="metricWorld3dSaved" class="metric-value">0</span>
+            <span class="metric-sub">3B Parıltı & İsim Etiketi</span>
+          </div>
+
+          <div class="metric-box">
+            <span class="metric-title">Essence Extraction Failed Sayısı</span>
+            <span id="metricExtractionFailed" class="metric-value" style="color:var(--amber);">0</span>
+            <span class="metric-sub">5dk Dinlenmeye Alınan</span>
+          </div>
+
+          <div class="metric-box">
+            <span class="metric-title">FPS & Yakalama Hızı</span>
+            <span id="metricFps" class="metric-value" style="color:var(--cyan);">0 FPS</span>
+            <span id="metricCaptureLatency" class="metric-sub">Yakalama Gecikmesi: 0 ms</span>
+          </div>
+
+          <div class="metric-box">
+            <span class="metric-title">Yakalama Gecikmesi</span>
+            <span id="metricCaptureMsBox" class="metric-value">0 ms</span>
+            <span id="metricCpuSub" class="metric-sub">DXCam / MSS Kare Süresi</span>
+          </div>
+
+          <div class="metric-box">
+            <span class="metric-title">RAM Kullanımı</span>
+            <span id="metricRamUsage" class="metric-value">0 MB</span>
+            <span class="metric-sub">Sistem Bellek Durumu</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📈 Canlı Saatlik Toplama Hızı Grafiği (Sparkline)</div>
+            <div class="card-subtitle">Son ölçümlere göre materyal/saat verimlilik eğrisi</div>
+          </div>
+        </div>
+
+        <div class="sparkline-wrap">
+          <canvas id="sparklineCanvas" width="560" height="130"></canvas>
+        </div>
+      </div>
+
+      <!-- Item 39: Olay Kayıtları Galerisi (Incident Snapshots) -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">📸 Olay Kayıtları Galerisi (Incident Snapshots)</div>
+            <div class="card-subtitle">Ölüm, Takılma, Uzun Savaş (&gt;2dk) ve Envanter Dolu anı ekran görüntüleri</div>
+          </div>
+          <span id="incidentCountBadge" class="badge">0 Kayıt</span>
+        </div>
+
+        <div class="btn-grid-3">
+          <button type="button" class="btn btn-cyan" onclick="triggerManualIncidentSnapshot()">📸 Anlık Kaydet</button>
+          <button type="button" class="btn" onclick="fetchIncidentsGallery()">🔄 Yenile</button>
+          <button type="button" class="btn btn-crimson" onclick="clearIncidentsGallery()">🗑️ Temizle</button>
+        </div>
+
+        <div id="incidentGalleryContainer" class="incident-gallery-grid">
+          <div style="grid-column: 1 / -1; color:var(--text-muted); text-align:center; padding:16px;">
+            Henüz kaydedilmiş kritik olay (Ölüm, Takılma, Uzun Savaş &gt;2dk) bulunmuyor.
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ================= SEKME 4: AYARLAR & CANLI LOG ================= -->
+    <section id="tab-settings" class="tab-pane">
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">⚙️ Uzaktan Bot Ayarları</div>
+            <div class="card-subtitle">Ayarları değiştirip doğrudan telefonunuzdan kaydedin</div>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span class="form-label-title">Materyal Başına Toplama (3x)</span>
+            <span class="form-label-desc">Bir düğümden kaç kez üst üste materyal toplanacağı</span>
+          </div>
+          <input type="number" id="settingHarvestsPerNode" class="form-control" min="1" max="10" value="3" />
+        </div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span class="form-label-title">Toplama Tuşu (F / E / Otomatik)</span>
+            <span class="form-label-desc">Oyun içi etkileşim ve toplama tuşu</span>
+          </div>
+          <select id="settingInteractKey" class="form-control">
+            <option value="auto">Otomatik (F/E)</option>
+            <option value="f">Sadece F Tuşu</option>
+            <option value="e">Sadece E Tuşu</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span class="form-label-title">Sağ Üst Minimap Oto-Kayıt</span>
+            <span class="form-label-desc">Minimap'te görülen sarı/turuncu materyal ikonlarını kaydet</span>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="settingMinimapAutoRecord" checked />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span class="form-label-title">3B Dünya Oto-Kayıt</span>
+            <span class="form-label-desc">Ekranda görülen Aria/Mela materyallerini otomatik kaydet</span>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="settingWorld3dAutoRecord" checked />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span class="form-label-title">Dinlenme Süresi (dk)</span>
+            <span class="form-label-desc">3x toplama veya hata sonrası düğüm bekleme süresi (dakika)</span>
+          </div>
+          <input type="number" id="settingCooldownMinutes" class="form-control" min="1" max="60" value="5" />
+        </div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span class="form-label-title">Test Modu (Simülasyon / Dry-Run)</span>
+            <span class="form-label-desc">Gerçek tuş basmadan sadece görsel tespit testi yap</span>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="settingDryRun" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <button type="button" class="btn btn-emerald" style="width:100%; padding:13px;" onclick="saveRemoteSettings()">
+          💾 Ayarları Telefondan Kaydet
+        </button>
+      </div>
+
+      <!-- Canlı Terminal Log İzleyici -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">💻 Canlı Terminal Kayıtları (Son 60 Satır)</div>
+            <div class="card-subtitle">Anlık bot kararları, 3x toplama ve uyarı mesajları</div>
+          </div>
+        </div>
+
+        <div class="segmented-group" id="logFilterGroup">
+          <button type="button" class="seg-btn active" data-log-filter="all">Tümü</button>
+          <button type="button" class="seg-btn" data-log-filter="warn">Uyarı/Hata</button>
+          <button type="button" class="seg-btn" data-log-filter="harvest">Toplama</button>
+        </div>
+
+        <div id="terminalLogBox" class="terminal-box">
+          <div class="log-line info">[SİSTEM] Mobil Komuta Merkezi başlatıldı. Sunucu verisi bekleniyor...</div>
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- Item 38: 256-Bit QR Güvenlik Anahtarı (Token Auth) Giriş Modalı -->
+  <div id="tokenAuthModal" class="modal-backdrop">
+    <div class="modal-box">
+      <div class="card-title">🔐 256-Bit Güvenlik Anahtarı (QR Token Auth)</div>
+      <div class="card-subtitle">
+        QR Kod ile bağlanmadıysanız veya tarayıcı anahtarınız değiştiyse masaüstü arayüzdeki güvenlik anahtarını (Token) giriniz.
+      </div>
+      <input
+        type="text"
+        id="tokenModalInput"
+        class="search-input"
+        placeholder="256-Bit Güvenlik Anahtarı veya Erişim Token'ı..."
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <div style="font-size:11px; color:var(--text-muted);">
+        Anahtar <code>localStorage('gatherion_token')</code> içerisine kaydedilir ve tüm isteklerde <code>X-Gatherion-Token</code> başlığı ile gönderilir.
+      </div>
+      <div class="btn-grid-2">
+        <button type="button" class="btn btn-emerald" onclick="saveTokenFromModal()">💾 Anahtarı Kaydet</button>
+        <button type="button" class="btn" onclick="closeTokenModal()">Kapat</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Item 39: Olay Anı Ekran Görüntüsü Tam Ekran İnceleme Modalı -->
+  <div id="incidentZoomModal" class="modal-backdrop" onclick="closeIncidentModal()">
+    <div class="modal-box" style="max-width: 600px;" onclick="event.stopPropagation()">
+      <div class="card-header">
+        <div id="incidentModalTitle" class="card-title">📸 Olay Anı Görüntüsü</div>
+        <button type="button" class="header-tool-btn" onclick="closeIncidentModal()">✕ Kapat</button>
+      </div>
+      <img id="incidentModalImg" src="" alt="Olay Görüntüsü" style="width:100%; border-radius:var(--radius-md); border:1px solid var(--border-highlight);" />
+      <div id="incidentModalDetails" style="font-size:12px; color:var(--text-muted);"></div>
+    </div>
+  </div>
+
+  <!-- Alt Navigasyon Çubuğu -->
+  <nav class="bottom-nav">
+    <button type="button" class="nav-btn active" data-target="tab-live">
+      <span class="nav-icon">🎮</span>
+      <span>Canlı Kumanda</span>
+    </button>
+    <button type="button" class="nav-btn" data-target="tab-map">
+      <span class="nav-icon">🗺️</span>
+      <span>Harita & Rota</span>
+    </button>
+    <button type="button" class="nav-btn" data-target="tab-stats">
+      <span class="nav-icon">📸</span>
+      <span>Olay & İstatistik</span>
+    </button>
+    <button type="button" class="nav-btn" data-target="tab-settings">
+      <span class="nav-icon">⚙️</span>
+      <span>Ayarlar & Log</span>
+    </button>
+  </nav>
+
+  <script>
+    // ==================== ITEM 38: QR KOD + 256-BİT GÜVENLİK ANAHTARI ====================
+    const urlParams = new URLSearchParams(window.location.search);
+    const qrUrlToken = (urlParams.get('token') || urlParams.get('key') || '').trim();
+    if (qrUrlToken) {
+      localStorage.setItem('gatherion_token', qrUrlToken);
+      localStorage.setItem('a2_mobile_token', qrUrlToken);
+    }
+
+    // ==================== UYGULAMA DURUMU (STATE) ====================
+    const AppState = {
+      activeTab: 'tab-live',
+      streamMode: 'full',      // 'full' | 'minimap'
+      pipMinimapEnabled: true,
+      streamIntervalMs: 1000,  // 500 | 1000 | 2000 | 0
+      streamTimer: null,
+      tapToClickEnabled: false,
+      logFilter: 'all',        // 'all' | 'warn' | 'harvest'
+      nodes: [],
+      incidents: [],
+      activeNodeId: null,
+      playerPos: { x: 0, y: 0 },
+      recentLogs: [],
+      sparklineHistory: [12, 18, 24, 30, 28, 36, 42, 40, 48, 54],
+      settingsLoadedOnce: false,
+      regionRouteLoadedOnce: false,
+      alarmMuted: localStorage.getItem('gatherion_alarm_muted') === '1',
+      lastAlarmTriggerTs: 0,
+      audioCtx: null,
+      sseSource: null,
+      sseConnected: false,
+      unauthorizedShown: false,
+      authToken: qrUrlToken || localStorage.getItem('gatherion_token') || localStorage.getItem('a2_mobile_token') || ''
+    };
+
+    function getAuthHeaders() {
+      const headers = { 'Content-Type': 'application/json' };
+      if (AppState.authToken) {
+        headers['X-Gatherion-Token'] = AppState.authToken;
+        headers['X-Access-Token'] = AppState.authToken;
+        headers['X-Auth-Token'] = AppState.authToken;
+        headers['Authorization'] = 'Bearer ' + AppState.authToken;
+      }
+      return headers;
+    }
+
+    function withTokenUrl(url) {
+      if (!AppState.authToken) return url;
+      const sep = url.includes('?') ? '&' : '?';
+      return url + sep + 'token=' + encodeURIComponent(AppState.authToken);
+    }
+
+    function openTokenModal(reasonMsg) {
+      const modal = document.getElementById('tokenAuthModal');
+      const input = document.getElementById('tokenModalInput');
+      if (input) input.value = AppState.authToken || '';
+      if (modal) modal.classList.add('open');
+      if (reasonMsg) showToast(reasonMsg, 'var(--amber)');
+    }
+
+    function closeTokenModal() {
+      const modal = document.getElementById('tokenAuthModal');
+      if (modal) modal.classList.remove('open');
+    }
+
+    function saveTokenFromModal() {
+      const input = document.getElementById('tokenModalInput');
+      const val = (input ? input.value : '').trim();
+      AppState.authToken = val;
+      if (val) {
+        localStorage.setItem('gatherion_token', val);
+        localStorage.setItem('a2_mobile_token', val);
+        showToast('🔐 256-Bit Güvenlik Anahtarı kaydedildi.', 'var(--emerald)');
+      } else {
+        localStorage.removeItem('gatherion_token');
+        localStorage.removeItem('a2_mobile_token');
+        showToast('Güvenlik anahtarı temizlendi.', 'var(--amber)');
+      }
+      AppState.unauthorizedShown = false;
+      closeTokenModal();
+      connectEventStream();
+      fetchStatus();
+      fetchNodes();
+      fetchIncidentsGallery();
+      refreshLiveFrame();
+    }
+
+    // ==================== ITEM 36: MOBİL SESLİ & TİTREŞİMLİ ACİL DURUM ALARMI ====================
+    function updateAlarmHeaderButton() {
+      const btn = document.getElementById('alarmMuteBtn');
+      if (!btn) return;
+      if (AppState.alarmMuted) {
+        btn.classList.add('muted');
+        btn.textContent = '🔕 Sessiz';
+      } else {
+        btn.classList.remove('muted');
+        btn.textContent = '🔔 Alarm Açık';
+      }
+    }
+
+    function toggleAlarmMute() {
+      AppState.alarmMuted = !AppState.alarmMuted;
+      localStorage.setItem('gatherion_alarm_muted', AppState.alarmMuted ? '1' : '0');
+      updateAlarmHeaderButton();
+      if (AppState.alarmMuted) {
+        stopEmergencyAlarm();
+        showToast('🔕 Acil durum sesli alarmı sessize alındı.', 'var(--amber)');
+      } else {
+        playSynthesizedSiren('chime');
+        showToast('🔔 Acil durum sesli ve titreşimli alarmı aktif!', 'var(--emerald)');
+      }
+    }
+
+    function playSynthesizedSiren(pattern = 'siren') {
+      try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return;
+        if (!AppState.audioCtx) {
+          AppState.audioCtx = new AudioCtx();
+        }
+        if (AppState.audioCtx.state === 'suspended') {
+          AppState.audioCtx.resume();
+        }
+        const ctx = AppState.audioCtx;
+        const now = ctx.currentTime;
+
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        if (pattern === 'chime') {
+          osc.type = 'triangle';
+          osc.frequency.setValueAtTime(587.33, now);       // D5
+          osc.frequency.setValueAtTime(880.0, now + 0.14); // A5
+          gain.gain.setValueAtTime(0.001, now);
+          gain.gain.exponentialRampToValueAtTime(0.22, now + 0.03);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+          osc.start(now);
+          osc.stop(now + 0.36);
+        } else {
+          // Acil Durum Siren Sentezi (Two-cycle Hi-Lo Emergency Siren)
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(660, now);
+          osc.frequency.linearRampToValueAtTime(1180, now + 0.28);
+          osc.frequency.linearRampToValueAtTime(620, now + 0.56);
+          osc.frequency.linearRampToValueAtTime(1220, now + 0.84);
+          osc.frequency.linearRampToValueAtTime(580, now + 1.15);
+
+          gain.gain.setValueAtTime(0.001, now);
+          gain.gain.exponentialRampToValueAtTime(0.32, now + 0.04);
+          gain.gain.setValueAtTime(0.30, now + 0.98);
+          gain.gain.exponentialRampToValueAtTime(0.001, now + 1.20);
+
+          osc.start(now);
+          osc.stop(now + 1.22);
+        }
+      } catch (e) {
+        // Tarayıcı otomatik ses kısıtlaması varsa sessiz geç
+      }
+    }
+
+    function triggerEmergencyAlarm(eventType, messageText, forceTest = false) {
+      const now = Date.now();
+      if (!forceTest && (now - AppState.lastAlarmTriggerTs) < 12000) {
+        return;
+      }
+      AppState.lastAlarmTriggerTs = now;
+
+      const banner = document.getElementById('alarmEmergencyBanner');
+      const bannerText = document.getElementById('alarmBannerText');
+      if (banner && bannerText) {
+        bannerText.textContent = `🚨 ${messageText || 'ACİL DURUM ALARMI!'}`;
+        banner.classList.add('active');
+      }
+
+      if (!AppState.alarmMuted || forceTest) {
+        playSynthesizedSiren('siren');
+        if (navigator.vibrate) {
+          try {
+            navigator.vibrate([300, 100, 300, 100, 500]);
+          } catch (e) {}
+        }
+      }
+      showToast(`🚨 ${messageText}`, 'var(--crimson)');
+    }
+
+    function stopEmergencyAlarm() {
+      const banner = document.getElementById('alarmEmergencyBanner');
+      if (banner) banner.classList.remove('active');
+      if (navigator.vibrate) {
+        try { navigator.vibrate(0); } catch (e) {}
+      }
+    }
+
+    // ==================== BİLDİRİM (TOAST) ====================
+    function showToast(message, borderColor = 'var(--cyan)') {
+      const container = document.getElementById('toastContainer');
+      const el = document.createElement('div');
+      el.className = 'toast';
+      el.style.borderColor = borderColor;
+      el.innerHTML = `<span>${message}</span>`;
+      container.appendChild(el);
+      setTimeout(() => {
+        el.style.opacity = '0';
+        el.style.transition = 'opacity 0.25s ease';
+        setTimeout(() => el.remove(), 260);
+      }, 2400);
+    }
+
+    // ==================== SEKME GEÇİŞLERİ ====================
+    document.querySelectorAll('.bottom-nav .nav-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const target = btn.getAttribute('data-target');
+        AppState.activeTab = target;
+        document.querySelectorAll('.bottom-nav .nav-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.querySelectorAll('.tab-pane').forEach(pane => {
+          pane.classList.toggle('active', pane.id === target);
+        });
+        if (target === 'tab-map') {
+          fetchNodes();
+          drawRouteRadar();
+        } else if (target === 'tab-stats') {
+          drawSparkline();
+          fetchIncidentsGallery();
+        }
+      });
+    });
+
+    // ==================== CANLI GÖRÜNTÜ AKIŞI, PiP MİNİMAP & DOKUNMATİK TIKLAMA ====================
+    const streamViewport = document.getElementById('streamViewport');
+    const liveStreamImg = document.getElementById('liveStreamImg');
+    const pipMinimapOverlay = document.getElementById('pipMinimapOverlay');
+    const pipMinimapImg = document.getElementById('pipMinimapImg');
+    const pipToggleBtn = document.getElementById('pipToggleBtn');
+    const streamModePill = document.getElementById('streamModePill');
+    const streamClickCoordsPill = document.getElementById('streamClickCoordsPill');
+
+    function togglePipMinimap() {
+      AppState.pipMinimapEnabled = !AppState.pipMinimapEnabled;
+      if (pipMinimapOverlay) {
+        pipMinimapOverlay.classList.toggle('hidden', !AppState.pipMinimapEnabled || AppState.streamMode === 'minimap');
+      }
+      if (pipToggleBtn) {
+        pipToggleBtn.classList.toggle('active', AppState.pipMinimapEnabled);
+        pipToggleBtn.textContent = AppState.pipMinimapEnabled ? '🖼️ PiP Minimap: Açık' : '🖼️ PiP Minimap: Kapalı';
+      }
+      if (AppState.pipMinimapEnabled) refreshLiveFrame();
+    }
+
+    document.querySelectorAll('#streamModeGroup .seg-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#streamModeGroup .seg-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        AppState.streamMode = btn.getAttribute('data-stream-mode');
+        streamViewport.classList.toggle('minimap-aspect', AppState.streamMode === 'minimap');
+        if (pipMinimapOverlay) {
+          pipMinimapOverlay.classList.toggle('hidden', !AppState.pipMinimapEnabled || AppState.streamMode === 'minimap');
+        }
+        streamModePill.textContent = AppState.streamMode === 'minimap'
+          ? 'Sağ Üst Minimap Yakın Çekim'
+          : 'Tam Ekran (2560x1440)';
+        refreshLiveFrame();
+      });
+    });
+
+    document.querySelectorAll('#streamFpsGroup .seg-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#streamFpsGroup .seg-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        AppState.streamIntervalMs = parseInt(btn.getAttribute('data-fps-ms'), 10);
+        restartStreamLoop();
+      });
+    });
+
+    function refreshLiveFrame() {
+      if (AppState.activeTab !== 'tab-live') return;
+      const ts = Date.now();
+      liveStreamImg.src = withTokenUrl(`/api/frame.jpg?mode=${encodeURIComponent(AppState.streamMode)}&t=${ts}`);
+      if (AppState.pipMinimapEnabled && AppState.streamMode === 'full' && pipMinimapImg) {
+        pipMinimapImg.src = withTokenUrl(`/api/frame.jpg?mode=minimap&quality=60&t=${ts}`);
+      }
+    }
+
+    function restartStreamLoop() {
+      if (AppState.streamTimer) {
+        clearInterval(AppState.streamTimer);
+        AppState.streamTimer = null;
+      }
+      if (AppState.streamIntervalMs > 0) {
+        refreshLiveFrame();
+        AppState.streamTimer = setInterval(refreshLiveFrame, AppState.streamIntervalMs);
+      }
+    }
+
+    // Dokunmatik Uzaktan Tıklama (Tap-to-Click)
+    const tapToggle = document.getElementById('tapToClickToggle');
+    const tapStatusHint = document.getElementById('tapStatusHint');
+    tapToggle.addEventListener('change', () => {
+      AppState.tapToClickEnabled = tapToggle.checked;
+      streamViewport.classList.toggle('tap-active', AppState.tapToClickEnabled);
+      tapStatusHint.textContent = AppState.tapToClickEnabled ? 'Aktif (Ekrana Dokun)' : 'Kapalı';
+      tapStatusHint.style.color = AppState.tapToClickEnabled ? 'var(--emerald)' : 'var(--text-muted)';
+      streamClickCoordsPill.style.display = AppState.tapToClickEnabled ? 'inline-block' : 'none';
+    });
+
+    streamViewport.addEventListener('click', async (ev) => {
+      if (!AppState.tapToClickEnabled) return;
+      const rect = streamViewport.getBoundingClientRect();
+      const relX = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      const relY = Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height));
+
+      const ripple = document.createElement('div');
+      ripple.className = 'tap-ripple';
+      ripple.style.left = `${ev.clientX - rect.left}px`;
+      ripple.style.top = `${ev.clientY - rect.top}px`;
+      streamViewport.appendChild(ripple);
+      setTimeout(() => ripple.remove(), 560);
+
+      const normX = Number(relX.toFixed(4));
+      const normY = Number(relY.toFixed(4));
+      streamClickCoordsPill.textContent = `Tık: ${(normX * 100).toFixed(1)}%, ${(normY * 100).toFixed(1)}%`;
+
+      await sendBotAction('click_screen', {
+        norm_x: normX,
+        norm_y: normY,
+        mode: AppState.streamMode,
+        button: 'left'
+      });
+      setTimeout(refreshLiveFrame, 220);
+    });
+
+    // ==================== UZAKTAN AKSİYON API ÇAĞRILARI ====================
+    async function sendBotAction(actionName, extraPayload = {}) {
+      try {
+        const payload = Object.assign({ action: actionName }, extraPayload);
+        const res = await fetch(withTokenUrl('/api/action'), {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: JSON.stringify(payload)
+        });
+        if (res.status === 401) {
+          openTokenModal('Yetkisiz erişim! Lütfen 256-Bit QR Güvenlik Anahtarını giriniz.');
+          return { ok: false, error: 'Unauthorized' };
+        }
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.ok !== false) {
+          showToast(data.message || `Komut gönderildi: ${actionName}`, 'var(--emerald)');
+        } else {
+          showToast(data.error || data.message || `Komut hatası: ${actionName}`, 'var(--crimson)');
+        }
+        fetchStatus();
+        if (AppState.activeTab === 'tab-map') fetchNodes();
+        return data;
+      } catch (err) {
+        showToast(`Bağlantı hatası: ${err.message}`, 'var(--crimson)');
+      }
+    }
+
+    function changeBotMode(modeKey) {
+      document.querySelectorAll('#modeButtonsGroup .btn-mode').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-bot-mode') === modeKey);
+      });
+      sendBotAction('set_mode', { mode: modeKey });
+    }
+
+    // Item 37: Uzaktan Kamera Döndürme ve Kurtarma Joystick'i Fonksiyonları
+    function sendKeyPress(keyName) {
+      sendBotAction('send_key', { key: keyName });
+    }
+
+    async function sendCameraRotate(direction) {
+      const dirClean = direction === 'left' ? 'left' : 'right';
+      const fallbackKey = dirClean === 'left' ? 'q' : 'e';
+      const res = await sendBotAction('rotate_camera', {
+        direction: dirClean,
+        degrees: dirClean === 'left' ? -35 : 35,
+        key: fallbackKey
+      });
+      if (res && res.ok === false && String(res.error || '').includes('Bilinmeyen')) {
+        await sendBotAction('send_key', { key: dirClean === 'left' ? 'a' : 'd' });
+      }
+    }
+
+    async function triggerAutoUnstuckMacro() {
+      showToast('⚡ Oto-Kurtar (Jump + Strafe) başlatılıyor...', 'var(--cyan)');
+      const res = await sendBotAction('auto_unstuck', { pattern: 'jump_strafe' });
+      if (res && res.ok === false && String(res.error || '').includes('Bilinmeyen')) {
+        await sendBotAction('send_key', { key: 'space' });
+        setTimeout(() => sendBotAction('send_key', { key: 'a' }), 180);
+        setTimeout(() => sendBotAction('send_key', { key: 'w' }), 360);
+      }
+    }
+
+    function triggerEmergencyStop() {
+      sendBotAction('panic_stop', { reason: 'Mobil kullanıcı ACİL DURDUR butonuna bastı' });
+    }
+
+    // Item 40: Mobil Üzerinden Rota, Bölge ve Sıralama Modu Değiştirme
+    async function switchMobileRegionRoute() {
+      const regionEl = document.getElementById('mobileRegionSelect');
+      const routeEl = document.getElementById('mobileRouteSelect');
+      const sortEl = document.getElementById('mobileSortModeSelect');
+
+      const selectedRegion = regionEl ? regionEl.value : 'Altgard';
+      const selectedRoute = routeEl ? routeEl.value : 'All';
+      const selectedSortMode = sortEl ? sortEl.value : 'smooth_loop';
+
+      const pill = document.getElementById('activeRegionPill');
+      if (pill) pill.textContent = selectedRegion;
+
+      const res = await sendBotAction('switch_region_route', {
+        region: selectedRegion,
+        region_name: selectedRegion,
+        route: selectedRoute,
+        route_name: selectedRoute,
+        sort_mode: selectedSortMode,
+        mode: selectedSortMode
+      });
+
+      if (res && res.ok === false && String(res.error || '').includes('Bilinmeyen')) {
+        await sendBotAction('optimize_route', {
+          mode: selectedSortMode,
+          region: selectedRegion,
+          route: selectedRoute
+        });
+      }
+      fetchNodes();
+    }
+
+    async function saveRemoteSettings() {
+      const harvestsPerNode = parseInt(document.getElementById('settingHarvestsPerNode').value, 10) || 3;
+      const interactKey = document.getElementById('settingInteractKey').value || 'auto';
+      const minimapAuto = document.getElementById('settingMinimapAutoRecord').checked;
+      const world3dAuto = document.getElementById('settingWorld3dAutoRecord').checked;
+      const cooldownMinutes = parseFloat(document.getElementById('settingCooldownMinutes').value) || 5;
+      const dryRun = document.getElementById('settingDryRun').checked;
+
+      const settingsObj = {
+        harvests_per_node: harvestsPerNode,
+        max_harvests_per_node: harvestsPerNode,
+        interact_key: interactKey,
+        gather_key: interactKey,
+        minimap_auto_record: minimapAuto,
+        auto_record_minimap: minimapAuto,
+        world_3d_auto_record: world3dAuto,
+        auto_record_3d: world3dAuto,
+        cooldown_minutes: cooldownMinutes,
+        rest_minutes: Math.round(cooldownMinutes),
+        node_cooldown_sec: Math.round(cooldownMinutes * 60),
+        dry_run: dryRun,
+        test_mode: dryRun
+      };
+
+      await sendBotAction('update_settings', Object.assign({ settings: settingsObj }, settingsObj));
+    }
+
+    // ==================== ITEM 39: OLAY KAYITLARI GALERİSİ (INCIDENT SNAPSHOTS) ====================
+    async function fetchIncidentsGallery() {
+      try {
+        const res = await fetch(withTokenUrl('/api/incidents'), {
+          headers: getAuthHeaders(),
+          cache: 'no-store'
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const list = Array.isArray(data) ? data : (data.incidents || []);
+          AppState.incidents = list;
+          renderIncidentsGallery();
+        }
+      } catch (e) {
+        // /api/incidents yoksa /api/status içindeki incidents listesi kullanılır
+      }
+    }
+
+    async function triggerManualIncidentSnapshot() {
+      await sendBotAction('record_incident', {
+        event_type: 'manual_snapshot',
+        details: 'Mobil panelden manuel olay anı görüntüsü kaydedildi'
+      });
+      fetchIncidentsGallery();
+    }
+
+    async function clearIncidentsGallery() {
+      await sendBotAction('clear_incidents', {});
+      AppState.incidents = [];
+      renderIncidentsGallery();
+    }
+
+    function openIncidentModal(idx) {
+      const item = AppState.incidents[idx];
+      if (!item) return;
+      const modal = document.getElementById('incidentZoomModal');
+      const titleEl = document.getElementById('incidentModalTitle');
+      const imgEl = document.getElementById('incidentModalImg');
+      const descEl = document.getElementById('incidentModalDetails');
+
+      const labelTr = item.label_tr || item.event_type || 'Olay Kaydı';
+      const tsStr = item.date_str || item.time_str || item.iso_time || '';
+      titleEl.textContent = `📸 ${labelTr} (${tsStr})`;
+      imgEl.src = item.thumbnail_b64 || withTokenUrl(`/api/incidents/${encodeURIComponent(item.id || '')}.jpg`);
+      descEl.textContent = `${item.details || ''} | Bölge: ${item.region || 'Altgard'} | Düğüm: #${item.node_id ?? '-'}`;
+      modal.classList.add('open');
+    }
+
+    function closeIncidentModal() {
+      const modal = document.getElementById('incidentZoomModal');
+      if (modal) modal.classList.remove('open');
+    }
+
+    function renderIncidentsGallery() {
+      const container = document.getElementById('incidentGalleryContainer');
+      const badge = document.getElementById('incidentCountBadge');
+      if (!container) return;
+
+      const list = AppState.incidents || [];
+      if (badge) badge.textContent = `${list.length} Kayıt`;
+
+      if (!list.length) {
+        container.innerHTML = `
+          <div style="grid-column: 1 / -1; color:var(--text-muted); text-align:center; padding:16px;">
+            Henüz kaydedilmiş kritik olay (Ölüm, Takılma, Uzun Savaş &gt;2dk) bulunmuyor.
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = list.map((item, idx) => {
+        const sev = String(item.severity || 'warning').toLowerCase();
+        const label = item.label_tr || item.event_type || 'Olay';
+        const timeStr = item.time_str || item.date_str || item.iso_time || '';
+        const details = item.details || '';
+        const region = item.region || 'Altgard';
+        const thumbSrc = item.thumbnail_b64 || withTokenUrl(`/api/frame.jpg?mode=full&t=${item.timestamp || idx}`);
+        const badgeCls = sev === 'critical' ? 'danger' : 'paused';
+
+        return `
+          <div class="incident-card ${sev}" onclick="openIncidentModal(${idx})">
+            <img class="incident-thumb" src="${thumbSrc}" alt="${label}" loading="lazy" />
+            <div class="incident-meta">
+              <div class="incident-top-row">
+                <span class="badge ${badgeCls}" style="font-size:10px;">${label}</span>
+                <span style="font-size:10.5px; color:var(--text-muted); font-family:monospace;">${timeStr}</span>
+              </div>
+              <div class="incident-desc">${details} (${region})</div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // ==================== ITEM 40: CANLI SSE (/api/stream) & POLLING FALLBACK ====================
+    function connectEventStream() {
+      if (!window.EventSource) return;
+      if (AppState.sseSource) {
+        try { AppState.sseSource.close(); } catch (e) {}
+        AppState.sseSource = null;
+      }
+      try {
+        const streamUrl = withTokenUrl('/api/stream');
+        const es = new EventSource(streamUrl);
+        AppState.sseSource = es;
+
+        es.onopen = () => {
+          AppState.sseConnected = true;
+          const b = document.getElementById('sseBadge');
+          if (b) {
+            b.className = 'badge running';
+            b.textContent = '📡 SSE Canlı';
+          }
+        };
+
+        es.onmessage = (ev) => {
+          try {
+            const payload = JSON.parse(ev.data);
+            if (payload && typeof payload === 'object') {
+              updateDashboardFromStatus(payload, 8);
+            }
+          } catch (e) {}
+        };
+
+        es.onerror = () => {
+          AppState.sseConnected = false;
+          const b = document.getElementById('sseBadge');
+          if (b) {
+            b.className = 'badge';
+            b.textContent = '📡 Poll';
+          }
+          try { es.close(); } catch (e) {}
+          AppState.sseSource = null;
+        };
+      } catch (e) {
+        AppState.sseConnected = false;
+      }
+    }
+
+    // ==================== DURUM (/api/status) SORGULAMA ====================
+    async function fetchStatus() {
+      const t0 = performance.now();
+      try {
+        const res = await fetch(withTokenUrl('/api/status'), {
+          headers: getAuthHeaders(),
+          cache: 'no-store'
+        });
+        if (res.status === 401) {
+          if (!AppState.unauthorizedShown) {
+            AppState.unauthorizedShown = true;
+            openTokenModal('🔐 Güvenlik doğrulaması gerekli: 256-Bit QR Token giriniz.');
+          }
+          throw new Error('HTTP 401');
+        }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const rtt = Math.max(1, Math.round(performance.now() - t0));
+        updateDashboardFromStatus(data, rtt);
+      } catch (err) {
+        const connDot = document.getElementById('connDot');
+        const stateBadge = document.getElementById('stateBadge');
+        connDot.className = 'brand-dot offline';
+        stateBadge.className = 'badge danger';
+        stateBadge.textContent = 'BAĞLANTI YOK';
+      }
+    }
+
+    function formatDuration(sec) {
+      const s = Math.max(0, Math.floor(Number(sec) || 0));
+      const hh = String(Math.floor(s / 3600)).padStart(2, '0');
+      const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+      const ss = String(s % 60).padStart(2, '0');
+      return `${hh}:${mm}:${ss}`;
+    }
+
+    function ensureSelectOption(selectEl, val) {
+      if (!selectEl || !val) return;
+      const exists = Array.from(selectEl.options).some(o => o.value === val);
+      if (!exists) {
+        const opt = document.createElement('option');
+        opt.value = val;
+        opt.textContent = val;
+        selectEl.appendChild(opt);
+      }
+    }
+
+    function updateDashboardFromStatus(s, rttMs) {
+      const botObj = s.bot || {};
+      const harvestObj = s.harvest || {};
+      const vitalsObj = s.vitals || {};
+      const routeObj = s.route || {};
+      const sysObj = s.system || s.telemetry || s.stats || {};
+
+      // Bağlantı ve gecikme
+      document.getElementById('latencyBadge').textContent = `⚡ ${rttMs} ms`;
+      const resStr = sysObj.resolution || s.resolution || (s.screen_width && s.screen_height ? `${s.screen_width}x${s.screen_height}` : '2560x1440');
+      document.getElementById('resBadge').textContent = resStr;
+      document.getElementById('uptimePill').textContent = `Süre: ${formatDuration(s.uptime_sec ?? s.uptime ?? 0)}`;
+
+      // Bot çalışma durumu rozeti
+      const rawState = String(botObj.raw_state || botObj.state || s.state || s.bot_state || 'IDLE').toUpperCase();
+      const isPaused = Boolean(botObj.is_paused ?? s.paused ?? (rawState.includes('PAUSE') || rawState.includes('DURAK')));
+      const isRunning = Boolean(s.running !== false && !isPaused);
+      const harvestStep = Number(harvestObj.current_stage ?? s.harvest_step ?? s.current_harvest_count ?? 0);
+      const maxHarvest = Number(harvestObj.max_stages ?? s.max_harvest ?? s.harvests_per_node ?? 3) || 3;
+      const modeStr = String(botObj.mode || s.mode || s.bot_mode || 'route').toLowerCase();
+
+      const connDot = document.getElementById('connDot');
+      const stateBadge = document.getElementById('stateBadge');
+
+      if (isPaused) {
+        connDot.className = 'brand-dot paused';
+        stateBadge.className = 'badge paused';
+        stateBadge.textContent = 'DURAKLATILDI';
+      } else if (rawState.includes('HARVEST') || rawState.includes('GATHER') || rawState.includes('TOPLA') || harvestStep > 0) {
+        connDot.className = 'brand-dot';
+        stateBadge.className = 'badge harvesting';
+        const stepDisp = Math.min(maxHarvest, Math.max(1, harvestStep || 1));
+        stateBadge.textContent = `TOPLANIYOR [${stepDisp}/${maxHarvest}]`;
+      } else if (modeStr.includes('explore') || rawState.includes('EXPLORE') || rawState.includes('KEŞİF')) {
+        connDot.className = 'brand-dot';
+        stateBadge.className = 'badge harvesting';
+        stateBadge.textContent = 'OTO-KEŞİF';
+      } else if (isRunning) {
+        connDot.className = 'brand-dot';
+        stateBadge.className = 'badge running';
+        stateBadge.textContent = 'ÇALIŞIYOR';
+      } else {
+        connDot.className = 'brand-dot paused';
+        stateBadge.className = 'badge paused';
+        stateBadge.textContent = 'BEKLEMEDE';
+      }
+
+      document.getElementById('activeActionText').textContent =
+        `Durum: ${botObj.status_text || s.status_text || s.last_action || rawState}`;
+
+      // Item 36: Acil Durum Kontrolleri (Karakter Ölümü, Envanter %95 Dolu, Uzun Savaş >2dk, Takılma)
+      const isDead = Boolean(vitalsObj.character_dead || s.character_dead);
+      const invRatio = Number(vitalsObj.inventory_fill_ratio ?? s.inventory_fill_ratio ?? (s.inventory_pct ? s.inventory_pct / 100 : 0));
+      const invNearFull = Boolean(vitalsObj.inventory_near_full || s.inventory_near_full || invRatio >= 0.95);
+      const combatSec = Number(vitalsObj.combat_duration_sec ?? s.combat_duration_sec ?? 0);
+      const prolongedCombat = Boolean(vitalsObj.prolonged_combat || s.prolonged_combat || combatSec >= 120);
+      const isStuck = Boolean(vitalsObj.stuck || s.stuck || rawState.includes('STUCK') || rawState.includes('TAKIL'));
+
+      if (isDead) {
+        triggerEmergencyAlarm('character_dead', 'KRİTİK ALARM: Karakter Öldü!');
+      } else if (invNearFull) {
+        triggerEmergencyAlarm('inventory_near_full', 'UYARI: Envanter %95+ Dolu!');
+      } else if (prolongedCombat) {
+        triggerEmergencyAlarm('prolonged_combat', 'ACİL UYARI: Uzun Süreli Savaş (>2dk)!');
+      } else if (isStuck) {
+        triggerEmergencyAlarm('stuck', 'UYARI: Karakter Engele Takıldı!');
+      }
+
+      // Item 40: Bölge, Rota ve Sıralama Modu Seçicilerini Senkronize Et
+      const activeRegion = routeObj.region_name || s.region_name || 'Altgard';
+      const activeRoute = routeObj.route_name || s.route_name || 'All';
+      const activeSort = routeObj.sort_mode || s.sort_mode || 'smooth_loop';
+      const regPill = document.getElementById('activeRegionPill');
+      if (regPill) regPill.textContent = activeRegion;
+
+      if (!AppState.regionRouteLoadedOnce) {
+        const regSel = document.getElementById('mobileRegionSelect');
+        const rtSel = document.getElementById('mobileRouteSelect');
+        const sortSel = document.getElementById('mobileSortModeSelect');
+        if (regSel && activeRegion) {
+          ensureSelectOption(regSel, activeRegion);
+          regSel.value = activeRegion;
+        }
+        if (rtSel && activeRoute) {
+          ensureSelectOption(rtSel, activeRoute);
+          rtSel.value = activeRoute;
+        }
+        if (sortSel && activeSort) {
+          sortSel.value = activeSort;
+        }
+        AppState.regionRouteLoadedOnce = true;
+      }
+
+      // 3x Materyal Toplama Halkası
+      const activeNodeId = routeObj.current_node_id ?? s.active_node_id ?? s.target_node_id ?? s.current_node_id ?? 0;
+      AppState.activeNodeId = activeNodeId;
+      document.getElementById('nodeBadge').textContent = `Düğüm #${activeNodeId || 0}`;
+      document.getElementById('statActiveNode').textContent = `#${activeNodeId || 0}`;
+
+      const totalGathered = Number(harvestObj.total_gathered ?? s.total_gathered ?? s.harvest_count ?? 0);
+      const hourlyRate = Number(harvestObj.gathers_per_hour ?? s.hourly_rate ?? s.gather_rate_hr ?? 0);
+      document.getElementById('statTotalGathered').textContent = String(totalGathered);
+      document.getElementById('statHourlyRate').textContent = `${Math.round(hourlyRate)}/s`;
+
+      const step1 = document.getElementById('stepNode1');
+      const step2 = document.getElementById('stepNode2');
+      const step3 = document.getElementById('stepNode3');
+      [step1, step2, step3].forEach((el, idx) => {
+        const num = idx + 1;
+        el.className = 'step-node';
+        if (harvestStep > num) {
+          el.classList.add('done');
+        } else if (harvestStep === num) {
+          el.classList.add('current');
+        }
+      });
+      document.getElementById('harvestCycleLabel').textContent =
+        `Toplama Döngüsü: ${Math.min(maxHarvest, harvestStep)}/${maxHarvest}`;
+
+      // Can (HP) ve Mana (MP)
+      const rawHp = vitalsObj.hp_ratio !== undefined ? vitalsObj.hp_ratio * 100 : (s.hp_pct ?? s.hp ?? 100);
+      const rawMp = vitalsObj.mp_ratio !== undefined ? vitalsObj.mp_ratio * 100 : (s.mp_pct ?? s.mp ?? 100);
+      const hpPct = Math.max(0, Math.min(100, Number(rawHp)));
+      const mpPct = Math.max(0, Math.min(100, Number(rawMp)));
+      document.getElementById('hpValueText').textContent = `${Math.round(hpPct)}%`;
+      document.getElementById('hpBarFill').style.width = `${hpPct}%`;
+      document.getElementById('mpValueText').textContent = `${Math.round(mpPct)}%`;
+      document.getElementById('mpBarFill').style.width = `${mpPct}%`;
+
+      // Telemetri & İstatistik Sekmesi
+      document.getElementById('metricMinimapSaved').textContent =
+        String(routeObj.minimap_mapped_count ?? sysObj.minimap_auto_recorded ?? s.minimap_nodes_added ?? 0);
+      document.getElementById('metricWorld3dSaved').textContent =
+        String(routeObj.world_3d_mapped_count ?? sysObj.world_3d_auto_recorded ?? s.world_3d_nodes_added ?? 0);
+      document.getElementById('metricExtractionFailed').textContent =
+        String(vitalsObj.extraction_failed_count ?? sysObj.extraction_failed_count ?? s.extraction_failures ?? 0);
+
+      const fpsVal = Number(sysObj.fps ?? s.fps ?? 30).toFixed(1);
+      const capMs = Number(sysObj.latency_ms ?? sysObj.capture_latency_ms ?? s.capture_ms ?? 8).toFixed(1);
+      const ramMb = Number(sysObj.memory_mb ?? sysObj.ram_mb ?? s.ram_mb ?? 185).toFixed(0);
+
+      document.getElementById('metricFps').textContent = `${fpsVal} FPS`;
+      document.getElementById('metricCaptureLatency').textContent = `Yakalama Gecikmesi: ${capMs} ms`;
+      document.getElementById('metricCaptureMsBox').textContent = `${capMs} ms`;
+      document.getElementById('metricRamUsage').textContent = `${ramMb} MB`;
+
+      if (hourlyRate > 0) {
+        AppState.sparklineHistory.push(hourlyRate);
+        if (AppState.sparklineHistory.length > 24) AppState.sparklineHistory.shift();
+        if (AppState.activeTab === 'tab-stats') drawSparkline();
+      }
+
+      // Item 39: Status içinden olay kayıtları gelirse galeriyi besle
+      const statusIncidents = s.incidents || s.recent_incidents;
+      if (Array.isArray(statusIncidents) && statusIncidents.length > 0) {
+        AppState.incidents = statusIncidents;
+        renderIncidentsGallery();
+      }
+
+      // Canlı Terminal Logları
+      const logs = s.recent_logs || s.logs || [];
+      if (Array.isArray(logs) && logs.length > 0) {
+        AppState.recentLogs = logs.slice(-60);
+        renderTerminalLogs();
+      }
+    }
+
+    // ==================== HARİTA & DÜĞÜMLER (/api/nodes) ====================
+    async function fetchNodes() {
+      try {
+        const res = await fetch(withTokenUrl('/api/nodes'), {
+          headers: getAuthHeaders(),
+          cache: 'no-store'
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        const list = Array.isArray(data) ? data : (data.nodes || []);
+        AppState.nodes = list;
+        document.getElementById('totalNodesCountBadge').textContent = `${list.length} Düğüm`;
+        renderNodesList();
+        drawRouteRadar();
+      } catch (e) {}
+    }
+
+    function formatCooldown(remSec) {
+      const s = Math.max(0, Math.ceil(Number(remSec) || 0));
+      const mm = String(Math.floor(s / 60)).padStart(2, '0');
+      const ss = String(s % 60).padStart(2, '0');
+      return `${mm}:${ss}`;
+    }
+
+    function renderNodesList() {
+      const container = document.getElementById('nodesListContainer');
+      const query = (document.getElementById('nodeSearchInput').value || '').trim().toLowerCase();
+      const nodes = AppState.nodes;
+
+      if (!nodes.length) {
+        container.innerHTML = `<div style="color:var(--text-muted); text-align:center; padding:18px;">Henüz kayıtlı materyal düğümü yok. F8 ile veya Oto-Keşif ile ekleyebilirsiniz.</div>`;
+        return;
+      }
+
+      const filtered = nodes.filter((n, idx) => {
+        const id = n.id ?? idx;
+        const src = String(n.source_type || n.source || n.origin || 'manual').toLowerCase();
+        const st = String(n.state || n.status || 'active').toLowerCase();
+        const label = `#${id} ${src} ${st} ${n.resource_type || n.name || ''}`.toLowerCase();
+        return !query || label.includes(query);
+      });
+
+      container.innerHTML = filtered.map((n, idx) => {
+        const id = n.id ?? idx;
+        const x = Number(n.x ?? 0).toFixed(1);
+        const y = Number(n.y ?? 0).toFixed(1);
+        const remCooldown = Number(n.rest_remaining_sec ?? n.cooldown_remaining ?? 0);
+        const failCount = Number(n.fail_count ?? n.failures ?? 0);
+        const harvestDone = Number(n.current_harvests ?? n.harvest_count ?? 0);
+        const maxH = Number(n.max_harvests ?? 3);
+        const source = String(n.source_type || n.source || 'F8').toUpperCase();
+
+        let stateBadgeHtml = `<span class="badge running">Aktif (${harvestDone}/${maxH})</span>`;
+        if (remCooldown > 0) {
+          stateBadgeHtml = `<span class="badge paused">⏳ Dinleniyor ${formatCooldown(remCooldown)}</span>`;
+        } else if (failCount >= 2 || n.state === 'failed') {
+          stateBadgeHtml = `<span class="badge danger">Başarısız (${failCount})</span>`;
+        }
+
+        const isCurrent = String(id) === String(AppState.activeNodeId) || Boolean(n.is_target);
+        return `
+          <div class="node-item ${isCurrent ? 'active-target' : ''}">
+            <div class="node-meta">
+              <div class="node-title">
+                <span>Düğüm #${id}</span>
+                <span class="badge" style="font-size:10px;">${source}</span>
+                ${stateBadgeHtml}
+              </div>
+              <div class="node-coords">Konum: X=${x}, Y=${y} | 3x Hasat: ${harvestDone}/${maxH}</div>
+            </div>
+            <button type="button" class="btn btn-cyan" style="padding:7px 10px; font-size:11.5px;" onclick="sendBotAction('reset_node', { node_id: ${JSON.stringify(id)} })">
+              Sıfırla (Aktif Et)
+            </button>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // ==================== 2B ROTA RADARI CANVAS ÇİZİMİ ====================
+    function drawRouteRadar() {
+      const canvas = document.getElementById('routeRadarCanvas');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      ctx.strokeStyle = 'rgba(6, 182, 212, 0.12)';
+      ctx.lineWidth = 1;
+      const cx = w / 2;
+      const cy = h / 2;
+      [45, 90, 135].forEach(r => {
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+      });
+
+      ctx.beginPath();
+      ctx.moveTo(0, cy); ctx.lineTo(w, cy);
+      ctx.moveTo(cx, 0); ctx.lineTo(cx, h);
+      ctx.stroke();
+
+      const nodes = AppState.nodes;
+      if (!nodes || nodes.length === 0) {
+        ctx.fillStyle = '#9ca3af';
+        ctx.font = '600 13px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Haritada gösterilecek düğüm bekleniyor...', cx, cy);
+        return;
+      }
+
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      nodes.forEach(n => {
+        const nx = Number(n.x ?? 0);
+        const ny = Number(n.y ?? 0);
+        if (nx < minX) minX = nx;
+        if (nx > maxX) maxX = nx;
+        if (ny < minY) minY = ny;
+        if (ny > maxY) maxY = ny;
+      });
+
+      const pad = 38;
+      const spanX = Math.max(1, maxX - minX);
+      const spanY = Math.max(1, maxY - minY);
+
+      const mapPt = (n) => {
+        const nx = Number(n.x ?? 0);
+        const ny = Number(n.y ?? 0);
+        return {
+          px: pad + ((nx - minX) / spanX) * (w - pad * 2),
+          py: pad + ((ny - minY) / spanY) * (h - pad * 2)
+        };
+      };
+
+      for (let i = 0; i < nodes.length; i++) {
+        const a = mapPt(nodes[i]);
+        const b = mapPt(nodes[(i + 1) % nodes.length]);
+        if (nodes.length === 1) break;
+
+        ctx.strokeStyle = 'rgba(6, 182, 212, 0.45)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(a.px, a.py);
+        ctx.lineTo(b.px, b.py);
+        ctx.stroke();
+
+        const angle = Math.atan2(b.py - a.py, b.px - a.px);
+        const mx = (a.px + b.px) / 2;
+        const my = (a.py + b.py) / 2;
+        ctx.fillStyle = '#06b6d4';
+        ctx.beginPath();
+        ctx.moveTo(mx + Math.cos(angle) * 6, my + Math.sin(angle) * 6);
+        ctx.lineTo(mx + Math.cos(angle + 2.5) * 6, my + Math.sin(angle + 2.5) * 6);
+        ctx.lineTo(mx + Math.cos(angle - 2.5) * 6, my + Math.sin(angle - 2.5) * 6);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      nodes.forEach((n, idx) => {
+        const id = n.id ?? idx;
+        const { px, py } = mapPt(n);
+        const remCooldown = Number(n.rest_remaining_sec ?? n.cooldown_remaining ?? 0);
+        const failCount = Number(n.fail_count ?? n.failures ?? 0);
+        const src = String(n.source_type || n.source || '').toLowerCase();
+
+        let color = '#10b981';
+        if (remCooldown > 0) color = '#f59e0b';
+        else if (failCount >= 2 || n.state === 'failed') color = '#ef4444';
+        else if (src.includes('minimap') || src.includes('3d') || src.includes('auto')) color = '#06b6d4';
+
+        if (String(id) === String(AppState.activeNodeId) || Boolean(n.is_target)) {
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.arc(px, py, 13, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(px, py, 8, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(`#${id} (3x)`, px, py - 12);
+      });
+    }
+
+    // ==================== SPARKLINE GRAFİĞİ ====================
+    function drawSparkline() {
+      const canvas = document.getElementById('sparklineCanvas');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const vals = AppState.sparklineHistory;
+      if (!vals.length) return;
+
+      const maxV = Math.max(10, ...vals);
+      const minV = Math.min(0, ...vals);
+      const span = Math.max(1, maxV - minV);
+      const pad = 16;
+
+      ctx.strokeStyle = '#10b981';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+
+      vals.forEach((v, i) => {
+        const x = pad + (i / Math.max(1, vals.length - 1)) * (w - pad * 2);
+        const y = h - pad - ((v - minV) / span) * (h - pad * 2);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    // ==================== CANLI TERMİNAL LOG FİLTRESİ ====================
+    document.querySelectorAll('#logFilterGroup .seg-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#logFilterGroup .seg-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        AppState.logFilter = btn.getAttribute('data-log-filter');
+        renderTerminalLogs();
+      });
+    });
+
+    function renderTerminalLogs() {
+      const box = document.getElementById('terminalLogBox');
+      const logs = AppState.recentLogs;
+      if (!logs || !logs.length) return;
+
+      const filtered = logs.filter(item => {
+        const text = typeof item === 'string' ? item : (item.msg || item.message || item.text || JSON.stringify(item));
+        const lower = text.toLowerCase();
+        if (AppState.logFilter === 'warn') {
+          return lower.includes('warn') || lower.includes('error') || lower.includes('failed') || lower.includes('hata') || lower.includes('uyarı');
+        }
+        if (AppState.logFilter === 'harvest') {
+          return lower.includes('topla') || lower.includes('harvest') || lower.includes('gather') || lower.includes('3/3') || lower.includes('düğüm');
+        }
+        return true;
+      });
+
+      box.innerHTML = filtered.map(item => {
+        const text = typeof item === 'string' ? item : `[${item.ts || item.time || ''}] ${item.msg || item.message || item.text || ''}`;
+        const lower = text.toLowerCase();
+        let cls = 'info';
+        if (lower.includes('error') || lower.includes('failed') || lower.includes('hata') || lower.includes('acil')) cls = 'error';
+        else if (lower.includes('warn') || lower.includes('uyarı') || lower.includes('dinlen')) cls = 'warn';
+        else if (lower.includes('topla') || lower.includes('harvest') || lower.includes('3x')) cls = 'harvest';
+        return `<div class="log-line ${cls}">${text.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
+      }).join('');
+
+      box.scrollTop = box.scrollHeight;
+    }
+
+    // ==================== BAŞLATMA DÖNGÜSÜ ====================
+    window.addEventListener('DOMContentLoaded', () => {
+      updateAlarmHeaderButton();
+      connectEventStream();
+      fetchStatus();
+      fetchNodes();
+      fetchIncidentsGallery();
+      restartStreamLoop();
+      setInterval(() => {
+        if (!AppState.sseConnected) fetchStatus();
+      }, 1200);
+      setInterval(() => {
+        if (AppState.activeTab === 'tab-map') fetchNodes();
+        if (AppState.activeTab === 'tab-stats') fetchIncidentsGallery();
+      }, 2500);
+    });
+  </script>
+</body>
+</html>

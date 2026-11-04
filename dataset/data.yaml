@@ -1,0 +1,18 @@
+# Ultralytics YOLOv8 / YOLOv11 Dataset Configuration - Aion 2 Autonomous Dataset Factory
+path: C:/Users/selçuk/Desktop/a2/dataset
+train: images/train
+val: images/val
+nc: 12
+names:
+  0: herb_aria
+  1: herb_mela
+  2: herb_targena
+  3: ore_orichalcum
+  4: gem_crystal
+  5: wood_tree
+  6: world_gather_crest
+  7: f_gather_prompt
+  8: e_gather_icon
+  9: minimap_sprout
+  10: monster_3d_negative
+  11: minimap_monster_negative

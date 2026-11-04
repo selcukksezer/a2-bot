@@ -1,0 +1,65 @@
+{
+  "id": "gatherion-v2-mobile-pwa",
+  "name": "Gatherion v2.0 Mobil Kumanda",
+  "short_name": "Gatherion v2.0",
+  "description": "Gatherion v2.0 AION 2 Canlı Telemetri, Çift Kanallı PiP Yayın, 2B Rota Radarı ve Uzaktan Kontrol PWA Paneli",
+  "lang": "tr-TR",
+  "dir": "ltr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": [
+    "standalone",
+    "fullscreen",
+    "minimal-ui"
+  ],
+  "orientation": "portrait",
+  "background_color": "#0b0f17",
+  "theme_color": "#0b0f17",
+  "categories": [
+    "utilities",
+    "games",
+    "productivity"
+  ],
+  "prefer_related_applications": false,
+  "icons": [
+    {
+      "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='112' fill='%230b0f17'/><circle cx='256' cy='256' r='196' fill='none' stroke='%2306b6d4' stroke-width='16' stroke-opacity='0.35'/><circle cx='256' cy='256' r='132' fill='none' stroke='%2310b981' stroke-width='14' stroke-dasharray='28 18'/><polygon points='256,88 396,384 256,324 116,384' fill='%2306b6d4'/><circle cx='256' cy='256' r='28' fill='%23f59e0b'/></svg>",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAbklEQVR4nO3awQnAIAwF0av4d7p06tCqg0UQbJ65B3L4kBJCgA8ys7t7Zg5wA6O11nrv/RFgBMys2t299z6O7xFgBMys6u45ju8RYATMrOruOY7vEWAEzKzq7jmO7xFgBMys2v098k929RdL4h7p8t+kAAAAAElFTkSuQmCC",
+      "sizes": "64x64",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Canlı Kumanda & PiP",
+      "short_name": "Kumanda",
+      "description": "Tam ekran ve Minimap/[F Gather] PiP canlı yayını aç",
+      "url": "/?tab=tab-live"
+    },
+    {
+      "name": "2B Rota Radarı",
+      "short_name": "Harita",
+      "description": "Haritaya dokunarak yürütme ve düğüm yönetimi",
+      "url": "/?tab=tab-map"
+    }
+  ]
+}

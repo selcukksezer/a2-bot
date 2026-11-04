@@ -1,7 +1,18 @@
+# Python Bytecode & Virtual Environments
 __pycache__/
-*.pyc
-*.pyo
-video_analysis/
-video_frames/
-.vscode/
-.idea/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Runtime Logs & Incident Snapshots
+logs/
+*.log
+
+# Auto-Generated YOLO Dataset Images/Labels & Intermediate PyTorch Checkpoints
+dataset/images/
+dataset/labels/
+dataset/*.cache
+models/rtx_runs/
+*.pt
