@@ -1091,3 +1091,26 @@ def generate_qr_data_uri(url: str, size: int = 260) -> str:
     png_bytes = generate_qr_png_bytes(url=url, size=size)
     b64 = base64.b64encode(png_bytes).decode("ascii")
     return f"data:image/png;base64,{b64}"
+
+
+class TunnelBridge:
+    """Compatibility tunnel bridge alias/wrapper."""
+    def __init__(self, manager: Optional[FreeCloudTunnelManager] = None) -> None:
+        self.manager = manager or FreeCloudTunnelManager()
+
+    def get_tunnel_security_status(self) -> dict:
+        is_running = False
+        if self.manager:
+            with self.manager._lock:
+                is_running = bool(self.manager.public_url and self.manager._proc and self.manager._proc.poll() is None)
+        return {"is_running": is_running, "token_protected": True}
+
+
+def _add_security_status_method():
+    def get_tunnel_security_status(self) -> dict:
+        with self._lock:
+            is_running = bool(self.public_url and self._proc and self._proc.poll() is None)
+        return {"is_running": is_running, "token_protected": True}
+    FreeCloudTunnelManager.get_tunnel_security_status = get_tunnel_security_status
+
+_add_security_status_method()

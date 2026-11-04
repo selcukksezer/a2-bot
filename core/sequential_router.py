@@ -1884,3 +1884,19 @@ class SequentialRoutePlanner:
                 "crossings_count": 0,
                 "smoothness_score": 0.0,
             }
+
+    def compute_route_efficiency_score(self, nodes: list) -> float:
+        """
+        Computes a normalized efficiency score in [0.0, 100.0] for the given nodes list.
+        Returns 100.0 if len(nodes) <= 1, else a bounded smoothness/distance metric.
+        """
+        try:
+            if not nodes or len(nodes) <= 1:
+                return 100.0
+            quality = self.evaluate_sequence_quality(nodes, closed_loop=False)
+            score = quality.get("smoothness_score", 0.0)
+            return float(max(0.0, min(100.0, score)))
+        except Exception as exc:
+            logger.error("compute_route_efficiency_score error: %s", exc)
+            return 0.0
+

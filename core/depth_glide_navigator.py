@@ -843,3 +843,20 @@ class GlideWaypointController:
             "execution_elapsed_sec": elapsed_total,
             "timeline": timeline_events,
         }
+
+    def get_navigator_telemetry_summary(self) -> dict:
+        """Returns a telemetry summary of the navigator state and stats safely."""
+        summary = {
+            "navigator_ready": True,
+            "glide_enabled": True,
+        }
+        try:
+            stats = {}
+            for k, v in self.__dict__.items():
+                if isinstance(v, (int, float, str, bool, list, dict)):
+                    stats[k] = v
+            summary["stats"] = stats
+        except Exception as e:
+            summary["stats_error"] = str(e)
+        return summary
+

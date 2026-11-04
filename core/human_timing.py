@@ -517,6 +517,15 @@ class DynamicBreakScheduler:
                 "total_micro_pauses": float(self.total_micro_pauses),
             }
 
+    def get_break_scheduler_status(self) -> dict:
+        try:
+            return {
+                "enabled": bool(getattr(self, "enabled", True)),
+                "is_on_break": bool(getattr(self, "_is_on_break", False)),
+            }
+        except Exception:
+            return {"enabled": True, "is_on_break": False}
+
 
 # ============================================================================
 # 3. ORGANİK ANTİ-AFK MOTORU (MOLA SIRASINDA İNSANİ EYLEMLER)

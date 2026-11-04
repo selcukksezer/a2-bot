@@ -754,6 +754,28 @@ class QuestlogImporter:
 
         return cv2.cvtColor(ref_zoomed, cv2.COLOR_BGR2GRAY)
 
+    def validate_imported_nodes_bounds(self, nodes: list) -> int:
+        """
+        Counts and returns how many items in nodes have valid positive map_x and map_y coordinates.
+        """
+        valid_count = 0
+        if not nodes:
+            return 0
+        for node in nodes:
+            if isinstance(node, dict):
+                mx = node.get("map_x", 0)
+                my = node.get("map_y", 0)
+            elif isinstance(node, (tuple, list)) and len(node) >= 2:
+                mx, my = node[0], node[1]
+            else:
+                continue
+            try:
+                if mx is not None and my is not None and float(mx) > 0 and float(my) > 0:
+                    valid_count += 1
+            except (ValueError, TypeError):
+                continue
+        return valid_count
+
     def import_sub_zones(
         self,
         zone: str,
