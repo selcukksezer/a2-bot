@@ -391,6 +391,25 @@ class DatasetQualityGate:
             lines.append(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
         return lines
 
+    def compute_sobel_edge_energy(self, frame: np.ndarray) -> float:
+        """Compute mean Sobel gradient magnitude energy of frame via SobelClahePatchNormalizer."""
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return 0.0
+        try:
+            from core.patch_normalizer import SobelClahePatchNormalizer
+            edge_map = SobelClahePatchNormalizer().compute_sobel_edge_map(frame)
+            if edge_map is not None and edge_map.size > 0:
+                return round(float(np.mean(edge_map)), 3)
+        except Exception:
+            pass
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            return round(float(np.mean(cv2.magnitude(gx, gy))), 3)
+        except Exception:
+            return 0.0
+
     def reset_history(self) -> None:
         """Clears the rolling hash history."""
         self._hash_history.clear()

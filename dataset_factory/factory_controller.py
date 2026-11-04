@@ -1108,6 +1108,21 @@ class AutoLabelingDatasetFactory:
             self._last_saved_preview_path = str(out_path)
         return out_path
 
+    def get_factory_gpu_and_onnx_summary(self) -> Dict[str, Any]:
+        """Return GPU environment and exported ONNX verification summary."""
+        try:
+            gpu_info = probe_gpu_environment()
+        except Exception as exc:
+            gpu_info = {"error": str(exc)}
+        try:
+            onnx_info = self.trainer.verify_exported_onnx_gpu_ready()
+        except Exception as exc:
+            onnx_info = {"onnx_ready": False, "error": str(exc)}
+        return {
+            "gpu_environment": gpu_info,
+            "onnx_verification": onnx_info,
+        }
+
 
 __all__ = [
     "FACTORY_12_CLASS_NAMES",

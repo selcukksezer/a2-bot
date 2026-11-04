@@ -333,3 +333,20 @@ class PreGatherTimeMachineBuffer:
                 "total_skipped_interval": self._total_skipped_interval,
                 "total_pruned": self._total_pruned,
             }
+
+    def export_recent_frames_meta(self) -> List[Dict[str, Any]]:
+        """
+        Export recent frames metadata (timestamps and player positions)
+        for IncidentFlightRecorder diagnostics, wrapped in try/except.
+        """
+        try:
+            with self._lock:
+                return [
+                    {
+                        "timestamp": float(snap.timestamp),
+                        "player_pos": (float(snap.player_pos[0]), float(snap.player_pos[1])) if snap.player_pos else (0.0, 0.0),
+                    }
+                    for snap in self._buffer
+                ]
+        except Exception:
+            return []

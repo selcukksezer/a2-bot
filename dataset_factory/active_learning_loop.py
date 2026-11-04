@@ -342,6 +342,20 @@ class ActiveLearningLoop:
                 self.class_counts[key] = max(0, int(val))
             return dict(self.class_counts)
 
+    def compute_economic_priority_bonus(self, material_name: str) -> float:
+        """Compute economic priority bonus in [0.0, 0.5] based on Aion 2 material market value."""
+        try:
+            from core.economy_broker import DEFAULT_AION2_MATERIAL_PRICES
+            norm = (material_name or "").strip().lower()
+            price = 500
+            for k, v in DEFAULT_AION2_MATERIAL_PRICES.items():
+                if k in norm or norm in k:
+                    price = int(v)
+                    break
+            return round(min(0.5, max(0.0, (price - 400.0) / 8000.0)), 3)
+        except Exception:
+            return 0.0
+
     def increment_class_count(self, class_key: Union[int, str], delta: int = 1) -> int:
         """Increment sample count for a specific material class."""
         with self._lock:

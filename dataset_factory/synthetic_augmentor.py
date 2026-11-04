@@ -704,6 +704,32 @@ class SyntheticYOLOAugmentor:
                 return False
         return True
 
+    @staticmethod
+    def verify_augmented_boxes_bounds(boxes: List[Dict[str, Any] | Tuple[float, float, float, float] | List[float]]) -> bool:
+        """
+        Validates all augmented YOLO boxes lie strictly within [0.0, 1.0].
+        Wrapped in try/except, returning a boolean.
+        """
+        try:
+            for b in boxes:
+                if isinstance(b, dict):
+                    cx, cy, w, h = SyntheticYOLOAugmentor._extract_yolo_cxcywh(b)
+                elif isinstance(b, (list, tuple)) and len(b) == 4:
+                    cx, cy, w, h = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+                else:
+                    return False
+                if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0 and 0.0 <= w <= 1.0 and 0.0 <= h <= 1.0):
+                    return False
+                x1 = cx - 0.5 * w
+                y1 = cy - 0.5 * h
+                x2 = cx + 0.5 * w
+                y2 = cy + 0.5 * h
+                if x1 < -1e-5 or y1 < -1e-5 or x2 > 1.0 + 1e-5 or y2 > 1.0 + 1e-5:
+                    return False
+            return True
+        except Exception:
+            return False
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")

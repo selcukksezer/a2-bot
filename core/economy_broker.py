@@ -119,6 +119,9 @@ DEFAULT_BROKER_PRICES: Dict[str, int] = {
     "Condensed Aether Crystal": 65000,
 }
 
+# Alias for compatibility with ActiveLearningLoop requirement
+DEFAULT_AION2_MATERIAL_PRICES = DEFAULT_BROKER_PRICES
+
 # Görüntü İşleme (CV) ile Pazar Satırı İkon Renk İmzaları (HSV aralıkları -> Materyal eşlemesi)
 BROKER_ICON_HSV_SIGNATURES: List[Tuple[str, Tuple[int, int, int], Tuple[int, int, int]]] = [
     ("Diamond Gemstone", (88, 25, 210), (108, 120, 255)),
