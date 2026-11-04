@@ -1302,6 +1302,18 @@ class GameHUDReader:
             logger.error("_classify_digit_contour failed: %s", exc)
             return None
 
+    def validate_distance_plausibility(self, distance_m, max_valid_m: int = 999) -> bool:
+        """
+        Returns True if distance_m is not None and 0 <= int(distance_m) <= int(max_valid_m) else False.
+        """
+        try:
+            if distance_m is None:
+                return False
+            val = int(distance_m)
+            return 0 <= val <= int(max_valid_m)
+        except (ValueError, TypeError):
+            return False
+
     def read_target_distance_meters(
         self,
         frame_bgr: np.ndarray,
@@ -1387,6 +1399,52 @@ class GameHUDReader:
             if fallback_px_dist is not None:
                 return max(0, int(round(float(fallback_px_dist) / 28.0)))
             return -1
+
+    def read_hp_mp(self, frame: np.ndarray) -> Dict[str, float]:
+        """Convenience alias for read_player_hp_mp_bars returning hp_pct and mp_pct."""
+        try:
+            res = self.read_player_hp_mp_bars(frame)
+            return {
+                "hp_pct": float(res.get("hp_pct", 0.0)),
+                "mp_pct": float(res.get("mp_pct", 0.0)),
+            }
+        except Exception as exc:
+            logger.error("read_hp_mp failed: %s", exc)
+            return {"hp_pct": 0.0, "mp_pct": 0.0}
+
+    def is_under_attack(self, frame: np.ndarray) -> bool:
+        """Determines if the player is under attack based on monster target presence or alerts."""
+        try:
+            if frame is None or frame.size == 0:
+                return False
+            target_info = self.detect_top_target_bar(frame)
+            if target_info.get("has_target", False) and target_info.get("is_monster_target", False):
+                return True
+            return False
+        except Exception as exc:
+            logger.error("is_under_attack failed: %s", exc)
+            return False
+
+    def get_hud_combat_and_health_summary(self, frame: np.ndarray) -> Dict[str, Any]:
+        """
+        Safely calls read_hp_mp and is_under_attack inside try/except and returns
+        {"hp_pct": float, "mp_pct": float, "is_under_attack": bool}.
+        """
+        try:
+            hp_mp = self.read_hp_mp(frame)
+            under_attack = self.is_under_attack(frame)
+            return {
+                "hp_pct": float(hp_mp.get("hp_pct", 0.0)),
+                "mp_pct": float(hp_mp.get("mp_pct", 0.0)),
+                "is_under_attack": bool(under_attack),
+            }
+        except Exception as exc:
+            logger.error("get_hud_combat_and_health_summary failed: %s", exc)
+            return {
+                "hp_pct": 0.0,
+                "mp_pct": 0.0,
+                "is_under_attack": False,
+            }
 
 
 _DEFAULT_HUD_READER: Optional[GameHUDReader] = None

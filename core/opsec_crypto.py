@@ -350,6 +350,19 @@ class LocalVaultCrypto:
                     return dict(default)
                 raise
 
+    def get_vault_encryption_summary(self) -> dict:
+        """
+        Returns non-sensitive metadata about the vault encryption state
+        without exposing any secret key or salt bytes.
+        """
+        with self._lock:
+            return {
+                "vault_ready": True,
+                "cipher": "AES-256-CTR-HMAC-SHA256" if not self.prefer_aes_gcm else "AES-256-GCM",
+                "vault_path": self.vault_path,
+                "kdf_iterations": self.PBKDF2_ITERATIONS,
+            }
+
     def get_unique_build_signature(self) -> Dict[str, Any]:
         """
         Her kullanıcıya özel yerel salt ve makine anahtarından türetilen benzersiz

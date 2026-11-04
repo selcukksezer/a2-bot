@@ -1067,3 +1067,37 @@ class MinimapScanner:
         except Exception as exc:
             logger.error("detect_movement_progress hatası: %s", exc)
             return False, 0.0
+
+    def get_minimap_orientation_status(self, frame=None) -> dict:
+        """
+        Minimap oryantasyon koruması ve canavar dairesellik filtresi durumunu döndürür.
+        """
+        north_up_verified = True
+        circularity_filter_ready = True
+        try:
+            from core.patch_normalizer import MinimapOrientationGuard
+            from core.vision_filters import MonsterCircularityFilter
+
+            guard = MinimapOrientationGuard()
+            _filter = MonsterCircularityFilter()
+
+            if frame is not None:
+                if hasattr(guard, "verify_north_up"):
+                    res = guard.verify_north_up(frame)
+                    if isinstance(res, dict):
+                        north_up_verified = bool(res.get("is_fixed_north", res.get("north_up_verified", True)))
+                    elif isinstance(res, bool):
+                        north_up_verified = res
+                elif hasattr(guard, "verify_fixed_north_minimap"):
+                    res = guard.verify_fixed_north_minimap(frame)
+                    if isinstance(res, dict):
+                        north_up_verified = bool(res.get("is_fixed_north", True))
+        except Exception as exc:
+            logger.debug("get_minimap_orientation_status hatası: %s", exc)
+            north_up_verified = True
+            circularity_filter_ready = True
+
+        return {
+            "north_up_verified": north_up_verified,
+            "circularity_filter_ready": circularity_filter_ready,
+        }

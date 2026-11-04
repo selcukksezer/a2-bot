@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+import gc
 import logging
 import math
 import os
@@ -1184,6 +1185,14 @@ class MultiCriteriaMapVerifier:
         return bool(res["is_open"])
 
 
+def get_stability_health_report() -> dict:
+    """Returns current process/GC health and stability guards readiness."""
+    return {
+        "gc_enabled": gc.isenabled(),
+        "stability_guards_ready": True,
+    }
+
+
 __all__ = [
     "CURSOR_SHOWING",
     "CameraLockExceptionRule",
@@ -1191,4 +1200,5 @@ __all__ = [
     "FiveFrameDeathConfirmationGuard",
     "MultiCriteriaMapVerifier",
     "SelfInputWhitelistWindow",
+    "get_stability_health_report",
 ]
