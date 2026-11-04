@@ -16,3 +16,10 @@ dataset/labels/
 dataset/*.cache
 models/rtx_runs/
 *.pt
+
+# Secrets, Tokens & Encrypted Local Vault
+config/.vault_salt
+config/gatherion_256bit_token.txt
+config/mobile_token.txt
+config/mobile_relay.json
+config/settings.enc
