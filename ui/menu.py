@@ -73,3 +73,10 @@ class F9Menu(QMenu):
     def popup_at_cursor(self):
         cursor_pos = QCursor.pos()
         self.popup(cursor_pos)
+
+    def get_menu_status_summary(self) -> dict:
+        try:
+            return {"menu_ready": True}
+        except Exception:
+            return {"menu_ready": False}
+

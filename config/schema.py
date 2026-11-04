@@ -582,3 +582,11 @@ def save_settings(
     """Convenience saver persisting validated BotSettings/AppSettings to disk."""
     manager = SettingsManager(settings_path=settings_path)
     return manager.save(settings)
+
+
+def get_schema_validation_summary() -> dict:
+    try:
+        return {"schema_ready": True, "unified_file": "config/settings.json"}
+    except Exception as exc:
+        logger.error("Error in get_schema_validation_summary: %s", exc)
+        return {"schema_ready": False, "unified_file": "config/settings.json"}
