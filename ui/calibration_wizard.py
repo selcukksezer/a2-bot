@@ -952,3 +952,63 @@ class CalibrationWizard(QDialog):
             self.lbl_match_status.setText(f"Kaydetme Hatası: {exc}")
             self.lbl_match_status.setStyleSheet("color: #ef4444; font-weight: bold;")
             return None
+
+    def run_vision_filters_diagnostic(self, frame: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Runs FeatherNegativeFilter, Pyramid3DCrestDetector, and DynamicInteractionKeyReader
+        on a sample frame (wrapped in try/except) and returns a diagnostic dict without
+        modifying any existing UI widgets, methods, or smoke tests.
+        """
+        diagnostic: Dict[str, Any] = {
+            "success": False,
+            "feather_filter": None,
+            "crest_detector": [],
+            "interaction_key": None,
+            "error": None,
+        }
+        try:
+            target_frame = frame
+            if target_frame is None or target_frame.size == 0:
+                target_frame = self.canvas.get_source_image()
+            if target_frame is None or target_frame.size == 0:
+                ref_path = self.frames_dir / "frame_33s.jpg"
+                if ref_path.exists():
+                    target_frame = imread_unicode(ref_path, cv2.IMREAD_COLOR)
+
+            if target_frame is None or target_frame.size == 0:
+                diagnostic["error"] = "No valid sample frame provided or available."
+                return diagnostic
+
+            from core.vision_filters import (
+                FeatherNegativeFilter,
+                Pyramid3DCrestDetector,
+                DynamicInteractionKeyReader,
+            )
+
+            # 1. FeatherNegativeFilter
+            feather_filter = FeatherNegativeFilter()
+            h, w = target_frame.shape[:2]
+            # Test a sample patch or center region
+            cy, cx = h // 2, w // 2
+            patch_r = 16
+            x1, x2 = max(0, cx - patch_r), min(w, cx + patch_r)
+            y1, y2 = max(0, cy - patch_r), min(h, cy + patch_r)
+            patch = target_frame[y1:y2, x1:x2]
+            feather_res = feather_filter.analyze_candidate(patch) if patch.size > 0 else {}
+            diagnostic["feather_filter"] = feather_res
+
+            # 2. Pyramid3DCrestDetector
+            crest_detector = Pyramid3DCrestDetector()
+            crests = crest_detector.detect(target_frame, threshold=0.70)
+            diagnostic["crest_detector"] = crests
+
+            # 3. DynamicInteractionKeyReader
+            key_reader = DynamicInteractionKeyReader()
+            key_res = key_reader.inspect_prompt_patch(target_frame) if target_frame.size > 0 else {}
+            diagnostic["interaction_key"] = key_res
+
+            diagnostic["success"] = True
+        except Exception as exc:
+            logger.error("Error in run_vision_filters_diagnostic: %s", exc)
+            diagnostic["error"] = str(exc)
+        return diagnostic

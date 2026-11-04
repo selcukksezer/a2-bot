@@ -1011,6 +1011,41 @@ class MapViewerWindow(QDialog):
         self._player_pos = (x, y) if (x is not None and y is not None) else None
         self.canvas.set_player_position(x, y, angle_deg)
 
+    def get_dry_run_trajectory_points(self) -> List[Tuple[float, float]]:
+        """
+        Returns simulated trajectory points from DryRunSimulator (wrapped in try/except, returning [] if none).
+        """
+        try:
+            from core.dry_run_simulator import DryRunReplaySimulator
+            simulator = DryRunReplaySimulator()
+            nodes, _ = self._extract_region_nodes_and_route_ids()
+            if not nodes:
+                nodes = list(self.canvas._nodes)
+            if not nodes:
+                return []
+            audit_result = simulator.run_8x_route_audit(nodes)
+            # Extract coordinates from audit segments or nodes
+            trajectory: List[Tuple[float, float]] = []
+            segments = audit_result.get("segments", [])
+            if segments:
+                for seg in segments:
+                    p1 = seg.get("p1")
+                    if p1 and isinstance(p1, (list, tuple)) and len(p1) >= 2:
+                        trajectory.append((float(p1[0]), float(p1[1])))
+                # Append final point of last segment
+                if segments:
+                    last_p2 = segments[-1].get("p2")
+                    if last_p2 and isinstance(last_p2, (list, tuple)) and len(last_p2) >= 2:
+                        trajectory.append((float(last_p2[0]), float(last_p2[1])))
+            else:
+                for n in nodes:
+                    xy = simulator._extract_xy(n)
+                    trajectory.append((float(xy[0]), float(xy[1])))
+            return trajectory
+        except Exception as exc:
+            logger.debug("get_dry_run_trajectory_points error or none available: %s", exc)
+            return []
+
     # -------------------------------------------------------------------------
     # Interactive Node Toggling & Context Menu (Türkçe)
     # -------------------------------------------------------------------------

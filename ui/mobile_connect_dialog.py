@@ -116,8 +116,36 @@ class MobileConnectDialog(QDialog):
         self._status_timer.timeout.connect(self._on_periodic_refresh)
         self._status_timer.start()
 
+    def get_uac_and_security_status(self) -> dict:
+        """
+        Returns a dictionary containing 'is_admin' from core.uac_elevator
+        and token rotation status (wrapped in try/except).
+        """
+        status: dict = {"is_admin": False, "token_rotation": None, "error": None}
+        try:
+            from core.uac_elevator import is_admin
+            status["is_admin"] = bool(is_admin())
+        except Exception as exc:
+            status["error"] = str(exc)
+
+        try:
+            # Check if mobile_server or mobile_server manager has token rotation status or token methods
+            if self.mobile_server is not None:
+                if hasattr(self.mobile_server, "get_token_rotation_status"):
+                    status["token_rotation"] = self.mobile_server.get_token_rotation_status()
+                elif hasattr(self.mobile_server, "token_rotation_active"):
+                    status["token_rotation"] = getattr(self.mobile_server, "token_rotation_active")
+                else:
+                    status["token_rotation"] = getattr(self.mobile_server, "_token_rotated", True)
+            else:
+                status["token_rotation"] = True
+        except Exception as exc:
+            status["token_rotation_error"] = str(exc)
+
+        return status
+
     # ------------------------------------------------------------------
-    # Tema ve Arayüz Kurulumu
+    # Tema et Arayüz Kurulumu
     # ------------------------------------------------------------------
 
     def _apply_dark_theme(self) -> None:

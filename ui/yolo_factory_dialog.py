@@ -2043,6 +2043,58 @@ class YOLOFactoryDialog(QDialog):
             return bool(finished)
         return True
 
+    def get_onnx_runtime_status(self) -> Dict[str, Any]:
+        """
+        Returns a dict with the active ONNXYolo3DDetector execution provider 
+        ('CUDAExecutionProvider' vs 'CPUExecutionProvider') and model file size 
+        (wrapped in try/except).
+        """
+        status: Dict[str, Any] = {
+            "execution_provider": "CPUExecutionProvider",
+            "model_file_size_bytes": 0,
+            "model_path": "",
+            "active": False,
+        }
+        try:
+            detector = getattr(self, "yolo_detector", None)
+            if detector is not None:
+                status["model_path"] = getattr(detector, "model_path", "")
+                if hasattr(detector, "backend_name"):
+                    bname = str(detector.backend_name)
+                    if "CUDAExecutionProvider" in bname:
+                        status["execution_provider"] = "CUDAExecutionProvider"
+                    elif "CPUExecutionProvider" in bname:
+                        status["execution_provider"] = "CPUExecutionProvider"
+                    elif "onnxruntime:" in bname:
+                        parts = bname.split(":")
+                        if len(parts) > 1:
+                            status["execution_provider"] = parts[1]
+                
+                # Check file size
+                mpath = getattr(detector, "_resolve_model_path", None)
+                resolved = None
+                if mpath and callable(mpath):
+                    resolved = mpath(detector.model_path)
+                elif detector.model_path:
+                    if os.path.isfile(detector.model_path):
+                        resolved = os.path.abspath(detector.model_path)
+                
+                if resolved and os.path.isfile(resolved):
+                    status["model_file_size_bytes"] = os.path.getsize(resolved)
+                    status["active"] = True
+            else:
+                # Try fallback default detector inspection
+                default_path = "models/yolov8n_gatherion.onnx"
+                status["model_path"] = default_path
+                root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                cand = os.path.join(root_dir, default_path)
+                if os.path.isfile(cand):
+                    status["model_file_size_bytes"] = os.path.getsize(cand)
+                    status["active"] = True
+        except Exception as exc:
+            logger.debug("[YOLOFactoryDialog] get_onnx_runtime_status error: %s", exc)
+        return status
+
     def on_open_dataset_folder_clicked(self) -> Path:
         """`dataset/` klasörünü işletim sistemi dosya gezgininde açar."""
         dataset_path = self._builtin_helper.dataset_dir

@@ -757,3 +757,60 @@ class GuideDialog(QDialog):
             self.run_diagnostics()
         except Exception as exc:
             logger.error("Failed opening CalibrationWizard from GuideDialog: %s", exc)
+
+    @staticmethod
+    def get_enterprise_modules_guide() -> List[Dict[str, str]]:
+        """
+        Returns a Turkish summary list of the 11 integrated enterprise & vision modules
+        and the RTX YOLO Dataset Factory.
+        """
+        return [
+            {
+                "module": "1. F9 Ana Kontrol ve Yüzer Menü (F9 Menu)",
+                "summary": "Gerçek zamanlı durum takibi, bot başlatma/durdurma, mod seçimi ve hızlı kılavuz erişimi sağlayan merkezi kontrol paneli."
+            },
+            {
+                "module": "2. Görsel Şablon ve Kalibrasyon Sihirbazı (Calibration Wizard)",
+                "summary": "F/E toplama butonu ve minimap ok şablonlarını özel ekran çözünürlükleri ve arayüz ölçekleri için kesip kalibre etmeyi sağlar."
+            },
+            {
+                "module": "3. Otomatik Sistem Tanılama (System Diagnostics)",
+                "summary": "Ekran çözünürlüğü, ekran yakalama bütünlüğü, şablon dosyaları ve Windows yönetici/SendInput yetkilerini otomatik doğrular."
+            },
+            {
+                "module": "4. Mobil Uzaktan Bağlantı & Komuta Merkezi (Mobile Connect Dialog)",
+                "summary": "Mobil cihazlar veya harici ağ üzerinden Gatherion-Local botunu uzaktan izleme, komut gönderme ve durum raporu alma modülü."
+            },
+            {
+                "module": "5. RTX YOLO Veri Seti Fabrikası (RTX YOLO Dataset Factory)",
+                "summary": "Yüksek performanslı RTX donanımı kullanarak otomatik veri toplama, etiketleme ve YOLO nesne tespiti model eğitimi sağlayan fabrika arayüzü."
+            },
+            {
+                "module": "6. Hibrit Otomatik Haritalama ve Navigasyon (Auto Cartographer)",
+                "summary": "Sağ üst minimap ikonları ile 3B dünya beyaz kanatlı toplama amblemlerini birleştirerek hatasız rota kaydı ve takibi yapar."
+            },
+            {
+                "module": "7. Savaş Kurtarma ve Ölüm Yönetimi (Combat Recovery)",
+                "summary": "Canavar saldırısı veya ölüm durumlarında güvenli bölgeye kaçış, otomatik dirilme (revive) ve rotaya geri dönme kurtarma sistemi."
+            },
+            {
+                "module": "8. Harita ve Konum Görselleştiricisi (Map Viewer)",
+                "summary": "Kayıtlı toplama rotalarını, ara noktaları (waypoints) ve materyal yoğunluk haritalarını 2B/3B olarak görselleştirip düzenleme aracı."
+            },
+            {
+                "module": "9. Davranışsal Güvenlik ve Anti-Ban Koruyucusu (Behavioral Guard)",
+                "summary": "Doğal insan benzeri fare hareketleri, rastgele gecikmeler ve anti-cheat önlemleriyle bot tespitini engelleyen koruma modülü."
+            },
+            {
+                "module": "10. Gelişmiş Ayarlar ve Profil Yöneticisi (Settings Window)",
+                "summary": "Oyun yolu, toplama tercihleri, performans ayarları ve kullanıcı profillerinin yönetildiği kapsamlı konfigürasyon merkezi."
+            },
+            {
+                "module": "11. Akıllı Radar ve Çevresel Farkındalık (Radar)",
+                "summary": "Çevredeki oyuncuları, canavarları ve toplama materyallerini gerçek zamanlı tarayıp ekranda radar HUD olarak gösteren modül."
+            },
+            {
+                "module": "12. Canlı HUD ve Durum Gözlemcisi (Overlay HUD)",
+                "summary": "Oyun ekranı üzerinde şeffaf katman olarak çalışan; anlık durum, istatistikler ve bot performansını gösteren heads-up display."
+            }
+        ]
