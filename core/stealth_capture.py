@@ -114,7 +114,90 @@ class DXGIDesktopCapture:
             ring_size=3,
         )
 
+        # Optional lazy-loaded DPI / Focus helpers
+        self._dpi_synchronizer: Optional[Any] = None
+        self._focus_guard: Optional[Any] = None
+
         self._initialize_backend()
+
+    def get_dpi_topology_info(self) -> Dict[str, Any]:
+        """
+        Lazy-loads `MonitorTopologyScaler` (or `DPIScalingSynchronizer`) and
+        `WindowFocusLossSuspender` (or `ForegroundFocusGuard`) from `core.dpi_focus_guard`
+        (wrapped in try/except) and returns monitor scale and focus status dict.
+        """
+        result: Dict[str, Any] = {
+            "scale_factor": 1.0,
+            "scale_percent": 100,
+            "dpi": 96,
+            "awareness_level": "uninitialized",
+            "is_focused": True,
+            "focus_info": "FocusGuard uninitialized or inactive",
+            "latency_ms": 0.0,
+        }
+
+        # Lazy-load DPI synchronizer
+        if self._dpi_synchronizer is None:
+            try:
+                from core.dpi_focus_guard import DPIScalingSynchronizer
+                self._dpi_synchronizer = DPIScalingSynchronizer()
+            except Exception as exc:
+                try:
+                    from core.dpi_focus_guard import MonitorTopologyScaler
+                    self._dpi_synchronizer = MonitorTopologyScaler()
+                except Exception as exc2:
+                    logger.debug("Could not lazy-load DPIScalingSynchronizer / MonitorTopologyScaler: %s, %s", exc, exc2)
+
+        if self._dpi_synchronizer is not None:
+            try:
+                diag_fn = getattr(self._dpi_synchronizer, "get_diagnostics", None)
+                if callable(diag_fn):
+                    diag = diag_fn()
+                    if isinstance(diag, dict):
+                        result.update(diag)
+                else:
+                    scale_fn = getattr(self._dpi_synchronizer, "get_scale_factor", None)
+                    if callable(scale_fn):
+                        scale = float(scale_fn())
+                        result["scale_factor"] = scale
+                        result["scale_percent"] = int(round(scale * 100))
+                        result["dpi"] = int(round(scale * 96))
+            except Exception as exc:
+                logger.debug("Error getting DPI diagnostics: %s", exc)
+
+        # Lazy-load Focus Guard / Suspender
+        if self._focus_guard is None:
+            try:
+                from core.dpi_focus_guard import ForegroundFocusGuard
+                self._focus_guard = ForegroundFocusGuard()
+            except Exception as exc:
+                try:
+                    from core.dpi_focus_guard import WindowFocusLossSuspender
+                    self._focus_guard = WindowFocusLossSuspender()
+                except Exception as exc2:
+                    logger.debug("Could not lazy-load ForegroundFocusGuard / WindowFocusLossSuspender: %s, %s", exc, exc2)
+
+        if self._focus_guard is not None:
+            try:
+                focus_fn = getattr(self._focus_guard, "is_game_window_focused", None)
+                if not callable(focus_fn):
+                    focus_fn = getattr(self._focus_guard, "check_focus", None)
+
+                if callable(focus_fn):
+                    res = focus_fn()
+                    if isinstance(res, tuple) and len(res) >= 2:
+                        result["is_focused"] = bool(res[0])
+                        result["focus_info"] = str(res[1])
+                    elif isinstance(res, bool):
+                        result["is_focused"] = res
+                
+                lat_prop = getattr(self._focus_guard, "last_check_latency_ms", None)
+                if lat_prop is not None:
+                    result["latency_ms"] = float(lat_prop)
+            except Exception as exc:
+                logger.debug("Error getting focus diagnostics: %s", exc)
+
+        return result
 
     def _initialize_backend(self) -> None:
         """Initializes DXGI Desktop Duplication if available, else thread-safe MSS."""

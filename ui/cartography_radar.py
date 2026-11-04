@@ -2909,3 +2909,14 @@ class CartographyRadarDialog(QDialog):
             self._ordered_nodes.pop(idx)
             self.canvas.set_sequential_nodes(self._ordered_nodes)
             self._refresh_metrics_bar()
+
+    def normalize_node_patch_preview(self, patch_img: Any) -> Any:
+        """Normalizes a node patch via SobelClahePatchNormalizer for diagnostic preview."""
+        try:
+            if not hasattr(self, "_patch_normalizer"):
+                from core.patch_normalizer import SobelClahePatchNormalizer
+                self._patch_normalizer = SobelClahePatchNormalizer()
+            return self._patch_normalizer.normalize_patch(patch_img)
+        except Exception as exc:
+            logger.debug("normalize_node_patch_preview fallback: %s", exc)
+            return patch_img

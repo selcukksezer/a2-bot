@@ -266,8 +266,42 @@ class BotWatchdog:
         self._notifications: Deque[Dict[str, Any]] = collections.deque(maxlen=100)
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
+        self._incident_recorder: Optional[Any] = None
+        try:
+            from core.incident_recorder import IncidentRecorder
+            IncidentFlightRecorder = IncidentRecorder
+            self._incident_recorder = IncidentFlightRecorder()
+        except Exception as exc:
+            logger.debug("IncidentFlightRecorder lazy load failed: %s", exc)
 
-    def set_freeze_on_pause(self, enabled: bool) -> None:
+    def trigger_incident_snapshot(self, reason: str, extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Logs a diagnostic snapshot via IncidentFlightRecorder when a stall or resolution change occurs,
+        wrapped safely in try/except.
+        """
+        try:
+            recorder = self._incident_recorder
+            if recorder is None:
+                try:
+                    from core.incident_recorder import IncidentRecorder
+                    IncidentFlightRecorder = IncidentRecorder
+                    recorder = IncidentFlightRecorder()
+                    self._incident_recorder = recorder
+                except Exception as load_exc:
+                    logger.debug("IncidentFlightRecorder lazy load in trigger_incident_snapshot failed: %s", load_exc)
+                    return None
+
+            if recorder is not None and hasattr(recorder, "record_incident"):
+                details = f"Watchdog incident snapshot: {reason}"
+                if extra:
+                    details += f" | {json.dumps(extra, ensure_ascii=False)}"
+                return recorder.record_incident(
+                    event_type="stuck" if "stall" in str(reason).lower() or "stuck" in str(reason).lower() else "manual_snapshot",
+                    details=details,
+                )
+        except Exception as exc:
+            logger.debug("trigger_incident_snapshot failed: %s", exc)
+        return None
         """Enables or disables automatic watchdog timer freezing during PAUSED/IDLE/BREAK states."""
         with self._lock:
             self.freeze_watchdog_on_pause = bool(enabled)
@@ -597,6 +631,13 @@ class BotWatchdog:
                             "current_resolution": current_res,
                         },
                     )
+                    self.trigger_incident_snapshot(
+                        "Resolution changed",
+                        {
+                            "previous_resolution": (prev_w, prev_h),
+                            "current_resolution": current_res,
+                        },
+                    )
                     return False
 
                 minimized, win_title = self._is_game_window_minimized()
@@ -717,6 +758,14 @@ class BotWatchdog:
                             "state": self._last_state,
                             "mode": self._last_mode,
                             "stall_count": self._stall_count,
+                        },
+                    )
+                    self.trigger_incident_snapshot(
+                        "Worker stalled",
+                        {
+                            "elapsed_sec": round(elapsed, 2),
+                            "state": self._last_state,
+                            "mode": self._last_mode,
                         },
                     )
                     invoke_recovery = True

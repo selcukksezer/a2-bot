@@ -1434,6 +1434,27 @@ class InputController:
         """Kayıtlı global kısayolları kaldırır."""
         self.hotkey_listener.unregister()
 
+    def record_dry_run_event(
+        self,
+        action_type: str,
+        x: int = 0,
+        y: int = 0,
+        key: str = "",
+    ) -> Dict[str, Any]:
+        """Simulates and records a trajectory or keypress via DryRunSimulator when test_mode is active."""
+        try:
+            if not hasattr(self, "_dry_run_sim"):
+                from core.dry_run_simulator import DryRunSimulator
+                self._dry_run_sim = DryRunSimulator()
+            if action_type == "click":
+                self._dry_run_sim.record_click(int(x), int(y), label=key or "left")
+            elif action_type == "key":
+                self._dry_run_sim.record_key_press(str(key), hold_ms=55.0)
+            return {"recorded": True, "action_type": action_type, "x": int(x), "y": int(y), "key": str(key)}
+        except Exception as exc:
+            logger.debug("record_dry_run_event warning: %s", exc)
+            return {"recorded": False, "action_type": action_type}
+
 
 # Geriye dönük uyumluluk için takma ad (Alias)
 InputDriver = InputController

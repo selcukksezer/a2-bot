@@ -605,6 +605,14 @@ class TelemetryEngine:
         self.heatmap_tracker: YieldHeatmapTracker = YieldHeatmapTracker()
         self.inventory_estimator: InventoryFullnessEstimator = InventoryFullnessEstimator()
 
+        # Lazy-loaded SessionProfitSimulator from core.economy_broker
+        self._profit_simulator: Optional[Any] = None
+        try:
+            from core.economy_broker import SessionProfitSimulator
+            self._profit_simulator = SessionProfitSimulator()
+        except Exception as _exc:
+            logger.debug("SessionProfitSimulator lazy-load edilemedi: %s", _exc)
+
     def reset_session(self) -> None:
         """Oturum istatistiklerini sıfırlar ve yeni bir oturum başlatır."""
         with self._lock:
@@ -621,6 +629,11 @@ class TelemetryEngine:
             self.failure_reasons.clear()
             self.heatmap_tracker.reset()
             self.inventory_estimator.reset()
+            if self._profit_simulator is not None and hasattr(self._profit_simulator, "reset_session"):
+                try:
+                    self._profit_simulator.reset_session()
+                except Exception:
+                    pass
             logger.info("Telemetri oturum verileri sıfırlandı.")
 
     def record_node_yield_event(
@@ -650,9 +663,43 @@ class TelemetryEngine:
         """Item 43 — Ekran görüntüsündeki sağ-üst çanta sayacını (`61/75`) okur ve doluluk durumunu döndürür."""
         return self.inventory_estimator.get_status(frame=frame)
 
-    def get_inventory_status(self, frame: Optional[np.ndarray] = None) -> Dict[str, Any]:
-        """Item 43 — Güncel envanter doluluk tahminini (`inventory_near_full`, `used_slots`, `max_slots`, `fill_pct`) döndürür."""
-        return self.inventory_estimator.get_status(frame=frame)
+    def get_economy_summary(self) -> Dict[str, Any]:
+        """
+        Returns estimated Kinah profit and hourly Kinah rate from the optional
+        SessionProfitSimulator (if available), or computes a fallback summary.
+        """
+        with self._lock:
+            if self._profit_simulator is not None:
+                try:
+                    if hasattr(self._profit_simulator, "get_session_economy_summary"):
+                        now = time.time()
+                        raw_dur = max(0.001, now - self.session_start_ts)
+                        active_pause = (now - self._pause_start_ts) if self._pause_start_ts is not None else 0.0
+                        eff_hours = max(1.0 / 3600.0, (raw_dur - (self.total_pause_sec + active_pause)) / 3600.0)
+                        return self._profit_simulator.get_session_economy_summary(elapsed_hours=eff_hours)
+                except Exception as _exc:
+                    logger.debug("SessionProfitSimulator get_session_economy_summary error: %s", _exc)
+
+            # Fallback summary if profit simulator is not loaded or failed
+            gathered_total = len(self.gather_events)
+            now = time.time()
+            raw_dur = max(0.001, now - self.session_start_ts)
+            active_pause = (now - self._pause_start_ts) if self._pause_start_ts is not None else 0.0
+            eff_hours = max(1.0 / 3600.0, (raw_dur - (self.total_pause_sec + active_pause)) / 3600.0)
+            
+            est_kinah = gathered_total * 3 * 14500
+            hourly_rate = int(round(est_kinah / eff_hours))
+            return {
+                "net_kinah_earned": est_kinah,
+                "gross_kinah_earned": est_kinah,
+                "kinah_per_hour": hourly_rate,
+                "elapsed_hours": round(eff_hours, 4),
+                "total_items_gathered": gathered_total * 3,
+                "formatted_net_kinah": str(est_kinah),
+                "formatted_kinah_per_hour": str(hourly_rate),
+                "formatted_summary_tr": f"Tahmini net Kinah: {est_kinah} (Saatlik: {hourly_rate}/saat)",
+                "material_breakdown": dict(self.by_resource),
+            }
 
     def record_pause_start(self) -> None:
         """Mola başlangıcını kaydeder."""
@@ -711,6 +758,15 @@ class TelemetryEngine:
                 event["used_slots"] = inv_status["used_slots"]
                 event["max_slots"] = inv_status["max_slots"]
                 event["fill_pct"] = inv_status["fill_pct"]
+
+                if self._profit_simulator is not None:
+                    try:
+                        if hasattr(self._profit_simulator, "record_gather"):
+                            self._profit_simulator.record_gather(clean_resource, count=3)
+                        elif hasattr(self._profit_simulator, "record_gathered_material"):
+                            self._profit_simulator.record_gathered_material(clean_resource, count=3)
+                    except Exception as _ps_err:
+                        logger.debug("SessionProfitSimulator record_gather error: %s", _ps_err)
 
             logger.info(
                 f"Gather kaydedildi: Node #{node_id} | {clean_resource} | "
