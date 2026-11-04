@@ -900,6 +900,19 @@ class BehavioralStealthGuard:
         """`NaturalCombatRotation.get_next_combat_action` çağrısını yürütür."""
         return self.combat_rotation.get_next_combat_action(now=now)
 
+    def get_behavioral_safety_status(self) -> dict:
+        """Davranışsal güvenlik durumu ve temel metrikleri döndürür."""
+        try:
+            with self._lock:
+                return {
+                    "guard_active": True,
+                    "quarantined_nodes_count": len(getattr(self.quarantine_manager, "_entries", {})),
+                    "corridor_top_k": getattr(self, "corridor_top_k", 3),
+                }
+        except Exception as exc:
+            logger.error("get_behavioral_safety_status hatası: %s", exc)
+            return {"guard_active": True, "error": str(exc)}
+
 
 # ============================================================================
 # MODÜL SEVİYESİ KISA YOL FONKSİYONLARI (DOĞRUDAN İMPORT UYUMLULUĞU İÇİN)

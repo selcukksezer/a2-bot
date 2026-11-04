@@ -553,3 +553,11 @@ class RouteOptimizer:
         except Exception as exc:
             logger.error("select_best_next_node hatasi: %s", exc)
             return ready_nodes[0] if ready_nodes else None
+
+    def get_optimizer_status_summary(self) -> dict:
+        """Returns optimizer status summary."""
+        try:
+            return {"optimizer_ready": True, "algorithm": "2-opt+TSP"}
+        except Exception as exc:
+            logger.error("get_optimizer_status_summary hatasi: %s", exc)
+            return {"optimizer_ready": False, "algorithm": "2-opt+TSP"}

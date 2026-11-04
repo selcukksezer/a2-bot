@@ -558,6 +558,12 @@ class WindMouseEngine:
             return True
         return self.cursor_automator.ensure_cursor_visible(input_ctrl=input_ctrl)
 
+    def get_humanizer_profile_summary(self) -> dict:
+        try:
+            return {"humanizer_ready": True, "curve_engine": "WindMouse+Bezier"}
+        except Exception:
+            return {"humanizer_ready": False, "curve_engine": "WindMouse+Bezier"}
+
     @staticmethod
     def _fitts_ease_in_out(progress: float) -> float:
         """

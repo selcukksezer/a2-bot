@@ -72,6 +72,13 @@ MAPLESS_DISTANCE_THRESHOLD_M: float = 40.0  # < 40m haritasız mikro-navigasyon 
 # ==============================================================================
 # YARDIMCI FONKSİYONLAR
 # ==============================================================================
+def get_navigation_intel_summary(self) -> dict:
+    try:
+        return {"intel_ready": True, "metrics": getattr(self, "__dict__", {})}
+    except Exception as e:
+        return {"intel_ready": True, "error": str(e)}
+
+
 def _send_key_via_controller(
     input_ctrl: Any,
     key: str,
