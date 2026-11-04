@@ -105,9 +105,21 @@ class _MenuRowWidget(QWidget):
         self.set_hovered(False)
         super().leaveEvent(event)
 
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._last_press_ts = time.monotonic()
+            self.clicked.emit(self.action_id)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.action_id)
+            last_p = getattr(self, "_last_press_ts", 0.0)
+            if (time.monotonic() - last_p) >= 0.35:
+                self.clicked.emit(self.action_id)
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event: Any) -> None:
@@ -225,6 +237,7 @@ class F9Menu(QWidget):
         self._route_submenu: Optional[QMenu] = None
         self._guide_dialog: Optional[QDialog] = None
         self._log_dialog: Optional[QDialog] = None
+        self._last_popup_ts: float = 0.0
 
         self._sync_from_route_manager()
         self._init_ui()
@@ -290,14 +303,20 @@ class F9Menu(QWidget):
             }
 
     def _init_ui(self) -> None:
+        # Qt.WindowType.Tool + WindowStaysOnTopHint kullanıyoruz:
+        # Qt.WindowType.Popup Windows'ta fareyi kilitlediği (SetCapture) ve Aion 2 kamera
+        # modunda imleç merkeze çekildiğinde kendi kendine kapanıp açıldığı (titreme) için
+        # Tool penceresi kullanılarak farenin serbest kalması ve menünün sabit durması sağlanır.
         self.setWindowFlags(
-            Qt.WindowType.Popup
+            Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.NoDropShadowWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setWindowTitle("F9 Hızlı Kontrol Menüsü")
 
         self.setStyleSheet(
@@ -634,28 +653,81 @@ class F9Menu(QWidget):
     # -------------------------------------------------------------------------
     # Açılır Menü & Alt Menü Yönetimi
     # -------------------------------------------------------------------------
-    def popup_at_cursor(self) -> None:
-        """F9 menüsünü doğrudan QCursor.pos() imleç konumunda açar."""
+    def _release_win32_cursor_and_focus(self) -> None:
+        """
+        Aion 2 gibi 3B oyunların fare imlecini ekran merkezine kilitlemesini (ClipCursor / SetCapture)
+        serbest bırakır ve F9 menüsünü Windows ön plan penceresi (Foreground Window) yaparak
+        fare imlecinin menü üzerinde rahatça hareket etmesini sağlar.
+        """
+        if not sys.platform.startswith("win"):
+            return
         try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            # 1. Oyun tarafından konulmuş imleç hapsetme sınırlarını (ClipCursor) ve yakalamayı kaldır
+            user32.ClipCursor(None)
+            user32.ReleaseCapture()
+
+            # 2. İmleci görünür zorla (ShowCursor sayacı negatifse >= 0 yap)
+            for _ in range(8):
+                if user32.ShowCursor(True) >= 0:
+                    break
+
+            # 3. Menü penceresini güvenli şekilde ön plana (Foreground) getir
+            hwnd = int(self.winId())
+            if hwnd:
+                fg_hwnd = user32.GetForegroundWindow()
+                fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+                cur_tid = kernel32.GetCurrentThreadId()
+                attached = False
+                if fg_tid and cur_tid and fg_tid != cur_tid:
+                    attached = bool(user32.AttachThreadInput(fg_tid, cur_tid, True))
+                try:
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetForegroundWindow(hwnd)
+                    user32.SetActiveWindow(hwnd)
+                    user32.SetFocus(hwnd)
+                finally:
+                    if attached:
+                        user32.AttachThreadInput(fg_tid, cur_tid, False)
+        except Exception as exc:
+            logger.debug("Win32 fare kilidi açma / ön plan odaklama bilgisi: %s", exc)
+
+    def popup_at_cursor(self) -> None:
+        """F9 menüsünü doğrudan QCursor.pos() imleç konumunda açar ve fareyi serbest bırakır."""
+        try:
+            now_mono = time.monotonic()
+            if self.isVisible() and (now_mono - self._last_popup_ts) < 0.45:
+                self._release_win32_cursor_and_focus()
+                return
+
+            self._last_popup_ts = now_mono
             self._sync_from_route_manager()
             self._refresh_labels()
             for r in self._rows.values():
                 r.set_hovered(False)
+
+            self._release_win32_cursor_and_focus()
 
             pos = QCursor.pos()
             screen = QApplication.screenAt(pos) or QApplication.primaryScreen()
             self.adjustSize()
             if screen is not None:
                 avail = screen.availableGeometry()
-                x = min(max(pos.x(), avail.left() + 4), avail.right() - self.width() - 4)
-                y = min(max(pos.y(), avail.top() + 4), avail.bottom() - self.height() - 4)
+                # İmleç ekranın tam ortasında veya kenarında olsa bile menünün hemen imleç altında açılmasını sağla
+                x = min(max(pos.x() - 24, avail.left() + 8), avail.right() - self.width() - 8)
+                y = min(max(pos.y() - 16, avail.top() + 8), avail.bottom() - self.height() - 8)
                 pos = QPoint(x, y)
 
             self.move(pos)
             self.show()
             self.raise_()
             self.activateWindow()
-            self.setFocus(Qt.FocusReason.PopupFocusReason)
+            self._release_win32_cursor_and_focus()
+            self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
         except Exception as exc:
             logger.error("F9Menu imleç konumunda açılamadı: %s", exc)
 
@@ -668,6 +740,7 @@ class F9Menu(QWidget):
         if pos is None:
             self.popup_at_cursor()
         else:
+            self._last_popup_ts = time.monotonic()
             self._sync_from_route_manager()
             self._refresh_labels()
             self.adjustSize()
@@ -675,7 +748,8 @@ class F9Menu(QWidget):
             self.show()
             self.raise_()
             self.activateWindow()
-            self.setFocus(Qt.FocusReason.PopupFocusReason)
+            self._release_win32_cursor_and_focus()
+            self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     def _on_row_hovered(self, action_id: str, row_widget: QWidget) -> None:
         for aid, r in self._rows.items():

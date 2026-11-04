@@ -391,7 +391,10 @@ class HotkeyListener:
         self.on_f8: Optional[Callable[[], None]] = None
         self.on_user_key_interrupt: Optional[Callable[[str], None]] = None
         self._hook_handle = None
+        self._release_hook_handle = None
         self._f9_menu_open: bool = False
+        self._f9_physically_down: bool = False
+        self._f8_physically_down: bool = False
         self._last_f9_ts: float = 0.0
         self._last_f8_ts: float = 0.0
         self._last_resume_ts: float = 0.0
@@ -423,7 +426,8 @@ class HotkeyListener:
                 return False
 
             self._hook_handle = keyboard.on_press(self._on_key_event, suppress=False)
-            logger.info("Global kısayol dinleyicisi aktif edildi (F9, F9->Enter/R, F8, Debounce=0.45s).")
+            self._release_hook_handle = keyboard.on_release(self._on_key_release, suppress=False)
+            logger.info("Global kısayol dinleyicisi aktif edildi (F9, F9->Enter/R, F8, Debounce=0.55s).")
             return True
         except Exception as exc:
             logger.error("Kısayol dinleyicisi kaydedilirken hata oluştu: %s", exc)
@@ -435,10 +439,30 @@ class HotkeyListener:
             if self._hook_handle is not None and HAS_KEYBOARD and keyboard is not None:
                 keyboard.unhook(self._hook_handle)
                 self._hook_handle = None
-                logger.debug("Global kısayol dinleyicisi kaldırıldı.")
+            if self._release_hook_handle is not None and HAS_KEYBOARD and keyboard is not None:
+                keyboard.unhook(self._release_hook_handle)
+                self._release_hook_handle = None
+            logger.debug("Global kısayol dinleyicisi kaldırıldı.")
         except Exception as exc:
             logger.error("Kısayol dinleyicisi kaldırılırken hata: %s", exc)
             self._hook_handle = None
+            self._release_hook_handle = None
+
+    def _on_key_release(self, event) -> None:
+        """Tuş bırakıldığında fiziksel basılı tutma (auto-repeat) kilidini sıfırlar."""
+        try:
+            raw_name = getattr(event, "name", "")
+            if not raw_name:
+                return
+            key_name = str(raw_name).strip().lower()
+            if key_name == "f9":
+                with self._lock:
+                    self._f9_physically_down = False
+            elif key_name == "f8":
+                with self._lock:
+                    self._f8_physically_down = False
+        except Exception:
+            pass
 
     def set_f9_menu_open(self, is_open: bool) -> None:
         """F9 menüsünün açık/kapalı durumunu günceller."""
@@ -467,16 +491,20 @@ class HotkeyListener:
             ):
                 return
 
-            # 1. F9: Botu duraklat / F9 Menüsünü imlecin olduğu yerde aç (0.45s debounce)
+            # 1. F9: Botu duraklat / F9 Menüsünü imlecin olduğu yerde aç (auto-repeat & 0.55s debounce korumalı)
             if key_name == "f9":
                 with self._lock:
-                    last_f9 = max(self._last_f9_ts, self._last_f9_time, self.controller._last_f9_ts)
-                    if now - last_f9 < HOTKEY_DEBOUNCE_SEC:
+                    if self._f9_physically_down:
                         return
+                    last_f9 = max(self._last_f9_ts, self._last_f9_time, self.controller._last_f9_ts)
+                    if now - last_f9 < 0.55:
+                        return
+                    self._f9_physically_down = True
                     self._last_f9_ts = now
                     self._last_f9_time = now
                     self.controller._last_f9_ts = now
                     self._f9_menu_open = True
+                self.controller.free_mouse_cursor()
                 logger.info("[Hotkey] F9 algılandı -> Bot duraklatılıyor / F9 Menüsü açılıyor.")
                 if self.on_f9 is not None:
                     threading.Thread(target=self._safe_invoke, args=(self.on_f9,), daemon=True).start()
@@ -906,6 +934,24 @@ class InputController:
         except Exception as exc:
             logger.error("Fare konumu okunamadı: %s", exc)
         return 0, 0
+
+    def free_mouse_cursor(self) -> None:
+        """
+        F9 Menüsü açıldığında oyunun fareyi ekran ortasına kilitlemesini (ClipCursor / SetCapture)
+        ve basılı kalan sağ/sol fare tuşlarını serbest bırakır.
+        """
+        try:
+            user32 = ctypes.windll.user32
+            user32.ClipCursor(None)
+            user32.ReleaseCapture()
+            for _ in range(8):
+                if user32.ShowCursor(True) >= 0:
+                    break
+            if not self.test_mode:
+                self._sendinput_mouse_button("right", False)
+                self._sendinput_mouse_button("left", False)
+        except Exception as exc:
+            logger.debug("free_mouse_cursor bilgi: %s", exc)
 
     def normalize_coords(self, x: int, y: int) -> Tuple[float, float]:
         """Piksel koordinatlarını [0.0, 1.0] aralığında normalize koordinata dönüştürür."""

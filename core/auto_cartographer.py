@@ -669,19 +669,31 @@ class AutoCartographer:
             self.norm_x = round(self.map_x / float(max(1, w)), 4)
             self.norm_y = round(self.map_y / float(max(1, h)), 4)
 
+            now_cal = time.time()
+            prev_log_x = getattr(self, "_last_logged_cal_x", -999.0)
+            prev_log_y = getattr(self, "_last_logged_cal_y", -999.0)
+            prev_log_ts = getattr(self, "_last_logged_cal_ts", 0.0)
+
             self._is_calibrated_on_world_map = True
-            self._last_calibration_ts = time.time()
+            self._last_calibration_ts = now_cal
             self._cumulative_drift_px = 0.0
             self.odometry_tracker.cumulative_drift_px = 0.0
             self._append_trajectory(self._last_calibration_ts)
 
-            logger.info(
-                "Dünya haritası üzerinde konum kalibre edildi: map=(%.1f, %.1f), norm=(%.4f, %.4f)",
-                self.map_x,
-                self.map_y,
-                self.norm_x,
-                self.norm_y,
-            )
+            if (
+                math.hypot(self.map_x - prev_log_x, self.map_y - prev_log_y) >= 6.0
+                or (now_cal - prev_log_ts) >= 12.0
+            ):
+                self._last_logged_cal_x = self.map_x
+                self._last_logged_cal_y = self.map_y
+                self._last_logged_cal_ts = now_cal
+                logger.info(
+                    "Dünya haritası üzerinde konum kalibre edildi: map=(%.1f, %.1f), norm=(%.4f, %.4f)",
+                    self.map_x,
+                    self.map_y,
+                    self.norm_x,
+                    self.norm_y,
+                )
             return self.get_position()
         except Exception as exc:
             logger.error("calibrate_on_world_map hatası: %s", exc)

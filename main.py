@@ -545,14 +545,26 @@ class GatherionOrchestrator(QObject):
 
     @pyqtSlot()
     def on_f9_hotkey(self) -> None:
-        """Pauses bot and opens the F9 popup menu at cursor position."""
+        """Pauses bot, frees mouse cursor from game lock, and opens the F9 popup menu at cursor position."""
         try:
+            if hasattr(self.input_ctrl, "free_mouse_cursor"):
+                self.input_ctrl.free_mouse_cursor()
+
             if not self.worker.is_paused:
                 self.worker.pause("Duraklatıldı (F9 Menü)")
             if hasattr(self.watchdog, "set_paused"):
                 self.watchdog.set_paused(True, state="PAUSED")
+
+            # Menü zaten yeni açıldıysa (<0.55s) çift sinyalde kapanıp açılmasını (titremeyi) önle
+            if self.f9_menu.isVisible():
+                last_pop = getattr(self.f9_menu, "_last_popup_ts", 0.0)
+                if (time.monotonic() - last_pop) < 0.55:
+                    if hasattr(self.f9_menu, "_release_win32_cursor_and_focus"):
+                        self.f9_menu._release_win32_cursor_and_focus()
+                    return
+
             try:
-                winsound.Beep(900, 90)
+                winsound.Beep(900, 75)
             except Exception:
                 logger.debug("Beep skipped")
 

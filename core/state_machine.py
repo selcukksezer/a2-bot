@@ -687,8 +687,12 @@ class BotWorker(QThread):
                     self._paused = False
                     self._set_state_internal(BotState.WALKING.value)
                 else:
-                    # When entering ROUTE_MODE, auto-sort the route into a smooth sequential loop
-                    self._auto_sort_sequential_route()
+                    # When entering ROUTE_MODE: if called from GUI thread while worker is running,
+                    # defer heavy sequential route sorting to the background worker thread so F9Menu never freezes!
+                    if self.isRunning() and threading.current_thread() is not self:
+                        self._pending_route_sort = True
+                    else:
+                        self._auto_sort_sequential_route()
                     if not self._paused:
                         self._set_state_internal(BotState.WALKING.value)
 
@@ -861,6 +865,11 @@ class BotWorker(QThread):
                     # 1. Process any queued F8 node recording request
                     if self._consume_f8_request():
                         self._execute_f8_record()
+
+                    # 1.5 Process deferred route sorting on worker thread (prevents GUI freeze on F9 -> Route)
+                    if getattr(self, "_pending_route_sort", False):
+                        self._pending_route_sort = False
+                        self._auto_sort_sequential_route()
 
                     # 2. Refresh resting nodes status on RouteManager if supported
                     self._refresh_route_cooldowns()
@@ -1772,12 +1781,25 @@ class BotWorker(QThread):
             if self.route_manager is not None and hasattr(self.route_manager, "open_map"):
                 return bool(self.route_manager.open_map())
             if self.vision is not None and hasattr(self.vision, "is_map_open"):
-                if not self.vision.is_map_open():
-                    self._toggle_map_key()
-                    self.msleep(250)
+                if self.vision.is_map_open():
+                    return True
+                self._toggle_map_key()
+                # Wait up to ~560ms (4 x 140ms) for Aion 2 World Map fade-in animation to complete
+                for _ in range(4):
+                    self.msleep(140)
+                    if self.vision.is_map_open():
+                        self.msleep(80)  # Let map canvas settle at 100% opacity before template matching
+                        return True
+                # Retry once if the first M press was swallowed during camera/combat transition
+                self._toggle_map_key()
+                for _ in range(3):
+                    self.msleep(150)
+                    if self.vision.is_map_open():
+                        self.msleep(80)
+                        return True
                 return bool(self.vision.is_map_open())
             self._toggle_map_key()
-            self.msleep(250)
+            self.msleep(350)
             return True
         except Exception as exc:
             logger.debug("Error opening map: %s", exc)
