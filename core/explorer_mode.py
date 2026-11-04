@@ -56,6 +56,10 @@ from core.auto_cartographer import (
     DEFAULT_DEDUP_RADIUS_PX,
     AutoCartographer,
 )
+from core.depth_glide_navigator import (
+    GlideWaypointController,
+    MonocularDepthObstacleAvoidance,
+)
 from core.input_driver import InputController
 from core.material_scanner import DetectedMaterial, MaterialScanner
 from core.route_manager import (
@@ -121,6 +125,8 @@ class ExplorerModeController:
         test_mode: bool = True,
         enable_sound: bool = False,
         hud_callback: Optional[Callable[[str], None]] = None,
+        depth_obstacle_avoidance: Optional[MonocularDepthObstacleAvoidance] = None,
+        glide_controller: Optional[GlideWaypointController] = None,
     ) -> None:
         self.route_manager: RouteManager = route_manager or RouteManager()
         if region:
@@ -158,6 +164,9 @@ class ExplorerModeController:
         self.cast_wait_sec: float = max(0.01, float(cast_wait_sec))
         self.hud_callback: Optional[Callable[[str], None]] = hud_callback
 
+        self._depth_obstacle_avoidance: Optional[MonocularDepthObstacleAvoidance] = depth_obstacle_avoidance
+        self._glide_controller: Optional[GlideWaypointController] = glide_controller
+
         # Sıralı rota düğüm listesi ve iç durum sayaçları
         self._ordered_nodes: List[NodeData] = []
         self._step_count: int = 0
@@ -171,9 +180,34 @@ class ExplorerModeController:
 
         self._sync_ordered_nodes_from_route_manager()
 
-    # ------------------------------------------------------------------
-    # İç Senkronizasyon ve Yardımcı Metodlar
-    # ------------------------------------------------------------------
+    @property
+    def depth_obstacle_avoidance(self) -> MonocularDepthObstacleAvoidance:
+        """Lazy-loads or returns MonocularDepthObstacleAvoidance instance."""
+        if self._depth_obstacle_avoidance is None:
+            self._depth_obstacle_avoidance = MonocularDepthObstacleAvoidance()
+        return self._depth_obstacle_avoidance
+
+    @depth_obstacle_avoidance.setter
+    def depth_obstacle_avoidance(self, value: Optional[MonocularDepthObstacleAvoidance]) -> None:
+        self._depth_obstacle_avoidance = value
+
+    @property
+    def glide_controller(self) -> GlideWaypointController:
+        """Lazy-loads or returns GlideWaypointController instance."""
+        if self._glide_controller is None:
+            self._glide_controller = GlideWaypointController()
+        return self._glide_controller
+
+    @glide_controller.setter
+    def glide_controller(self, value: Optional[GlideWaypointController]) -> None:
+        self._glide_controller = value
+
+    def check_path_obstacle(self, frame: np.ndarray) -> Dict[str, Any]:
+        """
+        Uses MonocularDepthObstacleAvoidance to estimate whether an obstacle is directly
+        ahead during autonomous exploration.
+        """
+        return self.depth_obstacle_avoidance.analyze_forward_corridor(frame)
     @property
     def active_region(self) -> str:
         """Aktif bölge adını döndürür."""

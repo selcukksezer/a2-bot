@@ -1389,3 +1389,17 @@ class CombatRecovery:
                 "seconds_until_reset": 0.0,
                 "status": "ERROR",
             }
+
+    def get_ready_combat_skills(self, frame: Optional[np.ndarray] = None) -> List[str]:
+        """Reads ready (off-cooldown) skill keys via AdaptiveSkillBarReader, falling back to COMBAT_SKILL_KEYS."""
+        if frame is not None:
+            try:
+                if not hasattr(self, "_skill_bar_reader"):
+                    from core.skill_bar_reader import AdaptiveSkillBarReader
+                    self._skill_bar_reader = AdaptiveSkillBarReader()
+                res = self._skill_bar_reader.get_ready_skills(frame)
+                if isinstance(res, list) and res:
+                    return [str(k) for k in res]
+            except Exception as exc:
+                logger.debug("AdaptiveSkillBarReader fallback: %s", exc)
+        return list(self.COMBAT_SKILL_KEYS)

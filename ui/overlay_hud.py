@@ -233,6 +233,31 @@ class OverlayHUD(QWidget):
         except Exception as exc:
             logger.error("OverlayHUD pencere özellikleri ayarlanamadı: %s", exc)
 
+    def set_enterprise_status(
+        self,
+        yolo_provider: str = "CUDA",
+        kinah_per_hour: int = 0,
+        active_char: str = "Main",
+    ) -> None:
+        """
+        Enterprise status, YOLO provider, Kinah/hour, and active character fields,
+        and optionally updates tooltip or subtitle without breaking UI layout.
+        """
+        try:
+            self.yolo_provider = str(yolo_provider)
+            self.kinah_per_hour = int(kinah_per_hour)
+            self.active_char = str(active_char)
+            
+            # Format tooltip or subtitle update safely
+            formatted_sub = f"Char: {self.active_char} | YOLO: {self.yolo_provider} | Kinah/h: {self.kinah_per_hour:,}"
+            if hasattr(self, "subtitle_label") and self.subtitle_label is not None:
+                current_text = self.subtitle_label.text()
+                # If subtitle doesn't already contain enterprise info, append or update nicely
+                if "YOLO:" not in current_text and "Char:" not in current_text:
+                    self.subtitle_label.setToolTip(formatted_sub)
+        except Exception as exc:
+            logger.error("set_enterprise_status error: %s", exc)
+
     def set_click_through(self, enabled: bool = True) -> bool:
         """
         Win32 tıklama geçişi (WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW)

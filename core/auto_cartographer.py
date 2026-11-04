@@ -68,6 +68,13 @@ from core.route_manager import (
     NodeData,
     RouteManager,
 )
+from core.vision_filters import (
+    FeatherNegativeFilter,
+    MonsterCircularityFilter,
+    Pyramid3DCrestDetector,
+    NameplateHSVIsolator,
+    DynamicInteractionKeyReader,
+)
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -365,6 +372,13 @@ class AutoCartographer:
         self.total_minimap_recorded: int = 0
         self.total_3d_recorded: int = 0
         self.total_harvest_recorded: int = 0
+
+        # Vision filter instances for enhanced confidence safeguard
+        self.feather_negative_filter: FeatherNegativeFilter = FeatherNegativeFilter()
+        self.monster_circularity_filter: MonsterCircularityFilter = MonsterCircularityFilter()
+        self.pyramid_3d_crest_detector: Pyramid3DCrestDetector = Pyramid3DCrestDetector()
+        self.nameplate_isolator: NameplateHSVIsolator = NameplateHSVIsolator()
+        self.key_reader: DynamicInteractionKeyReader = DynamicInteractionKeyReader()
 
         if self.route_manager is not None:
             self._sync_existing_nodes_from_route_manager(self.route_manager)
@@ -1126,6 +1140,16 @@ class AutoCartographer:
                 icx = float(cents_w[idx][0])
                 icy = float(cents_w[idx][1])
 
+                # Optional vision_filters FeatherNegativeFilter & MonsterCircularityFilter safeguard check
+                try:
+                    icon_patch_bgr = minimap_bgr[max(0, by-2):min(mh, by+bh+2), max(0, bx-2):min(mw, bx+bw+2)]
+                    if icon_patch_bgr.size > 0 and hasattr(self, "feather_negative_filter"):
+                        is_f, f_score = self.feather_negative_filter.is_feather_icon(icon_patch_bgr)
+                        if is_f and float(f_score) >= 0.88:
+                            continue
+                except Exception as exc_vf:
+                    logger.debug("vision_filters minimap safeguard skipped: %s", exc_vf)
+
                 # Yanında yeşil yığın rozeti ('2' veya '3') var mı kontrol et (H: 68..90, S >= 75, V >= 115)
                 bx1, by1 = max(0, bx - 4), max(0, by - 4)
                 bx2, by2 = min(mw, bx + bw + 8), min(mh, by + bh + 6)
@@ -1245,7 +1269,17 @@ class AutoCartographer:
                     np.count_nonzero(cv2.inRange(crest_roi, (0, 0, 172), (180, 52, 255)))
                 )
                 min_crest_px = max(16, int(round(28 * scale_x * scale_y)))
-                if crest_white < min_crest_px:
+                
+                # Optional pyramid_3d_crest_detector safeguard check if available
+                pyramid_detected = False
+                if hasattr(self, "pyramid_3d_crest_detector"):
+                    crest_bgr_patch = frame_bgr[cy1:cy2, cx1:cx2]
+                    if crest_bgr_patch.size > 0:
+                        p_dets = self.pyramid_3d_crest_detector.detect(crest_bgr_patch, use_viewport_roi=False)
+                        if p_dets:
+                            pyramid_detected = True
+
+                if crest_white < min_crest_px and not pyramid_detected:
                     continue
 
                 # Etiketin altındaki 3D bitki/cevher dokusundan materyal türünü sınıflandır

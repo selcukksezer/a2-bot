@@ -2828,6 +2828,23 @@ class SettingsWindow(QDialog):
             cnt = len(self._get_nodes_for_selection(reg, rte))
             self.set_status_message(f"{cnt} nokta {reg} · {rte} rotasına aktarıldı")
 
+    def get_enterprise_summary_dict(self) -> Dict[str, Any]:
+        """Returns unified hotkeys, display, and mobile remote settings summary."""
+        summary: Dict[str, Any] = {
+            "hotkeys": {},
+            "display": {},
+            "mobile": {},
+        }
+        for obj in self._candidate_settings_objects():
+            for sec_name in ("hotkeys", "display", "mobile"):
+                sec_obj = getattr(obj, sec_name, None)
+                if sec_obj is not None and not summary[sec_name]:
+                    if isinstance(sec_obj, dict):
+                        summary[sec_name] = dict(sec_obj)
+                    elif hasattr(sec_obj, "__dict__"):
+                        summary[sec_name] = dict(sec_obj.__dict__)
+        return summary
+
 
 # Backwards compatibility alias
 SettingsDialog = SettingsWindow
