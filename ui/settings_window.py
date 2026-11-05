@@ -2857,6 +2857,9 @@ class SettingsWindow(QDialog):
     def get_settings_window_version_info(self) -> dict:
         return {"module": "settings_window", "version": "2.0.0", "ready": True}
 
+    def get_settings_window_diagnostic_snapshot(self) -> dict:
+        return {"module": "settings_window", "status": "ok", "ready": True}
+
 
 # Backwards compatibility alias
 SettingsDialog = SettingsWindow
