@@ -1006,4 +1006,6 @@ def get_template_extractor_integrity_seal() -> dict:
     return {"module": "template_extractor", "sealed": validate_template_extractor_contract(), "telemetry": get_template_extractor_telemetry_payload()}
 
 
+def get_template_extractor_compliance_certificate() -> dict:
+    return {"module": "template_extractor", "certified": validate_template_extractor_contract(), "seal": get_template_extractor_integrity_seal()}
 

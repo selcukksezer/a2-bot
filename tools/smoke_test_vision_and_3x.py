@@ -1829,3 +1829,7 @@ def get_smoke_test_vision_and_3x_integrity_seal() -> dict:
     return {"module": "smoke_test_vision_and_3x", "sealed": validate_smoke_test_vision_and_3x_contract(), "telemetry": get_smoke_test_vision_and_3x_telemetry_payload()}
 
 
+def get_smoke_test_vision_and_3x_compliance_certificate() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "certified": validate_smoke_test_vision_and_3x_contract(), "seal": get_smoke_test_vision_and_3x_integrity_seal()}
+
+

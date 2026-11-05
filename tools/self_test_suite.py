@@ -1370,4 +1370,10 @@ def get_self_test_suite_integrity_seal() -> dict:
     }
 
 
+def get_self_test_suite_compliance_certificate() -> dict:
+    return {
+        "module": "self_test_suite",
+        "certified": validate_self_test_suite_contract(),
+        "seal": get_self_test_suite_integrity_seal(),
+    }
 
