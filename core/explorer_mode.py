@@ -112,6 +112,9 @@ class ExplorerMode:
     def get_explorer_mode_version_info(self) -> dict:
         return {"module": "explorer_mode", "version": "2.0.0", "ready": True}
 
+    def get_explorer_mode_diagnostic_snapshot(self) -> dict:
+        return {"module": "explorer_mode", "status": "ok", "ready": True}
+
 
 class ExplorerModeController:
     """

@@ -1651,6 +1651,9 @@ class VisionEngine:
     def get_vision_engine_version_info(self) -> dict:
         return {"module": "vision", "version": "2.0.0", "ready": True}
 
+    def get_vision_engine_diagnostic_snapshot(self) -> dict:
+        return {"module": "vision", "status": "ok", "ready": True}
+
 
 # Backward-compatible class alias required across existing modules
 Vision = VisionEngine

@@ -2408,3 +2408,7 @@ class AutoCartographer:
     def get_auto_cartographer_version_info(self) -> dict:
         return {"module": "auto_cartographer", "version": "2.0.0", "ready": True}
 
+    def get_auto_cartographer_diagnostic_snapshot(self) -> dict:
+        return {"module": "auto_cartographer", "status": "ok", "ready": True}
+
+

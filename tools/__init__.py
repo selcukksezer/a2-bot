@@ -16,3 +16,7 @@ def get_tools_package_version_info() -> dict:
     return {"package": "tools", "version": "2.0.0", "ready": True}
 
 
+def get_tools_package_diagnostic_snapshot() -> dict:
+    return {"package": "tools", "status": "ok", "ready": True}
+
+

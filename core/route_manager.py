@@ -2420,6 +2420,9 @@ class RouteManager:
     def get_route_manager_version_info(self) -> dict:
         return {"module": "route_manager", "version": "2.0.0", "ready": True}
 
+    def get_route_manager_diagnostic_snapshot(self) -> dict:
+        return {"module": "route_manager", "status": "ok", "ready": True}
+
 
 from core.navigation_intel import PartialNodeDetector, handle_extraction_failure  # noqa: E402,F401
 
