@@ -1228,4 +1228,13 @@ def get_opsec_crypto_readiness_status() -> dict:
     }
 
 
+def get_opsec_crypto_audit_record() -> dict:
+    return {
+        "module": "opsec_crypto",
+        "audit_passed": validate_opsec_crypto_contract(),
+        "readiness": get_opsec_crypto_readiness_status(),
+    }
+
+
+
 

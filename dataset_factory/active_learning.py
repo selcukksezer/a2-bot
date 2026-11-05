@@ -50,6 +50,7 @@ __all__ = [
     "normalize_material_class_key",
     "resolve_class_id",
     "get_active_learning_readiness_status",
+    "get_active_learning_audit_record",
 ]
 
 
@@ -67,6 +68,11 @@ def get_active_learning_baseline_metrics() -> dict:
 
 def get_active_learning_readiness_status() -> dict:
     return {"module": "active_learning", "ready": validate_active_learning_contract(), "metrics": get_active_learning_baseline_metrics()}
+
+
+def get_active_learning_audit_record() -> dict:
+    return {"module": "active_learning", "audit_passed": validate_active_learning_contract(), "readiness": get_active_learning_readiness_status()}
+
 
 
 

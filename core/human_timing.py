@@ -977,4 +977,6 @@ def get_human_timing_readiness_status() -> dict:
     return {"module": "human_timing", "ready": validate_human_timing_contract(), "metrics": get_human_timing_baseline_metrics()}
 
 
+def get_human_timing_audit_record() -> dict:
+    return {"module": "human_timing", "audit_passed": validate_human_timing_contract(), "readiness": get_human_timing_readiness_status()}
 

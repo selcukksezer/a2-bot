@@ -1601,4 +1601,6 @@ def get_ocr_distance_readiness_status() -> dict:
     return {"module": "ocr_distance", "ready": validate_ocr_distance_contract(), "metrics": get_ocr_distance_baseline_metrics()}
 
 
+def get_ocr_distance_audit_record() -> dict:
+    return {"module": "ocr_distance", "audit_passed": validate_ocr_distance_contract(), "readiness": get_ocr_distance_readiness_status()}
 
