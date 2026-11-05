@@ -107,4 +107,8 @@ def get_combat_telemetry_payload() -> dict:
     return {"module": "combat", "payload": get_combat_operational_digest()}
 
 
+def get_combat_integrity_seal() -> dict:
+    return {"module": "combat", "sealed": validate_combat_contract(), "telemetry": get_combat_telemetry_payload()}
+
+
 

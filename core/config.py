@@ -105,3 +105,8 @@ def get_config_telemetry_payload() -> dict:
     return {"module": "config", "payload": get_config_operational_digest()}
 
 
+def get_config_integrity_seal() -> dict:
+    return {"module": "config", "sealed": validate_config_contract(), "telemetry": get_config_telemetry_payload()}
+
+
+

@@ -151,3 +151,8 @@ def get_navigator_telemetry_payload() -> dict:
     return {"module": "navigator", "payload": get_navigator_operational_digest()}
 
 
+def get_navigator_integrity_seal() -> dict:
+    return {"module": "navigator", "sealed": validate_navigator_contract(), "telemetry": get_navigator_telemetry_payload()}
+
+
+

@@ -690,3 +690,8 @@ def get_capture_operational_digest() -> dict:
 def get_capture_telemetry_payload() -> dict:
     return {"module": "capture", "payload": get_capture_operational_digest()}
 
+
+def get_capture_integrity_seal() -> dict:
+    return {"module": "capture", "sealed": validate_capture_contract(), "telemetry": get_capture_telemetry_payload()}
+
+
