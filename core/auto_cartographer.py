@@ -2412,3 +2412,6 @@ class AutoCartographer:
         return {"module": "auto_cartographer", "status": "ok", "ready": True}
 
 
+def get_auto_cartographer_capabilities() -> list:
+    return ["auto_cartographer", "minimap_mapping", "diagnostic_snapshot"]
+

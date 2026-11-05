@@ -20,3 +20,7 @@ def get_tools_package_diagnostic_snapshot() -> dict:
     return {"package": "tools", "status": "ok", "ready": True}
 
 
+def get_tools_package_capabilities() -> list:
+    return ["tools_package", "diagnostic_snapshot", "version_info"]
+
+

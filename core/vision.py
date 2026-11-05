@@ -1657,3 +1657,8 @@ class VisionEngine:
 
 # Backward-compatible class alias required across existing modules
 Vision = VisionEngine
+
+
+def get_vision_capabilities() -> list:
+    return ["vision_engine", "template_matching", "diagnostic_snapshot"]
+

@@ -2426,3 +2426,7 @@ class RouteManager:
 
 from core.navigation_intel import PartialNodeDetector, handle_extraction_failure  # noqa: E402,F401
 
+
+def get_route_manager_capabilities() -> list:
+    return ["route_manager", "node_persistence", "diagnostic_snapshot"]
+

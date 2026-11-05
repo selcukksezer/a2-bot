@@ -1950,3 +1950,8 @@ class ExplorerModeController:
         except Exception as exc:
             logger.error("get_next_sector_waypoint hatası: %s", exc)
             return None
+
+
+def get_explorer_mode_capabilities() -> list:
+    return ["explorer_mode", "autonomous_exploration", "diagnostic_snapshot"]
+
