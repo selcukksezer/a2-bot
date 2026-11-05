@@ -1583,3 +1583,8 @@ if __name__ == "__main__":
         r_inv["elapsed_ms"],
         open_res["elapsed_ms"],
     )
+
+
+def get_ocr_distance_capabilities() -> list:
+    return ["ocr_distance", "distance_parsing", "diagnostic_snapshot"]
+

@@ -959,3 +959,8 @@ def run_statistical_distribution_verification(n_samples: int = 1000) -> Dict[str
 
 if __name__ == "__main__":
     run_statistical_distribution_verification(1000)
+
+
+def get_human_timing_capabilities() -> list:
+    return ["human_timing", "gaussian_jitter", "diagnostic_snapshot"]
+

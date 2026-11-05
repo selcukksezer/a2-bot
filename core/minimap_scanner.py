@@ -1119,4 +1119,6 @@ class MinimapScanner:
         return {"module": "minimap_scanner", "status": "ok", "ready": True}
 
 
+def get_minimap_scanner_capabilities() -> list:
+    return ["minimap_scanner", "compass_tracking", "diagnostic_snapshot"]
 

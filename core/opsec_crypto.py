@@ -1202,3 +1202,8 @@ if __name__ == "__main__":
     assert alert_res is not None and alert_res["inputs_halted"] is True
     assert dummy_ctrl.press_key("f") is False
     print(f"[OK] PanicAlertSystem doğrulandı -> Sebep: {alert_res['reason']}, Girdi Kilidi: {alert_res['inputs_halted']}")
+
+
+def get_opsec_crypto_capabilities() -> list:
+    return ["opsec_crypto", "token_encryption", "diagnostic_snapshot"]
+

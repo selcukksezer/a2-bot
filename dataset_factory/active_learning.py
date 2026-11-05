@@ -50,3 +50,8 @@ __all__ = [
     "normalize_material_class_key",
     "resolve_class_id",
 ]
+
+
+def get_active_learning_capabilities() -> list:
+    return ["active_learning", "uncertainty_sampling", "diagnostic_snapshot"]
+
