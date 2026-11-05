@@ -675,3 +675,7 @@ def get_analytics_dialog_integrity_seal() -> dict:
     return {"module": "analytics_dialog", "sealed": validate_analytics_dialog_contract(), "telemetry": get_analytics_dialog_telemetry_payload()}
 
 
+def get_analytics_dialog_compliance_certificate() -> dict:
+    return {"module": "analytics_dialog", "certified": validate_analytics_dialog_contract(), "seal": get_analytics_dialog_integrity_seal()}
+
+

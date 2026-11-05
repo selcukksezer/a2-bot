@@ -3057,5 +3057,6 @@ def get_mobile_server_integrity_seal() -> dict:
     return {"module": "mobile_server", "sealed": validate_mobile_server_contract(), "telemetry": get_mobile_server_telemetry_payload()}
 
 
-
+def get_mobile_server_compliance_certificate() -> dict:
+    return {"module": "mobile_server", "certified": validate_mobile_server_contract(), "seal": get_mobile_server_integrity_seal()}
 

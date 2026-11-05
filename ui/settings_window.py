@@ -2897,5 +2897,6 @@ def get_settings_window_integrity_seal() -> dict:
     return {"module": "settings_window", "sealed": validate_settings_window_contract(), "telemetry": get_settings_window_telemetry_payload()}
 
 
-
+def get_settings_window_compliance_certificate() -> dict:
+    return {"module": "settings_window", "certified": validate_settings_window_contract(), "seal": get_settings_window_integrity_seal()}
 

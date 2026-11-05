@@ -1167,3 +1167,7 @@ def get_f9_menu_integrity_seal() -> dict:
     return {"module": "f9_menu", "sealed": validate_f9_menu_contract(), "telemetry": get_f9_menu_telemetry_payload()}
 
 
+def get_f9_menu_compliance_certificate() -> dict:
+    return {"module": "f9_menu", "certified": validate_f9_menu_contract(), "seal": get_f9_menu_integrity_seal()}
+
+
