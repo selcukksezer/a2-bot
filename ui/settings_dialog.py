@@ -325,3 +325,11 @@ def get_settings_dialog_operational_digest() -> dict:
     }
 
 
+def get_settings_dialog_telemetry_payload() -> dict:
+    return {
+        "module": "settings_dialog",
+        "payload": get_settings_dialog_operational_digest(),
+    }
+
+
+

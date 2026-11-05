@@ -129,4 +129,6 @@ def get_menu_operational_digest() -> dict:
     return {"module": "menu", "operational": validate_menu_contract(), "audit": get_menu_audit_record()}
 
 
+def get_menu_telemetry_payload() -> dict:
+    return {"module": "menu", "payload": get_menu_operational_digest()}
 

@@ -669,3 +669,11 @@ def get_schema_operational_digest() -> dict:
     }
 
 
+def get_schema_telemetry_payload() -> dict:
+    return {
+        "module": "schema",
+        "payload": get_schema_operational_digest(),
+    }
+
+
+
