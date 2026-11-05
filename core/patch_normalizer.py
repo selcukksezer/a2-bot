@@ -1112,6 +1112,7 @@ __all__ = [
     "get_patch_normalizer_integrity_seal",
     "get_patch_normalizer_compliance_certificate",
     "get_patch_normalizer_readiness_probe",
+    "get_patch_normalizer_audit_summary",
 ]
 
 
@@ -1207,5 +1208,11 @@ def get_patch_normalizer_readiness_probe() -> dict:
     }
 
 
-
+def get_patch_normalizer_audit_summary() -> dict:
+    """Returns audit summary for the patch normalizer module."""
+    return {
+        "module": "patch_normalizer",
+        "audit_passed": validate_patch_normalizer_contract(),
+        "probe": get_patch_normalizer_readiness_probe(),
+    }
 

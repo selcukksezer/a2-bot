@@ -1237,6 +1237,7 @@ __all__ = [
     "get_vision_filters_integrity_seal",
     "get_vision_filters_compliance_certificate",
     "get_vision_filters_readiness_probe",
+    "get_vision_filters_audit_summary",
 ]
 
 
@@ -1314,4 +1315,10 @@ def get_vision_filters_readiness_probe() -> dict:
     }
 
 
+def get_vision_filters_audit_summary() -> dict:
+    return {
+        "module": "vision_filters",
+        "audit_passed": validate_vision_filters_contract(),
+        "probe": get_vision_filters_readiness_probe(),
+    }
 

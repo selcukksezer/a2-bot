@@ -2628,4 +2628,8 @@ def get_state_machine_readiness_probe() -> dict:
     return {"module": "state_machine", "ready": validate_state_machine_contract(), "certificate": get_state_machine_compliance_certificate()}
 
 
+def get_state_machine_audit_summary() -> dict:
+    return {"module": "state_machine", "audit_passed": validate_state_machine_contract(), "probe": get_state_machine_readiness_probe()}
+
+
 

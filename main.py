@@ -1149,3 +1149,8 @@ def get_main_readiness_probe() -> dict:
     return {"module": "main", "ready": validate_main_contract(), "certificate": get_main_compliance_certificate()}
 
 
+def get_main_audit_summary() -> dict:
+    """Returns audit summary for main.py."""
+    return {"module": "main", "audit_passed": validate_main_contract(), "probe": get_main_readiness_probe()}
+
+
