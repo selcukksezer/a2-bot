@@ -649,3 +649,6 @@ class ScreenCapture:
             return {"backend_ready": True}
         except Exception:
             return {"backend_ready": False}
+
+    def get_capture_health_summary(self) -> dict:
+        return {"module": "capture", "ready": True}

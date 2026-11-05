@@ -1179,6 +1179,11 @@ def get_materials_db_summary() -> dict:
         return {"materials_db_ready": False}
 
 
+def get_materials_db_health_summary() -> dict:
+    """Return health summary for the materials_db module."""
+    return {"module": "materials_db", "ready": True}
+
+
 __all__ = [
     "DEFAULT_MAX_HARVESTS",
     "MATERIAL_CATEGORIES",
@@ -1194,4 +1199,5 @@ __all__ = [
     "is_rejected_non_material",
     "classify_3d_material_patch",
     "get_materials_db_summary",
+    "get_materials_db_health_summary",
 ]

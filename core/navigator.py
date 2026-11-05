@@ -109,3 +109,7 @@ class MapNavigator:
         self.close_map()
         print(f"[Navigator] Hedefe tıklandı, yürüyüş başladı (Zaman aşımı: {timeout_sec}s)")
         return True
+
+    def get_navigator_health_summary(self) -> dict:
+        return {"module": "navigator", "ready": True}
+

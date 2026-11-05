@@ -65,3 +65,6 @@ class CombatSystem:
             return {"combat_detector_ready": True}
         except Exception:
             return {"combat_detector_ready": False}
+
+    def get_combat_health_summary(self) -> dict:
+        return {"module": "combat", "ready": True}

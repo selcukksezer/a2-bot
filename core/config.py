@@ -42,6 +42,9 @@ class ConfigManager:
         self.config = self._mgr.settings.to_dict()
         return ok
 
+    def get_config_health_summary(self) -> dict:
+        return {"module": "config", "ready": True}
+
     def get_config_source_summary(self) -> dict:
         try:
             return {"unified_config": "config/settings.json", "ready": True}
