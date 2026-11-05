@@ -45,3 +45,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def get_test_input_ready_flag() -> dict:
+    return {"module": "test_input", "ready": True}
+

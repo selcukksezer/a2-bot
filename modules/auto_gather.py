@@ -103,6 +103,9 @@ class AutoGatherBot:
         except:
             pass
 
+    def get_auto_gather_ready_flag(self) -> dict:
+        return {"module": "auto_gather", "ready": True}
+
 if __name__ == "__main__":
     bot = AutoGatherBot()
     bot.start()

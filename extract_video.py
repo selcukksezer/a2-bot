@@ -20,3 +20,8 @@ for sec in range(0, int(total / fps), 3):
         count += 1
 cap.release()
 print(f"Extracted {count} frames to {out_dir}")
+
+
+def get_extract_video_ready_flag() -> dict:
+    return {"module": "extract_video", "ready": True}
+

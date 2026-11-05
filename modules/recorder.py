@@ -77,3 +77,7 @@ class NodeRecorder:
             pass
 
         return node
+
+    def get_recorder_ready_flag(self) -> dict:
+        return {"module": "recorder", "ready": True}
+

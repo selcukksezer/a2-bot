@@ -159,6 +159,9 @@ class RouteRunner:
             try: winsound.Beep(700, 200)
             except: pass
 
+    def get_route_runner_ready_flag(self) -> dict:
+        return {"module": "route_runner", "ready": True}
+
 if __name__ == "__main__":
     runner = RouteRunner()
     runner.start()
