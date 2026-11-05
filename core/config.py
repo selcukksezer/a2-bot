@@ -57,5 +57,8 @@ class ConfigManager:
     def get_config_version_info(self) -> dict:
         return {"module": "config", "version": "2.0.0", "ready": True}
 
+    def get_config_diagnostic_snapshot(self) -> dict:
+        return {"module": "config", "status": "ok", "ready": True}
+
 
 

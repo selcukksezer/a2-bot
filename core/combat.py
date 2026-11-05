@@ -75,4 +75,7 @@ class CombatSystem:
     def get_combat_version_info(self) -> dict:
         return {"module": "combat", "version": "2.0.0", "ready": True}
 
+    def get_combat_diagnostic_snapshot(self) -> dict:
+        return {"module": "combat", "status": "ok", "ready": True}
+
 

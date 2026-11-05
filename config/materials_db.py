@@ -1207,10 +1207,17 @@ __all__ = [
     "get_materials_db_health_summary",
     "get_materials_db_ready_flag",
     "get_materials_db_version_info",
+    "get_materials_db_diagnostic_snapshot",
 ]
 
 
 def get_materials_db_version_info() -> dict:
     """Return version information for the materials_db module."""
     return {"module": "materials_db", "version": "2.0.0", "ready": True}
+
+
+def get_materials_db_diagnostic_snapshot() -> dict:
+    """Return diagnostic snapshot for the materials_db module."""
+    return {"module": "materials_db", "status": "ok", "ready": True}
+
 
