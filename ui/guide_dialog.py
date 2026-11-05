@@ -832,3 +832,6 @@ class GuideDialog(QDialog):
         return {"module": "guide_dialog", "status": "ok", "ready": True}
 
 
+def get_guide_dialog_capabilities() -> list:
+    return ["guide_dialog", "interactive_help", "diagnostic_snapshot"]
+

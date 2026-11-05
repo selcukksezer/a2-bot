@@ -2937,4 +2937,6 @@ class CartographyRadarDialog(QDialog):
         return {"module": "cartography_radar", "status": "ok", "ready": True}
 
 
+def get_cartography_radar_capabilities() -> list:
+    return ["cartography_radar", "live_radar_overlay", "diagnostic_snapshot"]
 

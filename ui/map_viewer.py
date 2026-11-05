@@ -1256,3 +1256,8 @@ class MapViewerWindow(QDialog):
 # Backwards compatibility alias so existing imports (`from ui.map_viewer import MapViewerDialog`) continue to work
 MapViewerDialog = MapViewerWindow
 MapViewer = MapViewerWindow
+
+
+def get_map_viewer_capabilities() -> list:
+    return ["map_viewer", "route_visualization", "diagnostic_snapshot"]
+

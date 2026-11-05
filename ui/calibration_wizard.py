@@ -1029,4 +1029,6 @@ class CalibrationWizard(QDialog):
         return {"module": "calibration_wizard", "status": "ok", "ready": True}
 
 
+def get_calibration_wizard_capabilities() -> list:
+    return ["calibration_wizard", "roi_calibration", "diagnostic_snapshot"]
 

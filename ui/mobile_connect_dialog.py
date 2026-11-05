@@ -1158,3 +1158,8 @@ if __name__ == "__main__":
         dlg.close()
         sys.exit(0)
     sys.exit(app.exec())
+
+
+def get_mobile_connect_dialog_capabilities() -> list:
+    return ["mobile_connect_dialog", "qr_pairing", "diagnostic_snapshot"]
+
