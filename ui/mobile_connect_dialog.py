@@ -1168,3 +1168,7 @@ def validate_mobile_connect_dialog_contract() -> bool:
     return bool(get_mobile_connect_dialog_capabilities())
 
 
+def get_mobile_connect_dialog_baseline_metrics() -> dict:
+    return {"module": "mobile_connect_dialog", "contract_valid": validate_mobile_connect_dialog_contract(), "capability_count": len(get_mobile_connect_dialog_capabilities())}
+
+

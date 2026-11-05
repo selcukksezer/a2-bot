@@ -1266,3 +1266,7 @@ def validate_map_viewer_contract() -> bool:
     return bool(get_map_viewer_capabilities())
 
 
+def get_map_viewer_baseline_metrics() -> dict:
+    return {"module": "map_viewer", "contract_valid": validate_map_viewer_contract(), "capability_count": len(get_map_viewer_capabilities())}
+
+

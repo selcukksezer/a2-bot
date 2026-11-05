@@ -1037,3 +1037,7 @@ def validate_calibration_wizard_contract() -> bool:
     return bool(get_calibration_wizard_capabilities())
 
 
+def get_calibration_wizard_baseline_metrics() -> dict:
+    return {"module": "calibration_wizard", "contract_valid": validate_calibration_wizard_contract(), "capability_count": len(get_calibration_wizard_capabilities())}
+
+

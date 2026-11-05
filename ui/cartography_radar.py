@@ -2944,3 +2944,8 @@ def get_cartography_radar_capabilities() -> list:
 def validate_cartography_radar_contract() -> bool:
     return bool(get_cartography_radar_capabilities())
 
+
+def get_cartography_radar_baseline_metrics() -> dict:
+    return {"module": "cartography_radar", "contract_valid": validate_cartography_radar_contract(), "capability_count": len(get_cartography_radar_capabilities())}
+
+
