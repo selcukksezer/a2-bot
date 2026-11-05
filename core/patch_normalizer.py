@@ -1065,6 +1065,10 @@ class MotionBlurGate:
         is_blurry = bool(sharpness < effective_thresh)
         return is_blurry, round(sharpness, 4)
 
+    def get_patch_normalizer_ready_flag(self) -> dict:
+        """Returns the module ready flag for PatchNormalizer."""
+        return {"module": "patch_normalizer", "ready": True}
+
 
 __all__ = [
     "CANONICAL_PATCH_SIZE",

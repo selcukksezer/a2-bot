@@ -1211,6 +1211,9 @@ class NameplateHSVIsolator:
         except Exception:
             return {"vision_filters_ready": False}
 
+    def get_vision_filters_ready_flag(self) -> dict:
+        return {"module": "vision_filters", "ready": True}
+
 
 __all__ = [
     "FeatherNegativeFilter",

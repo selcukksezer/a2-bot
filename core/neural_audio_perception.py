@@ -1396,6 +1396,9 @@ class AudioLoopbackFFTAnalyzer:
         ).astype(np.float32)
         return (carrier * env).astype(np.float32)
 
+    def get_neural_audio_ready_flag(self) -> dict:
+        return {"module": "neural_audio_perception", "ready": True}
+
     def get_neural_audio_health_summary(self) -> dict:
         try:
             return {"neural_audio_ready": True}

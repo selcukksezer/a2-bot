@@ -1019,6 +1019,10 @@ class GatherionOrchestrator(QObject):
             logger.debug("Mobile server URL lookup fallback")
         return f"http://{get_local_lan_ip()}:8765"
 
+    def get_main_controller_ready_flag(self) -> dict:
+        """Returns the readiness flag for GatherionController."""
+        return {"module": "main", "ready": True}
+
     def get_main_controller_health_summary(self) -> dict:
         """Returns health summary for GatherionMainController safely."""
         try:

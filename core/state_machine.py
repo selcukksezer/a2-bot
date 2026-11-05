@@ -2574,3 +2574,7 @@ class BotWorker(QThread):
             return {"worker_ready": True, "mode": str(getattr(self, "mode", "route"))}
         except Exception:
             return {"worker_ready": True, "mode": "route"}
+
+    def get_state_machine_ready_flag(self) -> dict:
+        return {"module": "state_machine", "ready": True}
+
