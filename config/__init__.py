@@ -51,3 +51,11 @@ def get_config_init_operational_digest() -> dict:
 def get_config_init_telemetry_payload() -> dict:
     return {"module": "config_init", "telemetry_ready": validate_config_init_contract(), "digest": get_config_init_operational_digest()}
 
+
+get_config_package_telemetry_payload = get_config_init_telemetry_payload
+
+
+def get_config_package_integrity_seal() -> dict:
+    return {"module": "config_package", "sealed": validate_config_package_contract(), "telemetry": get_config_package_telemetry_payload()}
+
+

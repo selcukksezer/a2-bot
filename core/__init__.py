@@ -52,3 +52,11 @@ def get_core_init_telemetry_payload() -> dict:
     return {"module": "core_init", "telemetry_ready": validate_core_init_contract(), "digest": get_core_init_operational_digest()}
 
 
+get_core_package_operational_digest = get_core_init_operational_digest
+get_core_package_telemetry_payload = get_core_init_telemetry_payload
+
+
+def get_core_package_integrity_seal() -> dict:
+    return {"module": "core_package", "sealed": validate_core_package_contract(), "telemetry": get_core_package_telemetry_payload()}
+
+

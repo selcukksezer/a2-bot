@@ -1196,3 +1196,12 @@ def get_smoke_test_dataset_factory_telemetry_payload() -> dict:
     }
 
 
+def get_smoke_test_dataset_factory_integrity_seal() -> dict:
+    return {
+        "module": "smoke_test_dataset_factory",
+        "sealed": validate_smoke_test_dataset_factory_contract(),
+        "telemetry": get_smoke_test_dataset_factory_telemetry_payload(),
+    }
+
+
+

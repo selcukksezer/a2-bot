@@ -50,3 +50,11 @@ def get_ui_init_operational_digest() -> dict:
 def get_ui_init_telemetry_payload() -> dict:
     return {"module": "ui_init", "telemetry_ready": validate_ui_init_contract(), "digest": get_ui_init_operational_digest()}
 
+
+get_ui_package_telemetry_payload = get_ui_init_telemetry_payload
+
+
+def get_ui_package_integrity_seal() -> dict:
+    return {"module": "ui_package", "sealed": validate_ui_package_contract(), "telemetry": get_ui_package_telemetry_payload()}
+
+

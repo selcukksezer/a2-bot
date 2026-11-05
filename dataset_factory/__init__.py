@@ -17,6 +17,7 @@ __all__ = [
     "get_dataset_factory_package_audit_record",
     "get_dataset_factory_init_operational_digest",
     "get_dataset_factory_init_telemetry_payload",
+    "get_dataset_factory_package_integrity_seal",
 ]
 
 
@@ -89,5 +90,17 @@ def get_dataset_factory_init_telemetry_payload() -> dict:
         "telemetry_ready": validate_dataset_factory_init_contract(),
         "digest": get_dataset_factory_init_operational_digest(),
     }
+
+
+get_dataset_factory_package_telemetry_payload = get_dataset_factory_init_telemetry_payload
+
+
+def get_dataset_factory_package_integrity_seal() -> dict:
+    return {
+        "module": "dataset_factory_package",
+        "sealed": validate_dataset_factory_package_contract(),
+        "telemetry": get_dataset_factory_package_telemetry_payload(),
+    }
+
 
 
