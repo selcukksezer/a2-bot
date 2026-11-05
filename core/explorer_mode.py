@@ -106,6 +106,9 @@ class ExplorerMode:
         except Exception:
             return {"explorer_ready": False}
 
+    def get_explorer_mode_ready_flag(self) -> dict:
+        return {"module": "explorer_mode", "ready": True}
+
 
 class ExplorerModeController:
     """

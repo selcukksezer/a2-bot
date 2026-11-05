@@ -2400,3 +2400,7 @@ class AutoCartographer:
             map_y=self.map_y,
             clear_trajectory=clear_trajectory,
         )
+
+    def get_auto_cartographer_ready_flag(self) -> dict:
+        """Returns the auto cartographer ready flag."""
+        return {"module": "auto_cartographer", "ready": True}

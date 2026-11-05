@@ -1644,6 +1644,10 @@ class VisionEngine:
         except Exception:
             return {"vision_ready": False}
 
+    def get_vision_engine_ready_flag(self) -> dict:
+        """Returns vision engine ready flag."""
+        return {"module": "vision", "ready": True}
+
 
 # Backward-compatible class alias required across existing modules
 Vision = VisionEngine

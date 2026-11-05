@@ -2408,6 +2408,9 @@ class RouteManager:
             logger.error("ZIP içe aktarma hatası (%s): %s", zip_path, exc)
             raise
 
+    def get_route_manager_ready_flag(self) -> dict:
+        return {"module": "route_manager", "ready": True}
+
     def get_route_manager_health_summary(self) -> dict:
         try:
             return {"route_manager_ready": True}
