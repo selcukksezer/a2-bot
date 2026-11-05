@@ -1147,3 +1147,8 @@ if __name__ == "__main__":
 def get_smoke_test_dataset_factory_version_info() -> dict:
     return {"module": "smoke_test_dataset_factory", "version": "2.0.0", "ready": True}
 
+
+def get_smoke_test_dataset_factory_diagnostic_snapshot() -> dict:
+    return {"module": "smoke_test_dataset_factory", "status": "ok", "ready": True}
+
+

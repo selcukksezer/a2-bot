@@ -31,3 +31,7 @@ def get_dataset_factory_package_version_info() -> dict:
     return {"package": "dataset_factory", "version": "2.0.0", "ready": True}
 
 
+def get_dataset_factory_package_diagnostic_snapshot() -> dict:
+    return {"package": "dataset_factory", "status": "ok", "ready": True}
+
+

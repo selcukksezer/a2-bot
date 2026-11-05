@@ -16,3 +16,7 @@ def get_config_package_version_info() -> dict:
     return {"package": "config", "version": "2.0.0", "ready": True}
 
 
+def get_config_package_diagnostic_snapshot() -> dict:
+    return {"package": "config", "status": "ok", "ready": True}
+
+
