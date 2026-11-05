@@ -25,3 +25,8 @@ print(f"Extracted {count} frames to {out_dir}")
 def get_extract_video_ready_flag() -> dict:
     return {"module": "extract_video", "ready": True}
 
+
+def get_extract_video_version_info() -> dict:
+    return {"module": "extract_video", "version": "2.0.0", "ready": True}
+
+

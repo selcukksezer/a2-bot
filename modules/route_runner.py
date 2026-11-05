@@ -162,6 +162,9 @@ class RouteRunner:
     def get_route_runner_ready_flag(self) -> dict:
         return {"module": "route_runner", "ready": True}
 
+    def get_route_runner_version_info(self) -> dict:
+        return {"module": "route_runner", "version": "2.0.0", "ready": True}
+
 if __name__ == "__main__":
     runner = RouteRunner()
     runner.start()
