@@ -126,3 +126,8 @@ class MapNavigator:
 def get_navigator_capabilities() -> list:
     return ["navigator", "waypoint_traversal", "diagnostic_snapshot"]
 
+
+def validate_navigator_contract() -> bool:
+    return bool(get_navigator_capabilities())
+
+

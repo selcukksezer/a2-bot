@@ -667,3 +667,7 @@ def get_capture_capabilities() -> list:
     return ["capture", "screen_grabber", "diagnostic_snapshot"]
 
 
+def validate_capture_contract() -> bool:
+    return bool(get_capture_capabilities())
+
+

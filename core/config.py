@@ -64,3 +64,7 @@ class ConfigManager:
 def get_config_capabilities() -> list:
     return ["config_manager", "settings_persistence", "diagnostic_snapshot"]
 
+
+def validate_config_contract() -> bool:
+    return bool(get_config_capabilities())
+

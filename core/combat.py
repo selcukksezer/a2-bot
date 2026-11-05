@@ -83,3 +83,7 @@ def get_combat_capabilities() -> list:
     return ["combat", "skill_rotation", "diagnostic_snapshot"]
 
 
+def validate_combat_contract() -> bool:
+    return bool(get_combat_capabilities())
+
+

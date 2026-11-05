@@ -1209,6 +1209,7 @@ __all__ = [
     "get_materials_db_version_info",
     "get_materials_db_diagnostic_snapshot",
     "get_materials_db_capabilities",
+    "validate_materials_db_contract",
 ]
 
 
@@ -1226,5 +1227,9 @@ def get_materials_db_capabilities() -> list:
     """Return capabilities list for the materials_db module."""
     return ["materials_db", "gatherable_catalog", "diagnostic_snapshot"]
 
+
+def validate_materials_db_contract() -> bool:
+    """Validate the contract for the materials_db module."""
+    return bool(get_materials_db_capabilities())
 
 
