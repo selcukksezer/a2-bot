@@ -157,3 +157,11 @@ def get_auto_gather_operational_digest() -> dict:
     }
 
 
+def get_auto_gather_telemetry_payload() -> dict:
+    return {
+        "module": "auto_gather",
+        "payload": get_auto_gather_operational_digest(),
+    }
+
+
+

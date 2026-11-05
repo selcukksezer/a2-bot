@@ -197,4 +197,6 @@ def get_route_runner_operational_digest() -> dict:
     return {"module": "route_runner", "operational": validate_route_runner_contract(), "audit": get_route_runner_audit_record()}
 
 
+def get_route_runner_telemetry_payload() -> dict:
+    return {"module": "route_runner", "payload": get_route_runner_operational_digest()}
 

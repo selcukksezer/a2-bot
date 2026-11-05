@@ -112,4 +112,6 @@ def get_recorder_operational_digest() -> dict:
     return {"module": "recorder", "operational": validate_recorder_contract(), "audit": get_recorder_audit_record()}
 
 
+def get_recorder_telemetry_payload() -> dict:
+    return {"module": "recorder", "payload": get_recorder_operational_digest()}
 

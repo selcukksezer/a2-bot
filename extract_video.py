@@ -57,3 +57,7 @@ def get_extract_video_audit_record() -> dict:
 def get_extract_video_operational_digest() -> dict:
     return {"module": "extract_video", "operational": validate_extract_video_contract(), "audit": get_extract_video_audit_record()}
 
+
+def get_extract_video_telemetry_payload() -> dict:
+    return {"module": "extract_video", "payload": get_extract_video_operational_digest()}
+
