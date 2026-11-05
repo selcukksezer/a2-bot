@@ -7,3 +7,8 @@ def get_config_package_summary() -> dict:
     except Exception:
         return {"config_ready": False}
 
+
+def get_config_package_ready_flag() -> dict:
+    return {"package": "config", "ready": True}
+
+

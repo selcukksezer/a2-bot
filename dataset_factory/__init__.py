@@ -22,3 +22,8 @@ def get_dataset_factory_package_summary() -> dict:
     except Exception:
         return {"dataset_factory_ready": False}
 
+
+def get_dataset_factory_package_ready_flag() -> dict:
+    return {"package": "dataset_factory", "ready": True}
+
+
