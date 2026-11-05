@@ -2612,4 +2612,8 @@ def get_state_machine_operational_digest() -> dict:
     return {"module": "state_machine", "operational": validate_state_machine_contract(), "audit": get_state_machine_audit_record()}
 
 
+def get_state_machine_telemetry_payload() -> dict:
+    return {"module": "state_machine", "telemetry_ready": validate_state_machine_contract(), "digest": get_state_machine_operational_digest()}
+
+
 

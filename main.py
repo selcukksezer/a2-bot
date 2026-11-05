@@ -1129,3 +1129,9 @@ def get_main_operational_digest() -> dict:
     return {"module": "main", "operational": validate_main_contract(), "audit": get_main_audit_record()}
 
 
+def get_main_telemetry_payload() -> dict:
+    """Returns telemetry payload for main.py."""
+    return {"module": "main", "telemetry_ready": validate_main_contract(), "digest": get_main_operational_digest()}
+
+
+

@@ -1450,3 +1450,8 @@ def get_neural_audio_perception_audit_record() -> dict:
 def get_neural_audio_perception_operational_digest() -> dict:
     return {"module": "neural_audio_perception", "operational": validate_neural_audio_perception_contract(), "audit": get_neural_audio_perception_audit_record()}
 
+
+def get_neural_audio_perception_telemetry_payload() -> dict:
+    return {"module": "neural_audio_perception", "telemetry_ready": validate_neural_audio_perception_contract(), "digest": get_neural_audio_perception_operational_digest()}
+
+
