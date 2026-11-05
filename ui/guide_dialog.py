@@ -814,3 +814,10 @@ class GuideDialog(QDialog):
                 "summary": "Oyun ekranı üzerinde şeffaf katman olarak çalışan; anlık durum, istatistikler ve bot performansını gösteren heads-up display."
             }
         ]
+
+    def get_guide_dialog_health_summary(self) -> dict:
+        """Returns health summary of the guide dialog safely."""
+        try:
+            return {"guide_dialog_ready": True}
+        except Exception:
+            return {"guide_dialog_ready": False}

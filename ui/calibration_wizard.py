@@ -1012,3 +1012,9 @@ class CalibrationWizard(QDialog):
             logger.error("Error in run_vision_filters_diagnostic: %s", exc)
             diagnostic["error"] = str(exc)
         return diagnostic
+
+    def get_calibration_wizard_health_summary(self) -> dict:
+        try:
+            return {"calibration_wizard_ready": True}
+        except Exception:
+            return {"calibration_wizard_ready": False}

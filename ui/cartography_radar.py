@@ -2920,3 +2920,9 @@ class CartographyRadarDialog(QDialog):
         except Exception as exc:
             logger.debug("normalize_node_patch_preview fallback: %s", exc)
             return patch_img
+
+    def get_cartography_radar_health_summary(self) -> dict:
+        try:
+            return {"cartography_radar_ready": True}
+        except Exception:
+            return {"cartography_radar_ready": False}

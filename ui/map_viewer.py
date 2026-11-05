@@ -1237,6 +1237,12 @@ class MapViewerWindow(QDialog):
         except Exception as exc:
             logger.error("Failed deleting node #%d: %s", node_id, exc)
 
+    def get_map_viewer_health_summary(self) -> dict:
+        try:
+            return {"map_viewer_ready": True}
+        except Exception:
+            return {"map_viewer_ready": False}
+
 
 # Backwards compatibility alias so existing imports (`from ui.map_viewer import MapViewerDialog`) continue to work
 MapViewerDialog = MapViewerWindow

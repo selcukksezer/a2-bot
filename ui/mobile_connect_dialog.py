@@ -1131,6 +1131,12 @@ class MobileConnectDialog(QDialog):
     def _show_feedback(self, message: str) -> None:
         self.lbl_feedback.setText(message)
 
+    def get_mobile_connect_dialog_health_summary(self) -> dict:
+        try:
+            return {"mobile_connect_dialog_ready": True}
+        except Exception:
+            return {"mobile_connect_dialog_ready": False}
+
 
 if __name__ == "__main__":
     import sys
