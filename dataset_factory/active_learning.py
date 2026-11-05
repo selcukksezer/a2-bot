@@ -18,12 +18,18 @@ class ActiveLearningEngine(ActiveLearningLoop):
     def get_active_learning_ready_flag(self) -> dict:
         return {"module": "active_learning", "ready": True}
 
+    def get_active_learning_version_info(self) -> dict:
+        return {"module": "active_learning", "version": "2.0.0", "ready": True}
+
 
 class ActiveLearning(ActiveLearningEngine):
     """Alias wrapper for ActiveLearningEngine."""
 
     def get_active_learning_ready_flag(self) -> dict:
         return {"module": "active_learning", "ready": True}
+
+    def get_active_learning_version_info(self) -> dict:
+        return {"module": "active_learning", "version": "2.0.0", "ready": True}
 
 
 __all__ = [

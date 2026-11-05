@@ -406,6 +406,9 @@ class LocalVaultCrypto:
     def get_opsec_crypto_ready_flag(self) -> dict:
         return {"module": "opsec_crypto", "ready": True}
 
+    def get_opsec_crypto_version_info(self) -> dict:
+        return {"module": "opsec_crypto", "version": "2.0.0", "ready": True}
+
 
 # ============================================================================
 # 2. NativeWin32HotkeyManager (WH_KEYBOARD_LL Kancası Olmadan Kısayol Dinleyici)

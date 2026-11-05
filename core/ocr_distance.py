@@ -1455,6 +1455,9 @@ class GameHUDReader:
     def get_ocr_distance_ready_flag(self) -> dict:
         return {"module": "ocr_distance", "ready": True}
 
+    def get_ocr_distance_version_info(self) -> dict:
+        return {"module": "ocr_distance", "version": "2.0.0", "ready": True}
+
 
 _DEFAULT_HUD_READER: Optional[GameHUDReader] = None
 

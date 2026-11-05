@@ -1112,3 +1112,7 @@ class MinimapScanner:
     def get_minimap_scanner_ready_flag(self) -> dict:
         return {"module": "minimap_scanner", "ready": True}
 
+    def get_minimap_scanner_version_info(self) -> dict:
+        return {"module": "minimap_scanner", "version": "2.0.0", "ready": True}
+
+
