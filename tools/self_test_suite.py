@@ -1294,5 +1294,10 @@ def get_self_test_suite_summary() -> dict:
         return {"self_test_ready": False}
 
 
+def get_self_test_suite_ready_flag() -> dict:
+    """Returns self test suite ready flag."""
+    return {"module": "self_test_suite", "ready": True}
+
+
 if __name__ == "__main__":
     sys.exit(main())

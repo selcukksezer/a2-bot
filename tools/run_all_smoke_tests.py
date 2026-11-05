@@ -1457,5 +1457,10 @@ def get_master_smoke_runner_summary() -> dict:
         return {"master_smoke_ready": False, "total_checks": 0}
 
 
+def get_master_smoke_runner_ready_flag() -> dict:
+    """Returns the ready flag for the master smoke runner."""
+    return {"module": "run_all_smoke_tests", "ready": True}
+
+
 if __name__ == "__main__":
     sys.exit(main())

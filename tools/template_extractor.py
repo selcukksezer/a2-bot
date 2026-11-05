@@ -956,5 +956,10 @@ def get_extractor_health_summary() -> dict:
         return {"extractor_ready": False}
 
 
+def get_template_extractor_ready_flag() -> dict:
+    """Returns template extractor ready flag."""
+    return {"module": "template_extractor", "ready": True}
+
+
 if __name__ == "__main__":
     sys.exit(main())

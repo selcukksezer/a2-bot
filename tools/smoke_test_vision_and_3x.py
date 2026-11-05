@@ -1769,6 +1769,10 @@ def _print_turkish_smoke_report(
     print(sep)
 
 
+def get_vision_3x_smoke_ready_flag() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "ready": True}
+
+
 def get_vision_3x_smoke_summary() -> dict:
     try:
         return {"vision_3x_smoke_ready": True}
