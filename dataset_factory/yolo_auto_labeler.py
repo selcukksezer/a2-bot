@@ -1468,6 +1468,7 @@ __all__ = [
     "NEGATIVE_CLASS_IDS",
     "map_material_name_to_yolo_class_id",
     "YOLOAutoLabeler",
+    "get_yolo_auto_labeler_readiness_status",
 ]
 
 
@@ -1481,5 +1482,13 @@ def validate_yolo_auto_labeler_contract() -> bool:
 
 def get_yolo_auto_labeler_baseline_metrics() -> dict:
     return {"module": "yolo_auto_labeler", "contract_valid": validate_yolo_auto_labeler_contract(), "capability_count": len(get_yolo_auto_labeler_capabilities())}
+
+
+def get_yolo_auto_labeler_readiness_status() -> dict:
+    try:
+        return {"module": "yolo_auto_labeler", "ready": validate_yolo_auto_labeler_contract(), "metrics": get_yolo_auto_labeler_baseline_metrics()}
+    except Exception:
+        return {"module": "yolo_auto_labeler", "ready": False, "metrics": {}}
+
 
 

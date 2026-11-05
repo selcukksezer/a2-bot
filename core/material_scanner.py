@@ -1369,3 +1369,7 @@ def get_material_scanner_baseline_metrics() -> dict:
     return {"module": "material_scanner", "contract_valid": validate_material_scanner_contract(), "capability_count": len(get_material_scanner_capabilities())}
 
 
+def get_material_scanner_readiness_status() -> dict:
+    return {"module": "material_scanner", "ready": validate_material_scanner_contract(), "metrics": get_material_scanner_baseline_metrics()}
+
+

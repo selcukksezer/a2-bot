@@ -1799,3 +1799,12 @@ def get_rtx_trainer_engine_baseline_metrics() -> dict:
     }
 
 
+def get_rtx_trainer_engine_readiness_status() -> dict:
+    return {
+        "module": "rtx_trainer_engine",
+        "ready": validate_rtx_trainer_engine_contract(),
+        "metrics": get_rtx_trainer_engine_baseline_metrics(),
+    }
+
+
+
