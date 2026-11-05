@@ -371,4 +371,6 @@ def get_uac_elevator_integrity_seal() -> dict:
     return {"module": "uac_elevator", "sealed": validate_uac_elevator_contract(), "telemetry": get_uac_elevator_telemetry_payload()}
 
 
+def get_uac_elevator_compliance_certificate() -> dict:
+    return {"module": "uac_elevator", "certified": validate_uac_elevator_contract(), "seal": get_uac_elevator_integrity_seal()}
 

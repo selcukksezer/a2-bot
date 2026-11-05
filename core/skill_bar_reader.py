@@ -501,3 +501,8 @@ def get_skill_bar_reader_integrity_seal() -> dict:
     return {"module": "skill_bar_reader", "sealed": validate_skill_bar_reader_contract(), "telemetry": get_skill_bar_reader_telemetry_payload()}
 
 
+def get_skill_bar_reader_compliance_certificate() -> dict:
+    return {"module": "skill_bar_reader", "certified": validate_skill_bar_reader_contract(), "seal": get_skill_bar_reader_integrity_seal()}
+
+
+
