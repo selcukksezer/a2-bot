@@ -762,3 +762,6 @@ class SelfHealingTemplateTuner:
                 "saved_patch_path": saved_path_str,
                 "backup_patch_path": backup_path_str,
             }
+
+    def get_dpi_focus_guard_ready_flag(self) -> dict:
+        return {"module": "dpi_focus_guard", "ready": True}

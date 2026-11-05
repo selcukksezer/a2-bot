@@ -284,6 +284,10 @@ def get_uac_elevation_summary() -> dict:
         return {"uac_module_ready": False}
 
 
+def get_uac_elevator_ready_flag() -> dict:
+    return {"module": "uac_elevator", "ready": True}
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     logger.info("Running core/uac_elevator.py self-check...")

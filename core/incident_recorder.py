@@ -674,3 +674,6 @@ class IncidentRecorder:
             return {"recorder_ready": True}
         except Exception:
             return {"recorder_ready": False}
+
+    def get_incident_recorder_ready_flag(self) -> dict:
+        return {"module": "incident_recorder", "ready": True}

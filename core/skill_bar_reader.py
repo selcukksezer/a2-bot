@@ -451,6 +451,9 @@ class MicroCameraLookAround:
             self.last_sway_summary = summary
             return summary
 
+    def get_skill_bar_reader_ready_flag(self) -> dict:
+        return {"module": "skill_bar_reader", "ready": True}
+
     def get_skill_reader_health_summary(self) -> dict:
         try:
             return {"skill_reader_ready": True}

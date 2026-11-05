@@ -410,3 +410,7 @@ class DryRunReplaySimulator:
         except Exception:
             return {"simulator_ready": False}
 
+    def get_dry_run_simulator_ready_flag(self) -> dict:
+        return {"module": "dry_run_simulator", "ready": True}
+
+
