@@ -1182,3 +1182,7 @@ class TelemetryEngine:
     def get_telemetry_engine_ready_flag(self) -> dict:
         return {"module": "telemetry", "ready": True}
 
+    def get_telemetry_engine_version_info(self) -> dict:
+        return {"module": "telemetry", "version": "2.0.0", "ready": True}
+
+
