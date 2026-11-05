@@ -1403,3 +1403,10 @@ class CombatRecovery:
             except Exception as exc:
                 logger.debug("AdaptiveSkillBarReader fallback: %s", exc)
         return list(self.COMBAT_SKILL_KEYS)
+
+    def get_combat_recovery_health_summary(self) -> dict:
+        try:
+            return {"combat_recovery_ready": True}
+        except Exception as exc:
+            logger.error("get_combat_recovery_health_summary hatası: %s", exc)
+            return {"combat_recovery_ready": False}

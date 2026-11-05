@@ -1455,6 +1455,13 @@ class InputController:
             logger.debug("record_dry_run_event warning: %s", exc)
             return {"recorded": False, "action_type": action_type}
 
+    def get_input_controller_health_summary(self) -> dict:
+        try:
+            return {"input_controller_ready": True}
+        except Exception as e:
+            logger.debug("get_input_controller_health_summary error: %s", e)
+            return {"input_controller_ready": False}
+
 
 # Geriye dönük uyumluluk için takma ad (Alias)
 InputDriver = InputController

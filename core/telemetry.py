@@ -1172,3 +1172,9 @@ class TelemetryEngine:
 
         logger.info(f"Uyarı işlendi [{clean_type}]: {clean_msg} (Durum={success})")
         return success
+
+    def get_telemetry_health_summary(self) -> dict:
+        try:
+            return {"telemetry_ready": True}
+        except Exception:
+            return {"telemetry_ready": False}

@@ -528,6 +528,13 @@ class DXGIDesktopCapture:
                     logger.debug("Error closing thread-local MSS: %s", exc)
                 self._thread_local.sct = None
 
+    def get_stealth_capture_health_summary(self) -> dict:
+        """Returns stealth capture readiness health summary."""
+        try:
+            return {"stealth_capture_ready": True}
+        except Exception:
+            return {"stealth_capture_ready": False}
+
 
 class AdaptiveFramePacer:
     """

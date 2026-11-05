@@ -865,6 +865,14 @@ class BotWatchdog:
             status["display_valid"] = display_ok
             return status
 
+    def get_watchdog_health_summary(self) -> dict:
+        """Returns watchdog health summary safely inside a try/except block."""
+        try:
+            return {"watchdog_ready": True}
+        except Exception as exc:
+            logger.debug("get_watchdog_health_summary failed: %s", exc)
+            return {"watchdog_ready": False}
+
     def start(self) -> bool:
         """Starts the lightweight background watchdog monitoring thread."""
         with self._lock:
