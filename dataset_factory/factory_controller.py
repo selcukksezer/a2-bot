@@ -1129,6 +1129,9 @@ class AutoLabelingDatasetFactory:
         except Exception:
             return {"factory_controller_ready": False}
 
+    def get_factory_controller_ready_flag(self) -> dict:
+        return {"module": "factory_controller", "ready": True}
+
 
 __all__ = [
     "FACTORY_12_CLASS_NAMES",

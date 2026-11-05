@@ -919,6 +919,9 @@ class TradeBrokerPriceScanner:
             "recommendation_tr": recommendation_tr,
         }
 
+    def get_economy_broker_ready_flag(self) -> dict:
+        return {"module": "economy_broker", "ready": True}
+
 
 # ==============================================================================
 # 2. AUTO-CRAFTING & SUBSTANCE MORPHING QUEUE
@@ -1374,3 +1377,7 @@ class SessionProfitSimulator:
             return {"economy_broker_ready": True}
         except Exception:
             return {"economy_broker_ready": False}
+
+    def get_economy_broker_ready_flag(self) -> dict:
+        return {"module": "economy_broker", "ready": True}
+

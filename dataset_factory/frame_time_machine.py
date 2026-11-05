@@ -356,3 +356,7 @@ class PreGatherTimeMachineBuffer:
             return {"time_machine_ready": True}
         except Exception:
             return {"time_machine_ready": False}
+
+    def get_time_machine_ready_flag(self) -> dict:
+        return {"module": "frame_time_machine", "ready": True}
+
