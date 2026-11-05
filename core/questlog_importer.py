@@ -1551,3 +1551,8 @@ def get_questlog_importer_operational_digest() -> dict:
     return {"module": "questlog_importer", "operational": validate_questlog_importer_contract(), "audit": get_questlog_importer_audit_record()}
 
 
+def get_questlog_importer_telemetry_payload() -> dict:
+    return {"module": "questlog_importer", "payload": get_questlog_importer_operational_digest()}
+
+
+

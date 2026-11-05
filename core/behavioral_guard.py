@@ -1015,5 +1015,9 @@ def get_behavioral_guard_operational_digest() -> dict:
     }
 
 
-
+def get_behavioral_guard_telemetry_payload() -> dict:
+    return {
+        "module": "behavioral_guard",
+        "payload": get_behavioral_guard_operational_digest(),
+    }
 

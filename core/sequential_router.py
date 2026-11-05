@@ -1957,5 +1957,9 @@ def get_sequential_router_operational_digest() -> dict:
     }
 
 
-
+def get_sequential_router_telemetry_payload() -> dict:
+    return {
+        "module": "sequential_router",
+        "payload": get_sequential_router_operational_digest(),
+    }
 

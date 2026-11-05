@@ -922,5 +922,9 @@ def get_depth_glide_navigator_operational_digest() -> dict:
     }
 
 
-
+def get_depth_glide_navigator_telemetry_payload() -> dict:
+    return {
+        "module": "depth_glide_navigator",
+        "payload": get_depth_glide_navigator_operational_digest(),
+    }
 

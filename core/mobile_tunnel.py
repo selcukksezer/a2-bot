@@ -1180,3 +1180,7 @@ def get_mobile_tunnel_operational_digest() -> dict:
     return {"module": "mobile_tunnel", "operational": validate_mobile_tunnel_contract(), "audit": get_mobile_tunnel_audit_record()}
 
 
+def get_mobile_tunnel_telemetry_payload() -> dict:
+    return {"module": "mobile_tunnel", "payload": get_mobile_tunnel_operational_digest()}
+
+
