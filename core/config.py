@@ -68,3 +68,7 @@ def get_config_capabilities() -> list:
 def validate_config_contract() -> bool:
     return bool(get_config_capabilities())
 
+
+def get_config_baseline_metrics() -> dict:
+    return {"module": "config", "contract_valid": validate_config_contract(), "capability_count": len(get_config_capabilities())}
+

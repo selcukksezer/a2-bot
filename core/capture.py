@@ -671,3 +671,7 @@ def validate_capture_contract() -> bool:
     return bool(get_capture_capabilities())
 
 
+def get_capture_baseline_metrics() -> dict:
+    return {"module": "capture", "contract_valid": validate_capture_contract(), "capability_count": len(get_capture_capabilities())}
+
+

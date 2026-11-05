@@ -131,3 +131,7 @@ def validate_navigator_contract() -> bool:
     return bool(get_navigator_capabilities())
 
 
+def get_navigator_baseline_metrics() -> dict:
+    return {"module": "navigator", "contract_valid": validate_navigator_contract(), "capability_count": len(get_navigator_capabilities())}
+
+

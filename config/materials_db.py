@@ -1210,6 +1210,7 @@ __all__ = [
     "get_materials_db_diagnostic_snapshot",
     "get_materials_db_capabilities",
     "validate_materials_db_contract",
+    "get_materials_db_baseline_metrics",
 ]
 
 
@@ -1231,5 +1232,14 @@ def get_materials_db_capabilities() -> list:
 def validate_materials_db_contract() -> bool:
     """Validate the contract for the materials_db module."""
     return bool(get_materials_db_capabilities())
+
+
+def get_materials_db_baseline_metrics() -> dict:
+    """Return baseline metrics for the materials_db module."""
+    return {
+        "module": "materials_db",
+        "contract_valid": validate_materials_db_contract(),
+        "capability_count": len(get_materials_db_capabilities()),
+    }
 
 
