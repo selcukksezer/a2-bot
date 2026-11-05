@@ -700,3 +700,7 @@ def get_incident_recorder_baseline_metrics() -> dict:
     return {"module": "incident_recorder", "contract_valid": validate_incident_recorder_contract(), "capability_count": len(get_incident_recorder_capabilities())}
 
 
+def get_incident_recorder_readiness_status() -> dict:
+    return {"module": "incident_recorder", "ready": validate_incident_recorder_contract(), "metrics": get_incident_recorder_baseline_metrics()}
+
+

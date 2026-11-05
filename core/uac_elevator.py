@@ -351,3 +351,8 @@ def get_uac_elevator_baseline_metrics() -> dict:
     return {"module": "uac_elevator", "contract_valid": validate_uac_elevator_contract(), "capability_count": len(get_uac_elevator_capabilities())}
 
 
+def get_uac_elevator_readiness_status() -> dict:
+    return {"module": "uac_elevator", "ready": validate_uac_elevator_contract(), "metrics": get_uac_elevator_baseline_metrics()}
+
+
+

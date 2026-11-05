@@ -434,3 +434,12 @@ def validate_dry_run_simulator_contract() -> bool:
 def get_dry_run_simulator_baseline_metrics() -> dict:
     return {"module": "dry_run_simulator", "contract_valid": validate_dry_run_simulator_contract(), "capability_count": len(get_dry_run_simulator_capabilities())}
 
+
+def get_dry_run_simulator_readiness_status() -> dict:
+    return {
+        "module": "dry_run_simulator",
+        "ready": validate_dry_run_simulator_contract(),
+        "metrics": get_dry_run_simulator_baseline_metrics(),
+    }
+
+
