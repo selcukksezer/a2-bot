@@ -929,3 +929,7 @@ def get_stealth_capture_readiness_probe() -> dict:
     return {"module": "stealth_capture", "ready": validate_stealth_capture_contract(), "certificate": get_stealth_capture_compliance_certificate()}
 
 
+def get_stealth_capture_audit_summary() -> dict:
+    return {"module": "stealth_capture", "audit_passed": validate_stealth_capture_contract(), "probe": get_stealth_capture_readiness_probe()}
+
+

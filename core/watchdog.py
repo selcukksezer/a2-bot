@@ -1393,4 +1393,8 @@ def get_watchdog_readiness_probe() -> dict:
     return {"module": "watchdog", "ready": validate_watchdog_contract(), "certificate": get_watchdog_compliance_certificate()}
 
 
+def get_watchdog_audit_summary() -> dict:
+    return {"module": "watchdog", "audit_passed": validate_watchdog_contract(), "probe": get_watchdog_readiness_probe()}
+
+
 

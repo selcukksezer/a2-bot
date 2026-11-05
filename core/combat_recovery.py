@@ -1493,4 +1493,12 @@ def get_combat_recovery_readiness_probe() -> dict:
     }
 
 
+def get_combat_recovery_audit_summary() -> dict:
+    return {
+        "module": "combat_recovery",
+        "audit_passed": validate_combat_recovery_contract(),
+        "probe": get_combat_recovery_readiness_probe(),
+    }
+
+
 

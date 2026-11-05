@@ -1257,4 +1257,10 @@ def get_telemetry_readiness_probe() -> dict:
     }
 
 
+def get_telemetry_audit_summary() -> dict:
+    return {
+        "module": "telemetry",
+        "audit_passed": validate_telemetry_contract(),
+        "probe": get_telemetry_readiness_probe(),
+    }
 
