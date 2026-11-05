@@ -1521,6 +1521,9 @@ class DatasetCurator:
     def get_dataset_curator_version_info(self) -> dict:
         return {"module": "dataset_curator", "version": "2.0.0", "ready": True}
 
+    def get_dataset_curator_diagnostic_snapshot(self) -> dict:
+        return {"module": "dataset_curator", "status": "ok", "ready": True}
+
 
 __all__ = [
     "TARGET_DATASET_GOAL",

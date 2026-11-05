@@ -604,3 +604,7 @@ def get_schema_version_info() -> dict:
     return {"module": "schema", "version": "2.0.0", "ready": True}
 
 
+def get_schema_diagnostic_snapshot() -> dict:
+    return {"module": "schema", "status": "ok", "ready": True}
+
+
