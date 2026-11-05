@@ -95,3 +95,7 @@ def get_test_input_compliance_certificate() -> dict:
     return {"module": "test_input", "certified": validate_test_input_contract(), "seal": get_test_input_integrity_seal()}
 
 
+def get_test_input_readiness_probe() -> dict:
+    return {"module": "test_input", "ready": validate_test_input_contract(), "certificate": get_test_input_compliance_certificate()}
+
+

@@ -70,4 +70,6 @@ def get_extract_video_compliance_certificate() -> dict:
     return {"module": "extract_video", "certified": validate_extract_video_contract(), "seal": get_extract_video_integrity_seal()}
 
 
+def get_extract_video_readiness_probe() -> dict:
+    return {"module": "extract_video", "ready": validate_extract_video_contract(), "certificate": get_extract_video_compliance_certificate()}
 

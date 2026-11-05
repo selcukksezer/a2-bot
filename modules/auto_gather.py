@@ -180,3 +180,11 @@ def get_auto_gather_compliance_certificate() -> dict:
     }
 
 
+def get_auto_gather_readiness_probe() -> dict:
+    return {
+        "module": "auto_gather",
+        "ready": validate_auto_gather_contract(),
+        "certificate": get_auto_gather_compliance_certificate(),
+    }
+
+

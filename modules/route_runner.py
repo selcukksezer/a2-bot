@@ -209,3 +209,7 @@ def get_route_runner_compliance_certificate() -> dict:
     return {"module": "route_runner", "certified": validate_route_runner_contract(), "seal": get_route_runner_integrity_seal()}
 
 
+def get_route_runner_readiness_probe() -> dict:
+    return {"module": "route_runner", "ready": validate_route_runner_contract(), "certificate": get_route_runner_compliance_certificate()}
+
+
