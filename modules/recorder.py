@@ -120,3 +120,7 @@ def get_recorder_integrity_seal() -> dict:
     return {"module": "recorder", "sealed": validate_recorder_contract(), "telemetry": get_recorder_telemetry_payload()}
 
 
+def get_recorder_compliance_certificate() -> dict:
+    return {"module": "recorder", "certified": validate_recorder_contract(), "seal": get_recorder_integrity_seal()}
+
+

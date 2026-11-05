@@ -171,3 +171,12 @@ def get_auto_gather_integrity_seal() -> dict:
         "telemetry": get_auto_gather_telemetry_payload(),
     }
 
+
+def get_auto_gather_compliance_certificate() -> dict:
+    return {
+        "module": "auto_gather",
+        "certified": validate_auto_gather_contract(),
+        "seal": get_auto_gather_integrity_seal(),
+    }
+
+
