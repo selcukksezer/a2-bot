@@ -2905,3 +2905,7 @@ def get_settings_window_readiness_probe() -> dict:
     return {"module": "settings_window", "ready": validate_settings_window_contract(), "certificate": get_settings_window_compliance_certificate()}
 
 
+def get_settings_window_audit_summary() -> dict:
+    return {"module": "settings_window", "audit_passed": validate_settings_window_contract(), "probe": get_settings_window_readiness_probe()}
+
+

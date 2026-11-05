@@ -3065,3 +3065,7 @@ def get_mobile_server_readiness_probe() -> dict:
     return {"module": "mobile_server", "ready": validate_mobile_server_contract(), "certificate": get_mobile_server_compliance_certificate()}
 
 
+def get_mobile_server_audit_summary() -> dict:
+    return {"module": "mobile_server", "audit_passed": validate_mobile_server_contract(), "probe": get_mobile_server_readiness_probe()}
+
+

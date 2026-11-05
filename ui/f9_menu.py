@@ -1175,3 +1175,7 @@ def get_f9_menu_readiness_probe() -> dict:
     return {"module": "f9_menu", "ready": validate_f9_menu_contract(), "certificate": get_f9_menu_compliance_certificate()}
 
 
+def get_f9_menu_audit_summary() -> dict:
+    return {"module": "f9_menu", "audit_passed": validate_f9_menu_contract(), "probe": get_f9_menu_readiness_probe()}
+
+

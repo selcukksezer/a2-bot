@@ -683,3 +683,7 @@ def get_analytics_dialog_readiness_probe() -> dict:
     return {"module": "analytics_dialog", "ready": validate_analytics_dialog_contract(), "certificate": get_analytics_dialog_compliance_certificate()}
 
 
+def get_analytics_dialog_audit_summary() -> dict:
+    return {"module": "analytics_dialog", "audit_passed": validate_analytics_dialog_contract(), "probe": get_analytics_dialog_readiness_probe()}
+
+
