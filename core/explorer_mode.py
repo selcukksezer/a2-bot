@@ -1955,3 +1955,7 @@ class ExplorerModeController:
 def get_explorer_mode_capabilities() -> list:
     return ["explorer_mode", "autonomous_exploration", "diagnostic_snapshot"]
 
+
+def validate_explorer_mode_contract() -> bool:
+    return bool(get_explorer_mode_capabilities())
+

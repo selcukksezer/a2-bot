@@ -1662,3 +1662,8 @@ Vision = VisionEngine
 def get_vision_capabilities() -> list:
     return ["vision_engine", "template_matching", "diagnostic_snapshot"]
 
+
+def validate_vision_contract() -> bool:
+    return bool(get_vision_capabilities())
+
+

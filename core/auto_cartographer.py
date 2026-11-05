@@ -2415,3 +2415,8 @@ class AutoCartographer:
 def get_auto_cartographer_capabilities() -> list:
     return ["auto_cartographer", "minimap_mapping", "diagnostic_snapshot"]
 
+
+def validate_auto_cartographer_contract() -> bool:
+    return bool(get_auto_cartographer_capabilities())
+
+

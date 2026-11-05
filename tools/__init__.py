@@ -24,3 +24,7 @@ def get_tools_package_capabilities() -> list:
     return ["tools_package", "diagnostic_snapshot", "version_info"]
 
 
+def validate_tools_package_contract() -> bool:
+    return bool(get_tools_package_capabilities())
+
+

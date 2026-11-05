@@ -2430,3 +2430,8 @@ from core.navigation_intel import PartialNodeDetector, handle_extraction_failure
 def get_route_manager_capabilities() -> list:
     return ["route_manager", "node_persistence", "diagnostic_snapshot"]
 
+
+def validate_route_manager_contract() -> bool:
+    return bool(get_route_manager_capabilities())
+
+
