@@ -625,6 +625,9 @@ class ForegroundFocusGuard:
         except Exception:
             return {"focus_guard_ready": False}
 
+    def get_dpi_focus_guard_version_info(self) -> dict:
+        return {"module": "dpi_focus_guard", "version": "2.0.0", "ready": True}
+
 
 
 # ============================================================================
@@ -765,3 +768,7 @@ class SelfHealingTemplateTuner:
 
     def get_dpi_focus_guard_ready_flag(self) -> dict:
         return {"module": "dpi_focus_guard", "ready": True}
+
+    def get_dpi_focus_guard_version_info(self) -> dict:
+        return {"module": "dpi_focus_guard", "version": "2.0.0", "ready": True}
+

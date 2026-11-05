@@ -288,6 +288,17 @@ def get_uac_elevator_ready_flag() -> dict:
     return {"module": "uac_elevator", "ready": True}
 
 
+class UACElevator:
+    """UAC Elevator sarmalayıcı sınıfı."""
+
+    def get_uac_elevator_version_info(self) -> dict:
+        return {"module": "uac_elevator", "version": "2.0.0", "ready": True}
+
+
+def get_uac_elevator_version_info() -> dict:
+    return {"module": "uac_elevator", "version": "2.0.0", "ready": True}
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     logger.info("Running core/uac_elevator.py self-check...")

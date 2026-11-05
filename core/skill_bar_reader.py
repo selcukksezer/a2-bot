@@ -251,6 +251,9 @@ class SkillBarReader:
 
         return chosen_key
 
+    def get_skill_bar_reader_version_info(self) -> dict:
+        return {"module": "skill_bar_reader", "version": "2.0.0", "ready": True}
+
 
 class MicroCameraLookAround:
     """

@@ -413,4 +413,7 @@ class DryRunReplaySimulator:
     def get_dry_run_simulator_ready_flag(self) -> dict:
         return {"module": "dry_run_simulator", "ready": True}
 
+    def get_dry_run_simulator_version_info(self) -> dict:
+        return {"module": "dry_run_simulator", "version": "2.0.0", "ready": True}
+
 
