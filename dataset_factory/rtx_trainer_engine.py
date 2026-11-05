@@ -1838,3 +1838,11 @@ def get_rtx_trainer_engine_integrity_seal() -> dict:
     }
 
 
+def get_rtx_trainer_engine_compliance_certificate() -> dict:
+    return {
+        "module": "rtx_trainer_engine",
+        "certified": validate_rtx_trainer_engine_contract(),
+        "seal": get_rtx_trainer_engine_integrity_seal(),
+    }
+
+

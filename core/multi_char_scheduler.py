@@ -1572,3 +1572,7 @@ def get_multi_char_scheduler_integrity_seal() -> dict:
     return {"module": "multi_char_scheduler", "sealed": validate_multi_char_scheduler_contract(), "telemetry": get_multi_char_scheduler_telemetry_payload()}
 
 
+def get_multi_char_scheduler_compliance_certificate() -> dict:
+    return {"module": "multi_char_scheduler", "certified": validate_multi_char_scheduler_contract(), "seal": get_multi_char_scheduler_integrity_seal()}
+
+

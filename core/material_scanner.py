@@ -1389,3 +1389,7 @@ def get_material_scanner_integrity_seal() -> dict:
     return {"module": "material_scanner", "sealed": validate_material_scanner_contract(), "telemetry": get_material_scanner_telemetry_payload()}
 
 
+def get_material_scanner_compliance_certificate() -> dict:
+    return {"module": "material_scanner", "certified": validate_material_scanner_contract(), "seal": get_material_scanner_integrity_seal()}
+
+
