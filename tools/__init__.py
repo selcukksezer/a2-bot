@@ -46,4 +46,14 @@ def get_tools_package_audit_record() -> dict:
         return {"module": "tools_package", "audit_passed": False, "readiness": {}}
 
 
+validate_tools_init_contract = validate_tools_package_contract
+get_tools_init_audit_record = get_tools_package_audit_record
+
+
+def get_tools_init_operational_digest() -> dict:
+    return {"module": "tools_init", "operational": validate_tools_init_contract(), "audit": get_tools_init_audit_record()}
+
+
+
+
 

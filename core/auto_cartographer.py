@@ -2440,4 +2440,10 @@ def get_auto_cartographer_audit_record() -> dict:
     }
 
 
+def get_auto_cartographer_operational_digest() -> dict:
+    return {
+        "module": "auto_cartographer",
+        "operational": validate_auto_cartographer_contract(),
+        "audit": get_auto_cartographer_audit_record(),
+    }
 

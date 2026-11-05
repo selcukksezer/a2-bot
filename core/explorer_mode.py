@@ -1972,3 +1972,8 @@ def get_explorer_mode_audit_record() -> dict:
     return {"module": "explorer_mode", "audit_passed": validate_explorer_mode_contract(), "readiness": get_explorer_mode_readiness_status()}
 
 
+def get_explorer_mode_operational_digest() -> dict:
+    return {"module": "explorer_mode", "operational": validate_explorer_mode_contract(), "audit": get_explorer_mode_audit_record()}
+
+
+
