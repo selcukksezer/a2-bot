@@ -671,3 +671,7 @@ def get_analytics_dialog_telemetry_payload() -> dict:
     return {"module": "analytics_dialog", "telemetry_ready": validate_analytics_dialog_contract(), "digest": get_analytics_dialog_operational_digest()}
 
 
+def get_analytics_dialog_integrity_seal() -> dict:
+    return {"module": "analytics_dialog", "sealed": validate_analytics_dialog_contract(), "telemetry": get_analytics_dialog_telemetry_payload()}
+
+

@@ -2893,4 +2893,9 @@ def get_settings_window_telemetry_payload() -> dict:
     return {"module": "settings_window", "telemetry_ready": validate_settings_window_contract(), "digest": get_settings_window_operational_digest()}
 
 
+def get_settings_window_integrity_seal() -> dict:
+    return {"module": "settings_window", "sealed": validate_settings_window_contract(), "telemetry": get_settings_window_telemetry_payload()}
+
+
+
 

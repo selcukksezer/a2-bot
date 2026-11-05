@@ -1162,3 +1162,8 @@ def get_f9_menu_operational_digest() -> dict:
 def get_f9_menu_telemetry_payload() -> dict:
     return {"module": "f9_menu", "telemetry_ready": validate_f9_menu_contract(), "digest": get_f9_menu_operational_digest()}
 
+
+def get_f9_menu_integrity_seal() -> dict:
+    return {"module": "f9_menu", "sealed": validate_f9_menu_contract(), "telemetry": get_f9_menu_telemetry_payload()}
+
+

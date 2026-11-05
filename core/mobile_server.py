@@ -3053,4 +3053,9 @@ def get_mobile_server_telemetry_payload() -> dict:
     return {"module": "mobile_server", "telemetry_ready": validate_mobile_server_contract(), "digest": get_mobile_server_operational_digest()}
 
 
+def get_mobile_server_integrity_seal() -> dict:
+    return {"module": "mobile_server", "sealed": validate_mobile_server_contract(), "telemetry": get_mobile_server_telemetry_payload()}
+
+
+
 
