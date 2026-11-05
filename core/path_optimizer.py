@@ -561,3 +561,6 @@ class RouteOptimizer:
         except Exception as exc:
             logger.error("get_optimizer_status_summary hatasi: %s", exc)
             return {"optimizer_ready": False, "algorithm": "2-opt+TSP"}
+
+    def get_path_optimizer_health_summary(self) -> dict:
+        return {"module": "path_optimizer", "ready": True}

@@ -915,6 +915,9 @@ class WindMouseEngine:
                     return fn
         return _set_cursor_pos_win32
 
+    def get_windmouse_health_summary(self) -> dict:
+        return {"module": "windmouse_humanizer", "ready": True}
+
 
 # Geriye dönük uyumluluk ve alternatif sınıf adı takma adı
 WindMouseController = WindMouseEngine

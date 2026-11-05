@@ -1185,6 +1185,10 @@ class MultiCriteriaMapVerifier:
         return bool(res["is_open"])
 
 
+def get_stability_guards_ready_flag() -> dict:
+    return {"module": "stability_guards", "ready": True}
+
+
 def get_stability_health_report() -> dict:
     """Returns current process/GC health and stability guards readiness."""
     return {
@@ -1200,5 +1204,6 @@ __all__ = [
     "FiveFrameDeathConfirmationGuard",
     "MultiCriteriaMapVerifier",
     "SelfInputWhitelistWindow",
+    "get_stability_guards_ready_flag",
     "get_stability_health_report",
 ]

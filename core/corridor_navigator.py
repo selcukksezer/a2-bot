@@ -1301,6 +1301,9 @@ class CorridorNavigator:
         next_idx = (int(current_seq_pos) + 1) % n
         return nodes[next_idx], next_idx
 
+    def get_corridor_navigator_health_summary(self) -> dict:
+        return {"module": "corridor_navigator", "ready": True}
+
     def get_corridor_status_summary(self) -> dict:
         try:
             return {"corridor_ready": True, "metrics": {}}

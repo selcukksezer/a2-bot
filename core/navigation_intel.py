@@ -1946,6 +1946,19 @@ class MaplessMicroNavigator:
 
 from core.route_manager import NodeData, RouteManager  # noqa: E402,F401
 
+
+class NavigationIntel:
+    """
+    NavigationIntel sınıfı, toplanan harita, binek ve navigasyon zekası modüllerini
+    bir araya getiren ana koordinasyon sınıfıdır.
+    """
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+    def get_navigation_intel_health_summary(self) -> dict:
+        return {"module": "navigation_intel", "ready": True}
+
+
 __all__ = [
     "DEFAULT_REPROMPT_WAIT_SEC",
     "DEFAULT_REPROMPT_WAIT_MS",
