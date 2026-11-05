@@ -703,4 +703,8 @@ def get_capture_readiness_probe() -> dict:
     return {"module": "capture", "ready": validate_capture_contract(), "certificate": get_capture_compliance_certificate()}
 
 
+def get_capture_audit_summary() -> dict:
+    return {"module": "capture", "audit_passed": validate_capture_contract(), "probe": get_capture_readiness_probe()}
+
+
 

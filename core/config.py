@@ -116,3 +116,7 @@ def get_config_compliance_certificate() -> dict:
 def get_config_readiness_probe() -> dict:
     return {"module": "config", "ready": validate_config_contract(), "certificate": get_config_compliance_certificate()}
 
+
+def get_config_audit_summary() -> dict:
+    return {"module": "config", "audit_passed": validate_config_contract(), "probe": get_config_readiness_probe()}
+

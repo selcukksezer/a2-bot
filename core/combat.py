@@ -118,3 +118,7 @@ def get_combat_compliance_certificate() -> dict:
 def get_combat_readiness_probe() -> dict:
     return {"module": "combat", "ready": validate_combat_contract(), "certificate": get_combat_compliance_certificate()}
 
+
+def get_combat_audit_summary() -> dict:
+    return {"module": "combat", "audit_passed": validate_combat_contract(), "probe": get_combat_readiness_probe()}
+

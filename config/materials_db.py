@@ -1218,6 +1218,7 @@ __all__ = [
     "get_materials_db_integrity_seal",
     "get_materials_db_compliance_certificate",
     "get_materials_db_readiness_probe",
+    "get_materials_db_audit_summary",
 ]
 
 
@@ -1309,6 +1310,15 @@ def get_materials_db_readiness_probe() -> dict:
         "module": "materials_db",
         "ready": validate_materials_db_contract(),
         "certificate": get_materials_db_compliance_certificate(),
+    }
+
+
+def get_materials_db_audit_summary() -> dict:
+    """Return audit summary for the materials_db module."""
+    return {
+        "module": "materials_db",
+        "audit_passed": validate_materials_db_contract(),
+        "probe": get_materials_db_readiness_probe(),
     }
 
 

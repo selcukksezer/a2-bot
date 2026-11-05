@@ -163,3 +163,7 @@ def get_navigator_readiness_probe() -> dict:
     return {"module": "navigator", "ready": validate_navigator_contract(), "certificate": get_navigator_compliance_certificate()}
 
 
+def get_navigator_audit_summary() -> dict:
+    return {"module": "navigator", "audit_passed": validate_navigator_contract(), "probe": get_navigator_readiness_probe()}
+
+
