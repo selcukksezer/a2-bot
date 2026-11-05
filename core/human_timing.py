@@ -980,3 +980,8 @@ def get_human_timing_readiness_status() -> dict:
 def get_human_timing_audit_record() -> dict:
     return {"module": "human_timing", "audit_passed": validate_human_timing_contract(), "readiness": get_human_timing_readiness_status()}
 
+
+def get_human_timing_operational_digest() -> dict:
+    return {"module": "human_timing", "operational": validate_human_timing_contract(), "audit": get_human_timing_audit_record()}
+
+

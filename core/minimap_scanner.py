@@ -1157,3 +1157,12 @@ def get_minimap_scanner_audit_record() -> dict:
         "readiness": get_minimap_scanner_readiness_status(),
     }
 
+
+def get_minimap_scanner_operational_digest() -> dict:
+    return {
+        "module": "minimap_scanner",
+        "operational": validate_minimap_scanner_contract(),
+        "audit": get_minimap_scanner_audit_record(),
+    }
+
+

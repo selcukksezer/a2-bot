@@ -51,6 +51,7 @@ __all__ = [
     "resolve_class_id",
     "get_active_learning_readiness_status",
     "get_active_learning_audit_record",
+    "get_active_learning_operational_digest",
 ]
 
 
@@ -72,6 +73,14 @@ def get_active_learning_readiness_status() -> dict:
 
 def get_active_learning_audit_record() -> dict:
     return {"module": "active_learning", "audit_passed": validate_active_learning_contract(), "readiness": get_active_learning_readiness_status()}
+
+
+def get_active_learning_operational_digest() -> dict:
+    return {"module": "active_learning", "operational": validate_active_learning_contract(), "audit": get_active_learning_audit_record()}
+
+
+def get_active_learning_operational_digest() -> dict:
+    return {"module": "active_learning", "operational": validate_active_learning_contract(), "audit": get_active_learning_audit_record()}
 
 
 

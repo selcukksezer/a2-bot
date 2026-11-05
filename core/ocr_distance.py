@@ -1604,3 +1604,8 @@ def get_ocr_distance_readiness_status() -> dict:
 def get_ocr_distance_audit_record() -> dict:
     return {"module": "ocr_distance", "audit_passed": validate_ocr_distance_contract(), "readiness": get_ocr_distance_readiness_status()}
 
+
+def get_ocr_distance_operational_digest() -> dict:
+    return {"module": "ocr_distance", "operational": validate_ocr_distance_contract(), "audit": get_ocr_distance_audit_record()}
+
+
