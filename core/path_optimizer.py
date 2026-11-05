@@ -568,3 +568,7 @@ class RouteOptimizer:
     def get_path_optimizer_ready_flag(self) -> dict:
         return {"module": "path_optimizer", "ready": True}
 
+    def get_path_optimizer_version_info(self) -> dict:
+        return {"module": "path_optimizer", "version": "2.0.0", "ready": True}
+
+

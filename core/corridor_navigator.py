@@ -1313,3 +1313,7 @@ class CorridorNavigator:
     def get_corridor_navigator_ready_flag(self) -> dict:
         return {"module": "corridor_navigator", "ready": True}
 
+    def get_corridor_navigator_version_info(self) -> dict:
+        return {"module": "corridor_navigator", "version": "2.0.0", "ready": True}
+
+

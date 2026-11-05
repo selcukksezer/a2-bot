@@ -921,6 +921,9 @@ class WindMouseEngine:
     def get_windmouse_humanizer_ready_flag(self) -> dict:
         return {"module": "windmouse_humanizer", "ready": True}
 
+    def get_windmouse_humanizer_version_info(self) -> dict:
+        return {"module": "windmouse_humanizer", "version": "2.0.0", "ready": True}
+
 
 # Geriye dönük uyumluluk ve alternatif sınıf adı takma adı
 WindMouseController = WindMouseEngine
