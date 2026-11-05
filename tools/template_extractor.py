@@ -1002,3 +1002,8 @@ def get_template_extractor_telemetry_payload() -> dict:
     return {"module": "template_extractor", "telemetry_ready": validate_template_extractor_contract(), "digest": get_template_extractor_operational_digest()}
 
 
+def get_template_extractor_integrity_seal() -> dict:
+    return {"module": "template_extractor", "sealed": validate_template_extractor_contract(), "telemetry": get_template_extractor_telemetry_payload()}
+
+
+

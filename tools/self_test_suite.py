@@ -1362,3 +1362,12 @@ def get_self_test_suite_telemetry_payload() -> dict:
     }
 
 
+def get_self_test_suite_integrity_seal() -> dict:
+    return {
+        "module": "self_test_suite",
+        "sealed": validate_self_test_suite_contract(),
+        "telemetry": get_self_test_suite_telemetry_payload(),
+    }
+
+
+

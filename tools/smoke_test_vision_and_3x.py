@@ -1825,3 +1825,7 @@ def get_smoke_test_vision_and_3x_telemetry_payload() -> dict:
     return {"module": "smoke_test_vision_and_3x", "telemetry_ready": validate_smoke_test_vision_and_3x_contract(), "digest": get_smoke_test_vision_and_3x_operational_digest()}
 
 
+def get_smoke_test_vision_and_3x_integrity_seal() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "sealed": validate_smoke_test_vision_and_3x_contract(), "telemetry": get_smoke_test_vision_and_3x_telemetry_payload()}
+
+
