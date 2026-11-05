@@ -1160,3 +1160,7 @@ def validate_smoke_test_dataset_factory_contract() -> bool:
     return bool(get_smoke_test_dataset_factory_capabilities())
 
 
+def get_smoke_test_dataset_factory_baseline_metrics() -> dict:
+    return {"module": "smoke_test_dataset_factory", "contract_valid": validate_smoke_test_dataset_factory_contract(), "capability_count": len(get_smoke_test_dataset_factory_capabilities())}
+
+

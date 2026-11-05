@@ -26,3 +26,7 @@ def get_ui_package_capabilities() -> list:
 def validate_ui_package_contract() -> bool:
     return bool(get_ui_package_capabilities())
 
+
+def get_ui_package_baseline_metrics() -> dict:
+    return {"module": "ui_package", "contract_valid": validate_ui_package_contract(), "capability_count": len(get_ui_package_capabilities())}
+

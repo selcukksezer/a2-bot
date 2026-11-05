@@ -43,3 +43,11 @@ def validate_dataset_factory_package_contract() -> bool:
     return bool(get_dataset_factory_package_capabilities())
 
 
+def get_dataset_factory_package_baseline_metrics() -> dict:
+    return {
+        "module": "dataset_factory_package",
+        "contract_valid": validate_dataset_factory_package_contract(),
+        "capability_count": len(get_dataset_factory_package_capabilities()),
+    }
+
+

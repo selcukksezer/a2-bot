@@ -28,3 +28,7 @@ def validate_config_package_contract() -> bool:
     return bool(get_config_package_capabilities())
 
 
+def get_config_package_baseline_metrics() -> dict:
+    return {"module": "config_package", "contract_valid": validate_config_package_contract(), "capability_count": len(get_config_package_capabilities())}
+
+
