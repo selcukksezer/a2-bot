@@ -9,6 +9,9 @@ class QualityGate(DatasetQualityGate):
     def get_quality_gate_ready_flag(self) -> dict:
         return {"module": "quality_gate", "ready": True}
 
+    def get_quality_gate_version_info(self) -> dict:
+        return {"module": "quality_gate", "version": "2.0.0", "ready": True}
+
 
 __all__ = [
     "QualityGate",

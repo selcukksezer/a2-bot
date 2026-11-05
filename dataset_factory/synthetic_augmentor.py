@@ -739,6 +739,9 @@ class SyntheticYOLOAugmentor:
     def get_synthetic_augmentor_ready_flag(self) -> dict:
         return {"module": "synthetic_augmentor", "ready": True}
 
+    def get_synthetic_augmentor_version_info(self) -> dict:
+        return {"module": "synthetic_augmentor", "version": "2.0.0", "ready": True}
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")

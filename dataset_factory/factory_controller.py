@@ -1132,6 +1132,9 @@ class AutoLabelingDatasetFactory:
     def get_factory_controller_ready_flag(self) -> dict:
         return {"module": "factory_controller", "ready": True}
 
+    def get_factory_controller_version_info(self) -> dict:
+        return {"module": "factory_controller", "version": "2.0.0", "ready": True}
+
 
 __all__ = [
     "FACTORY_12_CLASS_NAMES",
