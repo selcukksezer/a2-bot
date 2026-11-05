@@ -1335,3 +1335,15 @@ def get_self_test_suite_readiness_status() -> dict:
         return {"module": "self_test_suite", "ready": False, "metrics": {}}
 
 
+def get_self_test_suite_audit_record() -> dict:
+    try:
+        return {
+            "module": "self_test_suite",
+            "audit_passed": validate_self_test_suite_contract(),
+            "readiness": get_self_test_suite_readiness_status(),
+        }
+    except Exception:
+        return {"module": "self_test_suite", "audit_passed": False, "readiness": {}}
+
+
+

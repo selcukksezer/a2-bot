@@ -1490,3 +1490,8 @@ def get_run_all_smoke_tests_readiness_status() -> dict:
     return {"module": "run_all_smoke_tests", "ready": validate_run_all_smoke_tests_contract(), "metrics": get_run_all_smoke_tests_baseline_metrics()}
 
 
+def get_run_all_smoke_tests_audit_record() -> dict:
+    return {"module": "run_all_smoke_tests", "audit_passed": validate_run_all_smoke_tests_contract(), "readiness": get_run_all_smoke_tests_readiness_status()}
+
+
+

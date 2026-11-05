@@ -990,4 +990,9 @@ def get_template_extractor_readiness_status() -> dict:
     return {"module": "template_extractor", "ready": validate_template_extractor_contract(), "metrics": get_template_extractor_baseline_metrics()}
 
 
+def get_template_extractor_audit_record() -> dict:
+    return {"module": "template_extractor", "audit_passed": validate_template_extractor_contract(), "readiness": get_template_extractor_readiness_status()}
+
+
+
 

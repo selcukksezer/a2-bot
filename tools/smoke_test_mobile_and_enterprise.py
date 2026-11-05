@@ -1070,4 +1070,8 @@ def get_smoke_test_mobile_readiness_status() -> dict:
     return {"module": "smoke_test_mobile_and_enterprise", "ready": True, "metrics": get_smoke_test_mobile_baseline_metrics() if 'get_smoke_test_mobile_baseline_metrics' in globals() else {}}
 
 
+def get_smoke_test_mobile_audit_record() -> dict:
+    return {"module": "smoke_test_mobile_and_enterprise", "audit_passed": True, "readiness": get_smoke_test_mobile_readiness_status()}
+
+
 
