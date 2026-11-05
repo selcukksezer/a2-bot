@@ -72,3 +72,7 @@ class CombatSystem:
     def get_combat_ready_flag(self) -> dict:
         return {"module": "combat", "ready": True}
 
+    def get_combat_version_info(self) -> dict:
+        return {"module": "combat", "version": "2.0.0", "ready": True}
+
+

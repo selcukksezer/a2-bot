@@ -656,3 +656,7 @@ class ScreenCapture:
     def get_capture_ready_flag(self) -> dict:
         return {"module": "capture", "ready": True}
 
+    def get_capture_version_info(self) -> dict:
+        return {"module": "capture", "version": "2.0.0", "ready": True}
+
+
