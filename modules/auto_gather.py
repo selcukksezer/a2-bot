@@ -124,3 +124,12 @@ def get_auto_gather_capabilities() -> list:
 def validate_auto_gather_contract() -> bool:
     return bool(get_auto_gather_capabilities())
 
+
+def get_auto_gather_baseline_metrics() -> dict:
+    return {
+        "module": "auto_gather",
+        "contract_valid": validate_auto_gather_contract(),
+        "gather_ready": True,
+    }
+
+

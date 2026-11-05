@@ -96,3 +96,8 @@ def validate_recorder_contract() -> bool:
     return bool(get_recorder_capabilities())
 
 
+def get_recorder_baseline_metrics() -> dict:
+    return {"module": "recorder", "contract_valid": validate_recorder_contract(), "recorder_ready": True}
+
+
+

@@ -42,3 +42,7 @@ def validate_extract_video_contract() -> bool:
     return bool(get_extract_video_capabilities())
 
 
+def get_extract_video_baseline_metrics() -> dict:
+    return {"module": "extract_video", "contract_valid": validate_extract_video_contract(), "extractor_ready": True}
+
+

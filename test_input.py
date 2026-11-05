@@ -67,3 +67,7 @@ def validate_test_input_contract() -> bool:
     return bool(get_test_input_capabilities())
 
 
+def get_test_input_baseline_metrics() -> dict:
+    return {"module": "test_input", "contract_valid": validate_test_input_contract(), "test_input_ready": True}
+
+
