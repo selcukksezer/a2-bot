@@ -362,3 +362,8 @@ def get_uac_elevator_audit_record() -> dict:
 def get_uac_elevator_operational_digest() -> dict:
     return {"module": "uac_elevator", "operational": validate_uac_elevator_contract(), "audit": get_uac_elevator_audit_record()}
 
+
+def get_uac_elevator_telemetry_payload() -> dict:
+    return {"module": "uac_elevator", "telemetry_ready": validate_uac_elevator_contract(), "digest": get_uac_elevator_operational_digest()}
+
+

@@ -712,4 +712,9 @@ def get_incident_recorder_operational_digest() -> dict:
     return {"module": "incident_recorder", "operational": validate_incident_recorder_contract(), "audit": get_incident_recorder_audit_record()}
 
 
+def get_incident_recorder_telemetry_payload() -> dict:
+    return {"module": "incident_recorder", "telemetry_ready": validate_incident_recorder_contract(), "digest": get_incident_recorder_operational_digest()}
+
+
+
 

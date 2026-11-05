@@ -493,4 +493,6 @@ def get_skill_bar_reader_operational_digest() -> dict:
     return {"module": "skill_bar_reader", "operational": validate_skill_bar_reader_contract(), "audit": get_skill_bar_reader_audit_record()}
 
 
+def get_skill_bar_reader_telemetry_payload() -> dict:
+    return {"module": "skill_bar_reader", "telemetry_ready": validate_skill_bar_reader_contract(), "digest": get_skill_bar_reader_operational_digest()}
 

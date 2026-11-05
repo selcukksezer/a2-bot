@@ -458,3 +458,12 @@ def get_dry_run_simulator_operational_digest() -> dict:
         "audit": get_dry_run_simulator_audit_record(),
     }
 
+
+def get_dry_run_simulator_telemetry_payload() -> dict:
+    return {
+        "module": "dry_run_simulator",
+        "telemetry_ready": validate_dry_run_simulator_contract(),
+        "digest": get_dry_run_simulator_operational_digest(),
+    }
+
+

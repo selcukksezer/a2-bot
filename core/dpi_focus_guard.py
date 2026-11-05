@@ -827,3 +827,12 @@ def get_dpi_focus_guard_operational_digest() -> dict:
     }
 
 
+def get_dpi_focus_guard_telemetry_payload() -> dict:
+    return {
+        "module": "dpi_focus_guard",
+        "telemetry_ready": validate_dpi_focus_guard_contract(),
+        "digest": get_dpi_focus_guard_operational_digest(),
+    }
+
+
+
