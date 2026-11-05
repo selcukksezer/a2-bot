@@ -1815,4 +1815,13 @@ def get_rtx_trainer_engine_audit_record() -> dict:
     }
 
 
+def get_rtx_trainer_engine_operational_digest() -> dict:
+    return {
+        "module": "rtx_trainer_engine",
+        "operational": validate_rtx_trainer_engine_contract(),
+        "audit": get_rtx_trainer_engine_audit_record(),
+    }
+
+
+
 

@@ -1560,5 +1560,9 @@ def get_multi_char_scheduler_audit_record() -> dict:
     return {"module": "multi_char_scheduler", "audit_passed": validate_multi_char_scheduler_contract(), "readiness": get_multi_char_scheduler_readiness_status()}
 
 
+def get_multi_char_scheduler_operational_digest() -> dict:
+    return {"module": "multi_char_scheduler", "operational": validate_multi_char_scheduler_contract(), "audit": get_multi_char_scheduler_audit_record()}
+
+
 
 

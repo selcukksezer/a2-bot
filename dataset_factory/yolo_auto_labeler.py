@@ -1470,6 +1470,7 @@ __all__ = [
     "YOLOAutoLabeler",
     "get_yolo_auto_labeler_readiness_status",
     "get_yolo_auto_labeler_audit_record",
+    "get_yolo_auto_labeler_operational_digest",
 ]
 
 
@@ -1507,5 +1508,10 @@ def get_yolo_auto_labeler_audit_record() -> dict:
         }
 
 
-
+def get_yolo_auto_labeler_operational_digest() -> dict:
+    return {
+        "module": "yolo_auto_labeler",
+        "operational": validate_yolo_auto_labeler_contract(),
+        "audit": get_yolo_auto_labeler_audit_record(),
+    }
 
