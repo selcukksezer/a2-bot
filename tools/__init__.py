@@ -54,6 +54,7 @@ def get_tools_init_operational_digest() -> dict:
     return {"module": "tools_init", "operational": validate_tools_init_contract(), "audit": get_tools_init_audit_record()}
 
 
-
+def get_tools_init_telemetry_payload() -> dict:
+    return {"module": "tools_init", "telemetry_ready": validate_tools_init_contract(), "digest": get_tools_init_operational_digest()}
 
 

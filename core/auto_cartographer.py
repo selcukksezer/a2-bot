@@ -2447,3 +2447,12 @@ def get_auto_cartographer_operational_digest() -> dict:
         "audit": get_auto_cartographer_audit_record(),
     }
 
+
+def get_auto_cartographer_telemetry_payload() -> dict:
+    return {
+        "module": "auto_cartographer",
+        "telemetry_ready": validate_auto_cartographer_contract(),
+        "digest": get_auto_cartographer_operational_digest(),
+    }
+
+

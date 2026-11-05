@@ -1976,4 +1976,9 @@ def get_explorer_mode_operational_digest() -> dict:
     return {"module": "explorer_mode", "operational": validate_explorer_mode_contract(), "audit": get_explorer_mode_audit_record()}
 
 
+def get_explorer_mode_telemetry_payload() -> dict:
+    return {"module": "explorer_mode", "telemetry_ready": validate_explorer_mode_contract(), "digest": get_explorer_mode_operational_digest()}
+
+
+
 

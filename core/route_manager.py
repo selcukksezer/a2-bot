@@ -2451,5 +2451,6 @@ def get_route_manager_operational_digest() -> dict:
     return {"module": "route_manager", "operational": validate_route_manager_contract(), "audit": get_route_manager_audit_record()}
 
 
-
+def get_route_manager_telemetry_payload() -> dict:
+    return {"module": "route_manager", "telemetry_ready": validate_route_manager_contract(), "digest": get_route_manager_operational_digest()}
 

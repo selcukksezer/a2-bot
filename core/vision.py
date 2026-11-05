@@ -1683,3 +1683,8 @@ def get_vision_operational_digest() -> dict:
     return {"module": "vision", "operational": validate_vision_contract(), "audit": get_vision_audit_record()}
 
 
+def get_vision_telemetry_payload() -> dict:
+    return {"module": "vision", "telemetry_ready": validate_vision_contract(), "digest": get_vision_operational_digest()}
+
+
+
