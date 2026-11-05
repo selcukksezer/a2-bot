@@ -1204,3 +1204,7 @@ def validate_overlay_hud_contract() -> bool:
     return bool(get_overlay_hud_capabilities())
 
 
+def get_overlay_hud_baseline_metrics() -> dict:
+    return {"module": "overlay_hud", "contract_valid": validate_overlay_hud_contract(), "capability_count": len(get_overlay_hud_capabilities())}
+
+

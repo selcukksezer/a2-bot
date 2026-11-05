@@ -1143,3 +1143,7 @@ def validate_f9_menu_contract() -> bool:
     return bool(get_f9_menu_capabilities())
 
 
+def get_f9_menu_baseline_metrics() -> dict:
+    return {"module": "f9_menu", "contract_valid": validate_f9_menu_contract(), "capability_count": len(get_f9_menu_capabilities())}
+
+
