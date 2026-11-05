@@ -1963,3 +1963,8 @@ def validate_explorer_mode_contract() -> bool:
 def get_explorer_mode_baseline_metrics() -> dict:
     return {"module": "explorer_mode", "contract_valid": validate_explorer_mode_contract(), "capability_count": len(get_explorer_mode_capabilities())}
 
+
+def get_explorer_mode_readiness_status() -> dict:
+    return {"module": "explorer_mode", "ready": validate_explorer_mode_contract(), "metrics": get_explorer_mode_baseline_metrics()}
+
+

@@ -2424,3 +2424,11 @@ def get_auto_cartographer_baseline_metrics() -> dict:
     return {"module": "auto_cartographer", "contract_valid": validate_auto_cartographer_contract(), "capability_count": len(get_auto_cartographer_capabilities())}
 
 
+def get_auto_cartographer_readiness_status() -> dict:
+    return {
+        "module": "auto_cartographer",
+        "ready": validate_auto_cartographer_contract(),
+        "metrics": get_auto_cartographer_baseline_metrics(),
+    }
+
+

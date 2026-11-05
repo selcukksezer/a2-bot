@@ -2439,3 +2439,8 @@ def get_route_manager_baseline_metrics() -> dict:
     return {"module": "route_manager", "contract_valid": validate_route_manager_contract(), "capability_count": len(get_route_manager_capabilities())}
 
 
+def get_route_manager_readiness_status() -> dict:
+    return {"module": "route_manager", "ready": validate_route_manager_contract(), "metrics": get_route_manager_baseline_metrics()}
+
+
+

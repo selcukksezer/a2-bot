@@ -1671,3 +1671,7 @@ def get_vision_baseline_metrics() -> dict:
     return {"module": "vision", "contract_valid": validate_vision_contract(), "capability_count": len(get_vision_capabilities())}
 
 
+def get_vision_readiness_status() -> dict:
+    return {"module": "vision", "ready": validate_vision_contract(), "metrics": get_vision_baseline_metrics()}
+
+

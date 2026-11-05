@@ -32,3 +32,10 @@ def get_tools_package_baseline_metrics() -> dict:
     return {"module": "tools_package", "contract_valid": validate_tools_package_contract(), "capability_count": len(get_tools_package_capabilities())}
 
 
+def get_tools_package_readiness_status() -> dict:
+    try:
+        return {"module": "tools_package", "ready": validate_tools_package_contract(), "metrics": get_tools_package_baseline_metrics()}
+    except Exception:
+        return {"module": "tools_package", "ready": False, "metrics": {}}
+
+
