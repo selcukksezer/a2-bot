@@ -1025,4 +1025,8 @@ class CalibrationWizard(QDialog):
     def get_calibration_wizard_version_info(self) -> dict:
         return {"module": "calibration_wizard", "version": "2.0.0", "ready": True}
 
+    def get_calibration_wizard_diagnostic_snapshot(self) -> dict:
+        return {"module": "calibration_wizard", "status": "ok", "ready": True}
+
+
 

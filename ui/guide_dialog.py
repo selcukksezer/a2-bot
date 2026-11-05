@@ -828,3 +828,7 @@ class GuideDialog(QDialog):
     def get_guide_dialog_version_info(self) -> dict:
         return {"module": "guide_dialog", "version": "2.0.0", "ready": True}
 
+    def get_guide_dialog_diagnostic_snapshot(self) -> dict:
+        return {"module": "guide_dialog", "status": "ok", "ready": True}
+
+
