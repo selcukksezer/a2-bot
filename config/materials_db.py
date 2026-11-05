@@ -1213,6 +1213,7 @@ __all__ = [
     "get_materials_db_baseline_metrics",
     "get_materials_db_readiness_status",
     "get_materials_db_audit_record",
+    "get_materials_db_operational_digest",
 ]
 
 
@@ -1263,5 +1264,12 @@ def get_materials_db_audit_record() -> dict:
     }
 
 
+def get_materials_db_operational_digest() -> dict:
+    """Return operational digest for the materials_db module."""
+    return {
+        "module": "materials_db",
+        "operational": validate_materials_db_contract(),
+        "audit": get_materials_db_audit_record(),
+    }
 
 

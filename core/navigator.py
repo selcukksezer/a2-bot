@@ -142,3 +142,8 @@ def get_navigator_readiness_status() -> dict:
 def get_navigator_audit_record() -> dict:
     return {"module": "navigator", "audit_passed": validate_navigator_contract(), "readiness": get_navigator_readiness_status()}
 
+
+def get_navigator_operational_digest() -> dict:
+    return {"module": "navigator", "operational": validate_navigator_contract(), "audit": get_navigator_audit_record()}
+
+

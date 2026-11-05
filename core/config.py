@@ -97,4 +97,6 @@ def get_config_audit_record() -> dict:
     return {"module": "config", "audit_passed": validate_config_contract(), "readiness": get_config_readiness_status()}
 
 
+def get_config_operational_digest() -> dict:
+    return {"module": "config", "operational": validate_config_contract(), "audit": get_config_audit_record()}
 

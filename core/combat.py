@@ -99,3 +99,7 @@ def get_combat_audit_record() -> dict:
     return {"module": "combat", "audit_passed": validate_combat_contract(), "readiness": get_combat_readiness_status()}
 
 
+def get_combat_operational_digest() -> dict:
+    return {"module": "combat", "operational": validate_combat_contract(), "audit": get_combat_audit_record()}
+
+

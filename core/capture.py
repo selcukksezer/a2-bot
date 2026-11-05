@@ -683,4 +683,8 @@ def get_capture_audit_record() -> dict:
     return {"module": "capture", "audit_passed": validate_capture_contract(), "readiness": get_capture_readiness_status()}
 
 
+def get_capture_operational_digest() -> dict:
+    return {"module": "capture", "operational": validate_capture_contract(), "audit": get_capture_audit_record()}
+
+
 
