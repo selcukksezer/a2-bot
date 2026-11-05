@@ -652,3 +652,7 @@ class ScreenCapture:
 
     def get_capture_health_summary(self) -> dict:
         return {"module": "capture", "ready": True}
+
+    def get_capture_ready_flag(self) -> dict:
+        return {"module": "capture", "ready": True}
+

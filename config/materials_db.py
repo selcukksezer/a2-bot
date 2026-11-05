@@ -1184,6 +1184,11 @@ def get_materials_db_health_summary() -> dict:
     return {"module": "materials_db", "ready": True}
 
 
+def get_materials_db_ready_flag() -> dict:
+    """Return ready flag for the materials_db module."""
+    return {"module": "materials_db", "ready": True}
+
+
 __all__ = [
     "DEFAULT_MAX_HARVESTS",
     "MATERIAL_CATEGORIES",
@@ -1200,4 +1205,5 @@ __all__ = [
     "classify_3d_material_patch",
     "get_materials_db_summary",
     "get_materials_db_health_summary",
+    "get_materials_db_ready_flag",
 ]

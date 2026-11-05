@@ -51,3 +51,7 @@ class ConfigManager:
         except Exception:
             return {"unified_config": "config/settings.json", "ready": False}
 
+    def get_config_ready_flag(self) -> dict:
+        return {"module": "config", "ready": True}
+
+

@@ -113,3 +113,7 @@ class MapNavigator:
     def get_navigator_health_summary(self) -> dict:
         return {"module": "navigator", "ready": True}
 
+    def get_navigator_ready_flag(self) -> dict:
+        return {"module": "navigator", "ready": True}
+
+
