@@ -501,6 +501,9 @@ class NtfyCloudRelay:
     def get_mobile_tunnel_version_info(self) -> dict:
         return {"module": "mobile_tunnel", "version": "2.0.0", "ready": True}
 
+    def get_mobile_tunnel_diagnostic_snapshot(self) -> dict:
+        return {"module": "mobile_tunnel", "status": "ok", "ready": True}
+
 
 
 class FreeCloudTunnelManager:
@@ -951,6 +954,9 @@ class FreeCloudTunnelManager:
     def get_mobile_tunnel_version_info(self) -> dict:
         return {"module": "mobile_tunnel", "version": "2.0.0", "ready": True}
 
+    def get_mobile_tunnel_diagnostic_snapshot(self) -> dict:
+        return {"module": "mobile_tunnel", "status": "ok", "ready": True}
+
 
 
 def _draw_finder_pattern(grid: np.ndarray, top: int, left: int) -> None:
@@ -1130,6 +1136,9 @@ class TunnelBridge:
 
     def get_mobile_tunnel_version_info(self) -> dict:
         return {"module": "mobile_tunnel", "version": "2.0.0", "ready": True}
+
+    def get_mobile_tunnel_diagnostic_snapshot(self) -> dict:
+        return {"module": "mobile_tunnel", "status": "ok", "ready": True}
 
 
 MobileTunnel = FreeCloudTunnelManager

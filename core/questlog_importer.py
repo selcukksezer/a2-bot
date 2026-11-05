@@ -1059,6 +1059,9 @@ class QuestlogImporter:
     def get_questlog_importer_version_info(self) -> dict:
         return {"module": "questlog_importer", "version": "2.0.0", "ready": True}
 
+    def get_questlog_importer_diagnostic_snapshot(self) -> dict:
+        return {"module": "questlog_importer", "status": "ok", "ready": True}
+
 
 # ==============================================================================
 # CONFIRMATION DIALOG ("The import takes about 20 seconds" - frame_15s.jpg)

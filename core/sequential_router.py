@@ -1913,4 +1913,7 @@ class SequentialRoutePlanner:
     def get_sequential_router_version_info(self) -> dict:
         return {"module": "sequential_router", "version": "2.0.0", "ready": True}
 
+    def get_sequential_router_diagnostic_snapshot(self) -> dict:
+        return {"module": "sequential_router", "status": "ok", "ready": True}
+
 
