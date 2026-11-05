@@ -661,3 +661,11 @@ def get_schema_audit_record() -> dict:
     }
 
 
+def get_schema_operational_digest() -> dict:
+    return {
+        "module": "schema",
+        "operational": validate_schema_contract(),
+        "audit": get_schema_audit_record(),
+    }
+
+

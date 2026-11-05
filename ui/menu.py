@@ -125,4 +125,8 @@ def get_menu_audit_record() -> dict:
     return {"module": "menu", "audit_passed": validate_menu_contract(), "readiness": get_menu_readiness_status()}
 
 
+def get_menu_operational_digest() -> dict:
+    return {"module": "menu", "operational": validate_menu_contract(), "audit": get_menu_audit_record()}
+
+
 

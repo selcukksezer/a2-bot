@@ -224,4 +224,8 @@ def get_overlay_audit_record() -> dict:
     return {"module": "overlay", "audit_passed": validate_overlay_contract(), "readiness": get_overlay_readiness_status()}
 
 
+def get_overlay_operational_digest() -> dict:
+    return {"module": "overlay", "operational": validate_overlay_contract(), "audit": get_overlay_audit_record()}
+
+
 

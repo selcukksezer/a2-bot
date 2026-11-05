@@ -1536,6 +1536,7 @@ __all__ = [
     "get_dataset_curator_baseline_metrics",
     "get_dataset_curator_readiness_status",
     "get_dataset_curator_audit_record",
+    "get_dataset_curator_operational_digest",
 ]
 
 
@@ -1563,4 +1564,9 @@ def get_dataset_curator_readiness_status() -> dict:
 
 def get_dataset_curator_audit_record() -> dict:
     return {"module": "dataset_curator", "audit_passed": validate_dataset_curator_contract(), "readiness": get_dataset_curator_readiness_status()}
+
+
+def get_dataset_curator_operational_digest() -> dict:
+    return {"module": "dataset_curator", "operational": validate_dataset_curator_contract(), "audit": get_dataset_curator_audit_record()}
+
 

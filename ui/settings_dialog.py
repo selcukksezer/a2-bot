@@ -317,3 +317,11 @@ def get_settings_dialog_audit_record() -> dict:
     }
 
 
+def get_settings_dialog_operational_digest() -> dict:
+    return {
+        "module": "settings_dialog",
+        "operational": validate_settings_dialog_contract(),
+        "audit": get_settings_dialog_audit_record(),
+    }
+
+
