@@ -676,4 +676,12 @@ def get_schema_telemetry_payload() -> dict:
     }
 
 
+def get_schema_integrity_seal() -> dict:
+    return {
+        "module": "schema",
+        "sealed": validate_schema_contract(),
+        "telemetry": get_schema_telemetry_payload(),
+    }
+
+
 

@@ -231,3 +231,8 @@ def get_overlay_operational_digest() -> dict:
 def get_overlay_telemetry_payload() -> dict:
     return {"module": "overlay", "payload": get_overlay_operational_digest()}
 
+
+def get_overlay_integrity_seal() -> dict:
+    return {"module": "overlay", "sealed": validate_overlay_contract(), "telemetry": get_overlay_telemetry_payload()}
+
+

@@ -132,3 +132,8 @@ def get_menu_operational_digest() -> dict:
 def get_menu_telemetry_payload() -> dict:
     return {"module": "menu", "payload": get_menu_operational_digest()}
 
+
+def get_menu_integrity_seal() -> dict:
+    return {"module": "menu", "sealed": validate_menu_contract(), "telemetry": get_menu_telemetry_payload()}
+
+

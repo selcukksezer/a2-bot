@@ -1538,6 +1538,7 @@ __all__ = [
     "get_dataset_curator_audit_record",
     "get_dataset_curator_operational_digest",
     "get_dataset_curator_telemetry_payload",
+    "get_dataset_curator_integrity_seal",
 ]
 
 
@@ -1573,6 +1574,11 @@ def get_dataset_curator_operational_digest() -> dict:
 
 def get_dataset_curator_telemetry_payload() -> dict:
     return {"module": "dataset_curator", "payload": get_dataset_curator_operational_digest()}
+
+
+def get_dataset_curator_integrity_seal() -> dict:
+    return {"module": "dataset_curator", "sealed": validate_dataset_curator_contract(), "telemetry": get_dataset_curator_telemetry_payload()}
+
 
 
 

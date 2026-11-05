@@ -332,4 +332,11 @@ def get_settings_dialog_telemetry_payload() -> dict:
     }
 
 
+def get_settings_dialog_integrity_seal() -> dict:
+    return {
+        "module": "settings_dialog",
+        "sealed": validate_settings_dialog_contract(),
+        "telemetry": get_settings_dialog_telemetry_payload(),
+    }
+
 
