@@ -2463,4 +2463,6 @@ def get_route_manager_compliance_certificate() -> dict:
     return {"module": "route_manager", "certified": validate_route_manager_contract(), "seal": get_route_manager_integrity_seal()}
 
 
+def get_route_manager_readiness_probe() -> dict:
+    return {"module": "route_manager", "ready": validate_route_manager_contract(), "certificate": get_route_manager_compliance_certificate()}
 

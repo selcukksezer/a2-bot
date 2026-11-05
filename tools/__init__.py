@@ -69,5 +69,10 @@ def get_tools_package_compliance_certificate() -> dict:
     return {"module": "tools_package", "certified": validate_tools_package_contract(), "seal": get_tools_package_integrity_seal()}
 
 
+validate_tools_pkg_contract = validate_tools_package_contract
+get_tools_pkg_compliance_certificate = get_tools_package_compliance_certificate
 
+
+def get_tools_pkg_readiness_probe() -> dict:
+    return {"module": "tools_pkg", "ready": validate_tools_pkg_contract(), "certificate": get_tools_pkg_compliance_certificate()}
 

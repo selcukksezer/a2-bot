@@ -2471,3 +2471,11 @@ def get_auto_cartographer_compliance_certificate() -> dict:
         "seal": get_auto_cartographer_integrity_seal(),
     }
 
+
+def get_auto_cartographer_readiness_probe() -> dict:
+    return {
+        "module": "auto_cartographer",
+        "ready": validate_auto_cartographer_contract(),
+        "certificate": get_auto_cartographer_compliance_certificate(),
+    }
+

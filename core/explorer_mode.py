@@ -1988,3 +1988,7 @@ def get_explorer_mode_compliance_certificate() -> dict:
     return {"module": "explorer_mode", "certified": validate_explorer_mode_contract(), "seal": get_explorer_mode_integrity_seal()}
 
 
+def get_explorer_mode_readiness_probe() -> dict:
+    return {"module": "explorer_mode", "ready": validate_explorer_mode_contract(), "certificate": get_explorer_mode_compliance_certificate()}
+
+

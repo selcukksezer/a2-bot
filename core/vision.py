@@ -1695,3 +1695,7 @@ def get_vision_compliance_certificate() -> dict:
     return {"module": "vision", "certified": validate_vision_contract(), "seal": get_vision_integrity_seal()}
 
 
+def get_vision_readiness_probe() -> dict:
+    return {"module": "vision", "ready": validate_vision_contract(), "certificate": get_vision_compliance_certificate()}
+
+
