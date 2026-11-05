@@ -100,4 +100,8 @@ def get_recorder_baseline_metrics() -> dict:
     return {"module": "recorder", "contract_valid": validate_recorder_contract(), "recorder_ready": True}
 
 
+def get_recorder_readiness_status() -> dict:
+    return {"module": "recorder", "ready": validate_recorder_contract(), "metrics": get_recorder_baseline_metrics()}
+
+
 

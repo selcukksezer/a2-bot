@@ -71,3 +71,7 @@ def get_test_input_baseline_metrics() -> dict:
     return {"module": "test_input", "contract_valid": validate_test_input_contract(), "test_input_ready": True}
 
 
+def get_test_input_readiness_status() -> dict:
+    return {"module": "test_input", "ready": validate_test_input_contract(), "metrics": get_test_input_baseline_metrics()}
+
+

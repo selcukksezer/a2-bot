@@ -185,4 +185,6 @@ def get_route_runner_baseline_metrics() -> dict:
     return {"module": "route_runner", "contract_valid": validate_route_runner_contract(), "runner_ready": True}
 
 
+def get_route_runner_readiness_status() -> dict:
+    return {"module": "route_runner", "ready": validate_route_runner_contract(), "metrics": get_route_runner_baseline_metrics()}
 

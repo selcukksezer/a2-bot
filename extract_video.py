@@ -46,3 +46,7 @@ def get_extract_video_baseline_metrics() -> dict:
     return {"module": "extract_video", "contract_valid": validate_extract_video_contract(), "extractor_ready": True}
 
 
+def get_extract_video_readiness_status() -> dict:
+    return {"module": "extract_video", "ready": validate_extract_video_contract(), "metrics": get_extract_video_baseline_metrics()}
+
+

@@ -133,3 +133,12 @@ def get_auto_gather_baseline_metrics() -> dict:
     }
 
 
+def get_auto_gather_readiness_status() -> dict:
+    return {
+        "module": "auto_gather",
+        "ready": validate_auto_gather_contract(),
+        "metrics": get_auto_gather_baseline_metrics(),
+    }
+
+
+
