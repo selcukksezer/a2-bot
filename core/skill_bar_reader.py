@@ -254,6 +254,9 @@ class SkillBarReader:
     def get_skill_bar_reader_version_info(self) -> dict:
         return {"module": "skill_bar_reader", "version": "2.0.0", "ready": True}
 
+    def get_skill_bar_reader_diagnostic_snapshot(self) -> dict:
+        return {"module": "skill_bar_reader", "status": "ok", "ready": True}
+
 
 class MicroCameraLookAround:
     """

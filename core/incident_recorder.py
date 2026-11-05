@@ -681,3 +681,7 @@ class IncidentRecorder:
     def get_incident_recorder_version_info(self) -> dict:
         return {"module": "incident_recorder", "version": "2.0.0", "ready": True}
 
+    def get_incident_recorder_diagnostic_snapshot(self) -> dict:
+        return {"module": "incident_recorder", "status": "ok", "ready": True}
+
+
