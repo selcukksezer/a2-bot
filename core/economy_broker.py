@@ -1427,4 +1427,9 @@ def get_economy_broker_compliance_certificate() -> dict:
     return {"module": "economy_broker", "certified": validate_economy_broker_contract(), "seal": get_economy_broker_integrity_seal()}
 
 
+def get_economy_broker_readiness_probe() -> dict:
+    return {"module": "economy_broker", "ready": validate_economy_broker_contract(), "certificate": get_economy_broker_compliance_certificate()}
+
+
+
 

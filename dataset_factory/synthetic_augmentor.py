@@ -838,4 +838,6 @@ def get_synthetic_augmentor_compliance_certificate() -> dict:
     return {"module": "synthetic_augmentor", "certified": validate_synthetic_augmentor_contract(), "seal": get_synthetic_augmentor_integrity_seal()}
 
 
+def get_synthetic_augmentor_readiness_probe() -> dict:
+    return {"module": "synthetic_augmentor", "ready": validate_synthetic_augmentor_contract(), "certificate": get_synthetic_augmentor_compliance_certificate()}
 

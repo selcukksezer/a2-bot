@@ -403,4 +403,6 @@ def get_frame_time_machine_compliance_certificate() -> dict:
     return {"module": "frame_time_machine", "certified": validate_frame_time_machine_contract(), "seal": get_frame_time_machine_integrity_seal()}
 
 
+def get_frame_time_machine_readiness_probe() -> dict:
+    return {"module": "frame_time_machine", "ready": validate_frame_time_machine_contract(), "certificate": get_frame_time_machine_compliance_certificate()}
 
