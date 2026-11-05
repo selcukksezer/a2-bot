@@ -2125,3 +2125,7 @@ class YOLOFactoryDialog(QDialog):
         if self._training_worker is not None and self._training_worker.isRunning():
             self._training_worker.wait(3000)
         super().closeEvent(event)
+
+    def get_yolo_factory_dialog_ready_flag(self) -> dict:
+        return {"module": "yolo_factory_dialog", "ready": True}
+

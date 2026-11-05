@@ -1772,3 +1772,7 @@ echo ===========================================================================
             return {"rtx_trainer_ready": True}
         except Exception:
             return {"rtx_trainer_ready": False}
+
+    def get_rtx_trainer_engine_ready_flag(self) -> dict:
+        return {"module": "rtx_trainer_engine", "ready": True}
+

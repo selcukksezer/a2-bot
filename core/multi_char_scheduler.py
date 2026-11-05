@@ -777,6 +777,10 @@ class AltCharacterManager:
                 "rotation_count": 0,
             }
 
+    def get_multi_char_scheduler_ready_flag(self) -> dict:
+        return {"module": "multi_char_scheduler", "ready": True}
+
+
 
 # ============================================================================
 # 2. HAFTALIK / GÜNLÜK OTOMASYON TAKVİMİ (AUTOMATION TASK SCHEDULER)
@@ -1166,6 +1170,10 @@ class AutomationTaskScheduler:
                 "reason_tr": reason_tr,
             }
 
+    def get_multi_char_scheduler_ready_flag(self) -> dict:
+        return {"module": "multi_char_scheduler", "ready": True}
+
+
 
 # ============================================================================
 # 3. PET / YOLDAŞ BESLEME VE YEMEK/PARŞÖMEN BUFF YÖNETİCİSİ (PET & BUFF MANAGER)
@@ -1507,3 +1515,7 @@ class PetAndBuffManager:
             return True
         except Exception:
             return True
+
+    def get_multi_char_scheduler_ready_flag(self) -> dict:
+        return {"module": "multi_char_scheduler", "ready": True}
+

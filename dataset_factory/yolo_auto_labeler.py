@@ -1449,6 +1449,9 @@ class YOLOAutoLabeler:
         except Exception:
             return {"auto_labeler_ready": False, "classes": 0}
 
+    def get_yolo_auto_labeler_ready_flag(self) -> dict:
+        return {"module": "yolo_auto_labeler", "ready": True}
+
 
 __all__ = [
     "YOLO_CLASSES",

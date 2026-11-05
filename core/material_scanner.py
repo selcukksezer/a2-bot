@@ -1346,3 +1346,7 @@ class MaterialScanner:
             max(1, center_hsv.shape[0] * center_hsv.shape[1])
         )
         return slate_ratio > 0.52
+
+    def get_material_scanner_ready_flag(self) -> dict:
+        return {"module": "material_scanner", "ready": True}
+
