@@ -1163,3 +1163,8 @@ if __name__ == "__main__":
 def get_mobile_connect_dialog_capabilities() -> list:
     return ["mobile_connect_dialog", "qr_pairing", "diagnostic_snapshot"]
 
+
+def validate_mobile_connect_dialog_contract() -> bool:
+    return bool(get_mobile_connect_dialog_capabilities())
+
+

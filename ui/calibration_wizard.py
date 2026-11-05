@@ -1032,3 +1032,8 @@ class CalibrationWizard(QDialog):
 def get_calibration_wizard_capabilities() -> list:
     return ["calibration_wizard", "roi_calibration", "diagnostic_snapshot"]
 
+
+def validate_calibration_wizard_contract() -> bool:
+    return bool(get_calibration_wizard_capabilities())
+
+

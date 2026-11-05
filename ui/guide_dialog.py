@@ -835,3 +835,8 @@ class GuideDialog(QDialog):
 def get_guide_dialog_capabilities() -> list:
     return ["guide_dialog", "interactive_help", "diagnostic_snapshot"]
 
+
+def validate_guide_dialog_contract() -> bool:
+    return bool(get_guide_dialog_capabilities())
+
+

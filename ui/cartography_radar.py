@@ -2940,3 +2940,7 @@ class CartographyRadarDialog(QDialog):
 def get_cartography_radar_capabilities() -> list:
     return ["cartography_radar", "live_radar_overlay", "diagnostic_snapshot"]
 
+
+def validate_cartography_radar_contract() -> bool:
+    return bool(get_cartography_radar_capabilities())
+

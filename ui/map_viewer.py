@@ -1261,3 +1261,8 @@ MapViewer = MapViewerWindow
 def get_map_viewer_capabilities() -> list:
     return ["map_viewer", "route_visualization", "diagnostic_snapshot"]
 
+
+def validate_map_viewer_contract() -> bool:
+    return bool(get_map_viewer_capabilities())
+
+
