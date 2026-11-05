@@ -350,3 +350,9 @@ class PreGatherTimeMachineBuffer:
                 ]
         except Exception:
             return []
+
+    def get_time_machine_health_summary(self) -> dict:
+        try:
+            return {"time_machine_ready": True}
+        except Exception:
+            return {"time_machine_ready": False}

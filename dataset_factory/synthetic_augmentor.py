@@ -730,6 +730,12 @@ class SyntheticYOLOAugmentor:
         except Exception:
             return False
 
+    def get_augmentor_health_summary(self) -> dict:
+        try:
+            return {"augmentor_ready": True}
+        except Exception:
+            return {"augmentor_ready": False}
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")

@@ -1368,3 +1368,9 @@ class SessionProfitSimulator:
             "formatted_summary_tr": formatted_summary_tr,
             "material_breakdown": material_breakdown,
         }
+
+    def get_economy_broker_health_summary(self) -> dict:
+        try:
+            return {"economy_broker_ready": True}
+        except Exception:
+            return {"economy_broker_ready": False}

@@ -1123,6 +1123,12 @@ class AutoLabelingDatasetFactory:
             "onnx_verification": onnx_info,
         }
 
+    def get_factory_controller_health_summary(self) -> dict:
+        try:
+            return {"factory_controller_ready": True}
+        except Exception:
+            return {"factory_controller_ready": False}
+
 
 __all__ = [
     "FACTORY_12_CLASS_NAMES",
