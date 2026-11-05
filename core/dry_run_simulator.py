@@ -482,3 +482,12 @@ def get_dry_run_simulator_compliance_certificate() -> dict:
         "seal": get_dry_run_simulator_integrity_seal(),
     }
 
+
+def get_dry_run_simulator_readiness_probe() -> dict:
+    return {
+        "module": "dry_run_simulator",
+        "ready": validate_dry_run_simulator_contract(),
+        "certificate": get_dry_run_simulator_compliance_certificate(),
+    }
+
+
