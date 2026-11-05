@@ -1972,3 +1972,12 @@ def get_sequential_router_integrity_seal() -> dict:
     }
 
 
+def get_sequential_router_compliance_certificate() -> dict:
+    return {
+        "module": "sequential_router",
+        "certified": validate_sequential_router_contract(),
+        "seal": get_sequential_router_integrity_seal(),
+    }
+
+
+

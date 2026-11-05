@@ -1030,3 +1030,12 @@ def get_behavioral_guard_integrity_seal() -> dict:
     }
 
 
+def get_behavioral_guard_compliance_certificate() -> dict:
+    return {
+        "module": "behavioral_guard",
+        "certified": validate_behavioral_guard_contract(),
+        "seal": get_behavioral_guard_integrity_seal(),
+    }
+
+
+

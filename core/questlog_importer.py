@@ -1558,3 +1558,8 @@ def get_questlog_importer_telemetry_payload() -> dict:
 def get_questlog_importer_integrity_seal() -> dict:
     return {"module": "questlog_importer", "sealed": validate_questlog_importer_contract(), "telemetry": get_questlog_importer_telemetry_payload()}
 
+
+def get_questlog_importer_compliance_certificate() -> dict:
+    return {"module": "questlog_importer", "certified": validate_questlog_importer_contract(), "seal": get_questlog_importer_integrity_seal()}
+
+
