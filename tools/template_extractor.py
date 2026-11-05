@@ -1018,3 +1018,7 @@ def get_template_extractor_audit_summary() -> dict:
     return {"module": "template_extractor", "audit_passed": validate_template_extractor_contract(), "probe": get_template_extractor_readiness_probe()}
 
 
+def get_template_extractor_heartbeat_snapshot() -> dict:
+    return {"module": "template_extractor", "alive": validate_template_extractor_contract(), "audit": get_template_extractor_audit_summary()}
+
+

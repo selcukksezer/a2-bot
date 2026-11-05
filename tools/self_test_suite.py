@@ -1394,4 +1394,12 @@ def get_self_test_suite_audit_summary() -> dict:
     }
 
 
+def get_self_test_suite_heartbeat_snapshot() -> dict:
+    return {
+        "module": "self_test_suite",
+        "alive": validate_self_test_suite_contract(),
+        "audit": get_self_test_suite_audit_summary(),
+    }
+
+
 

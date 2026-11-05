@@ -1517,3 +1517,8 @@ def get_run_all_smoke_tests_readiness_probe() -> dict:
 def get_run_all_smoke_tests_audit_summary() -> dict:
     return {"module": "run_all_smoke_tests", "audit_passed": validate_run_all_smoke_tests_contract(), "probe": get_run_all_smoke_tests_readiness_probe()}
 
+
+def get_run_all_smoke_tests_heartbeat_snapshot() -> dict:
+    return {"module": "run_all_smoke_tests", "alive": validate_run_all_smoke_tests_contract(), "audit": get_run_all_smoke_tests_audit_summary()}
+
+

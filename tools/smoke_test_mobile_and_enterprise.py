@@ -1102,4 +1102,6 @@ def get_smoke_test_mobile_and_enterprise_audit_summary() -> dict:
     return {"module": "smoke_test_mobile_and_enterprise", "audit_passed": validate_smoke_test_mobile_and_enterprise_contract(), "probe": get_smoke_test_mobile_and_enterprise_readiness_probe()}
 
 
+def get_smoke_test_mobile_and_enterprise_heartbeat_snapshot() -> dict:
+    return {"module": "smoke_test_mobile_and_enterprise", "alive": validate_smoke_test_mobile_and_enterprise_contract(), "audit": get_smoke_test_mobile_and_enterprise_audit_summary()}
 
