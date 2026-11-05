@@ -805,3 +805,8 @@ if __name__ == "__main__":
 def get_synthetic_augmentor_capabilities() -> list:
     return ["synthetic_augmentor", "photometric_augmentation", "diagnostic_snapshot"]
 
+
+def validate_synthetic_augmentor_contract() -> bool:
+    return bool(get_synthetic_augmentor_capabilities())
+
+

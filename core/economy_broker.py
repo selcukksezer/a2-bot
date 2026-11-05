@@ -1394,3 +1394,8 @@ class SessionProfitSimulator:
 def get_economy_broker_capabilities() -> list:
     return ["economy_broker", "market_valuation", "diagnostic_snapshot"]
 
+
+def validate_economy_broker_contract() -> bool:
+    return bool(get_economy_broker_capabilities())
+
+

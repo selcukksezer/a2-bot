@@ -1184,3 +1184,8 @@ if __name__ == "__main__":
 def get_factory_controller_capabilities() -> list:
     return ["factory_controller", "pipeline_orchestration", "diagnostic_snapshot"]
 
+
+def validate_factory_controller_contract() -> bool:
+    return bool(get_factory_controller_capabilities())
+
+

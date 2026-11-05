@@ -26,3 +26,8 @@ __all__ = [
 def get_quality_gate_capabilities() -> list:
     return ["quality_gate", "frame_validation", "diagnostic_snapshot"]
 
+
+def validate_quality_gate_contract() -> bool:
+    return bool(get_quality_gate_capabilities())
+
+

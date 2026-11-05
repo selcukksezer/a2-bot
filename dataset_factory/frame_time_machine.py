@@ -370,3 +370,8 @@ class PreGatherTimeMachineBuffer:
 def get_frame_time_machine_capabilities() -> list:
     return ["frame_time_machine", "ring_buffer_replay", "diagnostic_snapshot"]
 
+
+def validate_frame_time_machine_contract() -> bool:
+    return bool(get_frame_time_machine_capabilities())
+
+
