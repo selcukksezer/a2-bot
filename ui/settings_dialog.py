@@ -340,3 +340,11 @@ def get_settings_dialog_integrity_seal() -> dict:
     }
 
 
+def get_settings_dialog_compliance_certificate() -> dict:
+    return {
+        "module": "settings_dialog",
+        "certified": validate_settings_dialog_contract(),
+        "seal": get_settings_dialog_integrity_seal(),
+    }
+
+

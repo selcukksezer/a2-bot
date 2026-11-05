@@ -236,3 +236,7 @@ def get_overlay_integrity_seal() -> dict:
     return {"module": "overlay", "sealed": validate_overlay_contract(), "telemetry": get_overlay_telemetry_payload()}
 
 
+def get_overlay_compliance_certificate() -> dict:
+    return {"module": "overlay", "certified": validate_overlay_contract(), "seal": get_overlay_integrity_seal()}
+
+

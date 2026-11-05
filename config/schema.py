@@ -684,4 +684,10 @@ def get_schema_integrity_seal() -> dict:
     }
 
 
+def get_schema_compliance_certificate() -> dict:
+    return {
+        "module": "schema",
+        "certified": validate_schema_contract(),
+        "seal": get_schema_integrity_seal(),
+    }
 

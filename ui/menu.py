@@ -137,3 +137,7 @@ def get_menu_integrity_seal() -> dict:
     return {"module": "menu", "sealed": validate_menu_contract(), "telemetry": get_menu_telemetry_payload()}
 
 
+def get_menu_compliance_certificate() -> dict:
+    return {"module": "menu", "certified": validate_menu_contract(), "seal": get_menu_integrity_seal()}
+
+
