@@ -367,4 +367,6 @@ class PreGatherTimeMachineBuffer:
         return {"module": "frame_time_machine", "status": "ok", "ready": True}
 
 
+def get_frame_time_machine_capabilities() -> list:
+    return ["frame_time_machine", "ring_buffer_replay", "diagnostic_snapshot"]
 

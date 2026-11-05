@@ -1179,3 +1179,8 @@ if __name__ == "__main__":
             ensure_ascii=False,
         )
     )
+
+
+def get_factory_controller_capabilities() -> list:
+    return ["factory_controller", "pipeline_orchestration", "diagnostic_snapshot"]
+

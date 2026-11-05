@@ -1391,3 +1391,6 @@ class SessionProfitSimulator:
         return {"module": "economy_broker", "status": "ok", "ready": True}
 
 
+def get_economy_broker_capabilities() -> list:
+    return ["economy_broker", "market_valuation", "diagnostic_snapshot"]
+

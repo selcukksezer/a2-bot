@@ -800,3 +800,8 @@ if __name__ == "__main__":
         )
 
     logger.info("All 10x photometric & geometric synthetic augmentations verified strictly inside [0.0, 1.0].")
+
+
+def get_synthetic_augmentor_capabilities() -> list:
+    return ["synthetic_augmentor", "photometric_augmentation", "diagnostic_snapshot"]
+

@@ -21,3 +21,8 @@ __all__ = [
     "DatasetQualityGate",
     "QualityGateDecision",
 ]
+
+
+def get_quality_gate_capabilities() -> list:
+    return ["quality_gate", "frame_validation", "diagnostic_snapshot"]
+
