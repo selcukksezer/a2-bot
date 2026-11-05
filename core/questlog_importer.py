@@ -1535,3 +1535,7 @@ def validate_questlog_importer_contract() -> bool:
     return bool(get_questlog_importer_capabilities())
 
 
+def get_questlog_importer_baseline_metrics() -> dict:
+    return {"module": "questlog_importer", "contract_valid": validate_questlog_importer_contract(), "capability_count": len(get_questlog_importer_capabilities())}
+
+

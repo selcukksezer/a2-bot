@@ -982,3 +982,11 @@ def get_behavioral_guard_capabilities() -> list:
 def validate_behavioral_guard_contract() -> bool:
     return bool(get_behavioral_guard_capabilities())
 
+
+def get_behavioral_guard_baseline_metrics() -> dict:
+    return {
+        "module": "behavioral_guard",
+        "contract_valid": validate_behavioral_guard_contract(),
+        "capability_count": len(get_behavioral_guard_capabilities()),
+    }
+

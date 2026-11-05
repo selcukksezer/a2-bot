@@ -1925,3 +1925,11 @@ def validate_sequential_router_contract() -> bool:
     return bool(get_sequential_router_capabilities())
 
 
+def get_sequential_router_baseline_metrics() -> dict:
+    return {
+        "module": "sequential_router",
+        "contract_valid": validate_sequential_router_contract(),
+        "capability_count": len(get_sequential_router_capabilities()),
+    }
+
+
