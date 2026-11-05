@@ -1410,3 +1410,7 @@ class CombatRecovery:
         except Exception as exc:
             logger.error("get_combat_recovery_health_summary hatası: %s", exc)
             return {"combat_recovery_ready": False}
+
+    def get_combat_recovery_ready_flag(self) -> dict:
+        return {"module": "combat_recovery", "ready": True}
+

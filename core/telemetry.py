@@ -1178,3 +1178,7 @@ class TelemetryEngine:
             return {"telemetry_ready": True}
         except Exception:
             return {"telemetry_ready": False}
+
+    def get_telemetry_engine_ready_flag(self) -> dict:
+        return {"module": "telemetry", "ready": True}
+

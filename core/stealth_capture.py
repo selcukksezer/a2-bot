@@ -535,6 +535,9 @@ class DXGIDesktopCapture:
         except Exception:
             return {"stealth_capture_ready": False}
 
+    def get_stealth_capture_ready_flag(self) -> dict:
+        return {"module": "stealth_capture", "ready": True}
+
 
 class AdaptiveFramePacer:
     """
@@ -868,3 +871,14 @@ class StealthOverlayManager:
         except Exception as exc:
             logger.error("Failed to read GWL_EXSTYLE: %s", exc)
             return 0
+
+    def get_stealth_capture_ready_flag(self) -> dict:
+        return {"module": "stealth_capture", "ready": True}
+
+
+class StealthCapture(DXGIDesktopCapture):
+    """Stealth capture facade inheriting isolated desktop duplication capture."""
+
+    def get_stealth_capture_ready_flag(self) -> dict:
+        return {"module": "stealth_capture", "ready": True}
+

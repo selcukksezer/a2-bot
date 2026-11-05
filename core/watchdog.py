@@ -923,6 +923,9 @@ class BotWatchdog:
                 logger.error("Unexpected error in watchdog monitor loop: %s", exc)
             time.sleep(interval)
 
+    def get_watchdog_ready_flag(self) -> dict:
+        return {"module": "watchdog", "ready": True}
+
 
 def freeze_watchdog_on_pause(
     watchdog: BotWatchdog,

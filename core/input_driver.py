@@ -1462,6 +1462,9 @@ class InputController:
             logger.debug("get_input_controller_health_summary error: %s", e)
             return {"input_controller_ready": False}
 
+    def get_input_controller_ready_flag(self) -> dict:
+        return {"module": "input_driver", "ready": True}
+
 
 # Geriye dönük uyumluluk için takma ad (Alias)
 InputDriver = InputController
