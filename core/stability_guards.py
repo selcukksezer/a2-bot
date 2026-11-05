@@ -1253,3 +1253,8 @@ __all__ = [
 def get_stability_guards_capabilities() -> list:
     return ["stability_guards", "fault_containment", "diagnostic_snapshot"]
 
+
+def validate_stability_guards_contract() -> bool:
+    return bool(get_stability_guards_capabilities())
+
+

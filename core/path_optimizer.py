@@ -582,4 +582,6 @@ def get_path_optimizer_capabilities() -> list:
     return ["path_optimizer", "2opt_tsp_solver", "diagnostic_snapshot"]
 
 
+def validate_path_optimizer_contract() -> bool:
+    return bool(get_path_optimizer_capabilities())
 

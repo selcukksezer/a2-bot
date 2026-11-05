@@ -1985,3 +1985,8 @@ __all__ = [
 def get_navigation_intel_capabilities() -> list:
     return ["navigation_intel", "spatial_heuristics", "diagnostic_snapshot"]
 
+
+def validate_navigation_intel_contract() -> bool:
+    return bool(get_navigation_intel_capabilities())
+
+

@@ -1042,3 +1042,7 @@ def check_driver_backend_status() -> dict[str, Any]:
 def get_windmouse_humanizer_capabilities() -> list:
     return ["windmouse_humanizer", "bezier_windmouse", "diagnostic_snapshot"]
 
+
+def validate_windmouse_humanizer_contract() -> bool:
+    return bool(get_windmouse_humanizer_capabilities())
+

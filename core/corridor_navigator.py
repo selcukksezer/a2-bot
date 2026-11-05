@@ -1323,3 +1323,8 @@ class CorridorNavigator:
 def get_corridor_navigator_capabilities() -> list:
     return ["corridor_navigator", "corridor_steering", "diagnostic_snapshot"]
 
+
+def validate_corridor_navigator_contract() -> bool:
+    return bool(get_corridor_navigator_capabilities())
+
+
