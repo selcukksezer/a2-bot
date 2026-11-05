@@ -3025,4 +3025,6 @@ refresh();
         return {"module": "mobile_server", "status": "ok", "ready": True}
 
 
+def get_mobile_server_capabilities() -> list:
+    return ["mobile_server", "remote_api", "diagnostic_snapshot"]
 

@@ -1131,4 +1131,11 @@ class F9Menu(QWidget):
     def get_f9_menu_diagnostic_snapshot(self) -> dict:
         return {"module": "f9_menu", "status": "ok", "ready": True}
 
+    def get_f9_menu_capabilities(self) -> list:
+        return ["f9_menu", "quick_actions", "diagnostic_snapshot"]
+
+
+def get_f9_menu_capabilities() -> list:
+    return ["f9_menu", "quick_actions", "diagnostic_snapshot"]
+
 

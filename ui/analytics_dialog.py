@@ -643,4 +643,6 @@ class AnalyticsDialog(QDialog):
         return {"module": "analytics_dialog", "status": "ok", "ready": True}
 
 
+def get_analytics_dialog_capabilities() -> list:
+    return ["analytics_dialog", "telemetry_visualization", "diagnostic_snapshot"]
 

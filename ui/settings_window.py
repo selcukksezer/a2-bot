@@ -2863,3 +2863,8 @@ class SettingsWindow(QDialog):
 
 # Backwards compatibility alias
 SettingsDialog = SettingsWindow
+
+
+def get_settings_window_capabilities() -> list:
+    return ["settings_window", "configuration_ui", "diagnostic_snapshot"]
+

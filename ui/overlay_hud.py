@@ -1194,3 +1194,8 @@ class OverlayHUD(QWidget):
 GameOverlay = OverlayHUD
 
 __all__ = ["OverlayHUD", "GameOverlay", "OverlaySignals", "ClickableShortcutWidget"]
+
+
+def get_overlay_hud_capabilities() -> list:
+    return ["overlay_hud", "transparent_hud", "diagnostic_snapshot"]
+
