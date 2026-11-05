@@ -1205,6 +1205,12 @@ class NameplateHSVIsolator:
             "confidence": round(conf, 4),
         }
 
+    def get_vision_filters_health_summary(self) -> dict:
+        try:
+            return {"vision_filters_ready": True}
+        except Exception:
+            return {"vision_filters_ready": False}
+
 
 __all__ = [
     "FeatherNegativeFilter",

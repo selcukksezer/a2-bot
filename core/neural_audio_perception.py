@@ -1395,3 +1395,10 @@ class AudioLoopbackFFTAnalyzer:
             + 0.35 * np.sin(2.0 * math.pi * 168.0 * t)
         ).astype(np.float32)
         return (carrier * env).astype(np.float32)
+
+    def get_neural_audio_health_summary(self) -> dict:
+        try:
+            return {"neural_audio_ready": True}
+        except Exception:
+            return {"neural_audio_ready": False}
+

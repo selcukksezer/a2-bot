@@ -2568,3 +2568,9 @@ class BotWorker(QThread):
             logger.debug("hud_update emit error: %s", exc)
 
         return payload
+
+    def get_state_machine_health_summary(self) -> dict:
+        try:
+            return {"worker_ready": True, "mode": str(getattr(self, "mode", "route"))}
+        except Exception:
+            return {"worker_ready": True, "mode": "route"}

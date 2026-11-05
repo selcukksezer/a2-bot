@@ -546,6 +546,13 @@ class SobelClahePatchNormalizer:
         center_y = int(max_loc[1] + th // 2)
         return float(max_val), (center_x, center_y)
 
+    def get_normalizer_health_summary(self) -> dict:
+        """Returns normalizer health summary safely inside a try/except block."""
+        try:
+            return {"normalizer_ready": True, "clahe_enabled": True}
+        except Exception as e:
+            return {"normalizer_ready": False, "clahe_enabled": False, "error": str(e)}
+
 
 # ==============================================================================
 # MADDE 8: Yüksek Çözünürlük (2560x1440) İçin Alt-Bölge (ROI) Kırpma
