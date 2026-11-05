@@ -13,6 +13,7 @@ from .frame_time_machine import FrameSnapshot, PreGatherTimeMachineBuffer
 __all__ = [
     "FrameSnapshot",
     "PreGatherTimeMachineBuffer",
+    "get_dataset_factory_package_readiness_status",
 ]
 
 
@@ -49,5 +50,14 @@ def get_dataset_factory_package_baseline_metrics() -> dict:
         "contract_valid": validate_dataset_factory_package_contract(),
         "capability_count": len(get_dataset_factory_package_capabilities()),
     }
+
+
+def get_dataset_factory_package_readiness_status() -> dict:
+    return {
+        "module": "dataset_factory_package",
+        "ready": validate_dataset_factory_package_contract(),
+        "metrics": get_dataset_factory_package_baseline_metrics(),
+    }
+
 
 

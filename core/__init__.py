@@ -31,3 +31,7 @@ def validate_core_package_contract() -> bool:
 def get_core_package_baseline_metrics() -> dict:
     return {"module": "core_package", "contract_valid": validate_core_package_contract(), "capability_count": len(get_core_package_capabilities())}
 
+
+def get_core_package_readiness_status() -> dict:
+    return {"module": "core_package", "ready": validate_core_package_contract(), "metrics": get_core_package_baseline_metrics()}
+

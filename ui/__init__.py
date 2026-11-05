@@ -30,3 +30,7 @@ def validate_ui_package_contract() -> bool:
 def get_ui_package_baseline_metrics() -> dict:
     return {"module": "ui_package", "contract_valid": validate_ui_package_contract(), "capability_count": len(get_ui_package_capabilities())}
 
+
+def get_ui_package_readiness_status() -> dict:
+    return {"module": "ui_package", "ready": validate_ui_package_contract(), "metrics": get_ui_package_baseline_metrics()}
+
