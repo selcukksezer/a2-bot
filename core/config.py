@@ -93,3 +93,8 @@ def get_core_config_readiness_status() -> dict:
     return {"module": "core_config", "ready": validate_core_config_contract(), "metrics": get_core_config_baseline_metrics()}
 
 
+def get_config_audit_record() -> dict:
+    return {"module": "config", "audit_passed": validate_config_contract(), "readiness": get_config_readiness_status()}
+
+
+

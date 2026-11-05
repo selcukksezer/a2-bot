@@ -139,4 +139,6 @@ def get_navigator_readiness_status() -> dict:
     return {"module": "navigator", "ready": validate_navigator_contract(), "metrics": get_navigator_baseline_metrics()}
 
 
+def get_navigator_audit_record() -> dict:
+    return {"module": "navigator", "audit_passed": validate_navigator_contract(), "readiness": get_navigator_readiness_status()}
 

@@ -679,4 +679,8 @@ def get_capture_readiness_status() -> dict:
     return {"module": "capture", "ready": validate_capture_contract(), "metrics": get_capture_baseline_metrics()}
 
 
+def get_capture_audit_record() -> dict:
+    return {"module": "capture", "audit_passed": validate_capture_contract(), "readiness": get_capture_readiness_status()}
+
+
 

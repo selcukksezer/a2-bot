@@ -95,3 +95,7 @@ def get_combat_readiness_status() -> dict:
     return {"module": "combat", "ready": validate_combat_contract(), "metrics": get_combat_baseline_metrics()}
 
 
+def get_combat_audit_record() -> dict:
+    return {"module": "combat", "audit_passed": validate_combat_contract(), "readiness": get_combat_readiness_status()}
+
+
