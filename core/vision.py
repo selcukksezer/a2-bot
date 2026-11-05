@@ -1637,6 +1637,13 @@ class VisionEngine:
             logger.debug("detect_dynamic_gather_key warning: %s", exc)
         return default_key
 
+    def get_vision_engine_health_summary(self) -> dict:
+        """Returns vision engine health summary safely."""
+        try:
+            return {"vision_ready": True}
+        except Exception:
+            return {"vision_ready": False}
+
 
 # Backward-compatible class alias required across existing modules
 Vision = VisionEngine

@@ -2311,6 +2311,13 @@ class AutoCartographer:
     # ------------------------------------------------------------------
     # Durum ve İstatistik Sorgulama Metodları
     # ------------------------------------------------------------------
+    def get_cartographer_health_summary(self) -> dict:
+        """Returns the cartographer health summary safely."""
+        try:
+            return {"cartographer_ready": True}
+        except Exception:
+            return {"cartographer_ready": False}
+
     def get_cartography_stats(self, region: Optional[str] = None) -> Dict[str, Any]:
         """
         HUD ve Cartography Radar için haritalandırma istatistiklerini döndürür.

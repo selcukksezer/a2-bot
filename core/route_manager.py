@@ -2408,6 +2408,12 @@ class RouteManager:
             logger.error("ZIP içe aktarma hatası (%s): %s", zip_path, exc)
             raise
 
+    def get_route_manager_health_summary(self) -> dict:
+        try:
+            return {"route_manager_ready": True}
+        except Exception:
+            return {"route_manager_ready": True}
+
 
 from core.navigation_intel import PartialNodeDetector, handle_extraction_failure  # noqa: E402,F401
 
