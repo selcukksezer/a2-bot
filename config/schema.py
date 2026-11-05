@@ -590,3 +590,7 @@ def get_schema_validation_summary() -> dict:
     except Exception as exc:
         logger.error("Error in get_schema_validation_summary: %s", exc)
         return {"schema_ready": False, "unified_file": "config/settings.json"}
+
+
+def get_schema_health_summary() -> dict:
+    return {"module": "schema", "ready": True}

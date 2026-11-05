@@ -175,6 +175,9 @@ class GameOverlay(QWidget):
         self.log_lbl2.setText(self.log_lbl1.text())
         self.log_lbl1.setText(entry)
 
+    def get_overlay_health_summary(self) -> dict:
+        return {"module": "overlay", "ready": True}
+
     def get_overlay_status_summary(self) -> dict:
         try:
             return {"overlay_ready": True}

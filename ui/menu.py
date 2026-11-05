@@ -74,6 +74,9 @@ class F9Menu(QMenu):
         cursor_pos = QCursor.pos()
         self.popup(cursor_pos)
 
+    def get_menu_health_summary(self) -> dict:
+        return {"module": "menu", "ready": True}
+
     def get_menu_status_summary(self) -> dict:
         try:
             return {"menu_ready": True}

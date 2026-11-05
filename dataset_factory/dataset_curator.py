@@ -1515,6 +1515,9 @@ class DatasetCurator:
         except Exception:
             return {"curator_ready": False, "unicode_io": False}
 
+    def get_dataset_curator_ready_flag(self) -> dict:
+        return {"module": "dataset_curator", "ready": True}
+
 
 __all__ = [
     "TARGET_DATASET_GOAL",

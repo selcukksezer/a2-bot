@@ -259,6 +259,9 @@ class SettingsDialog(QDialog):
         self.cfg.set("route", "fight_back_when_attacked", self.chk_combat.isChecked())
         self.accept()
 
+    def get_settings_dialog_health_summary(self) -> dict:
+        return {"module": "settings_dialog", "ready": True}
+
     def get_settings_dialog_summary(self) -> dict:
         try:
             return {"settings_dialog_ready": True}
