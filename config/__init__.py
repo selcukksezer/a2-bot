@@ -24,3 +24,7 @@ def get_config_package_capabilities() -> list:
     return ["config_package", "diagnostic_snapshot", "version_info"]
 
 
+def validate_config_package_contract() -> bool:
+    return bool(get_config_package_capabilities())
+
+

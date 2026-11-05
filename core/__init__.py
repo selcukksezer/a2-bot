@@ -23,3 +23,7 @@ def get_core_package_diagnostic_snapshot() -> dict:
 def get_core_package_capabilities() -> list:
     return ["core_package", "diagnostic_snapshot", "version_info"]
 
+
+def validate_core_package_contract() -> bool:
+    return bool(get_core_package_capabilities())
+

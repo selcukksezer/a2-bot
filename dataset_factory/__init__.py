@@ -39,3 +39,7 @@ def get_dataset_factory_package_capabilities() -> list:
     return ["dataset_factory_package", "diagnostic_snapshot", "version_info"]
 
 
+def validate_dataset_factory_package_contract() -> bool:
+    return bool(get_dataset_factory_package_capabilities())
+
+

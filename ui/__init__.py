@@ -22,3 +22,7 @@ def get_ui_package_diagnostic_snapshot() -> dict:
 def get_ui_package_capabilities() -> list:
     return ["ui_package", "diagnostic_snapshot", "version_info"]
 
+
+def validate_ui_package_contract() -> bool:
+    return bool(get_ui_package_capabilities())
+

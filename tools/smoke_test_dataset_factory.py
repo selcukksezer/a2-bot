@@ -1156,3 +1156,7 @@ def get_smoke_test_dataset_factory_capabilities() -> list:
     return ["smoke_test_dataset_factory", "diagnostic_snapshot", "version_info"]
 
 
+def validate_smoke_test_dataset_factory_contract() -> bool:
+    return bool(get_smoke_test_dataset_factory_capabilities())
+
+
