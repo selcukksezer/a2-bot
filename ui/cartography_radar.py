@@ -2949,3 +2949,15 @@ def get_cartography_radar_baseline_metrics() -> dict:
     return {"module": "cartography_radar", "contract_valid": validate_cartography_radar_contract(), "capability_count": len(get_cartography_radar_capabilities())}
 
 
+def get_cartography_radar_readiness_status() -> dict:
+    try:
+        return {
+            "module": "cartography_radar",
+            "ready": validate_cartography_radar_contract(),
+            "metrics": get_cartography_radar_baseline_metrics(),
+        }
+    except Exception:
+        return {"module": "cartography_radar", "ready": False, "metrics": {}}
+
+
+
