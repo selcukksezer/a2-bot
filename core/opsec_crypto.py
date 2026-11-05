@@ -1243,3 +1243,11 @@ def get_opsec_crypto_operational_digest() -> dict:
         "audit": get_opsec_crypto_audit_record(),
     }
 
+
+def get_opsec_crypto_telemetry_payload() -> dict:
+    return {
+        "module": "opsec_crypto",
+        "payload": get_opsec_crypto_operational_digest(),
+    }
+
+

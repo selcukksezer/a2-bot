@@ -52,6 +52,7 @@ __all__ = [
     "get_active_learning_readiness_status",
     "get_active_learning_audit_record",
     "get_active_learning_operational_digest",
+    "get_active_learning_telemetry_payload",
 ]
 
 
@@ -79,9 +80,6 @@ def get_active_learning_operational_digest() -> dict:
     return {"module": "active_learning", "operational": validate_active_learning_contract(), "audit": get_active_learning_audit_record()}
 
 
-def get_active_learning_operational_digest() -> dict:
-    return {"module": "active_learning", "operational": validate_active_learning_contract(), "audit": get_active_learning_audit_record()}
-
-
-
+def get_active_learning_telemetry_payload() -> dict:
+    return {"module": "active_learning", "payload": get_active_learning_operational_digest()}
 

@@ -1609,3 +1609,8 @@ def get_ocr_distance_operational_digest() -> dict:
     return {"module": "ocr_distance", "operational": validate_ocr_distance_contract(), "audit": get_ocr_distance_audit_record()}
 
 
+def get_ocr_distance_telemetry_payload() -> dict:
+    return {"module": "ocr_distance", "payload": get_ocr_distance_operational_digest()}
+
+
+

@@ -1166,3 +1166,11 @@ def get_minimap_scanner_operational_digest() -> dict:
     }
 
 
+def get_minimap_scanner_telemetry_payload() -> dict:
+    return {
+        "module": "minimap_scanner",
+        "payload": get_minimap_scanner_operational_digest(),
+    }
+
+
+
