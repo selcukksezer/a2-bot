@@ -1381,4 +1381,6 @@ def get_material_scanner_operational_digest() -> dict:
     return {"module": "material_scanner", "operational": validate_material_scanner_contract(), "audit": get_material_scanner_audit_record()}
 
 
+def get_material_scanner_telemetry_payload() -> dict:
+    return {"module": "material_scanner", "payload": get_material_scanner_operational_digest()}
 

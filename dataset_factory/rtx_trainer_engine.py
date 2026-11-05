@@ -1823,5 +1823,9 @@ def get_rtx_trainer_engine_operational_digest() -> dict:
     }
 
 
-
+def get_rtx_trainer_engine_telemetry_payload() -> dict:
+    return {
+        "module": "rtx_trainer_engine",
+        "payload": get_rtx_trainer_engine_operational_digest(),
+    }
 

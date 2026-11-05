@@ -2160,4 +2160,6 @@ def get_yolo_factory_dialog_operational_digest() -> dict:
     return {"module": "yolo_factory_dialog", "operational": validate_yolo_factory_dialog_contract(), "audit": get_yolo_factory_dialog_audit_record()}
 
 
+def get_yolo_factory_dialog_telemetry_payload() -> dict:
+    return {"module": "yolo_factory_dialog", "payload": get_yolo_factory_dialog_operational_digest()}
 

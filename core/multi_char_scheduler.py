@@ -1564,5 +1564,6 @@ def get_multi_char_scheduler_operational_digest() -> dict:
     return {"module": "multi_char_scheduler", "operational": validate_multi_char_scheduler_contract(), "audit": get_multi_char_scheduler_audit_record()}
 
 
-
+def get_multi_char_scheduler_telemetry_payload() -> dict:
+    return {"module": "multi_char_scheduler", "payload": get_multi_char_scheduler_operational_digest()}
 
