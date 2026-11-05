@@ -54,3 +54,7 @@ def get_test_input_ready_flag() -> dict:
 def get_test_input_version_info() -> dict:
     return {"module": "test_input", "version": "2.0.0", "ready": True}
 
+
+def get_test_input_diagnostic_snapshot() -> dict:
+    return {"module": "test_input", "status": "ok", "ready": True}
+

@@ -109,6 +109,9 @@ class AutoGatherBot:
     def get_auto_gather_version_info(self) -> dict:
         return {"module": "auto_gather", "version": "2.0.0", "ready": True}
 
+    def get_auto_gather_diagnostic_snapshot(self) -> dict:
+        return {"module": "auto_gather", "status": "ok", "ready": True}
+
 if __name__ == "__main__":
     bot = AutoGatherBot()
     bot.start()

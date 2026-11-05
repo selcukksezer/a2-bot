@@ -84,4 +84,7 @@ class NodeRecorder:
     def get_recorder_version_info(self) -> dict:
         return {"module": "recorder", "version": "2.0.0", "ready": True}
 
+    def get_recorder_diagnostic_snapshot(self) -> dict:
+        return {"module": "recorder", "status": "ok", "ready": True}
+
 

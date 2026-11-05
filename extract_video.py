@@ -30,3 +30,7 @@ def get_extract_video_version_info() -> dict:
     return {"module": "extract_video", "version": "2.0.0", "ready": True}
 
 
+def get_extract_video_diagnostic_snapshot() -> dict:
+    return {"module": "extract_video", "status": "ok", "ready": True}
+
+
