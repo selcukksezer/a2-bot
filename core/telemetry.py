@@ -1217,3 +1217,12 @@ def get_telemetry_audit_record() -> dict:
     }
 
 
+def get_telemetry_operational_digest() -> dict:
+    return {
+        "module": "telemetry",
+        "operational": validate_telemetry_contract(),
+        "audit": get_telemetry_audit_record(),
+    }
+
+
+

@@ -909,5 +909,6 @@ def get_stealth_capture_audit_record() -> dict:
     return {"module": "stealth_capture", "audit_passed": validate_stealth_capture_contract(), "readiness": get_stealth_capture_readiness_status()}
 
 
-
+def get_stealth_capture_operational_digest() -> dict:
+    return {"module": "stealth_capture", "operational": validate_stealth_capture_contract(), "audit": get_stealth_capture_audit_record()}
 

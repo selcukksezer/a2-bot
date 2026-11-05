@@ -1453,3 +1453,12 @@ def get_combat_recovery_audit_record() -> dict:
     }
 
 
+def get_combat_recovery_operational_digest() -> dict:
+    return {
+        "module": "combat_recovery",
+        "operational": validate_combat_recovery_contract(),
+        "audit": get_combat_recovery_audit_record(),
+    }
+
+
+

@@ -1567,4 +1567,9 @@ def get_input_driver_audit_record() -> dict:
     return {"module": "input_driver", "audit_passed": validate_input_driver_contract(), "readiness": get_input_driver_readiness_status()}
 
 
+def get_input_driver_operational_digest() -> dict:
+    return {"module": "input_driver", "operational": validate_input_driver_contract(), "audit": get_input_driver_audit_record()}
+
+
+
 
