@@ -1829,3 +1829,12 @@ def get_rtx_trainer_engine_telemetry_payload() -> dict:
         "payload": get_rtx_trainer_engine_operational_digest(),
     }
 
+
+def get_rtx_trainer_engine_integrity_seal() -> dict:
+    return {
+        "module": "rtx_trainer_engine",
+        "sealed": validate_rtx_trainer_engine_contract(),
+        "telemetry": get_rtx_trainer_engine_telemetry_payload(),
+    }
+
+

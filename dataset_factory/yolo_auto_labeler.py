@@ -1472,6 +1472,7 @@ __all__ = [
     "get_yolo_auto_labeler_audit_record",
     "get_yolo_auto_labeler_operational_digest",
     "get_yolo_auto_labeler_telemetry_payload",
+    "get_yolo_auto_labeler_integrity_seal",
 ]
 
 
@@ -1521,6 +1522,14 @@ def get_yolo_auto_labeler_telemetry_payload() -> dict:
     return {
         "module": "yolo_auto_labeler",
         "payload": get_yolo_auto_labeler_operational_digest(),
+    }
+
+
+def get_yolo_auto_labeler_integrity_seal() -> dict:
+    return {
+        "module": "yolo_auto_labeler",
+        "sealed": validate_yolo_auto_labeler_contract(),
+        "telemetry": get_yolo_auto_labeler_telemetry_payload(),
     }
 
 

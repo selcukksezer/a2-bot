@@ -1567,3 +1567,8 @@ def get_multi_char_scheduler_operational_digest() -> dict:
 def get_multi_char_scheduler_telemetry_payload() -> dict:
     return {"module": "multi_char_scheduler", "payload": get_multi_char_scheduler_operational_digest()}
 
+
+def get_multi_char_scheduler_integrity_seal() -> dict:
+    return {"module": "multi_char_scheduler", "sealed": validate_multi_char_scheduler_contract(), "telemetry": get_multi_char_scheduler_telemetry_payload()}
+
+

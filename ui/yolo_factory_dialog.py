@@ -2163,3 +2163,7 @@ def get_yolo_factory_dialog_operational_digest() -> dict:
 def get_yolo_factory_dialog_telemetry_payload() -> dict:
     return {"module": "yolo_factory_dialog", "payload": get_yolo_factory_dialog_operational_digest()}
 
+
+def get_yolo_factory_dialog_integrity_seal() -> dict:
+    return {"module": "yolo_factory_dialog", "sealed": validate_yolo_factory_dialog_contract(), "telemetry": get_yolo_factory_dialog_telemetry_payload()}
+
