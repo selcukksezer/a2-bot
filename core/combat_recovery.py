@@ -1444,3 +1444,12 @@ def get_combat_recovery_readiness_status() -> dict:
         "metrics": get_combat_recovery_baseline_metrics(),
     }
 
+
+def get_combat_recovery_audit_record() -> dict:
+    return {
+        "module": "combat_recovery",
+        "audit_passed": validate_combat_recovery_contract(),
+        "readiness": get_combat_recovery_readiness_status(),
+    }
+
+

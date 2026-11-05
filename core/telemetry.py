@@ -1209,3 +1209,11 @@ def get_telemetry_readiness_status() -> dict:
     }
 
 
+def get_telemetry_audit_record() -> dict:
+    return {
+        "module": "telemetry",
+        "audit_passed": validate_telemetry_contract(),
+        "readiness": get_telemetry_readiness_status(),
+    }
+
+

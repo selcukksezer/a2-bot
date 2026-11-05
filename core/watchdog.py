@@ -1369,4 +1369,6 @@ def get_watchdog_readiness_status() -> dict:
     return {"module": "watchdog", "ready": validate_watchdog_contract(), "metrics": get_watchdog_baseline_metrics()}
 
 
+def get_watchdog_audit_record() -> dict:
+    return {"module": "watchdog", "audit_passed": validate_watchdog_contract(), "readiness": get_watchdog_readiness_status()}
 
