@@ -1463,4 +1463,6 @@ def get_neural_audio_perception_compliance_certificate() -> dict:
     return {"module": "neural_audio_perception", "certified": validate_neural_audio_perception_contract(), "seal": get_neural_audio_perception_integrity_seal()}
 
 
+def get_neural_audio_perception_readiness_probe() -> dict:
+    return {"module": "neural_audio_perception", "ready": validate_neural_audio_perception_contract(), "certificate": get_neural_audio_perception_compliance_certificate()}
 

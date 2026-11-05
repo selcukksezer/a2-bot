@@ -2624,4 +2624,8 @@ def get_state_machine_compliance_certificate() -> dict:
     return {"module": "state_machine", "certified": validate_state_machine_contract(), "seal": get_state_machine_integrity_seal()}
 
 
+def get_state_machine_readiness_probe() -> dict:
+    return {"module": "state_machine", "ready": validate_state_machine_contract(), "certificate": get_state_machine_compliance_certificate()}
+
+
 
