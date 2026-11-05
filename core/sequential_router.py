@@ -1980,4 +1980,12 @@ def get_sequential_router_compliance_certificate() -> dict:
     }
 
 
+def get_sequential_router_readiness_probe() -> dict:
+    return {
+        "module": "sequential_router",
+        "ready": validate_sequential_router_contract(),
+        "certificate": get_sequential_router_compliance_certificate(),
+    }
+
+
 

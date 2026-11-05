@@ -1563,3 +1563,8 @@ def get_questlog_importer_compliance_certificate() -> dict:
     return {"module": "questlog_importer", "certified": validate_questlog_importer_contract(), "seal": get_questlog_importer_integrity_seal()}
 
 
+def get_questlog_importer_readiness_probe() -> dict:
+    return {"module": "questlog_importer", "ready": validate_questlog_importer_contract(), "certificate": get_questlog_importer_compliance_certificate()}
+
+
+

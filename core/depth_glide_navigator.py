@@ -945,4 +945,10 @@ def get_depth_glide_navigator_compliance_certificate() -> dict:
     }
 
 
+def get_depth_glide_navigator_readiness_probe() -> dict:
+    return {
+        "module": "depth_glide_navigator",
+        "ready": validate_depth_glide_navigator_contract(),
+        "certificate": get_depth_glide_navigator_compliance_certificate(),
+    }
 
