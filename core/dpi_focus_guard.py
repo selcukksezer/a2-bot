@@ -835,4 +835,12 @@ def get_dpi_focus_guard_telemetry_payload() -> dict:
     }
 
 
+def get_dpi_focus_guard_integrity_seal() -> dict:
+    return {
+        "module": "dpi_focus_guard",
+        "sealed": validate_dpi_focus_guard_contract(),
+        "telemetry": get_dpi_focus_guard_telemetry_payload(),
+    }
+
+
 

@@ -716,5 +716,6 @@ def get_incident_recorder_telemetry_payload() -> dict:
     return {"module": "incident_recorder", "telemetry_ready": validate_incident_recorder_contract(), "digest": get_incident_recorder_operational_digest()}
 
 
-
+def get_incident_recorder_integrity_seal() -> dict:
+    return {"module": "incident_recorder", "sealed": validate_incident_recorder_contract(), "telemetry": get_incident_recorder_telemetry_payload()}
 

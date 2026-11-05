@@ -467,3 +467,12 @@ def get_dry_run_simulator_telemetry_payload() -> dict:
     }
 
 
+def get_dry_run_simulator_integrity_seal() -> dict:
+    return {
+        "module": "dry_run_simulator",
+        "sealed": validate_dry_run_simulator_contract(),
+        "telemetry": get_dry_run_simulator_telemetry_payload(),
+    }
+
+
+
