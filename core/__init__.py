@@ -72,4 +72,6 @@ def get_core_pkg_readiness_probe() -> dict:
     return {"module": "core_pkg", "ready": validate_core_pkg_contract(), "certificate": get_core_pkg_compliance_certificate()}
 
 
+def get_core_pkg_audit_summary() -> dict:
+    return {"module": "core_pkg", "audit_passed": validate_core_pkg_contract(), "probe": get_core_pkg_readiness_probe()}
 

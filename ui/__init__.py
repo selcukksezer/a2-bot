@@ -70,4 +70,6 @@ def get_ui_pkg_readiness_probe() -> dict:
     return {"module": "ui_pkg", "ready": validate_ui_pkg_contract(), "certificate": get_ui_pkg_compliance_certificate()}
 
 
+def get_ui_pkg_audit_summary() -> dict:
+    return {"module": "ui_pkg", "audit_passed": validate_ui_pkg_contract(), "probe": get_ui_pkg_readiness_probe()}
 

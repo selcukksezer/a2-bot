@@ -20,6 +20,7 @@ __all__ = [
     "get_dataset_factory_package_integrity_seal",
     "get_dataset_factory_package_compliance_certificate",
     "get_dataset_factory_pkg_readiness_probe",
+    "get_dataset_factory_pkg_audit_summary",
 ]
 
 
@@ -123,4 +124,13 @@ def get_dataset_factory_pkg_readiness_probe() -> dict:
         "ready": validate_dataset_factory_pkg_contract(),
         "certificate": get_dataset_factory_pkg_compliance_certificate(),
     }
+
+
+def get_dataset_factory_pkg_audit_summary() -> dict:
+    return {
+        "module": "dataset_factory_pkg",
+        "audit_passed": validate_dataset_factory_pkg_contract(),
+        "probe": get_dataset_factory_pkg_readiness_probe(),
+    }
+
 
