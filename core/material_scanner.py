@@ -1393,3 +1393,8 @@ def get_material_scanner_compliance_certificate() -> dict:
     return {"module": "material_scanner", "certified": validate_material_scanner_contract(), "seal": get_material_scanner_integrity_seal()}
 
 
+def get_material_scanner_readiness_probe() -> dict:
+    return {"module": "material_scanner", "ready": validate_material_scanner_contract(), "certificate": get_material_scanner_compliance_certificate()}
+
+
+

@@ -1846,3 +1846,11 @@ def get_rtx_trainer_engine_compliance_certificate() -> dict:
     }
 
 
+def get_rtx_trainer_engine_readiness_probe() -> dict:
+    return {
+        "module": "rtx_trainer_engine",
+        "ready": validate_rtx_trainer_engine_contract(),
+        "certificate": get_rtx_trainer_engine_compliance_certificate(),
+    }
+
+
