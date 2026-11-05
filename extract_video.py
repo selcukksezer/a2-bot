@@ -73,3 +73,8 @@ def get_extract_video_compliance_certificate() -> dict:
 def get_extract_video_readiness_probe() -> dict:
     return {"module": "extract_video", "ready": validate_extract_video_contract(), "certificate": get_extract_video_compliance_certificate()}
 
+
+def get_extract_video_audit_summary() -> dict:
+    return {"module": "extract_video", "audit_passed": validate_extract_video_contract(), "probe": get_extract_video_readiness_probe()}
+
+

@@ -188,3 +188,11 @@ def get_auto_gather_readiness_probe() -> dict:
     }
 
 
+def get_auto_gather_audit_summary() -> dict:
+    return {
+        "module": "auto_gather",
+        "audit_passed": validate_auto_gather_contract(),
+        "probe": get_auto_gather_readiness_probe(),
+    }
+
+

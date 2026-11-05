@@ -99,3 +99,7 @@ def get_test_input_readiness_probe() -> dict:
     return {"module": "test_input", "ready": validate_test_input_contract(), "certificate": get_test_input_compliance_certificate()}
 
 
+def get_test_input_audit_summary() -> dict:
+    return {"module": "test_input", "audit_passed": validate_test_input_contract(), "probe": get_test_input_readiness_probe()}
+
+
