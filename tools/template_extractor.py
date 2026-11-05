@@ -961,5 +961,11 @@ def get_template_extractor_ready_flag() -> dict:
     return {"module": "template_extractor", "ready": True}
 
 
+def get_template_extractor_version_info() -> dict:
+    """Returns template extractor version information."""
+    return {"module": "template_extractor", "version": "2.0.0", "ready": True}
+
+
 if __name__ == "__main__":
     sys.exit(main())
+

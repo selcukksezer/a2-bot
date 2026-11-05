@@ -1783,3 +1783,8 @@ def get_vision_3x_smoke_summary() -> dict:
 if __name__ == "__main__":
     passed, total, _ = run_vision_and_3x_smoke_tests(print_report=True)
     sys.exit(0 if passed == total else 1)
+
+
+def get_smoke_test_vision_and_3x_version_info() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "version": "2.0.0", "ready": True}
+

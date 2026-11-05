@@ -1044,3 +1044,8 @@ def get_mobile_enterprise_smoke_ready_flag() -> dict:
 if __name__ == "__main__":
     passed, failed, _ = run_mobile_and_enterprise_smoke_tests(verbose=True)
     sys.exit(0 if failed == 0 else 1)
+
+
+def get_smoke_test_mobile_and_enterprise_version_info() -> dict:
+    return {"module": "smoke_test_mobile_and_enterprise", "version": "2.0.0", "ready": True}
+

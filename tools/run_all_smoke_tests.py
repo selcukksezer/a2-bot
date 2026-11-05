@@ -1462,5 +1462,10 @@ def get_master_smoke_runner_ready_flag() -> dict:
     return {"module": "run_all_smoke_tests", "ready": True}
 
 
+def get_run_all_smoke_tests_version_info() -> dict:
+    return {"module": "run_all_smoke_tests", "version": "2.0.0", "ready": True}
+
+
 if __name__ == "__main__":
     sys.exit(main())
+

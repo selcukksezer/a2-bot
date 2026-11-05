@@ -1301,3 +1301,9 @@ def get_self_test_suite_ready_flag() -> dict:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def get_self_test_suite_version_info() -> dict:
+    """Returns self test suite version info."""
+    return {"module": "self_test_suite", "version": "2.0.0", "ready": True}
+
