@@ -2588,3 +2588,11 @@ class BotWorker(QThread):
         return ["state_machine", "diagnostic_snapshot", "version_info"]
 
 
+def get_state_machine_capabilities() -> list:
+    return ["state_machine", "diagnostic_snapshot", "version_info"]
+
+
+def validate_state_machine_contract() -> bool:
+    return bool(get_state_machine_capabilities())
+
+

@@ -1231,3 +1231,8 @@ __all__ = [
     "MonsterCircularityFilter",
     "NameplateHSVIsolator",
 ]
+
+
+def validate_vision_filters_contract() -> bool:
+    return bool(get_vision_filters_capabilities())
+

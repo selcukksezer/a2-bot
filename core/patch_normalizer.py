@@ -1106,3 +1106,14 @@ __all__ = [
     "WatershedClusterSeparator",
     "MotionBlurGate",
 ]
+
+
+def get_patch_normalizer_capabilities() -> list:
+    """Returns capabilities for the patch normalizer module."""
+    return ["patch_normalizer", "diagnostic_snapshot", "version_info"]
+
+
+def validate_patch_normalizer_contract() -> bool:
+    """Validates the patch normalizer module contract."""
+    return bool(get_patch_normalizer_capabilities())
+

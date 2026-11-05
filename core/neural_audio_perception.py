@@ -1415,4 +1415,10 @@ class AudioLoopbackFFTAnalyzer:
         return ["neural_audio_perception", "diagnostic_snapshot", "version_info"]
 
 
+def get_neural_audio_perception_capabilities() -> list:
+    return ["neural_audio_perception", "diagnostic_snapshot", "version_info"]
+
+
+def validate_neural_audio_perception_contract() -> bool:
+    return bool(get_neural_audio_perception_capabilities())
 

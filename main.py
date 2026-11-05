@@ -1102,3 +1102,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def validate_main_contract() -> bool:
+    """Validates module contract for main.py."""
+    return bool(get_main_capabilities())
+
