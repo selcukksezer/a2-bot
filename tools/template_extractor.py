@@ -994,5 +994,6 @@ def get_template_extractor_audit_record() -> dict:
     return {"module": "template_extractor", "audit_passed": validate_template_extractor_contract(), "readiness": get_template_extractor_readiness_status()}
 
 
-
+def get_template_extractor_operational_digest() -> dict:
+    return {"module": "template_extractor", "operational": validate_template_extractor_contract(), "audit": get_template_extractor_audit_record()}
 

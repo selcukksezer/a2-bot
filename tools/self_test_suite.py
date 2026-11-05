@@ -1346,4 +1346,10 @@ def get_self_test_suite_audit_record() -> dict:
         return {"module": "self_test_suite", "audit_passed": False, "readiness": {}}
 
 
+def get_self_test_suite_operational_digest() -> dict:
+    return {
+        "module": "self_test_suite",
+        "operational": validate_self_test_suite_contract(),
+        "audit": get_self_test_suite_audit_record(),
+    }
 

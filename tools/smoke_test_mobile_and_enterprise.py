@@ -1074,4 +1074,10 @@ def get_smoke_test_mobile_audit_record() -> dict:
     return {"module": "smoke_test_mobile_and_enterprise", "audit_passed": True, "readiness": get_smoke_test_mobile_readiness_status()}
 
 
+def get_smoke_test_mobile_and_enterprise_audit_record() -> dict:
+    return get_smoke_test_mobile_audit_record()
+
+
+def get_smoke_test_mobile_and_enterprise_operational_digest() -> dict:
+    return {"module": "smoke_test_mobile_and_enterprise", "operational": validate_smoke_test_mobile_and_enterprise_contract(), "audit": get_smoke_test_mobile_and_enterprise_audit_record()}
 

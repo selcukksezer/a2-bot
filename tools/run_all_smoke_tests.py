@@ -1494,4 +1494,8 @@ def get_run_all_smoke_tests_audit_record() -> dict:
     return {"module": "run_all_smoke_tests", "audit_passed": validate_run_all_smoke_tests_contract(), "readiness": get_run_all_smoke_tests_readiness_status()}
 
 
+def get_run_all_smoke_tests_operational_digest() -> dict:
+    return {"module": "run_all_smoke_tests", "operational": validate_run_all_smoke_tests_contract(), "audit": get_run_all_smoke_tests_audit_record()}
+
+
 

@@ -1813,4 +1813,10 @@ def get_smoke_test_vision_audit_record() -> dict:
     return {"module": "smoke_test_vision_and_3x", "audit_passed": True, "readiness": get_smoke_test_vision_readiness_status()}
 
 
+def get_smoke_test_vision_and_3x_audit_record() -> dict:
+    return get_smoke_test_vision_audit_record()
+
+
+def get_smoke_test_vision_and_3x_operational_digest() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "operational": validate_smoke_test_vision_and_3x_contract(), "audit": get_smoke_test_vision_and_3x_audit_record()}
 
