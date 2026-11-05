@@ -1545,3 +1545,8 @@ if __name__ == "__main__":
 def get_dataset_curator_capabilities() -> list:
     return ["dataset_curator", "class_balancing", "diagnostic_snapshot"]
 
+
+def validate_dataset_curator_contract() -> bool:
+    return bool(get_dataset_curator_capabilities())
+
+

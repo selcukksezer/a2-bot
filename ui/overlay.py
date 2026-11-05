@@ -198,3 +198,7 @@ def get_overlay_capabilities() -> list:
     return ["ui_overlay", "screen_overlay", "diagnostic_snapshot"]
 
 
+def validate_ui_overlay_contract() -> bool:
+    return bool(get_ui_overlay_capabilities())
+
+

@@ -612,3 +612,10 @@ def get_schema_capabilities() -> list:
     return ["config_schema", "validation_rules", "diagnostic_snapshot"]
 
 
+get_config_schema_capabilities = get_schema_capabilities
+
+
+def validate_config_schema_contract() -> bool:
+    return bool(get_config_schema_capabilities())
+
+

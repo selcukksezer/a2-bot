@@ -97,3 +97,11 @@ def get_menu_capabilities() -> list:
     return ["ui_menu", "main_menu_dispatch", "diagnostic_snapshot"]
 
 
+def get_ui_menu_capabilities() -> list:
+    return get_menu_capabilities()
+
+
+def validate_ui_menu_contract() -> bool:
+    return bool(get_ui_menu_capabilities())
+
+
