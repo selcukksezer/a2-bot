@@ -1108,3 +1108,9 @@ def validate_main_contract() -> bool:
     """Validates module contract for main.py."""
     return bool(get_main_capabilities())
 
+
+def get_main_baseline_metrics() -> dict:
+    """Returns baseline metrics for main.py."""
+    return {"module": "main", "contract_valid": validate_main_contract(), "capability_count": len(get_main_capabilities())}
+
+

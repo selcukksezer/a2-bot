@@ -1117,3 +1117,9 @@ def validate_patch_normalizer_contract() -> bool:
     """Validates the patch normalizer module contract."""
     return bool(get_patch_normalizer_capabilities())
 
+
+def get_patch_normalizer_baseline_metrics() -> dict:
+    """Returns baseline metrics for the patch normalizer module."""
+    return {"module": "patch_normalizer", "contract_valid": validate_patch_normalizer_contract(), "capability_count": len(get_patch_normalizer_capabilities())}
+
+

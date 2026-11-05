@@ -1236,3 +1236,8 @@ __all__ = [
 def validate_vision_filters_contract() -> bool:
     return bool(get_vision_filters_capabilities())
 
+
+def get_vision_filters_baseline_metrics() -> dict:
+    return {"module": "vision_filters", "contract_valid": validate_vision_filters_contract(), "capability_count": len(get_vision_filters_capabilities())}
+
+

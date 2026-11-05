@@ -2596,3 +2596,7 @@ def validate_state_machine_contract() -> bool:
     return bool(get_state_machine_capabilities())
 
 
+def get_state_machine_baseline_metrics() -> dict:
+    return {"module": "state_machine", "contract_valid": validate_state_machine_contract(), "capability_count": len(get_state_machine_capabilities())}
+
+
