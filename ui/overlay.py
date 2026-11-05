@@ -199,6 +199,13 @@ def get_overlay_capabilities() -> list:
 
 
 def validate_ui_overlay_contract() -> bool:
-    return bool(get_ui_overlay_capabilities())
+    return bool(get_overlay_capabilities())
+
+
+def get_ui_overlay_baseline_metrics() -> dict:
+    try:
+        return {"module": "ui_overlay", "contract_valid": validate_ui_overlay_contract(), "overlay_ready": True}
+    except Exception:
+        return {"module": "ui_overlay", "contract_valid": False, "overlay_ready": False}
 
 

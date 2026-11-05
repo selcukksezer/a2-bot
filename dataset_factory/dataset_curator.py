@@ -1533,6 +1533,7 @@ __all__ = [
     "resolve_yolo_class_id_and_name",
     "imread_unicode",
     "imwrite_unicode",
+    "get_dataset_curator_baseline_metrics",
 ]
 
 
@@ -1548,5 +1549,10 @@ def get_dataset_curator_capabilities() -> list:
 
 def validate_dataset_curator_contract() -> bool:
     return bool(get_dataset_curator_capabilities())
+
+
+def get_dataset_curator_baseline_metrics() -> dict:
+    return {"module": "dataset_curator", "contract_valid": validate_dataset_curator_contract(), "curator_ready": True}
+
 
 

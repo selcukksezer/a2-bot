@@ -105,3 +105,7 @@ def validate_ui_menu_contract() -> bool:
     return bool(get_ui_menu_capabilities())
 
 
+def get_ui_menu_baseline_metrics() -> dict:
+    return {"module": "ui_menu", "contract_valid": validate_ui_menu_contract(), "menu_ready": True}
+
+

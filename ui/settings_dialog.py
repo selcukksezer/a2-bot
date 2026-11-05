@@ -286,3 +286,12 @@ def validate_settings_dialog_contract() -> bool:
     return bool(get_settings_dialog_capabilities())
 
 
+def get_settings_dialog_baseline_metrics() -> dict:
+    return {
+        "module": "settings_dialog",
+        "contract_valid": validate_settings_dialog_contract(),
+        "dialog_ready": True,
+    }
+
+
+

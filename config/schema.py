@@ -619,3 +619,19 @@ def validate_config_schema_contract() -> bool:
     return bool(get_config_schema_capabilities())
 
 
+def get_config_schema_baseline_metrics() -> dict:
+    try:
+        return {
+            "module": "config_schema",
+            "contract_valid": validate_config_schema_contract(),
+            "schema_ready": True,
+        }
+    except Exception:
+        return {
+            "module": "config_schema",
+            "contract_valid": False,
+            "schema_ready": True,
+        }
+
+
+
