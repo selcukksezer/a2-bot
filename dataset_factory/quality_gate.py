@@ -21,6 +21,7 @@ __all__ = [
     "DatasetQualityGate",
     "QualityGateDecision",
     "get_quality_gate_readiness_status",
+    "get_quality_gate_audit_record",
 ]
 
 
@@ -38,6 +39,11 @@ def get_quality_gate_baseline_metrics() -> dict:
 
 def get_quality_gate_readiness_status() -> dict:
     return {"module": "quality_gate", "ready": validate_quality_gate_contract(), "metrics": get_quality_gate_baseline_metrics()}
+
+
+def get_quality_gate_audit_record() -> dict:
+    return {"module": "quality_gate", "audit_passed": validate_quality_gate_contract(), "readiness": get_quality_gate_readiness_status()}
+
 
 
 

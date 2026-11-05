@@ -818,3 +818,8 @@ def get_synthetic_augmentor_readiness_status() -> dict:
     return {"module": "synthetic_augmentor", "ready": validate_synthetic_augmentor_contract(), "metrics": get_synthetic_augmentor_baseline_metrics()}
 
 
+def get_synthetic_augmentor_audit_record() -> dict:
+    return {"module": "synthetic_augmentor", "audit_passed": validate_synthetic_augmentor_contract(), "readiness": get_synthetic_augmentor_readiness_status()}
+
+
+

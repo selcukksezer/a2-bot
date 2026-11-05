@@ -1407,4 +1407,9 @@ def get_economy_broker_readiness_status() -> dict:
     return {"module": "economy_broker", "ready": validate_economy_broker_contract(), "metrics": get_economy_broker_baseline_metrics()}
 
 
+def get_economy_broker_audit_record() -> dict:
+    return {"module": "economy_broker", "audit_passed": validate_economy_broker_contract(), "readiness": get_economy_broker_readiness_status()}
+
+
+
 

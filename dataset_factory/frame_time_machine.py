@@ -383,4 +383,6 @@ def get_frame_time_machine_readiness_status() -> dict:
     return {"module": "frame_time_machine", "ready": validate_frame_time_machine_contract(), "metrics": get_frame_time_machine_baseline_metrics()}
 
 
+def get_frame_time_machine_audit_record() -> dict:
+    return {"module": "frame_time_machine", "audit_passed": validate_frame_time_machine_contract(), "readiness": get_frame_time_machine_readiness_status()}
 
