@@ -1220,6 +1220,9 @@ class NameplateHSVIsolator:
     def get_vision_filters_diagnostic_snapshot(self) -> dict:
         return {"module": "vision_filters", "status": "ok", "ready": True}
 
+    def get_vision_filters_capabilities(self) -> list:
+        return ["vision_filters", "diagnostic_snapshot", "version_info"]
+
 
 __all__ = [
     "FeatherNegativeFilter",

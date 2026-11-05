@@ -2584,4 +2584,7 @@ class BotWorker(QThread):
     def get_state_machine_diagnostic_snapshot(self) -> dict:
         return {"module": "state_machine", "status": "ok", "ready": True}
 
+    def get_state_machine_capabilities(self) -> list:
+        return ["state_machine", "diagnostic_snapshot", "version_info"]
+
 

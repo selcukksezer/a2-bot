@@ -1070,6 +1070,10 @@ class GatherionOrchestrator(QObject):
         """Returns diagnostic snapshot for main module."""
         return {"module": "main", "status": "ok", "ready": True}
 
+    def get_main_capabilities(self) -> list:
+        """Returns supported capabilities for main module."""
+        return ["main", "diagnostic_snapshot", "version_info"]
+
 
 def main() -> int:
     if "--elevate" in sys.argv:

@@ -561,6 +561,10 @@ class SobelClahePatchNormalizer:
         """Returns diagnostic snapshot for the patch normalizer module."""
         return {"module": "patch_normalizer", "status": "ok", "ready": True}
 
+    def get_patch_normalizer_capabilities(self) -> list:
+        """Returns capabilities for the patch normalizer module."""
+        return ["patch_normalizer", "diagnostic_snapshot", "version_info"]
+
 
 # ==============================================================================
 # MADDE 8: Yüksek Çözünürlük (2560x1440) İçin Alt-Bölge (ROI) Kırpma
@@ -1080,6 +1084,10 @@ class MotionBlurGate:
     def get_patch_normalizer_version_info(self) -> dict:
         """Returns version info for the patch normalizer module."""
         return {"module": "patch_normalizer", "version": "2.0.0", "ready": True}
+
+    def get_patch_normalizer_capabilities(self) -> list:
+        """Returns capabilities for the patch normalizer module."""
+        return ["patch_normalizer", "diagnostic_snapshot", "version_info"]
 
 
 PatchNormalizer = SobelClahePatchNormalizer

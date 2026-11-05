@@ -1411,5 +1411,8 @@ class AudioLoopbackFFTAnalyzer:
     def get_neural_audio_diagnostic_snapshot(self) -> dict:
         return {"module": "neural_audio_perception", "status": "ok", "ready": True}
 
+    def get_neural_audio_perception_capabilities(self) -> list:
+        return ["neural_audio_perception", "diagnostic_snapshot", "version_info"]
+
 
 
