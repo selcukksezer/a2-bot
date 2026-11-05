@@ -1225,4 +1225,13 @@ def get_telemetry_operational_digest() -> dict:
     }
 
 
+def get_telemetry_telemetry_payload() -> dict:
+    return {
+        "module": "telemetry",
+        "telemetry_ready": validate_telemetry_contract(),
+        "digest": get_telemetry_operational_digest(),
+    }
+
+
+
 

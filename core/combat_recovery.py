@@ -1461,4 +1461,10 @@ def get_combat_recovery_operational_digest() -> dict:
     }
 
 
+def get_combat_recovery_telemetry_payload() -> dict:
+    return {
+        "module": "combat_recovery",
+        "telemetry_ready": validate_combat_recovery_contract(),
+        "digest": get_combat_recovery_operational_digest(),
+    }
 

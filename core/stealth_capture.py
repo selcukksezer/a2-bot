@@ -912,3 +912,8 @@ def get_stealth_capture_audit_record() -> dict:
 def get_stealth_capture_operational_digest() -> dict:
     return {"module": "stealth_capture", "operational": validate_stealth_capture_contract(), "audit": get_stealth_capture_audit_record()}
 
+
+def get_stealth_capture_telemetry_payload() -> dict:
+    return {"module": "stealth_capture", "telemetry_ready": validate_stealth_capture_contract(), "digest": get_stealth_capture_operational_digest()}
+
+

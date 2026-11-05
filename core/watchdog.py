@@ -1377,3 +1377,7 @@ def get_watchdog_operational_digest() -> dict:
     return {"module": "watchdog", "operational": validate_watchdog_contract(), "audit": get_watchdog_audit_record()}
 
 
+def get_watchdog_telemetry_payload() -> dict:
+    return {"module": "watchdog", "telemetry_ready": validate_watchdog_contract(), "digest": get_watchdog_operational_digest()}
+
+
