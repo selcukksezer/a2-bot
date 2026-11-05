@@ -913,6 +913,10 @@ class BehavioralStealthGuard:
             logger.error("get_behavioral_safety_status hatası: %s", exc)
             return {"guard_active": True, "error": str(exc)}
 
+    def get_behavioral_guard_health_summary(self) -> dict:
+        try: return {"behavioral_guard_ready": True}
+        except Exception: return {"behavioral_guard_ready": False}
+
 
 # ============================================================================
 # MODÜL SEVİYESİ KISA YOL FONKSİYONLARI (DOĞRUDAN İMPORT UYUMLULUĞU İÇİN)

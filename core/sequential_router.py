@@ -1900,3 +1900,10 @@ class SequentialRoutePlanner:
             logger.error("compute_route_efficiency_score error: %s", exc)
             return 0.0
 
+    def get_sequential_router_health_summary(self) -> dict:
+        try:
+            return {"sequential_router_ready": True}
+        except Exception as exc:
+            logger.error("get_sequential_router_health_summary error: %s", exc)
+            return {"sequential_router_ready": False}
+

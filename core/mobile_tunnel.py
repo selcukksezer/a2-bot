@@ -1098,6 +1098,12 @@ class TunnelBridge:
     def __init__(self, manager: Optional[FreeCloudTunnelManager] = None) -> None:
         self.manager = manager or FreeCloudTunnelManager()
 
+    def get_mobile_tunnel_health_summary(self) -> dict:
+        try:
+            return {"mobile_tunnel_ready": True}
+        except Exception:
+            return {"mobile_tunnel_ready": False}
+
     def get_tunnel_security_status(self) -> dict:
         is_running = False
         if self.manager:

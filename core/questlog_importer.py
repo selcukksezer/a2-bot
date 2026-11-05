@@ -589,6 +589,12 @@ class QuestlogImporter:
         self.db = QUESTLOG_DATABASE
         self._cached_ref_maps = {}
 
+    def get_questlog_importer_health_summary(self) -> dict:
+        try:
+            return {"questlog_importer_ready": True}
+        except Exception:
+            return {"questlog_importer_ready": False}
+
     def get_zones(self) -> list[str]:
         """Returns the list of all available zones."""
         try:

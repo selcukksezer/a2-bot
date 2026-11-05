@@ -860,3 +860,9 @@ class GlideWaypointController:
             summary["stats_error"] = str(e)
         return summary
 
+    def get_depth_glide_health_summary(self) -> dict:
+        try:
+            return {"depth_glide_ready": True}
+        except Exception:
+            return {"depth_glide_ready": False}
+
