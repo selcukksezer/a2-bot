@@ -1452,6 +1452,9 @@ class GameHUDReader:
                 "is_under_attack": False,
             }
 
+    def get_ocr_distance_ready_flag(self) -> dict:
+        return {"module": "ocr_distance", "ready": True}
+
 
 _DEFAULT_HUD_READER: Optional[GameHUDReader] = None
 

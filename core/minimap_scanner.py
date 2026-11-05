@@ -1108,3 +1108,7 @@ class MinimapScanner:
             return {"minimap_scanner_ready": True}
         except Exception:
             return {"minimap_scanner_ready": False}
+
+    def get_minimap_scanner_ready_flag(self) -> dict:
+        return {"module": "minimap_scanner", "ready": True}
+

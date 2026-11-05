@@ -403,6 +403,9 @@ class LocalVaultCrypto:
                 "pid": os.getpid(),
             }
 
+    def get_opsec_crypto_ready_flag(self) -> dict:
+        return {"module": "opsec_crypto", "ready": True}
+
 
 # ============================================================================
 # 2. NativeWin32HotkeyManager (WH_KEYBOARD_LL Kancası Olmadan Kısayol Dinleyici)

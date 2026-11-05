@@ -326,6 +326,9 @@ class HumanTimingEngine:
             logger.error("sleep_visual_reaction sırasında hata: %s", exc)
         return delay
 
+    def get_human_timing_ready_flag(self) -> dict:
+        return {"module": "human_timing", "ready": True}
+
 
 # ============================================================================
 # 2. DİNAMİK MOLA PLANLAYICI (MİKRO VE MAKRO MOLALAR)
