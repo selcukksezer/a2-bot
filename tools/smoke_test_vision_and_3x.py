@@ -1820,3 +1820,8 @@ def get_smoke_test_vision_and_3x_audit_record() -> dict:
 def get_smoke_test_vision_and_3x_operational_digest() -> dict:
     return {"module": "smoke_test_vision_and_3x", "operational": validate_smoke_test_vision_and_3x_contract(), "audit": get_smoke_test_vision_and_3x_audit_record()}
 
+
+def get_smoke_test_vision_and_3x_telemetry_payload() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "telemetry_ready": validate_smoke_test_vision_and_3x_contract(), "digest": get_smoke_test_vision_and_3x_operational_digest()}
+
+

@@ -1353,3 +1353,12 @@ def get_self_test_suite_operational_digest() -> dict:
         "audit": get_self_test_suite_audit_record(),
     }
 
+
+def get_self_test_suite_telemetry_payload() -> dict:
+    return {
+        "module": "self_test_suite",
+        "telemetry_ready": validate_self_test_suite_contract(),
+        "digest": get_self_test_suite_operational_digest(),
+    }
+
+

@@ -1498,4 +1498,6 @@ def get_run_all_smoke_tests_operational_digest() -> dict:
     return {"module": "run_all_smoke_tests", "operational": validate_run_all_smoke_tests_contract(), "audit": get_run_all_smoke_tests_audit_record()}
 
 
+def get_run_all_smoke_tests_telemetry_payload() -> dict:
+    return {"module": "run_all_smoke_tests", "telemetry_ready": validate_run_all_smoke_tests_contract(), "digest": get_run_all_smoke_tests_operational_digest()}
 

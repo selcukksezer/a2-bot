@@ -997,3 +997,8 @@ def get_template_extractor_audit_record() -> dict:
 def get_template_extractor_operational_digest() -> dict:
     return {"module": "template_extractor", "operational": validate_template_extractor_contract(), "audit": get_template_extractor_audit_record()}
 
+
+def get_template_extractor_telemetry_payload() -> dict:
+    return {"module": "template_extractor", "telemetry_ready": validate_template_extractor_contract(), "digest": get_template_extractor_operational_digest()}
+
+
