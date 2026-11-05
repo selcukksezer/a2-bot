@@ -1217,6 +1217,7 @@ __all__ = [
     "get_materials_db_telemetry_payload",
     "get_materials_db_integrity_seal",
     "get_materials_db_compliance_certificate",
+    "get_materials_db_readiness_probe",
 ]
 
 
@@ -1300,4 +1301,14 @@ def get_materials_db_compliance_certificate() -> dict:
         "certified": validate_materials_db_contract(),
         "seal": get_materials_db_integrity_seal(),
     }
+
+
+def get_materials_db_readiness_probe() -> dict:
+    """Return readiness probe for the materials_db module."""
+    return {
+        "module": "materials_db",
+        "ready": validate_materials_db_contract(),
+        "certificate": get_materials_db_compliance_certificate(),
+    }
+
 

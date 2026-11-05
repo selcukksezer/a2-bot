@@ -158,3 +158,8 @@ def get_navigator_integrity_seal() -> dict:
 def get_navigator_compliance_certificate() -> dict:
     return {"module": "navigator", "certified": validate_navigator_contract(), "seal": get_navigator_integrity_seal()}
 
+
+def get_navigator_readiness_probe() -> dict:
+    return {"module": "navigator", "ready": validate_navigator_contract(), "certificate": get_navigator_compliance_certificate()}
+
+

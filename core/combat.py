@@ -114,3 +114,7 @@ def get_combat_integrity_seal() -> dict:
 def get_combat_compliance_certificate() -> dict:
     return {"module": "combat", "certified": validate_combat_contract(), "seal": get_combat_integrity_seal()}
 
+
+def get_combat_readiness_probe() -> dict:
+    return {"module": "combat", "ready": validate_combat_contract(), "certificate": get_combat_compliance_certificate()}
+
