@@ -1054,3 +1054,8 @@ def get_smoke_test_mobile_and_enterprise_diagnostic_snapshot() -> dict:
     return {"module": "smoke_test_mobile_and_enterprise", "status": "ok", "ready": True}
 
 
+def get_smoke_test_mobile_and_enterprise_capabilities() -> list:
+    return ["smoke_test_mobile_and_enterprise", "diagnostic_snapshot", "version_info"]
+
+
+

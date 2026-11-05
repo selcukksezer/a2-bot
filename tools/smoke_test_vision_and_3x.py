@@ -1793,3 +1793,7 @@ def get_smoke_test_vision_and_3x_diagnostic_snapshot() -> dict:
     return {"module": "smoke_test_vision_and_3x", "status": "ok", "ready": True}
 
 
+def get_smoke_test_vision_and_3x_capabilities() -> list:
+    return ["smoke_test_vision_and_3x", "diagnostic_snapshot", "version_info"]
+
+

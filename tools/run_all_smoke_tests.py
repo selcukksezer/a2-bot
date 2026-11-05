@@ -1474,3 +1474,7 @@ def get_run_all_smoke_tests_diagnostic_snapshot() -> dict:
     return {"module": "run_all_smoke_tests", "status": "ok", "ready": True}
 
 
+def get_run_all_smoke_tests_capabilities() -> list:
+    return ["run_all_smoke_tests", "diagnostic_snapshot", "version_info"]
+
+

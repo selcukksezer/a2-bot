@@ -974,3 +974,7 @@ def get_template_extractor_diagnostic_snapshot() -> dict:
     return {"module": "template_extractor", "status": "ok", "ready": True}
 
 
+def get_template_extractor_capabilities() -> list:
+    return ["template_extractor", "diagnostic_snapshot", "version_info"]
+
+

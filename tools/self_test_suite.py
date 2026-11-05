@@ -1312,3 +1312,8 @@ def get_self_test_suite_diagnostic_snapshot() -> dict:
     return {"module": "self_test_suite", "status": "ok", "ready": True}
 
 
+def get_self_test_suite_capabilities() -> list:
+    return ["self_test_suite", "diagnostic_snapshot", "version_info"]
+
+
+
