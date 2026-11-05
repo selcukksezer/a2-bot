@@ -2930,3 +2930,7 @@ class CartographyRadarDialog(QDialog):
     def get_cartography_radar_ready_flag(self) -> dict:
         return {"module": "cartography_radar", "ready": True}
 
+    def get_cartography_radar_version_info(self) -> dict:
+        return {"module": "cartography_radar", "version": "2.0.0", "ready": True}
+
+
