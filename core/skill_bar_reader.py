@@ -508,3 +508,8 @@ def get_skill_bar_reader_compliance_certificate() -> dict:
 def get_skill_bar_reader_readiness_probe() -> dict:
     return {"module": "skill_bar_reader", "ready": validate_skill_bar_reader_contract(), "certificate": get_skill_bar_reader_compliance_certificate()}
 
+
+def get_skill_bar_reader_audit_summary() -> dict:
+    return {"module": "skill_bar_reader", "audit_passed": validate_skill_bar_reader_contract(), "probe": get_skill_bar_reader_readiness_probe()}
+
+

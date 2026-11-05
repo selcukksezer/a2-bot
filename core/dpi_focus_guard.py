@@ -858,3 +858,12 @@ def get_dpi_focus_guard_readiness_probe() -> dict:
         "certificate": get_dpi_focus_guard_compliance_certificate(),
     }
 
+
+def get_dpi_focus_guard_audit_summary() -> dict:
+    return {
+        "module": "dpi_focus_guard",
+        "audit_passed": validate_dpi_focus_guard_contract(),
+        "probe": get_dpi_focus_guard_readiness_probe(),
+    }
+
+

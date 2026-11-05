@@ -378,3 +378,8 @@ def get_uac_elevator_compliance_certificate() -> dict:
 def get_uac_elevator_readiness_probe() -> dict:
     return {"module": "uac_elevator", "ready": validate_uac_elevator_contract(), "certificate": get_uac_elevator_compliance_certificate()}
 
+
+def get_uac_elevator_audit_summary() -> dict:
+    return {"module": "uac_elevator", "audit_passed": validate_uac_elevator_contract(), "probe": get_uac_elevator_readiness_probe()}
+
+

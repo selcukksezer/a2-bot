@@ -728,3 +728,7 @@ def get_incident_recorder_readiness_probe() -> dict:
     return {"module": "incident_recorder", "ready": validate_incident_recorder_contract(), "certificate": get_incident_recorder_compliance_certificate()}
 
 
+def get_incident_recorder_audit_summary() -> dict:
+    return {"module": "incident_recorder", "audit_passed": validate_incident_recorder_contract(), "probe": get_incident_recorder_readiness_probe()}
+
+
