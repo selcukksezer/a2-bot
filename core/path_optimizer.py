@@ -632,3 +632,12 @@ def get_path_optimizer_integrity_seal() -> dict:
         "telemetry": get_path_optimizer_telemetry_payload(),
     }
 
+
+def get_path_optimizer_compliance_certificate() -> dict:
+    return {
+        "module": "path_optimizer",
+        "certified": validate_path_optimizer_contract(),
+        "seal": get_path_optimizer_integrity_seal(),
+    }
+
+

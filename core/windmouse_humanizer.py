@@ -1094,4 +1094,10 @@ def get_windmouse_humanizer_integrity_seal() -> dict:
     }
 
 
+def get_windmouse_humanizer_compliance_certificate() -> dict:
+    return {
+        "module": "windmouse_humanizer",
+        "certified": validate_windmouse_humanizer_contract(),
+        "seal": get_windmouse_humanizer_integrity_seal(),
+    }
 

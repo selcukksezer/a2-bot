@@ -1371,3 +1371,12 @@ def get_corridor_navigator_integrity_seal() -> dict:
     }
 
 
+def get_corridor_navigator_compliance_certificate() -> dict:
+    return {
+        "module": "corridor_navigator",
+        "certified": validate_corridor_navigator_contract(),
+        "seal": get_corridor_navigator_integrity_seal(),
+    }
+
+
+
