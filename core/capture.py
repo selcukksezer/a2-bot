@@ -663,3 +663,7 @@ class ScreenCapture:
         return {"module": "capture", "status": "ok", "ready": True}
 
 
+def get_capture_capabilities() -> list:
+    return ["capture", "screen_grabber", "diagnostic_snapshot"]
+
+

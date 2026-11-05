@@ -1208,6 +1208,7 @@ __all__ = [
     "get_materials_db_ready_flag",
     "get_materials_db_version_info",
     "get_materials_db_diagnostic_snapshot",
+    "get_materials_db_capabilities",
 ]
 
 
@@ -1219,5 +1220,11 @@ def get_materials_db_version_info() -> dict:
 def get_materials_db_diagnostic_snapshot() -> dict:
     """Return diagnostic snapshot for the materials_db module."""
     return {"module": "materials_db", "status": "ok", "ready": True}
+
+
+def get_materials_db_capabilities() -> list:
+    """Return capabilities list for the materials_db module."""
+    return ["materials_db", "gatherable_catalog", "diagnostic_snapshot"]
+
 
 

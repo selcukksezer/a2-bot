@@ -79,3 +79,7 @@ class CombatSystem:
         return {"module": "combat", "status": "ok", "ready": True}
 
 
+def get_combat_capabilities() -> list:
+    return ["combat", "skill_rotation", "diagnostic_snapshot"]
+
+

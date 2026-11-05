@@ -123,3 +123,6 @@ class MapNavigator:
         return {"module": "navigator", "status": "ok", "ready": True}
 
 
+def get_navigator_capabilities() -> list:
+    return ["navigator", "waypoint_traversal", "diagnostic_snapshot"]
+

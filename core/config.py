@@ -61,4 +61,6 @@ class ConfigManager:
         return {"module": "config", "status": "ok", "ready": True}
 
 
+def get_config_capabilities() -> list:
+    return ["config_manager", "settings_persistence", "diagnostic_snapshot"]
 
