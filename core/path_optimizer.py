@@ -594,3 +594,12 @@ def get_path_optimizer_baseline_metrics() -> dict:
     }
 
 
+def get_path_optimizer_readiness_status() -> dict:
+    return {
+        "module": "path_optimizer",
+        "ready": validate_path_optimizer_contract(),
+        "metrics": get_path_optimizer_baseline_metrics(),
+    }
+
+
+

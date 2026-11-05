@@ -1055,3 +1055,12 @@ def get_windmouse_humanizer_baseline_metrics() -> dict:
     }
 
 
+def get_windmouse_humanizer_readiness_status() -> dict:
+    return {
+        "module": "windmouse_humanizer",
+        "ready": validate_windmouse_humanizer_contract(),
+        "metrics": get_windmouse_humanizer_baseline_metrics(),
+    }
+
+
+

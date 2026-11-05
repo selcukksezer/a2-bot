@@ -1979,6 +1979,7 @@ __all__ = [
     "handle_extraction_failure",
     "AutoMountManager",
     "MaplessMicroNavigator",
+    "get_navigation_intel_readiness_status",
 ]
 
 
@@ -1992,5 +1993,10 @@ def validate_navigation_intel_contract() -> bool:
 
 def get_navigation_intel_baseline_metrics() -> dict:
     return {"module": "navigation_intel", "contract_valid": validate_navigation_intel_contract(), "capability_count": len(get_navigation_intel_capabilities())}
+
+
+def get_navigation_intel_readiness_status() -> dict:
+    return {"module": "navigation_intel", "ready": validate_navigation_intel_contract(), "metrics": get_navigation_intel_baseline_metrics()}
+
 
 

@@ -1332,3 +1332,11 @@ def get_corridor_navigator_baseline_metrics() -> dict:
     return {"module": "corridor_navigator", "contract_valid": validate_corridor_navigator_contract(), "capability_count": len(get_corridor_navigator_capabilities())}
 
 
+def get_corridor_navigator_readiness_status() -> dict:
+    return {
+        "module": "corridor_navigator",
+        "ready": validate_corridor_navigator_contract(),
+        "metrics": get_corridor_navigator_baseline_metrics(),
+    }
+
+
