@@ -1540,3 +1540,6 @@ class PetAndBuffManager:
         return {"module": "multi_char_scheduler", "status": "ok", "ready": True}
 
 
+def get_multi_char_scheduler_capabilities() -> list:
+    return ["multi_char_scheduler", "character_rotation", "diagnostic_snapshot"]
+

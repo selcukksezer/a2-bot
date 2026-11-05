@@ -1469,3 +1469,8 @@ __all__ = [
     "map_material_name_to_yolo_class_id",
     "YOLOAutoLabeler",
 ]
+
+
+def get_yolo_auto_labeler_capabilities() -> list:
+    return ["yolo_auto_labeler", "bbox_annotation", "diagnostic_snapshot"]
+

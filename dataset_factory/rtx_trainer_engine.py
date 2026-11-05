@@ -1783,3 +1783,6 @@ echo ===========================================================================
         return {"module": "rtx_trainer_engine", "status": "ok", "ready": True}
 
 
+def get_rtx_trainer_engine_capabilities() -> list:
+    return ["rtx_trainer_engine", "fp16_onnx_export", "diagnostic_snapshot"]
+

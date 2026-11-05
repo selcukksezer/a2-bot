@@ -2136,3 +2136,6 @@ class YOLOFactoryDialog(QDialog):
         return {"module": "yolo_factory_dialog", "status": "ok", "ready": True}
 
 
+def get_yolo_factory_dialog_capabilities() -> list:
+    return ["yolo_factory_dialog", "dataset_pipeline_ui", "diagnostic_snapshot"]
+

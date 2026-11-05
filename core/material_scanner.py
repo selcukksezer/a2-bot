@@ -1357,4 +1357,6 @@ class MaterialScanner:
         return {"module": "material_scanner", "status": "ok", "ready": True}
 
 
+def get_material_scanner_capabilities() -> list:
+    return ["material_scanner", "resource_detection", "diagnostic_snapshot"]
 
