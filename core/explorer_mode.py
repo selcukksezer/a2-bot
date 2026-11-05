@@ -1959,3 +1959,7 @@ def get_explorer_mode_capabilities() -> list:
 def validate_explorer_mode_contract() -> bool:
     return bool(get_explorer_mode_capabilities())
 
+
+def get_explorer_mode_baseline_metrics() -> dict:
+    return {"module": "explorer_mode", "contract_valid": validate_explorer_mode_contract(), "capability_count": len(get_explorer_mode_capabilities())}
+

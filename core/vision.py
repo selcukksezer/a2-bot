@@ -1667,3 +1667,7 @@ def validate_vision_contract() -> bool:
     return bool(get_vision_capabilities())
 
 
+def get_vision_baseline_metrics() -> dict:
+    return {"module": "vision", "contract_valid": validate_vision_contract(), "capability_count": len(get_vision_capabilities())}
+
+
