@@ -1567,4 +1567,8 @@ def get_questlog_importer_readiness_probe() -> dict:
     return {"module": "questlog_importer", "ready": validate_questlog_importer_contract(), "certificate": get_questlog_importer_compliance_certificate()}
 
 
+def get_questlog_importer_audit_summary() -> dict:
+    return {"module": "questlog_importer", "audit_passed": validate_questlog_importer_contract(), "probe": get_questlog_importer_readiness_probe()}
+
+
 

@@ -952,3 +952,12 @@ def get_depth_glide_navigator_readiness_probe() -> dict:
         "certificate": get_depth_glide_navigator_compliance_certificate(),
     }
 
+
+def get_depth_glide_navigator_audit_summary() -> dict:
+    return {
+        "module": "depth_glide_navigator",
+        "audit_passed": validate_depth_glide_navigator_contract(),
+        "probe": get_depth_glide_navigator_readiness_probe(),
+    }
+
+

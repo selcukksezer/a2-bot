@@ -1196,3 +1196,8 @@ def get_mobile_tunnel_readiness_probe() -> dict:
     return {"module": "mobile_tunnel", "ready": validate_mobile_tunnel_contract(), "certificate": get_mobile_tunnel_compliance_certificate()}
 
 
+def get_mobile_tunnel_audit_summary() -> dict:
+    return {"module": "mobile_tunnel", "audit_passed": validate_mobile_tunnel_contract(), "probe": get_mobile_tunnel_readiness_probe()}
+
+
+

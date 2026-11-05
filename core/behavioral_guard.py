@@ -1045,3 +1045,12 @@ def get_behavioral_guard_readiness_probe() -> dict:
         "certificate": get_behavioral_guard_compliance_certificate(),
     }
 
+
+def get_behavioral_guard_audit_summary() -> dict:
+    return {
+        "module": "behavioral_guard",
+        "audit_passed": validate_behavioral_guard_contract(),
+        "probe": get_behavioral_guard_readiness_probe(),
+    }
+
+

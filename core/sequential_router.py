@@ -1988,4 +1988,12 @@ def get_sequential_router_readiness_probe() -> dict:
     }
 
 
+def get_sequential_router_audit_summary() -> dict:
+    return {
+        "module": "sequential_router",
+        "audit_passed": validate_sequential_router_contract(),
+        "probe": get_sequential_router_readiness_probe(),
+    }
+
+
 
