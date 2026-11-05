@@ -395,3 +395,7 @@ def get_frame_time_machine_telemetry_payload() -> dict:
     return {"module": "frame_time_machine", "payload": get_frame_time_machine_operational_digest()}
 
 
+def get_frame_time_machine_integrity_seal() -> dict:
+    return {"module": "frame_time_machine", "sealed": validate_frame_time_machine_contract(), "telemetry": get_frame_time_machine_telemetry_payload()}
+
+

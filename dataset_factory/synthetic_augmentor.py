@@ -829,3 +829,8 @@ def get_synthetic_augmentor_operational_digest() -> dict:
 def get_synthetic_augmentor_telemetry_payload() -> dict:
     return {"module": "synthetic_augmentor", "payload": get_synthetic_augmentor_operational_digest()}
 
+
+def get_synthetic_augmentor_integrity_seal() -> dict:
+    return {"module": "synthetic_augmentor", "sealed": validate_synthetic_augmentor_contract(), "telemetry": get_synthetic_augmentor_telemetry_payload()}
+
+

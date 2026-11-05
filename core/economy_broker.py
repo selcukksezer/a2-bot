@@ -1419,3 +1419,7 @@ def get_economy_broker_telemetry_payload() -> dict:
     return {"module": "economy_broker", "payload": get_economy_broker_operational_digest()}
 
 
+def get_economy_broker_integrity_seal() -> dict:
+    return {"module": "economy_broker", "sealed": validate_economy_broker_contract(), "telemetry": get_economy_broker_telemetry_payload()}
+
+
