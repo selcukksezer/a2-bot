@@ -602,4 +602,10 @@ def get_path_optimizer_readiness_status() -> dict:
     }
 
 
+def get_path_optimizer_audit_record() -> dict:
+    return {
+        "module": "path_optimizer",
+        "audit_passed": validate_path_optimizer_contract(),
+        "readiness": get_path_optimizer_readiness_status(),
+    }
 

@@ -1340,3 +1340,12 @@ def get_corridor_navigator_readiness_status() -> dict:
     }
 
 
+def get_corridor_navigator_audit_record() -> dict:
+    return {
+        "module": "corridor_navigator",
+        "audit_passed": validate_corridor_navigator_contract(),
+        "readiness": get_corridor_navigator_readiness_status(),
+    }
+
+
+

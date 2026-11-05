@@ -1248,6 +1248,7 @@ __all__ = [
     "get_stability_health_report",
     "get_stability_guards_capabilities",
     "get_stability_guards_readiness_status",
+    "get_stability_guards_audit_record",
 ]
 
 
@@ -1265,6 +1266,10 @@ def get_stability_guards_baseline_metrics() -> dict:
 
 def get_stability_guards_readiness_status() -> dict:
     return {"module": "stability_guards", "ready": validate_stability_guards_contract(), "metrics": get_stability_guards_baseline_metrics()}
+
+
+def get_stability_guards_audit_record() -> dict:
+    return {"module": "stability_guards", "audit_passed": validate_stability_guards_contract(), "readiness": get_stability_guards_readiness_status()}
 
 
 

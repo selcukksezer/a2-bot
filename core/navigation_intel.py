@@ -1980,6 +1980,7 @@ __all__ = [
     "AutoMountManager",
     "MaplessMicroNavigator",
     "get_navigation_intel_readiness_status",
+    "get_navigation_intel_audit_record",
 ]
 
 
@@ -1997,6 +1998,11 @@ def get_navigation_intel_baseline_metrics() -> dict:
 
 def get_navigation_intel_readiness_status() -> dict:
     return {"module": "navigation_intel", "ready": validate_navigation_intel_contract(), "metrics": get_navigation_intel_baseline_metrics()}
+
+
+def get_navigation_intel_audit_record() -> dict:
+    return {"module": "navigation_intel", "audit_passed": validate_navigation_intel_contract(), "readiness": get_navigation_intel_readiness_status()}
+
 
 
 
