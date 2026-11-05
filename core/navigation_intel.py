@@ -1986,6 +1986,7 @@ __all__ = [
     "get_navigation_intel_integrity_seal",
     "get_navigation_intel_compliance_certificate",
     "get_navigation_intel_readiness_probe",
+    "get_navigation_intel_audit_summary",
 ]
 
 
@@ -2027,4 +2028,9 @@ def get_navigation_intel_compliance_certificate() -> dict:
 
 def get_navigation_intel_readiness_probe() -> dict:
     return {"module": "navigation_intel", "ready": validate_navigation_intel_contract(), "certificate": get_navigation_intel_compliance_certificate()}
+
+
+def get_navigation_intel_audit_summary() -> dict:
+    return {"module": "navigation_intel", "audit_passed": validate_navigation_intel_contract(), "probe": get_navigation_intel_readiness_probe()}
+
 

@@ -1387,5 +1387,10 @@ def get_corridor_navigator_readiness_probe() -> dict:
     }
 
 
-
+def get_corridor_navigator_audit_summary() -> dict:
+    return {
+        "module": "corridor_navigator",
+        "audit_passed": validate_corridor_navigator_contract(),
+        "probe": get_corridor_navigator_readiness_probe(),
+    }
 

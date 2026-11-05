@@ -1110,3 +1110,11 @@ def get_windmouse_humanizer_readiness_probe() -> dict:
     }
 
 
+def get_windmouse_humanizer_audit_summary() -> dict:
+    return {
+        "module": "windmouse_humanizer",
+        "audit_passed": validate_windmouse_humanizer_contract(),
+        "probe": get_windmouse_humanizer_readiness_probe(),
+    }
+
+

@@ -649,3 +649,12 @@ def get_path_optimizer_readiness_probe() -> dict:
     }
 
 
+def get_path_optimizer_audit_summary() -> dict:
+    return {
+        "module": "path_optimizer",
+        "audit_passed": validate_path_optimizer_contract(),
+        "probe": get_path_optimizer_readiness_probe(),
+    }
+
+
+
