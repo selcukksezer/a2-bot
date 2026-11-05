@@ -989,3 +989,8 @@ def get_human_timing_telemetry_payload() -> dict:
     return {"module": "human_timing", "payload": get_human_timing_operational_digest()}
 
 
+def get_human_timing_integrity_seal() -> dict:
+    return {"module": "human_timing", "sealed": validate_human_timing_contract(), "telemetry": get_human_timing_telemetry_payload()}
+
+
+

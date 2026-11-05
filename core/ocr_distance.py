@@ -1613,4 +1613,6 @@ def get_ocr_distance_telemetry_payload() -> dict:
     return {"module": "ocr_distance", "payload": get_ocr_distance_operational_digest()}
 
 
+def get_ocr_distance_integrity_seal() -> dict:
+    return {"module": "ocr_distance", "sealed": validate_ocr_distance_contract(), "telemetry": get_ocr_distance_telemetry_payload()}
 

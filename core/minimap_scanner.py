@@ -1173,4 +1173,10 @@ def get_minimap_scanner_telemetry_payload() -> dict:
     }
 
 
+def get_minimap_scanner_integrity_seal() -> dict:
+    return {
+        "module": "minimap_scanner",
+        "sealed": validate_minimap_scanner_contract(),
+        "telemetry": get_minimap_scanner_telemetry_payload(),
+    }
 

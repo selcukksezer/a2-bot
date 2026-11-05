@@ -1251,3 +1251,12 @@ def get_opsec_crypto_telemetry_payload() -> dict:
     }
 
 
+def get_opsec_crypto_integrity_seal() -> dict:
+    return {
+        "module": "opsec_crypto",
+        "sealed": validate_opsec_crypto_contract(),
+        "telemetry": get_opsec_crypto_telemetry_payload(),
+    }
+
+
+
