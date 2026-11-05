@@ -1907,3 +1907,7 @@ class SequentialRoutePlanner:
             logger.error("get_sequential_router_health_summary error: %s", exc)
             return {"sequential_router_ready": False}
 
+    def get_sequential_router_ready_flag(self) -> dict:
+        return {"module": "sequential_router", "ready": True}
+
+

@@ -1053,6 +1053,9 @@ class QuestlogImporter:
                 "elapsed_sec": 0.0,
             }
 
+    def get_questlog_importer_ready_flag(self) -> dict:
+        return {"module": "questlog_importer", "ready": True}
+
 
 # ==============================================================================
 # CONFIRMATION DIALOG ("The import takes about 20 seconds" - frame_15s.jpg)

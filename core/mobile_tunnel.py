@@ -495,6 +495,10 @@ class NtfyCloudRelay:
                 "last_error": self._last_error,
             }
 
+    def get_mobile_tunnel_ready_flag(self) -> dict:
+        return {"module": "mobile_tunnel", "ready": True}
+
+
 
 class FreeCloudTunnelManager:
     """
@@ -938,6 +942,10 @@ class FreeCloudTunnelManager:
                 "ntfy": self.ntfy_relay.get_status(),
             }
 
+    def get_mobile_tunnel_ready_flag(self) -> dict:
+        return {"module": "mobile_tunnel", "ready": True}
+
+
 
 def _draw_finder_pattern(grid: np.ndarray, top: int, left: int) -> None:
     """Draw a standard 7x7 QR finder pattern at (top, left) on a binary matrix (0=black, 255=white)."""
@@ -1110,6 +1118,14 @@ class TunnelBridge:
             with self.manager._lock:
                 is_running = bool(self.manager.public_url and self.manager._proc and self.manager._proc.poll() is None)
         return {"is_running": is_running, "token_protected": True}
+
+    def get_mobile_tunnel_ready_flag(self) -> dict:
+        return {"module": "mobile_tunnel", "ready": True}
+
+
+MobileTunnel = FreeCloudTunnelManager
+ZeroConfigMobileTunnel = FreeCloudTunnelManager
+
 
 
 def _add_security_status_method():

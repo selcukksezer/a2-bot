@@ -553,6 +553,10 @@ class MonocularDepthObstacleAvoidance:
             "test_mode": bool(test_mode),
         }
 
+    def get_depth_glide_navigator_ready_flag(self) -> dict:
+        return {"module": "depth_glide_navigator", "ready": True}
+
+
 
 class GlideWaypointController:
     """
@@ -865,4 +869,8 @@ class GlideWaypointController:
             return {"depth_glide_ready": True}
         except Exception:
             return {"depth_glide_ready": False}
+
+    def get_depth_glide_navigator_ready_flag(self) -> dict:
+        return {"module": "depth_glide_navigator", "ready": True}
+
 

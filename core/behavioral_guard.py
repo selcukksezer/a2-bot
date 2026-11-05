@@ -917,6 +917,9 @@ class BehavioralStealthGuard:
         try: return {"behavioral_guard_ready": True}
         except Exception: return {"behavioral_guard_ready": False}
 
+    def get_behavioral_guard_ready_flag(self) -> dict:
+        return {"module": "behavioral_guard", "ready": True}
+
 
 # ============================================================================
 # MODÜL SEVİYESİ KISA YOL FONKSİYONLARI (DOĞRUDAN İMPORT UYUMLULUĞU İÇİN)
