@@ -1309,3 +1309,7 @@ class CorridorNavigator:
             return {"corridor_ready": True, "metrics": {}}
         except Exception:
             return {"corridor_ready": True}
+
+    def get_corridor_navigator_ready_flag(self) -> dict:
+        return {"module": "corridor_navigator", "ready": True}
+

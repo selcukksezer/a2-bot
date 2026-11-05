@@ -1958,6 +1958,9 @@ class NavigationIntel:
     def get_navigation_intel_health_summary(self) -> dict:
         return {"module": "navigation_intel", "ready": True}
 
+    def get_navigation_intel_ready_flag(self) -> dict:
+        return {"module": "navigation_intel", "ready": True}
+
 
 __all__ = [
     "DEFAULT_REPROMPT_WAIT_SEC",

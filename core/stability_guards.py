@@ -282,6 +282,9 @@ class SelfInputWhitelistWindow:
             self._key_timestamps.clear()
             self._vk_timestamps.clear()
 
+    def get_stability_guards_ready_flag(self) -> dict:
+        return {"module": "stability_guards", "ready": True}
+
 
 # ============================================================================
 # MADDE 11: KAMERA KİLİDİ ((1280, 720) / (W/2, H/2)) ALGILAYICI
@@ -458,6 +461,9 @@ class CameraLockExceptionRule:
             "delta_px": round(delta_px, 2),
             "updated_anchor": (ax, ay),
         }
+
+    def get_stability_guards_ready_flag(self) -> dict:
+        return {"module": "stability_guards", "ready": True}
 
 
 # ============================================================================
@@ -649,6 +655,9 @@ class CursorVisibilityAutomator:
                 return True
 
         return self.is_cursor_visible()
+
+    def get_stability_guards_ready_flag(self) -> dict:
+        return {"module": "stability_guards", "ready": True}
 
 
 # ============================================================================
@@ -889,6 +898,9 @@ class FiveFrameDeathConfirmationGuard:
             hp_ratio=hp_ratio,
             confirm_frames=confirm_frames,
         )
+
+    def get_stability_guards_ready_flag(self) -> dict:
+        return {"module": "stability_guards", "ready": True}
 
 
 # ============================================================================
@@ -1184,6 +1196,26 @@ class MultiCriteriaMapVerifier:
         res = self.verify_map_state(frame)
         return bool(res["is_open"])
 
+    def get_stability_guards_ready_flag(self) -> dict:
+        return {"module": "stability_guards", "ready": True}
+
+
+class StabilityGuards:
+    """Ana kararlılık korumaları bileşik sınıfı (Maddeler 11–15)."""
+
+    def __init__(self) -> None:
+        self.whitelist = SelfInputWhitelistWindow()
+        self.camera_lock_rule = CameraLockExceptionRule()
+        self.cursor_automator = CursorVisibilityAutomator(whitelist=self.whitelist)
+        self.death_guard = FiveFrameDeathConfirmationGuard()
+        self.map_verifier = MultiCriteriaMapVerifier()
+
+    def get_stability_guards_ready_flag(self) -> dict:
+        return {"module": "stability_guards", "ready": True}
+
+
+RuntimeStabilityGuard = StabilityGuards
+
 
 def get_stability_guards_ready_flag() -> dict:
     return {"module": "stability_guards", "ready": True}
@@ -1203,7 +1235,9 @@ __all__ = [
     "CursorVisibilityAutomator",
     "FiveFrameDeathConfirmationGuard",
     "MultiCriteriaMapVerifier",
+    "RuntimeStabilityGuard",
     "SelfInputWhitelistWindow",
+    "StabilityGuards",
     "get_stability_guards_ready_flag",
     "get_stability_health_report",
 ]
