@@ -1397,4 +1397,6 @@ def get_material_scanner_readiness_probe() -> dict:
     return {"module": "material_scanner", "ready": validate_material_scanner_contract(), "certificate": get_material_scanner_compliance_certificate()}
 
 
+def get_material_scanner_audit_summary() -> dict:
+    return {"module": "material_scanner", "audit_passed": validate_material_scanner_contract(), "probe": get_material_scanner_readiness_probe()}
 

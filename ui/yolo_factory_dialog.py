@@ -2176,4 +2176,8 @@ def get_yolo_factory_dialog_readiness_probe() -> dict:
     return {"module": "yolo_factory_dialog", "ready": validate_yolo_factory_dialog_contract(), "certificate": get_yolo_factory_dialog_compliance_certificate()}
 
 
+def get_yolo_factory_dialog_audit_summary() -> dict:
+    return {"module": "yolo_factory_dialog", "audit_passed": validate_yolo_factory_dialog_contract(), "probe": get_yolo_factory_dialog_readiness_probe()}
+
+
 

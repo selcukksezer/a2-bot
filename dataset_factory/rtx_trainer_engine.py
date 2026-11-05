@@ -1854,3 +1854,11 @@ def get_rtx_trainer_engine_readiness_probe() -> dict:
     }
 
 
+def get_rtx_trainer_engine_audit_summary() -> dict:
+    return {
+        "module": "rtx_trainer_engine",
+        "audit_passed": validate_rtx_trainer_engine_contract(),
+        "probe": get_rtx_trainer_engine_readiness_probe(),
+    }
+
+

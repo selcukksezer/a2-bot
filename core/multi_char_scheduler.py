@@ -1580,3 +1580,8 @@ def get_multi_char_scheduler_readiness_probe() -> dict:
     return {"module": "multi_char_scheduler", "ready": validate_multi_char_scheduler_contract(), "certificate": get_multi_char_scheduler_compliance_certificate()}
 
 
+def get_multi_char_scheduler_audit_summary() -> dict:
+    return {"module": "multi_char_scheduler", "audit_passed": validate_multi_char_scheduler_contract(), "probe": get_multi_char_scheduler_readiness_probe()}
+
+
+
