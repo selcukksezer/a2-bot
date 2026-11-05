@@ -1152,3 +1152,7 @@ def get_smoke_test_dataset_factory_diagnostic_snapshot() -> dict:
     return {"module": "smoke_test_dataset_factory", "status": "ok", "ready": True}
 
 
+def get_smoke_test_dataset_factory_capabilities() -> list:
+    return ["smoke_test_dataset_factory", "diagnostic_snapshot", "version_info"]
+
+

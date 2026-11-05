@@ -18,3 +18,7 @@ def get_ui_package_version_info() -> dict:
 def get_ui_package_diagnostic_snapshot() -> dict:
     return {"package": "ui", "status": "ok", "ready": True}
 
+
+def get_ui_package_capabilities() -> list:
+    return ["ui_package", "diagnostic_snapshot", "version_info"]
+

@@ -20,4 +20,6 @@ def get_core_package_diagnostic_snapshot() -> dict:
     return {"package": "core", "status": "ok", "ready": True}
 
 
+def get_core_package_capabilities() -> list:
+    return ["core_package", "diagnostic_snapshot", "version_info"]
 

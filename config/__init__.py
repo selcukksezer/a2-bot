@@ -20,3 +20,7 @@ def get_config_package_diagnostic_snapshot() -> dict:
     return {"package": "config", "status": "ok", "ready": True}
 
 
+def get_config_package_capabilities() -> list:
+    return ["config_package", "diagnostic_snapshot", "version_info"]
+
+
