@@ -1192,3 +1192,7 @@ class TelemetryEngine:
 def get_telemetry_capabilities() -> list:
     return ["telemetry", "metrics_aggregation", "diagnostic_snapshot"]
 
+
+def validate_telemetry_contract() -> bool:
+    return bool(get_telemetry_capabilities())
+

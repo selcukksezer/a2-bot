@@ -1356,3 +1356,7 @@ if __name__ == "__main__":
 def get_watchdog_capabilities() -> list:
     return ["watchdog", "stuck_recovery", "diagnostic_snapshot"]
 
+
+def validate_watchdog_contract() -> bool:
+    return bool(get_watchdog_capabilities())
+

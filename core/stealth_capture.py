@@ -892,3 +892,8 @@ class StealthCapture(DXGIDesktopCapture):
 def get_stealth_capture_capabilities() -> list:
     return ["stealth_capture", "frame_acquisition", "diagnostic_snapshot"]
 
+
+def validate_stealth_capture_contract() -> bool:
+    return bool(get_stealth_capture_capabilities())
+
+

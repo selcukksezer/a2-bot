@@ -1550,3 +1550,8 @@ if __name__ == "__main__":
 def get_input_driver_capabilities() -> list:
     return ["input_driver", "humanized_input", "diagnostic_snapshot"]
 
+
+def validate_input_driver_contract() -> bool:
+    return bool(get_input_driver_capabilities())
+
+

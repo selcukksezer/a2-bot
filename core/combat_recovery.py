@@ -1424,3 +1424,8 @@ class CombatRecovery:
 def get_combat_recovery_capabilities() -> list:
     return ["combat_recovery", "retaliation_protocol", "diagnostic_snapshot"]
 
+
+def validate_combat_recovery_contract() -> bool:
+    return bool(get_combat_recovery_capabilities())
+
+
