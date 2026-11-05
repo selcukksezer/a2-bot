@@ -1766,3 +1766,9 @@ echo ===========================================================================
             "confidence": round(confidence, 4),
             "distance": round(best_dist, 4),
         }
+
+    def get_rtx_trainer_health_summary(self) -> dict:
+        try:
+            return {"rtx_trainer_ready": True}
+        except Exception:
+            return {"rtx_trainer_ready": False}

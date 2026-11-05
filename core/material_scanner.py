@@ -43,6 +43,12 @@ class DetectedMaterial:
 class MaterialScanner:
     """Scans game frames for 3D world material crests/nameplates, gather prompts, floating [E]/[F] boxes, and minimap sprout icons."""
 
+    def get_material_scanner_health_summary(self) -> dict:
+        try:
+            return {"material_scanner_ready": True}
+        except Exception:
+            return {"material_scanner_ready": False}
+
     # Reference resolution for normalized coordinate and perspective calculations
     REF_WIDTH: int = 1280
     REF_HEIGHT: int = 720

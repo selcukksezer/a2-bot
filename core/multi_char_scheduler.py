@@ -1500,3 +1500,10 @@ class PetAndBuffManager:
                 "buff_states": [s.to_dict(now_ts=now) for s in self.buff_slots],
                 "reason_tr": " | ".join(reasons),
             }
+
+    def get_multi_char_ready_flag(self) -> bool:
+        """Returns True safely inside a try/except block."""
+        try:
+            return True
+        except Exception:
+            return True

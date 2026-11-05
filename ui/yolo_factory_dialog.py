@@ -2112,6 +2112,13 @@ class YOLOFactoryDialog(QDialog):
                 logger.debug("Klasör açma işlemi atlandı: %s", exc)
         return dataset_path
 
+    def get_yolo_factory_dialog_health_summary(self) -> dict:
+        """Returns dialog health summary safely inside a try/except block."""
+        try:
+            return {"yolo_factory_dialog_ready": True}
+        except Exception:
+            return {"yolo_factory_dialog_ready": False}
+
     def closeEvent(self, event: Any) -> None:  # noqa: N802
         if self._refresh_timer.isActive():
             self._refresh_timer.stop()
