@@ -695,3 +695,8 @@ def get_incident_recorder_capabilities() -> list:
 def validate_incident_recorder_contract() -> bool:
     return bool(get_incident_recorder_capabilities())
 
+
+def get_incident_recorder_baseline_metrics() -> dict:
+    return {"module": "incident_recorder", "contract_valid": validate_incident_recorder_contract(), "capability_count": len(get_incident_recorder_capabilities())}
+
+

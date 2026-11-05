@@ -346,3 +346,8 @@ def get_uac_elevator_capabilities() -> list:
 def validate_uac_elevator_contract() -> bool:
     return bool(get_uac_elevator_capabilities())
 
+
+def get_uac_elevator_baseline_metrics() -> dict:
+    return {"module": "uac_elevator", "contract_valid": validate_uac_elevator_contract(), "capability_count": len(get_uac_elevator_capabilities())}
+
+

@@ -477,3 +477,7 @@ def validate_skill_bar_reader_contract() -> bool:
     return bool(get_skill_bar_reader_capabilities())
 
 
+def get_skill_bar_reader_baseline_metrics() -> dict:
+    return {"module": "skill_bar_reader", "contract_valid": validate_skill_bar_reader_contract(), "capability_count": len(get_skill_bar_reader_capabilities())}
+
+

@@ -799,3 +799,7 @@ def validate_dpi_focus_guard_contract() -> bool:
     return bool(get_dpi_focus_guard_capabilities())
 
 
+def get_dpi_focus_guard_baseline_metrics() -> dict:
+    return {"module": "dpi_focus_guard", "contract_valid": validate_dpi_focus_guard_contract(), "capability_count": len(get_dpi_focus_guard_capabilities())}
+
+
