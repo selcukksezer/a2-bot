@@ -76,3 +76,7 @@ get_tools_pkg_compliance_certificate = get_tools_package_compliance_certificate
 def get_tools_pkg_readiness_probe() -> dict:
     return {"module": "tools_pkg", "ready": validate_tools_pkg_contract(), "certificate": get_tools_pkg_compliance_certificate()}
 
+
+def get_tools_pkg_audit_summary() -> dict:
+    return {"module": "tools_pkg", "audit_passed": validate_tools_pkg_contract(), "probe": get_tools_pkg_readiness_probe()}
+

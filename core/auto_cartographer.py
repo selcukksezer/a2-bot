@@ -2479,3 +2479,12 @@ def get_auto_cartographer_readiness_probe() -> dict:
         "certificate": get_auto_cartographer_compliance_certificate(),
     }
 
+
+def get_auto_cartographer_audit_summary() -> dict:
+    return {
+        "module": "auto_cartographer",
+        "audit_passed": validate_auto_cartographer_contract(),
+        "probe": get_auto_cartographer_readiness_probe(),
+    }
+
+

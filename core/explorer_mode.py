@@ -1992,3 +1992,7 @@ def get_explorer_mode_readiness_probe() -> dict:
     return {"module": "explorer_mode", "ready": validate_explorer_mode_contract(), "certificate": get_explorer_mode_compliance_certificate()}
 
 
+def get_explorer_mode_audit_summary() -> dict:
+    return {"module": "explorer_mode", "audit_passed": validate_explorer_mode_contract(), "probe": get_explorer_mode_readiness_probe()}
+
+

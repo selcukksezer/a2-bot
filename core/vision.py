@@ -1699,3 +1699,7 @@ def get_vision_readiness_probe() -> dict:
     return {"module": "vision", "ready": validate_vision_contract(), "certificate": get_vision_compliance_certificate()}
 
 
+def get_vision_audit_summary() -> dict:
+    return {"module": "vision", "audit_passed": validate_vision_contract(), "probe": get_vision_readiness_probe()}
+
+
