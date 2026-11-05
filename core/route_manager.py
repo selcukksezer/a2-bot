@@ -2443,4 +2443,8 @@ def get_route_manager_readiness_status() -> dict:
     return {"module": "route_manager", "ready": validate_route_manager_contract(), "metrics": get_route_manager_baseline_metrics()}
 
 
+def get_route_manager_audit_record() -> dict:
+    return {"module": "route_manager", "audit_passed": validate_route_manager_contract(), "readiness": get_route_manager_readiness_status()}
+
+
 

@@ -39,3 +39,11 @@ def get_tools_package_readiness_status() -> dict:
         return {"module": "tools_package", "ready": False, "metrics": {}}
 
 
+def get_tools_package_audit_record() -> dict:
+    try:
+        return {"module": "tools_package", "audit_passed": validate_tools_package_contract(), "readiness": get_tools_package_readiness_status()}
+    except Exception:
+        return {"module": "tools_package", "audit_passed": False, "readiness": {}}
+
+
+

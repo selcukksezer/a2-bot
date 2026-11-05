@@ -2432,3 +2432,12 @@ def get_auto_cartographer_readiness_status() -> dict:
     }
 
 
+def get_auto_cartographer_audit_record() -> dict:
+    return {
+        "module": "auto_cartographer",
+        "audit_passed": validate_auto_cartographer_contract(),
+        "readiness": get_auto_cartographer_readiness_status(),
+    }
+
+
+
