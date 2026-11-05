@@ -1278,3 +1278,7 @@ def get_map_viewer_audit_record() -> dict:
     return {"module": "map_viewer", "audit_passed": validate_map_viewer_contract(), "readiness": get_map_viewer_readiness_status()}
 
 
+def get_map_viewer_operational_digest() -> dict:
+    return {"module": "map_viewer", "operational": validate_map_viewer_contract(), "audit": get_map_viewer_audit_record()}
+
+

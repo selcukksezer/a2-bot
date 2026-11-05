@@ -2975,5 +2975,10 @@ def get_cartography_radar_audit_record() -> dict:
         }
 
 
-
+def get_cartography_radar_operational_digest() -> dict:
+    return {
+        "module": "cartography_radar",
+        "operational": validate_cartography_radar_contract(),
+        "audit": get_cartography_radar_audit_record(),
+    }
 

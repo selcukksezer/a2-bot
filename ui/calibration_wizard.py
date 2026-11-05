@@ -1049,4 +1049,9 @@ def get_calibration_wizard_audit_record() -> dict:
     return {"module": "calibration_wizard", "audit_passed": validate_calibration_wizard_contract(), "readiness": get_calibration_wizard_readiness_status()}
 
 
+def get_calibration_wizard_operational_digest() -> dict:
+    return {"module": "calibration_wizard", "operational": validate_calibration_wizard_contract(), "audit": get_calibration_wizard_audit_record()}
+
+
+
 
