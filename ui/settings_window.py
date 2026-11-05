@@ -2880,3 +2880,8 @@ def get_settings_window_baseline_metrics() -> dict:
 def get_settings_window_readiness_status() -> dict:
     return {"module": "settings_window", "ready": validate_settings_window_contract(), "metrics": get_settings_window_baseline_metrics()}
 
+
+def get_settings_window_audit_record() -> dict:
+    return {"module": "settings_window", "audit_passed": validate_settings_window_contract(), "readiness": get_settings_window_readiness_status()}
+
+

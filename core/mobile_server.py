@@ -3041,3 +3041,7 @@ def get_mobile_server_readiness_status() -> dict:
     return {"module": "mobile_server", "ready": validate_mobile_server_contract(), "metrics": get_mobile_server_baseline_metrics()}
 
 
+def get_mobile_server_audit_record() -> dict:
+    return {"module": "mobile_server", "audit_passed": validate_mobile_server_contract(), "readiness": get_mobile_server_readiness_status()}
+
+
