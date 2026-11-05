@@ -61,3 +61,8 @@ def get_extract_video_operational_digest() -> dict:
 def get_extract_video_telemetry_payload() -> dict:
     return {"module": "extract_video", "payload": get_extract_video_operational_digest()}
 
+
+def get_extract_video_integrity_seal() -> dict:
+    return {"module": "extract_video", "sealed": validate_extract_video_contract(), "telemetry": get_extract_video_telemetry_payload()}
+
+

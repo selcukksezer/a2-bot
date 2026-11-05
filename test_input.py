@@ -87,3 +87,7 @@ def get_test_input_telemetry_payload() -> dict:
     return {"module": "test_input", "payload": get_test_input_operational_digest()}
 
 
+def get_test_input_integrity_seal() -> dict:
+    return {"module": "test_input", "sealed": validate_test_input_contract(), "telemetry": get_test_input_telemetry_payload()}
+
+

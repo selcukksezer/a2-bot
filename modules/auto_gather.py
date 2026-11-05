@@ -164,4 +164,10 @@ def get_auto_gather_telemetry_payload() -> dict:
     }
 
 
+def get_auto_gather_integrity_seal() -> dict:
+    return {
+        "module": "auto_gather",
+        "sealed": validate_auto_gather_contract(),
+        "telemetry": get_auto_gather_telemetry_payload(),
+    }
 

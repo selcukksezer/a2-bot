@@ -115,3 +115,8 @@ def get_recorder_operational_digest() -> dict:
 def get_recorder_telemetry_payload() -> dict:
     return {"module": "recorder", "payload": get_recorder_operational_digest()}
 
+
+def get_recorder_integrity_seal() -> dict:
+    return {"module": "recorder", "sealed": validate_recorder_contract(), "telemetry": get_recorder_telemetry_payload()}
+
+

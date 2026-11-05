@@ -200,3 +200,8 @@ def get_route_runner_operational_digest() -> dict:
 def get_route_runner_telemetry_payload() -> dict:
     return {"module": "route_runner", "payload": get_route_runner_operational_digest()}
 
+
+def get_route_runner_integrity_seal() -> dict:
+    return {"module": "route_runner", "sealed": validate_route_runner_contract(), "telemetry": get_route_runner_telemetry_payload()}
+
+
