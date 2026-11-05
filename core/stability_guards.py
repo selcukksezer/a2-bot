@@ -1253,6 +1253,7 @@ __all__ = [
     "get_stability_guards_telemetry_payload",
     "get_stability_guards_integrity_seal",
     "get_stability_guards_compliance_certificate",
+    "get_stability_guards_readiness_probe",
 ]
 
 
@@ -1290,4 +1291,8 @@ def get_stability_guards_integrity_seal() -> dict:
 
 def get_stability_guards_compliance_certificate() -> dict:
     return {"module": "stability_guards", "certified": validate_stability_guards_contract(), "seal": get_stability_guards_integrity_seal()}
+
+
+def get_stability_guards_readiness_probe() -> dict:
+    return {"module": "stability_guards", "ready": validate_stability_guards_contract(), "certificate": get_stability_guards_compliance_certificate()}
 

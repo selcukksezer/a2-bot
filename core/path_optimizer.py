@@ -641,3 +641,11 @@ def get_path_optimizer_compliance_certificate() -> dict:
     }
 
 
+def get_path_optimizer_readiness_probe() -> dict:
+    return {
+        "module": "path_optimizer",
+        "ready": validate_path_optimizer_contract(),
+        "certificate": get_path_optimizer_compliance_certificate(),
+    }
+
+

@@ -1379,4 +1379,13 @@ def get_corridor_navigator_compliance_certificate() -> dict:
     }
 
 
+def get_corridor_navigator_readiness_probe() -> dict:
+    return {
+        "module": "corridor_navigator",
+        "ready": validate_corridor_navigator_contract(),
+        "certificate": get_corridor_navigator_compliance_certificate(),
+    }
+
+
+
 
