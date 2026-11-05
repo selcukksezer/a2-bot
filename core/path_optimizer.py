@@ -618,3 +618,11 @@ def get_path_optimizer_operational_digest() -> dict:
     }
 
 
+def get_path_optimizer_telemetry_payload() -> dict:
+    return {
+        "module": "path_optimizer",
+        "payload": get_path_optimizer_operational_digest(),
+    }
+
+
+

@@ -1356,5 +1356,9 @@ def get_corridor_navigator_operational_digest() -> dict:
     }
 
 
-
+def get_corridor_navigator_telemetry_payload() -> dict:
+    return {
+        "module": "corridor_navigator",
+        "payload": get_corridor_navigator_operational_digest(),
+    }
 

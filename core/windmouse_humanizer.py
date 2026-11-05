@@ -1078,3 +1078,11 @@ def get_windmouse_humanizer_operational_digest() -> dict:
         "audit": get_windmouse_humanizer_audit_record(),
     }
 
+
+def get_windmouse_humanizer_telemetry_payload() -> dict:
+    return {
+        "module": "windmouse_humanizer",
+        "payload": get_windmouse_humanizer_operational_digest(),
+    }
+
+

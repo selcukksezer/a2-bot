@@ -1982,6 +1982,7 @@ __all__ = [
     "get_navigation_intel_readiness_status",
     "get_navigation_intel_audit_record",
     "get_navigation_intel_operational_digest",
+    "get_navigation_intel_telemetry_payload",
 ]
 
 
@@ -2009,6 +2010,7 @@ def get_navigation_intel_operational_digest() -> dict:
     return {"module": "navigation_intel", "operational": validate_navigation_intel_contract(), "audit": get_navigation_intel_audit_record()}
 
 
-
+def get_navigation_intel_telemetry_payload() -> dict:
+    return {"module": "navigation_intel", "payload": get_navigation_intel_operational_digest()}
 
 
