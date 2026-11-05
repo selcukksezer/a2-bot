@@ -38,3 +38,7 @@ def get_extract_video_capabilities() -> list:
     return ["extract_video", "frame_extraction", "diagnostic_snapshot"]
 
 
+def validate_extract_video_contract() -> bool:
+    return bool(get_extract_video_capabilities())
+
+

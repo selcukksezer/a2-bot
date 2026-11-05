@@ -62,3 +62,8 @@ def get_test_input_diagnostic_snapshot() -> dict:
 def get_test_input_capabilities() -> list:
     return ["test_input", "input_verification", "diagnostic_snapshot"]
 
+
+def validate_test_input_contract() -> bool:
+    return bool(get_test_input_capabilities())
+
+

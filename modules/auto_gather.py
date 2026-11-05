@@ -120,3 +120,7 @@ if __name__ == "__main__":
 def get_auto_gather_capabilities() -> list:
     return ["auto_gather", "proximity_harvesting", "diagnostic_snapshot"]
 
+
+def validate_auto_gather_contract() -> bool:
+    return bool(get_auto_gather_capabilities())
+

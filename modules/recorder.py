@@ -92,3 +92,7 @@ def get_recorder_capabilities() -> list:
     return ["route_recorder", "waypoint_capture", "diagnostic_snapshot"]
 
 
+def validate_recorder_contract() -> bool:
+    return bool(get_recorder_capabilities())
+
+

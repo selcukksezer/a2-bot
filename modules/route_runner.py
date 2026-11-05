@@ -176,3 +176,8 @@ if __name__ == "__main__":
 def get_route_runner_capabilities() -> list:
     return ["route_runner", "sequential_execution", "diagnostic_snapshot"]
 
+
+def validate_route_runner_contract() -> bool:
+    return bool(get_route_runner_capabilities())
+
+
