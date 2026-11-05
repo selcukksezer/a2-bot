@@ -64,3 +64,12 @@ def get_core_package_compliance_certificate() -> dict:
     return {"module": "core_package", "certified": validate_core_package_contract(), "seal": get_core_package_integrity_seal()}
 
 
+validate_core_pkg_contract = validate_core_package_contract
+get_core_pkg_compliance_certificate = get_core_package_compliance_certificate
+
+
+def get_core_pkg_readiness_probe() -> dict:
+    return {"module": "core_pkg", "ready": validate_core_pkg_contract(), "certificate": get_core_pkg_compliance_certificate()}
+
+
+

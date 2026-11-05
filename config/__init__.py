@@ -63,3 +63,12 @@ def get_config_package_compliance_certificate() -> dict:
     return {"module": "config_package", "certified": validate_config_package_contract(), "seal": get_config_package_integrity_seal()}
 
 
+validate_config_pkg_contract = validate_config_package_contract
+get_config_pkg_compliance_certificate = get_config_package_compliance_certificate
+
+
+def get_config_pkg_readiness_probe() -> dict:
+    return {"module": "config_pkg", "ready": validate_config_pkg_contract(), "certificate": get_config_pkg_compliance_certificate()}
+
+
+

@@ -1211,3 +1211,12 @@ def get_smoke_test_dataset_factory_compliance_certificate() -> dict:
         "seal": get_smoke_test_dataset_factory_integrity_seal(),
     }
 
+
+def get_smoke_test_dataset_factory_readiness_probe() -> dict:
+    return {
+        "module": "smoke_test_dataset_factory",
+        "ready": validate_smoke_test_dataset_factory_contract(),
+        "certificate": get_smoke_test_dataset_factory_compliance_certificate(),
+    }
+
+

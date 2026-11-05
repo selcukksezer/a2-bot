@@ -62,3 +62,12 @@ def get_ui_package_compliance_certificate() -> dict:
     return {"module": "ui_package", "certified": validate_ui_package_contract(), "seal": get_ui_package_integrity_seal()}
 
 
+validate_ui_pkg_contract = validate_ui_package_contract
+get_ui_pkg_compliance_certificate = get_ui_package_compliance_certificate
+
+
+def get_ui_pkg_readiness_probe() -> dict:
+    return {"module": "ui_pkg", "ready": validate_ui_pkg_contract(), "certificate": get_ui_pkg_compliance_certificate()}
+
+
+
