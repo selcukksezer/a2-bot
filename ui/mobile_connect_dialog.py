@@ -1183,3 +1183,8 @@ def get_mobile_connect_dialog_audit_record() -> dict:
 def get_mobile_connect_dialog_operational_digest() -> dict:
     return {"module": "mobile_connect_dialog", "operational": validate_mobile_connect_dialog_contract(), "audit": get_mobile_connect_dialog_audit_record()}
 
+
+def get_mobile_connect_dialog_telemetry_payload() -> dict:
+    return {"module": "mobile_connect_dialog", "telemetry_ready": validate_mobile_connect_dialog_contract(), "digest": get_mobile_connect_dialog_operational_digest()}
+
+

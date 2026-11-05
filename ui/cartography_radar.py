@@ -2982,3 +2982,12 @@ def get_cartography_radar_operational_digest() -> dict:
         "audit": get_cartography_radar_audit_record(),
     }
 
+
+def get_cartography_radar_telemetry_payload() -> dict:
+    return {
+        "module": "cartography_radar",
+        "telemetry_ready": validate_cartography_radar_contract(),
+        "digest": get_cartography_radar_operational_digest(),
+    }
+
+

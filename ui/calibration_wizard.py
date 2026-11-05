@@ -1053,5 +1053,6 @@ def get_calibration_wizard_operational_digest() -> dict:
     return {"module": "calibration_wizard", "operational": validate_calibration_wizard_contract(), "audit": get_calibration_wizard_audit_record()}
 
 
-
+def get_calibration_wizard_telemetry_payload() -> dict:
+    return {"module": "calibration_wizard", "telemetry_ready": validate_calibration_wizard_contract(), "digest": get_calibration_wizard_operational_digest()}
 
