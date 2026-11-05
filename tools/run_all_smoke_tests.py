@@ -1510,4 +1510,6 @@ def get_run_all_smoke_tests_compliance_certificate() -> dict:
     return {"module": "run_all_smoke_tests", "certified": validate_run_all_smoke_tests_contract(), "seal": get_run_all_smoke_tests_integrity_seal()}
 
 
+def get_run_all_smoke_tests_readiness_probe() -> dict:
+    return {"module": "run_all_smoke_tests", "ready": validate_run_all_smoke_tests_contract(), "certificate": get_run_all_smoke_tests_compliance_certificate()}
 

@@ -1009,3 +1009,7 @@ def get_template_extractor_integrity_seal() -> dict:
 def get_template_extractor_compliance_certificate() -> dict:
     return {"module": "template_extractor", "certified": validate_template_extractor_contract(), "seal": get_template_extractor_integrity_seal()}
 
+
+def get_template_extractor_readiness_probe() -> dict:
+    return {"module": "template_extractor", "ready": validate_template_extractor_contract(), "certificate": get_template_extractor_compliance_certificate()}
+

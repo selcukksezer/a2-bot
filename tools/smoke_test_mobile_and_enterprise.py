@@ -1093,3 +1093,8 @@ def get_smoke_test_mobile_and_enterprise_integrity_seal() -> dict:
 def get_smoke_test_mobile_and_enterprise_compliance_certificate() -> dict:
     return {"module": "smoke_test_mobile_and_enterprise", "certified": validate_smoke_test_mobile_and_enterprise_contract(), "seal": get_smoke_test_mobile_and_enterprise_integrity_seal()}
 
+
+def get_smoke_test_mobile_and_enterprise_readiness_probe() -> dict:
+    return {"module": "smoke_test_mobile_and_enterprise", "ready": validate_smoke_test_mobile_and_enterprise_contract(), "certificate": get_smoke_test_mobile_and_enterprise_compliance_certificate()}
+
+
