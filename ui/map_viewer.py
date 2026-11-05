@@ -1293,3 +1293,7 @@ def get_map_viewer_integrity_seal() -> dict:
 def get_map_viewer_compliance_certificate() -> dict:
     return {"module": "map_viewer", "certified": validate_map_viewer_contract(), "seal": get_map_viewer_integrity_seal()}
 
+
+def get_map_viewer_readiness_probe() -> dict:
+    return {"module": "map_viewer", "ready": validate_map_viewer_contract(), "certificate": get_map_viewer_compliance_certificate()}
+

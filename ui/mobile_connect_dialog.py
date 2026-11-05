@@ -1195,3 +1195,7 @@ def get_mobile_connect_dialog_integrity_seal() -> dict:
 def get_mobile_connect_dialog_compliance_certificate() -> dict:
     return {"module": "mobile_connect_dialog", "certified": validate_mobile_connect_dialog_contract(), "seal": get_mobile_connect_dialog_integrity_seal()}
 
+
+def get_mobile_connect_dialog_readiness_probe() -> dict:
+    return {"module": "mobile_connect_dialog", "ready": validate_mobile_connect_dialog_contract(), "certificate": get_mobile_connect_dialog_compliance_certificate()}
+

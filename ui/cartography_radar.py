@@ -3007,3 +3007,12 @@ def get_cartography_radar_compliance_certificate() -> dict:
     }
 
 
+def get_cartography_radar_readiness_probe() -> dict:
+    return {
+        "module": "cartography_radar",
+        "ready": validate_cartography_radar_contract(),
+        "certificate": get_cartography_radar_compliance_certificate(),
+    }
+
+
+

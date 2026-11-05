@@ -868,4 +868,9 @@ def get_guide_dialog_compliance_certificate() -> dict:
     return {"module": "guide_dialog", "certified": validate_guide_dialog_contract(), "seal": get_guide_dialog_integrity_seal()}
 
 
+def get_guide_dialog_readiness_probe() -> dict:
+    return {"module": "guide_dialog", "ready": validate_guide_dialog_contract(), "certificate": get_guide_dialog_compliance_certificate()}
+
+
+
 
