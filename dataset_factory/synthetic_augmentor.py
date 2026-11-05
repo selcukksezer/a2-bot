@@ -822,4 +822,9 @@ def get_synthetic_augmentor_audit_record() -> dict:
     return {"module": "synthetic_augmentor", "audit_passed": validate_synthetic_augmentor_contract(), "readiness": get_synthetic_augmentor_readiness_status()}
 
 
+def get_synthetic_augmentor_operational_digest() -> dict:
+    return {"module": "synthetic_augmentor", "operational": validate_synthetic_augmentor_contract(), "audit": get_synthetic_augmentor_audit_record()}
+
+
+
 

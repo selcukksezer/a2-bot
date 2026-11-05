@@ -1411,5 +1411,6 @@ def get_economy_broker_audit_record() -> dict:
     return {"module": "economy_broker", "audit_passed": validate_economy_broker_contract(), "readiness": get_economy_broker_readiness_status()}
 
 
-
+def get_economy_broker_operational_digest() -> dict:
+    return {"module": "economy_broker", "operational": validate_economy_broker_contract(), "audit": get_economy_broker_audit_record()}
 

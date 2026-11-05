@@ -1145,6 +1145,7 @@ __all__ = [
     "AutoLabelingDatasetFactory",
     "get_factory_controller_readiness_status",
     "get_factory_controller_audit_record",
+    "get_factory_controller_operational_digest",
 ]
 
 
@@ -1201,6 +1202,10 @@ def get_factory_controller_readiness_status() -> dict:
 
 def get_factory_controller_audit_record() -> dict:
     return {"module": "factory_controller", "audit_passed": validate_factory_controller_contract(), "readiness": get_factory_controller_readiness_status()}
+
+
+def get_factory_controller_operational_digest() -> dict:
+    return {"module": "factory_controller", "operational": validate_factory_controller_contract(), "audit": get_factory_controller_audit_record()}
 
 
 
