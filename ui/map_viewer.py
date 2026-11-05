@@ -1286,4 +1286,9 @@ def get_map_viewer_telemetry_payload() -> dict:
     return {"module": "map_viewer", "telemetry_ready": validate_map_viewer_contract(), "digest": get_map_viewer_operational_digest()}
 
 
+def get_map_viewer_integrity_seal() -> dict:
+    return {"module": "map_viewer", "sealed": validate_map_viewer_contract(), "telemetry": get_map_viewer_telemetry_payload()}
+
+
+
 

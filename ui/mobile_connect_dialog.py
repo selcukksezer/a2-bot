@@ -1188,3 +1188,8 @@ def get_mobile_connect_dialog_telemetry_payload() -> dict:
     return {"module": "mobile_connect_dialog", "telemetry_ready": validate_mobile_connect_dialog_contract(), "digest": get_mobile_connect_dialog_operational_digest()}
 
 
+def get_mobile_connect_dialog_integrity_seal() -> dict:
+    return {"module": "mobile_connect_dialog", "sealed": validate_mobile_connect_dialog_contract(), "telemetry": get_mobile_connect_dialog_telemetry_payload()}
+
+
+

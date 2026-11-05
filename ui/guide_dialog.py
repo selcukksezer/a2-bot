@@ -860,3 +860,7 @@ def get_guide_dialog_telemetry_payload() -> dict:
     return {"module": "guide_dialog", "telemetry_ready": validate_guide_dialog_contract(), "digest": get_guide_dialog_operational_digest()}
 
 
+def get_guide_dialog_integrity_seal() -> dict:
+    return {"module": "guide_dialog", "sealed": validate_guide_dialog_contract(), "telemetry": get_guide_dialog_telemetry_payload()}
+
+

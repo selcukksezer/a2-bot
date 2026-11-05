@@ -1056,3 +1056,8 @@ def get_calibration_wizard_operational_digest() -> dict:
 def get_calibration_wizard_telemetry_payload() -> dict:
     return {"module": "calibration_wizard", "telemetry_ready": validate_calibration_wizard_contract(), "digest": get_calibration_wizard_operational_digest()}
 
+
+def get_calibration_wizard_integrity_seal() -> dict:
+    return {"module": "calibration_wizard", "sealed": validate_calibration_wizard_contract(), "telemetry": get_calibration_wizard_telemetry_payload()}
+
+

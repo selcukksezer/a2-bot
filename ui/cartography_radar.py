@@ -2991,3 +2991,11 @@ def get_cartography_radar_telemetry_payload() -> dict:
     }
 
 
+def get_cartography_radar_integrity_seal() -> dict:
+    return {
+        "module": "cartography_radar",
+        "sealed": validate_cartography_radar_contract(),
+        "telemetry": get_cartography_radar_telemetry_payload(),
+    }
+
+
