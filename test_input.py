@@ -75,3 +75,7 @@ def get_test_input_readiness_status() -> dict:
     return {"module": "test_input", "ready": validate_test_input_contract(), "metrics": get_test_input_baseline_metrics()}
 
 
+def get_test_input_audit_record() -> dict:
+    return {"module": "test_input", "audit_passed": validate_test_input_contract(), "readiness": get_test_input_readiness_status()}
+
+

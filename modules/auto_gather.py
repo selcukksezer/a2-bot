@@ -141,4 +141,10 @@ def get_auto_gather_readiness_status() -> dict:
     }
 
 
+def get_auto_gather_audit_record() -> dict:
+    return {
+        "module": "auto_gather",
+        "audit_passed": validate_auto_gather_contract(),
+        "readiness": get_auto_gather_readiness_status(),
+    }
 

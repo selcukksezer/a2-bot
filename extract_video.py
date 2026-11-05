@@ -50,3 +50,8 @@ def get_extract_video_readiness_status() -> dict:
     return {"module": "extract_video", "ready": validate_extract_video_contract(), "metrics": get_extract_video_baseline_metrics()}
 
 
+def get_extract_video_audit_record() -> dict:
+    return {"module": "extract_video", "audit_passed": validate_extract_video_contract(), "readiness": get_extract_video_readiness_status()}
+
+
+

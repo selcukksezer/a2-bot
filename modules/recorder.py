@@ -104,4 +104,8 @@ def get_recorder_readiness_status() -> dict:
     return {"module": "recorder", "ready": validate_recorder_contract(), "metrics": get_recorder_baseline_metrics()}
 
 
+def get_recorder_audit_record() -> dict:
+    return {"module": "recorder", "audit_passed": validate_recorder_contract(), "readiness": get_recorder_readiness_status()}
+
+
 
