@@ -1172,4 +1172,13 @@ def get_smoke_test_dataset_factory_readiness_status() -> dict:
     }
 
 
+def get_smoke_test_dataset_factory_audit_record() -> dict:
+    return {
+        "module": "smoke_test_dataset_factory",
+        "audit_passed": validate_smoke_test_dataset_factory_contract(),
+        "readiness": get_smoke_test_dataset_factory_readiness_status(),
+    }
+
+
+
 

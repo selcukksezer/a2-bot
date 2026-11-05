@@ -34,3 +34,8 @@ def get_ui_package_baseline_metrics() -> dict:
 def get_ui_package_readiness_status() -> dict:
     return {"module": "ui_package", "ready": validate_ui_package_contract(), "metrics": get_ui_package_baseline_metrics()}
 
+
+def get_ui_package_audit_record() -> dict:
+    return {"module": "ui_package", "audit_passed": validate_ui_package_contract(), "readiness": get_ui_package_readiness_status()}
+
+

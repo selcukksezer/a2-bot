@@ -36,3 +36,8 @@ def get_config_package_readiness_status() -> dict:
     return {"module": "config_package", "ready": validate_config_package_contract(), "metrics": get_config_package_baseline_metrics()}
 
 
+def get_config_package_audit_record() -> dict:
+    return {"module": "config_package", "audit_passed": validate_config_package_contract(), "readiness": get_config_package_readiness_status()}
+
+
+

@@ -35,3 +35,8 @@ def get_core_package_baseline_metrics() -> dict:
 def get_core_package_readiness_status() -> dict:
     return {"module": "core_package", "ready": validate_core_package_contract(), "metrics": get_core_package_baseline_metrics()}
 
+
+def get_core_package_audit_record() -> dict:
+    return {"module": "core_package", "audit_passed": validate_core_package_contract(), "readiness": get_core_package_readiness_status()}
+
+

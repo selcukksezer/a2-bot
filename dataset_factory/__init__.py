@@ -14,6 +14,7 @@ __all__ = [
     "FrameSnapshot",
     "PreGatherTimeMachineBuffer",
     "get_dataset_factory_package_readiness_status",
+    "get_dataset_factory_package_audit_record",
 ]
 
 
@@ -60,4 +61,10 @@ def get_dataset_factory_package_readiness_status() -> dict:
     }
 
 
+def get_dataset_factory_package_audit_record() -> dict:
+    return {
+        "module": "dataset_factory_package",
+        "audit_passed": validate_dataset_factory_package_contract(),
+        "readiness": get_dataset_factory_package_readiness_status(),
+    }
 
