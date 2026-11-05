@@ -1183,6 +1183,9 @@ class OverlayHUD(QWidget):
     def get_overlay_hud_ready_flag(self) -> dict:
         return {"module": "overlay_hud", "ready": True}
 
+    def get_overlay_hud_version_info(self) -> dict:
+        return {"module": "overlay_hud", "version": "2.0.0", "ready": True}
+
 
 # GameOverlay içe aktaran modüller için geriye dönük uyumluluk takma adı
 GameOverlay = OverlayHUD

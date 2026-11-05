@@ -1125,3 +1125,7 @@ class F9Menu(QWidget):
     def get_f9_menu_ready_flag(self) -> dict:
         return {"module": "f9_menu", "ready": True}
 
+    def get_f9_menu_version_info(self) -> dict:
+        return {"module": "f9_menu", "version": "2.0.0", "ready": True}
+
+
