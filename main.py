@@ -1114,3 +1114,8 @@ def get_main_baseline_metrics() -> dict:
     return {"module": "main", "contract_valid": validate_main_contract(), "capability_count": len(get_main_capabilities())}
 
 
+def get_main_readiness_status() -> dict:
+    """Returns readiness status for main.py."""
+    return {"module": "main", "ready": validate_main_contract(), "metrics": get_main_baseline_metrics()}
+
+

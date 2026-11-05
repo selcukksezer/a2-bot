@@ -1105,6 +1105,7 @@ __all__ = [
     "HighResROICropper",
     "WatershedClusterSeparator",
     "MotionBlurGate",
+    "get_patch_normalizer_readiness_status",
 ]
 
 
@@ -1121,5 +1122,21 @@ def validate_patch_normalizer_contract() -> bool:
 def get_patch_normalizer_baseline_metrics() -> dict:
     """Returns baseline metrics for the patch normalizer module."""
     return {"module": "patch_normalizer", "contract_valid": validate_patch_normalizer_contract(), "capability_count": len(get_patch_normalizer_capabilities())}
+
+
+def get_patch_normalizer_readiness_status() -> dict:
+    """Returns readiness status for the patch normalizer module."""
+    try:
+        return {
+            "module": "patch_normalizer",
+            "ready": validate_patch_normalizer_contract(),
+            "metrics": get_patch_normalizer_baseline_metrics(),
+        }
+    except Exception:
+        return {
+            "module": "patch_normalizer",
+            "ready": False,
+            "metrics": {},
+        }
 
 

@@ -1427,3 +1427,16 @@ def get_neural_audio_perception_baseline_metrics() -> dict:
     return {"module": "neural_audio_perception", "contract_valid": validate_neural_audio_perception_contract(), "capability_count": len(get_neural_audio_perception_capabilities())}
 
 
+def validate_neural_audio_contract() -> bool:
+    return validate_neural_audio_perception_contract()
+
+
+def get_neural_audio_baseline_metrics() -> dict:
+    return get_neural_audio_perception_baseline_metrics()
+
+
+def get_neural_audio_readiness_status() -> dict:
+    return {"module": "neural_audio_perception", "ready": validate_neural_audio_contract(), "metrics": get_neural_audio_baseline_metrics()}
+
+
+
