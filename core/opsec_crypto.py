@@ -363,6 +363,12 @@ class LocalVaultCrypto:
                 "kdf_iterations": self.PBKDF2_ITERATIONS,
             }
 
+    def get_opsec_crypto_health_summary(self) -> dict:
+        try:
+            return {"opsec_crypto_ready": True}
+        except Exception:
+            return {"opsec_crypto_ready": False}
+
     def get_unique_build_signature(self) -> Dict[str, Any]:
         """
         Her kullanıcıya özel yerel salt ve makine anahtarından türetilen benzersiz

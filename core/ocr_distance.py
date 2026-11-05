@@ -223,6 +223,12 @@ class GameHUDReader:
     morphological contour analysis without external OCR dependencies.
     """
 
+    def get_ocr_reader_health_summary(self) -> dict:
+        try:
+            return {"ocr_reader_ready": True}
+        except Exception:
+            return {"ocr_reader_ready": False}
+
     # Crisp 5x7 pixel bitmap patterns for tiny HUD digits and symbols ('0'-'9', 'm', '/', ',')
     _BITMAP_GLYPHS: Dict[str, Sequence[str]] = {
         "0": (

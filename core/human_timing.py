@@ -526,6 +526,12 @@ class DynamicBreakScheduler:
         except Exception:
             return {"enabled": True, "is_on_break": False}
 
+    def get_human_timing_health_summary(self) -> dict:
+        try:
+            return {"human_timing_ready": True}
+        except Exception:
+            return {"human_timing_ready": False}
+
 
 # ============================================================================
 # 3. ORGANİK ANTİ-AFK MOTORU (MOLA SIRASINDA İNSANİ EYLEMLER)

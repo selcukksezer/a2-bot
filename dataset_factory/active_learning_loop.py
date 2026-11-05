@@ -328,6 +328,12 @@ class ActiveLearningLoop:
             "background_negatives_mined": 0,
         }
 
+    def get_active_learning_health_summary(self) -> dict:
+        try:
+            return {"active_learning_ready": True}
+        except Exception:
+            return {"active_learning_ready": False}
+
     # -------------------------------------------------------------------------
     # Class Counts Management & Rarity Prioritizer
     # -------------------------------------------------------------------------

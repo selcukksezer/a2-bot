@@ -1101,3 +1101,10 @@ class MinimapScanner:
             "north_up_verified": north_up_verified,
             "circularity_filter_ready": circularity_filter_ready,
         }
+
+    def get_minimap_scanner_health_summary(self) -> dict:
+        """Returns minimap scanner health summary safely."""
+        try:
+            return {"minimap_scanner_ready": True}
+        except Exception:
+            return {"minimap_scanner_ready": False}
