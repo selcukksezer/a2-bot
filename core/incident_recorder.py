@@ -708,3 +708,8 @@ def get_incident_recorder_audit_record() -> dict:
     return {"module": "incident_recorder", "audit_passed": validate_incident_recorder_contract(), "readiness": get_incident_recorder_readiness_status()}
 
 
+def get_incident_recorder_operational_digest() -> dict:
+    return {"module": "incident_recorder", "operational": validate_incident_recorder_contract(), "audit": get_incident_recorder_audit_record()}
+
+
+

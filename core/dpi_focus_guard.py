@@ -818,3 +818,12 @@ def get_dpi_focus_guard_audit_record() -> dict:
         "readiness": get_dpi_focus_guard_readiness_status(),
     }
 
+
+def get_dpi_focus_guard_operational_digest() -> dict:
+    return {
+        "module": "dpi_focus_guard",
+        "operational": validate_dpi_focus_guard_contract(),
+        "audit": get_dpi_focus_guard_audit_record(),
+    }
+
+

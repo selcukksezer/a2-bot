@@ -451,4 +451,10 @@ def get_dry_run_simulator_audit_record() -> dict:
     }
 
 
+def get_dry_run_simulator_operational_digest() -> dict:
+    return {
+        "module": "dry_run_simulator",
+        "operational": validate_dry_run_simulator_contract(),
+        "audit": get_dry_run_simulator_audit_record(),
+    }
 

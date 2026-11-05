@@ -489,4 +489,8 @@ def get_skill_bar_reader_audit_record() -> dict:
     return {"module": "skill_bar_reader", "audit_passed": validate_skill_bar_reader_contract(), "readiness": get_skill_bar_reader_readiness_status()}
 
 
+def get_skill_bar_reader_operational_digest() -> dict:
+    return {"module": "skill_bar_reader", "operational": validate_skill_bar_reader_contract(), "audit": get_skill_bar_reader_audit_record()}
+
+
 
