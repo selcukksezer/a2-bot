@@ -648,3 +648,16 @@ def get_config_schema_readiness_status() -> dict:
             "metrics": {},
         }
 
+
+validate_schema_contract = validate_config_schema_contract
+get_schema_readiness_status = get_config_schema_readiness_status
+
+
+def get_schema_audit_record() -> dict:
+    return {
+        "module": "schema",
+        "audit_passed": validate_schema_contract(),
+        "readiness": get_schema_readiness_status(),
+    }
+
+

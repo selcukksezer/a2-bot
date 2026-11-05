@@ -216,3 +216,12 @@ def get_ui_overlay_readiness_status() -> dict:
         return {"module": "ui_overlay", "ready": False, "metrics": {}}
 
 
+validate_overlay_contract = validate_ui_overlay_contract
+get_overlay_readiness_status = get_ui_overlay_readiness_status
+
+
+def get_overlay_audit_record() -> dict:
+    return {"module": "overlay", "audit_passed": validate_overlay_contract(), "readiness": get_overlay_readiness_status()}
+
+
+

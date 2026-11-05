@@ -308,3 +308,12 @@ def get_settings_dialog_readiness_status() -> dict:
             "metrics": {},
         }
 
+
+def get_settings_dialog_audit_record() -> dict:
+    return {
+        "module": "settings_dialog",
+        "audit_passed": validate_settings_dialog_contract(),
+        "readiness": get_settings_dialog_readiness_status(),
+    }
+
+

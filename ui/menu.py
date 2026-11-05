@@ -113,3 +113,16 @@ def get_ui_menu_readiness_status() -> dict:
     return {"module": "ui_menu", "ready": validate_ui_menu_contract(), "metrics": get_ui_menu_baseline_metrics()}
 
 
+def validate_menu_contract() -> bool:
+    return validate_ui_menu_contract()
+
+
+def get_menu_readiness_status() -> dict:
+    return get_ui_menu_readiness_status()
+
+
+def get_menu_audit_record() -> dict:
+    return {"module": "menu", "audit_passed": validate_menu_contract(), "readiness": get_menu_readiness_status()}
+
+
+
