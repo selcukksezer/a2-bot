@@ -2404,3 +2404,7 @@ class AutoCartographer:
     def get_auto_cartographer_ready_flag(self) -> dict:
         """Returns the auto cartographer ready flag."""
         return {"module": "auto_cartographer", "ready": True}
+
+    def get_auto_cartographer_version_info(self) -> dict:
+        return {"module": "auto_cartographer", "version": "2.0.0", "ready": True}
+

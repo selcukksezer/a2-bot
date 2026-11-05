@@ -109,6 +109,9 @@ class ExplorerMode:
     def get_explorer_mode_ready_flag(self) -> dict:
         return {"module": "explorer_mode", "ready": True}
 
+    def get_explorer_mode_version_info(self) -> dict:
+        return {"module": "explorer_mode", "version": "2.0.0", "ready": True}
+
 
 class ExplorerModeController:
     """
