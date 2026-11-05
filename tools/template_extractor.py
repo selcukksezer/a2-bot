@@ -969,3 +969,8 @@ def get_template_extractor_version_info() -> dict:
 if __name__ == "__main__":
     sys.exit(main())
 
+
+def get_template_extractor_diagnostic_snapshot() -> dict:
+    return {"module": "template_extractor", "status": "ok", "ready": True}
+
+

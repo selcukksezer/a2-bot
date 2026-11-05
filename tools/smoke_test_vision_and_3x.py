@@ -1788,3 +1788,8 @@ if __name__ == "__main__":
 def get_smoke_test_vision_and_3x_version_info() -> dict:
     return {"module": "smoke_test_vision_and_3x", "version": "2.0.0", "ready": True}
 
+
+def get_smoke_test_vision_and_3x_diagnostic_snapshot() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "status": "ok", "ready": True}
+
+

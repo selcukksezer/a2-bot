@@ -1049,3 +1049,8 @@ if __name__ == "__main__":
 def get_smoke_test_mobile_and_enterprise_version_info() -> dict:
     return {"module": "smoke_test_mobile_and_enterprise", "version": "2.0.0", "ready": True}
 
+
+def get_smoke_test_mobile_and_enterprise_diagnostic_snapshot() -> dict:
+    return {"module": "smoke_test_mobile_and_enterprise", "status": "ok", "ready": True}
+
+

@@ -1469,3 +1469,8 @@ def get_run_all_smoke_tests_version_info() -> dict:
 if __name__ == "__main__":
     sys.exit(main())
 
+
+def get_run_all_smoke_tests_diagnostic_snapshot() -> dict:
+    return {"module": "run_all_smoke_tests", "status": "ok", "ready": True}
+
+

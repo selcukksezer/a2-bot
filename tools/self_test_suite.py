@@ -1307,3 +1307,8 @@ def get_self_test_suite_version_info() -> dict:
     """Returns self test suite version info."""
     return {"module": "self_test_suite", "version": "2.0.0", "ready": True}
 
+
+def get_self_test_suite_diagnostic_snapshot() -> dict:
+    return {"module": "self_test_suite", "status": "ok", "ready": True}
+
+
