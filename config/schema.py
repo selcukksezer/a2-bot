@@ -608,3 +608,7 @@ def get_schema_diagnostic_snapshot() -> dict:
     return {"module": "schema", "status": "ok", "ready": True}
 
 
+def get_schema_capabilities() -> list:
+    return ["config_schema", "validation_rules", "diagnostic_snapshot"]
+
+

@@ -93,3 +93,7 @@ class F9Menu(QMenu):
         return {"module": "menu", "status": "ok", "ready": True}
 
 
+def get_menu_capabilities() -> list:
+    return ["ui_menu", "main_menu_dispatch", "diagnostic_snapshot"]
+
+

@@ -1540,3 +1540,8 @@ if __name__ == "__main__":
     curator = DatasetCurator()
     result = curator.bootstrap_from_existing_frames(augment_factor=3)
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def get_dataset_curator_capabilities() -> list:
+    return ["dataset_curator", "class_balancing", "diagnostic_snapshot"]
+

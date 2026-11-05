@@ -278,3 +278,7 @@ class SettingsDialog(QDialog):
         return {"module": "settings_dialog", "status": "ok", "ready": True}
 
 
+def get_settings_dialog_capabilities() -> list:
+    return ["settings_dialog", "preferences_editor", "diagnostic_snapshot"]
+
+

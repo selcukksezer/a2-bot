@@ -193,3 +193,8 @@ class GameOverlay(QWidget):
     def get_overlay_diagnostic_snapshot(self) -> dict:
         return {"module": "overlay", "status": "ok", "ready": True}
 
+
+def get_overlay_capabilities() -> list:
+    return ["ui_overlay", "screen_overlay", "diagnostic_snapshot"]
+
+
