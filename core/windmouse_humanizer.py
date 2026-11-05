@@ -1071,5 +1071,10 @@ def get_windmouse_humanizer_audit_record() -> dict:
     }
 
 
-
+def get_windmouse_humanizer_operational_digest() -> dict:
+    return {
+        "module": "windmouse_humanizer",
+        "operational": validate_windmouse_humanizer_contract(),
+        "audit": get_windmouse_humanizer_audit_record(),
+    }
 

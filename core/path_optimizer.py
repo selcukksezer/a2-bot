@@ -609,3 +609,12 @@ def get_path_optimizer_audit_record() -> dict:
         "readiness": get_path_optimizer_readiness_status(),
     }
 
+
+def get_path_optimizer_operational_digest() -> dict:
+    return {
+        "module": "path_optimizer",
+        "operational": validate_path_optimizer_contract(),
+        "audit": get_path_optimizer_audit_record(),
+    }
+
+

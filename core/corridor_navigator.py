@@ -1348,4 +1348,13 @@ def get_corridor_navigator_audit_record() -> dict:
     }
 
 
+def get_corridor_navigator_operational_digest() -> dict:
+    return {
+        "module": "corridor_navigator",
+        "operational": validate_corridor_navigator_contract(),
+        "audit": get_corridor_navigator_audit_record(),
+    }
+
+
+
 

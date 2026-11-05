@@ -1981,6 +1981,7 @@ __all__ = [
     "MaplessMicroNavigator",
     "get_navigation_intel_readiness_status",
     "get_navigation_intel_audit_record",
+    "get_navigation_intel_operational_digest",
 ]
 
 
@@ -2002,6 +2003,11 @@ def get_navigation_intel_readiness_status() -> dict:
 
 def get_navigation_intel_audit_record() -> dict:
     return {"module": "navigation_intel", "audit_passed": validate_navigation_intel_contract(), "readiness": get_navigation_intel_readiness_status()}
+
+
+def get_navigation_intel_operational_digest() -> dict:
+    return {"module": "navigation_intel", "operational": validate_navigation_intel_contract(), "audit": get_navigation_intel_audit_record()}
+
 
 
 
