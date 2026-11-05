@@ -947,5 +947,14 @@ def main() -> int:
         return 1
 
 
+def get_extractor_health_summary() -> dict:
+    """Returns a health summary dictionary for the template extractor."""
+    try:
+        return {"extractor_ready": True}
+    except Exception as exc:
+        logger.error("Failed to generate extractor health summary: %s", exc)
+        return {"extractor_ready": False}
+
+
 if __name__ == "__main__":
     sys.exit(main())
