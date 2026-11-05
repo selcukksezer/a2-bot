@@ -58,3 +58,7 @@ def get_test_input_version_info() -> dict:
 def get_test_input_diagnostic_snapshot() -> dict:
     return {"module": "test_input", "status": "ok", "ready": True}
 
+
+def get_test_input_capabilities() -> list:
+    return ["test_input", "input_verification", "diagnostic_snapshot"]
+

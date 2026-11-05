@@ -34,3 +34,7 @@ def get_extract_video_diagnostic_snapshot() -> dict:
     return {"module": "extract_video", "status": "ok", "ready": True}
 
 
+def get_extract_video_capabilities() -> list:
+    return ["extract_video", "frame_extraction", "diagnostic_snapshot"]
+
+

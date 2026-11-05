@@ -88,3 +88,7 @@ class NodeRecorder:
         return {"module": "recorder", "status": "ok", "ready": True}
 
 
+def get_recorder_capabilities() -> list:
+    return ["route_recorder", "waypoint_capture", "diagnostic_snapshot"]
+
+

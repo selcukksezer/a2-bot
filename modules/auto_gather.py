@@ -115,3 +115,8 @@ class AutoGatherBot:
 if __name__ == "__main__":
     bot = AutoGatherBot()
     bot.start()
+
+
+def get_auto_gather_capabilities() -> list:
+    return ["auto_gather", "proximity_harvesting", "diagnostic_snapshot"]
+

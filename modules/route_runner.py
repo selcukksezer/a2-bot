@@ -171,3 +171,8 @@ class RouteRunner:
 if __name__ == "__main__":
     runner = RouteRunner()
     runner.start()
+
+
+def get_route_runner_capabilities() -> list:
+    return ["route_runner", "sequential_execution", "diagnostic_snapshot"]
+
