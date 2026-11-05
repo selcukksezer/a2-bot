@@ -3037,3 +3037,7 @@ def get_mobile_server_baseline_metrics() -> dict:
     return {"module": "mobile_server", "contract_valid": validate_mobile_server_contract(), "capability_count": len(get_mobile_server_capabilities())}
 
 
+def get_mobile_server_readiness_status() -> dict:
+    return {"module": "mobile_server", "ready": validate_mobile_server_contract(), "metrics": get_mobile_server_baseline_metrics()}
+
+

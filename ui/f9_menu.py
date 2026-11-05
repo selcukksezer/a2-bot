@@ -1147,3 +1147,8 @@ def get_f9_menu_baseline_metrics() -> dict:
     return {"module": "f9_menu", "contract_valid": validate_f9_menu_contract(), "capability_count": len(get_f9_menu_capabilities())}
 
 
+def get_f9_menu_readiness_status() -> dict:
+    return {"module": "f9_menu", "ready": validate_f9_menu_contract(), "metrics": get_f9_menu_baseline_metrics()}
+
+
+

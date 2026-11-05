@@ -2876,3 +2876,7 @@ def validate_settings_window_contract() -> bool:
 def get_settings_window_baseline_metrics() -> dict:
     return {"module": "settings_window", "contract_valid": validate_settings_window_contract(), "capability_count": len(get_settings_window_capabilities())}
 
+
+def get_settings_window_readiness_status() -> dict:
+    return {"module": "settings_window", "ready": validate_settings_window_contract(), "metrics": get_settings_window_baseline_metrics()}
+

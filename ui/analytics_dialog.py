@@ -655,3 +655,8 @@ def get_analytics_dialog_baseline_metrics() -> dict:
     return {"module": "analytics_dialog", "contract_valid": validate_analytics_dialog_contract(), "capability_count": len(get_analytics_dialog_capabilities())}
 
 
+def get_analytics_dialog_readiness_status() -> dict:
+    return {"module": "analytics_dialog", "ready": validate_analytics_dialog_contract(), "metrics": get_analytics_dialog_baseline_metrics()}
+
+
+
