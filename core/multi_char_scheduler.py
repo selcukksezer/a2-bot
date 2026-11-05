@@ -1548,3 +1548,8 @@ def validate_multi_char_scheduler_contract() -> bool:
     return bool(get_multi_char_scheduler_capabilities())
 
 
+def get_multi_char_scheduler_baseline_metrics() -> dict:
+    return {"module": "multi_char_scheduler", "contract_valid": validate_multi_char_scheduler_contract(), "capability_count": len(get_multi_char_scheduler_capabilities())}
+
+
+

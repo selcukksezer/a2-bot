@@ -1479,3 +1479,7 @@ def validate_yolo_auto_labeler_contract() -> bool:
     return bool(get_yolo_auto_labeler_capabilities())
 
 
+def get_yolo_auto_labeler_baseline_metrics() -> dict:
+    return {"module": "yolo_auto_labeler", "contract_valid": validate_yolo_auto_labeler_contract(), "capability_count": len(get_yolo_auto_labeler_capabilities())}
+
+

@@ -1791,3 +1791,11 @@ def validate_rtx_trainer_engine_contract() -> bool:
     return bool(get_rtx_trainer_engine_capabilities())
 
 
+def get_rtx_trainer_engine_baseline_metrics() -> dict:
+    return {
+        "module": "rtx_trainer_engine",
+        "contract_valid": validate_rtx_trainer_engine_contract(),
+        "capability_count": len(get_rtx_trainer_engine_capabilities()),
+    }
+
+
