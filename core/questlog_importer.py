@@ -1539,3 +1539,8 @@ def get_questlog_importer_baseline_metrics() -> dict:
     return {"module": "questlog_importer", "contract_valid": validate_questlog_importer_contract(), "capability_count": len(get_questlog_importer_capabilities())}
 
 
+def get_questlog_importer_readiness_status() -> dict:
+    return {"module": "questlog_importer", "ready": validate_questlog_importer_contract(), "metrics": get_questlog_importer_baseline_metrics()}
+
+
+

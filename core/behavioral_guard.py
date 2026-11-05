@@ -990,3 +990,12 @@ def get_behavioral_guard_baseline_metrics() -> dict:
         "capability_count": len(get_behavioral_guard_capabilities()),
     }
 
+
+def get_behavioral_guard_readiness_status() -> dict:
+    return {
+        "module": "behavioral_guard",
+        "ready": validate_behavioral_guard_contract(),
+        "metrics": get_behavioral_guard_baseline_metrics(),
+    }
+
+

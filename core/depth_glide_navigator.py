@@ -898,3 +898,11 @@ def get_depth_glide_navigator_baseline_metrics() -> dict:
     return {"module": "depth_glide_navigator", "contract_valid": validate_depth_glide_navigator_contract(), "capability_count": len(get_depth_glide_navigator_capabilities())}
 
 
+def get_depth_glide_navigator_readiness_status() -> dict:
+    return {
+        "module": "depth_glide_navigator",
+        "ready": validate_depth_glide_navigator_contract(),
+        "metrics": get_depth_glide_navigator_baseline_metrics(),
+    }
+
+

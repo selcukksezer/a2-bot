@@ -1168,4 +1168,9 @@ def get_mobile_tunnel_baseline_metrics() -> dict:
     return {"module": "mobile_tunnel", "contract_valid": validate_mobile_tunnel_contract(), "capability_count": len(get_mobile_tunnel_capabilities())}
 
 
+def get_mobile_tunnel_readiness_status() -> dict:
+    return {"module": "mobile_tunnel", "ready": validate_mobile_tunnel_contract(), "metrics": get_mobile_tunnel_baseline_metrics()}
+
+
+
 

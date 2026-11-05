@@ -1933,3 +1933,11 @@ def get_sequential_router_baseline_metrics() -> dict:
     }
 
 
+def get_sequential_router_readiness_status() -> dict:
+    return {
+        "module": "sequential_router",
+        "ready": validate_sequential_router_contract(),
+        "metrics": get_sequential_router_baseline_metrics(),
+    }
+
+
