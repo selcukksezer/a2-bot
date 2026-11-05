@@ -2960,4 +2960,20 @@ def get_cartography_radar_readiness_status() -> dict:
         return {"module": "cartography_radar", "ready": False, "metrics": {}}
 
 
+def get_cartography_radar_audit_record() -> dict:
+    try:
+        return {
+            "module": "cartography_radar",
+            "audit_passed": validate_cartography_radar_contract(),
+            "readiness": get_cartography_radar_readiness_status(),
+        }
+    except Exception:
+        return {
+            "module": "cartography_radar",
+            "audit_passed": False,
+            "readiness": {"module": "cartography_radar", "ready": False, "metrics": {}},
+        }
+
+
+
 

@@ -1176,4 +1176,8 @@ def get_mobile_connect_dialog_readiness_status() -> dict:
     return {"module": "mobile_connect_dialog", "ready": validate_mobile_connect_dialog_contract(), "metrics": get_mobile_connect_dialog_baseline_metrics()}
 
 
+def get_mobile_connect_dialog_audit_record() -> dict:
+    return {"module": "mobile_connect_dialog", "audit_passed": validate_mobile_connect_dialog_contract(), "readiness": get_mobile_connect_dialog_readiness_status()}
+
+
 
