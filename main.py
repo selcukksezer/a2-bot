@@ -1066,6 +1066,10 @@ class GatherionOrchestrator(QObject):
             logger.debug("Tray hide ignored")
         self.app.quit()
 
+    def get_main_diagnostic_snapshot(self) -> dict:
+        """Returns diagnostic snapshot for main module."""
+        return {"module": "main", "status": "ok", "ready": True}
+
 
 def main() -> int:
     if "--elevate" in sys.argv:

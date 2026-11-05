@@ -557,6 +557,10 @@ class SobelClahePatchNormalizer:
         """Returns version info for the patch normalizer module."""
         return {"module": "patch_normalizer", "version": "2.0.0", "ready": True}
 
+    def get_patch_normalizer_diagnostic_snapshot(self) -> dict:
+        """Returns diagnostic snapshot for the patch normalizer module."""
+        return {"module": "patch_normalizer", "status": "ok", "ready": True}
+
 
 # ==============================================================================
 # MADDE 8: Yüksek Çözünürlük (2560x1440) İçin Alt-Bölge (ROI) Kırpma
