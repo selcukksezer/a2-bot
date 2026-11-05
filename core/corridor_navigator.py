@@ -1316,4 +1316,7 @@ class CorridorNavigator:
     def get_corridor_navigator_version_info(self) -> dict:
         return {"module": "corridor_navigator", "version": "2.0.0", "ready": True}
 
+    def get_corridor_navigator_diagnostic_snapshot(self) -> dict:
+        return {"module": "corridor_navigator", "status": "ok", "ready": True}
+
 

@@ -571,4 +571,7 @@ class RouteOptimizer:
     def get_path_optimizer_version_info(self) -> dict:
         return {"module": "path_optimizer", "version": "2.0.0", "ready": True}
 
+    def get_path_optimizer_diagnostic_snapshot(self) -> dict:
+        return {"module": "path_optimizer", "status": "ok", "ready": True}
+
 

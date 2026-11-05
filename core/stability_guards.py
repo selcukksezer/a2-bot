@@ -1216,6 +1216,9 @@ class StabilityGuards:
     def get_stability_guards_version_info(self) -> dict:
         return {"module": "stability_guards", "version": "2.0.0", "ready": True}
 
+    def get_stability_guards_diagnostic_snapshot(self) -> dict:
+        return {"module": "stability_guards", "status": "ok", "ready": True}
+
 
 RuntimeStabilityGuard = StabilityGuards
 
