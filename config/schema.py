@@ -634,4 +634,17 @@ def get_config_schema_baseline_metrics() -> dict:
         }
 
 
+def get_config_schema_readiness_status() -> dict:
+    try:
+        return {
+            "module": "config_schema",
+            "ready": validate_config_schema_contract(),
+            "metrics": get_config_schema_baseline_metrics(),
+        }
+    except Exception:
+        return {
+            "module": "config_schema",
+            "ready": False,
+            "metrics": {},
+        }
 

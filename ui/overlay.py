@@ -209,3 +209,10 @@ def get_ui_overlay_baseline_metrics() -> dict:
         return {"module": "ui_overlay", "contract_valid": False, "overlay_ready": False}
 
 
+def get_ui_overlay_readiness_status() -> dict:
+    try:
+        return {"module": "ui_overlay", "ready": validate_ui_overlay_contract(), "metrics": get_ui_overlay_baseline_metrics()}
+    except Exception:
+        return {"module": "ui_overlay", "ready": False, "metrics": {}}
+
+

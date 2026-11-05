@@ -1534,6 +1534,7 @@ __all__ = [
     "imread_unicode",
     "imwrite_unicode",
     "get_dataset_curator_baseline_metrics",
+    "get_dataset_curator_readiness_status",
 ]
 
 
@@ -1553,6 +1554,10 @@ def validate_dataset_curator_contract() -> bool:
 
 def get_dataset_curator_baseline_metrics() -> dict:
     return {"module": "dataset_curator", "contract_valid": validate_dataset_curator_contract(), "curator_ready": True}
+
+
+def get_dataset_curator_readiness_status() -> dict:
+    return {"module": "dataset_curator", "ready": validate_dataset_curator_contract(), "metrics": get_dataset_curator_baseline_metrics()}
 
 
 

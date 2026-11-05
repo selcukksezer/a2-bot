@@ -109,3 +109,7 @@ def get_ui_menu_baseline_metrics() -> dict:
     return {"module": "ui_menu", "contract_valid": validate_ui_menu_contract(), "menu_ready": True}
 
 
+def get_ui_menu_readiness_status() -> dict:
+    return {"module": "ui_menu", "ready": validate_ui_menu_contract(), "metrics": get_ui_menu_baseline_metrics()}
+
+

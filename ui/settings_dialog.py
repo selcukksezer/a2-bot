@@ -294,4 +294,17 @@ def get_settings_dialog_baseline_metrics() -> dict:
     }
 
 
+def get_settings_dialog_readiness_status() -> dict:
+    try:
+        return {
+            "module": "settings_dialog",
+            "ready": validate_settings_dialog_contract(),
+            "metrics": get_settings_dialog_baseline_metrics(),
+        }
+    except Exception:
+        return {
+            "module": "settings_dialog",
+            "ready": False,
+            "metrics": {},
+        }
 
