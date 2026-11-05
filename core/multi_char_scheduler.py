@@ -783,6 +783,10 @@ class AltCharacterManager:
     def get_multi_char_scheduler_version_info(self) -> dict:
         return {"module": "multi_char_scheduler", "version": "2.0.0", "ready": True}
 
+    def get_multi_char_scheduler_diagnostic_snapshot(self) -> dict:
+        return {"module": "multi_char_scheduler", "status": "ok", "ready": True}
+
+
 
 
 # ============================================================================
@@ -1179,6 +1183,10 @@ class AutomationTaskScheduler:
     def get_multi_char_scheduler_version_info(self) -> dict:
         return {"module": "multi_char_scheduler", "version": "2.0.0", "ready": True}
 
+    def get_multi_char_scheduler_diagnostic_snapshot(self) -> dict:
+        return {"module": "multi_char_scheduler", "status": "ok", "ready": True}
+
+
 
 
 # ============================================================================
@@ -1527,4 +1535,8 @@ class PetAndBuffManager:
 
     def get_multi_char_scheduler_version_info(self) -> dict:
         return {"module": "multi_char_scheduler", "version": "2.0.0", "ready": True}
+
+    def get_multi_char_scheduler_diagnostic_snapshot(self) -> dict:
+        return {"module": "multi_char_scheduler", "status": "ok", "ready": True}
+
 

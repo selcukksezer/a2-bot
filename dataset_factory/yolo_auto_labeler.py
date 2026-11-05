@@ -1455,6 +1455,9 @@ class YOLOAutoLabeler:
     def get_yolo_auto_labeler_version_info(self) -> dict:
         return {"module": "yolo_auto_labeler", "version": "2.0.0", "ready": True}
 
+    def get_yolo_auto_labeler_diagnostic_snapshot(self) -> dict:
+        return {"module": "yolo_auto_labeler", "status": "ok", "ready": True}
+
 
 __all__ = [
     "YOLO_CLASSES",

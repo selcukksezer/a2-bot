@@ -1353,4 +1353,8 @@ class MaterialScanner:
     def get_material_scanner_version_info(self) -> dict:
         return {"module": "material_scanner", "version": "2.0.0", "ready": True}
 
+    def get_material_scanner_diagnostic_snapshot(self) -> dict:
+        return {"module": "material_scanner", "status": "ok", "ready": True}
+
+
 

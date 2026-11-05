@@ -2132,3 +2132,7 @@ class YOLOFactoryDialog(QDialog):
     def get_yolo_factory_dialog_version_info(self) -> dict:
         return {"module": "yolo_factory_dialog", "version": "2.0.0", "ready": True}
 
+    def get_yolo_factory_dialog_diagnostic_snapshot(self) -> dict:
+        return {"module": "yolo_factory_dialog", "status": "ok", "ready": True}
+
+
