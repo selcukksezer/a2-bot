@@ -1107,6 +1107,7 @@ __all__ = [
     "MotionBlurGate",
     "get_patch_normalizer_readiness_status",
     "get_patch_normalizer_audit_record",
+    "get_patch_normalizer_operational_digest",
 ]
 
 
@@ -1155,5 +1156,15 @@ def get_patch_normalizer_audit_record() -> dict:
             "audit_passed": False,
             "readiness": {},
         }
+
+
+def get_patch_normalizer_operational_digest() -> dict:
+    """Returns operational digest for the patch normalizer module."""
+    return {
+        "module": "patch_normalizer",
+        "operational": validate_patch_normalizer_contract(),
+        "audit": get_patch_normalizer_audit_record(),
+    }
+
 
 

@@ -1232,6 +1232,7 @@ __all__ = [
     "NameplateHSVIsolator",
     "get_vision_filters_readiness_status",
     "get_vision_filters_audit_record",
+    "get_vision_filters_operational_digest",
 ]
 
 
@@ -1269,5 +1270,10 @@ def get_vision_filters_audit_record() -> dict:
         }
 
 
-
+def get_vision_filters_operational_digest() -> dict:
+    return {
+        "module": "vision_filters",
+        "operational": validate_vision_filters_contract(),
+        "audit": get_vision_filters_audit_record(),
+    }
 

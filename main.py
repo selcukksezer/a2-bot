@@ -1124,3 +1124,8 @@ def get_main_audit_record() -> dict:
     return {"module": "main", "audit_passed": validate_main_contract(), "readiness": get_main_readiness_status()}
 
 
+def get_main_operational_digest() -> dict:
+    """Returns operational digest for main.py."""
+    return {"module": "main", "operational": validate_main_contract(), "audit": get_main_audit_record()}
+
+

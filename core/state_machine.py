@@ -2608,4 +2608,8 @@ def get_state_machine_audit_record() -> dict:
     return {"module": "state_machine", "audit_passed": validate_state_machine_contract(), "readiness": get_state_machine_readiness_status()}
 
 
+def get_state_machine_operational_digest() -> dict:
+    return {"module": "state_machine", "operational": validate_state_machine_contract(), "audit": get_state_machine_audit_record()}
+
+
 
