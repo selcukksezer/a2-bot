@@ -1468,3 +1468,12 @@ def get_combat_recovery_telemetry_payload() -> dict:
         "digest": get_combat_recovery_operational_digest(),
     }
 
+
+def get_combat_recovery_integrity_seal() -> dict:
+    return {
+        "module": "combat_recovery",
+        "sealed": validate_combat_recovery_contract(),
+        "telemetry": get_combat_recovery_telemetry_payload(),
+    }
+
+

@@ -1381,3 +1381,7 @@ def get_watchdog_telemetry_payload() -> dict:
     return {"module": "watchdog", "telemetry_ready": validate_watchdog_contract(), "digest": get_watchdog_operational_digest()}
 
 
+def get_watchdog_integrity_seal() -> dict:
+    return {"module": "watchdog", "sealed": validate_watchdog_contract(), "telemetry": get_watchdog_telemetry_payload()}
+
+

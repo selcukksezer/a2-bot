@@ -1233,5 +1233,10 @@ def get_telemetry_telemetry_payload() -> dict:
     }
 
 
-
+def get_telemetry_integrity_seal() -> dict:
+    return {
+        "module": "telemetry",
+        "sealed": validate_telemetry_contract(),
+        "telemetry": get_telemetry_telemetry_payload(),
+    }
 

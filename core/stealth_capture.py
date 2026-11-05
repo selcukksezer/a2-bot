@@ -917,3 +917,8 @@ def get_stealth_capture_telemetry_payload() -> dict:
     return {"module": "stealth_capture", "telemetry_ready": validate_stealth_capture_contract(), "digest": get_stealth_capture_operational_digest()}
 
 
+def get_stealth_capture_integrity_seal() -> dict:
+    return {"module": "stealth_capture", "sealed": validate_stealth_capture_contract(), "telemetry": get_stealth_capture_telemetry_payload()}
+
+
+

@@ -1574,3 +1574,8 @@ def get_input_driver_operational_digest() -> dict:
 def get_input_driver_telemetry_payload() -> dict:
     return {"module": "input_driver", "telemetry_ready": validate_input_driver_contract(), "digest": get_input_driver_operational_digest()}
 
+
+def get_input_driver_integrity_seal() -> dict:
+    return {"module": "input_driver", "sealed": validate_input_driver_contract(), "telemetry": get_input_driver_telemetry_payload()}
+
+
