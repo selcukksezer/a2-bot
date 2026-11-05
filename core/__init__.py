@@ -12,3 +12,7 @@ def get_core_package_ready_flag() -> dict:
     return {"package": "core", "ready": True}
 
 
+def get_core_package_version_info() -> dict:
+    return {"package": "core", "version": "2.0.0", "ready": True}
+
+

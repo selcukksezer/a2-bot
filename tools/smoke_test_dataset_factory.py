@@ -1142,3 +1142,8 @@ def get_dataset_factory_smoke_ready_flag() -> dict:
 if __name__ == "__main__":
     passed_cnt, total_cnt, _ = run_dataset_factory_smoke_tests(print_report=True)
     sys.exit(0 if passed_cnt == total_cnt else 1)
+
+
+def get_smoke_test_dataset_factory_version_info() -> dict:
+    return {"module": "smoke_test_dataset_factory", "version": "2.0.0", "ready": True}
+

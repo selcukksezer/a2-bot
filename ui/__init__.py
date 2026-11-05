@@ -11,3 +11,8 @@ def get_ui_package_ready_flag() -> dict:
     return {"package": "ui", "ready": True}
 
 
+def get_ui_package_version_info() -> dict:
+    return {"package": "ui", "version": "2.0.0", "ready": True}
+
+
+
