@@ -1199,3 +1199,8 @@ def get_mobile_connect_dialog_compliance_certificate() -> dict:
 def get_mobile_connect_dialog_readiness_probe() -> dict:
     return {"module": "mobile_connect_dialog", "ready": validate_mobile_connect_dialog_contract(), "certificate": get_mobile_connect_dialog_compliance_certificate()}
 
+
+def get_mobile_connect_dialog_audit_summary() -> dict:
+    return {"module": "mobile_connect_dialog", "audit_passed": validate_mobile_connect_dialog_contract(), "probe": get_mobile_connect_dialog_readiness_probe()}
+
+

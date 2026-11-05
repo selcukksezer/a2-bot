@@ -3015,4 +3015,10 @@ def get_cartography_radar_readiness_probe() -> dict:
     }
 
 
+def get_cartography_radar_audit_summary() -> dict:
+    return {
+        "module": "cartography_radar",
+        "audit_passed": validate_cartography_radar_contract(),
+        "probe": get_cartography_radar_readiness_probe(),
+    }
 

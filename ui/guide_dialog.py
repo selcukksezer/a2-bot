@@ -872,5 +872,6 @@ def get_guide_dialog_readiness_probe() -> dict:
     return {"module": "guide_dialog", "ready": validate_guide_dialog_contract(), "certificate": get_guide_dialog_compliance_certificate()}
 
 
-
+def get_guide_dialog_audit_summary() -> dict:
+    return {"module": "guide_dialog", "audit_passed": validate_guide_dialog_contract(), "probe": get_guide_dialog_readiness_probe()}
 
