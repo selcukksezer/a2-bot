@@ -996,3 +996,7 @@ def get_human_timing_integrity_seal() -> dict:
 def get_human_timing_compliance_certificate() -> dict:
     return {"module": "human_timing", "certified": validate_human_timing_contract(), "seal": get_human_timing_integrity_seal()}
 
+
+def get_human_timing_readiness_probe() -> dict:
+    return {"module": "human_timing", "ready": validate_human_timing_contract(), "certificate": get_human_timing_compliance_certificate()}
+

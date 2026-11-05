@@ -1189,3 +1189,12 @@ def get_minimap_scanner_compliance_certificate() -> dict:
     }
 
 
+def get_minimap_scanner_readiness_probe() -> dict:
+    return {
+        "module": "minimap_scanner",
+        "ready": validate_minimap_scanner_contract(),
+        "certificate": get_minimap_scanner_compliance_certificate(),
+    }
+
+
+

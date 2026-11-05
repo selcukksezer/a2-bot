@@ -1266,3 +1266,12 @@ def get_opsec_crypto_compliance_certificate() -> dict:
         "seal": get_opsec_crypto_integrity_seal(),
     }
 
+
+def get_opsec_crypto_readiness_probe() -> dict:
+    return {
+        "module": "opsec_crypto",
+        "ready": validate_opsec_crypto_contract(),
+        "certificate": get_opsec_crypto_compliance_certificate(),
+    }
+
+

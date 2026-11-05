@@ -1621,3 +1621,7 @@ def get_ocr_distance_compliance_certificate() -> dict:
     return {"module": "ocr_distance", "certified": validate_ocr_distance_contract(), "seal": get_ocr_distance_integrity_seal()}
 
 
+def get_ocr_distance_readiness_probe() -> dict:
+    return {"module": "ocr_distance", "ready": validate_ocr_distance_contract(), "certificate": get_ocr_distance_compliance_certificate()}
+
+
