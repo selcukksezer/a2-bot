@@ -1801,3 +1801,7 @@ def validate_smoke_test_vision_and_3x_contract() -> bool:
     return bool(get_smoke_test_vision_and_3x_capabilities())
 
 
+def get_smoke_test_vision_and_3x_baseline_metrics() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "contract_valid": validate_smoke_test_vision_and_3x_contract(), "capability_count": len(get_smoke_test_vision_and_3x_capabilities())}
+
+

@@ -1061,3 +1061,8 @@ def get_smoke_test_mobile_and_enterprise_capabilities() -> list:
 def validate_smoke_test_mobile_and_enterprise_contract() -> bool:
     return bool(get_smoke_test_mobile_and_enterprise_capabilities())
 
+
+def get_smoke_test_mobile_and_enterprise_baseline_metrics() -> dict:
+    return {"module": "smoke_test_mobile_and_enterprise", "contract_valid": validate_smoke_test_mobile_and_enterprise_contract(), "capability_count": len(get_smoke_test_mobile_and_enterprise_capabilities())}
+
+

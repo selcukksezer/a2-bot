@@ -982,3 +982,7 @@ def validate_template_extractor_contract() -> bool:
     return bool(get_template_extractor_capabilities())
 
 
+def get_template_extractor_baseline_metrics() -> dict:
+    return {"module": "template_extractor", "contract_valid": validate_template_extractor_contract(), "capability_count": len(get_template_extractor_capabilities())}
+
+

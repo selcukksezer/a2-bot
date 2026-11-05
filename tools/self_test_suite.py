@@ -1319,3 +1319,7 @@ def get_self_test_suite_capabilities() -> list:
 def validate_self_test_suite_contract() -> bool:
     return bool(get_self_test_suite_capabilities())
 
+
+def get_self_test_suite_baseline_metrics() -> dict:
+    return {"module": "self_test_suite", "contract_valid": validate_self_test_suite_contract(), "capability_count": len(get_self_test_suite_capabilities())}
+
