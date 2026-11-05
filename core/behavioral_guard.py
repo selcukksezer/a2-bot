@@ -920,6 +920,9 @@ class BehavioralStealthGuard:
     def get_behavioral_guard_ready_flag(self) -> dict:
         return {"module": "behavioral_guard", "ready": True}
 
+    def get_behavioral_guard_version_info(self) -> dict:
+        return {"module": "behavioral_guard", "version": "2.0.0", "ready": True}
+
 
 # ============================================================================
 # MODÜL SEVİYESİ KISA YOL FONKSİYONLARI (DOĞRUDAN İMPORT UYUMLULUĞU İÇİN)

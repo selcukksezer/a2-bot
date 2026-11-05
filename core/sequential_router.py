@@ -1910,4 +1910,7 @@ class SequentialRoutePlanner:
     def get_sequential_router_ready_flag(self) -> dict:
         return {"module": "sequential_router", "ready": True}
 
+    def get_sequential_router_version_info(self) -> dict:
+        return {"module": "sequential_router", "version": "2.0.0", "ready": True}
+
 
