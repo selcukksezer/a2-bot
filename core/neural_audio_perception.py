@@ -1405,3 +1405,7 @@ class AudioLoopbackFFTAnalyzer:
         except Exception:
             return {"neural_audio_ready": False}
 
+    def get_neural_audio_version_info(self) -> dict:
+        return {"module": "neural_audio_perception", "version": "2.0.0", "ready": True}
+
+

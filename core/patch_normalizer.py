@@ -553,6 +553,10 @@ class SobelClahePatchNormalizer:
         except Exception as e:
             return {"normalizer_ready": False, "clahe_enabled": False, "error": str(e)}
 
+    def get_patch_normalizer_version_info(self) -> dict:
+        """Returns version info for the patch normalizer module."""
+        return {"module": "patch_normalizer", "version": "2.0.0", "ready": True}
+
 
 # ==============================================================================
 # MADDE 8: Yüksek Çözünürlük (2560x1440) İçin Alt-Bölge (ROI) Kırpma
@@ -1069,6 +1073,12 @@ class MotionBlurGate:
         """Returns the module ready flag for PatchNormalizer."""
         return {"module": "patch_normalizer", "ready": True}
 
+    def get_patch_normalizer_version_info(self) -> dict:
+        """Returns version info for the patch normalizer module."""
+        return {"module": "patch_normalizer", "version": "2.0.0", "ready": True}
+
+
+PatchNormalizer = SobelClahePatchNormalizer
 
 __all__ = [
     "CANONICAL_PATCH_SIZE",
@@ -1079,6 +1089,7 @@ __all__ = [
     "ROISliceMeta",
     "MinimapOrientationGuard",
     "SobelClahePatchNormalizer",
+    "PatchNormalizer",
     "HighResROICropper",
     "WatershedClusterSeparator",
     "MotionBlurGate",

@@ -1030,6 +1030,10 @@ class GatherionOrchestrator(QObject):
         except Exception:
             return {"controller_ready": False, "enterprise_modules_wired": 0}
 
+    def get_main_version_info(self) -> dict:
+        """Returns version info for main module."""
+        return {"module": "main", "version": "2.0.0", "ready": True}
+
     def shutdown(self) -> None:
         """Gracefully stops all background threads, mobile server, tunnel, saves telemetry, and exits."""
         logger.info("Gatherion-Local v2.0 (Türkçe) kapatılıyor")
