@@ -111,4 +111,6 @@ def get_combat_integrity_seal() -> dict:
     return {"module": "combat", "sealed": validate_combat_contract(), "telemetry": get_combat_telemetry_payload()}
 
 
+def get_combat_compliance_certificate() -> dict:
+    return {"module": "combat", "certified": validate_combat_contract(), "seal": get_combat_integrity_seal()}
 

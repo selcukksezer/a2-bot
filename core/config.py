@@ -109,4 +109,6 @@ def get_config_integrity_seal() -> dict:
     return {"module": "config", "sealed": validate_config_contract(), "telemetry": get_config_telemetry_payload()}
 
 
+def get_config_compliance_certificate() -> dict:
+    return {"module": "config", "certified": validate_config_contract(), "seal": get_config_integrity_seal()}
 
