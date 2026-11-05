@@ -108,4 +108,8 @@ def get_recorder_audit_record() -> dict:
     return {"module": "recorder", "audit_passed": validate_recorder_contract(), "readiness": get_recorder_readiness_status()}
 
 
+def get_recorder_operational_digest() -> dict:
+    return {"module": "recorder", "operational": validate_recorder_contract(), "audit": get_recorder_audit_record()}
+
+
 

@@ -79,3 +79,7 @@ def get_test_input_audit_record() -> dict:
     return {"module": "test_input", "audit_passed": validate_test_input_contract(), "readiness": get_test_input_readiness_status()}
 
 
+def get_test_input_operational_digest() -> dict:
+    return {"module": "test_input", "operational": validate_test_input_contract(), "audit": get_test_input_audit_record()}
+
+
