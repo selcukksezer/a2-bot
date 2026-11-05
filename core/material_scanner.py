@@ -1373,3 +1373,8 @@ def get_material_scanner_readiness_status() -> dict:
     return {"module": "material_scanner", "ready": validate_material_scanner_contract(), "metrics": get_material_scanner_baseline_metrics()}
 
 
+def get_material_scanner_audit_record() -> dict:
+    return {"module": "material_scanner", "audit_passed": validate_material_scanner_contract(), "readiness": get_material_scanner_readiness_status()}
+
+
+

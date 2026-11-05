@@ -2152,4 +2152,8 @@ def get_yolo_factory_dialog_readiness_status() -> dict:
     return {"module": "yolo_factory_dialog", "ready": validate_yolo_factory_dialog_contract(), "metrics": get_yolo_factory_dialog_baseline_metrics()}
 
 
+def get_yolo_factory_dialog_audit_record() -> dict:
+    return {"module": "yolo_factory_dialog", "audit_passed": validate_yolo_factory_dialog_contract(), "readiness": get_yolo_factory_dialog_readiness_status()}
+
+
 

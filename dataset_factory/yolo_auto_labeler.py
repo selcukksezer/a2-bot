@@ -1469,6 +1469,7 @@ __all__ = [
     "map_material_name_to_yolo_class_id",
     "YOLOAutoLabeler",
     "get_yolo_auto_labeler_readiness_status",
+    "get_yolo_auto_labeler_audit_record",
 ]
 
 
@@ -1489,6 +1490,22 @@ def get_yolo_auto_labeler_readiness_status() -> dict:
         return {"module": "yolo_auto_labeler", "ready": validate_yolo_auto_labeler_contract(), "metrics": get_yolo_auto_labeler_baseline_metrics()}
     except Exception:
         return {"module": "yolo_auto_labeler", "ready": False, "metrics": {}}
+
+
+def get_yolo_auto_labeler_audit_record() -> dict:
+    try:
+        return {
+            "module": "yolo_auto_labeler",
+            "audit_passed": validate_yolo_auto_labeler_contract(),
+            "readiness": get_yolo_auto_labeler_readiness_status(),
+        }
+    except Exception:
+        return {
+            "module": "yolo_auto_labeler",
+            "audit_passed": False,
+            "readiness": {},
+        }
+
 
 
 

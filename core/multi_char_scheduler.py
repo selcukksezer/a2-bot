@@ -1556,5 +1556,9 @@ def get_multi_char_scheduler_readiness_status() -> dict:
     return {"module": "multi_char_scheduler", "ready": validate_multi_char_scheduler_contract(), "metrics": get_multi_char_scheduler_baseline_metrics()}
 
 
+def get_multi_char_scheduler_audit_record() -> dict:
+    return {"module": "multi_char_scheduler", "audit_passed": validate_multi_char_scheduler_contract(), "readiness": get_multi_char_scheduler_readiness_status()}
+
+
 
 
