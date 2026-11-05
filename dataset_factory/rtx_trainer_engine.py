@@ -1776,3 +1776,7 @@ echo ===========================================================================
     def get_rtx_trainer_engine_ready_flag(self) -> dict:
         return {"module": "rtx_trainer_engine", "ready": True}
 
+    def get_rtx_trainer_engine_version_info(self) -> dict:
+        return {"module": "rtx_trainer_engine", "version": "2.0.0", "ready": True}
+
+
