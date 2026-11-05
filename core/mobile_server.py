@@ -3014,3 +3014,7 @@ refresh();
 </script>
 </body>
 </html>"""
+
+    def get_mobile_server_ready_flag(self) -> dict:
+        return {"module": "mobile_server", "ready": True}
+

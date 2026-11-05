@@ -1121,3 +1121,7 @@ class F9Menu(QWidget):
             return {"f9_menu_ready": True}
         except Exception:
             return {"f9_menu_ready": False}
+
+    def get_f9_menu_ready_flag(self) -> dict:
+        return {"module": "f9_menu", "ready": True}
+

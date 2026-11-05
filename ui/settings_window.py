@@ -2851,6 +2851,9 @@ class SettingsWindow(QDialog):
         except Exception:
             return {"settings_window_ready": False}
 
+    def get_settings_window_ready_flag(self) -> dict:
+        return {"module": "settings_window", "ready": True}
+
 
 # Backwards compatibility alias
 SettingsDialog = SettingsWindow

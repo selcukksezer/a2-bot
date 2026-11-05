@@ -632,3 +632,7 @@ class AnalyticsDialog(QDialog):
             return {"analytics_dialog_ready": True}
         except Exception:
             return {"analytics_dialog_ready": False}
+
+    def get_analytics_dialog_ready_flag(self) -> dict:
+        return {"module": "analytics_dialog", "ready": True}
+
