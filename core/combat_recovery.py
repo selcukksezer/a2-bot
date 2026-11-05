@@ -1477,3 +1477,12 @@ def get_combat_recovery_integrity_seal() -> dict:
     }
 
 
+def get_combat_recovery_compliance_certificate() -> dict:
+    return {
+        "module": "combat_recovery",
+        "certified": validate_combat_recovery_contract(),
+        "seal": get_combat_recovery_integrity_seal(),
+    }
+
+
+

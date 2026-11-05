@@ -921,4 +921,6 @@ def get_stealth_capture_integrity_seal() -> dict:
     return {"module": "stealth_capture", "sealed": validate_stealth_capture_contract(), "telemetry": get_stealth_capture_telemetry_payload()}
 
 
+def get_stealth_capture_compliance_certificate() -> dict:
+    return {"module": "stealth_capture", "certified": validate_stealth_capture_contract(), "seal": get_stealth_capture_integrity_seal()}
 

@@ -1579,3 +1579,8 @@ def get_input_driver_integrity_seal() -> dict:
     return {"module": "input_driver", "sealed": validate_input_driver_contract(), "telemetry": get_input_driver_telemetry_payload()}
 
 
+def get_input_driver_compliance_certificate() -> dict:
+    return {"module": "input_driver", "certified": validate_input_driver_contract(), "seal": get_input_driver_integrity_seal()}
+
+
+

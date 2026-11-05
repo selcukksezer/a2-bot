@@ -1240,3 +1240,12 @@ def get_telemetry_integrity_seal() -> dict:
         "telemetry": get_telemetry_telemetry_payload(),
     }
 
+
+def get_telemetry_compliance_certificate() -> dict:
+    return {
+        "module": "telemetry",
+        "certified": validate_telemetry_contract(),
+        "seal": get_telemetry_integrity_seal(),
+    }
+
+
