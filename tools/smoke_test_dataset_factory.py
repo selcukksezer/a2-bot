@@ -1180,5 +1180,10 @@ def get_smoke_test_dataset_factory_audit_record() -> dict:
     }
 
 
-
+def get_smoke_test_dataset_factory_operational_digest() -> dict:
+    return {
+        "module": "smoke_test_dataset_factory",
+        "operational": validate_smoke_test_dataset_factory_contract(),
+        "audit": get_smoke_test_dataset_factory_audit_record(),
+    }
 

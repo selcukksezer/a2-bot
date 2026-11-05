@@ -39,3 +39,12 @@ def get_ui_package_audit_record() -> dict:
     return {"module": "ui_package", "audit_passed": validate_ui_package_contract(), "readiness": get_ui_package_readiness_status()}
 
 
+validate_ui_init_contract = validate_ui_package_contract
+get_ui_init_audit_record = get_ui_package_audit_record
+
+
+def get_ui_init_operational_digest() -> dict:
+    return {"module": "ui_init", "operational": validate_ui_init_contract(), "audit": get_ui_init_audit_record()}
+
+
+

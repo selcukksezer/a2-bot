@@ -40,4 +40,10 @@ def get_config_package_audit_record() -> dict:
     return {"module": "config_package", "audit_passed": validate_config_package_contract(), "readiness": get_config_package_readiness_status()}
 
 
+validate_config_init_contract = validate_config_package_contract
+get_config_init_audit_record = get_config_package_audit_record
+
+
+def get_config_init_operational_digest() -> dict:
+    return {"module": "config_init", "operational": validate_config_init_contract(), "audit": get_config_init_audit_record()}
 

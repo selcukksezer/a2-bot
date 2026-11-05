@@ -15,6 +15,7 @@ __all__ = [
     "PreGatherTimeMachineBuffer",
     "get_dataset_factory_package_readiness_status",
     "get_dataset_factory_package_audit_record",
+    "get_dataset_factory_init_operational_digest",
 ]
 
 
@@ -67,4 +68,17 @@ def get_dataset_factory_package_audit_record() -> dict:
         "audit_passed": validate_dataset_factory_package_contract(),
         "readiness": get_dataset_factory_package_readiness_status(),
     }
+
+
+validate_dataset_factory_init_contract = validate_dataset_factory_package_contract
+get_dataset_factory_init_audit_record = get_dataset_factory_package_audit_record
+
+
+def get_dataset_factory_init_operational_digest() -> dict:
+    return {
+        "module": "dataset_factory_init",
+        "operational": validate_dataset_factory_init_contract(),
+        "audit": get_dataset_factory_init_audit_record(),
+    }
+
 

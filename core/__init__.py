@@ -40,3 +40,11 @@ def get_core_package_audit_record() -> dict:
     return {"module": "core_package", "audit_passed": validate_core_package_contract(), "readiness": get_core_package_readiness_status()}
 
 
+validate_core_init_contract = validate_core_package_contract
+get_core_init_audit_record = get_core_package_audit_record
+
+
+def get_core_init_operational_digest() -> dict:
+    return {"module": "core_init", "operational": validate_core_init_contract(), "audit": get_core_init_audit_record()}
+
+
