@@ -662,3 +662,8 @@ def get_analytics_dialog_readiness_status() -> dict:
 def get_analytics_dialog_audit_record() -> dict:
     return {"module": "analytics_dialog", "audit_passed": validate_analytics_dialog_contract(), "readiness": get_analytics_dialog_readiness_status()}
 
+
+def get_analytics_dialog_operational_digest() -> dict:
+    return {"module": "analytics_dialog", "operational": validate_analytics_dialog_contract(), "audit": get_analytics_dialog_audit_record()}
+
+

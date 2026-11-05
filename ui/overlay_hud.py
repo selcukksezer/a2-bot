@@ -1193,7 +1193,7 @@ class OverlayHUD(QWidget):
 # GameOverlay içe aktaran modüller için geriye dönük uyumluluk takma adı
 GameOverlay = OverlayHUD
 
-__all__ = ["OverlayHUD", "GameOverlay", "OverlaySignals", "ClickableShortcutWidget", "get_overlay_hud_readiness_status", "get_overlay_hud_audit_record"]
+__all__ = ["OverlayHUD", "GameOverlay", "OverlaySignals", "ClickableShortcutWidget", "get_overlay_hud_readiness_status", "get_overlay_hud_audit_record", "get_overlay_hud_operational_digest"]
 
 
 def get_overlay_hud_capabilities() -> list:
@@ -1222,5 +1222,6 @@ def get_overlay_hud_audit_record() -> dict:
         return {"module": "overlay_hud", "audit_passed": False, "readiness": {}}
 
 
-
+def get_overlay_hud_operational_digest() -> dict:
+    return {"module": "overlay_hud", "operational": validate_overlay_hud_contract(), "audit": get_overlay_hud_audit_record()}
 

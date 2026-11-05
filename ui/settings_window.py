@@ -2885,3 +2885,8 @@ def get_settings_window_audit_record() -> dict:
     return {"module": "settings_window", "audit_passed": validate_settings_window_contract(), "readiness": get_settings_window_readiness_status()}
 
 
+def get_settings_window_operational_digest() -> dict:
+    return {"module": "settings_window", "operational": validate_settings_window_contract(), "audit": get_settings_window_audit_record()}
+
+
+
