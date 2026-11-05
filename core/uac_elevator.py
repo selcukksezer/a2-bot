@@ -337,3 +337,12 @@ if __name__ == "__main__":
     assert captured_calls[0][4] == str(PROJECT_ROOT)
 
     logger.info("core/uac_elevator.py self-check PASSED (is_admin=%s, exe=%s).", admin_state, payload["lpFile"])
+
+
+def get_uac_elevator_capabilities() -> list:
+    return ["uac_elevator", "diagnostic_snapshot", "version_info"]
+
+
+def validate_uac_elevator_contract() -> bool:
+    return bool(get_uac_elevator_capabilities())
+

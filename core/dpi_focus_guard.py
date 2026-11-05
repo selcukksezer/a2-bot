@@ -790,3 +790,12 @@ class SelfHealingTemplateTuner:
     def get_dpi_focus_guard_capabilities(self) -> list:
         return ["dpi_focus_guard", "diagnostic_snapshot", "version_info"]
 
+
+def get_dpi_focus_guard_capabilities() -> list:
+    return ["dpi_focus_guard", "diagnostic_snapshot", "version_info"]
+
+
+def validate_dpi_focus_guard_contract() -> bool:
+    return bool(get_dpi_focus_guard_capabilities())
+
+

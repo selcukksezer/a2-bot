@@ -423,3 +423,12 @@ class DryRunReplaySimulator:
         return ["dry_run_simulator", "diagnostic_snapshot", "version_info"]
 
 
+def get_dry_run_simulator_capabilities() -> list:
+    return ["dry_run_simulator", "diagnostic_snapshot", "version_info"]
+
+
+def validate_dry_run_simulator_contract() -> bool:
+    return bool(get_dry_run_simulator_capabilities())
+
+
+

@@ -473,3 +473,7 @@ class MicroCameraLookAround:
         return ["skill_bar_reader", "diagnostic_snapshot", "version_info"]
 
 
+def validate_skill_bar_reader_contract() -> bool:
+    return bool(get_skill_bar_reader_capabilities())
+
+

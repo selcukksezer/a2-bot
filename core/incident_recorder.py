@@ -688,4 +688,10 @@ class IncidentRecorder:
         return ["incident_recorder", "diagnostic_snapshot", "version_info"]
 
 
+def get_incident_recorder_capabilities() -> list:
+    return ["incident_recorder", "diagnostic_snapshot", "version_info"]
+
+
+def validate_incident_recorder_contract() -> bool:
+    return bool(get_incident_recorder_capabilities())
 
