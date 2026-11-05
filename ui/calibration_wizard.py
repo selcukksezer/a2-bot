@@ -1018,3 +1018,7 @@ class CalibrationWizard(QDialog):
             return {"calibration_wizard_ready": True}
         except Exception:
             return {"calibration_wizard_ready": False}
+
+    def get_calibration_wizard_ready_flag(self) -> dict:
+        return {"module": "calibration_wizard", "ready": True}
+

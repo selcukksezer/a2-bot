@@ -1243,6 +1243,10 @@ class MapViewerWindow(QDialog):
         except Exception:
             return {"map_viewer_ready": False}
 
+    def get_map_viewer_ready_flag(self) -> dict:
+        return {"module": "map_viewer", "ready": True}
+
 
 # Backwards compatibility alias so existing imports (`from ui.map_viewer import MapViewerDialog`) continue to work
 MapViewerDialog = MapViewerWindow
+MapViewer = MapViewerWindow

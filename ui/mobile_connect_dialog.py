@@ -1137,6 +1137,9 @@ class MobileConnectDialog(QDialog):
         except Exception:
             return {"mobile_connect_dialog_ready": False}
 
+    def get_mobile_connect_dialog_ready_flag(self) -> dict:
+        return {"module": "mobile_connect_dialog", "ready": True}
+
 
 if __name__ == "__main__":
     import sys

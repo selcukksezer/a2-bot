@@ -2926,3 +2926,7 @@ class CartographyRadarDialog(QDialog):
             return {"cartography_radar_ready": True}
         except Exception:
             return {"cartography_radar_ready": False}
+
+    def get_cartography_radar_ready_flag(self) -> dict:
+        return {"module": "cartography_radar", "ready": True}
+

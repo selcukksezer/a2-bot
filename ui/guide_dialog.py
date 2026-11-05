@@ -821,3 +821,6 @@ class GuideDialog(QDialog):
             return {"guide_dialog_ready": True}
         except Exception:
             return {"guide_dialog_ready": False}
+
+    def get_guide_dialog_ready_flag(self) -> dict:
+        return {"module": "guide_dialog", "ready": True}
