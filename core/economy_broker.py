@@ -1403,3 +1403,8 @@ def get_economy_broker_baseline_metrics() -> dict:
     return {"module": "economy_broker", "contract_valid": validate_economy_broker_contract(), "capability_count": len(get_economy_broker_capabilities())}
 
 
+def get_economy_broker_readiness_status() -> dict:
+    return {"module": "economy_broker", "ready": validate_economy_broker_contract(), "metrics": get_economy_broker_baseline_metrics()}
+
+
+

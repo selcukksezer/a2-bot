@@ -1143,6 +1143,7 @@ __all__ = [
     "FACTORY_12_CLASS_NAMES",
     "FACTORY_12_CLASS_LABELS_TR",
     "AutoLabelingDatasetFactory",
+    "get_factory_controller_readiness_status",
 ]
 
 
@@ -1191,5 +1192,9 @@ def validate_factory_controller_contract() -> bool:
 
 def get_factory_controller_baseline_metrics() -> dict:
     return {"module": "factory_controller", "contract_valid": validate_factory_controller_contract(), "capability_count": len(get_factory_controller_capabilities())}
+
+
+def get_factory_controller_readiness_status() -> dict:
+    return {"module": "factory_controller", "ready": validate_factory_controller_contract(), "metrics": get_factory_controller_baseline_metrics()}
 
 

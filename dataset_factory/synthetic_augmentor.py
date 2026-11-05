@@ -814,3 +814,7 @@ def get_synthetic_augmentor_baseline_metrics() -> dict:
     return {"module": "synthetic_augmentor", "contract_valid": validate_synthetic_augmentor_contract(), "capability_count": len(get_synthetic_augmentor_capabilities())}
 
 
+def get_synthetic_augmentor_readiness_status() -> dict:
+    return {"module": "synthetic_augmentor", "ready": validate_synthetic_augmentor_contract(), "metrics": get_synthetic_augmentor_baseline_metrics()}
+
+
