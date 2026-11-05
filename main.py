@@ -1119,3 +1119,8 @@ def get_main_readiness_status() -> dict:
     return {"module": "main", "ready": validate_main_contract(), "metrics": get_main_baseline_metrics()}
 
 
+def get_main_audit_record() -> dict:
+    """Returns audit record for main.py."""
+    return {"module": "main", "audit_passed": validate_main_contract(), "readiness": get_main_readiness_status()}
+
+

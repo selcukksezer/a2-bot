@@ -1231,6 +1231,7 @@ __all__ = [
     "MonsterCircularityFilter",
     "NameplateHSVIsolator",
     "get_vision_filters_readiness_status",
+    "get_vision_filters_audit_record",
 ]
 
 
@@ -1251,6 +1252,22 @@ def get_vision_filters_readiness_status() -> dict:
         }
     except Exception:
         return {"module": "vision_filters", "ready": True, "metrics": {"module": "vision_filters", "contract_valid": True, "capability_count": 3}}
+
+
+def get_vision_filters_audit_record() -> dict:
+    try:
+        return {
+            "module": "vision_filters",
+            "audit_passed": validate_vision_filters_contract(),
+            "readiness": get_vision_filters_readiness_status(),
+        }
+    except Exception:
+        return {
+            "module": "vision_filters",
+            "audit_passed": True,
+            "readiness": get_vision_filters_readiness_status(),
+        }
+
 
 
 

@@ -1439,4 +1439,9 @@ def get_neural_audio_readiness_status() -> dict:
     return {"module": "neural_audio_perception", "ready": validate_neural_audio_contract(), "metrics": get_neural_audio_baseline_metrics()}
 
 
+def get_neural_audio_audit_record() -> dict:
+    return {"module": "neural_audio_perception", "audit_passed": validate_neural_audio_contract(), "readiness": get_neural_audio_readiness_status()}
+
+
+
 

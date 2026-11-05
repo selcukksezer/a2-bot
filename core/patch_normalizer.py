@@ -1106,6 +1106,7 @@ __all__ = [
     "WatershedClusterSeparator",
     "MotionBlurGate",
     "get_patch_normalizer_readiness_status",
+    "get_patch_normalizer_audit_record",
 ]
 
 
@@ -1137,6 +1138,22 @@ def get_patch_normalizer_readiness_status() -> dict:
             "module": "patch_normalizer",
             "ready": False,
             "metrics": {},
+        }
+
+
+def get_patch_normalizer_audit_record() -> dict:
+    """Returns audit record for the patch normalizer module."""
+    try:
+        return {
+            "module": "patch_normalizer",
+            "audit_passed": validate_patch_normalizer_contract(),
+            "readiness": get_patch_normalizer_readiness_status(),
+        }
+    except Exception:
+        return {
+            "module": "patch_normalizer",
+            "audit_passed": False,
+            "readiness": {},
         }
 
 

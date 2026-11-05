@@ -2604,3 +2604,8 @@ def get_state_machine_readiness_status() -> dict:
     return {"module": "state_machine", "ready": validate_state_machine_contract(), "metrics": get_state_machine_baseline_metrics()}
 
 
+def get_state_machine_audit_record() -> dict:
+    return {"module": "state_machine", "audit_passed": validate_state_machine_contract(), "readiness": get_state_machine_readiness_status()}
+
+
+
