@@ -83,3 +83,7 @@ class F9Menu(QMenu):
         except Exception:
             return {"menu_ready": False}
 
+    def get_menu_ready_flag(self) -> dict:
+        return {"module": "menu", "ready": True}
+
+

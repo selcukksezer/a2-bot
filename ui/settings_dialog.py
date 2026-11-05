@@ -267,3 +267,7 @@ class SettingsDialog(QDialog):
             return {"settings_dialog_ready": True}
         except Exception:
             return {"settings_dialog_ready": False}
+
+    def get_settings_dialog_ready_flag(self) -> dict:
+        return {"module": "settings_dialog", "ready": True}
+

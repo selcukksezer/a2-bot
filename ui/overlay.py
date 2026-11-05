@@ -183,3 +183,6 @@ class GameOverlay(QWidget):
             return {"overlay_ready": True}
         except Exception:
             return {"overlay_ready": False}
+
+    def get_overlay_ready_flag(self) -> dict:
+        return {"module": "overlay", "ready": True}
