@@ -297,6 +297,9 @@ class UACElevator:
     def get_uac_elevator_diagnostic_snapshot(self) -> dict:
         return {"module": "uac_elevator", "status": "ok", "ready": True}
 
+    def get_uac_elevator_capabilities(self) -> list:
+        return ["uac_elevator", "diagnostic_snapshot", "version_info"]
+
 
 def get_uac_elevator_version_info() -> dict:
     return {"module": "uac_elevator", "version": "2.0.0", "ready": True}

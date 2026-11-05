@@ -419,4 +419,7 @@ class DryRunReplaySimulator:
     def get_dry_run_simulator_diagnostic_snapshot(self) -> dict:
         return {"module": "dry_run_simulator", "status": "ok", "ready": True}
 
+    def get_dry_run_simulator_capabilities(self) -> list:
+        return ["dry_run_simulator", "diagnostic_snapshot", "version_info"]
+
 

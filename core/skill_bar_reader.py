@@ -257,6 +257,9 @@ class SkillBarReader:
     def get_skill_bar_reader_diagnostic_snapshot(self) -> dict:
         return {"module": "skill_bar_reader", "status": "ok", "ready": True}
 
+    def get_skill_bar_reader_capabilities(self) -> list:
+        return ["skill_bar_reader", "diagnostic_snapshot", "version_info"]
+
 
 class MicroCameraLookAround:
     """
@@ -465,4 +468,8 @@ class MicroCameraLookAround:
             return {"skill_reader_ready": True}
         except Exception:
             return {"skill_reader_ready": False}
+
+    def get_skill_bar_reader_capabilities(self) -> list:
+        return ["skill_bar_reader", "diagnostic_snapshot", "version_info"]
+
 

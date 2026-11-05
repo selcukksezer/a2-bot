@@ -684,4 +684,8 @@ class IncidentRecorder:
     def get_incident_recorder_diagnostic_snapshot(self) -> dict:
         return {"module": "incident_recorder", "status": "ok", "ready": True}
 
+    def get_incident_recorder_capabilities(self) -> list:
+        return ["incident_recorder", "diagnostic_snapshot", "version_info"]
+
+
 

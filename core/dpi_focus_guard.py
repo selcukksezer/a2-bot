@@ -441,6 +441,9 @@ class DPIScalingSynchronizer:
     def get_dpi_focus_guard_diagnostic_snapshot(self) -> dict:
         return {"module": "dpi_focus_guard", "status": "ok", "ready": True}
 
+    def get_dpi_focus_guard_capabilities(self) -> list:
+        return ["dpi_focus_guard", "diagnostic_snapshot", "version_info"]
+
 
 # ============================================================================
 # ITEM 48: Oyun Penceresi Odak Koruması (ForegroundFocusGuard)
@@ -634,6 +637,9 @@ class ForegroundFocusGuard:
     def get_dpi_focus_guard_diagnostic_snapshot(self) -> dict:
         return {"module": "dpi_focus_guard", "status": "ok", "ready": True}
 
+    def get_dpi_focus_guard_capabilities(self) -> list:
+        return ["dpi_focus_guard", "diagnostic_snapshot", "version_info"]
+
 
 
 # ============================================================================
@@ -780,4 +786,7 @@ class SelfHealingTemplateTuner:
 
     def get_dpi_focus_guard_diagnostic_snapshot(self) -> dict:
         return {"module": "dpi_focus_guard", "status": "ok", "ready": True}
+
+    def get_dpi_focus_guard_capabilities(self) -> list:
+        return ["dpi_focus_guard", "diagnostic_snapshot", "version_info"]
 
