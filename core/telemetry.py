@@ -1249,3 +1249,12 @@ def get_telemetry_compliance_certificate() -> dict:
     }
 
 
+def get_telemetry_readiness_probe() -> dict:
+    return {
+        "module": "telemetry",
+        "ready": validate_telemetry_contract(),
+        "certificate": get_telemetry_compliance_certificate(),
+    }
+
+
+

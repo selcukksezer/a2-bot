@@ -1485,4 +1485,12 @@ def get_combat_recovery_compliance_certificate() -> dict:
     }
 
 
+def get_combat_recovery_readiness_probe() -> dict:
+    return {
+        "module": "combat_recovery",
+        "ready": validate_combat_recovery_contract(),
+        "certificate": get_combat_recovery_compliance_certificate(),
+    }
+
+
 

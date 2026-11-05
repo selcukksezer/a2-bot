@@ -1389,3 +1389,8 @@ def get_watchdog_compliance_certificate() -> dict:
     return {"module": "watchdog", "certified": validate_watchdog_contract(), "seal": get_watchdog_integrity_seal()}
 
 
+def get_watchdog_readiness_probe() -> dict:
+    return {"module": "watchdog", "ready": validate_watchdog_contract(), "certificate": get_watchdog_compliance_certificate()}
+
+
+
