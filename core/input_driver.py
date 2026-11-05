@@ -1559,3 +1559,7 @@ def get_input_driver_baseline_metrics() -> dict:
     return {"module": "input_driver", "contract_valid": validate_input_driver_contract(), "capability_count": len(get_input_driver_capabilities())}
 
 
+def get_input_driver_readiness_status() -> dict:
+    return {"module": "input_driver", "ready": validate_input_driver_contract(), "metrics": get_input_driver_baseline_metrics()}
+
+

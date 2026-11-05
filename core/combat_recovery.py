@@ -1437,4 +1437,10 @@ def get_combat_recovery_baseline_metrics() -> dict:
     }
 
 
+def get_combat_recovery_readiness_status() -> dict:
+    return {
+        "module": "combat_recovery",
+        "ready": validate_combat_recovery_contract(),
+        "metrics": get_combat_recovery_baseline_metrics(),
+    }
 
