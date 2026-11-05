@@ -1690,3 +1690,8 @@ def get_vision_telemetry_payload() -> dict:
 def get_vision_integrity_seal() -> dict:
     return {"module": "vision", "sealed": validate_vision_contract(), "telemetry": get_vision_telemetry_payload()}
 
+
+def get_vision_compliance_certificate() -> dict:
+    return {"module": "vision", "certified": validate_vision_contract(), "seal": get_vision_integrity_seal()}
+
+

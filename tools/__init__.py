@@ -65,4 +65,9 @@ def get_tools_package_integrity_seal() -> dict:
     return {"module": "tools_package", "sealed": validate_tools_package_contract(), "telemetry": get_tools_package_telemetry_payload()}
 
 
+def get_tools_package_compliance_certificate() -> dict:
+    return {"module": "tools_package", "certified": validate_tools_package_contract(), "seal": get_tools_package_integrity_seal()}
+
+
+
 

@@ -1983,3 +1983,8 @@ def get_explorer_mode_telemetry_payload() -> dict:
 def get_explorer_mode_integrity_seal() -> dict:
     return {"module": "explorer_mode", "sealed": validate_explorer_mode_contract(), "telemetry": get_explorer_mode_telemetry_payload()}
 
+
+def get_explorer_mode_compliance_certificate() -> dict:
+    return {"module": "explorer_mode", "certified": validate_explorer_mode_contract(), "seal": get_explorer_mode_integrity_seal()}
+
+
