@@ -14,3 +14,11 @@ __all__ = [
     "FrameSnapshot",
     "PreGatherTimeMachineBuffer",
 ]
+
+
+def get_dataset_factory_package_summary() -> dict:
+    try:
+        return {"dataset_factory_ready": True}
+    except Exception:
+        return {"dataset_factory_ready": False}
+
