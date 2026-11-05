@@ -1058,4 +1058,6 @@ def get_smoke_test_mobile_and_enterprise_capabilities() -> list:
     return ["smoke_test_mobile_and_enterprise", "diagnostic_snapshot", "version_info"]
 
 
+def validate_smoke_test_mobile_and_enterprise_contract() -> bool:
+    return bool(get_smoke_test_mobile_and_enterprise_capabilities())
 

@@ -1478,3 +1478,7 @@ def get_run_all_smoke_tests_capabilities() -> list:
     return ["run_all_smoke_tests", "diagnostic_snapshot", "version_info"]
 
 
+def validate_run_all_smoke_tests_contract() -> bool:
+    return bool(get_run_all_smoke_tests_capabilities())
+
+

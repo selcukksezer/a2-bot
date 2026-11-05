@@ -978,3 +978,7 @@ def get_template_extractor_capabilities() -> list:
     return ["template_extractor", "diagnostic_snapshot", "version_info"]
 
 
+def validate_template_extractor_contract() -> bool:
+    return bool(get_template_extractor_capabilities())
+
+

@@ -1316,4 +1316,6 @@ def get_self_test_suite_capabilities() -> list:
     return ["self_test_suite", "diagnostic_snapshot", "version_info"]
 
 
+def validate_self_test_suite_contract() -> bool:
+    return bool(get_self_test_suite_capabilities())
 

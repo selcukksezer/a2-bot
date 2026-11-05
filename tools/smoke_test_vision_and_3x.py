@@ -1797,3 +1797,7 @@ def get_smoke_test_vision_and_3x_capabilities() -> list:
     return ["smoke_test_vision_and_3x", "diagnostic_snapshot", "version_info"]
 
 
+def validate_smoke_test_vision_and_3x_contract() -> bool:
+    return bool(get_smoke_test_vision_and_3x_capabilities())
+
+
