@@ -929,6 +929,9 @@ class BotWatchdog:
     def get_watchdog_version_info(self) -> dict:
         return {"module": "watchdog", "version": "2.0.0", "ready": True}
 
+    def get_watchdog_diagnostic_snapshot(self) -> dict:
+        return {"module": "watchdog", "status": "ok", "ready": True}
+
 
 def freeze_watchdog_on_pause(
     watchdog: BotWatchdog,

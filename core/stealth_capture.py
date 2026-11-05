@@ -885,4 +885,8 @@ class StealthCapture(DXGIDesktopCapture):
     def get_stealth_capture_version_info(self) -> dict:
         return {"module": "stealth_capture", "version": "2.0.0", "ready": True}
 
+    def get_stealth_capture_diagnostic_snapshot(self) -> dict:
+        return {"module": "stealth_capture", "status": "ok", "ready": True}
+
+
 
