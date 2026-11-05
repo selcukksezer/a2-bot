@@ -1362,3 +1362,12 @@ def get_corridor_navigator_telemetry_payload() -> dict:
         "payload": get_corridor_navigator_operational_digest(),
     }
 
+
+def get_corridor_navigator_integrity_seal() -> dict:
+    return {
+        "module": "corridor_navigator",
+        "sealed": validate_corridor_navigator_contract(),
+        "telemetry": get_corridor_navigator_telemetry_payload(),
+    }
+
+

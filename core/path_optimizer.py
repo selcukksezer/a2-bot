@@ -625,4 +625,10 @@ def get_path_optimizer_telemetry_payload() -> dict:
     }
 
 
+def get_path_optimizer_integrity_seal() -> dict:
+    return {
+        "module": "path_optimizer",
+        "sealed": validate_path_optimizer_contract(),
+        "telemetry": get_path_optimizer_telemetry_payload(),
+    }
 

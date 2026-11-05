@@ -1086,3 +1086,12 @@ def get_windmouse_humanizer_telemetry_payload() -> dict:
     }
 
 
+def get_windmouse_humanizer_integrity_seal() -> dict:
+    return {
+        "module": "windmouse_humanizer",
+        "sealed": validate_windmouse_humanizer_contract(),
+        "telemetry": get_windmouse_humanizer_telemetry_payload(),
+    }
+
+
+
