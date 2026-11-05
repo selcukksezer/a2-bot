@@ -1110,6 +1110,7 @@ __all__ = [
     "get_patch_normalizer_operational_digest",
     "get_patch_normalizer_telemetry_payload",
     "get_patch_normalizer_integrity_seal",
+    "get_patch_normalizer_compliance_certificate",
 ]
 
 
@@ -1185,5 +1186,15 @@ def get_patch_normalizer_integrity_seal() -> dict:
         "sealed": validate_patch_normalizer_contract(),
         "telemetry": get_patch_normalizer_telemetry_payload(),
     }
+
+
+def get_patch_normalizer_compliance_certificate() -> dict:
+    """Returns compliance certificate for the patch normalizer module."""
+    return {
+        "module": "patch_normalizer",
+        "certified": validate_patch_normalizer_contract(),
+        "seal": get_patch_normalizer_integrity_seal(),
+    }
+
 
 

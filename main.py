@@ -1138,3 +1138,9 @@ def get_main_integrity_seal() -> dict:
     """Returns integrity seal for main.py."""
     return {"module": "main", "sealed": validate_main_contract(), "telemetry": get_main_telemetry_payload()}
 
+
+def get_main_compliance_certificate() -> dict:
+    """Returns compliance certificate for main.py."""
+    return {"module": "main", "certified": validate_main_contract(), "seal": get_main_integrity_seal()}
+
+

@@ -2620,4 +2620,8 @@ def get_state_machine_integrity_seal() -> dict:
     return {"module": "state_machine", "sealed": validate_state_machine_contract(), "telemetry": get_state_machine_telemetry_payload()}
 
 
+def get_state_machine_compliance_certificate() -> dict:
+    return {"module": "state_machine", "certified": validate_state_machine_contract(), "seal": get_state_machine_integrity_seal()}
+
+
 

@@ -1459,3 +1459,8 @@ def get_neural_audio_perception_integrity_seal() -> dict:
     return {"module": "neural_audio_perception", "sealed": validate_neural_audio_perception_contract(), "telemetry": get_neural_audio_perception_telemetry_payload()}
 
 
+def get_neural_audio_perception_compliance_certificate() -> dict:
+    return {"module": "neural_audio_perception", "certified": validate_neural_audio_perception_contract(), "seal": get_neural_audio_perception_integrity_seal()}
+
+
+
