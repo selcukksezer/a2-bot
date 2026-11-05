@@ -914,4 +914,13 @@ def get_depth_glide_navigator_audit_record() -> dict:
     }
 
 
+def get_depth_glide_navigator_operational_digest() -> dict:
+    return {
+        "module": "depth_glide_navigator",
+        "operational": validate_depth_glide_navigator_contract(),
+        "audit": get_depth_glide_navigator_audit_record(),
+    }
+
+
+
 

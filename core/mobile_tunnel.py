@@ -1175,3 +1175,8 @@ def get_mobile_tunnel_readiness_status() -> dict:
 def get_mobile_tunnel_audit_record() -> dict:
     return {"module": "mobile_tunnel", "audit_passed": validate_mobile_tunnel_contract(), "readiness": get_mobile_tunnel_readiness_status()}
 
+
+def get_mobile_tunnel_operational_digest() -> dict:
+    return {"module": "mobile_tunnel", "operational": validate_mobile_tunnel_contract(), "audit": get_mobile_tunnel_audit_record()}
+
+

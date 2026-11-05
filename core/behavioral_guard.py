@@ -1007,4 +1007,13 @@ def get_behavioral_guard_audit_record() -> dict:
     }
 
 
+def get_behavioral_guard_operational_digest() -> dict:
+    return {
+        "module": "behavioral_guard",
+        "operational": validate_behavioral_guard_contract(),
+        "audit": get_behavioral_guard_audit_record(),
+    }
+
+
+
 

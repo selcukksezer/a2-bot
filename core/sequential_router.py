@@ -1949,4 +1949,13 @@ def get_sequential_router_audit_record() -> dict:
     }
 
 
+def get_sequential_router_operational_digest() -> dict:
+    return {
+        "module": "sequential_router",
+        "operational": validate_sequential_router_contract(),
+        "audit": get_sequential_router_audit_record(),
+    }
+
+
+
 
