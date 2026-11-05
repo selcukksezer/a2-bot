@@ -186,3 +186,7 @@ class GameOverlay(QWidget):
 
     def get_overlay_ready_flag(self) -> dict:
         return {"module": "overlay", "ready": True}
+
+    def get_overlay_version_info(self) -> dict:
+        return {"module": "overlay", "version": "2.0.0", "ready": True}
+

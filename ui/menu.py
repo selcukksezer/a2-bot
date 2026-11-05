@@ -86,4 +86,7 @@ class F9Menu(QMenu):
     def get_menu_ready_flag(self) -> dict:
         return {"module": "menu", "ready": True}
 
+    def get_menu_version_info(self) -> dict:
+        return {"module": "menu", "version": "2.0.0", "ready": True}
+
 

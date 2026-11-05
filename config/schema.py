@@ -599,3 +599,8 @@ def get_schema_health_summary() -> dict:
 def get_schema_ready_flag() -> dict:
     return {"module": "schema", "ready": True}
 
+
+def get_schema_version_info() -> dict:
+    return {"module": "schema", "version": "2.0.0", "ready": True}
+
+
