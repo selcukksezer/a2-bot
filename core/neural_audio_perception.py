@@ -1455,3 +1455,7 @@ def get_neural_audio_perception_telemetry_payload() -> dict:
     return {"module": "neural_audio_perception", "telemetry_ready": validate_neural_audio_perception_contract(), "digest": get_neural_audio_perception_operational_digest()}
 
 
+def get_neural_audio_perception_integrity_seal() -> dict:
+    return {"module": "neural_audio_perception", "sealed": validate_neural_audio_perception_contract(), "telemetry": get_neural_audio_perception_telemetry_payload()}
+
+

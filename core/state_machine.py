@@ -2616,4 +2616,8 @@ def get_state_machine_telemetry_payload() -> dict:
     return {"module": "state_machine", "telemetry_ready": validate_state_machine_contract(), "digest": get_state_machine_operational_digest()}
 
 
+def get_state_machine_integrity_seal() -> dict:
+    return {"module": "state_machine", "sealed": validate_state_machine_contract(), "telemetry": get_state_machine_telemetry_payload()}
+
+
 

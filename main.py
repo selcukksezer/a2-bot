@@ -1134,4 +1134,7 @@ def get_main_telemetry_payload() -> dict:
     return {"module": "main", "telemetry_ready": validate_main_contract(), "digest": get_main_operational_digest()}
 
 
+def get_main_integrity_seal() -> dict:
+    """Returns integrity seal for main.py."""
+    return {"module": "main", "sealed": validate_main_contract(), "telemetry": get_main_telemetry_payload()}
 

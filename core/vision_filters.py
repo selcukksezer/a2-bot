@@ -1234,6 +1234,7 @@ __all__ = [
     "get_vision_filters_audit_record",
     "get_vision_filters_operational_digest",
     "get_vision_filters_telemetry_payload",
+    "get_vision_filters_integrity_seal",
 ]
 
 
@@ -1284,6 +1285,14 @@ def get_vision_filters_telemetry_payload() -> dict:
         "module": "vision_filters",
         "telemetry_ready": validate_vision_filters_contract(),
         "digest": get_vision_filters_operational_digest(),
+    }
+
+
+def get_vision_filters_integrity_seal() -> dict:
+    return {
+        "module": "vision_filters",
+        "sealed": validate_vision_filters_contract(),
+        "telemetry": get_vision_filters_telemetry_payload(),
     }
 
 
