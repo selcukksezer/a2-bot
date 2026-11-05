@@ -585,3 +585,12 @@ def get_path_optimizer_capabilities() -> list:
 def validate_path_optimizer_contract() -> bool:
     return bool(get_path_optimizer_capabilities())
 
+
+def get_path_optimizer_baseline_metrics() -> dict:
+    return {
+        "module": "path_optimizer",
+        "contract_valid": validate_path_optimizer_contract(),
+        "capability_count": len(get_path_optimizer_capabilities()),
+    }
+
+

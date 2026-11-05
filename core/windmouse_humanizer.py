@@ -1046,3 +1046,12 @@ def get_windmouse_humanizer_capabilities() -> list:
 def validate_windmouse_humanizer_contract() -> bool:
     return bool(get_windmouse_humanizer_capabilities())
 
+
+def get_windmouse_humanizer_baseline_metrics() -> dict:
+    return {
+        "module": "windmouse_humanizer",
+        "contract_valid": validate_windmouse_humanizer_contract(),
+        "capability_count": len(get_windmouse_humanizer_capabilities()),
+    }
+
+

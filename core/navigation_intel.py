@@ -1990,3 +1990,7 @@ def validate_navigation_intel_contract() -> bool:
     return bool(get_navigation_intel_capabilities())
 
 
+def get_navigation_intel_baseline_metrics() -> dict:
+    return {"module": "navigation_intel", "contract_valid": validate_navigation_intel_contract(), "capability_count": len(get_navigation_intel_capabilities())}
+
+

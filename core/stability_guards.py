@@ -1258,3 +1258,7 @@ def validate_stability_guards_contract() -> bool:
     return bool(get_stability_guards_capabilities())
 
 
+def get_stability_guards_baseline_metrics() -> dict:
+    return {"module": "stability_guards", "contract_valid": validate_stability_guards_contract(), "capability_count": len(get_stability_guards_capabilities())}
+
+
