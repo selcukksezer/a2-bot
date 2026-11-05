@@ -1322,3 +1322,12 @@ def get_vision_filters_audit_summary() -> dict:
         "probe": get_vision_filters_readiness_probe(),
     }
 
+
+def get_vision_filters_heartbeat_snapshot() -> dict:
+    return {
+        "module": "vision_filters",
+        "alive": validate_vision_filters_contract(),
+        "audit": get_vision_filters_audit_summary(),
+    }
+
+

@@ -1470,3 +1470,7 @@ def get_neural_audio_perception_readiness_probe() -> dict:
 def get_neural_audio_perception_audit_summary() -> dict:
     return {"module": "neural_audio_perception", "audit_passed": validate_neural_audio_perception_contract(), "probe": get_neural_audio_perception_readiness_probe()}
 
+
+def get_neural_audio_perception_heartbeat_snapshot() -> dict:
+    return {"module": "neural_audio_perception", "alive": validate_neural_audio_perception_contract(), "audit": get_neural_audio_perception_audit_summary()}
+

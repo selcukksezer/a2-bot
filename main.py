@@ -1154,3 +1154,8 @@ def get_main_audit_summary() -> dict:
     return {"module": "main", "audit_passed": validate_main_contract(), "probe": get_main_readiness_probe()}
 
 
+def get_main_heartbeat_snapshot() -> dict:
+    """Returns heartbeat snapshot for main.py."""
+    return {"module": "main", "alive": validate_main_contract(), "audit": get_main_audit_summary()}
+
+

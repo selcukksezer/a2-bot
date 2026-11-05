@@ -1113,6 +1113,7 @@ __all__ = [
     "get_patch_normalizer_compliance_certificate",
     "get_patch_normalizer_readiness_probe",
     "get_patch_normalizer_audit_summary",
+    "get_patch_normalizer_heartbeat_snapshot",
 ]
 
 
@@ -1215,4 +1216,14 @@ def get_patch_normalizer_audit_summary() -> dict:
         "audit_passed": validate_patch_normalizer_contract(),
         "probe": get_patch_normalizer_readiness_probe(),
     }
+
+
+def get_patch_normalizer_heartbeat_snapshot() -> dict:
+    """Returns heartbeat snapshot for the patch normalizer module."""
+    return {
+        "module": "patch_normalizer",
+        "alive": validate_patch_normalizer_contract(),
+        "audit": get_patch_normalizer_audit_summary(),
+    }
+
 
