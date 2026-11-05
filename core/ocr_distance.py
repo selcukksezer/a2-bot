@@ -1593,3 +1593,7 @@ def validate_ocr_distance_contract() -> bool:
     return bool(get_ocr_distance_capabilities())
 
 
+def get_ocr_distance_baseline_metrics() -> dict:
+    return {"module": "ocr_distance", "contract_valid": validate_ocr_distance_contract(), "capability_count": len(get_ocr_distance_capabilities())}
+
+

@@ -1212,3 +1212,11 @@ def validate_opsec_crypto_contract() -> bool:
     return bool(get_opsec_crypto_capabilities())
 
 
+def get_opsec_crypto_baseline_metrics() -> dict:
+    return {
+        "module": "opsec_crypto",
+        "contract_valid": validate_opsec_crypto_contract(),
+        "capability_count": len(get_opsec_crypto_capabilities()),
+    }
+
+

@@ -1127,3 +1127,11 @@ def validate_minimap_scanner_contract() -> bool:
     return bool(get_minimap_scanner_capabilities())
 
 
+def get_minimap_scanner_baseline_metrics() -> dict:
+    return {
+        "module": "minimap_scanner",
+        "contract_valid": validate_minimap_scanner_contract(),
+        "capability_count": len(get_minimap_scanner_capabilities()),
+    }
+
+

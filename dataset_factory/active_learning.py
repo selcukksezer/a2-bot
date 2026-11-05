@@ -60,3 +60,7 @@ def validate_active_learning_contract() -> bool:
     return bool(get_active_learning_capabilities())
 
 
+def get_active_learning_baseline_metrics() -> dict:
+    return {"module": "active_learning", "contract_valid": validate_active_learning_contract(), "capability_count": len(get_active_learning_capabilities())}
+
+
