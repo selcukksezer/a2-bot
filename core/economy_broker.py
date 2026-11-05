@@ -1423,3 +1423,8 @@ def get_economy_broker_integrity_seal() -> dict:
     return {"module": "economy_broker", "sealed": validate_economy_broker_contract(), "telemetry": get_economy_broker_telemetry_payload()}
 
 
+def get_economy_broker_compliance_certificate() -> dict:
+    return {"module": "economy_broker", "certified": validate_economy_broker_contract(), "seal": get_economy_broker_integrity_seal()}
+
+
+

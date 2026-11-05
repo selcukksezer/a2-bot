@@ -834,3 +834,8 @@ def get_synthetic_augmentor_integrity_seal() -> dict:
     return {"module": "synthetic_augmentor", "sealed": validate_synthetic_augmentor_contract(), "telemetry": get_synthetic_augmentor_telemetry_payload()}
 
 
+def get_synthetic_augmentor_compliance_certificate() -> dict:
+    return {"module": "synthetic_augmentor", "certified": validate_synthetic_augmentor_contract(), "seal": get_synthetic_augmentor_integrity_seal()}
+
+
+

@@ -399,3 +399,8 @@ def get_frame_time_machine_integrity_seal() -> dict:
     return {"module": "frame_time_machine", "sealed": validate_frame_time_machine_contract(), "telemetry": get_frame_time_machine_telemetry_payload()}
 
 
+def get_frame_time_machine_compliance_certificate() -> dict:
+    return {"module": "frame_time_machine", "certified": validate_frame_time_machine_contract(), "seal": get_frame_time_machine_integrity_seal()}
+
+
+

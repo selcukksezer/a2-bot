@@ -1148,6 +1148,7 @@ __all__ = [
     "get_factory_controller_operational_digest",
     "get_factory_controller_telemetry_payload",
     "get_factory_controller_integrity_seal",
+    "get_factory_controller_compliance_certificate",
 ]
 
 
@@ -1216,4 +1217,9 @@ def get_factory_controller_telemetry_payload() -> dict:
 
 def get_factory_controller_integrity_seal() -> dict:
     return {"module": "factory_controller", "sealed": validate_factory_controller_contract(), "telemetry": get_factory_controller_telemetry_payload()}
+
+
+def get_factory_controller_compliance_certificate() -> dict:
+    return {"module": "factory_controller", "certified": validate_factory_controller_contract(), "seal": get_factory_controller_integrity_seal()}
+
 
