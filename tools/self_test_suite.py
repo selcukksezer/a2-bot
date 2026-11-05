@@ -1386,3 +1386,12 @@ def get_self_test_suite_readiness_probe() -> dict:
     }
 
 
+def get_self_test_suite_audit_summary() -> dict:
+    return {
+        "module": "self_test_suite",
+        "audit_passed": validate_self_test_suite_contract(),
+        "probe": get_self_test_suite_readiness_probe(),
+    }
+
+
+

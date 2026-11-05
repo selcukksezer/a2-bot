@@ -1837,3 +1837,7 @@ def get_smoke_test_vision_and_3x_readiness_probe() -> dict:
     return {"module": "smoke_test_vision_and_3x", "ready": validate_smoke_test_vision_and_3x_contract(), "certificate": get_smoke_test_vision_and_3x_compliance_certificate()}
 
 
+def get_smoke_test_vision_and_3x_audit_summary() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "audit_passed": validate_smoke_test_vision_and_3x_contract(), "probe": get_smoke_test_vision_and_3x_readiness_probe()}
+
+

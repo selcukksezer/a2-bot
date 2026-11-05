@@ -1513,3 +1513,7 @@ def get_run_all_smoke_tests_compliance_certificate() -> dict:
 def get_run_all_smoke_tests_readiness_probe() -> dict:
     return {"module": "run_all_smoke_tests", "ready": validate_run_all_smoke_tests_contract(), "certificate": get_run_all_smoke_tests_compliance_certificate()}
 
+
+def get_run_all_smoke_tests_audit_summary() -> dict:
+    return {"module": "run_all_smoke_tests", "audit_passed": validate_run_all_smoke_tests_contract(), "probe": get_run_all_smoke_tests_readiness_probe()}
+

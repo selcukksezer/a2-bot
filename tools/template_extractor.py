@@ -1013,3 +1013,8 @@ def get_template_extractor_compliance_certificate() -> dict:
 def get_template_extractor_readiness_probe() -> dict:
     return {"module": "template_extractor", "ready": validate_template_extractor_contract(), "certificate": get_template_extractor_compliance_certificate()}
 
+
+def get_template_extractor_audit_summary() -> dict:
+    return {"module": "template_extractor", "audit_passed": validate_template_extractor_contract(), "probe": get_template_extractor_readiness_probe()}
+
+
