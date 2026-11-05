@@ -675,3 +675,8 @@ def get_capture_baseline_metrics() -> dict:
     return {"module": "capture", "contract_valid": validate_capture_contract(), "capability_count": len(get_capture_capabilities())}
 
 
+def get_capture_readiness_status() -> dict:
+    return {"module": "capture", "ready": validate_capture_contract(), "metrics": get_capture_baseline_metrics()}
+
+
+

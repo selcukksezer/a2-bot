@@ -91,3 +91,7 @@ def get_combat_baseline_metrics() -> dict:
     return {"module": "combat", "contract_valid": validate_combat_contract(), "capability_count": len(get_combat_capabilities())}
 
 
+def get_combat_readiness_status() -> dict:
+    return {"module": "combat", "ready": validate_combat_contract(), "metrics": get_combat_baseline_metrics()}
+
+

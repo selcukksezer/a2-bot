@@ -72,3 +72,24 @@ def validate_config_contract() -> bool:
 def get_config_baseline_metrics() -> dict:
     return {"module": "config", "contract_valid": validate_config_contract(), "capability_count": len(get_config_capabilities())}
 
+
+def get_config_readiness_status() -> dict:
+    return {"module": "config", "ready": validate_config_contract(), "metrics": get_config_baseline_metrics()}
+
+
+def get_core_config_capabilities() -> list:
+    return get_config_capabilities()
+
+
+def validate_core_config_contract() -> bool:
+    return validate_config_contract()
+
+
+def get_core_config_baseline_metrics() -> dict:
+    return {"module": "core_config", "contract_valid": validate_core_config_contract(), "capability_count": len(get_core_config_capabilities())}
+
+
+def get_core_config_readiness_status() -> dict:
+    return {"module": "core_config", "ready": validate_core_config_contract(), "metrics": get_core_config_baseline_metrics()}
+
+
