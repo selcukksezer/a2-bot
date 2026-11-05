@@ -1360,3 +1360,8 @@ class MaterialScanner:
 def get_material_scanner_capabilities() -> list:
     return ["material_scanner", "resource_detection", "diagnostic_snapshot"]
 
+
+def validate_material_scanner_contract() -> bool:
+    return bool(get_material_scanner_capabilities())
+
+

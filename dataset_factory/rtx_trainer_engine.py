@@ -1786,3 +1786,8 @@ echo ===========================================================================
 def get_rtx_trainer_engine_capabilities() -> list:
     return ["rtx_trainer_engine", "fp16_onnx_export", "diagnostic_snapshot"]
 
+
+def validate_rtx_trainer_engine_contract() -> bool:
+    return bool(get_rtx_trainer_engine_capabilities())
+
+

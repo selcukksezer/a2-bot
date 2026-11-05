@@ -1474,3 +1474,8 @@ __all__ = [
 def get_yolo_auto_labeler_capabilities() -> list:
     return ["yolo_auto_labeler", "bbox_annotation", "diagnostic_snapshot"]
 
+
+def validate_yolo_auto_labeler_contract() -> bool:
+    return bool(get_yolo_auto_labeler_capabilities())
+
+

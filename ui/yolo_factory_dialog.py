@@ -2139,3 +2139,8 @@ class YOLOFactoryDialog(QDialog):
 def get_yolo_factory_dialog_capabilities() -> list:
     return ["yolo_factory_dialog", "dataset_pipeline_ui", "diagnostic_snapshot"]
 
+
+def validate_yolo_factory_dialog_contract() -> bool:
+    return bool(get_yolo_factory_dialog_capabilities())
+
+

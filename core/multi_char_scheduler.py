@@ -1543,3 +1543,8 @@ class PetAndBuffManager:
 def get_multi_char_scheduler_capabilities() -> list:
     return ["multi_char_scheduler", "character_rotation", "diagnostic_snapshot"]
 
+
+def validate_multi_char_scheduler_contract() -> bool:
+    return bool(get_multi_char_scheduler_capabilities())
+
+
