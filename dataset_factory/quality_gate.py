@@ -12,6 +12,9 @@ class QualityGate(DatasetQualityGate):
     def get_quality_gate_version_info(self) -> dict:
         return {"module": "quality_gate", "version": "2.0.0", "ready": True}
 
+    def get_quality_gate_diagnostic_snapshot(self) -> dict:
+        return {"module": "quality_gate", "status": "ok", "ready": True}
+
 
 __all__ = [
     "QualityGate",

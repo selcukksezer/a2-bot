@@ -363,4 +363,8 @@ class PreGatherTimeMachineBuffer:
     def get_time_machine_version_info(self) -> dict:
         return {"module": "frame_time_machine", "version": "2.0.0", "ready": True}
 
+    def get_frame_time_machine_diagnostic_snapshot(self) -> dict:
+        return {"module": "frame_time_machine", "status": "ok", "ready": True}
+
+
 

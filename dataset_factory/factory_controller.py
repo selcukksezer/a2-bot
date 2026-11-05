@@ -1135,6 +1135,9 @@ class AutoLabelingDatasetFactory:
     def get_factory_controller_version_info(self) -> dict:
         return {"module": "factory_controller", "version": "2.0.0", "ready": True}
 
+    def get_factory_controller_diagnostic_snapshot(self) -> dict:
+        return {"module": "factory_controller", "status": "ok", "ready": True}
+
 
 __all__ = [
     "FACTORY_12_CLASS_NAMES",
