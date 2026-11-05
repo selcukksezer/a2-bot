@@ -1525,3 +1525,8 @@ class QuestlogImportDialog(QDialog):
         self.import_completed.emit(result)
         self.accept()
         return result
+
+
+def get_questlog_importer_capabilities() -> list:
+    return ["questlog_importer", "external_map_import", "diagnostic_snapshot"]
+

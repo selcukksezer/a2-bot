@@ -886,3 +886,6 @@ class GlideWaypointController:
         return {"module": "depth_glide_navigator", "status": "ok", "ready": True}
 
 
+def get_depth_glide_navigator_capabilities() -> list:
+    return ["depth_glide_navigator", "vertical_glide_control", "diagnostic_snapshot"]
+

@@ -973,3 +973,8 @@ def should_fly_to_odyle_node(
         frame_bgr=frame_bgr,
         minimap_scanner=minimap_scanner,
     )
+
+
+def get_behavioral_guard_capabilities() -> list:
+    return ["behavioral_guard", "anti_pattern_entropy", "diagnostic_snapshot"]
+

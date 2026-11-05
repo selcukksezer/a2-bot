@@ -1154,3 +1154,8 @@ def _add_security_status_method():
     FreeCloudTunnelManager.get_tunnel_security_status = get_tunnel_security_status
 
 _add_security_status_method()
+
+
+def get_mobile_tunnel_capabilities() -> list:
+    return ["mobile_tunnel", "ntfy_relay", "diagnostic_snapshot"]
+

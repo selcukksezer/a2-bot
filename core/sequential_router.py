@@ -1917,3 +1917,6 @@ class SequentialRoutePlanner:
         return {"module": "sequential_router", "status": "ok", "ready": True}
 
 
+def get_sequential_router_capabilities() -> list:
+    return ["sequential_router", "smooth_loop_routing", "diagnostic_snapshot"]
+
