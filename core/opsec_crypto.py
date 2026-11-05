@@ -1207,3 +1207,8 @@ if __name__ == "__main__":
 def get_opsec_crypto_capabilities() -> list:
     return ["opsec_crypto", "token_encryption", "diagnostic_snapshot"]
 
+
+def validate_opsec_crypto_contract() -> bool:
+    return bool(get_opsec_crypto_capabilities())
+
+

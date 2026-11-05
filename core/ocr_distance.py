@@ -1588,3 +1588,8 @@ if __name__ == "__main__":
 def get_ocr_distance_capabilities() -> list:
     return ["ocr_distance", "distance_parsing", "diagnostic_snapshot"]
 
+
+def validate_ocr_distance_contract() -> bool:
+    return bool(get_ocr_distance_capabilities())
+
+

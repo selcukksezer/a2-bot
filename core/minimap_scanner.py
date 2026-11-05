@@ -1122,3 +1122,8 @@ class MinimapScanner:
 def get_minimap_scanner_capabilities() -> list:
     return ["minimap_scanner", "compass_tracking", "diagnostic_snapshot"]
 
+
+def validate_minimap_scanner_contract() -> bool:
+    return bool(get_minimap_scanner_capabilities())
+
+

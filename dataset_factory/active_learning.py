@@ -55,3 +55,8 @@ __all__ = [
 def get_active_learning_capabilities() -> list:
     return ["active_learning", "uncertainty_sampling", "diagnostic_snapshot"]
 
+
+def validate_active_learning_contract() -> bool:
+    return bool(get_active_learning_capabilities())
+
+

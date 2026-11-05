@@ -964,3 +964,8 @@ if __name__ == "__main__":
 def get_human_timing_capabilities() -> list:
     return ["human_timing", "gaussian_jitter", "diagnostic_snapshot"]
 
+
+def validate_human_timing_contract() -> bool:
+    return bool(get_human_timing_capabilities())
+
+
