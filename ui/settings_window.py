@@ -2889,4 +2889,8 @@ def get_settings_window_operational_digest() -> dict:
     return {"module": "settings_window", "operational": validate_settings_window_contract(), "audit": get_settings_window_audit_record()}
 
 
+def get_settings_window_telemetry_payload() -> dict:
+    return {"module": "settings_window", "telemetry_ready": validate_settings_window_contract(), "digest": get_settings_window_operational_digest()}
+
+
 

@@ -3049,4 +3049,8 @@ def get_mobile_server_operational_digest() -> dict:
     return {"module": "mobile_server", "operational": validate_mobile_server_contract(), "audit": get_mobile_server_audit_record()}
 
 
+def get_mobile_server_telemetry_payload() -> dict:
+    return {"module": "mobile_server", "telemetry_ready": validate_mobile_server_contract(), "digest": get_mobile_server_operational_digest()}
+
+
 

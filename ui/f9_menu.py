@@ -1159,4 +1159,6 @@ def get_f9_menu_operational_digest() -> dict:
     return {"module": "f9_menu", "operational": validate_f9_menu_contract(), "audit": get_f9_menu_audit_record()}
 
 
+def get_f9_menu_telemetry_payload() -> dict:
+    return {"module": "f9_menu", "telemetry_ready": validate_f9_menu_contract(), "digest": get_f9_menu_operational_digest()}
 

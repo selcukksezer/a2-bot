@@ -667,3 +667,7 @@ def get_analytics_dialog_operational_digest() -> dict:
     return {"module": "analytics_dialog", "operational": validate_analytics_dialog_contract(), "audit": get_analytics_dialog_audit_record()}
 
 
+def get_analytics_dialog_telemetry_payload() -> dict:
+    return {"module": "analytics_dialog", "telemetry_ready": validate_analytics_dialog_contract(), "digest": get_analytics_dialog_operational_digest()}
+
+
