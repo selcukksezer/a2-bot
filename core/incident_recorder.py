@@ -704,3 +704,7 @@ def get_incident_recorder_readiness_status() -> dict:
     return {"module": "incident_recorder", "ready": validate_incident_recorder_contract(), "metrics": get_incident_recorder_baseline_metrics()}
 
 
+def get_incident_recorder_audit_record() -> dict:
+    return {"module": "incident_recorder", "audit_passed": validate_incident_recorder_contract(), "readiness": get_incident_recorder_readiness_status()}
+
+

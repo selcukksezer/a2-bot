@@ -443,3 +443,12 @@ def get_dry_run_simulator_readiness_status() -> dict:
     }
 
 
+def get_dry_run_simulator_audit_record() -> dict:
+    return {
+        "module": "dry_run_simulator",
+        "audit_passed": validate_dry_run_simulator_contract(),
+        "readiness": get_dry_run_simulator_readiness_status(),
+    }
+
+
+
