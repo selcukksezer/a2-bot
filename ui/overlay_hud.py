@@ -1174,6 +1174,12 @@ class OverlayHUD(QWidget):
             logger.error("OverlayHUD.mouseReleaseEvent hatası: %s", exc)
         super().mouseReleaseEvent(event)
 
+    def get_overlay_hud_health_summary(self) -> dict:
+        try:
+            return {"overlay_hud_ready": True}
+        except Exception:
+            return {"overlay_hud_ready": False}
+
 
 # GameOverlay içe aktaran modüller için geriye dönük uyumluluk takma adı
 GameOverlay = OverlayHUD

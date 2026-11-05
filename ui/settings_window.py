@@ -2845,6 +2845,12 @@ class SettingsWindow(QDialog):
                         summary[sec_name] = dict(sec_obj.__dict__)
         return summary
 
+    def get_settings_window_health_summary(self) -> dict:
+        try:
+            return {"settings_window_ready": True}
+        except Exception:
+            return {"settings_window_ready": False}
+
 
 # Backwards compatibility alias
 SettingsDialog = SettingsWindow

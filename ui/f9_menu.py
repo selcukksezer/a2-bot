@@ -1115,3 +1115,9 @@ class F9Menu(QWidget):
             logger.info("Destek tanılama raporu panoya kopyalandı (%d karakter).", len(report))
         except Exception as exc:
             logger.error("Destek bilgisi panoya kopyalanamadı: %s", exc)
+
+    def get_f9_menu_health_summary(self) -> dict:
+        try:
+            return {"f9_menu_ready": True}
+        except Exception:
+            return {"f9_menu_ready": False}

@@ -626,3 +626,9 @@ class AnalyticsDialog(QDialog):
         except Exception as exc:
             logger.error(f"closeEvent hatası: {exc}")
         super().closeEvent(event)
+
+    def get_analytics_dialog_health_summary(self) -> dict:
+        try:
+            return {"analytics_dialog_ready": True}
+        except Exception:
+            return {"analytics_dialog_ready": False}

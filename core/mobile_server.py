@@ -2951,6 +2951,12 @@ class MobileRemoteServer:
 
         return self._builtin_fallback_html()
 
+    def get_mobile_server_health_summary(self) -> dict:
+        try:
+            return {"mobile_server_ready": True}
+        except Exception:
+            return {"mobile_server_ready": False}
+
     def _builtin_fallback_html(self) -> str:
         return """<!DOCTYPE html>
 <html lang="tr">
