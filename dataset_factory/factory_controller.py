@@ -1189,3 +1189,7 @@ def validate_factory_controller_contract() -> bool:
     return bool(get_factory_controller_capabilities())
 
 
+def get_factory_controller_baseline_metrics() -> dict:
+    return {"module": "factory_controller", "contract_valid": validate_factory_controller_contract(), "capability_count": len(get_factory_controller_capabilities())}
+
+

@@ -31,3 +31,7 @@ def validate_quality_gate_contract() -> bool:
     return bool(get_quality_gate_capabilities())
 
 
+def get_quality_gate_baseline_metrics() -> dict:
+    return {"module": "quality_gate", "contract_valid": validate_quality_gate_contract(), "capability_count": len(get_quality_gate_capabilities())}
+
+

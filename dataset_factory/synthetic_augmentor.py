@@ -810,3 +810,7 @@ def validate_synthetic_augmentor_contract() -> bool:
     return bool(get_synthetic_augmentor_capabilities())
 
 
+def get_synthetic_augmentor_baseline_metrics() -> dict:
+    return {"module": "synthetic_augmentor", "contract_valid": validate_synthetic_augmentor_contract(), "capability_count": len(get_synthetic_augmentor_capabilities())}
+
+

@@ -375,3 +375,7 @@ def validate_frame_time_machine_contract() -> bool:
     return bool(get_frame_time_machine_capabilities())
 
 
+def get_frame_time_machine_baseline_metrics() -> dict:
+    return {"module": "frame_time_machine", "contract_valid": validate_frame_time_machine_contract(), "capability_count": len(get_frame_time_machine_capabilities())}
+
+

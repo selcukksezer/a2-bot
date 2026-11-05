@@ -1399,3 +1399,7 @@ def validate_economy_broker_contract() -> bool:
     return bool(get_economy_broker_capabilities())
 
 
+def get_economy_broker_baseline_metrics() -> dict:
+    return {"module": "economy_broker", "contract_valid": validate_economy_broker_contract(), "capability_count": len(get_economy_broker_capabilities())}
+
+
