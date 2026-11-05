@@ -1530,3 +1530,8 @@ class QuestlogImportDialog(QDialog):
 def get_questlog_importer_capabilities() -> list:
     return ["questlog_importer", "external_map_import", "diagnostic_snapshot"]
 
+
+def validate_questlog_importer_contract() -> bool:
+    return bool(get_questlog_importer_capabilities())
+
+

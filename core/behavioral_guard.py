@@ -978,3 +978,7 @@ def should_fly_to_odyle_node(
 def get_behavioral_guard_capabilities() -> list:
     return ["behavioral_guard", "anti_pattern_entropy", "diagnostic_snapshot"]
 
+
+def validate_behavioral_guard_contract() -> bool:
+    return bool(get_behavioral_guard_capabilities())
+

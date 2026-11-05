@@ -1920,3 +1920,8 @@ class SequentialRoutePlanner:
 def get_sequential_router_capabilities() -> list:
     return ["sequential_router", "smooth_loop_routing", "diagnostic_snapshot"]
 
+
+def validate_sequential_router_contract() -> bool:
+    return bool(get_sequential_router_capabilities())
+
+

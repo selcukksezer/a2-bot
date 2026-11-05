@@ -889,3 +889,8 @@ class GlideWaypointController:
 def get_depth_glide_navigator_capabilities() -> list:
     return ["depth_glide_navigator", "vertical_glide_control", "diagnostic_snapshot"]
 
+
+def validate_depth_glide_navigator_contract() -> bool:
+    return bool(get_depth_glide_navigator_capabilities())
+
+

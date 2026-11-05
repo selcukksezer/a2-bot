@@ -1159,3 +1159,8 @@ _add_security_status_method()
 def get_mobile_tunnel_capabilities() -> list:
     return ["mobile_tunnel", "ntfy_relay", "diagnostic_snapshot"]
 
+
+def validate_mobile_tunnel_contract() -> bool:
+    return bool(get_mobile_tunnel_capabilities())
+
+
