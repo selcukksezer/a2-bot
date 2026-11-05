@@ -47,4 +47,6 @@ def get_ui_init_operational_digest() -> dict:
     return {"module": "ui_init", "operational": validate_ui_init_contract(), "audit": get_ui_init_audit_record()}
 
 
+def get_ui_init_telemetry_payload() -> dict:
+    return {"module": "ui_init", "telemetry_ready": validate_ui_init_contract(), "digest": get_ui_init_operational_digest()}
 

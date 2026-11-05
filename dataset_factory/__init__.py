@@ -16,6 +16,7 @@ __all__ = [
     "get_dataset_factory_package_readiness_status",
     "get_dataset_factory_package_audit_record",
     "get_dataset_factory_init_operational_digest",
+    "get_dataset_factory_init_telemetry_payload",
 ]
 
 
@@ -79,6 +80,14 @@ def get_dataset_factory_init_operational_digest() -> dict:
         "module": "dataset_factory_init",
         "operational": validate_dataset_factory_init_contract(),
         "audit": get_dataset_factory_init_audit_record(),
+    }
+
+
+def get_dataset_factory_init_telemetry_payload() -> dict:
+    return {
+        "module": "dataset_factory_init",
+        "telemetry_ready": validate_dataset_factory_init_contract(),
+        "digest": get_dataset_factory_init_operational_digest(),
     }
 
 

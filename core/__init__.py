@@ -48,3 +48,7 @@ def get_core_init_operational_digest() -> dict:
     return {"module": "core_init", "operational": validate_core_init_contract(), "audit": get_core_init_audit_record()}
 
 
+def get_core_init_telemetry_payload() -> dict:
+    return {"module": "core_init", "telemetry_ready": validate_core_init_contract(), "digest": get_core_init_operational_digest()}
+
+
