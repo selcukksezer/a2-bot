@@ -3028,3 +3028,7 @@ refresh();
 def get_mobile_server_capabilities() -> list:
     return ["mobile_server", "remote_api", "diagnostic_snapshot"]
 
+
+def validate_mobile_server_contract() -> bool:
+    return bool(get_mobile_server_capabilities())
+

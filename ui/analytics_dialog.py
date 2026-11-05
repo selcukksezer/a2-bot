@@ -646,3 +646,8 @@ class AnalyticsDialog(QDialog):
 def get_analytics_dialog_capabilities() -> list:
     return ["analytics_dialog", "telemetry_visualization", "diagnostic_snapshot"]
 
+
+def validate_analytics_dialog_contract() -> bool:
+    return bool(get_analytics_dialog_capabilities())
+
+

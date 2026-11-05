@@ -1199,3 +1199,8 @@ __all__ = ["OverlayHUD", "GameOverlay", "OverlaySignals", "ClickableShortcutWidg
 def get_overlay_hud_capabilities() -> list:
     return ["overlay_hud", "transparent_hud", "diagnostic_snapshot"]
 
+
+def validate_overlay_hud_contract() -> bool:
+    return bool(get_overlay_hud_capabilities())
+
+

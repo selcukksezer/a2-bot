@@ -2868,3 +2868,7 @@ SettingsDialog = SettingsWindow
 def get_settings_window_capabilities() -> list:
     return ["settings_window", "configuration_ui", "diagnostic_snapshot"]
 
+
+def validate_settings_window_contract() -> bool:
+    return bool(get_settings_window_capabilities())
+

@@ -1139,3 +1139,7 @@ def get_f9_menu_capabilities() -> list:
     return ["f9_menu", "quick_actions", "diagnostic_snapshot"]
 
 
+def validate_f9_menu_contract() -> bool:
+    return bool(get_f9_menu_capabilities())
+
+
