@@ -1589,3 +1589,7 @@ def get_dataset_curator_compliance_certificate() -> dict:
 def get_dataset_curator_readiness_probe() -> dict:
     return {"module": "dataset_curator", "ready": validate_dataset_curator_contract(), "certificate": get_dataset_curator_compliance_certificate()}
 
+
+def get_dataset_curator_audit_summary() -> dict:
+    return {"module": "dataset_curator", "audit_passed": validate_dataset_curator_contract(), "probe": get_dataset_curator_readiness_probe()}
+

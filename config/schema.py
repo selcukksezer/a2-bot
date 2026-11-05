@@ -700,3 +700,10 @@ def get_schema_readiness_probe() -> dict:
     }
 
 
+def get_schema_audit_summary() -> dict:
+    return {
+        "module": "schema",
+        "audit_passed": validate_schema_contract(),
+        "probe": get_schema_readiness_probe(),
+    }
+

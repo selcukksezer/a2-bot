@@ -145,3 +145,7 @@ def get_menu_readiness_probe() -> dict:
     return {"module": "menu", "ready": validate_menu_contract(), "certificate": get_menu_compliance_certificate()}
 
 
+def get_menu_audit_summary() -> dict:
+    return {"module": "menu", "audit_passed": validate_menu_contract(), "probe": get_menu_readiness_probe()}
+
+

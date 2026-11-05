@@ -244,3 +244,7 @@ def get_overlay_readiness_probe() -> dict:
     return {"module": "overlay", "ready": validate_overlay_contract(), "certificate": get_overlay_compliance_certificate()}
 
 
+def get_overlay_audit_summary() -> dict:
+    return {"module": "overlay", "audit_passed": validate_overlay_contract(), "probe": get_overlay_readiness_probe()}
+
+

@@ -356,3 +356,11 @@ def get_settings_dialog_readiness_probe() -> dict:
     }
 
 
+def get_settings_dialog_audit_summary() -> dict:
+    return {
+        "module": "settings_dialog",
+        "audit_passed": validate_settings_dialog_contract(),
+        "probe": get_settings_dialog_readiness_probe(),
+    }
+
+
