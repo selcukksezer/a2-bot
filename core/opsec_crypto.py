@@ -1220,3 +1220,12 @@ def get_opsec_crypto_baseline_metrics() -> dict:
     }
 
 
+def get_opsec_crypto_readiness_status() -> dict:
+    return {
+        "module": "opsec_crypto",
+        "ready": validate_opsec_crypto_contract(),
+        "metrics": get_opsec_crypto_baseline_metrics(),
+    }
+
+
+

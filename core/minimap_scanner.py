@@ -1135,3 +1135,19 @@ def get_minimap_scanner_baseline_metrics() -> dict:
     }
 
 
+def get_minimap_scanner_readiness_status() -> dict:
+    try:
+        return {
+            "module": "minimap_scanner",
+            "ready": validate_minimap_scanner_contract(),
+            "metrics": get_minimap_scanner_baseline_metrics(),
+        }
+    except Exception:
+        return {
+            "module": "minimap_scanner",
+            "ready": False,
+            "metrics": {},
+        }
+
+
+

@@ -973,3 +973,8 @@ def get_human_timing_baseline_metrics() -> dict:
     return {"module": "human_timing", "contract_valid": validate_human_timing_contract(), "capability_count": len(get_human_timing_capabilities())}
 
 
+def get_human_timing_readiness_status() -> dict:
+    return {"module": "human_timing", "ready": validate_human_timing_contract(), "metrics": get_human_timing_baseline_metrics()}
+
+
+

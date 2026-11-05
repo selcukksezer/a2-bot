@@ -49,6 +49,7 @@ __all__ = [
     "CLASS_NAME_TO_ID",
     "normalize_material_class_key",
     "resolve_class_id",
+    "get_active_learning_readiness_status",
 ]
 
 
@@ -62,5 +63,10 @@ def validate_active_learning_contract() -> bool:
 
 def get_active_learning_baseline_metrics() -> dict:
     return {"module": "active_learning", "contract_valid": validate_active_learning_contract(), "capability_count": len(get_active_learning_capabilities())}
+
+
+def get_active_learning_readiness_status() -> dict:
+    return {"module": "active_learning", "ready": validate_active_learning_contract(), "metrics": get_active_learning_baseline_metrics()}
+
 
 
