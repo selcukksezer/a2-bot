@@ -986,3 +986,8 @@ def get_template_extractor_baseline_metrics() -> dict:
     return {"module": "template_extractor", "contract_valid": validate_template_extractor_contract(), "capability_count": len(get_template_extractor_capabilities())}
 
 
+def get_template_extractor_readiness_status() -> dict:
+    return {"module": "template_extractor", "ready": validate_template_extractor_contract(), "metrics": get_template_extractor_baseline_metrics()}
+
+
+

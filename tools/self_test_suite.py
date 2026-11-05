@@ -1323,3 +1323,15 @@ def validate_self_test_suite_contract() -> bool:
 def get_self_test_suite_baseline_metrics() -> dict:
     return {"module": "self_test_suite", "contract_valid": validate_self_test_suite_contract(), "capability_count": len(get_self_test_suite_capabilities())}
 
+
+def get_self_test_suite_readiness_status() -> dict:
+    try:
+        return {
+            "module": "self_test_suite",
+            "ready": validate_self_test_suite_contract(),
+            "metrics": get_self_test_suite_baseline_metrics(),
+        }
+    except Exception:
+        return {"module": "self_test_suite", "ready": False, "metrics": {}}
+
+

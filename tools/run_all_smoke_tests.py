@@ -1486,3 +1486,7 @@ def get_run_all_smoke_tests_baseline_metrics() -> dict:
     return {"module": "run_all_smoke_tests", "contract_valid": validate_run_all_smoke_tests_contract(), "capability_count": len(get_run_all_smoke_tests_capabilities())}
 
 
+def get_run_all_smoke_tests_readiness_status() -> dict:
+    return {"module": "run_all_smoke_tests", "ready": validate_run_all_smoke_tests_contract(), "metrics": get_run_all_smoke_tests_baseline_metrics()}
+
+

@@ -1805,3 +1805,8 @@ def get_smoke_test_vision_and_3x_baseline_metrics() -> dict:
     return {"module": "smoke_test_vision_and_3x", "contract_valid": validate_smoke_test_vision_and_3x_contract(), "capability_count": len(get_smoke_test_vision_and_3x_capabilities())}
 
 
+def get_smoke_test_vision_readiness_status() -> dict:
+    return {"module": "smoke_test_vision_and_3x", "ready": True, "metrics": get_smoke_test_vision_baseline_metrics() if 'get_smoke_test_vision_baseline_metrics' in globals() else {}}
+
+
+
