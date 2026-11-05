@@ -1021,3 +1021,12 @@ def get_behavioral_guard_telemetry_payload() -> dict:
         "payload": get_behavioral_guard_operational_digest(),
     }
 
+
+def get_behavioral_guard_integrity_seal() -> dict:
+    return {
+        "module": "behavioral_guard",
+        "sealed": validate_behavioral_guard_contract(),
+        "telemetry": get_behavioral_guard_telemetry_payload(),
+    }
+
+

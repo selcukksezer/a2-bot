@@ -928,3 +928,12 @@ def get_depth_glide_navigator_telemetry_payload() -> dict:
         "payload": get_depth_glide_navigator_operational_digest(),
     }
 
+
+def get_depth_glide_navigator_integrity_seal() -> dict:
+    return {
+        "module": "depth_glide_navigator",
+        "sealed": validate_depth_glide_navigator_contract(),
+        "telemetry": get_depth_glide_navigator_telemetry_payload(),
+    }
+
+

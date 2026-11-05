@@ -1963,3 +1963,12 @@ def get_sequential_router_telemetry_payload() -> dict:
         "payload": get_sequential_router_operational_digest(),
     }
 
+
+def get_sequential_router_integrity_seal() -> dict:
+    return {
+        "module": "sequential_router",
+        "sealed": validate_sequential_router_contract(),
+        "telemetry": get_sequential_router_telemetry_payload(),
+    }
+
+

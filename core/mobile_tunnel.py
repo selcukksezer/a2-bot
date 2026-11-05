@@ -1184,3 +1184,7 @@ def get_mobile_tunnel_telemetry_payload() -> dict:
     return {"module": "mobile_tunnel", "payload": get_mobile_tunnel_operational_digest()}
 
 
+def get_mobile_tunnel_integrity_seal() -> dict:
+    return {"module": "mobile_tunnel", "sealed": validate_mobile_tunnel_contract(), "telemetry": get_mobile_tunnel_telemetry_payload()}
+
+
