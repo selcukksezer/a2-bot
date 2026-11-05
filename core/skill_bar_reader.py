@@ -513,3 +513,7 @@ def get_skill_bar_reader_audit_summary() -> dict:
     return {"module": "skill_bar_reader", "audit_passed": validate_skill_bar_reader_contract(), "probe": get_skill_bar_reader_readiness_probe()}
 
 
+def get_skill_bar_reader_heartbeat_snapshot() -> dict:
+    return {"module": "skill_bar_reader", "alive": validate_skill_bar_reader_contract(), "audit": get_skill_bar_reader_audit_summary()}
+
+

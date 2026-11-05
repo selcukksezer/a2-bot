@@ -498,3 +498,12 @@ def get_dry_run_simulator_audit_summary() -> dict:
         "probe": get_dry_run_simulator_readiness_probe(),
     }
 
+
+def get_dry_run_simulator_heartbeat_snapshot() -> dict:
+    return {
+        "module": "dry_run_simulator",
+        "alive": validate_dry_run_simulator_contract(),
+        "audit": get_dry_run_simulator_audit_summary(),
+    }
+
+

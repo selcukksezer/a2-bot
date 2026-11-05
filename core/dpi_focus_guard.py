@@ -867,3 +867,12 @@ def get_dpi_focus_guard_audit_summary() -> dict:
     }
 
 
+def get_dpi_focus_guard_heartbeat_snapshot() -> dict:
+    return {
+        "module": "dpi_focus_guard",
+        "alive": validate_dpi_focus_guard_contract(),
+        "audit": get_dpi_focus_guard_audit_summary(),
+    }
+
+
+
