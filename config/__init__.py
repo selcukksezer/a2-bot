@@ -74,3 +74,11 @@ def get_config_pkg_readiness_probe() -> dict:
 def get_config_pkg_audit_summary() -> dict:
     return {"module": "config_pkg", "audit_passed": validate_config_pkg_contract(), "probe": get_config_pkg_readiness_probe()}
 
+
+get_config_init_audit_summary = get_config_pkg_audit_summary
+
+
+def get_config_init_heartbeat_snapshot() -> dict:
+    return {"module": "config_init", "alive": validate_config_init_contract(), "audit": get_config_init_audit_summary()}
+
+

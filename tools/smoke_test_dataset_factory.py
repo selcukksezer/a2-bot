@@ -1227,3 +1227,12 @@ def get_smoke_test_dataset_factory_audit_summary() -> dict:
         "probe": get_smoke_test_dataset_factory_readiness_probe(),
     }
 
+
+def get_smoke_test_dataset_factory_heartbeat_snapshot() -> dict:
+    return {
+        "module": "smoke_test_dataset_factory",
+        "alive": validate_smoke_test_dataset_factory_contract(),
+        "audit": get_smoke_test_dataset_factory_audit_summary(),
+    }
+
+

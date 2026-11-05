@@ -21,6 +21,7 @@ __all__ = [
     "get_dataset_factory_package_compliance_certificate",
     "get_dataset_factory_pkg_readiness_probe",
     "get_dataset_factory_pkg_audit_summary",
+    "get_dataset_factory_init_heartbeat_snapshot",
 ]
 
 
@@ -131,6 +132,17 @@ def get_dataset_factory_pkg_audit_summary() -> dict:
         "module": "dataset_factory_pkg",
         "audit_passed": validate_dataset_factory_pkg_contract(),
         "probe": get_dataset_factory_pkg_readiness_probe(),
+    }
+
+
+get_dataset_factory_init_audit_summary = get_dataset_factory_pkg_audit_summary
+
+
+def get_dataset_factory_init_heartbeat_snapshot() -> dict:
+    return {
+        "module": "dataset_factory_init",
+        "alive": validate_dataset_factory_init_contract(),
+        "audit": get_dataset_factory_init_audit_summary(),
     }
 
 

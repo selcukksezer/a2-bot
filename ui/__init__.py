@@ -73,3 +73,11 @@ def get_ui_pkg_readiness_probe() -> dict:
 def get_ui_pkg_audit_summary() -> dict:
     return {"module": "ui_pkg", "audit_passed": validate_ui_pkg_contract(), "probe": get_ui_pkg_readiness_probe()}
 
+
+get_ui_init_audit_summary = get_ui_pkg_audit_summary
+
+
+def get_ui_init_heartbeat_snapshot() -> dict:
+    return {"module": "ui_init", "alive": validate_ui_init_contract(), "audit": get_ui_init_audit_summary()}
+
+

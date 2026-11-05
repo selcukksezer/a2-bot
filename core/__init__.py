@@ -75,3 +75,10 @@ def get_core_pkg_readiness_probe() -> dict:
 def get_core_pkg_audit_summary() -> dict:
     return {"module": "core_pkg", "audit_passed": validate_core_pkg_contract(), "probe": get_core_pkg_readiness_probe()}
 
+
+get_core_init_audit_summary = get_core_pkg_audit_summary
+
+
+def get_core_init_heartbeat_snapshot() -> dict:
+    return {"module": "core_init", "alive": validate_core_init_contract(), "audit": get_core_init_audit_summary()}
+
