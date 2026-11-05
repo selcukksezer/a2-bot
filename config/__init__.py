@@ -59,3 +59,7 @@ def get_config_package_integrity_seal() -> dict:
     return {"module": "config_package", "sealed": validate_config_package_contract(), "telemetry": get_config_package_telemetry_payload()}
 
 
+def get_config_package_compliance_certificate() -> dict:
+    return {"module": "config_package", "certified": validate_config_package_contract(), "seal": get_config_package_integrity_seal()}
+
+

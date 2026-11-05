@@ -60,3 +60,7 @@ def get_core_package_integrity_seal() -> dict:
     return {"module": "core_package", "sealed": validate_core_package_contract(), "telemetry": get_core_package_telemetry_payload()}
 
 
+def get_core_package_compliance_certificate() -> dict:
+    return {"module": "core_package", "certified": validate_core_package_contract(), "seal": get_core_package_integrity_seal()}
+
+

@@ -58,3 +58,7 @@ def get_ui_package_integrity_seal() -> dict:
     return {"module": "ui_package", "sealed": validate_ui_package_contract(), "telemetry": get_ui_package_telemetry_payload()}
 
 
+def get_ui_package_compliance_certificate() -> dict:
+    return {"module": "ui_package", "certified": validate_ui_package_contract(), "seal": get_ui_package_integrity_seal()}
+
+

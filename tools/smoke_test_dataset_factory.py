@@ -1204,4 +1204,10 @@ def get_smoke_test_dataset_factory_integrity_seal() -> dict:
     }
 
 
+def get_smoke_test_dataset_factory_compliance_certificate() -> dict:
+    return {
+        "module": "smoke_test_dataset_factory",
+        "certified": validate_smoke_test_dataset_factory_contract(),
+        "seal": get_smoke_test_dataset_factory_integrity_seal(),
+    }
 
