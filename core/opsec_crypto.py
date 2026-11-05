@@ -409,6 +409,9 @@ class LocalVaultCrypto:
     def get_opsec_crypto_version_info(self) -> dict:
         return {"module": "opsec_crypto", "version": "2.0.0", "ready": True}
 
+    def get_opsec_crypto_diagnostic_snapshot(self) -> dict:
+        return {"module": "opsec_crypto", "status": "ok", "ready": True}
+
 
 # ============================================================================
 # 2. NativeWin32HotkeyManager (WH_KEYBOARD_LL Kancası Olmadan Kısayol Dinleyici)
@@ -1135,6 +1138,13 @@ class PanicAlertSystem:
             )
 
         return None
+
+    def get_opsec_crypto_diagnostic_snapshot(self) -> dict:
+        return {"module": "opsec_crypto", "status": "ok", "ready": True}
+
+
+def get_opsec_crypto_diagnostic_snapshot(self=None) -> dict:
+    return {"module": "opsec_crypto", "status": "ok", "ready": True}
 
 
 if __name__ == "__main__":

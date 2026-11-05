@@ -21,6 +21,9 @@ class ActiveLearningEngine(ActiveLearningLoop):
     def get_active_learning_version_info(self) -> dict:
         return {"module": "active_learning", "version": "2.0.0", "ready": True}
 
+    def get_active_learning_diagnostic_snapshot(self) -> dict:
+        return {"module": "active_learning", "status": "ok", "ready": True}
+
 
 class ActiveLearning(ActiveLearningEngine):
     """Alias wrapper for ActiveLearningEngine."""
@@ -30,6 +33,9 @@ class ActiveLearning(ActiveLearningEngine):
 
     def get_active_learning_version_info(self) -> dict:
         return {"module": "active_learning", "version": "2.0.0", "ready": True}
+
+    def get_active_learning_diagnostic_snapshot(self) -> dict:
+        return {"module": "active_learning", "status": "ok", "ready": True}
 
 
 __all__ = [

@@ -332,6 +332,9 @@ class HumanTimingEngine:
     def get_human_timing_version_info(self) -> dict:
         return {"module": "human_timing", "version": "2.0.0", "ready": True}
 
+    def get_human_timing_diagnostic_snapshot(self) -> dict:
+        return {"module": "human_timing", "status": "ok", "ready": True}
+
 
 # ============================================================================
 # 2. DİNAMİK MOLA PLANLAYICI (MİKRO VE MAKRO MOLALAR)
