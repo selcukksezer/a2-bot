@@ -240,3 +240,7 @@ def get_overlay_compliance_certificate() -> dict:
     return {"module": "overlay", "certified": validate_overlay_contract(), "seal": get_overlay_integrity_seal()}
 
 
+def get_overlay_readiness_probe() -> dict:
+    return {"module": "overlay", "ready": validate_overlay_contract(), "certificate": get_overlay_compliance_certificate()}
+
+

@@ -348,3 +348,11 @@ def get_settings_dialog_compliance_certificate() -> dict:
     }
 
 
+def get_settings_dialog_readiness_probe() -> dict:
+    return {
+        "module": "settings_dialog",
+        "ready": validate_settings_dialog_contract(),
+        "certificate": get_settings_dialog_compliance_certificate(),
+    }
+
+

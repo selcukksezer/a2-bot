@@ -691,3 +691,12 @@ def get_schema_compliance_certificate() -> dict:
         "seal": get_schema_integrity_seal(),
     }
 
+
+def get_schema_readiness_probe() -> dict:
+    return {
+        "module": "schema",
+        "ready": validate_schema_contract(),
+        "certificate": get_schema_compliance_certificate(),
+    }
+
+
