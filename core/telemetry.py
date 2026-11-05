@@ -1196,3 +1196,7 @@ def get_telemetry_capabilities() -> list:
 def validate_telemetry_contract() -> bool:
     return bool(get_telemetry_capabilities())
 
+
+def get_telemetry_baseline_metrics() -> dict:
+    return {"module": "telemetry", "contract_valid": validate_telemetry_contract(), "capability_count": len(get_telemetry_capabilities())}
+

@@ -1360,3 +1360,8 @@ def get_watchdog_capabilities() -> list:
 def validate_watchdog_contract() -> bool:
     return bool(get_watchdog_capabilities())
 
+
+def get_watchdog_baseline_metrics() -> dict:
+    return {"module": "watchdog", "contract_valid": validate_watchdog_contract(), "capability_count": len(get_watchdog_capabilities())}
+
+

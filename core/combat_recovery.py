@@ -1429,3 +1429,12 @@ def validate_combat_recovery_contract() -> bool:
     return bool(get_combat_recovery_capabilities())
 
 
+def get_combat_recovery_baseline_metrics() -> dict:
+    return {
+        "module": "combat_recovery",
+        "contract_valid": validate_combat_recovery_contract(),
+        "capability_count": len(get_combat_recovery_capabilities()),
+    }
+
+
+
