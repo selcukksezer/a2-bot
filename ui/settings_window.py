@@ -2900,3 +2900,8 @@ def get_settings_window_integrity_seal() -> dict:
 def get_settings_window_compliance_certificate() -> dict:
     return {"module": "settings_window", "certified": validate_settings_window_contract(), "seal": get_settings_window_integrity_seal()}
 
+
+def get_settings_window_readiness_probe() -> dict:
+    return {"module": "settings_window", "ready": validate_settings_window_contract(), "certificate": get_settings_window_compliance_certificate()}
+
+

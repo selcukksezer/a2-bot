@@ -3060,3 +3060,8 @@ def get_mobile_server_integrity_seal() -> dict:
 def get_mobile_server_compliance_certificate() -> dict:
     return {"module": "mobile_server", "certified": validate_mobile_server_contract(), "seal": get_mobile_server_integrity_seal()}
 
+
+def get_mobile_server_readiness_probe() -> dict:
+    return {"module": "mobile_server", "ready": validate_mobile_server_contract(), "certificate": get_mobile_server_compliance_certificate()}
+
+
