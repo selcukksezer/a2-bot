@@ -1351,3 +1351,8 @@ if __name__ == "__main__":
     assert "GATHERION A2 BOT - SUPPORT DIAGNOSTIC REPORT" in report_out
     assert "Python" in report_out and "OpenCV" in report_out
     logger.info("core/watchdog.py self-check PASSED (%d chars in support report).", len(report_out))
+
+
+def get_watchdog_capabilities() -> list:
+    return ["watchdog", "stuck_recovery", "diagnostic_snapshot"]
+

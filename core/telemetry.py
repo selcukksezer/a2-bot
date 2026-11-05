@@ -1189,3 +1189,6 @@ class TelemetryEngine:
         return {"module": "telemetry", "status": "ok", "ready": True}
 
 
+def get_telemetry_capabilities() -> list:
+    return ["telemetry", "metrics_aggregation", "diagnostic_snapshot"]
+

@@ -889,4 +889,6 @@ class StealthCapture(DXGIDesktopCapture):
         return {"module": "stealth_capture", "status": "ok", "ready": True}
 
 
+def get_stealth_capture_capabilities() -> list:
+    return ["stealth_capture", "frame_acquisition", "diagnostic_snapshot"]
 

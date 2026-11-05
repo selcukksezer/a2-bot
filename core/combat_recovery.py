@@ -1421,4 +1421,6 @@ class CombatRecovery:
         return {"module": "combat_recovery", "status": "ok", "ready": True}
 
 
+def get_combat_recovery_capabilities() -> list:
+    return ["combat_recovery", "retaliation_protocol", "diagnostic_snapshot"]
 

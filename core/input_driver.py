@@ -1545,3 +1545,8 @@ if __name__ == "__main__":
     assert ctrl._chat_guard_esc_count == esc_before + 2, "toggle_map must press ESC first when chat is open"
 
     logger.info("core/input_driver.py self-check PASSED (esc_guard_count=%d).", ctrl._chat_guard_esc_count)
+
+
+def get_input_driver_capabilities() -> list:
+    return ["input_driver", "humanized_input", "diagnostic_snapshot"]
+
