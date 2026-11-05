@@ -1146,6 +1146,7 @@ __all__ = [
     "get_factory_controller_readiness_status",
     "get_factory_controller_audit_record",
     "get_factory_controller_operational_digest",
+    "get_factory_controller_telemetry_payload",
 ]
 
 
@@ -1206,6 +1207,11 @@ def get_factory_controller_audit_record() -> dict:
 
 def get_factory_controller_operational_digest() -> dict:
     return {"module": "factory_controller", "operational": validate_factory_controller_contract(), "audit": get_factory_controller_audit_record()}
+
+
+def get_factory_controller_telemetry_payload() -> dict:
+    return {"module": "factory_controller", "payload": get_factory_controller_operational_digest()}
+
 
 
 

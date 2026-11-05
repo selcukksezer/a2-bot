@@ -1414,3 +1414,8 @@ def get_economy_broker_audit_record() -> dict:
 def get_economy_broker_operational_digest() -> dict:
     return {"module": "economy_broker", "operational": validate_economy_broker_contract(), "audit": get_economy_broker_audit_record()}
 
+
+def get_economy_broker_telemetry_payload() -> dict:
+    return {"module": "economy_broker", "payload": get_economy_broker_operational_digest()}
+
+

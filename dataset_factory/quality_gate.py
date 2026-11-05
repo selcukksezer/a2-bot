@@ -23,6 +23,7 @@ __all__ = [
     "get_quality_gate_readiness_status",
     "get_quality_gate_audit_record",
     "get_quality_gate_operational_digest",
+    "get_quality_gate_telemetry_payload",
 ]
 
 
@@ -48,4 +49,9 @@ def get_quality_gate_audit_record() -> dict:
 
 def get_quality_gate_operational_digest() -> dict:
     return {"module": "quality_gate", "operational": validate_quality_gate_contract(), "audit": get_quality_gate_audit_record()}
+
+
+def get_quality_gate_telemetry_payload() -> dict:
+    return {"module": "quality_gate", "payload": get_quality_gate_operational_digest()}
+
 

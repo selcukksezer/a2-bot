@@ -391,3 +391,7 @@ def get_frame_time_machine_operational_digest() -> dict:
     return {"module": "frame_time_machine", "operational": validate_frame_time_machine_contract(), "audit": get_frame_time_machine_audit_record()}
 
 
+def get_frame_time_machine_telemetry_payload() -> dict:
+    return {"module": "frame_time_machine", "payload": get_frame_time_machine_operational_digest()}
+
+
