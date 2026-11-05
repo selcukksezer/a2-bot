@@ -100,3 +100,8 @@ def get_config_audit_record() -> dict:
 def get_config_operational_digest() -> dict:
     return {"module": "config", "operational": validate_config_contract(), "audit": get_config_audit_record()}
 
+
+def get_config_telemetry_payload() -> dict:
+    return {"module": "config", "payload": get_config_operational_digest()}
+
+

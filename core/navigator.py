@@ -147,3 +147,7 @@ def get_navigator_operational_digest() -> dict:
     return {"module": "navigator", "operational": validate_navigator_contract(), "audit": get_navigator_audit_record()}
 
 
+def get_navigator_telemetry_payload() -> dict:
+    return {"module": "navigator", "payload": get_navigator_operational_digest()}
+
+

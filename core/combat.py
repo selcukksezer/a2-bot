@@ -103,3 +103,8 @@ def get_combat_operational_digest() -> dict:
     return {"module": "combat", "operational": validate_combat_contract(), "audit": get_combat_audit_record()}
 
 
+def get_combat_telemetry_payload() -> dict:
+    return {"module": "combat", "payload": get_combat_operational_digest()}
+
+
+

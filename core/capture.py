@@ -687,4 +687,6 @@ def get_capture_operational_digest() -> dict:
     return {"module": "capture", "operational": validate_capture_contract(), "audit": get_capture_audit_record()}
 
 
+def get_capture_telemetry_payload() -> dict:
+    return {"module": "capture", "payload": get_capture_operational_digest()}
 
