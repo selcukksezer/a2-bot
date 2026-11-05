@@ -1543,4 +1543,6 @@ def get_questlog_importer_readiness_status() -> dict:
     return {"module": "questlog_importer", "ready": validate_questlog_importer_contract(), "metrics": get_questlog_importer_baseline_metrics()}
 
 
+def get_questlog_importer_audit_record() -> dict:
+    return {"module": "questlog_importer", "audit_passed": validate_questlog_importer_contract(), "readiness": get_questlog_importer_readiness_status()}
 

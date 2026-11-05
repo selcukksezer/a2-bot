@@ -999,3 +999,12 @@ def get_behavioral_guard_readiness_status() -> dict:
     }
 
 
+def get_behavioral_guard_audit_record() -> dict:
+    return {
+        "module": "behavioral_guard",
+        "audit_passed": validate_behavioral_guard_contract(),
+        "readiness": get_behavioral_guard_readiness_status(),
+    }
+
+
+

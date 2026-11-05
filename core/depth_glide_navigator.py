@@ -906,3 +906,12 @@ def get_depth_glide_navigator_readiness_status() -> dict:
     }
 
 
+def get_depth_glide_navigator_audit_record() -> dict:
+    return {
+        "module": "depth_glide_navigator",
+        "audit_passed": validate_depth_glide_navigator_contract(),
+        "readiness": get_depth_glide_navigator_readiness_status(),
+    }
+
+
+
