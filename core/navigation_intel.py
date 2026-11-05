@@ -1980,3 +1980,8 @@ __all__ = [
     "AutoMountManager",
     "MaplessMicroNavigator",
 ]
+
+
+def get_navigation_intel_capabilities() -> list:
+    return ["navigation_intel", "spatial_heuristics", "diagnostic_snapshot"]
+

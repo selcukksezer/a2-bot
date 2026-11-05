@@ -1246,4 +1246,10 @@ __all__ = [
     "StabilityGuards",
     "get_stability_guards_ready_flag",
     "get_stability_health_report",
+    "get_stability_guards_capabilities",
 ]
+
+
+def get_stability_guards_capabilities() -> list:
+    return ["stability_guards", "fault_containment", "diagnostic_snapshot"]
+

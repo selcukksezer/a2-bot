@@ -1037,3 +1037,8 @@ def check_driver_backend_status() -> dict[str, Any]:
         status["active_backend"] = "unavailable"
 
     return status
+
+
+def get_windmouse_humanizer_capabilities() -> list:
+    return ["windmouse_humanizer", "bezier_windmouse", "diagnostic_snapshot"]
+

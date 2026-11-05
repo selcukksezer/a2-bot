@@ -574,4 +574,12 @@ class RouteOptimizer:
     def get_path_optimizer_diagnostic_snapshot(self) -> dict:
         return {"module": "path_optimizer", "status": "ok", "ready": True}
 
+    def get_path_optimizer_capabilities(self) -> list:
+        return ["path_optimizer", "2opt_tsp_solver", "diagnostic_snapshot"]
+
+
+def get_path_optimizer_capabilities() -> list:
+    return ["path_optimizer", "2opt_tsp_solver", "diagnostic_snapshot"]
+
+
 

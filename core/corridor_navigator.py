@@ -1320,3 +1320,6 @@ class CorridorNavigator:
         return {"module": "corridor_navigator", "status": "ok", "ready": True}
 
 
+def get_corridor_navigator_capabilities() -> list:
+    return ["corridor_navigator", "corridor_steering", "diagnostic_snapshot"]
+
