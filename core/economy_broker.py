@@ -1431,5 +1431,6 @@ def get_economy_broker_readiness_probe() -> dict:
     return {"module": "economy_broker", "ready": validate_economy_broker_contract(), "certificate": get_economy_broker_compliance_certificate()}
 
 
-
+def get_economy_broker_audit_summary() -> dict:
+    return {"module": "economy_broker", "audit_passed": validate_economy_broker_contract(), "probe": get_economy_broker_readiness_probe()}
 

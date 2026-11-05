@@ -406,3 +406,7 @@ def get_frame_time_machine_compliance_certificate() -> dict:
 def get_frame_time_machine_readiness_probe() -> dict:
     return {"module": "frame_time_machine", "ready": validate_frame_time_machine_contract(), "certificate": get_frame_time_machine_compliance_certificate()}
 
+
+def get_frame_time_machine_audit_summary() -> dict:
+    return {"module": "frame_time_machine", "audit_passed": validate_frame_time_machine_contract(), "probe": get_frame_time_machine_readiness_probe()}
+
