@@ -1197,4 +1197,10 @@ def get_minimap_scanner_readiness_probe() -> dict:
     }
 
 
+def get_minimap_scanner_audit_summary() -> dict:
+    return {
+        "module": "minimap_scanner",
+        "audit_passed": validate_minimap_scanner_contract(),
+        "probe": get_minimap_scanner_readiness_probe(),
+    }
 

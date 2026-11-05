@@ -56,6 +56,7 @@ __all__ = [
     "get_active_learning_integrity_seal",
     "get_active_learning_compliance_certificate",
     "get_active_learning_readiness_probe",
+    "get_active_learning_audit_summary",
 ]
 
 
@@ -97,6 +98,10 @@ def get_active_learning_compliance_certificate() -> dict:
 
 def get_active_learning_readiness_probe() -> dict:
     return {"module": "active_learning", "ready": validate_active_learning_contract(), "certificate": get_active_learning_compliance_certificate()}
+
+
+def get_active_learning_audit_summary() -> dict:
+    return {"module": "active_learning", "audit_passed": validate_active_learning_contract(), "probe": get_active_learning_readiness_probe()}
 
 
 

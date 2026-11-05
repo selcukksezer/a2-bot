@@ -1000,3 +1000,7 @@ def get_human_timing_compliance_certificate() -> dict:
 def get_human_timing_readiness_probe() -> dict:
     return {"module": "human_timing", "ready": validate_human_timing_contract(), "certificate": get_human_timing_compliance_certificate()}
 
+
+def get_human_timing_audit_summary() -> dict:
+    return {"module": "human_timing", "audit_passed": validate_human_timing_contract(), "probe": get_human_timing_readiness_probe()}
+

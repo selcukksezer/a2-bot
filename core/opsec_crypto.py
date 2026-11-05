@@ -1275,3 +1275,11 @@ def get_opsec_crypto_readiness_probe() -> dict:
     }
 
 
+def get_opsec_crypto_audit_summary() -> dict:
+    return {
+        "module": "opsec_crypto",
+        "audit_passed": validate_opsec_crypto_contract(),
+        "probe": get_opsec_crypto_readiness_probe(),
+    }
+
+
