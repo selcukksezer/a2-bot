@@ -1192,4 +1192,6 @@ def get_mobile_connect_dialog_integrity_seal() -> dict:
     return {"module": "mobile_connect_dialog", "sealed": validate_mobile_connect_dialog_contract(), "telemetry": get_mobile_connect_dialog_telemetry_payload()}
 
 
+def get_mobile_connect_dialog_compliance_certificate() -> dict:
+    return {"module": "mobile_connect_dialog", "certified": validate_mobile_connect_dialog_contract(), "seal": get_mobile_connect_dialog_integrity_seal()}
 

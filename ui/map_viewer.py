@@ -1290,5 +1290,6 @@ def get_map_viewer_integrity_seal() -> dict:
     return {"module": "map_viewer", "sealed": validate_map_viewer_contract(), "telemetry": get_map_viewer_telemetry_payload()}
 
 
-
+def get_map_viewer_compliance_certificate() -> dict:
+    return {"module": "map_viewer", "certified": validate_map_viewer_contract(), "seal": get_map_viewer_integrity_seal()}
 

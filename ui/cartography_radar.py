@@ -2999,3 +2999,11 @@ def get_cartography_radar_integrity_seal() -> dict:
     }
 
 
+def get_cartography_radar_compliance_certificate() -> dict:
+    return {
+        "module": "cartography_radar",
+        "certified": validate_cartography_radar_contract(),
+        "seal": get_cartography_radar_integrity_seal(),
+    }
+
+
