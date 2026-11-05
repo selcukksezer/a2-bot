@@ -58,3 +58,11 @@ def get_tools_init_telemetry_payload() -> dict:
     return {"module": "tools_init", "telemetry_ready": validate_tools_init_contract(), "digest": get_tools_init_operational_digest()}
 
 
+get_tools_package_telemetry_payload = get_tools_init_telemetry_payload
+
+
+def get_tools_package_integrity_seal() -> dict:
+    return {"module": "tools_package", "sealed": validate_tools_package_contract(), "telemetry": get_tools_package_telemetry_payload()}
+
+
+

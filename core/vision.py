@@ -1687,4 +1687,6 @@ def get_vision_telemetry_payload() -> dict:
     return {"module": "vision", "telemetry_ready": validate_vision_contract(), "digest": get_vision_operational_digest()}
 
 
+def get_vision_integrity_seal() -> dict:
+    return {"module": "vision", "sealed": validate_vision_contract(), "telemetry": get_vision_telemetry_payload()}
 

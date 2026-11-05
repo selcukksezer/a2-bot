@@ -2454,3 +2454,8 @@ def get_route_manager_operational_digest() -> dict:
 def get_route_manager_telemetry_payload() -> dict:
     return {"module": "route_manager", "telemetry_ready": validate_route_manager_contract(), "digest": get_route_manager_operational_digest()}
 
+
+def get_route_manager_integrity_seal() -> dict:
+    return {"module": "route_manager", "sealed": validate_route_manager_contract(), "telemetry": get_route_manager_telemetry_payload()}
+
+

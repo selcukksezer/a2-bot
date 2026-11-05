@@ -2456,3 +2456,12 @@ def get_auto_cartographer_telemetry_payload() -> dict:
     }
 
 
+def get_auto_cartographer_integrity_seal() -> dict:
+    return {
+        "module": "auto_cartographer",
+        "sealed": validate_auto_cartographer_contract(),
+        "telemetry": get_auto_cartographer_telemetry_payload(),
+    }
+
+
+

@@ -1980,5 +1980,6 @@ def get_explorer_mode_telemetry_payload() -> dict:
     return {"module": "explorer_mode", "telemetry_ready": validate_explorer_mode_contract(), "digest": get_explorer_mode_operational_digest()}
 
 
-
+def get_explorer_mode_integrity_seal() -> dict:
+    return {"module": "explorer_mode", "sealed": validate_explorer_mode_contract(), "telemetry": get_explorer_mode_telemetry_payload()}
 
