@@ -1,0 +1,52 @@
+{
+  "mcpServers": {
+    "jons-mcp-pyright": {
+      "command": "C:\\Users\\selçuk\\.local\\bin\\uvx.exe",
+      "args": [
+        "--no-config",
+        "--no-python-downloads",
+        "--python",
+        "C:\\Users\\selçuk\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+        "--from",
+        "jons-mcp-pyright==0.0.2",
+        "jons-mcp-pyright",
+        "F:\\a2"
+      ],
+      "cwd": "F:\\a2",
+      "env": {
+        "UV_CACHE_DIR": "F:\\a2\\temp\\uv-cache",
+        "UV_TOOL_DIR": "F:\\a2\\temp\\uv-tools",
+        "UV_PYTHON_INSTALL_DIR": "F:\\a2\\temp\\uv-python",
+        "UV_PYTHON_DOWNLOADS": "never",
+        "TEMP": "F:\\a2\\temp",
+        "TMP": "F:\\a2\\temp",
+        "PIP_CACHE_DIR": "F:\\a2\\temp\\pip-cache",
+        "npm_config_cache": "F:\\a2\\temp\\npm-cache",
+        "PYRIGHT_PATH": "F:/a2/temp/uv-cache/archive-v0/-Mmb6KLzpJXnhzJr7PrZV/Scripts/pyright-langserver.exe --stdio"
+      }
+    },
+    "mcp-server-analyzer": {
+      "command": "C:\\Users\\selçuk\\.local\\bin\\uvx.exe",
+      "args": [
+        "--no-config",
+        "--no-python-downloads",
+        "--python",
+        "C:\\Users\\selçuk\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+        "--from",
+        "mcp-server-analyzer==0.4.1",
+        "mcp-server-analyzer"
+      ],
+      "cwd": "F:\\a2",
+      "env": {
+        "UV_CACHE_DIR": "F:\\a2\\temp\\uv-cache",
+        "UV_TOOL_DIR": "F:\\a2\\temp\\uv-tools",
+        "UV_PYTHON_INSTALL_DIR": "F:\\a2\\temp\\uv-python",
+        "UV_PYTHON_DOWNLOADS": "never",
+        "TEMP": "F:\\a2\\temp",
+        "TMP": "F:\\a2\\temp",
+        "PIP_CACHE_DIR": "F:\\a2\\temp\\pip-cache",
+        "npm_config_cache": "F:\\a2\\temp\\npm-cache"
+      }
+    }
+  }
+}

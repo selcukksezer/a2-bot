@@ -1,0 +1,9 @@
+{
+  "region": "test_g6_region",
+  "routes": [
+    "All",
+    "test_g6_route"
+  ],
+  "nodes": [],
+  "updated_at": 1794084088.0215342
+}

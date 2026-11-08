@@ -19,9 +19,10 @@ Matches `video_frames/frame_06s.jpg`, `frame_12s.jpg`, and `frame_21s.jpg` pixel
     48x48 map patch thumbnails, bold `#1` node labels, route memberships,
     visit counts, relative last-visit timestamps, and green `ready` / amber
     countdown capsule badges (plus empty-state overlay message)
-  * 2-row action bar:
+  * 3-row action bar:
     Row 1: `Add nodes...`, `Remove from route`, `Delete node`, `Move to region...`, `Map...`
-    Row 2: `Share route...`, `Import route...`, `Import from questlog...`
+    Row 2: `Seçilenleri Sil`, `YZ Yanlışları Sil`
+    Row 3: `Share route...`, `Import route...`, `Import from questlog...`
 - Footer Bar:
   * Left: `Quit bot` (`quit_requested`), `Gatherion v1.6.15` label, `status_lbl`
   * Right: `Reset to defaults`, blue `Save` (`#3b82f6`, `settings_saved`), `Close`
@@ -35,10 +36,14 @@ import logging
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from PyQt6.QtCore import (
     QEasingCurve,
+    QEvent,
+    QItemSelection,
+    QItemSelectionModel,
+    QObject,
     QPoint,
     QPointF,
     QPropertyAnimation,
@@ -59,6 +64,7 @@ from PyQt6.QtGui import (
     QMouseEvent,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
 )
@@ -70,23 +76,29 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QStackedLayout,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+from ui.shell_page_frame import wrap_shell_tab_root_layout
 
 logger = logging.getLogger("Gatherion.SettingsWindow")
 if not logger.handlers:
@@ -132,6 +144,18 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "break_every_variance": 1,
     "break_lasts_min": 10,
     "break_lasts_variance": 1,
+    "record_node_f8": "ctrl+alt+f8",
+    "toggle_menu_f9": "ctrl+alt+f9",
+    "pause_resume_f10": "ctrl+alt+f10",
+    "selective_gather_enabled": False,
+    "selected_materials": [],
+    "proximity_route_auto": True,
+    "auto_use_hp_potion": True,
+    "hp_potion_threshold_pct": 65,
+    "auto_use_mp_potion": True,
+    "mp_potion_threshold_pct": 45,
+    "auto_refresh_buff_scroll": True,
+    "buff_scroll_interval_sec": 300,
 }
 
 # Mapping between canonical keys and legacy nested (section, key) pairs
@@ -143,6 +167,9 @@ LEGACY_KEY_MAP: Dict[str, Tuple[str, str]] = {
     "harvests_per_node": ("gathering", "harvests_per_node"),
     "gather_key": ("gathering", "gather_key"),
     "retry_on_extraction_fail": ("gathering", "retry_on_extraction_fail"),
+    "selective_gather_enabled": ("gathering", "selective_gather_enabled"),
+    "selected_materials": ("gathering", "selected_materials"),
+    "proximity_route_auto": ("gathering", "proximity_route_auto"),
     "rest_minutes": ("route", "rest_after_visit_min"),
     "climb_air_max_sec": ("route", "climb_air_max_sec"),
     "gathered_join_active_route": ("route", "gathered_nodes_join_route"),
@@ -157,12 +184,23 @@ LEGACY_KEY_MAP: Dict[str, Tuple[str, str]] = {
     "pause_after_no_gather_min": ("route", "pause_after_idle_min"),
     "fight_back": ("route", "fight_back_when_attacked"),
     "fight_stop_gather_sec": ("route", "fight_stop_gather_sec"),
+    "auto_use_hp_potion": ("route", "auto_use_hp_potion"),
+    "hp_potion_threshold_pct": ("route", "hp_potion_threshold_pct"),
+    "auto_use_mp_potion": ("route", "auto_use_mp_potion"),
+    "mp_potion_threshold_pct": ("route", "mp_potion_threshold_pct"),
+    "auto_refresh_buff_scroll": ("route", "auto_refresh_buff_scroll"),
+    "buff_scroll_interval_sec": ("route", "buff_scroll_interval_sec"),
     "minimap_auto_record": ("route", "minimap_auto_record"),
     "minimap_ignore_monsters": ("route", "minimap_ignore_monsters"),
+    "auto_record_3d_crests": ("route", "auto_record_3d_crests"),
+    "last_tab": ("display", "last_tab"),
     "break_every_min": ("breaks", "interval_min"),
     "break_every_variance": ("breaks", "interval_jitter_min"),
     "break_lasts_min": ("breaks", "duration_min"),
     "break_lasts_variance": ("breaks", "duration_jitter_min"),
+    "record_node_f8": ("hotkeys", "record_node_f8"),
+    "toggle_menu_f9": ("hotkeys", "toggle_menu_f9"),
+    "pause_resume_f10": ("hotkeys", "pause_resume_f10"),
 }
 
 
@@ -173,10 +211,11 @@ class ToggleSwitch(QCheckBox):
     """
     Modern iOS / Gatherion-style rounded pill toggle switch rendered with QPainter.
     Supports smooth thumb animation and optional inline text label on the right.
+    Matches ayarlar.html `.sw` (34x19px, #3a4654 off -> #2f7fe0 on).
     """
 
     SWITCH_WIDTH = 34
-    SWITCH_HEIGHT = 18
+    SWITCH_HEIGHT = 19
     TEXT_SPACING = 8
 
     def __init__(
@@ -196,6 +235,9 @@ class ToggleSwitch(QCheckBox):
 
         self.setChecked(bool(checked))
         self.toggled.connect(self._on_toggled)
+        policy = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
 
     @pyqtProperty(float)
     def thumb_position(self) -> float:
@@ -223,19 +265,36 @@ class ToggleSwitch(QCheckBox):
             self._thumb_pos = 1.0 if checked else 0.0
             self.update()
 
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        label = self.text()
+        if not label:
+            return self.SWITCH_HEIGHT + 4
+        fm = QFontMetrics(QFont("Segoe UI", 9))
+        text_w = max(48, int(width) - self.SWITCH_WIDTH - self.TEXT_SPACING - 8)
+        bounds = fm.boundingRect(0, 0, text_w, 800, int(Qt.TextFlag.TextWordWrap), label)
+        return max(self.SWITCH_HEIGHT + 4, bounds.height() + 4)
+
     def sizeHint(self) -> QSize:  # noqa: N802
         label = self.text()
         if not label:
-            return QSize(self.SWITCH_WIDTH + 2, self.SWITCH_HEIGHT + 4)
+            return QSize(self.SWITCH_WIDTH + 4, self.SWITCH_HEIGHT + 4)
         fm = QFontMetrics(QFont("Segoe UI", 9))
         text_w = fm.horizontalAdvance(label)
-        return QSize(
-            self.SWITCH_WIDTH + self.TEXT_SPACING + text_w + 8,
-            max(self.SWITCH_HEIGHT + 4, fm.height() + 4),
-        )
+        pref_w = min(self.SWITCH_WIDTH + self.TEXT_SPACING + text_w + 12, 520)
+        return QSize(pref_w, self.heightForWidth(pref_w))
 
     def minimumSizeHint(self) -> QSize:  # noqa: N802
-        return self.sizeHint()
+        return QSize(self.SWITCH_WIDTH + 140, self.SWITCH_HEIGHT + 4)
+
+    def resizeEvent(self, event: Any) -> None:  # noqa: N802
+        needed = self.heightForWidth(max(1, self.width()))
+        if self.minimumHeight() != needed:
+            self.setMinimumHeight(needed)
+            self.updateGeometry()
+        super().resizeEvent(event)
 
     def hitButton(self, pos: QPoint) -> bool:  # noqa: N802
         return self.rect().contains(pos)
@@ -261,18 +320,18 @@ class ToggleSwitch(QCheckBox):
         radius = sw_h / 2.0
 
         t = self._thumb_pos
-        # Interpolate track color between #2b313a (unchecked) and #38bdf8 (checked)
-        r = int(43 + (56 - 43) * t)
-        g = int(49 + (189 - 49) * t)
-        b = int(58 + (248 - 58) * t)
+        # Interpolate track color between #3a4654 (unchecked) and #2f7fe0 (checked)
+        r = int(58 + (47 - 58) * t)
+        g = int(70 + (127 - 70) * t)
+        b = int(84 + (224 - 84) * t)
         track_color = QColor(r, g, b)
-        border_color = QColor("#38bdf8") if t > 0.5 else QColor("#444c56")
+        border_color = QColor("#3b8bff") if t > 0.5 else QColor("#4d5b6c")
 
         painter.setPen(QPen(border_color, 1.0))
         painter.setBrush(QBrush(track_color))
         painter.drawRoundedRect(track_rect, radius, radius)
 
-        # Thumb circle
+        # Thumb circle (14px inside 19px height)
         margin = 2.5
         thumb_d = sw_h - (margin * 2.0)
         min_x = 1.0 + margin
@@ -280,10 +339,10 @@ class ToggleSwitch(QCheckBox):
         thumb_x = min_x + (max_x - min_x) * t
         thumb_y = sw_y + margin
 
-        # Interpolate thumb color between #9ca3af (unchecked) and #ffffff (checked)
-        tr = int(156 + (255 - 156) * t)
-        tg = int(163 + (255 - 163) * t)
-        tb = int(175 + (255 - 175) * t)
+        # Interpolate thumb color between #dfe6ec (unchecked) and #ffffff (checked)
+        tr = int(223 + (255 - 223) * t)
+        tg = int(230 + (255 - 230) * t)
+        tb = int(236 + (255 - 236) * t)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(tr, tg, tb)))
         painter.drawEllipse(QRectF(thumb_x, thumb_y, thumb_d, thumb_d))
@@ -293,17 +352,70 @@ class ToggleSwitch(QCheckBox):
         if label:
             font = QFont("Segoe UI", 9)
             painter.setFont(font)
-            text_color = QColor("#f3f4f6") if self._hovered else QColor("#d1d5db")
+            text_color = QColor("#ffffff") if self._hovered else QColor("#d7dfe7")
             painter.setPen(QPen(text_color))
             text_x = int(sw_w) + self.TEXT_SPACING + 2
-            text_rect = QRect(text_x, 0, max(10, self.width() - text_x), self.height())
+            text_rect = QRect(text_x, 0, max(10, self.width() - text_x - 2), self.height())
             painter.drawText(
                 text_rect,
-                int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                int(
+                    Qt.AlignmentFlag.AlignVCenter
+                    | Qt.AlignmentFlag.AlignLeft
+                    | Qt.TextFlag.TextWordWrap
+                ),
                 label,
             )
 
         painter.end()
+
+
+class _HotkeyCaptureEdit(QLineEdit):
+    """Interactive hotkey capture input matching ayarlar.html `#hkStrip`."""
+
+    def __init__(self, default_chord: str = "", parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        if default_chord:
+            self.setText(default_chord)
+            self.setPlaceholderText(default_chord)
+
+    def keyPressEvent(self, event: Any) -> None:  # noqa: N802
+        key = event.key()
+        if key in (
+            Qt.Key.Key_Control,
+            Qt.Key.Key_Shift,
+            Qt.Key.Key_Alt,
+            Qt.Key.Key_Meta,
+            Qt.Key.Key_unknown,
+        ):
+            return
+        if key == Qt.Key.Key_Tab or key == Qt.Key.Key_Backtab:
+            super().keyPressEvent(event)
+            return
+        mods = event.modifiers()
+        parts: List[str] = []
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            parts.append("ctrl")
+        if mods & Qt.KeyboardModifier.AltModifier:
+            parts.append("alt")
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("shift")
+        if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F12:
+            parts.append(f"f{key - Qt.Key.Key_F1 + 1}")
+            self.setText("+".join(parts))
+            event.accept()
+            return
+        if mods & (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.ShiftModifier
+        ):
+            txt = (event.text() or "").strip().lower()
+            if txt and txt.isprintable():
+                parts.append(txt)
+                self.setText("+".join(parts))
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 # ============================================================================
@@ -311,9 +423,10 @@ class ToggleSwitch(QCheckBox):
 # ============================================================================
 class _RestBadgeWidget(QWidget):
     """
-    Renders a rounded pill badge inside the REST table column:
-    - Green capsule (`Hazır`) when node cooldown is complete
-    - Amber/orange capsule (`4dk 12sn`) when node is resting
+    Renders a rounded pill badge inside the REST table column matching ayarlar.html `.pill`:
+    - Green capsule (`Hazır`, #123324 / #3ddc84 / #1d573c)
+    - Amber capsule (`4dk 12sn` or `Kopya?`, #33270e / #f5c04e / #594417)
+    - Blue/info capsule (`Toplandı` / `Yoksayılan`, #12283d / #6ec3ff / #1f486c)
     """
 
     def __init__(
@@ -321,12 +434,14 @@ class _RestBadgeWidget(QWidget):
         text: str = "Hazır",
         is_ready: bool = True,
         parent: Optional[QWidget] = None,
+        ignored: bool = False,
     ) -> None:
         super().__init__(parent)
         self._text = str(text)
         self._is_ready = bool(is_ready)
-        self.setFixedHeight(28)
-        self.setMinimumWidth(58)
+        self._ignored = bool(ignored)
+        self.setFixedHeight(26)
+        self.setMinimumWidth(88 if self._ignored else 58)
 
     def set_status(self, text: str, is_ready: bool) -> None:
         if self._text != text or self._is_ready != is_ready:
@@ -339,7 +454,7 @@ class _RestBadgeWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         font = QFont("Segoe UI", 8)
-        font.setWeight(QFont.Weight.DemiBold)
+        font.setWeight(QFont.Weight.Bold)
         painter.setFont(font)
         fm = QFontMetrics(font)
 
@@ -349,14 +464,18 @@ class _RestBadgeWidget(QWidget):
         pill_y = (self.height() - pill_h) // 2
         pill_rect = QRectF(float(pill_x), float(pill_y), float(pill_w), float(pill_h))
 
-        if self._is_ready:
-            bg_color = QColor(20, 83, 45, 190)       # Dark emerald fill
-            border_color = QColor(34, 197, 94, 140)  # Green border
-            text_color = QColor("#4ade80")           # Bright green text
+        if self._ignored:
+            bg_color = QColor("#12283d")
+            border_color = QColor("#1f486c")
+            text_color = QColor("#6ec3ff")
+        elif self._is_ready:
+            bg_color = QColor("#123324")
+            border_color = QColor("#1d573c")
+            text_color = QColor("#3ddc84")
         else:
-            bg_color = QColor(120, 53, 15, 190)      # Dark amber fill
-            border_color = QColor(245, 158, 11, 150) # Amber border
-            text_color = QColor("#fbbf24")           # Bright amber text
+            bg_color = QColor("#33270e")
+            border_color = QColor("#594417")
+            text_color = QColor("#f5c04e")
 
         painter.setPen(QPen(border_color, 1.0))
         painter.setBrush(QBrush(bg_color))
@@ -659,7 +778,7 @@ class _BuiltinQuestlogImportDialog(QDialog):
         self.lbl_selected.setText(f"Seçilen: {total} nokta (harita başına ~1.2 sn)")
 
     def _on_import_clicked(self) -> None:
-        zone_name = self.cb_zone.currentText().strip() or "Altgard"
+        zone_name = self.cb_zone.currentText().strip() or (self._current_region() or "")
         sub_items = self.list_subzones.selectedItems()
         route_name = "Dredgion Crash Site"
         if sub_items:
@@ -706,6 +825,72 @@ class _BuiltinQuestlogImportDialog(QDialog):
 # ============================================================================
 # Main Settings Window (`SettingsWindow(QDialog)`)
 # ============================================================================
+def _wrong_node_status(wrong: List[Any], backup_path: str = "") -> str:
+    """Turkish status: removal count and the top wrong gatherion classes."""
+    from core.wrong_node_scan import format_removed_status_tr
+
+    return format_removed_status_tr(wrong, backup_path)
+
+
+class _RowSelectFilter(QObject):
+    """Ctrl/Shift clicks on a row widget select that node row."""
+
+    def __init__(self, table: QTableWidget) -> None:
+        super().__init__(table)
+        self.table = table
+
+    def eventFilter(self, obj: Any, event: Any) -> bool:  # noqa: N802
+        if event.type() != QEvent.Type.MouseButtonPress:
+            return False
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        row = self._row_of(obj)
+        if row < 0:
+            return False
+        table = self.table
+        mods = event.modifiers()
+        model = table.model()
+        selection = table.selectionModel()
+        if model is None or selection is None:
+            return False
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            anchor = table.currentRow()
+            if anchor < 0:
+                anchor = row
+            start, end = sorted((anchor, row))
+            top = model.index(start, 0)
+            bottom = model.index(end, max(0, table.columnCount() - 1))
+            selection.select(
+                QItemSelection(top, bottom),
+                QItemSelectionModel.SelectionFlag.ClearAndSelect
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
+        elif mods & Qt.KeyboardModifier.ControlModifier:
+            index = model.index(row, 0)
+            selection.select(
+                index,
+                QItemSelectionModel.SelectionFlag.Toggle
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
+        else:
+            table.selectRow(row)
+        table.setCurrentCell(row, 0)
+        return True
+
+    @staticmethod
+    def _row_of(obj: Any) -> int:
+        widget = obj
+        while widget is not None:
+            row = widget.property("gatherion_row") if hasattr(widget, "property") else None
+            if row is not None:
+                try:
+                    return int(row)
+                except (TypeError, ValueError):
+                    return -1
+            widget = widget.parent() if hasattr(widget, "parent") else None
+        return -1
+
+
 class SettingsWindow(QDialog):
     """
     Gatherion v1.6.15 two-column dark settings and node management window (Türkçe UI).
@@ -714,6 +899,7 @@ class SettingsWindow(QDialog):
     quit_requested = pyqtSignal()
     settings_saved = pyqtSignal()
     route_changed = pyqtSignal(str, str)
+    selective_gather_changed = pyqtSignal(list, bool)  # (materials: list, auto_proximity: bool)
 
     def __init__(
         self,
@@ -735,6 +921,13 @@ class SettingsWindow(QDialog):
         )
         self._last_saved_values: Dict[str, Any] = {}
 
+        # Kara Liste (Blacklist) Yöneticisi
+        try:
+            from core.blacklist_manager import get_blacklist_manager
+            self.blacklist_mgr = get_blacklist_manager()
+        except Exception:
+            self.blacklist_mgr = None
+
         self._updating_combos: bool = False
         self._map_viewer_dlg: Optional[QDialog] = None
         self._questlog_dlg: Optional[QDialog] = None
@@ -749,7 +942,11 @@ class SettingsWindow(QDialog):
         self._apply_dark_stylesheet()
         self._init_ui()
         self._load_from_settings()
-        self.refresh_regions_and_routes()
+        self.refresh_regions_and_routes(
+            prefer_region=str(self._cfg_get("active_region", "") or "") or None,
+            prefer_route=str(self._cfg_get("active_route", "") or "") or None,
+        )
+        self.load_blacklist_table()
 
         # Live 1-second timer to update node LAST and REST badges dynamically
         self._refresh_timer = QTimer(self)
@@ -994,50 +1191,67 @@ class SettingsWindow(QDialog):
         self.setStyleSheet(
             """
             QDialog {
-                background-color: #16191f;
-                color: #d1d5db;
-                font-family: 'Segoe UI', sans-serif;
+                background-color: #0a0e13;
+                color: #e8edf2;
+                font-family: 'Segoe UI', system-ui, sans-serif;
                 font-size: 12px;
             }
+            QScrollArea,
+            QScrollArea > QWidget,
+            QScrollArea > QWidget > QWidget,
+            QWidget#SettingsColumnsHost,
+            QWidget#SettingsLeftHost,
+            QWidget#SettingsRightHost {
+                background-color: #0a0e13;
+                border: none;
+            }
+            QScrollArea::corner {
+                background: #0a0e13;
+            }
             QGroupBox {
-                background-color: #1a1e24;
-                border: 1px solid #282e37;
-                border-radius: 6px;
-                margin-top: 6px;
-                padding-top: 22px;
-                padding-bottom: 8px;
-                padding-left: 10px;
-                padding-right: 10px;
-                font-weight: bold;
+                background-color: #12181f;
+                border: 1px solid #232d39;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding: 12px 12px 10px 12px;
+                font-weight: 700;
                 font-size: 11px;
-                color: #9ca3af;
+                color: #9bb8dc;
             }
             QGroupBox::title {
-                subcontrol-origin: padding;
+                subcontrol-origin: margin;
                 subcontrol-position: top left;
                 left: 12px;
-                top: 8px;
-                color: #9ca3af;
-                font-weight: 600;
-                letter-spacing: 0.5px;
+                background-color: #12181f;
+                color: #9bb8dc;
+                font-weight: 700;
+                padding: 1px 6px;
+                border-radius: 3px;
+                letter-spacing: 0.6px;
             }
             QLabel {
-                color: #d1d5db;
+                color: #d7dfe7;
                 font-size: 12px;
                 background: transparent;
             }
-            QSpinBox, QDoubleSpinBox {
-                background-color: #222730;
-                border: 1px solid #363d49;
-                border-radius: 4px;
-                color: #f3f4f6;
-                padding: 2px 6px;
+            QLabel[hintLabel="true"] {
+                color: #67737f;
+                font-size: 11px;
+            }
+            QSpinBox, QDoubleSpinBox, QLineEdit {
+                background-color: #0d1218;
+                border: 1px solid #2c3846;
+                border-radius: 5px;
+                color: #e8edf2;
+                padding: 3px 7px;
                 min-height: 22px;
                 font-size: 12px;
-                selection-background-color: #0284c7;
+                font-family: Consolas, "Cascadia Mono", monospace;
+                selection-background-color: #2f7fe0;
             }
-            QSpinBox:focus, QDoubleSpinBox:focus {
-                border: 1px solid #38bdf8;
+            QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus {
+                border: 1px solid #3b8bff;
+                background-color: #101823;
             }
             QSpinBox::up-button, QSpinBox::down-button,
             QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
@@ -1045,94 +1259,106 @@ class SettingsWindow(QDialog):
                 border: none;
             }
             QComboBox {
-                background-color: #222730;
-                border: 1px solid #363d49;
-                border-radius: 4px;
-                color: #f3f4f6;
+                background-color: #0d1218;
+                border: 1px solid #2c3846;
+                border-radius: 5px;
+                color: #e8edf2;
                 padding: 3px 8px;
                 min-height: 22px;
                 font-size: 12px;
             }
             QComboBox:hover {
-                border: 1px solid #4b5563;
+                border: 1px solid #3b8bff;
             }
             QComboBox::drop-down {
                 border: none;
                 width: 20px;
             }
             QComboBox QAbstractItemView {
-                background-color: #1e222a;
-                color: #f3f4f6;
-                border: 1px solid #363d49;
-                selection-background-color: #2563eb;
+                background-color: #12181f;
+                color: #e8edf2;
+                border: 1px solid #2c3846;
+                selection-background-color: #2f7fe0;
             }
             QPushButton {
-                background-color: #242932;
-                color: #e5e7eb;
-                border: 1px solid #363d49;
-                border-radius: 4px;
-                padding: 4px 10px;
+                background-color: #1c2632;
+                color: #e8edf2;
+                border: 1px solid #2c3846;
+                border-radius: 5px;
+                padding: 5px 10px;
                 min-height: 20px;
                 font-size: 12px;
+                font-weight: 500;
             }
             QPushButton:hover {
-                background-color: #2e3540;
-                border-color: #4b5563;
+                background-color: #243140;
+                border-color: #3a4a5c;
             }
             QPushButton:pressed {
-                background-color: #1c2026;
+                background-color: #171f28;
             }
             QPushButton:disabled {
-                color: #6b7280;
-                background-color: #1c2026;
-                border-color: #282e37;
+                color: #67737f;
+                background-color: #12181f;
+                border-color: #232d39;
             }
             QPushButton#DangerOutlineButton {
-                background-color: #242932;
-                color: #f87171;
-                border: 1px solid #6b2626;
+                background-color: #28161a;
+                color: #ff8e92;
+                border: 1px solid #59262c;
             }
             QPushButton#DangerOutlineButton:hover {
-                background-color: #3a1d22;
-                border: 1px solid #ef4444;
-                color: #fca5a5;
+                background-color: #351b21;
+                border: 1px solid #753139;
+                color: #ffb4b7;
             }
             QPushButton#PrimarySaveButton {
-                background-color: #3b82f6;
+                background-color: #2f7fe0;
                 color: #ffffff;
-                border: 1px solid #2563eb;
-                font-weight: bold;
-                padding: 5px 18px;
+                border: 1px solid #3b8bff;
+                font-weight: 700;
+                padding: 6px 18px;
             }
             QPushButton#PrimarySaveButton:hover {
-                background-color: #2563eb;
+                background-color: #3b8bff;
+            }
+            QFrame#SettingsHotkeysStrip {
+                background-color: #12181f;
+                border: 1px solid #232d39;
+                border-radius: 8px;
+            }
+            QFrame#SettingsInfoLine {
+                background-color: #0d1218;
+                border: 1px solid #232d39;
+                border-radius: 6px;
             }
             QTableWidget {
-                background-color: #15181e;
-                border: 1px solid #282e37;
-                border-radius: 4px;
-                color: #e5e7eb;
+                background-color: #0d1218;
+                border: 1px solid #232d39;
+                border-radius: 6px;
+                color: #e8edf2;
                 gridline-color: transparent;
-                selection-background-color: #1e3a5f;
+                selection-background-color: #1a2d44;
                 selection-color: #ffffff;
                 font-size: 12px;
             }
             QHeaderView::section {
-                background-color: #15181e;
-                color: #9ca3af;
+                background-color: #141c24;
+                color: #8b98a6;
                 border: none;
-                border-bottom: 1px solid #282e37;
-                padding: 5px 6px;
-                font-size: 11px;
-                font-weight: 600;
+                border-bottom: 1px solid #232d39;
+                padding: 6px 8px;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.7px;
             }
             QScrollBar:vertical {
-                background: #15181e;
+                background: #0d1218;
                 width: 8px;
                 margin: 0px;
             }
             QScrollBar::handle:vertical {
-                background: #374151;
+                background: #283444;
                 min-height: 24px;
                 border-radius: 4px;
             }
@@ -1141,199 +1367,357 @@ class SettingsWindow(QDialog):
             }
             """
         )
+        if hasattr(self, "_columns_scroll") and self._columns_scroll is not None:
+            vp = self._columns_scroll.viewport()
+            if vp is not None:
+                vp.setStyleSheet("background-color: #0a0e13;")
 
     def _init_ui(self) -> None:
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(12, 10, 12, 10)
+        root_layout = wrap_shell_tab_root_layout(self, "settings")
         root_layout.setSpacing(8)
 
-        # Two-column main content layout
-        columns_layout = QHBoxLayout()
+        # Prototype Header (.header) matching ayarlar.html
+        header_frame = QFrame(self)
+        header_frame.setStyleSheet(
+            "QFrame { background: transparent; border: none; border-bottom: 1px solid #232d39; }"
+        )
+        header_lay = QHBoxLayout(header_frame)
+        header_lay.setContentsMargins(2, 0, 2, 8)
+        header_lay.setSpacing(12)
+
+        title_stack = QVBoxLayout()
+        title_stack.setContentsMargins(0, 0, 0, 0)
+        title_stack.setSpacing(1)
+        kicker_lbl = QLabel("YAPILANDIRMA", header_frame)
+        kicker_lbl.setStyleSheet(
+            "color: #8b98a6; font-size: 10px; font-weight: 700; letter-spacing: 1.8px; border: none;"
+        )
+        title_lbl = QLabel("Ayarlar", header_frame)
+        title_lbl.setStyleSheet(
+            "color: #e8edf2; font-size: 19px; font-weight: 700; border: none;"
+        )
+        sub_lbl = QLabel("Toplama, mola, kısayol ve rota.", header_frame)
+        sub_lbl.setStyleSheet("color: #8b98a6; font-size: 12px; border: none;")
+        title_stack.addWidget(kicker_lbl)
+        title_stack.addWidget(title_lbl)
+        title_stack.addWidget(sub_lbl)
+        header_lay.addLayout(title_stack)
+        header_lay.addStretch(1)
+
+        perf_row = QHBoxLayout()
+        perf_row.setContentsMargins(0, 0, 0, 0)
+        perf_row.setSpacing(6)
+        self.chip_fps = QLabel('FPS <b style="color:#e8edf2;font-family:Consolas;">0</b>', header_frame)
+        self.chip_fps.setTextFormat(Qt.TextFormat.RichText)
+        self.chip_fps.setStyleSheet(
+            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 3px 8px; font-size: 11px; color: #8b98a6;"
+        )
+        perf_row.addWidget(self.chip_fps)
+
+        self.chip_gpu = QLabel('GPU <b style="color:#e8edf2;font-family:Consolas;">0%</b>', header_frame)
+        self.chip_gpu.setTextFormat(Qt.TextFormat.RichText)
+        self.chip_gpu.setStyleSheet(
+            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 3px 8px; font-size: 11px; color: #8b98a6;"
+        )
+        perf_row.addWidget(self.chip_gpu)
+
+        self.chip_cpu = QLabel('CPU <b style="color:#e8edf2;font-family:Consolas;">0%</b>', header_frame)
+        self.chip_cpu.setTextFormat(Qt.TextFormat.RichText)
+        self.chip_cpu.setStyleSheet(
+            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 3px 8px; font-size: 11px; color: #8b98a6;"
+        )
+        perf_row.addWidget(self.chip_cpu)
+
+        self.chip_lat = QLabel('LAT <b style="color:#e8edf2;font-family:Consolas;">0.0ms</b>', header_frame)
+        self.chip_lat.setTextFormat(Qt.TextFormat.RichText)
+        self.chip_lat.setStyleSheet(
+            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 3px 8px; font-size: 11px; color: #8b98a6;"
+        )
+        perf_row.addWidget(self.chip_lat)
+        header_lay.addLayout(perf_row)
+        root_layout.addWidget(header_frame)
+
+        # Two-column main content (.cols: 1.05fr : 1fr)
+        columns_host = QWidget(self)
+        columns_host.setObjectName("SettingsColumnsHost")
+        columns_host.setStyleSheet("background-color: #0a0e13;")
+        columns_layout = QHBoxLayout(columns_host)
+        columns_layout.setContentsMargins(0, 0, 0, 0)
         columns_layout.setSpacing(10)
 
         # ------------------------------------------------------------------
-        # LEFT COLUMN: GATHERING, ROUTE, AUTO-CARTOGRAPHY, BREAKS
+        # LEFT COLUMN: GATHERING, ROUTE, SIDE-BY-SIDE CARTOGRAPHY + BREAKS
         # ------------------------------------------------------------------
-        left_col = QVBoxLayout()
-        left_col.setSpacing(6)
+        left_host = QWidget()
+        left_host.setObjectName("SettingsLeftHost")
+        left_host.setStyleSheet("background-color: #0a0e13;")
+        left_host.setMinimumWidth(340)
+        left_col = QVBoxLayout(left_host)
+        left_col.setContentsMargins(0, 0, 4, 0)
+        left_col.setSpacing(8)
 
         left_col.addWidget(self._build_gathering_group())
-        left_col.addWidget(self._build_route_group(), stretch=1)
-        left_col.addWidget(self._build_cartography_group())
-        left_col.addWidget(self._build_breaks_group())
+        left_col.addWidget(self._build_route_group())
 
-        columns_layout.addLayout(left_col, stretch=48)
+        sub_pair_row = QHBoxLayout()
+        sub_pair_row.setContentsMargins(0, 0, 0, 0)
+        sub_pair_row.setSpacing(8)
+        sub_pair_row.addWidget(self._build_cartography_group(), stretch=13)
+        sub_pair_row.addWidget(self._build_breaks_group(), stretch=10)
+        left_col.addLayout(sub_pair_row)
+        left_col.addStretch(1)
+
+        self._columns_scroll = QScrollArea(columns_host)
+        self._columns_scroll.setObjectName("SettingsColumnsScroll")
+        self._columns_scroll.setWidgetResizable(True)
+        self._columns_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._columns_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._columns_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._columns_scroll.setStyleSheet("background-color: #0a0e13; border: none;")
+        self._columns_scroll.setWidget(left_host)
+        if self._columns_scroll.viewport() is not None:
+            self._columns_scroll.viewport().setStyleSheet("background-color: #0a0e13;")
+
+        columns_layout.addWidget(self._columns_scroll, stretch=51)
 
         # ------------------------------------------------------------------
-        # RIGHT COLUMN: NODES / REGIONS & ROUTES
+        # RIGHT COLUMN: NODES / REGIONS & ROUTES (FIXED)
         # ------------------------------------------------------------------
-        right_col = QVBoxLayout()
+        right_host = QWidget(columns_host)
+        right_host.setObjectName("SettingsRightHost")
+        right_host.setStyleSheet("background-color: #0a0e13;")
+        right_host.setMinimumWidth(320)
+        right_col = QVBoxLayout(right_host)
+        right_col.setContentsMargins(0, 0, 0, 0)
         right_col.setSpacing(8)
-        right_col.addWidget(self._build_nodes_group(), stretch=1)
 
-        columns_layout.addLayout(right_col, stretch=52)
-        root_layout.addLayout(columns_layout, stretch=1)
+        self.right_tab_widget = QTabWidget(self)
+        self.right_tab_widget.setObjectName("SettingsRightTabs")
+        self.nodes_tab = self._build_nodes_group()
+        self.blacklist_tab = self._build_blacklist_group()
+        self.right_tab_widget.addTab(self.nodes_tab, "📍 ROTA DÜĞÜMLERİ")
+        self.right_tab_widget.addTab(self.blacklist_tab, "⛔ KARA LİSTE (BLACKLIST)")
+        right_col.addWidget(self.right_tab_widget, stretch=1)
 
-        # Status message row (above footer separator, matching frame_21s.jpg)
-        self.status_lbl = QLabel("")
-        self.status_lbl.setStyleSheet("color: #d1d5db; font-size: 12px; padding: 1px 2px;")
-        root_layout.addWidget(self.status_lbl)
+        columns_layout.addWidget(right_host, stretch=49)
 
-        # Thin horizontal divider above footer
-        divider = QFrame(self)
+        root_layout.addWidget(columns_host, stretch=1)
+
+        self.columns_host = columns_host
+        self.left_host = left_host
+        self.right_host = right_host
+
+        # Full-width Bot Kısayolları strip (#hkStrip) matching ayarlar.html
+        root_layout.addWidget(self._build_hotkeys_group())
+
+        # Status + footer live in one bar so the shell can keep them under every tab.
+        self.footer_bar = QWidget(self)
+        self.footer_bar.setObjectName("SettingsFooterBar")
+        self.footer_bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        footer_bar_lay = QVBoxLayout(self.footer_bar)
+        footer_bar_lay.setContentsMargins(0, 0, 0, 0)
+        footer_bar_lay.setSpacing(6)
+
+        info_frame = QFrame(self.footer_bar)
+        info_frame.setObjectName("SettingsInfoLine")
+        info_lay = QHBoxLayout(info_frame)
+        info_lay.setContentsMargins(12, 5, 12, 5)
+        self.status_lbl = QLabel(
+            "YZ modeli hazır. Henüz tarama yapılmadı.",
+            info_frame,
+        )
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.status_lbl.setStyleSheet("color: #8b98a6; font-size: 11px; border: none;")
+        info_lay.addWidget(self.status_lbl)
+        footer_bar_lay.addWidget(info_frame)
+
+        divider = QFrame(self.footer_bar)
         divider.setFrameShape(QFrame.Shape.HLine)
         divider.setFixedHeight(1)
-        divider.setStyleSheet("background-color: #282e37; border: none;")
-        root_layout.addWidget(divider)
+        divider.setStyleSheet("background-color: #232d39; border: none;")
+        footer_bar_lay.addWidget(divider)
 
         # ------------------------------------------------------------------
-        # FOOTER BAR
+        # FOOTER BAR (.foot: .exitrow + 3x3 .fgrid)
         # ------------------------------------------------------------------
         footer_layout = QHBoxLayout()
         footer_layout.setContentsMargins(0, 2, 0, 0)
-        footer_layout.setSpacing(8)
+        footer_layout.setSpacing(10)
 
         self.btn_quit = QPushButton("Bottan Çık", self)
         self.btn_quit.setToolTip("Uygulamayı güvenli şekilde kapatır")
         self.btn_quit.clicked.connect(self._on_quit_clicked)
         footer_layout.addWidget(self.btn_quit)
 
-        self.version_lbl = QLabel("Gatherion v1.6.15", self)
-        self.version_lbl.setStyleSheet("color: #8b949e; font-size: 12px;")
+        self.version_lbl = QLabel("Gatherion v2.0", self)
+        self.version_lbl.setStyleSheet("color: #67737f; font-size: 11px;")
         footer_layout.addWidget(self.version_lbl)
 
+        self.dirty_lbl = QLabel("● Kaydedilmemiş değişiklikler", self)
+        self.dirty_lbl.setStyleSheet("color: #f5c04e; font-size: 11px; font-weight: 600;")
+        self.dirty_lbl.setVisible(False)
+        footer_layout.addWidget(self.dirty_lbl)
+
+        self.saved_lbl = QLabel("✓ Kaydedildi ve uygulandı", self)
+        self.saved_lbl.setStyleSheet("color: #3ddc84; font-size: 11px; font-weight: 600;")
+        self.saved_lbl.setVisible(False)
+        footer_layout.addWidget(self.saved_lbl)
+
         footer_layout.addStretch(1)
+        footer_bar_lay.addLayout(footer_layout)
+
+        tool_grid = QGridLayout()
+        tool_grid.setContentsMargins(0, 0, 0, 0)
+        tool_grid.setHorizontalSpacing(6)
+        tool_grid.setVerticalSpacing(6)
 
         self.btn_radar = QPushButton("Canlı Radar", self)
         self.btn_radar.setToolTip("Oto-haritalama canlı radar penceresini açar")
         self.btn_radar.clicked.connect(self._on_open_radar)
-        footer_layout.addWidget(self.btn_radar)
 
         self.btn_yolo_factory = QPushButton("🧠 YOLO Veri Fabrikası", self)
         self.btn_yolo_factory.setToolTip(
             "Kendi kendini eğiten yapay zeka (YOLO) veri seti fabrikası ve RTX eğitim merkezini açar"
         )
         self.btn_yolo_factory.clicked.connect(self._on_open_yolo_factory)
-        footer_layout.addWidget(self.btn_yolo_factory)
 
         self.btn_mobile_connect = QPushButton("📱 Mobil Kumanda", self)
         self.btn_mobile_connect.setToolTip(
             "Telefon / mobil tarayıcı üzerinden canlı izleme ve kumanda QR kod penceresini açar"
         )
         self.btn_mobile_connect.clicked.connect(self._on_open_mobile_connect)
-        footer_layout.addWidget(self.btn_mobile_connect)
 
         self.btn_analytics = QPushButton("İstatistikler", self)
         self.btn_analytics.setToolTip("Canlı telemetri ve toplama istatistiklerini açar")
         self.btn_analytics.clicked.connect(self._on_open_analytics)
-        footer_layout.addWidget(self.btn_analytics)
 
         self.btn_calibration = QPushButton("Kalibrasyon", self)
         self.btn_calibration.setToolTip("Görüntü kalibrasyon sihirbazını açar")
         self.btn_calibration.clicked.connect(self._on_open_calibration)
-        footer_layout.addWidget(self.btn_calibration)
 
         self.btn_guide = QPushButton("Kılavuz", self)
         self.btn_guide.setToolTip("Kullanım kılavuzu ve sorun giderme penceresini açar")
         self.btn_guide.clicked.connect(self._on_open_guide)
-        footer_layout.addWidget(self.btn_guide)
 
         self.btn_reset_defaults = QPushButton("Varsayılanlara Sıfırla", self)
         self.btn_reset_defaults.setToolTip("Tüm ayarları varsayılan değerlerine döndürür")
         self.btn_reset_defaults.clicked.connect(self.reset_to_defaults)
-        footer_layout.addWidget(self.btn_reset_defaults)
 
         self.btn_save = QPushButton("Kaydet ve Uygula", self)
         self.btn_save.setObjectName("PrimarySaveButton")
         self.btn_save.setToolTip("Ayarları kaydeder ve anında uygular")
         self.btn_save.clicked.connect(self.save_settings)
-        footer_layout.addWidget(self.btn_save)
 
         self.btn_close = QPushButton("Kapat", self)
         self.btn_close.clicked.connect(self.close)
-        footer_layout.addWidget(self.btn_close)
 
-        root_layout.addLayout(footer_layout)
+        tool_buttons = (
+            self.btn_radar,
+            self.btn_yolo_factory,
+            self.btn_mobile_connect,
+            self.btn_analytics,
+            self.btn_calibration,
+            self.btn_guide,
+            self.btn_reset_defaults,
+            self.btn_save,
+            self.btn_close,
+        )
+        for index, button in enumerate(tool_buttons):
+            tool_grid.addWidget(button, index // 3, index % 3)
+        footer_bar_lay.addLayout(tool_grid)
+        root_layout.addWidget(self.footer_bar)
 
     # ------------------------------------------------------------------
-    # Left Column Builders
+    # Left Column Builders (matching ayarlar.html `.grid2` + `.trow`)
     # ------------------------------------------------------------------
     def _build_gathering_group(self) -> QGroupBox:
-        grp = QGroupBox("Toplama Ayarları (Gathering)", self)
+        grp = QGroupBox("TOPLAMA AYARLARI (GATHERING)", self)
         lay = QVBoxLayout(grp)
         lay.setSpacing(6)
+        lay.setContentsMargins(10, 12, 10, 10)
+        grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        lay.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
 
-        # F/E Basım Aralığı (sn): [1.5] ile [3.0] sn
-        row_f = QHBoxLayout()
-        row_f.setSpacing(6)
-        row_f.addWidget(QLabel("F/E Basım Aralığı (sn):"))
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
 
+        # Cell (0,0): F/E basım alt sınır (sn): [1.5] sn
+        cell_min = QHBoxLayout()
+        cell_min.setSpacing(6)
+        cell_min.addWidget(QLabel("F/E basım alt sınır (sn):"), stretch=1)
         self.f_interval_min = QDoubleSpinBox(self)
         self.f_interval_min.setRange(0.1, 60.0)
         self.f_interval_min.setSingleStep(0.1)
         self.f_interval_min.setDecimals(1)
-        self.f_interval_min.setFixedWidth(54)
-        self.spin_f_min = self.f_interval_min  # Alias
+        self.f_interval_min.setFixedWidth(56)
+        self.spin_f_min = self.f_interval_min
+        cell_min.addWidget(self.f_interval_min)
+        h_min = QLabel("sn")
+        h_min.setProperty("hintLabel", True)
+        cell_min.addWidget(h_min)
+        grid.addLayout(cell_min, 0, 0)
 
+        # Cell (0,1): F/E basım üst sınır (sn): [3.0] sn
+        cell_max = QHBoxLayout()
+        cell_max.setSpacing(6)
+        cell_max.addWidget(QLabel("F/E basım üst sınır (sn):"), stretch=1)
         self.f_interval_max = QDoubleSpinBox(self)
         self.f_interval_max.setRange(0.1, 60.0)
         self.f_interval_max.setSingleStep(0.1)
         self.f_interval_max.setDecimals(1)
-        self.f_interval_max.setFixedWidth(54)
-        self.spin_f_max = self.f_interval_max  # Alias
+        self.f_interval_max.setFixedWidth(56)
+        self.spin_f_max = self.f_interval_max
+        cell_max.addWidget(self.f_interval_max)
+        h_max = QLabel("sn")
+        h_max.setProperty("hintLabel", True)
+        cell_max.addWidget(h_max)
+        grid.addLayout(cell_max, 0, 1)
 
-        row_f.addWidget(self.f_interval_min)
-        row_f.addWidget(QLabel("ile"))
-        row_f.addWidget(self.f_interval_max)
-        row_f.addWidget(QLabel("saniye arası"))
-        row_f.addStretch(1)
-        lay.addLayout(row_f)
-
-        # Harvests per node: SpinBox (1 to 10, default 3)
-        row_harvest = QHBoxLayout()
-        row_harvest.setSpacing(6)
-        self.lbl_harvests_per_node = QLabel(
-            "Materyal Başına Toplama Sayısı (Varsayılan: 3x):"
-        )
+        # Cell (1,0): Materyal başına toplama (Varsayılan: 3x): [3]
+        cell_harv = QHBoxLayout()
+        cell_harv.setSpacing(6)
+        self.lbl_harvests_per_node = QLabel("Materyal başına toplama (Varsayılan: 3x):")
         self.lbl_harvests_per_node.setToolTip("Harvests per node (3x per material)")
-        row_harvest.addWidget(self.lbl_harvests_per_node)
-
+        cell_harv.addWidget(self.lbl_harvests_per_node, stretch=1)
         self.harvests_per_node = QSpinBox(self)
         self.harvests_per_node.setRange(1, 10)
         self.harvests_per_node.setValue(3)
-        self.harvests_per_node.setFixedWidth(54)
+        self.harvests_per_node.setFixedWidth(56)
         self.harvests_per_node.setToolTip(
             "Harvests per node (3x per material) — Her materyal noktasından kaç kez toplanacağı (1-10)"
         )
         self.spin_harvests_per_node = self.harvests_per_node
-        row_harvest.addWidget(self.harvests_per_node)
-        row_harvest.addStretch(1)
-        lay.addLayout(row_harvest)
+        cell_harv.addWidget(self.harvests_per_node)
+        grid.addLayout(cell_harv, 1, 0)
 
-        # Gather key: ComboBox ("f", "e", "auto")
-        row_gkey = QHBoxLayout()
-        row_gkey.setSpacing(6)
-        self.lbl_gather_key = QLabel("Toplama Tuşu (F / E / Otomatik):")
+        # Cell (1,1): Toplama tuşu (F / E / Otomatik): [f]
+        cell_gkey = QHBoxLayout()
+        cell_gkey.setSpacing(6)
+        self.lbl_gather_key = QLabel("Toplama tuşu (F / E / Otomatik):")
         self.lbl_gather_key.setToolTip("Gather key (f / e / auto)")
-        row_gkey.addWidget(self.lbl_gather_key)
-
+        cell_gkey.addWidget(self.lbl_gather_key, stretch=1)
         self.gather_key = QComboBox(self)
         for key_opt in ("f", "e", "auto"):
             self.gather_key.addItem(key_opt, key_opt)
         self.gather_key.setCurrentText("f")
-        self.gather_key.setFixedWidth(78)
+        self.gather_key.setFixedWidth(74)
         self.gather_key.setToolTip(
             "Oyun istemcisinde görünen toplama tuşu: 'f' ([F]), 'e' ([E]) veya 'auto' (otomatik)"
         )
         self.cb_gather_key = self.gather_key
         self.combo_gather_key = self.gather_key
-        row_gkey.addWidget(self.gather_key)
-        row_gkey.addStretch(1)
-        lay.addLayout(row_gkey)
+        cell_gkey.addWidget(self.gather_key)
+        grid.addLayout(cell_gkey, 1, 1)
 
-        # Toggle: Retry on 'Essence Extraction failed'
+        lay.addLayout(grid)
+
         self.retry_on_extraction_fail = ToggleSwitch(
-            "'Essence Extraction failed' Hatasında Tekrar Dene", self, checked=True
+            "‘Essence Extraction failed’ hatasında tekrar dene", self, checked=True
         )
         self.retry_on_extraction_fail.setToolTip(
             "Retry on 'Essence Extraction failed' — Toplama başarısız olduğunda aynı aşamayı tekrar dener"
@@ -1341,161 +1725,436 @@ class SettingsWindow(QDialog):
         self.chk_retry_on_extraction_fail = self.retry_on_extraction_fail
         lay.addWidget(self.retry_on_extraction_fail)
 
-        # Toggle: Test mode (detect only, never press keys)
-        self.test_mode = ToggleSwitch("Test Modu (Tuş basmadan simüle et)", self)
+        self.test_mode = ToggleSwitch("Test modu (tuş basmadan simüle et)", self)
         self.test_mode.setToolTip("Test mode (detect only, never press keys)")
         self.chk_test = self.test_mode
         lay.addWidget(self.test_mode)
 
-        # Toggle: Show overlay over the game
-        self.show_overlay = ToggleSwitch("Bilgi Panelini (Overlay HUD) Göster", self)
+        self.show_overlay = ToggleSwitch("Bilgi panelini (Overlay HUD) göster", self)
         self.show_overlay.setToolTip("Show overlay over the game")
         self.chk_overlay = self.show_overlay
         lay.addWidget(self.show_overlay)
 
+        # ------------------------------------------------------------------
+        # Seç-Topla (Materyal Seç & Yakınlık Rotası) Bölümü
+        # ------------------------------------------------------------------
+        sep_sg = QFrame(self)
+        sep_sg.setFrameShape(QFrame.Shape.HLine)
+        sep_sg.setFixedHeight(1)
+        sep_sg.setStyleSheet("background-color: #2b323c; border: none; margin: 4px 0px;")
+        lay.addWidget(sep_sg)
+
+        self.chk_selective_gather = ToggleSwitch(
+            "🎯 Seç-Topla Aktif (Sadece Seçilen Materyali Topla)", self
+        )
+        self.chk_selective_gather.setToolTip(
+            "Seç-Topla: Bot sadece listeden seçilen materyalleri toplar, civardaki diğer materyalleri atlar"
+        )
+        lay.addWidget(self.chk_selective_gather)
+
+        sg_row = QHBoxLayout()
+        sg_row.setSpacing(8)
+        lbl_sg_mat = QLabel("Hedef Materyal:")
+        lbl_sg_mat.setToolTip("Yakınlığına göre rota çizilecek ve toplanacak materyal türü")
+        sg_row.addWidget(lbl_sg_mat)
+
+        self.combo_selective_materials = QComboBox(self)
+        self.combo_selective_materials.setStyleSheet(
+            """
+            QComboBox {
+                background-color: #11151c;
+                color: #ffffff;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 11px;
+                min-width: 160px;
+            }
+            QComboBox:hover {
+                border-color: #38bdf8;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #11151c;
+                color: #ffffff;
+                selection-background-color: #2563eb;
+                selection-color: #ffffff;
+                border: 1px solid #334155;
+                outline: none;
+                font-size: 11px;
+            }
+            """
+        )
+        view_sg = self.combo_selective_materials.view()
+        if view_sg is not None:
+            pal = view_sg.palette()
+            pal.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
+            pal.setColor(QPalette.ColorRole.WindowText, QColor("#ffffff"))
+            pal.setColor(QPalette.ColorRole.Base, QColor("#11151c"))
+            view_sg.setPalette(pal)
+
+        self.populate_selective_materials()
+        sg_row.addWidget(self.combo_selective_materials, stretch=1)
+        lay.addLayout(sg_row)
+
+        self.chk_proximity_route_auto = ToggleSwitch(
+            "🧭 Yakınlığa Göre Otomatik Rota Sırala (Proximity Route)", self, checked=True
+        )
+        self.chk_proximity_route_auto.setToolTip(
+            "Otomatik Proximity Rota: Seçilen materyal noktalarını oyuncunun konumuna en yakından uzağa sıralar"
+        )
+        lay.addWidget(self.chk_proximity_route_auto)
+
+        self.btn_proximity_route = QPushButton("🧭 Yakınlığa Göre Rota Çiz & Topla", self)
+        self.btn_proximity_route.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_proximity_route.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #1e3a8a;
+                color: #ffffff;
+                border: 1px solid #3b82f6;
+                border-radius: 4px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+                border-color: #60a5fa;
+            }
+            QPushButton:pressed {
+                background-color: #1d4ed8;
+            }
+            """
+        )
+        lay.addWidget(self.btn_proximity_route)
+
+        self.chk_selective_gather.toggled.connect(self._on_selective_gather_ui_changed)
+        self.combo_selective_materials.currentIndexChanged.connect(self._on_selective_gather_ui_changed)
+        self.chk_proximity_route_auto.toggled.connect(self._on_selective_gather_ui_changed)
+        self.btn_proximity_route.clicked.connect(self._on_proximity_route_clicked)
+
         return grp
 
-    def _build_route_group(self) -> QGroupBox:
-        grp = QGroupBox("Rota ve Otomasyon (Route)", self)
-        lay = QVBoxLayout(grp)
-        lay.setSpacing(5)
+    DEFAULT_SELECTIVE_PRESETS: List[Tuple[str, List[str]]] = [
+        ("Tümü (Hepsi)", []),
+        ("⛏️ Orichalcum Ore (orichalcum)", ["orichalcum"]),
+        ("🌸 Aria (aria)", ["aria"]),
+        ("🍒 Mela (mela)", ["mela"]),
+        ("🌿 Targena (targena)", ["targena"]),
+        ("💎 Gem / Odyle (gem_crystal)", ["gem_crystal"]),
+        ("🪵 Ağaç / Kereste (tree_log)", ["tree_log"]),
+    ]
 
-        # Dinlenme Süresi (dk): [5] dk  |  Havada maks. yükselme: [10] sn
+    def populate_selective_materials(self) -> None:
+        """Populates the selective materials combo box with presets and dynamic region materials."""
+        if not hasattr(self, "combo_selective_materials") or self.combo_selective_materials is None:
+            return
+
+        self.combo_selective_materials.blockSignals(True)
+        current_data = self.combo_selective_materials.currentData()
+        self.combo_selective_materials.clear()
+
+        # 1. Preset entries
+        for label, val in self.DEFAULT_SELECTIVE_PRESETS:
+            self.combo_selective_materials.addItem(label, val)
+
+        # 2. Dynamic region materials
+        reg_val = ""
+        if hasattr(self, "region_combo") and self.region_combo is not None:
+            try:
+                reg_val = self._current_region()
+            except Exception:
+                reg_val = ""
+        if not reg_val and self.route_manager is not None:
+            reg_val = getattr(self.route_manager, "active_region", "")
+        region_name = str(reg_val or "Altgard").strip()
+        seen_names = {"orichalcum", "aria", "mela", "targena", "gem_crystal", "tree_log", "all", ""}
+        try:
+            from config.materials_db import get_region_expected_materials
+            reg_mats = get_region_expected_materials(region_name)
+            if reg_mats:
+                for mat in reg_mats:
+                    canonical = getattr(mat, "base_material", getattr(mat, "name", "")).strip()
+                    cat = getattr(mat, "category", "")
+                    if canonical and canonical.lower() not in seen_names:
+                        seen_names.add(canonical.lower())
+                        icon = "🌿" if "Herb" in cat else ("⛏️" if "Ore" in cat else ("💎" if "Gem" in cat or "Odyle" in cat else ("🪵" if "Log" in cat else "📦")))
+                        label = f"{icon} {canonical} ({region_name})"
+                        self.combo_selective_materials.addItem(label, [canonical.lower()])
+        except Exception as exc:
+            logger.debug("SettingsWindow bölge materyalleri taranırken hata: %s", exc)
+
+        # 3. Dynamic materials from route_manager nodes if present
+        if self.route_manager is not None and hasattr(self.route_manager, "data"):
+            try:
+                reg_data = self.route_manager.data.get("regions", {}).get(region_name, {})
+                nodes = reg_data.get("nodes", [])
+                for node in nodes:
+                    if isinstance(node, dict):
+                        m_type = str(node.get("material_type", "") or node.get("name", "")).strip()
+                        if m_type and m_type.lower() not in seen_names:
+                            seen_names.add(m_type.lower())
+                            self.combo_selective_materials.addItem(f"📍 {m_type}", [m_type.lower()])
+            except Exception as exc:
+                logger.debug("SettingsWindow route_manager nodeları taranırken hata: %s", exc)
+
+        # Restore selection
+        restored = False
+        if current_data is not None:
+            for idx in range(self.combo_selective_materials.count()):
+                if self.combo_selective_materials.itemData(idx) == current_data:
+                    self.combo_selective_materials.setCurrentIndex(idx)
+                    restored = True
+                    break
+        if not restored:
+            self.combo_selective_materials.setCurrentIndex(0)
+
+        self.combo_selective_materials.blockSignals(False)
+
+    def set_selected_materials(
+        self, materials: Sequence[str], auto_proximity: bool = True
+    ) -> None:
+        """Programmatically sets the selective materials and auto_proximity flag."""
+        mats = [str(m).strip() for m in materials if str(m).strip()]
+        if hasattr(self, "combo_selective_materials"):
+            self.combo_selective_materials.blockSignals(True)
+            matched = False
+            for idx in range(self.combo_selective_materials.count()):
+                d = self.combo_selective_materials.itemData(idx)
+                if d and any(m in d for m in mats):
+                    self.combo_selective_materials.setCurrentIndex(idx)
+                    matched = True
+                    break
+            if not matched and not mats:
+                self.combo_selective_materials.setCurrentIndex(0)
+            elif not matched and mats:
+                self.combo_selective_materials.addItem(f"🎯 {', '.join(mats)}", list(mats))
+                self.combo_selective_materials.setCurrentIndex(
+                    self.combo_selective_materials.count() - 1
+                )
+            self.combo_selective_materials.blockSignals(False)
+
+        if hasattr(self, "chk_selective_gather"):
+            self.chk_selective_gather.setChecked(bool(mats))
+
+        if hasattr(self, "chk_proximity_route_auto"):
+            self.chk_proximity_route_auto.setChecked(bool(auto_proximity))
+
+    def get_selected_materials(self) -> List[str]:
+        if hasattr(self, "combo_selective_materials"):
+            return list(self.combo_selective_materials.currentData() or [])
+        return []
+
+    def _on_selective_gather_ui_changed(self) -> None:
+        if not hasattr(self, "combo_selective_materials") or not hasattr(self, "chk_selective_gather"):
+            return
+        enabled = self.chk_selective_gather.isChecked()
+        mats = self.combo_selective_materials.currentData() or []
+        auto_prox = self.chk_proximity_route_auto.isChecked() if hasattr(self, "chk_proximity_route_auto") else True
+        effective_mats = list(mats) if enabled else []
+        self.selective_gather_changed.emit(effective_mats, auto_prox)
+        logger.info(
+            "SettingsWindow Seç-Topla güncellendi: %s (Aktif: %s, Oto-Yakınlık: %s)",
+            effective_mats,
+            enabled,
+            auto_prox,
+        )
+
+    def _on_proximity_route_clicked(self) -> None:
+        if hasattr(self, "combo_selective_materials"):
+            mats = self.combo_selective_materials.currentData() or []
+        else:
+            mats = []
+        if hasattr(self, "chk_selective_gather") and mats:
+            self.chk_selective_gather.setChecked(True)
+        if hasattr(self, "chk_proximity_route_auto"):
+            self.chk_proximity_route_auto.setChecked(True)
+        self.selective_gather_changed.emit(list(mats), True)
+        logger.info("SettingsWindow 'Yakınlığa Göre Rota Çiz & Topla' tıklandı. Materyaller: %s", mats)
+
+    def _build_route_group(self) -> QGroupBox:
+        grp = QGroupBox("ROTA VE OTOMASYON (ROUTE)", self)
+        lay = QVBoxLayout(grp)
+        lay.setSpacing(6)
+        lay.setContentsMargins(10, 12, 10, 10)
+        grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        lay.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
+
+        # Row 1: .grid2 (Dinlenme süresi | Havada maks. yükselme)
+        g_top = QGridLayout()
+        g_top.setContentsMargins(0, 0, 0, 0)
+        g_top.setHorizontalSpacing(14)
+        g_top.setColumnStretch(0, 1)
+        g_top.setColumnStretch(1, 1)
+
         row_rest = QHBoxLayout()
         row_rest.setSpacing(6)
-        row_rest.addWidget(QLabel("Dinlenme Süresi (dk):"))
+        row_rest.addWidget(QLabel("Dinlenme süresi (dk):"), stretch=1)
         self.rest_minutes = QSpinBox(self)
         self.rest_minutes.setRange(0, 240)
-        self.rest_minutes.setFixedWidth(48)
+        self.rest_minutes.setFixedWidth(56)
         self.spin_rest = self.rest_minutes
         row_rest.addWidget(self.rest_minutes)
-        row_rest.addSpacing(10)
-        row_rest.addWidget(QLabel("Havada maks. yükselme (sn):"))
+        g_top.addLayout(row_rest, 0, 0)
+
+        row_climb = QHBoxLayout()
+        row_climb.setSpacing(6)
+        row_climb.addWidget(QLabel("Havada maks. yükselme (sn):"), stretch=1)
         self.climb_air_max_sec = QSpinBox(self)
         self.climb_air_max_sec.setRange(0, 120)
-        self.climb_air_max_sec.setFixedWidth(48)
-        row_rest.addWidget(self.climb_air_max_sec)
-        row_rest.addStretch(1)
-        lay.addLayout(row_rest)
+        self.climb_air_max_sec.setFixedWidth(56)
+        row_climb.addWidget(self.climb_air_max_sec)
+        g_top.addLayout(row_climb, 0, 1)
+        lay.addLayout(g_top)
 
-        # Toggle: Gathered nodes join the active route
         self.gathered_join_active_route = ToggleSwitch(
             "Toplanan noktaları aktif rotaya otomatik ekle", self
         )
         lay.addWidget(self.gathered_join_active_route)
 
-        # Toggle: Fly to nodes the game cannot reach on foot
         self.fly_unreachable = ToggleSwitch(
             "Yürüyerek ulaşılamayan noktalara uçarak git", self
         )
         lay.addWidget(self.fly_unreachable)
 
-        # Toggle: Check minimap for Odyle in air
         self.check_odyle_minimap = ToggleSwitch(
             "Havadayken Minimap üzerinde Odyle kontrol et", self
         )
         lay.addWidget(self.check_odyle_minimap)
 
-        # Yolda giderken noktaya her [10] saniyede bir tekrar tıkla (0: asla)
+        # Row: .grid2 (Yolda noktaya tekrar tıklama süresi | Noktaya ulaşma süresi)
+        g_mid = QGridLayout()
+        g_mid.setContentsMargins(0, 0, 0, 0)
+        g_mid.setHorizontalSpacing(14)
+        g_mid.setColumnStretch(0, 1)
+        g_mid.setColumnStretch(1, 1)
+
         row_reclick = QHBoxLayout()
-        row_reclick.setSpacing(6)
-        row_reclick.addWidget(QLabel("Yolda noktaya tekrar tıklama süresi:"))
+        row_reclick.setSpacing(4)
+        row_reclick.addWidget(QLabel("Yolda noktaya tekrar tıklama süresi:"), stretch=1)
         self.reclick_node_sec = QSpinBox(self)
         self.reclick_node_sec.setRange(0, 300)
         self.reclick_node_sec.setFixedWidth(48)
         row_reclick.addWidget(self.reclick_node_sec)
-        row_reclick.addWidget(QLabel("sn (0: kapalı)"))
-        row_reclick.addStretch(1)
-        lay.addLayout(row_reclick)
+        h_rec = QLabel("sn (0: kapalı)")
+        h_rec.setProperty("hintLabel", True)
+        row_reclick.addWidget(h_rec)
+        g_mid.addLayout(row_reclick, 0, 0)
 
-        # Noktaya ulaşma zaman aşımı: [60] saniye
         row_reach = QHBoxLayout()
-        row_reach.setSpacing(6)
-        row_reach.addWidget(QLabel("Noktaya ulaşma süresi:"))
+        row_reach.setSpacing(4)
+        row_reach.addWidget(QLabel("Noktaya ulaşma süresi:"), stretch=1)
         self.time_to_reach_sec = QSpinBox(self)
         self.time_to_reach_sec.setRange(5, 600)
         self.time_to_reach_sec.setFixedWidth(48)
         self.spin_reach = self.time_to_reach_sec
         row_reach.addWidget(self.time_to_reach_sec)
-        row_reach.addWidget(QLabel("sn (sonra tekrar tıkla ve atla)"))
-        row_reach.addStretch(1)
-        lay.addLayout(row_reach)
+        h_rch = QLabel("sn (sonra tekrar tıkla ve atla)")
+        h_rch.setProperty("hintLabel", True)
+        row_reach.addWidget(h_rch)
+        g_mid.addLayout(row_reach, 0, 1)
+        lay.addLayout(g_mid)
 
-        # Toggle: Gather resources seen on the way (exploration)
         self.gather_on_the_way = ToggleSwitch(
-            "Yolda Giderken Gördüklerini Topla", self
+            "Yolda giderken gördüklerini topla", self
         )
         lay.addWidget(self.gather_on_the_way)
 
-        # Arka arkaya [10] başarısız noktadan sonra [5] dk bekle (0: kapalı)
+        # 2x2 .grid2 (Bekle | Başarısız noktada / Noktayı sil | Duraklat)
+        g_fail = QGridLayout()
+        g_fail.setContentsMargins(0, 0, 0, 0)
+        g_fail.setHorizontalSpacing(14)
+        g_fail.setVerticalSpacing(5)
+        g_fail.setColumnStretch(0, 1)
+        g_fail.setColumnStretch(1, 1)
+
         row_wait_fail = QHBoxLayout()
-        row_wait_fail.setSpacing(6)
-        row_wait_fail.addWidget(QLabel("Bekle:"))
+        row_wait_fail.setSpacing(4)
+        row_wait_fail.addWidget(QLabel("Bekle:"), stretch=1)
         self.wait_min_after_failed = QSpinBox(self)
         self.wait_min_after_failed.setRange(0, 240)
-        self.wait_min_after_failed.setFixedWidth(44)
+        self.wait_min_after_failed.setFixedWidth(48)
         row_wait_fail.addWidget(self.wait_min_after_failed)
-        row_wait_fail.addWidget(QLabel("dk, arka arkaya"))
+        h_wf = QLabel("dk, arka arkaya")
+        h_wf.setProperty("hintLabel", True)
+        row_wait_fail.addWidget(h_wf)
+        g_fail.addLayout(row_wait_fail, 0, 0)
+
+        row_wait_count = QHBoxLayout()
+        row_wait_count.setSpacing(4)
+        row_wait_count.addWidget(QLabel("Başarısız noktada:"), stretch=1)
         self.max_failed_in_row = QSpinBox(self)
         self.max_failed_in_row.setRange(0, 100)
-        self.max_failed_in_row.setFixedWidth(44)
-        row_wait_fail.addWidget(self.max_failed_in_row)
-        row_wait_fail.addWidget(QLabel("başarısız noktada (0: kapalı)"))
-        row_wait_fail.addStretch(1)
-        lay.addLayout(row_wait_fail)
+        self.max_failed_in_row.setFixedWidth(48)
+        row_wait_count.addWidget(self.max_failed_in_row)
+        h_wc = QLabel("(0: kapalı)")
+        h_wc.setProperty("hintLabel", True)
+        row_wait_count.addWidget(h_wc)
+        g_fail.addLayout(row_wait_count, 0, 1)
 
-        # Arka arkaya [0] başarısızlıktan sonra noktayı sil (0: kapalı)
         row_rem_fail = QHBoxLayout()
-        row_rem_fail.setSpacing(6)
-        row_rem_fail.addWidget(QLabel("Noktayı sil:"))
+        row_rem_fail.setSpacing(4)
+        row_rem_fail.addWidget(QLabel("Noktayı sil:"), stretch=1)
         self.remove_node_after_failures = QSpinBox(self)
         self.remove_node_after_failures.setRange(0, 100)
         self.remove_node_after_failures.setFixedWidth(44)
         row_rem_fail.addWidget(self.remove_node_after_failures)
-        row_rem_fail.addWidget(QLabel("ardışık başarısızlıktan sonra (0: kapalı)"))
-        row_rem_fail.addStretch(1)
-        lay.addLayout(row_rem_fail)
+        h_rf = QLabel("ardışık başarısızlıktan sonra (0: kapalı)")
+        h_rf.setProperty("hintLabel", True)
+        row_rem_fail.addWidget(h_rf)
+        g_fail.addLayout(row_rem_fail, 1, 0)
 
-        # Toplama yapmadan [15] dakika geçerse duraklat (0: kapalı)
         row_pause = QHBoxLayout()
-        row_pause.setSpacing(6)
-        row_pause.addWidget(QLabel("Duraklat:"))
+        row_pause.setSpacing(4)
+        row_pause.addWidget(QLabel("Duraklat:"), stretch=1)
         self.pause_after_no_gather_min = QSpinBox(self)
         self.pause_after_no_gather_min.setRange(0, 480)
         self.pause_after_no_gather_min.setFixedWidth(48)
         row_pause.addWidget(self.pause_after_no_gather_min)
-        row_pause.addWidget(QLabel("dk toplama yapılamazsa (0: kapalı)"))
-        row_pause.addStretch(1)
-        lay.addLayout(row_pause)
+        h_ps = QLabel("dk toplama yapılmazsa (0: kapalı)")
+        h_ps.setProperty("hintLabel", True)
+        row_pause.addWidget(h_ps)
+        g_fail.addLayout(row_pause, 1, 1)
+        lay.addLayout(g_fail)
 
-        # Toggle: Saldırı Altında Karşılık Ver + Çatışma sonrası bekleme
-        row_fight = QHBoxLayout()
-        row_fight.setSpacing(6)
-        self.fight_back = ToggleSwitch(
-            "Saldırı Altında Karşılık Ver", self
-        )
+        # Bottom row: Saldırı altında karşılık ver | Çatışma sonrası bekle
+        g_fight = QGridLayout()
+        g_fight.setContentsMargins(0, 0, 0, 0)
+        g_fight.setHorizontalSpacing(14)
+        g_fight.setColumnStretch(0, 1)
+        g_fight.setColumnStretch(1, 1)
+
+        self.fight_back = ToggleSwitch("Saldırı altında karşılık ver", self)
         self.chk_combat = self.fight_back
-        row_fight.addWidget(self.fight_back)
-        row_fight.addSpacing(8)
-        row_fight.addWidget(QLabel("Çatışma sonrası bekle:"))
+        g_fight.addWidget(self.fight_back, 0, 0)
+
+        row_fight = QHBoxLayout()
+        row_fight.setSpacing(4)
+        row_fight.addWidget(QLabel("Çatışma sonrası bekle:"), stretch=1)
         self.fight_stop_gather_sec = QSpinBox(self)
         self.fight_stop_gather_sec.setRange(0, 120)
-        self.fight_stop_gather_sec.setFixedWidth(44)
+        self.fight_stop_gather_sec.setFixedWidth(48)
         row_fight.addWidget(self.fight_stop_gather_sec)
-        row_fight.addWidget(QLabel("sn"))
-        row_fight.addStretch(1)
-        lay.addLayout(row_fight)
+        h_ft = QLabel("sn")
+        h_ft.setProperty("hintLabel", True)
+        row_fight.addWidget(h_ft)
+        g_fight.addLayout(row_fight, 0, 1)
+        lay.addLayout(g_fight)
 
         return grp
 
     def _build_cartography_group(self) -> QGroupBox:
-        grp = QGroupBox("Oto-Haritalama ve Radar (Auto-Cartography)", self)
+        grp = QGroupBox("OTO-HARİTALAMA VE RADAR (AUTO-CARTOGRAPHY)", self)
         lay = QVBoxLayout(grp)
-        lay.setSpacing(5)
+        lay.setSpacing(6)
+        lay.setContentsMargins(10, 12, 10, 10)
+        grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        lay.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
 
-        # Toggle: Auto-record materials from top-right Minimap
         self.minimap_auto_record = ToggleSwitch(
-            "Sağ Üst Haritadan (Minimap) Otomatik Kaydet", self, checked=True
+            "Sağ üst haritadan (Minimap) otomatik kaydet", self, checked=True
         )
         self.minimap_auto_record.setToolTip(
             "Auto-record materials from top-right Minimap"
@@ -1503,9 +2162,8 @@ class SettingsWindow(QDialog):
         self.chk_minimap_auto_record = self.minimap_auto_record
         lay.addWidget(self.minimap_auto_record)
 
-        # Toggle: 3B Dünyadaki Materyalleri (Aria/Mela) Otomatik Kaydet
         self.world_3d_auto_record = ToggleSwitch(
-            "3B Dünyadaki Materyalleri (Aria/Mela) Otomatik Kaydet", self, checked=True
+            "3B dünyadaki materyalleri (Aria/Mela) otomatik kaydet", self, checked=True
         )
         self.world_3d_auto_record.setToolTip(
             "3B ekranda görünen Aria, Mela, Odyle ve cevher parıltılarını otomatik haritalandırır"
@@ -1513,68 +2171,110 @@ class SettingsWindow(QDialog):
         self.minimap_cluster_stack_bonus = self.world_3d_auto_record
         lay.addWidget(self.world_3d_auto_record)
 
-        # Toggle: Ignore Monster white dots on Minimap
         self.minimap_ignore_monsters = ToggleSwitch(
-            "Minimap'teki Canavar Noktalarını (•) Yoksay", self, checked=True
+            "Minimap’teki canavar noktalarını (+) yoksay", self, checked=True
         )
         self.minimap_ignore_monsters.setToolTip(
             "Ignore Monster white dots on Minimap"
         )
         self.chk_minimap_ignore_monsters = self.minimap_ignore_monsters
         lay.addWidget(self.minimap_ignore_monsters)
+        lay.addStretch(1)
 
         return grp
 
     def _build_breaks_group(self) -> QGroupBox:
-        grp = QGroupBox("Molalar ve İnsanlaştırma (Breaks)", self)
+        grp = QGroupBox("MOLALAR VE İNSANSILAŞTIRMA (BREAKS)", self)
         lay = QVBoxLayout(grp)
         lay.setSpacing(6)
+        lay.setContentsMargins(10, 12, 10, 10)
+        grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        lay.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
 
-        # Her [0] ± [1] dakikada bir mola ver (0: kapalı)
-        row_every = QHBoxLayout()
-        row_every.setSpacing(6)
-        row_every.addWidget(QLabel("Mola sıklığı: her"))
         self.break_every_min = QSpinBox(self)
         self.break_every_min.setRange(0, 720)
-        self.break_every_min.setFixedWidth(46)
+        self.break_every_min.setFixedWidth(56)
+        row_every = QHBoxLayout()
+        row_every.setSpacing(6)
+        row_every.addWidget(QLabel("Mola sıklığı (dk, 0: kapalı):"), stretch=1)
         row_every.addWidget(self.break_every_min)
-        row_every.addWidget(QLabel("±"))
-        self.break_every_variance = QSpinBox(self)
-        self.break_every_variance.setRange(0, 120)
-        self.break_every_variance.setFixedWidth(44)
-        row_every.addWidget(self.break_every_variance)
-        row_every.addWidget(QLabel("dakikada bir (0: kapalı)"))
-        row_every.addStretch(1)
         lay.addLayout(row_every)
 
-        # Mola süresi [10] ± [1] dakika
-        row_lasts = QHBoxLayout()
-        row_lasts.setSpacing(6)
-        row_lasts.addWidget(QLabel("Mola süresi:"))
+        self.break_every_variance = QSpinBox(self)
+        self.break_every_variance.setRange(0, 120)
+        self.break_every_variance.setFixedWidth(56)
+        row_every_var = QHBoxLayout()
+        row_every_var.setSpacing(6)
+        row_every_var.addWidget(QLabel("Mola sıklığı sapması (dk):"), stretch=1)
+        row_every_var.addWidget(self.break_every_variance)
+        lay.addLayout(row_every_var)
+
         self.break_lasts_min = QSpinBox(self)
         self.break_lasts_min.setRange(1, 240)
-        self.break_lasts_min.setFixedWidth(46)
+        self.break_lasts_min.setFixedWidth(56)
+        row_lasts = QHBoxLayout()
+        row_lasts.setSpacing(6)
+        row_lasts.addWidget(QLabel("Mola süresi (dk):"), stretch=1)
         row_lasts.addWidget(self.break_lasts_min)
-        row_lasts.addWidget(QLabel("±"))
-        self.break_lasts_variance = QSpinBox(self)
-        self.break_lasts_variance.setRange(0, 60)
-        self.break_lasts_variance.setFixedWidth(44)
-        row_lasts.addWidget(self.break_lasts_variance)
-        row_lasts.addWidget(QLabel("dakika"))
-        row_lasts.addStretch(1)
         lay.addLayout(row_lasts)
 
+        self.break_lasts_variance = QSpinBox(self)
+        self.break_lasts_variance.setRange(0, 60)
+        self.break_lasts_variance.setFixedWidth(56)
+        row_lasts_var = QHBoxLayout()
+        row_lasts_var.setSpacing(6)
+        row_lasts_var.addWidget(QLabel("Mola süresi sapması (dk):"), stretch=1)
+        row_lasts_var.addWidget(self.break_lasts_variance)
+        lay.addLayout(row_lasts_var)
+        lay.addStretch(1)
+
         return grp
+
+    def _add_hotkey_edit(self, lay: QHBoxLayout, label: str, default: str) -> QLineEdit:
+        lbl = QLabel(label)
+        lbl.setStyleSheet("color: #8b98a6; font-size: 11px;")
+        lay.addWidget(lbl)
+        edit = _HotkeyCaptureEdit(default, self)
+        edit.setFixedWidth(120)
+        edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(edit)
+        return edit
+
+    def _build_hotkeys_group(self) -> QFrame:
+        strip = QFrame(self)
+        strip.setObjectName("SettingsHotkeysStrip")
+        lay = QHBoxLayout(strip)
+        lay.setContentsMargins(12, 7, 12, 7)
+        lay.setSpacing(10)
+
+        title = QLabel("BOT KISAYOLLARI", strip)
+        title.setStyleSheet(
+            "color: #9bb8dc; font-size: 11px; font-weight: 700; letter-spacing: 0.6px;"
+        )
+        lay.addWidget(title)
+
+        hint = QLabel(
+            "Alana tıklayıp tuş kombinasyonuna bas — kısayol yakalanır. Yalnız F8, F9 ve F10 oyuna ve Windows’a gider.",
+            strip,
+        )
+        hint.setStyleSheet("color: #67737f; font-size: 11px;")
+        lay.addWidget(hint)
+        lay.addStretch(1)
+
+        self.hotkey_node = self._add_hotkey_edit(lay, "Nokta ekle:", "ctrl+alt+f8")
+        self.hotkey_menu = self._add_hotkey_edit(lay, "Menü:", "ctrl+alt+f9")
+        self.hotkey_pause = self._add_hotkey_edit(lay, "Duraklat / Devam:", "ctrl+alt+f10")
+        return strip
 
     # ------------------------------------------------------------------
     # Right Column Builder (NODES / REGIONS & ROUTES)
     # ------------------------------------------------------------------
     def _build_nodes_group(self) -> QGroupBox:
-        grp = QGroupBox("Bölge ve Rotalar (Regions & Routes)", self)
+        grp = QGroupBox("BÖLGE VE ROTALAR (REGIONS · ROUTES)", self)
         lay = QVBoxLayout(grp)
-        lay.setSpacing(8)
+        lay.setSpacing(6)
+        lay.setContentsMargins(10, 12, 10, 10)
 
-        # Row 1: Region selector + Rename... + Delete region...
         reg_row = QHBoxLayout()
         reg_row.setSpacing(6)
         lbl_reg = QLabel("Bölge:")
@@ -1583,21 +2283,29 @@ class SettingsWindow(QDialog):
 
         self.region_combo = QComboBox(self)
         self.cb_region = self.region_combo
-        self.region_combo.setMinimumWidth(190)
+        self.region_combo.setMinimumWidth(160)
         self.region_combo.currentIndexChanged.connect(self._on_region_combo_changed)
         reg_row.addWidget(self.region_combo, stretch=1)
+        lay.addLayout(reg_row)
 
+        reg_btns = QHBoxLayout()
+        reg_btns.setSpacing(6)
         self.btn_rename_region = QPushButton("Adlandır...", self)
         self.btn_rename_region.clicked.connect(self._on_rename_region)
-        reg_row.addWidget(self.btn_rename_region)
-
         self.btn_delete_region = QPushButton("Bölgeyi Sil...", self)
         self.btn_delete_region.setObjectName("DangerOutlineButton")
         self.btn_delete_region.clicked.connect(self._on_delete_region)
-        reg_row.addWidget(self.btn_delete_region)
-        lay.addLayout(reg_row)
+        reg_btns.addWidget(self.btn_rename_region)
+        reg_btns.addWidget(self.btn_delete_region)
+        reg_btns.addStretch(1)
 
-        # Row 2: Route selector + New... + Rename... + Delete route...
+        self.point_filter_edit = QLineEdit(self)
+        self.point_filter_edit.setPlaceholderText("Nokta ara: #id")
+        self.point_filter_edit.setFixedWidth(128)
+        self.point_filter_edit.textChanged.connect(self._filter_nodes_table)
+        reg_btns.addWidget(self.point_filter_edit)
+        lay.addLayout(reg_btns)
+
         rte_row = QHBoxLayout()
         rte_row.setSpacing(6)
         lbl_rte = QLabel("Rota:")
@@ -1606,23 +2314,29 @@ class SettingsWindow(QDialog):
 
         self.route_combo = QComboBox(self)
         self.cb_route = self.route_combo
-        self.route_combo.setMinimumWidth(140)
+        self.route_combo.setMinimumWidth(160)
         self.route_combo.currentIndexChanged.connect(self._on_route_combo_changed)
         rte_row.addWidget(self.route_combo, stretch=1)
+        lay.addLayout(rte_row)
 
+        rte_btns = QHBoxLayout()
+        rte_btns.setSpacing(6)
         self.btn_new_route = QPushButton("Yeni...", self)
         self.btn_new_route.clicked.connect(self._on_new_route)
-        rte_row.addWidget(self.btn_new_route)
-
         self.btn_rename_route = QPushButton("Adlandır...", self)
         self.btn_rename_route.clicked.connect(self._on_rename_route)
-        rte_row.addWidget(self.btn_rename_route)
-
         self.btn_delete_route = QPushButton("Rotayı Sil...", self)
         self.btn_delete_route.setObjectName("DangerOutlineButton")
         self.btn_delete_route.clicked.connect(self._on_delete_route)
-        rte_row.addWidget(self.btn_delete_route)
-        lay.addLayout(rte_row)
+        rte_btns.addWidget(self.btn_new_route)
+        rte_btns.addWidget(self.btn_rename_route)
+        rte_btns.addWidget(self.btn_delete_route)
+        rte_btns.addStretch(1)
+
+        self.sel_info_lbl = QLabel("Seçili yok · 0 nokta", self)
+        self.sel_info_lbl.setStyleSheet("color: #67737f; font-size: 11px;")
+        rte_btns.addWidget(self.sel_info_lbl)
+        lay.addLayout(rte_btns)
 
         # Center Table Container with Empty State Overlay
         table_container = QWidget(self)
@@ -1638,9 +2352,11 @@ class SettingsWindow(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._row_select_filter = _RowSelectFilter(self.table)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.itemSelectionChanged.connect(self._update_sel_info_label)
 
         header = self.table.horizontalHeader()
         header.setDefaultAlignment(
@@ -1654,7 +2370,7 @@ class SettingsWindow(QDialog):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(3, 68)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(4, 72)
+        self.table.setColumnWidth(4, 78)
 
         # Empty-state overlay label inside the table viewport
         self.empty_nodes_lbl = QLabel(
@@ -1663,7 +2379,7 @@ class SettingsWindow(QDialog):
         )
         self.empty_nodes_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_nodes_lbl.setStyleSheet(
-            "color: #8b949e; font-size: 12px; background: transparent;"
+            "color: #67737f; font-size: 12px; background: transparent;"
         )
         self.empty_nodes_lbl.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
@@ -1672,7 +2388,7 @@ class SettingsWindow(QDialog):
         table_container_lay.addWidget(self.table)
         lay.addWidget(table_container, stretch=1)
 
-        # Bottom Action Buttons (2 neat rows)
+        # Bottom Action Buttons (2 neat rows matching ayarlar.html `.pactions`)
         act_row1 = QHBoxLayout()
         act_row1.setSpacing(6)
         self.btn_add_nodes = QPushButton("Nokta Ekle...", self)
@@ -1691,10 +2407,23 @@ class SettingsWindow(QDialog):
         act_row1.addWidget(self.btn_delete_node)
         act_row1.addWidget(self.btn_move_to_region)
         act_row1.addWidget(self.btn_map)
+        act_row1.addStretch(1)
         lay.addLayout(act_row1)
 
         act_row2 = QHBoxLayout()
         act_row2.setSpacing(6)
+        self.btn_delete_selected = QPushButton("Seçilenleri Sil", self)
+        self.btn_delete_selected.clicked.connect(self._on_delete_node)
+        self.btn_delete_wrong = QPushButton("YZ Yanlışları Sil", self)
+        self.btn_delete_wrong.clicked.connect(self._on_delete_wrong_nodes)
+        self.cb_wrong_tier = QComboBox(self)
+        self.cb_wrong_tier.addItem("Dengeli", "balanced")
+        self.cb_wrong_tier.addItem("Agresif", "aggressive")
+        self.cb_wrong_tier.addItem("Sıkı", "strict")
+        self.cb_wrong_tier.setCurrentIndex(0)
+        self.cb_wrong_tier.setToolTip(
+            "YZ yanlış tarama eşiği: Agresif≈0.10, Dengeli≈0.13, Sıkı≈0.22"
+        )
         self.btn_share_route = QPushButton("Rotayı Paylaş...", self)
         self.btn_share_route.clicked.connect(self._on_share_route)
         self.btn_import_route = QPushButton("Rota İçe Aktar...", self)
@@ -1702,14 +2431,251 @@ class SettingsWindow(QDialog):
         self.btn_import_questlog = QPushButton("Questlog'dan Aktar...", self)
         self.btn_import_questlog.clicked.connect(self._on_import_questlog)
 
+        act_row2.addWidget(self.btn_delete_selected)
+        act_row2.addWidget(self.btn_delete_wrong)
+        act_row2.addWidget(self.cb_wrong_tier)
         act_row2.addStretch(1)
         act_row2.addWidget(self.btn_share_route)
         act_row2.addWidget(self.btn_import_route)
         act_row2.addWidget(self.btn_import_questlog)
-        act_row2.addStretch(1)
         lay.addLayout(act_row2)
 
         return grp
+
+    def _build_blacklist_group(self) -> QGroupBox:
+        grp = QGroupBox("KARA LİSTE (BLACKLIST · YANLIŞ İŞARETLEMELER)", self)
+        lay = QVBoxLayout(grp)
+        lay.setSpacing(6)
+        lay.setContentsMargins(10, 12, 10, 10)
+
+        # Açıklama etiketi
+        desc_lbl = QLabel(
+            "Otomatik toplama sırasında 3 kez üst üste toplanacak kaynak bulunamayan veya YZ tarafından "
+            "yanlış işaretlendiği tespit edilen koordinatlar burada engellenir ve bir daha asla kaydedilmez.",
+            self,
+        )
+        desc_lbl.setWordWrap(True)
+        desc_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        lay.addWidget(desc_lbl)
+
+        # Filtre ve Durum Satırı
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+        self.blacklist_filter_edit = QLineEdit(self)
+        self.blacklist_filter_edit.setPlaceholderText("Kara listede ara: bölge veya koordinat...")
+        self.blacklist_filter_edit.textChanged.connect(self._filter_blacklist_table)
+        top_row.addWidget(self.blacklist_filter_edit, stretch=1)
+
+        self.blacklist_info_lbl = QLabel("0 koordinat engellendi", self)
+        self.blacklist_info_lbl.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: bold;")
+        top_row.addWidget(self.blacklist_info_lbl)
+        lay.addLayout(top_row)
+
+        # Kara Liste Tablosu
+        self.blacklist_table = QTableWidget(self)
+        self.blacklist_table.setColumnCount(5)
+        self.blacklist_table.setHorizontalHeaderLabels(
+            ["BÖLGE", "KOORDİNAT", "NEDEN", "YZ TEŞHİSİ", "TARİH"]
+        )
+        self.blacklist_table.verticalHeader().setVisible(False)
+        self.blacklist_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.blacklist_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.blacklist_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.blacklist_table.setShowGrid(False)
+        self.blacklist_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        bl_header = self.blacklist_table.horizontalHeader()
+        bl_header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        bl_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        bl_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        bl_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        bl_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        bl_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+
+        lay.addWidget(self.blacklist_table, stretch=1)
+
+        # Butonlar Satırı
+        act_row = QHBoxLayout()
+        act_row.setSpacing(6)
+        self.btn_blacklist_remove = QPushButton("Kara Listeden Kaldır", self)
+        self.btn_blacklist_remove.setObjectName("DangerOutlineButton")
+        self.btn_blacklist_remove.setToolTip("Seçilen koordinatı kara listeden kaldırır (tekrar kaydedilmesine izin verir)")
+        self.btn_blacklist_remove.clicked.connect(self._on_remove_from_blacklist)
+        act_row.addWidget(self.btn_blacklist_remove)
+
+        self.btn_blacklist_clear = QPushButton("Tümünü Temizle", self)
+        self.btn_blacklist_clear.setObjectName("DangerOutlineButton")
+        self.btn_blacklist_clear.setToolTip("Tüm kara listeyi temizler")
+        self.btn_blacklist_clear.clicked.connect(self._on_clear_blacklist)
+        act_row.addWidget(self.btn_blacklist_clear)
+
+        self.btn_blacklist_add = QPushButton("Manuel Ekle...", self)
+        self.btn_blacklist_add.setToolTip("Manuel olarak belirli bir koordinatı kara listeye ekler")
+        self.btn_blacklist_add.clicked.connect(self._on_add_to_blacklist)
+        act_row.addWidget(self.btn_blacklist_add)
+
+        self.btn_blacklist_refresh = QPushButton("Yenile", self)
+        self.btn_blacklist_refresh.setToolTip("Kara liste verilerini yeniden yükler")
+        self.btn_blacklist_refresh.clicked.connect(self.load_blacklist_table)
+        act_row.addWidget(self.btn_blacklist_refresh)
+
+        act_row.addStretch(1)
+        lay.addLayout(act_row)
+        return grp
+
+    def load_blacklist_table(self) -> None:
+        """Kara liste tablosunu diskteki kayıtlardan doldurur."""
+        if not hasattr(self, "blacklist_table"):
+            return
+        if getattr(self, "blacklist_mgr", None) is None:
+            try:
+                from core.blacklist_manager import get_blacklist_manager
+                self.blacklist_mgr = get_blacklist_manager()
+            except Exception:
+                return
+
+        entries = self.blacklist_mgr.get_entries()
+        self.blacklist_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            item_reg = QTableWidgetItem(str(entry.region))
+            item_reg.setData(Qt.ItemDataRole.UserRole, str(entry.id))
+            self.blacklist_table.setItem(row, 0, item_reg)
+
+            item_coord = QTableWidgetItem(f"({entry.map_x}, {entry.map_y})")
+            self.blacklist_table.setItem(row, 1, item_coord)
+
+            item_reason = QTableWidgetItem(str(entry.reason))
+            self.blacklist_table.setItem(row, 2, item_reason)
+
+            item_diag = QTableWidgetItem(str(entry.ai_verdict))
+            self.blacklist_table.setItem(row, 3, item_diag)
+
+            item_date = QTableWidgetItem(str(entry.created_at))
+            self.blacklist_table.setItem(row, 4, item_date)
+
+        if hasattr(self, "blacklist_info_lbl"):
+            self.blacklist_info_lbl.setText(f"{len(entries)} koordinat engellendi")
+
+    def _on_remove_from_blacklist(self) -> None:
+        if not hasattr(self, "blacklist_table") or self.blacklist_mgr is None:
+            return
+        selected_rows = self.blacklist_table.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.information(self, "Seçim Yok", "Lütfen kara listeden kaldırmak istediğiniz satırı seçin.")
+            return
+
+        entry_ids = []
+        for index in selected_rows:
+            item = self.blacklist_table.item(index.row(), 0)
+            if item:
+                eid = item.data(Qt.ItemDataRole.UserRole)
+                if eid:
+                    entry_ids.append(str(eid))
+
+        if not entry_ids:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Kara Listeden Kaldır",
+            f"Seçilen {len(entry_ids)} koordinat kara listeden kaldırılsın mı?\n"
+            "Kaldırılan koordinatlar tekrar rota veya düğüm olarak kaydedilebilir hale gelecektir.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            for eid in entry_ids:
+                self.blacklist_mgr.remove_entry(eid)
+            self.load_blacklist_table()
+
+    def _on_clear_blacklist(self) -> None:
+        if self.blacklist_mgr is None:
+            return
+        count = self.blacklist_mgr.count()
+        if count <= 0:
+            QMessageBox.information(self, "Kara Liste Boş", "Kara listede silinecek kayıt bulunmuyor.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Tümünü Temizle",
+            f"Kara listedeki tüm {count} koordinat kaydı silinsin mi?\n"
+            "Bu işlem geri alınamaz.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.blacklist_mgr.clear_all()
+            self.load_blacklist_table()
+
+    def _on_add_to_blacklist(self) -> None:
+        if self.blacklist_mgr is None:
+            return
+        reg, ok1 = QInputDialog.getText(
+            self, "Bölge Seç", "Bölge adı:", text=self._current_region() or "Altgard"
+        )
+        if not ok1 or not reg.strip():
+            return
+
+        coords, ok2 = QInputDialog.getText(
+            self, "Koordinat Gir", "Harita Koordinatı (X, Y):", text="100, 200"
+        )
+        if not ok2 or not coords.strip():
+            return
+
+        try:
+            parts = coords.replace("(", "").replace(")", "").split(",")
+            mx = int(float(parts[0].strip()))
+            my = int(float(parts[1].strip()))
+        except Exception:
+            QMessageBox.warning(self, "Hata", "Geçersiz koordinat formatı. Örnek: 150, 280")
+            return
+
+        self.blacklist_mgr.add_entry(
+            region=reg.strip(),
+            map_x=mx,
+            map_y=my,
+            reason="Kullanıcı tarafından manuel kara listeye eklendi",
+            ai_verdict="Manuel Tanım",
+        )
+        self.load_blacklist_table()
+
+    def _filter_blacklist_table(self, query: str) -> None:
+        if not hasattr(self, "blacklist_table"):
+            return
+        q = str(query or "").strip().lower()
+        rows = self.blacklist_table.rowCount()
+        cols = self.blacklist_table.columnCount()
+        for r in range(rows):
+            match = False
+            for c in range(cols):
+                it = self.blacklist_table.item(r, c)
+                if it and q in it.text().lower():
+                    match = True
+                    break
+            self.blacklist_table.setRowHidden(r, not match if q else False)
+
+    def _filter_nodes_table(self, query: str) -> None:
+        q = str(query or "").strip().lower().lstrip("#")
+        for row_idx in range(self.table.rowCount()):
+            it = self.table.item(row_idx, 0)
+            nid = str(it.data(Qt.ItemDataRole.UserRole) or "") if it is not None else ""
+            match = (not q) or (q in nid.lower())
+            self.table.setRowHidden(row_idx, not match)
+        self._update_sel_info_label()
+
+    def _update_sel_info_label(self) -> None:
+        if not hasattr(self, "sel_info_lbl"):
+            return
+        total = self.table.rowCount()
+        ids = self._selected_node_ids()
+        if ids:
+            if len(ids) == 1:
+                self.sel_info_lbl.setText(f"Seçili: #{ids[0]} · {total} nokta")
+            else:
+                self.sel_info_lbl.setText(f"Seçili: {len(ids)} nokta · toplam {total}")
+        else:
+            self.sel_info_lbl.setText(f"Seçili yok · {total} nokta")
 
     def resizeEvent(self, event: Any) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -1775,6 +2741,23 @@ class SettingsWindow(QDialog):
                 bool(self._cfg_get("retry_on_extraction_fail", True, target=settings))
             )
 
+            if hasattr(self, "chk_selective_gather"):
+                self.chk_selective_gather.setChecked(
+                    bool(self._cfg_get("selective_gather_enabled", False, target=settings))
+                )
+            if hasattr(self, "chk_proximity_route_auto"):
+                self.chk_proximity_route_auto.setChecked(
+                    bool(self._cfg_get("proximity_route_auto", True, target=settings))
+                )
+            if hasattr(self, "combo_selective_materials"):
+                raw_mats = self._cfg_get("selected_materials", [], target=settings) or []
+                if isinstance(raw_mats, str):
+                    raw_mats = [m.strip() for m in raw_mats.split(",") if m.strip()]
+                self.set_selected_materials(
+                    raw_mats,
+                    auto_proximity=bool(self._cfg_get("proximity_route_auto", True, target=settings)),
+                )
+
             # Route & Auto-Cartography settings
             self.rest_minutes.setValue(
                 int(self._cfg_get("rest_minutes", 5, target=settings))
@@ -1824,6 +2807,10 @@ class SettingsWindow(QDialog):
             self.minimap_ignore_monsters.setChecked(
                 bool(self._cfg_get("minimap_ignore_monsters", True, target=settings))
             )
+            if hasattr(self, "world_3d_auto_record"):
+                self.world_3d_auto_record.setChecked(
+                    bool(self._cfg_get("auto_record_3d_crests", True, target=settings))
+                )
 
             # Breaks settings
             self.break_every_min.setValue(
@@ -1838,6 +2825,15 @@ class SettingsWindow(QDialog):
             self.break_lasts_variance.setValue(
                 int(self._cfg_get("break_lasts_variance", 1, target=settings))
             )
+            self.hotkey_node.setText(
+                str(self._cfg_get("record_node_f8", "ctrl+alt+f8", target=settings) or "ctrl+alt+f8")
+            )
+            self.hotkey_menu.setText(
+                str(self._cfg_get("toggle_menu_f9", "ctrl+alt+f9", target=settings) or "ctrl+alt+f9")
+            )
+            self.hotkey_pause.setText(
+                str(self._cfg_get("pause_resume_f10", "ctrl+alt+f10", target=settings) or "ctrl+alt+f10")
+            )
         except Exception as exc:
             logger.error("Error loading settings into UI: %s", exc)
 
@@ -1851,8 +2847,39 @@ class SettingsWindow(QDialog):
         values = self.get_settings_dict()
         for key, val in values.items():
             self._cfg_set(key, val, target=settings)
+        self._remember_selection()
         self._cfg_save()
         return settings if settings is not None else self.settings
+
+    def _remember_selection(self) -> None:
+        """Store region, route, and shell tab on the settings object. Does not write routes."""
+        bot = getattr(self.config_manager, "settings", None)
+        if bot is None or not hasattr(bot, "active_region"):
+            bot = self.settings if hasattr(self.settings, "active_region") else None
+        if bot is None:
+            return
+        try:
+            region = self._current_region()
+        except Exception:
+            region = ""
+        try:
+            route = self._current_route()
+        except Exception:
+            route = ""
+        if region:
+            bot.active_region = region
+        if route:
+            bot.active_route = route
+        display = getattr(bot, "display", None)
+        shell = getattr(self, "_shell", None)
+        tab = ""
+        if shell is not None and hasattr(shell, "current_key"):
+            try:
+                tab = str(shell.current_key() or "").strip()
+            except Exception:
+                tab = ""
+        if display is not None and tab and hasattr(display, "last_tab"):
+            display.last_tab = tab
 
     def load_settings_into_ui(self) -> None:
         """Loads all settings from `config_manager` into the UI controls."""
@@ -1886,6 +2913,15 @@ class SettingsWindow(QDialog):
             "retry_on_extraction_fail": bool(
                 self.retry_on_extraction_fail.isChecked()
             ),
+            "selective_gather_enabled": bool(self.chk_selective_gather.isChecked())
+            if hasattr(self, "chk_selective_gather")
+            else False,
+            "selected_materials": list(self.combo_selective_materials.currentData() or [])
+            if hasattr(self, "combo_selective_materials")
+            else [],
+            "proximity_route_auto": bool(self.chk_proximity_route_auto.isChecked())
+            if hasattr(self, "chk_proximity_route_auto")
+            else True,
             "rest_minutes": int(self.rest_minutes.value()),
             "climb_air_max_sec": int(self.climb_air_max_sec.value()),
             "gathered_join_active_route": bool(
@@ -1904,17 +2940,35 @@ class SettingsWindow(QDialog):
             "fight_stop_gather_sec": int(self.fight_stop_gather_sec.value()),
             "minimap_auto_record": bool(self.minimap_auto_record.isChecked()),
             "minimap_ignore_monsters": bool(self.minimap_ignore_monsters.isChecked()),
+            "auto_record_3d_crests": bool(self.world_3d_auto_record.isChecked()),
             "break_every_min": int(self.break_every_min.value()),
             "break_every_variance": int(self.break_every_variance.value()),
             "break_lasts_min": int(self.break_lasts_min.value()),
             "break_lasts_variance": int(self.break_lasts_variance.value()),
+            "record_node_f8": self._chord_setting(self.hotkey_node.text(), "ctrl+alt+f8"),
+            "toggle_menu_f9": self._chord_setting(self.hotkey_menu.text(), "ctrl+alt+f9"),
+            "pause_resume_f10": self._chord_setting(self.hotkey_pause.text(), "ctrl+alt+f10"),
+            "blacklist": self.blacklist_mgr.to_list() if getattr(self, "blacklist_mgr", None) else [],
         }
+
+    @staticmethod
+    def _chord_setting(raw: str, fallback: str) -> str:
+        from config.schema import canonical_hotkey_chord
+
+        return canonical_hotkey_chord(raw, fallback)
 
     def save_settings(self) -> None:
         """Persists all UI settings to `config_manager` and emits `settings_saved`."""
         try:
+            if getattr(self, "blacklist_mgr", None) is not None:
+                self.blacklist_mgr.save()
             self._save_to_settings()
             self.set_status_message("Ayarlar kaydedildi ve uygulandı.")
+            if hasattr(self, "dirty_lbl"):
+                self.dirty_lbl.setVisible(False)
+            if hasattr(self, "saved_lbl"):
+                self.saved_lbl.setVisible(True)
+                QTimer.singleShot(2500, lambda: self.saved_lbl.setVisible(False))
             logger.info("Settings saved successfully.")
             self.settings_saved.emit()
         except Exception as exc:
@@ -1941,10 +2995,29 @@ class SettingsWindow(QDialog):
         """Updates the footer status message (`status_lbl`)."""
         self.status_lbl.setText(str(message))
 
+    set_status = set_status_message
+
     def _on_quit_clicked(self) -> None:
         logger.info("Quit bot requested from SettingsWindow.")
         self.quit_requested.emit()
         self.close()
+
+    def closeEvent(self, event: Any) -> None:  # noqa: N802
+        """Kapat hides the shell. It does not quit the bot. Overlay HUD stays up."""
+        shell = getattr(self, "_shell", None)
+        if shell is not None and not getattr(shell, "_closing", False):
+            event.ignore()
+            shell.close()
+            return
+        super().closeEvent(event)
+
+    def _open_hosted(self, key: str) -> bool:
+        """Switch a tab in the shell when this window is hosted. Otherwise open a dialog."""
+        opener = getattr(self, "tab_opener", None)
+        if callable(opener):
+            opener(key)
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Region & Route Combo Box Synchronization
@@ -2086,6 +3159,7 @@ class SettingsWindow(QDialog):
                 ):
                     self.route_manager.data["active_region"] = reg
             self._populate_routes_combo(reg)
+            self.populate_selective_materials()
         finally:
             self._updating_combos = False
         self._on_route_combo_changed()
@@ -2276,10 +3350,11 @@ class SettingsWindow(QDialog):
 
                 lbl_num = QLabel(f"#{node_id}", cell_node)
                 lbl_num.setStyleSheet(
-                    "color: #f3f4f6; font-weight: bold; font-size: 12px;"
+                    'color: #e8edf2; font-weight: bold; font-size: 12px; font-family: Consolas, "Cascadia Mono", monospace;'
                 )
                 cell_lay.addWidget(lbl_num)
                 cell_lay.addStretch(1)
+                self._arm_row_select(cell_node, row_idx)
 
                 # Store node_id in underlying QTableWidgetItem for selection operations
                 anchor_item = QTableWidgetItem()
@@ -2289,32 +3364,69 @@ class SettingsWindow(QDialog):
 
                 # Column 1: ROTALAR
                 item_routes = QTableWidgetItem(routes_str)
-                item_routes.setForeground(QBrush(QColor("#d1d5db")))
+                item_routes.setForeground(QBrush(QColor("#e8edf2")))
                 self.table.setItem(row_idx, 1, item_routes)
 
                 # Column 2: TOPLANAN
                 item_gathered = QTableWidgetItem(f"{gathered_cnt}×")
-                item_gathered.setForeground(QBrush(QColor("#d1d5db")))
+                item_gathered.setForeground(QBrush(QColor("#e8edf2")))
                 self.table.setItem(row_idx, 2, item_gathered)
 
                 # Column 3: SON
                 last_str = self._format_last_visited(last_ts, now)
                 item_last = QTableWidgetItem(last_str)
                 item_last.setData(Qt.ItemDataRole.UserRole, last_ts)
-                item_last.setForeground(QBrush(QColor("#9ca3af")))
+                item_last.setForeground(QBrush(QColor("#8b98a6")))
                 self.table.setItem(row_idx, 3, item_last)
 
-                # Column 4: DURUM (green `Hazır` or amber `4dk 12sn` capsule badge)
-                rest_text, is_ready = self._compute_rest_status(
-                    last_ts, rest_sec_cfg, now
+                # Column 4: DURUM (green `Hazır`, amber rest, gray `Yoksayılan`)
+                ignored = bool(
+                    node.get("not_gatherable", False)
+                    if isinstance(node, dict)
+                    else getattr(node, "not_gatherable", False)
                 )
-                badge = _RestBadgeWidget(rest_text, is_ready, self.table)
+                if ignored:
+                    rest_text, is_ready = "Yoksayılan", False
+                else:
+                    rest_text, is_ready = self._compute_rest_status(
+                        last_ts, rest_sec_cfg, now
+                    )
+                badge = _RestBadgeWidget(rest_text, is_ready, self.table, ignored=ignored)
+                self._arm_row_select(badge, row_idx)
                 self.table.setCellWidget(row_idx, 4, badge)
+            if hasattr(self, "point_filter_edit") and self.point_filter_edit.text().strip():
+                self._filter_nodes_table(self.point_filter_edit.text())
+            else:
+                self._update_sel_info_label()
         except Exception as exc:
             logger.error("Error populating nodes table: %s", exc)
 
+    def _update_header_perf(self) -> None:
+        """Updates header chips with live system metrics via SystemMonitor."""
+        try:
+            from core.system_monitor import SystemMonitor
+            snap = SystemMonitor.get_snapshot()
+            fps_val = snap.get("capture", {}).get("fps", 0.0)
+            fps_str = f"{fps_val:.0f}" if fps_val > 0 else "0"
+            gpu_pct = snap.get("gpu", {}).get("pct", 0)
+            cpu_pct = snap.get("cpu", {}).get("pct", 0)
+            lat_val = snap.get("capture", {}).get("latency_ms", 0.0)
+            lat_str = f"{lat_val:.1f}ms" if lat_val > 0 else "0.0ms"
+
+            if hasattr(self, "chip_fps"):
+                self.chip_fps.setText(f'FPS <b style="color:#e8edf2;font-family:Consolas;">{fps_str}</b>')
+            if hasattr(self, "chip_gpu"):
+                self.chip_gpu.setText(f'GPU <b style="color:#e8edf2;font-family:Consolas;">{gpu_pct}%</b>')
+            if hasattr(self, "chip_cpu"):
+                self.chip_cpu.setText(f'CPU <b style="color:#e8edf2;font-family:Consolas;">{cpu_pct}%</b>')
+            if hasattr(self, "chip_lat"):
+                self.chip_lat.setText(f'LAT <b style="color:#e8edf2;font-family:Consolas;">{lat_str}</b>')
+        except Exception as exc:
+            logger.debug("Header perf refresh error: %s", exc)
+
     def _update_live_node_statuses(self) -> None:
-        """Updates LAST and REST columns every second without rebuilding the whole table."""
+        """Updates header perf chips and LAST/REST columns every second."""
+        self._update_header_perf()
         if not self.isVisible() or self.table.rowCount() == 0:
             return
         try:
@@ -2401,7 +3513,7 @@ class SettingsWindow(QDialog):
         reg = self._current_region()
         if not reg:
             reg, ok_reg = QInputDialog.getText(
-                self, "Yeni Bölge", "Önce bir bölge adı girin:", text="Altgard"
+                self, "Yeni Bölge", "Önce bir bölge adı girin:", text=(self._current_region() or "")
             )
             reg = reg.strip()
             if not ok_reg or not reg:
@@ -2477,7 +3589,7 @@ class SettingsWindow(QDialog):
     # Node Action & Auxiliary Dialog Button Handlers
     # ------------------------------------------------------------------
     def _on_add_nodes(self) -> None:
-        reg = self._current_region() or "Altgard"
+        reg = self._current_region() or (self.route_manager.get_regions()[0] if self.route_manager and hasattr(self.route_manager, "get_regions") and self.route_manager.get_regions() else "")
         rte = self._current_route() or "All"
         try:
             all_nodes = self._get_nodes_for_selection(reg, "All")
@@ -2546,6 +3658,50 @@ class SettingsWindow(QDialog):
         except Exception as exc:
             logger.error("Remove from route failed: %s", exc)
 
+    def _arm_row_select(self, widget: QWidget, row_idx: int) -> None:
+        """Let Ctrl/Shift clicks on thumbnails and badges select the row."""
+        filt = getattr(self, "_row_select_filter", None)
+        if filt is None or widget is None:
+            return
+        widget.setProperty("gatherion_row", int(row_idx))
+        widget.installEventFilter(filt)
+        for child in widget.findChildren(QWidget):
+            child.setProperty("gatherion_row", int(row_idx))
+            child.installEventFilter(filt)
+
+    def _delete_ids_same_path(self, region: str, node_ids: List[int]) -> bool:
+        """Delete nodes through ``delete_nodes`` / ``save_region``, same as Noktayı Sil.
+
+        Returns False when nothing was written. WinError 5 is reported and is not success.
+        """
+        if not node_ids:
+            return False
+        rm = self.route_manager
+        if rm is None:
+            self.set_status_message("Rota yöneticisi yok. Nokta silinmedi.")
+            return False
+        if hasattr(rm, "delete_nodes"):
+            ok = bool(rm.delete_nodes(node_ids, region=region))
+        else:
+            deleted = 0
+            for nid in node_ids:
+                if hasattr(rm, "delete_node") and rm.delete_node(nid, region=region):
+                    deleted += 1
+            ok = deleted > 0
+        if ok:
+            return True
+        err = getattr(rm, "last_save_error", None)
+        winerror = getattr(err, "winerror", None) if err is not None else None
+        if winerror == 5:
+            self.set_status_message(
+                "Kayıt başarısız (WinError 5). Noktalar silinmedi."
+            )
+        elif err is not None:
+            self.set_status_message(f"Kayıt başarısız: {err}. Noktalar silinmedi.")
+        else:
+            self.set_status_message("Nokta silinmedi.")
+        return False
+
     def _on_delete_node(self) -> None:
         reg = self._current_region()
         rte = self._current_route()
@@ -2554,15 +3710,127 @@ class SettingsWindow(QDialog):
             self.set_status_message("Silmek için bir veya daha fazla nokta seçin.")
             return
         try:
-            deleted = 0
-            for nid in ids:
-                if hasattr(self.route_manager, "delete_node"):
-                    if self.route_manager.delete_node(nid, region=reg):
-                        deleted += 1
+            if not self._delete_ids_same_path(reg, ids):
+                return
             self.refresh_regions_and_routes(prefer_region=reg, prefer_route=rte)
-            self.set_status_message(f"{deleted} nokta '{reg}' bölgesinden silindi.")
+            self.set_status_message(f"{len(ids)} nokta '{reg}' bölgesinden silindi.")
         except Exception as exc:
             logger.error("Delete node failed: %s", exc)
+            self.set_status_message(f"Nokta silinemedi: {exc}")
+
+    def _wrong_scan_tier(self) -> str:
+        combo = getattr(self, "cb_wrong_tier", None)
+        if combo is None:
+            return "balanced"
+        data = combo.currentData()
+        if data:
+            return str(data)
+        return "balanced"
+
+    def _on_delete_wrong_nodes(self) -> None:
+        """Delete nodes the multi-signal gatherion gate calls wrong. Harvest 0 is not a reason."""
+        reg = self._current_region()
+        rte = self._current_route()
+        if not reg:
+            self.set_status_message("Önce bir bölge seçin.")
+            return
+        button = getattr(self, "btn_delete_wrong", None)
+        if button is not None:
+            button.setEnabled(False)
+        try:
+            from PyQt6.QtWidgets import QApplication
+
+            from core.wrong_node_scan import (
+                classify_wrong_nodes,
+                format_blocked_status_tr,
+                format_scan_meta_tr,
+                load_gatherion_detector,
+                load_node_patch,
+                load_patch_file,
+                scan_confidence_summary,
+                scan_would_exceed_half,
+            )
+
+            tier = self._wrong_scan_tier()
+            nodes = self._get_nodes_for_selection(reg, rte)
+            if not nodes:
+                self.set_status_message("Taranacak nokta yok. Hiçbir nokta silinmedi.")
+                return
+            self.set_status_message(f"YZ taraması çalışıyor (CPU, {tier})...")
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
+            try:
+                detector = load_gatherion_detector()
+            except Exception as exc:
+                logger.error("Gatherion modeli yüklenemedi: %s", exc)
+                self.set_status_message(
+                    f"Gatherion modeli yüklenemedi. Dosya yazılmadı: {exc}"
+                )
+                return
+            images = {}
+            rm = self.route_manager
+            for node in nodes:
+                node_id = int(
+                    node.get("id", 0) if isinstance(node, dict) else getattr(node, "id", 0)
+                )
+                image = None
+                if rm is not None and hasattr(rm, "_resolve_patch_disk_path"):
+                    try:
+                        path = str(rm._resolve_patch_disk_path(node))
+                        image = load_patch_file(path) if path else None
+                    except Exception as exc:
+                        logger.debug("Patch yolu okunamadı #%s: %s", node_id, exc)
+                        image = None
+                if image is None:
+                    image = load_node_patch(node, region=reg)
+                images[node_id] = image
+
+            def _progress(done: int, total: int) -> None:
+                if done % 8 != 0 and done != total:
+                    return
+                self.set_status_message(f"YZ taraması {done}/{total} (CPU, {tier})...")
+                if app is not None:
+                    app.processEvents()
+
+            wrong = classify_wrong_nodes(
+                nodes,
+                images,
+                detector,
+                on_progress=_progress,
+                tier=tier,
+            )
+            summary = scan_confidence_summary(nodes, images, detector)
+            meta = format_scan_meta_tr(detector, summary, tier=tier)
+            if not wrong:
+                self.set_status_message(
+                    f"YZ taraması yanlış düğüm bulamadı. Hiçbir nokta silinmedi. {meta}"
+                )
+                return
+            if scan_would_exceed_half(len(wrong), len(nodes)):
+                self.set_status_message(
+                    f"{format_blocked_status_tr(wrong, len(nodes))} {meta}"
+                )
+                return
+            if rm is None or not hasattr(rm, "backup_region_file"):
+                self.set_status_message("Yedek alınamadı. Dosya yazılmadı.")
+                return
+            try:
+                backup_path = rm.backup_region_file(reg)
+            except Exception as exc:
+                logger.error("Yedek alınamadı: %s", exc)
+                self.set_status_message(f"Yedek alınamadı. Dosya yazılmadı: {exc}")
+                return
+            if not self._delete_ids_same_path(reg, [item.node_id for item in wrong]):
+                return
+            self.refresh_regions_and_routes(prefer_region=reg, prefer_route=rte)
+            self.set_status_message(f"{_wrong_node_status(wrong, backup_path)} {meta}")
+        except Exception as exc:
+            logger.error("Wrong-node scan failed: %s", exc)
+            self.set_status_message(f"YZ taraması yazılmadı: {exc}")
+        finally:
+            if button is not None:
+                button.setEnabled(True)
 
     def delete_selected_node(self) -> None:
         """Backwards-compatibility alias for `_on_delete_node`."""
@@ -2606,7 +3874,9 @@ class SettingsWindow(QDialog):
 
     def _on_open_map(self) -> None:
         """Opens `ui.map_viewer.MapViewerWindow` for the active region and route."""
-        reg = self._current_region() or "Altgard"
+        if self._open_hosted("map"):
+            return
+        reg = self._current_region() or (self.route_manager.get_regions()[0] if self.route_manager and hasattr(self.route_manager, "get_regions") and self.route_manager.get_regions() else "")
         rte = self._current_route() or "All"
         rest_sec = float(self.rest_minutes.value() * 60)
         try:
@@ -2641,6 +3911,8 @@ class SettingsWindow(QDialog):
 
     def _on_open_radar(self) -> None:
         """Opens `ui.cartography_radar.CartographyRadarDialog`."""
+        if self._open_hosted("radar"):
+            return
         try:
             from ui.cartography_radar import CartographyRadarDialog  # type: ignore
 
@@ -2657,6 +3929,8 @@ class SettingsWindow(QDialog):
 
     def _on_open_analytics(self) -> None:
         """Opens `ui.analytics_dialog.AnalyticsDialog`."""
+        if self._open_hosted("stats"):
+            return
         try:
             from ui.analytics_dialog import AnalyticsDialog  # type: ignore
 
@@ -2671,6 +3945,8 @@ class SettingsWindow(QDialog):
 
     def _on_open_calibration(self) -> None:
         """Opens `ui.calibration_wizard.CalibrationWizard`."""
+        if self._open_hosted("calibration"):
+            return
         try:
             from ui.calibration_wizard import CalibrationWizard  # type: ignore
 
@@ -2685,6 +3961,8 @@ class SettingsWindow(QDialog):
 
     def _on_open_guide(self) -> None:
         """Opens `ui.guide_dialog.GuideDialog`."""
+        if self._open_hosted("guide"):
+            return
         try:
             from ui.guide_dialog import GuideDialog  # type: ignore
 
@@ -2699,6 +3977,8 @@ class SettingsWindow(QDialog):
 
     def _on_open_yolo_factory(self) -> None:
         """Opens `ui.yolo_factory_dialog.YOLOFactoryDialog`."""
+        if self._open_hosted("yolo"):
+            return
         try:
             from ui.yolo_factory_dialog import YOLOFactoryDialog  # type: ignore
 
@@ -2713,6 +3993,8 @@ class SettingsWindow(QDialog):
 
     def _on_open_mobile_connect(self) -> None:
         """Opens `ui.mobile_connect_dialog.MobileConnectDialog`."""
+        if self._open_hosted("mobile"):
+            return
         try:
             from ui.mobile_connect_dialog import MobileConnectDialog  # type: ignore
 
@@ -2727,7 +4009,7 @@ class SettingsWindow(QDialog):
 
     def _on_share_route(self) -> None:
         """Exports the active region/route to a `.zip` file via `export_route_zip`."""
-        reg = self._current_region() or "Altgard"
+        reg = self._current_region() or (self.route_manager.get_regions()[0] if self.route_manager and hasattr(self.route_manager, "get_regions") and self.route_manager.get_regions() else "")
         rte = self._current_route() or "All"
         default_name = f"{reg}_{rte.replace(' ', '_')}.zip"
         file_path, _ = QFileDialog.getSaveFileName(
@@ -2844,6 +4126,90 @@ class SettingsWindow(QDialog):
                     elif hasattr(sec_obj, "__dict__"):
                         summary[sec_name] = dict(sec_obj.__dict__)
         return summary
+
+    def get_consumable_settings(self) -> Dict[str, Any]:
+        """Returns automatic potion and buff scroll thresholds and keybinds."""
+        stored = self.__dict__.get("_consumable_settings_cache")
+        if isinstance(stored, dict):
+            return dict(stored)
+        defaults: Dict[str, Any] = {
+            "auto_use_hp_potion": True,
+            "hp_potion_threshold_pct": 55,
+            "hp_potion_key": "F1",
+            "auto_use_mp_potion": True,
+            "mp_potion_threshold_pct": 40,
+            "mp_potion_key": "F2",
+            "auto_refresh_buff_scroll": True,
+            "buff_scroll_interval_sec": 300,
+            "buff_scroll_key": "F6",
+        }
+        try:
+            cand_objs = self._candidate_settings_objects()
+        except Exception:
+            cand_objs = []
+        for obj in cand_objs:
+            combat_cfg = getattr(obj, "combat", None)
+            if combat_cfg is not None:
+                for k in list(defaults.keys()):
+                    if hasattr(combat_cfg, k):
+                        defaults[k] = getattr(combat_cfg, k)
+                    elif isinstance(combat_cfg, dict) and k in combat_cfg:
+                        defaults[k] = combat_cfg[k]
+        return defaults
+
+    def set_consumable_settings(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Updates automatic potion and buff scroll settings in memory and on bound settings objects."""
+        current = self.get_consumable_settings()
+        if isinstance(cfg, dict):
+            current.update(cfg)
+        self._consumable_settings_cache = dict(current)
+        try:
+            cand_objs = self._candidate_settings_objects()
+        except Exception:
+            cand_objs = []
+        for obj in cand_objs:
+            combat_cfg = getattr(obj, "combat", None)
+            if combat_cfg is not None:
+                for k, v in current.items():
+                    if isinstance(combat_cfg, dict):
+                        combat_cfg[k] = v
+                    else:
+                        try:
+                            setattr(combat_cfg, k, v)
+                        except Exception:
+                            pass
+        return dict(current)
+
+    def filter_node_table_by_query(self, query: str) -> int:
+        """Filters the route node table rows by material/type/coordinate query and returns visible row count."""
+        q = str(query or "").strip().lower()
+        tbl = self.__dict__.get("nodes_table") or self.__dict__.get("table_nodes")
+        if tbl is None:
+            return 0
+        visible_count = 0
+        for r in range(tbl.rowCount()):
+            row_text = " ".join(
+                (tbl.item(r, c).text() if tbl.item(r, c) is not None else "")
+                for c in range(tbl.columnCount())
+            ).lower()
+            match = (not q) or (q in row_text)
+            tbl.setRowHidden(r, not match)
+            if match:
+                visible_count += 1
+        return visible_count
+
+    def get_settings_node_hygiene_summary(self) -> Dict[str, Any]:
+        """Returns hygiene metrics for the active region's nodes in SettingsWindow."""
+        reg = self._current_region() if hasattr(self, "_current_region") else "Beluslan"
+        rte = self._current_route() if hasattr(self, "_current_route") else "All"
+        nodes = self._get_nodes_for_selection(reg, rte) if hasattr(self, "_get_nodes_for_selection") else []
+        return {
+            "region": reg,
+            "route": rte,
+            "node_count": len(nodes),
+            "consumables": self.get_consumable_settings(),
+            "ready": True,
+        }
 
     def get_settings_window_health_summary(self) -> dict:
         try:

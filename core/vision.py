@@ -96,6 +96,174 @@ _EMBEDDED_3D_GATHER_CREST_B64: str = (
     "nWrod428WcvT8jMOmJhGt7PMf682PAY="
 )
 
+# ==============================================================================
+# Player Center Self-Exclusion Zone (Normalized X: 0.43..0.57, Y: 0.38..0.64)
+# Eliminates false 3D monster and resource detections on player model, cape, mount
+# ==============================================================================
+PLAYER_CENTER_EXCLUSION_ZONE: Tuple[float, float, float, float] = (0.43, 0.38, 0.57, 0.64)
+PLAYER_SELF_EXCLUSION_ZONE: Tuple[float, float, float, float] = PLAYER_CENTER_EXCLUSION_ZONE
+
+
+def is_in_player_exclusion_zone(
+    x: Union[int, float],
+    y: Union[int, float],
+    frame_w: Optional[int] = None,
+    frame_h: Optional[int] = None,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    exclusion_zone: Tuple[float, float, float, float] = PLAYER_CENTER_EXCLUSION_ZONE,
+) -> bool:
+    """
+    Determines whether a point (x, y) or bounding box falls within the player center
+    self-exclusion zone (normalized X in [0.43, 0.57], Y in [0.38, 0.64]).
+    Used to eliminate false 3D monster and resource detections originating from
+    the player's own character model, cape, or mount.
+    """
+    try:
+        fw = float(frame_w) if (frame_w is not None and frame_w > 0) else float(REF_WIDTH)
+        fh = float(frame_h) if (frame_h is not None and frame_h > 0) else float(REF_HEIGHT)
+
+        zx1, zy1, zx2, zy2 = exclusion_zone
+
+        if bbox is not None and len(bbox) >= 4:
+            bx, by, bw, bh = bbox[:4]
+            cx = float(bx) + float(bw) / 2.0
+            cy = float(by) + float(bh) / 2.0
+        else:
+            cx, cy = float(x), float(y)
+
+        # Handle normalized vs absolute pixel coordinates
+        if (0.0 <= cx <= 1.0) and (0.0 <= cy <= 1.0):
+            nx = cx
+            ny = cy
+        else:
+            nx = cx / fw
+            ny = cy / fh
+
+        if zx1 <= nx <= zx2 and zy1 <= ny <= zy2:
+            return True
+
+        # Check significant bounding box overlap (> 40% of bbox)
+        if bbox is not None and len(bbox) >= 4:
+            bx, by, bw, bh = bbox[:4]
+            if bw > 0 and bh > 0:
+                pix_zx1 = zx1 * fw
+                pix_zx2 = zx2 * fw
+                pix_zy1 = zy1 * fh
+                pix_zy2 = zy2 * fh
+                ox = max(0.0, min(float(bx + bw), pix_zx2) - max(float(bx), pix_zx1))
+                oy = max(0.0, min(float(by + bh), pix_zy2) - max(float(by), pix_zy1))
+                if (ox * oy) / float(bw * bh) >= 0.40:
+                    return True
+
+        return False
+    except Exception:
+        return False
+
+
+def is_in_player_self_exclusion_zone(
+    x: Union[int, float],
+    y: Union[int, float],
+    frame_w: Optional[int] = None,
+    frame_h: Optional[int] = None,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    exclusion_zone: Tuple[float, float, float, float] = PLAYER_CENTER_EXCLUSION_ZONE,
+) -> bool:
+    """Alias for is_in_player_exclusion_zone."""
+    return is_in_player_exclusion_zone(
+        x=x, y=y, frame_w=frame_w, frame_h=frame_h, bbox=bbox, exclusion_zone=exclusion_zone
+    )
+
+
+def detect_inventory_panel(frame_bgr: Optional[np.ndarray]) -> bool:
+    """
+    Çanta + kuşanlı eşya ızgarası açık mı?
+
+    Sağ-üst minimap görünür kalsa da (``is_game_window_blocking`` bunu menü sanmaz)
+    veya panel çok karanlık olsa da (ortalama parlaklık < 22 gece sanılır) envanter
+    ikonları dünya materyali değildir. Koyu pencerede sütun hizalı ikon ızgarası aranır.
+    """
+    try:
+        if frame_bgr is None or not isinstance(frame_bgr, np.ndarray):
+            return False
+        if frame_bgr.ndim != 3 or frame_bgr.size == 0 or frame_bgr.shape[2] < 3:
+            return False
+        img = frame_bgr[:, :, :3]
+        frame_h, frame_w = img.shape[:2]
+        if frame_h < 200 or frame_w < 280:
+            return False
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+        windows = [(0, 0, frame_w, frame_h)]
+        # Çanta genelde ortaya oturur; tam kare parlak dünya yüzünden eşiği kaçırır.
+        for wf, hf, ax, ay in (
+            (0.42, 0.94, 0.28, 0.02),
+            (0.50, 0.90, 0.22, 0.04),
+            (0.55, 0.85, 0.18, 0.06),
+        ):
+            ww, hh = int(frame_w * wf), int(frame_h * hf)
+            x0 = min(max(0, int(frame_w * ax)), max(0, frame_w - ww))
+            y0 = min(max(0, int(frame_h * ay)), max(0, frame_h - hh))
+            if ww >= 200 and hh >= 220:
+                windows.append((x0, y0, ww, hh))
+        for wf, hf in ((0.62, 0.78), (0.48, 0.70), (0.85, 0.92)):
+            ww, hh = int(frame_w * wf), int(frame_h * hf)
+            if ww < 200 or hh < 220:
+                continue
+            step_x = max(1, ww // 3)
+            step_y = max(1, hh // 3)
+            y0 = 0
+            while y0 <= max(0, frame_h - hh):
+                x0 = 0
+                while x0 <= max(0, frame_w - ww):
+                    windows.append((x0, y0, ww, hh))
+                    if x0 == frame_w - ww:
+                        break
+                    x0 = min(frame_w - ww, x0 + step_x)
+                if y0 == frame_h - hh:
+                    break
+                y0 = min(frame_h - hh, y0 + step_y)
+            if len(windows) > 28:
+                break
+
+        for x0, y0, ww, hh in windows[:28]:
+            roi_g = gray[y0 : y0 + hh, x0 : x0 + ww]
+            if roi_g.size == 0:
+                continue
+            mean_g = float(roi_g.mean())
+            dark_frac = float(np.mean(roi_g < 48))
+            if mean_g > 40.0 or dark_frac < 0.74:
+                continue
+            roi_h = hsv[y0 : y0 + hh, x0 : x0 + ww]
+            icon = cv2.inRange(roi_h, (0, 30, 28), (180, 255, 255))
+            contours, _ = cv2.findContours(icon, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            xs: List[float] = []
+            for cnt in contours:
+                x, y, cw, ch = cv2.boundingRect(cnt)
+                if cw < 8 or ch < 8 or cw > int(ww * 0.16) or ch > int(hh * 0.12):
+                    continue
+                if not (0.35 <= (float(cw) / float(max(1, ch))) <= 2.6):
+                    continue
+                xs.append(x + cw / 2.0)
+            if len(xs) < 30:
+                continue
+            cols: List[List[float]] = []
+            tol = max(8.0, ww * 0.02)
+            for x in sorted(xs):
+                if not cols or abs(x - float(np.mean(cols[-1]))) > tol:
+                    cols.append([x])
+                else:
+                    cols[-1].append(x)
+            rich4 = sum(1 for col in cols if len(col) >= 4)
+            rich6 = sum(1 for col in cols if len(col) >= 6)
+            if rich4 >= 6 and rich6 >= 4:
+                return True
+        return False
+    except Exception as exc:
+        logger.debug("detect_inventory_panel hatası: %s", exc)
+        return False
+
 
 class VisionEngine:
     """
@@ -149,6 +317,11 @@ class VisionEngine:
         self.close_interaction_norm_roi: Tuple[float, float, float, float] = (0.42, 0.38, 0.69, 0.66)
         # Mid-screen 3D viewport ROI for floating [E]/[F] resource icon detection
         self.floating_icon_norm_roi: Tuple[float, float, float, float] = (0.25, 0.25, 0.75, 0.70)
+
+        # Player center self-exclusion zone in 3D viewport (x: 0.43..0.57, y: 0.38..0.64 normalized)
+        # Eliminates false 3D monster or resource detections originating from player model/cape/mount
+        self.player_center_exclusion_zone: Tuple[float, float, float, float] = PLAYER_CENTER_EXCLUSION_ZONE
+        self.player_self_exclusion_zone: Tuple[float, float, float, float] = PLAYER_CENTER_EXCLUSION_ZONE
 
         self.load_template()
 
@@ -656,6 +829,24 @@ class VisionEngine:
                                     best_center = (rx1 + bx + box_w // 2, ry1 + by + box_h // 2)
                                     detected_key = self._classify_badge_key(box)
 
+            if best_center is not None and img_bgr is not None:
+                try:
+                    from dataset_factory.exemplar_memory import get_exemplar_memory
+                    mem = get_exemplar_memory()
+                    bcx, bcy = best_center
+                    crop = img_bgr[max(0, bcy - 20) : min(img_bgr.shape[0], bcy + 20), max(0, bcx - 20) : min(img_bgr.shape[1], bcx + 20)]
+                    if crop.size > 0:
+                        is_neg, _, _ = mem.is_negative_patch(crop)
+                        if is_neg:
+                            best_score = 0.0
+                            best_center = None
+                        else:
+                            _, _, pos_sim = mem.classify_patch(crop)
+                            if pos_sim >= 0.70:
+                                best_score = max(best_score, float(pos_sim))
+                except Exception:
+                    pass
+
             found = bool(best_score >= float(threshold) and best_center is not None)
             if found:
                 self.last_detected_gather_key = detected_key
@@ -831,8 +1022,295 @@ class VisionEngine:
         return self.detect_gather_prompt(frame=frame, threshold=threshold, use_roi=True)
 
     # ------------------------------------------------------------------
-    # 1B. 3D White Winged Gather Crest Detection (Aria / Mela / Plants)
+    # 1B. Player Self-Exclusion Zone & 3D Gather Crest Alignment Proof
     # ------------------------------------------------------------------
+    def is_in_player_exclusion_zone(
+        self,
+        x: Union[int, float],
+        y: Union[int, float],
+        frame_w: Optional[int] = None,
+        frame_h: Optional[int] = None,
+        bbox: Optional[Tuple[int, int, int, int]] = None,
+    ) -> bool:
+        """
+        Determines whether coordinate (x, y) or bbox falls within the player center
+        self-exclusion zone (normalized X in [0.43, 0.57], Y in [0.38, 0.64]).
+        Used to eliminate false 3D monster and resource detections originating from
+        the player's own character model, cape, or mount.
+        """
+        return is_in_player_exclusion_zone(
+            x=x,
+            y=y,
+            frame_w=frame_w or self.screen_w,
+            frame_h=frame_h or self.screen_h,
+            bbox=bbox,
+            exclusion_zone=self.player_center_exclusion_zone,
+        )
+
+    def is_in_player_self_exclusion_zone(
+        self,
+        x: Union[int, float],
+        y: Union[int, float],
+        frame_w: Optional[int] = None,
+        frame_h: Optional[int] = None,
+        bbox: Optional[Tuple[int, int, int, int]] = None,
+    ) -> bool:
+        """Alias for is_in_player_exclusion_zone."""
+        return self.is_in_player_exclusion_zone(
+            x=x, y=y, frame_w=frame_w, frame_h=frame_h, bbox=bbox
+        )
+
+    def reject_player_exclusion_detections(
+        self,
+        detections: Sequence[Dict[str, Any]],
+        frame_w: Optional[int] = None,
+        frame_h: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Filters out any detection whose center or bbox falls inside the player center
+        self-exclusion zone (player character model, cape, or mount).
+        """
+        fw = frame_w or self.screen_w
+        fh = frame_h or self.screen_h
+        filtered: List[Dict[str, Any]] = []
+        for d in detections:
+            x = d.get("x", d.get("screen_x", d.get("center", (0, 0))[0]))
+            y = d.get("y", d.get("screen_y", d.get("center", (0, 0))[1]))
+            bbox = d.get("bbox")
+            if self.is_in_player_exclusion_zone(x=x, y=y, frame_w=fw, frame_h=fh, bbox=bbox):
+                continue
+            filtered.append(d)
+        return filtered
+
+    def verify_crest_alignment_proof(
+        self,
+        crest_xy: Tuple[Union[int, float], Union[int, float]],
+        frame_bgr: Optional[np.ndarray] = None,
+        raw_score: float = 0.85,
+        max_abs_dx: int = 45,
+        min_dy: int = 0,
+        max_dy: int = 70,
+    ) -> Dict[str, Any]:
+        """
+        Verifies vertical spatial alignment between a detected 3D winged crest (`\Y/`)
+        and either:
+        (1) Cyan/blue gatherable nameplate text (`‹ Aria ›`, `‹ Mela ›`), or
+        (2) An `[F]` gather interaction prompt or floating key icon.
+
+        Alignment criteria:
+            `abs(dx) <= 45px` and `0 <= dy <= 70px`
+            where `dx = target_cx - crest_cx` and `dy = target_cy - crest_cy`.
+
+        - If verified by alignment proof:
+          assigns genuine high confidence in [0.88 .. 0.96] (`trusted = True, weak = False`).
+        - If crest is an unverified isolated contour without nameplate or prompt proof:
+          assigns genuine confidence in [0.50 .. 0.68] (`trusted = False, weak = True`).
+
+        Returns:
+            Dict containing:
+            - `has_proof: bool` (True if vertically aligned with nameplate or [F] prompt)
+            - `trusted: bool` (True if verified, False if unverified)
+            - `weak: bool` (False if verified, True if unverified)
+            - `proof_type: str` ('nameplate', 'f_prompt', 'nameplate+f_prompt', or 'none')
+            - `dx: Optional[float]` (horizontal offset in pixels)
+            - `dy: Optional[float]` (vertical downward offset in pixels)
+            - `confidence: float` (genuine high confidence 0.88..0.96 if verified; 0.50..0.68 if unverified)
+            - `nameplate_detected: bool`
+            - `prompt_detected: bool`
+        """
+        crest_cx = int(round(crest_xy[0]))
+        crest_cy = int(round(crest_xy[1]))
+
+        if frame_bgr is None or frame_bgr.size == 0:
+            base_norm = np.clip((raw_score - 0.74) / 0.26, 0.0, 1.0) if raw_score >= 0.74 else 0.5
+            conf = round(float(np.clip(0.50 + 0.18 * base_norm, 0.50, 0.68)), 4)
+            return {
+                "has_proof": False,
+                "trusted": False,
+                "weak": True,
+                "proof_type": "none",
+                "dx": None,
+                "dy": None,
+                "confidence": conf,
+                "nameplate_detected": False,
+                "prompt_detected": False,
+            }
+
+        h, w = frame_bgr.shape[:2]
+        # Search window directly below and horizontally centered on the crest
+        x1 = max(0, crest_cx - max_abs_dx - 20)
+        x2 = min(w, crest_cx + max_abs_dx + 20)
+        y1 = max(0, crest_cy - 5)
+        y2 = min(h, crest_cy + max_dy + 30)
+
+        win_bgr = frame_bgr[y1:y2, x1:x2]
+        if win_bgr.size == 0 or win_bgr.shape[0] < 4 or win_bgr.shape[1] < 4:
+            base_norm = np.clip((raw_score - 0.74) / 0.26, 0.0, 1.0) if raw_score >= 0.74 else 0.5
+            conf = round(float(np.clip(0.50 + 0.18 * base_norm, 0.50, 0.68)), 4)
+            return {
+                "has_proof": False,
+                "trusted": False,
+                "weak": True,
+                "proof_type": "none",
+                "dx": None,
+                "dy": None,
+                "confidence": conf,
+                "nameplate_detected": False,
+                "prompt_detected": False,
+            }
+
+        win_hsv = cv2.cvtColor(win_bgr, cv2.COLOR_BGR2HSV)
+        win_gray = cv2.cvtColor(win_bgr, cv2.COLOR_BGR2GRAY)
+
+        # --------------------------------------------------------------
+        # 1. Cyan/Blue Gatherable Nameplate Text Detection
+        # --------------------------------------------------------------
+        mask_cyan_blue = (
+            ((win_hsv[:, :, 0] >= 45) & (win_hsv[:, :, 0] <= 135) & (win_hsv[:, :, 1] >= 32) & (win_hsv[:, :, 2] >= 105))
+            | ((win_hsv[:, :, 1] <= 40) & (win_hsv[:, :, 2] >= 190))
+        )
+        local_min = cv2.erode(win_gray, np.ones((5, 5), dtype=np.uint8))
+        local_contrast = ((win_gray.astype(np.int16) - local_min.astype(np.int16)) >= 45) & (local_min <= 95)
+        mask_text = mask_cyan_blue & (local_contrast | (win_hsv[:, :, 1] >= 60))
+
+        cnts, _ = cv2.findContours(mask_text.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        valid_glyphs: List[Tuple[float, float, int, int]] = []
+        for c in cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            area = cv2.contourArea(c)
+            if 2 <= bh <= 28 and 1 <= bw <= 55 and area >= 3:
+                gcx = float(x1 + bx) + float(bw) / 2.0
+                gcy = float(y1 + by) + float(bh) / 2.0
+                gdx = gcx - float(crest_cx)
+                gdy = gcy - float(crest_cy)
+                if abs(gdx) <= max_abs_dx and min_dy <= gdy <= max_dy:
+                    valid_glyphs.append((gcx, gcy, bw, bh))
+
+        nameplate_detected = len(valid_glyphs) >= 2 or (
+            len(valid_glyphs) >= 1 and sum(g[2] * g[3] for g in valid_glyphs) >= 24
+        )
+        nameplate_dx: Optional[float] = None
+        nameplate_dy: Optional[float] = None
+        if nameplate_detected and valid_glyphs:
+            nameplate_dx = float(np.median([g[0] for g in valid_glyphs])) - float(crest_cx)
+            nameplate_dy = float(np.median([g[1] for g in valid_glyphs])) - float(crest_cy)
+
+        # --------------------------------------------------------------
+        # 2. [F] Gather Prompt or Floating Key Badge Detection
+        # --------------------------------------------------------------
+        prompt_detected = False
+        prompt_dx: Optional[float] = None
+        prompt_dy: Optional[float] = None
+
+        # 2a. Template match gather pill tight if available
+        if (
+            self.gather_pill_tight is not None
+            and self.gather_pill_tight.shape[0] < win_gray.shape[0]
+            and self.gather_pill_tight.shape[1] < win_gray.shape[1]
+        ):
+            res_p = cv2.matchTemplate(win_gray, self.gather_pill_tight, cv2.TM_CCOEFF_NORMED)
+            _, mv_p, _, ml_p = cv2.minMaxLoc(res_p)
+            if float(mv_p) >= 0.65:
+                pcx = float(x1 + ml_p[0]) + float(self.gather_pill_tight.shape[1]) / 2.0
+                pcy = float(y1 + ml_p[1]) + float(self.gather_pill_tight.shape[0]) / 2.0
+                pdx = pcx - float(crest_cx)
+                pdy = pcy - float(crest_cy)
+                if abs(pdx) <= max_abs_dx and min_dy <= pdy <= max_dy:
+                    prompt_detected = True
+                    prompt_dx = pdx
+                    prompt_dy = pdy
+
+        # 2b. Dark pill container with bright [F] text check
+        if not prompt_detected:
+            dark_pill = (win_gray >= 12) & (win_gray <= 65)
+            p_cnts, _ = cv2.findContours(dark_pill.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for pc in p_cnts:
+                pbx, pby, pbw, pbh = cv2.boundingRect(pc)
+                if pbw >= 20 and 8 <= pbh <= 40 and float(pbw) / float(max(1, pbh)) >= 1.4:
+                    sub = win_gray[pby : pby + pbh, pbx : pbx + pbw]
+                    if int(np.count_nonzero(sub > 175)) >= 6 or float(np.mean(sub > 175)) >= 0.012:
+                        pcx = float(x1 + pbx) + float(pbw) / 2.0
+                        pcy = float(y1 + pby) + float(pbh) / 2.0
+                        pdx = pcx - float(crest_cx)
+                        pdy = pcy - float(crest_cy)
+                        if abs(pdx) <= max_abs_dx and min_dy <= pdy <= max_dy:
+                            prompt_detected = True
+                            prompt_dx = pdx
+                            prompt_dy = pdy
+                            break
+
+        # 2c. Floating [E]/[F] key icon template match
+        if (
+            not prompt_detected
+            and self.e_badge_template is not None
+            and self.e_badge_template.shape[0] < win_gray.shape[0]
+            and self.e_badge_template.shape[1] < win_gray.shape[1]
+        ):
+            res_e = cv2.matchTemplate(win_gray, self.e_badge_template, cv2.TM_CCOEFF_NORMED)
+            _, mv_e, _, ml_e = cv2.minMaxLoc(res_e)
+            if float(mv_e) >= 0.68:
+                ecx = float(x1 + ml_e[0]) + float(self.e_badge_template.shape[1]) / 2.0
+                ecy = float(y1 + ml_e[1]) + float(self.e_badge_template.shape[0]) / 2.0
+                edx = ecx - float(crest_cx)
+                edy = ecy - float(crest_cy)
+                if abs(edx) <= max_abs_dx and min_dy <= edy <= max_dy:
+                    prompt_detected = True
+                    prompt_dx = edx
+                    prompt_dy = edy
+
+        # --------------------------------------------------------------
+        # 3. Decision & Genuine Confidence Calibration
+        # --------------------------------------------------------------
+        has_proof = bool(nameplate_detected or prompt_detected)
+
+        if has_proof:
+            if nameplate_detected and prompt_detected:
+                proof_type = "nameplate+f_prompt"
+                chosen_dx = nameplate_dx
+                chosen_dy = nameplate_dy
+            elif nameplate_detected:
+                proof_type = "nameplate"
+                chosen_dx = nameplate_dx
+                chosen_dy = nameplate_dy
+            else:
+                proof_type = "f_prompt"
+                chosen_dx = prompt_dx
+                chosen_dy = prompt_dy
+
+            cdx = chosen_dx if chosen_dx is not None else 0.0
+            cdy = chosen_dy if chosen_dy is not None else 35.0
+
+            dx_factor = 1.0 - (abs(cdx) / float(max_abs_dx))
+            dy_factor = 1.0 - (abs(cdy - 35.0) / 35.0)
+            quality = np.clip(0.6 * dx_factor + 0.4 * max(0.0, dy_factor), 0.0, 1.0)
+            base_norm = np.clip((raw_score - 0.74) / 0.26, 0.0, 1.0) if raw_score >= 0.74 else 0.5
+            conf = round(float(np.clip(0.88 + 0.08 * (0.5 * quality + 0.5 * base_norm), 0.88, 0.96)), 4)
+            return {
+                "has_proof": True,
+                "trusted": True,
+                "weak": False,
+                "proof_type": proof_type,
+                "dx": round(cdx, 2),
+                "dy": round(cdy, 2),
+                "confidence": conf,
+                "nameplate_detected": bool(nameplate_detected),
+                "prompt_detected": bool(prompt_detected),
+            }
+        else:
+            base_norm = np.clip((raw_score - 0.74) / 0.26, 0.0, 1.0) if raw_score >= 0.74 else 0.5
+            conf = round(float(np.clip(0.50 + 0.18 * base_norm, 0.50, 0.68)), 4)
+            return {
+                "has_proof": False,
+                "trusted": False,
+                "weak": True,
+                "proof_type": "none",
+                "dx": None,
+                "dy": None,
+                "confidence": conf,
+                "nameplate_detected": False,
+                "prompt_detected": False,
+            }
+
     def detect_3d_gather_crests(
         self,
         frame: Optional[Union[np.ndarray, str, os.PathLike]] = None,
@@ -843,9 +1321,18 @@ class VisionEngine:
         (such as `Aria` and `Mela` in `aria_3d_crest_far.jpg`, `aria_f_gather_not_on_minimap.jpg`,
         `mela_f_gather_not_on_minimap.jpg`, and `video_frames/frame_33s.jpg`) in the 3D world.
 
+        Excludes false detections originating from the player center self-exclusion zone
+        (normalized X in [0.43, 0.57], Y in [0.38, 0.64] - player character model, cape, or mount).
+
+        Performs mandatory vertical spatial alignment proof with cyan/blue gatherable nameplate
+        text or [F] prompt (abs(dx) <= 45px and 0 <= dy <= 70px):
+        - If verified by alignment proof: assigns genuine high confidence 0.88 .. 0.96 (trusted = True, weak = False).
+        - If crest is an unverified isolated contour without proof: assigns 0.50 .. 0.68 (trusted = False, weak = True).
+
         Returns:
             List of dicts sorted by confidence descending, each containing:
-            `{"x": int, "y": int, "center": (int, int), "bbox": (int, int, int, int), "confidence": float}`
+            `{"x": int, "y": int, "center": (int, int), "bbox": (int, int, int, int), "confidence": float,
+              "trusted": bool, "weak": bool, "has_alignment_proof": bool, "proof_type": str, ...}`
         """
         try:
             if not self._crest_scales:
@@ -916,8 +1403,46 @@ class VisionEngine:
                 cx, cy = cand["x"], cand["y"]
                 if any((cx - k["x"]) ** 2 + (cy - k["y"]) ** 2 <= 28 ** 2 for k in kept):
                     continue
+
+                # Player self-exclusion zone: reject false detections on player model/cape/mount
+                if self.is_in_player_exclusion_zone(cx, cy, w, h, bbox=cand.get("bbox")):
+                    continue
+
+                # Exemplar memory verification
+                try:
+                    from dataset_factory.exemplar_memory import get_exemplar_memory
+                    mem = get_exemplar_memory()
+                    bx, by, bw, bh = cand["bbox"]
+                    crop = img_bgr[by : by + bh, bx : bx + bw]
+                    if crop.size > 0:
+                        is_neg, _, _ = mem.is_negative_patch(crop)
+                        if is_neg:
+                            continue
+                        _, _, pos_sim = mem.classify_patch(crop)
+                        if pos_sim >= 0.70:
+                            cand["confidence"] = max(cand["confidence"], round(float(pos_sim), 4))
+                except Exception:
+                    pass
+
+                # Vertical spatial alignment proof with cyan/blue nameplate text or [F] prompt
+                proof = self.verify_crest_alignment_proof(
+                    crest_xy=(cx, cy),
+                    frame_bgr=img_bgr,
+                    raw_score=cand["confidence"],
+                )
+                cand["has_alignment_proof"] = bool(proof["has_proof"])
+                cand["proof_type"] = str(proof["proof_type"])
+                cand["trusted"] = bool(proof["trusted"])
+                cand["weak"] = bool(proof["weak"])
+                cand["confidence"] = float(proof["confidence"])
+                if proof.get("dx") is not None:
+                    cand["alignment_dx"] = float(proof["dx"])
+                if proof.get("dy") is not None:
+                    cand["alignment_dy"] = float(proof["dy"])
+
                 kept.append(cand)
 
+            kept.sort(key=lambda d: d.get("confidence", 0.0), reverse=True)
             return kept
         except Exception as exc:
             logger.error("detect_3d_gather_crests failed: %s", exc)
@@ -1110,47 +1635,62 @@ class VisionEngine:
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
             # 1. Check bottom-center HP & MP bars (visible during normal 3D world gameplay)
-            hp_roi = hsv[int(h * 0.87) : int(h * 0.92), int(w * 0.36) : int(w * 0.47)]
-            mp_roi = hsv[int(h * 0.87) : int(h * 0.92), int(w * 0.52) : int(w * 0.63)]
+            hp_rect = None
+            mp_rect = None
+            try:
+                from dataset_factory.exemplar_memory import get_calibrated_rois
+                cm = get_calibrated_rois()
+                hp_rect = cm.get_normalized_rect("player_hp_bar")
+                mp_rect = cm.get_normalized_rect("player_mp_bar")
+            except Exception:
+                pass
+
+            if hp_rect:
+                hp_roi = hsv[int(h * hp_rect[1]) : int(h * hp_rect[3]), int(w * hp_rect[0]) : int(w * hp_rect[2])]
+            else:
+                hp_roi = hsv[int(h * 0.87) : int(h * 0.92), int(w * 0.36) : int(w * 0.47)]
+
+            if mp_rect:
+                mp_roi = hsv[int(h * mp_rect[1]) : int(h * mp_rect[3]), int(w * mp_rect[0]) : int(w * mp_rect[2])]
+            else:
+                mp_roi = hsv[int(h * 0.87) : int(h * 0.92), int(w * 0.52) : int(w * 0.63)]
             hp_red = float(
                 np.mean(
                     ((hp_roi[:, :, 0] < 12) | (hp_roi[:, :, 0] > 168))
-                    & (hp_roi[:, :, 1] > 110)
-                    & (hp_roi[:, :, 2] > 90)
+                    & (hp_roi[:, :, 1] > 120)
+                    & (hp_roi[:, :, 2] > 100)
                 )
             )
             mp_blue = float(
                 np.mean(
                     (mp_roi[:, :, 0] > 85)
                     & (mp_roi[:, :, 0] < 115)
-                    & (mp_roi[:, :, 1] > 110)
-                    & (mp_roi[:, :, 2] > 90)
+                    & (mp_roi[:, :, 1] > 120)
+                    & (mp_roi[:, :, 2] > 100)
                 )
             )
-            if hp_red > 0.06 or mp_blue > 0.06:
+            # Gameplay HUD (bottom HP + MP together) means the world map is closed.
+            # A single red map pin must not take this path.
+            if hp_red > 0.18 and mp_blue > 0.18:
                 return False
 
-            # Also reject if the 3D character overhead HP bar is visible near screen center
-            # (handles bottom-cropped 3D gameplay screenshots such as aria_3d_crest_far.jpg)
-            char_hp_roi = hsv[int(h * 0.40) : int(h * 0.60), int(w * 0.44) : int(w * 0.56)]
-            if char_hp_roi.size > 0:
-                char_hp_red = float(
-                    np.mean(
-                        ((char_hp_roi[:, :, 0] < 10) | (char_hp_roi[:, :, 0] > 170))
-                        & (char_hp_roi[:, :, 1] > 140)
-                        & (char_hp_roi[:, :, 2] > 120)
-                    )
-                )
-                if char_hp_red > 0.008:
-                    return False
-
-            # 2. Check wide map header banner template in top header bar across all common aspect scales
+            # 2. Header banner. templates/map_header.png is the 28px minimap pin and is
+            # skipped (width < 60). The legacy crop is the 720p English header, so scales
+            # must cover a native 2560x1440 UI (about 2.0x–2.67x), not only the video frame.
+            header_scales = (
+                0.65, 0.75, 0.85, 1.0, 1.15, 1.25, 1.40, 1.50,
+                1.5625, 1.65, 1.80, 2.0, 2.25, 2.50, 2.67,
+            )
             for hdr_tmpl in (self.map_header_legacy_template, self.map_header_template):
                 if hdr_tmpl is None or hdr_tmpl.shape[1] < 60:
                     continue
-                top_strip = gray[int(h * 0.02) : int(h * 0.14), int(w * 0.25) : int(w * 0.78)]
+                y1, y2 = int(h * 0.00), max(int(h * 0.16), int(h * 0.00) + 8)
+                x1, x2 = int(w * 0.12), max(int(w * 0.88), int(w * 0.12) + 8)
+                top_strip = gray[y1:y2, x1:x2]
+                if top_strip.size == 0:
+                    continue
                 th, tw = hdr_tmpl.shape[:2]
-                for s in (0.65, 0.75, 0.85, 1.0, 1.15, 1.25, 1.40, 1.50, 1.5625, 1.65, 1.80, 2.0):
+                for s in header_scales:
                     sw, sh = max(10, int(round(tw * s))), max(6, int(round(th * s)))
                     if sh < top_strip.shape[0] and sw < top_strip.shape[1]:
                         rt = (
@@ -1163,42 +1703,58 @@ class VisionEngine:
                         if float(mv) >= 0.68:
                             return True
 
-            # 3. Structural & color verification (works across all zones including colorful terrain maps)
-            left_hsv = hsv[int(h * 0.22) : int(h * 0.70), int(w * 0.01) : int(w * 0.18)]
-            left_gray = gray[int(h * 0.22) : int(h * 0.70), int(w * 0.01) : int(w * 0.18)]
+            # 3. Language-independent world-map chrome. A native 1440p client (Turkish
+            # header text, vivid terrain) does not match the 720p English crop, and a
+            # saturation cap of 98 rejected that colorful canvas. The signature is a dark
+            # left list, a brighter map canvas, a lit right edge, and the top-right close
+            # control — without the bottom gameplay bars.
+            left_hsv = hsv[int(h * 0.18) : int(h * 0.72), int(w * 0.012) : int(w * 0.16)]
+            left_gray = gray[int(h * 0.18) : int(h * 0.72), int(w * 0.012) : int(w * 0.16)]
+            if left_hsv.size == 0 or left_gray.size == 0:
+                return False
             left_sat = float(np.mean(left_hsv[:, :, 1]))
             left_val = float(np.mean(left_hsv[:, :, 2]))
             left_text_ratio = float(np.mean(left_gray > 145))
 
-            canvas_hsv = hsv[int(h * 0.15) : int(h * 0.70), int(w * 0.25) : int(w * 0.92)]
-            canvas_sat = float(np.mean(canvas_hsv[:, :, 1]))
+            canvas_hsv = hsv[int(h * 0.16) : int(h * 0.78), int(w * 0.22) : int(w * 0.90)]
+            if canvas_hsv.size == 0:
+                return False
             canvas_val = float(np.mean(canvas_hsv[:, :, 2]))
 
-            # Ensure right-hand Escape menu is NOT covering the right edge
             right_edge_val = float(
-                np.mean(hsv[int(h * 0.15) : int(h * 0.65), int(w * 0.88) : int(w * 0.96), 2])
+                np.mean(hsv[int(h * 0.16) : int(h * 0.70), int(w * 0.86) : int(w * 0.97), 2])
             )
+            x_gray = gray[int(h * 0.012) : int(h * 0.070), int(w * 0.955) : int(w * 0.995)]
+            x_bright = float(np.mean(x_gray > 150)) if x_gray.size else 0.0
+            top_gray = gray[int(h * 0.012) : int(h * 0.10), int(w * 0.20) : int(w * 0.80)]
+            top_mean = float(np.mean(top_gray)) if top_gray.size else 255.0
 
-            tab_gray = gray[int(h * 0.04) : int(h * 0.09), int(w * 0.38) : int(w * 0.65)]
-            tab_hsv = hsv[int(h * 0.04) : int(h * 0.09), int(w * 0.38) : int(w * 0.65)]
-            tab_bright = float(np.mean(tab_gray > 135))
-            tab_val = float(np.mean(tab_hsv[:, :, 2]))
+            if (
+                left_sat < 80.0
+                and 12.0 <= left_val <= 130.0
+                and left_text_ratio > 0.006
+                and canvas_val > 78.0
+                and canvas_val > left_val + 28.0
+                and canvas_val > top_mean + 35.0
+                and right_edge_val > 60.0
+                and x_bright > 0.004
+            ):
+                return True
 
-            x_gray = gray[int(h * 0.018) : int(h * 0.062), int(w * 0.965) : int(w * 0.994)]
-            x_bright = float(np.mean(x_gray > 150))
-
-            is_open = (
-                left_sat < 55.0
-                and 20.0 <= left_val <= 95.0
-                and left_text_ratio > 0.010
-                and canvas_sat < 95.0
-                and canvas_val > 65.0
-                and right_edge_val > 58.0
-                and tab_bright > 0.004
-                and tab_val < 85.0
-                and x_bright > 0.012
-            )
-            return bool(is_open)
+            # Overhead HP bar on a bottom-cropped gameplay shot (aria_3d_crest_far.jpg).
+            # Checked after chrome so red markers on an open map are not a veto.
+            char_hp_roi = hsv[int(h * 0.40) : int(h * 0.60), int(w * 0.44) : int(w * 0.56)]
+            if char_hp_roi.size > 0:
+                char_hp_red = float(
+                    np.mean(
+                        ((char_hp_roi[:, :, 0] < 10) | (char_hp_roi[:, :, 0] > 170))
+                        & (char_hp_roi[:, :, 1] > 160)
+                        & (char_hp_roi[:, :, 2] > 140)
+                    )
+                )
+                if char_hp_red > 0.025:
+                    return False
+            return False
         except Exception as exc:
             logger.error("is_map_open failed: %s", exc)
             return False
@@ -1231,65 +1787,70 @@ class VisionEngine:
             if self.is_map_open(img_bgr):
                 return False
 
+            # Envanter minimap'i kapatmadan ve ekranı gece kadar karartarak açılır.
+            # Parlak-minimap ve "mean < 22 = gece" kapıları bu paneli kaçırır.
+            if detect_inventory_panel(img_bgr):
+                return True
+
             hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-            # 1. Bottom-center HP & MP bars
-            hp_roi = hsv[int(h * 0.87) : int(h * 0.92), int(w * 0.36) : int(w * 0.47)]
-            mp_roi = hsv[int(h * 0.87) : int(h * 0.92), int(w * 0.52) : int(w * 0.63)]
-            hp_red = float(
-                np.mean(
-                    ((hp_roi[:, :, 0] < 12) | (hp_roi[:, :, 0] > 168))
-                    & (hp_roi[:, :, 1] > 110)
-                    & (hp_roi[:, :, 2] > 90)
-                )
-            )
-            mp_blue = float(
-                np.mean(
-                    (mp_roi[:, :, 0] > 85)
-                    & (mp_roi[:, :, 0] < 115)
-                    & (mp_roi[:, :, 1] > 110)
-                    & (mp_roi[:, :, 2] > 90)
-                )
-            )
+            mean_brightness = float(np.mean(gray))
+            if mean_brightness < 22.0:
+                # Dark screen / night / loading screen is not a blocking menu
+                return False
 
-            # Also check 3D character overhead HP bar + top-right minimap visibility
-            # so bottom-cropped 3D world screenshots (aria_3d_crest_far.jpg) are not misflagged
-            char_hp_roi = hsv[int(h * 0.40) : int(h * 0.60), int(w * 0.44) : int(w * 0.56)]
-            char_hp_red = float(
-                np.mean(
-                    ((char_hp_roi[:, :, 0] < 10) | (char_hp_roi[:, :, 0] > 170))
-                    & (char_hp_roi[:, :, 1] > 140)
-                    & (char_hp_roi[:, :, 2] > 120)
-                )
-            )
-
-            # 2. Top-right Minimap visibility (x=0.86..0.98, y=0.09..0.24)
+            # 1. Top-right Minimap visibility (x=0.86..0.98, y=0.09..0.24)
             mmap_roi = hsv[int(h * 0.09) : int(h * 0.24), int(w * 0.86) : int(w * 0.98)]
             mmap_val = float(np.mean(mmap_roi[:, :, 2]))
 
-            # 3. Right-hand menu panel area (x=0.71..0.96, y=0.01..0.70)
+            # If minimap is visibly active and has normal brightness, menus are closed
+            if mmap_val >= 55.0:
+                return False
+
+            # 2. Right-hand menu panel area (x=0.71..0.96, y=0.01..0.70)
             right_panel = hsv[int(h * 0.01) : int(h * 0.70), int(w * 0.71) : int(w * 0.96)]
             r_sat = float(np.mean(right_panel[:, :, 1]))
             r_val = float(np.mean(right_panel[:, :, 2]))
 
-            # 4. Top-right close 'X' icon
+            # 3. Top-right close 'X' icon (x=0.965..0.994, y=0.018..0.062)
             x_gray = gray[int(h * 0.018) : int(h * 0.062), int(w * 0.965) : int(w * 0.994)]
-            x_bright = float(np.mean(x_gray > 160))
+            x_bright = float(np.mean(x_gray > 190))
 
+            # Center modal dialog check (e.g. inventory/cube or system prompt dialog)
+            center_dialog = gray[int(h * 0.25) : int(h * 0.75), int(w * 0.25) : int(w * 0.75)]
+            center_edges = cv2.Canny(center_dialog, 60, 180)
+            center_edge_density = float(np.mean(center_edges > 0))
+
+            # Menus must show strict characteristic dark modal backdrop & high X icon intensity
             right_menu_open = (
-                mmap_val < 70.0
-                and r_sat < 48.0
-                and r_val < 52.0
-                and x_bright > 0.02
-            )
-            hud_occluded = (hp_red < 0.08 or mp_blue < 0.08) and not (
-                char_hp_red > 0.008 and mmap_val > 95.0
+                mmap_val < 38.0
+                and r_sat < 30.0
+                and r_val < 35.0
+                and x_bright > 0.15
             )
 
-            return bool(right_menu_open or hud_occluded)
+            center_modal_open = (
+                center_edge_density > 0.18
+                and x_bright > 0.16
+                and mmap_val < 35.0
+            )
+
+            return bool(right_menu_open or center_modal_open)
         except Exception as exc:
             logger.error("is_game_window_blocking failed: %s", exc)
+            return False
+
+    def is_inventory_open(
+        self,
+        frame: Optional[Union[np.ndarray, str, os.PathLike]] = None,
+    ) -> bool:
+        """Çanta/ekipman ızgarası görünür mü? Açıkken ikonlar materyal kaydı değildir."""
+        try:
+            img_bgr = self._coerce_frame(frame, grayscale=False)
+            return bool(detect_inventory_panel(img_bgr))
+        except Exception as exc:
+            logger.debug("is_inventory_open hatası: %s", exc)
             return False
 
     def check_blocking_window(
@@ -1604,10 +2165,15 @@ class VisionEngine:
     def detect_pyramid_3d_crests(
         self, frame: Optional[Union[np.ndarray, str, os.PathLike]] = None
     ) -> List[Dict[str, Any]]:
-        """Detects 3D pyramid gather crests using Pyramid3DCrestDetector alongside standard 3D crest detection."""
+        """
+        Detects 3D pyramid gather crests using Pyramid3DCrestDetector alongside standard 3D crest detection.
+        Rejects false detections originating from player center self-exclusion zone and verifies
+        vertical spatial alignment with cyan/blue nameplate or [F] prompt.
+        """
         img_bgr = self._coerce_frame(frame, grayscale=False)
         if img_bgr is None or img_bgr.size == 0:
             return []
+        h, w = img_bgr.shape[:2]
         results = list(self.detect_3d_gather_crests(img_bgr))
         if self._ensure_vision_filters() and hasattr(self, "_pyramid_detector"):
             try:
@@ -1615,9 +2181,31 @@ class VisionEngine:
                 if isinstance(py_hits, list):
                     for hit in py_hits:
                         if isinstance(hit, dict) and "x" in hit and "y" in hit:
-                            results.append(hit)
+                            hx = int(hit["x"])
+                            hy = int(hit["y"])
+                            # Reject false detection on player model/cape/mount
+                            if self.is_in_player_exclusion_zone(hx, hy, w, h, bbox=hit.get("bbox")):
+                                continue
+                            raw_score = float(hit.get("score", hit.get("confidence", 0.82)))
+                            proof = self.verify_crest_alignment_proof(
+                                crest_xy=(hx, hy),
+                                frame_bgr=img_bgr,
+                                raw_score=raw_score,
+                            )
+                            hit["has_alignment_proof"] = bool(proof["has_proof"])
+                            hit["proof_type"] = str(proof["proof_type"])
+                            hit["trusted"] = bool(proof["trusted"])
+                            hit["weak"] = bool(proof["weak"])
+                            hit["confidence"] = float(proof["confidence"])
+                            if proof.get("dx") is not None:
+                                hit["alignment_dx"] = float(proof["dx"])
+                            if proof.get("dy") is not None:
+                                hit["alignment_dy"] = float(proof["dy"])
+                            if not any((hx - r["x"]) ** 2 + (hy - r["y"]) ** 2 <= 28 ** 2 for r in results):
+                                results.append(hit)
             except Exception as exc:
                 logger.debug("detect_pyramid_3d_crests warning: %s", exc)
+        results.sort(key=lambda d: d.get("confidence", 0.0), reverse=True)
         return results
 
     def detect_dynamic_gather_key(
@@ -1636,6 +2224,582 @@ class VisionEngine:
         except Exception as exc:
             logger.debug("detect_dynamic_gather_key warning: %s", exc)
         return default_key
+
+    @staticmethod
+    def _detect_target_bar_hsv(hsv_crop: np.ndarray) -> Tuple[np.ndarray, str]:
+        """
+        Detects red, orange, yellow, olive, and magenta/pink hostile target HP bar pixels.
+        Returns (combined_mask, dominant_color_name).
+        """
+        if hsv_crop is None or hsv_crop.size == 0:
+            return np.zeros((0, 0), dtype=np.uint8), "none"
+
+        # Red: Crimson/Ruby hostile HP bar (lower & upper wrap)
+        red1 = (hsv_crop[:, :, 0] <= 12) & (hsv_crop[:, :, 1] >= 75) & (hsv_crop[:, :, 2] >= 70)
+        red2 = (hsv_crop[:, :, 0] >= 165) & (hsv_crop[:, :, 1] >= 75) & (hsv_crop[:, :, 2] >= 70)
+        mask_red = red1 | red2
+
+        # Orange: Amber/Tangerine hostile/damaged HP bar
+        mask_orange = (
+            (hsv_crop[:, :, 0] >= 13)
+            & (hsv_crop[:, :, 0] <= 25)
+            & (hsv_crop[:, :, 1] >= 75)
+            & (hsv_crop[:, :, 2] >= 80)
+        )
+
+        # Yellow: Gold/Yellow hostile or neutral-aggro HP bar
+        mask_yellow = (
+            (hsv_crop[:, :, 0] >= 26)
+            & (hsv_crop[:, :, 0] <= 40)
+            & (hsv_crop[:, :, 1] >= 70)
+            & (hsv_crop[:, :, 2] >= 80)
+        )
+
+        # Olive: Olive/Yellow-green HP bar
+        mask_olive = (
+            (hsv_crop[:, :, 0] >= 41)
+            & (hsv_crop[:, :, 0] <= 65)
+            & (hsv_crop[:, :, 1] >= 65)
+            & (hsv_crop[:, :, 2] >= 80)
+        )
+
+        # Magenta/Pink: Special boss or shield HP bar
+        mask_magenta = (
+            (hsv_crop[:, :, 0] >= 140)
+            & (hsv_crop[:, :, 0] <= 164)
+            & (hsv_crop[:, :, 1] >= 60)
+            & (hsv_crop[:, :, 2] >= 90)
+        )
+
+        combined = (mask_red | mask_orange | mask_yellow | mask_olive | mask_magenta).astype(np.uint8)
+
+        # Determine dominant color
+        counts = {
+            "red": int(np.count_nonzero(mask_red)),
+            "orange": int(np.count_nonzero(mask_orange)),
+            "yellow": int(np.count_nonzero(mask_yellow)),
+            "olive": int(np.count_nonzero(mask_olive)),
+            "magenta": int(np.count_nonzero(mask_magenta)),
+        }
+        best_col, best_count = max(counts.items(), key=lambda item: item[1])
+        dom_color = best_col if best_count >= 10 else "none"
+        return combined, dom_color
+
+    def read_target_hp_bar(self, frame_bgr: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Accurately reads the target monster's health bar percentage [0.0..100.0] and targeting status.
+        Eliminates false 'HEDEF YOK' dropouts by inspecting:
+        1. Multi-gamut hostile fill (Red, Orange, Yellow, Olive, Magenta).
+        2. HP bar track/slot container bounds.
+        3. Cyan / light-blue diamond bracket tips `< Monster Name >`.
+        4. Target frame header text and agro badge indicators.
+        5. Dynamically respects calibrated 'target_hp_bar' ROI from config/calibrated_rois.json.
+        """
+        img = self._coerce_frame(frame_bgr, grayscale=False)
+        default_res = {
+            "has_target": False,
+            "target_hp_pct": 0.0,
+            "target_pct": 0.0,
+            "is_hostile": False,
+            "is_monster_target": False,
+            "bar_bbox": (0, 0, 0, 0),
+            "confidence": 0.0,
+            "bar_color": "none",
+            "has_diamond_brackets": False,
+            "nameplate_detected": False,
+        }
+        if img is None or img.size == 0:
+            return default_res
+
+        try:
+            h, w = img.shape[:2]
+            scale_x = w / 2000.0
+            scale_y = h / 1124.0
+
+            # Dynamic calibrated ROI support with auto-reload
+            target_rect = None
+            try:
+                from dataset_factory.exemplar_memory import get_calibrated_rois
+                cm = get_calibrated_rois()
+                cm.check_reload()
+                cand_rect = cm.get_normalized_rect("target_hp_bar") or cm.get_normalized_rect("target_bar")
+                # Ensure the rect is in the upper HUD region (y1 < 0.25)
+                if cand_rect and cand_rect[1] < 0.25:
+                    target_rect = cand_rect
+            except Exception as exc:
+                logger.debug("target_hp_bar calibrated ROI load: %s", exc)
+
+            if target_rect is None:
+                # Top-center enemy target frame zone (y: 1.5%..12%, x: 30%..70%)
+                target_rect = (0.300, 0.015, 0.700, 0.120)
+
+            tx1 = max(0, int(round(w * target_rect[0])))
+            ty1 = max(0, int(round(h * target_rect[1])))
+            tx2 = min(w, int(round(w * target_rect[2])))
+            ty2 = min(h, int(round(h * target_rect[3])))
+
+            if tx2 <= tx1 or ty2 <= ty1:
+                return default_res
+
+            target_crop = img[ty1:ty2, tx1:tx2]
+            hsv = cv2.cvtColor(target_crop, cv2.COLOR_BGR2HSV)
+            gray = cv2.cvtColor(target_crop, cv2.COLOR_BGR2GRAY)
+
+            # 1. Hostile color mask & dominant color
+            color_mask, dom_color = self._detect_target_bar_hsv(hsv)
+
+            # 2. Cyan diamond brackets tips `< ... >` (left tip `<` and right tip `>`)
+            cyan_mask = (
+                (hsv[:, :, 0] >= 78)
+                & (hsv[:, :, 0] <= 108)
+                & (hsv[:, :, 1] >= 70)
+                & (hsv[:, :, 2] >= 125)
+            ).astype(np.uint8)
+            cyan_cnts, _ = cv2.findContours(cyan_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid_brackets = []
+            min_bracket_w = max(3, int(round(4 * scale_x)))
+            max_bracket_w = max(18, int(round(26 * scale_x)))
+            min_bracket_h = max(4, int(round(5 * scale_y)))
+            max_bracket_h = max(24, int(round(30 * scale_y)))
+            for cc in cyan_cnts:
+                cx, cy, cw_b, ch_b = cv2.boundingRect(cc)
+                if min_bracket_w <= cw_b <= max_bracket_w and min_bracket_h <= ch_b <= max_bracket_h:
+                    valid_brackets.append((cx, cy, cw_b, ch_b))
+
+            has_diamond_brackets = False
+            if len(valid_brackets) >= 2:
+                valid_brackets.sort(key=lambda b: b[0])
+                for i in range(len(valid_brackets) - 1):
+                    for j in range(i + 1, len(valid_brackets)):
+                        b1 = valid_brackets[i]
+                        b2 = valid_brackets[j]
+                        dx = (b2[0] + b2[2] // 2) - (b1[0] + b1[2] // 2)
+                        dy = abs((b2[1] + b2[3] // 2) - (b1[1] + b1[3] // 2))
+                        if dy <= max(8, int(round(10 * scale_y))) and max(40, int(round(60 * scale_x))) <= dx <= max(350, int(round(500 * scale_x))):
+                            has_diamond_brackets = True
+                            break
+                    if has_diamond_brackets:
+                        break
+
+            # 3. Target nameplate high-contrast text detection inside the crop
+            bright_text = (hsv[:, :, 1] <= 85) & (hsv[:, :, 2] >= 165)
+            text_px = int(np.count_nonzero(bright_text))
+            nameplate_detected = text_px >= max(20, int(round(35 * scale_x * scale_y)))
+
+            # 4. Empty bar container slot: dark gray / dark red slot
+            dark_slot = (
+                (hsv[:, :, 2] <= 45)
+                | (((hsv[:, :, 0] <= 15) | (hsv[:, :, 0] >= 165)) & (hsv[:, :, 1] >= 80) & (hsv[:, :, 2] <= 85))
+            ).astype(np.uint8)
+
+            # Combined bar strip (color fill + dark empty slot)
+            combined_bar = cv2.bitwise_or(color_mask, dark_slot)
+            kernel_comb = cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, int(round(12 * scale_x))), 2))
+            closed_combined = cv2.morphologyEx(combined_bar, cv2.MORPH_CLOSE, kernel_comb)
+
+            # Standalone color fill
+            kernel_col = cv2.getStructuringElement(cv2.MORPH_RECT, (max(6, int(round(8 * scale_x))), 2))
+            closed_color = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel_col)
+
+            # Find contours in combined bar
+            cnts_comb, _ = cv2.findContours(closed_combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cnts_color, _ = cv2.findContours(closed_color, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            min_bar_w = max(24, int(round(40 * scale_x)))
+            min_bar_h = 3
+            max_bar_h = max(18, int(round(36 * scale_y)))
+
+            best_container = None
+            for c in cnts_comb:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                aspect = float(bw) / float(max(1, bh))
+                if bw >= min_bar_w and min_bar_h <= bh <= max_bar_h and aspect >= 2.4:
+                    sub_col = color_mask[by : by + bh, bx : bx + bw]
+                    col_px = int(np.count_nonzero(sub_col))
+                    # Accept if it contains color fill OR confirmed diamond brackets
+                    if col_px >= max(4, int(round(8 * scale_x))) or has_diamond_brackets:
+                        if best_container is None or bw > best_container[2]:
+                            best_container = (bx, by, bw, bh)
+
+            # Also check standalone color contours
+            best_color_bar = None
+            for c in cnts_color:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                aspect = float(bw) / float(max(1, bh))
+                if bw >= max(14, int(round(20 * scale_x))) and min_bar_h <= bh <= max_bar_h and aspect >= 2.0:
+                    if best_color_bar is None or bw > best_color_bar[2]:
+                        best_color_bar = (bx, by, bw, bh)
+
+            has_target = False
+            target_hp_pct = 0.0
+            chosen_bbox = (0, 0, 0, 0)
+            conf = 0.0
+
+            if best_container is not None:
+                bx, by, bw, bh = best_container
+                has_target = True
+                chosen_bbox = (tx1 + bx, ty1 + by, bw, bh)
+                sub_col = color_mask[by : by + bh, bx : bx + bw]
+                col_sums = np.mean(sub_col, axis=0) > 0.15
+                fill_w = int(np.sum(col_sums))
+                target_hp_pct = round(min(100.0, max(0.0, (fill_w / float(max(1, bw))) * 100.0)), 1)
+                conf = 0.94 if has_diamond_brackets else 0.88
+            elif best_color_bar is not None:
+                bx, by, bw, bh = best_color_bar
+                has_target = True
+                chosen_bbox = (tx1 + bx, ty1 + by, bw, bh)
+                sub_col = color_mask[by : by + bh, bx : bx + bw]
+                col_sums = np.mean(sub_col, axis=0) > 0.15
+                fill_w = int(np.sum(col_sums))
+                target_hp_pct = round(min(100.0, max(0.0, (fill_w / float(max(1, bw))) * 100.0)), 1)
+                if target_hp_pct < 85.0 and bw >= min_bar_w * 2:
+                    target_hp_pct = 100.0
+                conf = 0.86
+            elif has_diamond_brackets or (nameplate_detected and int(np.count_nonzero(color_mask)) >= 5):
+                # Target locked but HP is near 0% or empty
+                has_target = True
+                target_hp_pct = 0.0
+                conf = 0.90 if has_diamond_brackets else 0.75
+                chosen_bbox = (tx1 + target_crop.shape[1] // 4, ty1 + 10, target_crop.shape[1] // 2, 16)
+
+            is_hostile = has_target and (dom_color in ("red", "orange", "yellow", "olive", "magenta") or has_diamond_brackets)
+
+            return {
+                "has_target": has_target,
+                "target_hp_pct": target_hp_pct,
+                "target_pct": target_hp_pct,
+                "is_hostile": is_hostile,
+                "is_monster_target": is_hostile,
+                "bar_bbox": chosen_bbox,
+                "confidence": round(conf, 3),
+                "bar_color": dom_color,
+                "has_diamond_brackets": has_diamond_brackets,
+                "nameplate_detected": nameplate_detected,
+            }
+        except Exception as exc:
+            logger.error("read_target_hp_bar failed: %s", exc)
+            return default_res
+
+    def detect_target_brackets(
+        self, frame_bgr: Optional[np.ndarray] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Detects cyan diamond bracket tips `< ... >` indicative of a targeted monster.
+        Returns list of bracket detections with coordinates and center positions.
+        """
+        img = self._coerce_frame(frame_bgr, grayscale=False)
+        if img is None or img.size == 0:
+            return []
+
+        h, w = img.shape[:2]
+        scale_x = w / 2000.0
+        scale_y = h / 1124.0
+
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        cyan_mask = (
+            (hsv[:, :, 0] >= 78)
+            & (hsv[:, :, 0] <= 108)
+            & (hsv[:, :, 1] >= 70)
+            & (hsv[:, :, 2] >= 125)
+        ).astype(np.uint8)
+
+        cnts, _ = cv2.findContours(cyan_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        brackets = []
+        min_bw = max(3, int(round(4 * scale_x)))
+        max_bw = max(22, int(round(30 * scale_x)))
+        min_bh = max(4, int(round(5 * scale_y)))
+        max_bh = max(26, int(round(34 * scale_y)))
+
+        for c in cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if min_bw <= bw <= max_bw and min_bh <= bh <= max_bh:
+                brackets.append({
+                    "x": bx,
+                    "y": by,
+                    "w": bw,
+                    "h": bh,
+                    "center_x": bx + bw // 2,
+                    "center_y": by + bh // 2,
+                })
+        return brackets
+
+    def has_active_target(self, frame_bgr: Optional[np.ndarray] = None) -> bool:
+        """Returns True if a target monster is currently selected/locked."""
+        res = self.read_target_hp_bar(frame_bgr)
+        return bool(res.get("has_target", False))
+
+    def get_target_hp_percentage(self, frame_bgr: Optional[np.ndarray] = None) -> float:
+        """Returns the target monster's health percentage [0.0..100.0]."""
+        res = self.read_target_hp_bar(frame_bgr)
+        return float(res.get("target_hp_pct", 0.0))
+
+    def read_player_hp_mp_bars(self, frame_bgr: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Dynamically reads player HP and MP fill percentages [0.0..100.0] and target HP percentage
+        using config/calibrated_rois.json when calibrated, auto-reloaded on file modification.
+        Eliminates false 'HEDEF YOK' targeting dropouts by using robust multi-gamut target bar reading.
+        """
+        img = self._coerce_frame(frame_bgr, grayscale=False)
+        if img is None or img.size == 0:
+            return {
+                "hp_pct": 100.0,
+                "mp_pct": 100.0,
+                "target_hp_pct": 0.0,
+                "target_pct": 0.0,
+                "has_target": False,
+                "is_monster_target": False,
+                "is_hostile": False,
+                "bar_color": "none",
+                "has_diamond_brackets": False,
+            }
+
+        try:
+            h, w = img.shape[:2]
+            from dataset_factory.exemplar_memory import get_calibrated_rois
+            cm = get_calibrated_rois()
+            cm.check_reload()
+
+            hp_rect = cm.get_normalized_rect("player_hp_bar") or (0.345, 0.880, 0.485, 0.915)
+            mp_rect = cm.get_normalized_rect("player_mp_bar") or (0.515, 0.880, 0.655, 0.915)
+
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+            # Player HP (red fill)
+            hy1, hy2 = int(h * hp_rect[1]), int(h * hp_rect[3])
+            hx1, hx2 = int(w * hp_rect[0]), int(w * hp_rect[2])
+            hp_crop = hsv[hy1:hy2, hx1:hx2]
+            if hp_crop.size > 0:
+                red_mask = ((hp_crop[:, :, 0] < 12) | (hp_crop[:, :, 0] > 168)) & (hp_crop[:, :, 1] > 110) & (hp_crop[:, :, 2] > 90)
+                col_fill = np.mean(red_mask, axis=0) > 0.25
+                hp_ratio = float(np.sum(col_fill)) / float(max(1, len(col_fill)))
+                hp_pct = round(hp_ratio * 100.0, 1)
+            else:
+                hp_pct = 100.0
+
+            # Player MP (cyan/blue fill)
+            my1, my2 = int(h * mp_rect[1]), int(h * mp_rect[3])
+            mx1, mx2 = int(w * mp_rect[0]), int(w * mp_rect[2])
+            mp_crop = hsv[my1:my2, mx1:mx2]
+            if mp_crop.size > 0:
+                blue_mask = (mp_crop[:, :, 0] > 85) & (mp_crop[:, :, 0] < 135) & (mp_crop[:, :, 1] > 100) & (mp_crop[:, :, 2] > 80)
+                col_fill_mp = np.mean(blue_mask, axis=0) > 0.25
+                mp_ratio = float(np.sum(col_fill_mp)) / float(max(1, len(col_fill_mp)))
+                mp_pct = round(mp_ratio * 100.0, 1)
+            else:
+                mp_pct = 100.0
+
+            # Target HP bar read via robust multi-gamut detector
+            target_info = self.read_target_hp_bar(img)
+
+            return {
+                "hp_pct": hp_pct,
+                "mp_pct": mp_pct,
+                "target_hp_pct": target_info["target_hp_pct"],
+                "target_pct": target_info["target_hp_pct"],
+                "has_target": target_info["has_target"],
+                "is_monster_target": target_info["is_monster_target"],
+                "is_hostile": target_info["is_hostile"],
+                "bar_color": target_info["bar_color"],
+                "has_diamond_brackets": target_info["has_diamond_brackets"],
+                "target_bbox": target_info["bar_bbox"],
+            }
+        except Exception as exc:
+            logger.error("read_player_hp_mp_bars failed: %s", exc)
+            return {
+                "hp_pct": 100.0,
+                "mp_pct": 100.0,
+                "target_hp_pct": 0.0,
+                "target_pct": 0.0,
+                "has_target": False,
+                "is_monster_target": False,
+                "is_hostile": False,
+                "bar_color": "none",
+                "has_diamond_brackets": False,
+            }
+
+    def detect_monsters_3d(
+        self,
+        frame_bgr: Optional[Union[np.ndarray, str, os.PathLike]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Detects 3D monsters in the game viewport and validates/refines them against ExemplarMemory:
+        - Detects hostile red/orange/yellow monster HP bars and nameplates (aspect >= 2.5).
+        - Detects targeted monsters with cyan diamond bracket tips `< Monster Name >` (boosts conf to 0.95).
+        - Detects yellow/olive monster nameplates in the 3D world.
+        - Excludes player's own overhead HP bar (center of screen: x: 0.44..0.56, y: 0.42..0.58).
+        - Rejects candidates matching negative exemplars in ExemplarMemory.
+        - Elevates confidence for candidates matching 10: monster_3d.
+        - Also detects top HUD target HP bar as class_id 18: target_hp_bar.
+        """
+        img = self._coerce_frame(frame_bgr, grayscale=False)
+        if img is None or img.size == 0:
+            return []
+
+        try:
+            from dataset_factory.exemplar_memory import get_exemplar_memory
+            mem = get_exemplar_memory()
+        except Exception:
+            mem = None
+
+        h, w = img.shape[:2]
+        scale_x = w / 2000.0
+        scale_y = h / 1124.0
+
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        monsters: List[Dict[str, Any]] = []
+
+        # ------------------------------------------------------------------
+        # 1. Top HUD target HP bar check (class_id = 18: target_hp_bar)
+        # ------------------------------------------------------------------
+        tgt_info = self.read_target_hp_bar(img)
+        if tgt_info.get("has_target") and tgt_info.get("bar_bbox", (0, 0, 0, 0))[2] > 0:
+            bx, by, bw, bh = tgt_info["bar_bbox"]
+            monsters.append({
+                "screen_x": bx + bw // 2,
+                "screen_y": by + bh // 2,
+                "bbox": (bx, by, bw, bh),
+                "confidence": float(tgt_info.get("confidence", 0.92)),
+                "class_id": 18,
+                "class_name": "target_hp_bar",
+                "has_diamond_brackets": bool(tgt_info.get("has_diamond_brackets", False)),
+                "target_hp_pct": float(tgt_info.get("target_hp_pct", 0.0)),
+                "is_hostile": bool(tgt_info.get("is_hostile", True)),
+                "is_targeted": True,
+            })
+
+        # ------------------------------------------------------------------
+        # 2. 3D Viewport Search Area (0.12*H..0.78*H, 0.10*W..0.88*W)
+        # ------------------------------------------------------------------
+        vy1, vy2 = int(h * 0.12), int(h * 0.78)
+        vx1, vx2 = int(w * 0.10), int(w * 0.88)
+        viewport_hsv = hsv[vy1:vy2, vx1:vx2]
+
+        # Player center self-exclusion zone in 3D viewport (x: 0.43..0.57, y: 0.38..0.64 normalized)
+        # Eliminates false 3D monster detections originating from player model/cape/mount
+        pex_x1, pex_y1, pex_x2, pex_y2 = self.player_center_exclusion_zone
+        center_y1 = max(0, int(h * pex_y1) - vy1)
+        center_y2 = min(vy2 - vy1, int(h * pex_y2) - vy1)
+        center_x1 = max(0, int(w * pex_x1) - vx1)
+        center_x2 = min(vx2 - vx1, int(w * pex_x2) - vx1)
+
+        valid_vp_mask = np.ones((vy2 - vy1, vx2 - vy1), dtype=bool)
+        if center_y2 > center_y1 and center_x2 > center_x1:
+            valid_vp_mask[center_y1:center_y2, center_x1:center_x2] = False
+
+        # Hostile red, orange, yellow nameplate/bar in 3D viewport
+        hsv_h = viewport_hsv[:, :, 0]
+        hsv_s = viewport_hsv[:, :, 1]
+        hsv_v = viewport_hsv[:, :, 2]
+
+        red_vp = ((hsv_h <= 12) | (hsv_h >= 165)) & (hsv_s >= 115) & (hsv_v >= 105)
+        orange_vp = (hsv_h >= 13) & (hsv_h <= 25) & (hsv_s >= 115) & (hsv_v >= 110)
+        yellow_vp = (hsv_h >= 26) & (hsv_h <= 34) & (hsv_s >= 105) & (hsv_v >= 115)
+
+        hostile_vp = (red_vp | orange_vp | yellow_vp) & valid_vp_mask
+
+        # Cyan diamond bracket tips in 3D viewport
+        cyan_vp = (hsv_h >= 78) & (hsv_h <= 108) & (hsv_s >= 70) & (hsv_v >= 125) & valid_vp_mask
+        cyan_cnts, _ = cv2.findContours(cyan_vp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        vp_brackets = []
+        for cc in cyan_cnts:
+            cx, cy, cw_b, ch_b = cv2.boundingRect(cc)
+            if 3 <= cw_b <= max(20, int(round(28 * scale_x))) and 4 <= ch_b <= max(24, int(round(32 * scale_y))):
+                vp_brackets.append((cx, cy, cw_b, ch_b))
+
+        # Horizontal morphology close to bridge nameplate letters and HP fill
+        kw = max(10, int(round(14 * scale_x)))
+        kh = max(2, int(round(3 * scale_y)))
+        kernel_vp = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
+        closed_vp = cv2.morphologyEx(hostile_vp.astype(np.uint8), cv2.MORPH_CLOSE, kernel_vp)
+
+        contours, _ = cv2.findContours(closed_vp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_w = max(25, int(round(35 * scale_x)))
+        max_w = max(160, int(round(320 * scale_x)))
+        min_h = 3
+        max_h = max(22, int(round(32 * scale_y)))
+
+        for cnt in contours:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            aspect = float(bw) / float(max(1, bh))
+            if not (min_w <= bw <= max_w and min_h <= bh <= max_h and aspect >= 2.5):
+                continue
+
+            abs_x = vx1 + bx
+            abs_y = vy1 + by
+            cand_cx = abs_x + bw // 2
+            cand_cy = abs_y + bh // 2
+
+            # Reject false 3D monster detections originating from player model/cape/mount
+            if self.is_in_player_exclusion_zone(cand_cx, cand_cy, w, h, bbox=(abs_x, abs_y, bw, bh)):
+                continue
+
+            # Check if this candidate is flanked by cyan brackets
+            has_brackets = False
+            for b in vp_brackets:
+                b_abs_x = vx1 + b[0]
+                b_abs_y = vy1 + b[1]
+                if abs(b_abs_y - abs_y) <= 12 and (abs(b_abs_x - abs_x) <= 35 or abs(b_abs_x - (abs_x + bw)) <= 35):
+                    has_brackets = True
+                    break
+
+            crop = img[max(0, abs_y - 10) : min(h, abs_y + bh + 40), max(0, abs_x - 15) : min(w, abs_x + bw + 15)]
+
+            # Exemplar memory evaluation
+            conf = 0.95 if has_brackets else 0.82
+            if mem is not None and crop.size > 0:
+                is_neg, neg_sim, _ = mem.is_negative_patch(crop)
+                if is_neg:
+                    continue
+                pos_cid, pos_cname, pos_sim = mem.classify_patch(crop, min_sim=0.70)
+                if pos_cid == 10:
+                    conf = max(conf, float(pos_sim))
+
+            monsters.append({
+                "screen_x": abs_x + bw // 2,
+                "screen_y": abs_y + bh // 2,
+                "bbox": (abs_x, abs_y, bw, bh),
+                "confidence": round(conf, 3),
+                "class_id": 10,
+                "class_name": "monster_3d",
+                "has_diamond_brackets": has_brackets,
+                "is_targeted": has_brackets,
+                "is_hostile": True,
+            })
+
+        # Deduplicate and cluster vertically/horizontally adjacent monster detections
+        # (e.g. nameplate + hostile red HP bar above it belonging to the same monster)
+        merged_monsters: List[Dict[str, Any]] = []
+        for m in monsters:
+            if m.get("class_id") != 10:
+                merged_monsters.append(m)
+                continue
+            bx, by, bw, bh = m["bbox"]
+            cx, cy = m["screen_x"], m["screen_y"]
+            merged = False
+            for existing in merged_monsters:
+                if existing.get("class_id") != 10:
+                    continue
+                ebx, eby, ebw, ebh = existing["bbox"]
+                ecx, ecy = existing["screen_x"], existing["screen_y"]
+                if abs(cx - ecx) <= max(35, int(round(50 * scale_x))) and abs(cy - ecy) <= max(30, int(round(40 * scale_y))):
+                    nx1 = min(bx, ebx)
+                    ny1 = min(by, eby)
+                    nx2 = max(bx + bw, ebx + ebw)
+                    ny2 = max(by + bh, eby + ebh)
+                    existing["bbox"] = (nx1, ny1, nx2 - nx1, ny2 - ny1)
+                    existing["screen_x"] = nx1 + (nx2 - nx1) // 2
+                    existing["screen_y"] = ny1 + (ny2 - ny1) // 2
+                    existing["confidence"] = max(existing["confidence"], m["confidence"])
+                    existing["has_diamond_brackets"] = existing["has_diamond_brackets"] or m.get("has_diamond_brackets", False)
+                    existing["is_targeted"] = existing["is_targeted"] or m.get("is_targeted", False)
+                    merged = True
+                    break
+            if not merged:
+                merged_monsters.append(m)
+
+        return merged_monsters
 
     def get_vision_engine_health_summary(self) -> dict:
         """Returns vision engine health summary safely."""
@@ -1701,5 +2865,17 @@ def get_vision_readiness_probe() -> dict:
 
 def get_vision_audit_summary() -> dict:
     return {"module": "vision", "audit_passed": validate_vision_contract(), "probe": get_vision_readiness_probe()}
+
+
+__all__ = [
+    "VisionEngine",
+    "Vision",
+    "PLAYER_CENTER_EXCLUSION_ZONE",
+    "PLAYER_SELF_EXCLUSION_ZONE",
+    "is_in_player_exclusion_zone",
+    "is_in_player_self_exclusion_zone",
+    "detect_inventory_panel",
+]
+
 
 

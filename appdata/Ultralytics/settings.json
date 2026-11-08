@@ -1,0 +1,19 @@
+{
+  "settings_version": "0.0.8",
+  "datasets_dir": "F:\\a2\\dataset",
+  "weights_dir": "F:\\a2\\temp\\weights",
+  "runs_dir": "F:\\a2\\models\\rtx_runs",
+  "uuid": "b30dec3b4d38537833af5528a91323da0d106105a047eea812fc9fbf9e3a99e7",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "mlflow": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": false
+}

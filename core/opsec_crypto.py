@@ -453,6 +453,7 @@ class NativeWin32HotkeyManager:
 
     HOTKEY_ID_F8: int = 108
     HOTKEY_ID_F9: int = 109
+    HOTKEY_ID_F10: int = 110
 
     def __init__(self, poll_interval_sec: float = 0.015) -> None:
         self.poll_interval_sec = max(0.002, float(poll_interval_sec))
@@ -514,33 +515,77 @@ class NativeWin32HotkeyManager:
             entry = self._hotkeys.get(hotkey_id)
             return bool(entry and entry[3])
 
+    @staticmethod
+    def vk_for_key(key: str) -> int:
+        name = str(key or "").strip().lower()
+        if len(name) >= 2 and name[0] == "f" and name[1:].isdigit():
+            number = int(name[1:])
+            if 1 <= number <= 24:
+                return 0x70 + number - 1
+        if len(name) == 1 and "a" <= name <= "z":
+            return ord(name.upper())
+        if name in ("esc", "escape"):
+            return 0x1B
+        return 0
+
+    @staticmethod
+    def chord_binding(spec: str, no_repeat: bool = True) -> Tuple[int, int]:
+        """
+        Map a chord spec to (vk, modifiers). Bare F8/F9/F10 and modifier-less specs return (0, 0)
+        so RegisterHotKey never consumes the game's own keys.
+        """
+        from config.schema import parse_hotkey_chord
+
+        key, mods = parse_hotkey_chord(spec)
+        if not key or not mods:
+            return 0, 0
+        vk = NativeWin32HotkeyManager.vk_for_key(key)
+        if not vk:
+            return 0, 0
+        bits = 0
+        if "alt" in mods:
+            bits |= NativeWin32HotkeyManager.MOD_ALT
+        if "ctrl" in mods:
+            bits |= NativeWin32HotkeyManager.MOD_CONTROL
+        if "shift" in mods:
+            bits |= NativeWin32HotkeyManager.MOD_SHIFT
+        if "win" in mods:
+            bits |= NativeWin32HotkeyManager.MOD_WIN
+        if no_repeat:
+            bits |= NativeWin32HotkeyManager.MOD_NOREPEAT
+        return vk, bits
+
     def register_default_f8_f9(
         self,
         on_f8: Optional[Callable[[], None]] = None,
         on_f9: Optional[Callable[[], None]] = None,
+        on_f10: Optional[Callable[[], None]] = None,
         no_repeat: bool = True,
+        node_chord: Optional[str] = None,
+        menu_chord: Optional[str] = None,
+        pause_chord: Optional[str] = None,
     ) -> Dict[str, bool]:
         """
-        Standart F8 (VK_F8 = 0x77) ve F9 (VK_F9 = 0x78) kısayollarını hiçbir
-        WH_KEYBOARD_LL kancası kurmadan kaydeder.
+        Register Ctrl+Alt+F8/F9/F10 (or the given chords) with MOD_NOREPEAT.
+        Does not register bare F8/F9/F10, so those keys still reach the game and Windows.
         """
-        mods = self.MOD_NOREPEAT if no_repeat else self.MOD_NONE
-        results: Dict[str, bool] = {}
+        from config.schema import DEFAULT_MENU_CHORD, DEFAULT_NODE_CHORD, DEFAULT_PAUSE_CHORD
 
-        if on_f8 is not None:
-            results["F8"] = self.register_native_hotkey(
-                self.HOTKEY_ID_F8,
-                self.VK_F8,
-                mods,
-                on_f8,
-            )
-        if on_f9 is not None:
-            results["F9"] = self.register_native_hotkey(
-                self.HOTKEY_ID_F9,
-                self.VK_F9,
-                mods,
-                on_f9,
-            )
+        chords = (
+            ("F8", node_chord or DEFAULT_NODE_CHORD, self.HOTKEY_ID_F8, on_f8),
+            ("F9", menu_chord or DEFAULT_MENU_CHORD, self.HOTKEY_ID_F9, on_f9),
+            ("F10", pause_chord or DEFAULT_PAUSE_CHORD, self.HOTKEY_ID_F10, on_f10),
+        )
+        results: Dict[str, bool] = {}
+        for name, chord, hotkey_id, callback in chords:
+            if callback is None:
+                continue
+            vk_code, modifiers = self.chord_binding(chord, no_repeat=no_repeat)
+            if not vk_code:
+                logger.warning("Kısayol akoru kaydedilemedi (yalın veya geçersiz): %s", chord)
+                results[name] = False
+                continue
+            results[name] = self.register_native_hotkey(hotkey_id, vk_code, modifiers, callback)
         return results
 
     def unregister_native_hotkey(self, hotkey_id: int) -> bool:
@@ -662,16 +707,16 @@ class NativeWin32HotkeyManager:
                             modifiers,
                         )
                     else:
-                        # Başka bir süreç aynı kısayolu tutuyorsa MOD_NOREPEAT olmadan da dene veya uyar
                         err_code = ctypes.get_last_error()
                         logger.warning(
-                            "RegisterHotKey(id=%d, vk=0x%02X) işletim sistemi tarafından reddedildi (err=%d). "
-                            "Yedek mesaj dinleme aktif.",
+                            "RegisterHotKey(id=%d, vk=0x%02X, mod=0x%04X) reddedildi (err=%d). "
+                            "Yalın F tuşu kaydedilmedi.",
                             hk_id,
                             vk_code,
+                            modifiers,
                             err_code,
                         )
-                        success = True
+                        success = False
                 else:
                     success = True
 

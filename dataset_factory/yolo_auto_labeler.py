@@ -51,6 +51,17 @@ YOLO_CLASSES: Dict[int, str] = {
     9: "minimap_sprout",
     10: "monster_3d",
     11: "minimap_monster_dot",
+    12: "world_material",
+    13: "skill_ui_prompt",
+    14: "obstacle",
+    15: "path_ground",
+    16: "player_hp_bar",
+    17: "player_mp_bar",
+    18: "hp_potion",
+    19: "mp_potion",
+    20: "target_hp_bar",
+    21: "skill_slot",
+    22: "buff_scroll",
 }
 
 YOLO_CLASSES_TR: Dict[int, str] = {
@@ -66,12 +77,76 @@ YOLO_CLASSES_TR: Dict[int, str] = {
     9: "Minimap 3 Yapraklı Filiz İkonu",
     10: "3B Canavar & İsim Plakası - Negatif Sınıf",
     11: "Minimap Yuvarlak Canavar Noktası • - Negatif Sınıf",
+    12: "Adı bilinmeyen dünya malzemesi",
+    13: "Skill / arayüz istemi (F ve E değil)",
+    14: "Engel",
+    15: "Yol / zemin",
+    16: "Oyuncu Can Barı (HP)",
+    17: "Oyuncu Mana Barı (MP)",
+    18: "Can İksiri (HP Potion)",
+    19: "Mana İksiri (MP Potion)",
+    20: "Hedef Can Barı (Target HP)",
+    21: "Skill Yuvası",
+    22: "Güçlendirme Parşömeni (Buff Scroll)",
 }
 
 YOLO_NAME_TO_ID: Dict[str, int] = {name: cid for cid, name in YOLO_CLASSES.items()}
 
-POSITIVE_CLASS_IDS: Sequence[int] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
-NEGATIVE_CLASS_IDS: Sequence[int] = (10, 11)
+try:
+    from dataset_factory.class_taxonomy import dataset_class_names as _taxonomy_class_names
+    from dataset_factory.class_taxonomy import dataset_labels_tr as _taxonomy_labels_tr
+
+    for _cid, _name in _taxonomy_class_names().items():
+        if int(_cid) >= 16 and int(_cid) not in YOLO_CLASSES:
+            YOLO_CLASSES[int(_cid)] = _name
+            YOLO_CLASSES_TR[int(_cid)] = _taxonomy_labels_tr().get(int(_cid), _name)
+    YOLO_NAME_TO_ID.clear()
+    YOLO_NAME_TO_ID.update({name: cid for cid, name in YOLO_CLASSES.items()})
+except Exception:
+    pass
+
+POSITIVE_CLASS_IDS: Sequence[int] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22)
+NEGATIVE_CLASS_IDS: Sequence[int] = (10, 11, 14)
+
+UNVERIFIED_HEURISTIC_SOURCES = {
+    "chromatic_salient_3d_resource",
+    "visual_ground_path_segmenter",
+    "visual_obstacle_segmenter",
+    "hud_skill_slot",
+    "hud_player_hp_bar",
+    "hud_player_mp_bar",
+    "hud_hp_potion",
+    "hud_mp_potion",
+    "hud_buff_scroll",
+    "dataset_requeue",
+    "legacy_auto",
+    "center_anchor_fallback",
+    "gather_material_hint",
+}
+
+
+def is_path_learning_stem(stem: str) -> bool:
+    """Check if stem is dedicated to path/obstacle learning."""
+    s = str(stem or "").strip().lower()
+    return (
+        s.startswith("learn_paths_")
+        or "learn_paths" in s
+        or "learn_obstacles" in s
+        or "_path_ground" in s
+        or "_path_" in s
+        or s.startswith("path_")
+    )
+
+
+def is_skill_learning_stem(stem: str) -> bool:
+    """Check if stem is dedicated to HUD skill/vitality learning."""
+    s = str(stem or "").strip().lower()
+    return (
+        "learn_skills" in s
+        or "learn_vitality" in s
+        or s.startswith("skill_")
+        or "_vitality" in s
+    )
 
 # Distinct BGR colors for UI preview rendering per class_id
 YOLO_CLASS_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
@@ -87,6 +162,17 @@ YOLO_CLASS_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
     9: (120, 255, 120),  # minimap_sprout: bright green
     10: (35, 35, 235),   # monster_3d: danger crimson red
     11: (70, 95, 250),   # minimap_monster_dot: orange-red negative dot
+    12: (180, 180, 180),
+    13: (200, 160, 255),
+    14: (40, 90, 200),
+    15: (160, 200, 120),
+    16: (60, 60, 230),
+    17: (230, 160, 50),
+    18: (40, 40, 240),    # hp_potion: vibrant red
+    19: (240, 160, 40),   # mp_potion: vibrant blue/cyan
+    20: (30, 30, 220),    # target_hp_bar: target health bar
+    21: (200, 140, 240),  # skill_slot: slot outline
+    22: (80, 200, 230),   # buff_scroll: golden parchment scroll
 }
 
 
@@ -106,13 +192,36 @@ def map_material_name_to_yolo_class_id(material_name: str, default_id: int = 3) 
     if norm in YOLO_NAME_TO_ID:
         return YOLO_NAME_TO_ID[norm]
 
+    try:
+        from dataset_factory.class_taxonomy import class_id_for_material_text
+
+        specific = class_id_for_material_text(norm)
+    except Exception:
+        specific = None
+    if specific is not None:
+        return int(specific)
+
     # Negative / monster keywords
     if any(k in norm for k in ("monster_dot", "minimap_monster", "yuvarlak canavar")):
         return 11
     if any(k in norm for k in ("monster", "zaif", "sparkie", "skyray", "canavar", "hostile", "mob")):
         return 10
 
-    # UI / Icon classes
+    # UI / Icon / HUD classes
+    if "buff_scroll" in norm or "scroll" in norm or "parşömen" in norm or "parcsomen" in norm:
+        return 22
+    if "hp_potion" in norm or "can iksiri" in norm or ("potion" in norm and "hp" in norm):
+        return 18
+    if "mp_potion" in norm or "mana iksiri" in norm or ("potion" in norm and "mp" in norm):
+        return 19
+    if "target_hp_bar" in norm or "target_hp" in norm:
+        return 20
+    if "skill_slot" in norm or "skill_bar" in norm:
+        return 21
+    if "player_hp_bar" in norm or "player_hp" in norm:
+        return 16
+    if "player_mp_bar" in norm or "player_mp" in norm:
+        return 17
     if "crest" in norm or "amblem" in norm:
         return 6
     if "f_gather" in norm or "gather_prompt" in norm or "f gather" in norm:
@@ -213,7 +322,19 @@ def map_material_name_to_yolo_class_id(material_name: str, default_id: int = 3) 
     ):
         return 3
 
-    return int(default_id)
+    if any(k in norm for k in ("gatherable plant", "gatherable material", "world_material")):
+        return 12
+    if any(k in norm for k in ("skill_ui", "skill", "cooldown", "vitality")):
+        return 13
+    if any(k in norm for k in ("obstacle", "engel", "cliff")):
+        return 14
+    if any(k in norm for k in ("path_ground", "walking path", "navigable")):
+        return 15
+
+    if int(default_id) in YOLO_NAME_TO_ID.values() or 0 <= int(default_id) < len(YOLO_CLASSES):
+        if int(default_id) == 3 and norm not in ("",):
+            return 12
+    return 12 if int(default_id) == 3 else int(default_id)
 
 
 class YOLOAutoLabeler:
@@ -271,6 +392,7 @@ class YOLOAutoLabeler:
         crest_threshold: float = 0.72,
         prompt_threshold: float = 0.68,
         floating_icon_threshold: float = 0.65,
+        exemplar_memory: Optional[Any] = None,
     ) -> None:
         self.vision_engine: VisionEngine = (
             vision_engine if vision_engine is not None else VisionEngine()
@@ -284,6 +406,15 @@ class YOLOAutoLabeler:
         self.crest_threshold: float = float(crest_threshold)
         self.prompt_threshold: float = float(prompt_threshold)
         self.floating_icon_threshold: float = float(floating_icon_threshold)
+        if exemplar_memory is not None:
+            self.exemplar_memory = exemplar_memory
+        else:
+            try:
+                from dataset_factory.exemplar_memory import get_exemplar_memory
+
+                self.exemplar_memory = get_exemplar_memory()
+            except Exception:
+                self.exemplar_memory = None
 
     # ------------------------------------------------------------------
     # Coordinate Normalization & Bounding Box Helpers
@@ -369,6 +500,8 @@ class YOLOAutoLabeler:
         confidence: float = 0.90,
         source: str = "auto_labeler",
         material_name: str = "",
+        hand_label: bool = False,
+        **kwargs,
     ) -> Dict[str, Any]:
         """Construct a standardized YOLO annotation dictionary with normalized and pixel bounds."""
         cid = int(class_id)
@@ -381,6 +514,38 @@ class YOLOAutoLabeler:
         cls_name = YOLO_CLASSES[cid]
         cls_name_tr = YOLO_CLASSES_TR[cid]
         conf_clamped = round(float(np.clip(confidence, 0.01, 1.0)), 4)
+        is_hand = bool(
+            hand_label
+            or kwargs.get("is_hand_label")
+            or kwargs.get("human_approved")
+            or kwargs.get("approved")
+            or "hand" in str(source).lower()
+        )
+        src_str = str(source).strip().lower()
+        is_heuristic = any(src_str == s or src_str.startswith(s) for s in UNVERIFIED_HEURISTIC_SOURCES)
+
+        if is_hand:
+            is_emin = True
+        elif "trusted" in kwargs:
+            is_emin = bool(kwargs["trusted"])
+        elif "weak" in kwargs:
+            is_emin = not bool(kwargs["weak"])
+        elif is_heuristic:
+            # Unverified heuristic proposals must NEVER be trusted/emin without human approval
+            is_emin = False
+        else:
+            is_emin = bool(
+                conf_clamped >= 0.85
+                and (
+                    source.startswith("vision_3d_crest")
+                    or "gather_prompt" in source
+                    or "floating" in source
+                    or "exemplar" in source
+                    or "target_hp_bar" in source
+                    or "minimap" in source
+                    or "monster" in source
+                )
+            )
 
         return {
             "class_id": cid,
@@ -401,6 +566,9 @@ class YOLOAutoLabeler:
             "confidence": conf_clamped,
             "source": str(source),
             "is_negative": bool(cid in NEGATIVE_CLASS_IDS),
+            "hand_label": is_hand,
+            "trusted": is_emin,
+            "weak": not is_emin,
         }
 
     @staticmethod
@@ -541,7 +709,11 @@ class YOLOAutoLabeler:
                 else:
                     mesh_class_id = patch_cid
             else:
-                mesh_class_id = map_material_name_to_yolo_class_id(detected_mat_name, default_id=3)
+                named = map_material_name_to_yolo_class_id(detected_mat_name, default_id=12)
+                if named == 3 and patch_conf < 0.80:
+                    mesh_class_id = 12
+                else:
+                    mesh_class_id = named
         else:
             mesh_class_id = map_material_name_to_yolo_class_id(detected_mat_name, default_id=3)
 
@@ -585,7 +757,7 @@ class YOLOAutoLabeler:
             h=rh,
             img_w=img_w,
             img_h=img_h,
-            confidence=max(0.84, patch_conf),
+            confidence=float(np.clip(patch_conf, 0.05, 0.99)),
             source="3d_mesh_below_crest",
             material_name=detected_mat_name,
         )
@@ -690,29 +862,124 @@ class YOLOAutoLabeler:
         frame_bgr: np.ndarray,
         hsv: np.ndarray,
         existing_positive_boxes: Sequence[Sequence[int]],
+        gray: Optional[np.ndarray] = None,
+        shared_frame_context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Detect 3D monster nameplates and bodies in the 3D viewport (`class_id = 10: monster_3d`),
-        such as:
+        Detect 3D monster nameplates, bodies, and hostile HP bars (`class_id = 10: monster_3d`)
+        and target HP bars (`class_id = 20: target_hp_bar`), such as:
+        - Hostile red monster HP bars / nameplates in 3D viewport (Hue 0..10 | 168..180, Sat >= 125, Val >= 115).
+        - Top boss / target enemy health bar (0.02*H..0.12*H, 0.30*W..0.70*W) -> class_id 20: target_hp_bar.
         - Targeted monsters with cyan diamond bracket tips + yellow text + green/red health bar +
-          red `'4'` agro badge (e.g. `< Yellow-Maned Zaif >` in `pilgrims_ridge_1.jpg`).
-        - Untargeted yellow/olive monster nameplates in the 3D world (e.g. `Highland Odyle Sparkie`
-          in `aria_3d_crest_far.jpg` and `mela_f_gather_not_on_minimap.jpg`).
-        Strictly excludes:
-        - The player's own central nameplate (`Two-Faced / Muses`),
-        - HUD/UI bars (top boss bar, right quest tracker, minimap, bottom skill/chat bars),
-        - Any positive gatherable crest/resource already detected.
+          red '4' agro badge (e.g. `< Yellow-Maned Zaif >`).
+        - Untargeted yellow/olive monster nameplates in the 3D world (e.g. `Highland Odyle Sparkie`).
         """
         monsters: List[Dict[str, Any]] = []
         img_h, img_w = frame_bgr.shape[:2]
-        if img_w < 600 or img_h < 360:
+        if img_w < 500 or img_h < 300:
             return monsters
 
         scale_x = img_w / 2000.0
         scale_y = img_h / 1124.0
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        if gray is None:
+            if shared_frame_context is not None and "gray" in shared_frame_context and shared_frame_context["gray"] is not None:
+                gray = shared_frame_context["gray"]
+            else:
+                gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                if shared_frame_context is not None:
+                    shared_frame_context["gray"] = gray
 
-        # High-contrast stroke filter (Top-Hat) to separate thin text glyphs from sunlit ground/rocks
+        # ------------------------------------------------------------------
+        # Stage B1: Hostile Red Monster HP Bars & Top Target HP Bar
+        # ------------------------------------------------------------------
+        red_part1 = cv2.inRange(hsv, np.array([0, 125, 115]), np.array([10, 255, 255]))
+        red_part2 = cv2.inRange(hsv, np.array([168, 125, 115]), np.array([180, 255, 255]))
+        red_u8 = cv2.bitwise_or(red_part1, red_part2)
+
+        # 1. Top HUD target HP bar check (0.02*H..0.12*H, 0.30*W..0.70*W)
+        top_y1, top_y2 = int(img_h * 0.02), int(img_h * 0.12)
+        top_x1, top_x2 = int(img_w * 0.30), int(img_w * 0.70)
+        top_red = red_u8[top_y1:top_y2, top_x1:top_x2]
+        if top_red.size > 0:
+            top_closed = cv2.morphologyEx(
+                top_red, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+            )
+            top_cnts, _ = cv2.findContours(top_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for tcnt in top_cnts:
+                tx, ty, tw, th_b = cv2.boundingRect(tcnt)
+                aspect = float(tw) / float(max(1, th_b))
+                min_tw = max(40, int(round(60 * scale_x)))
+                max_tw = max(120, int(round(360 * scale_x)))
+                if aspect >= 3.5 and min_tw <= tw <= max_tw and 4 <= th_b <= int(32 * scale_y):
+                    abs_tx = top_x1 + tx
+                    abs_ty = top_y1 + ty
+                    target_bar_cid = YOLO_NAME_TO_ID.get("target_hp_bar", 20)
+                    monsters.append(
+                        self._make_annotation(
+                            class_id=target_bar_cid,
+                            x=abs_tx,
+                            y=abs_ty,
+                            w=tw,
+                            h=th_b,
+                            img_w=img_w,
+                            img_h=img_h,
+                            confidence=0.92,
+                            source="target_hp_bar_scanner",
+                            material_name="target_hp_bar",
+                        )
+                    )
+
+        # 2. Viewport hostile monster red health bars (0.12*H..0.75*H)
+        vp_red = red_u8.copy()
+        vp_red[: int(img_h * 0.12), :] = 0
+        vp_red[int(img_h * 0.75) :, :] = 0
+        vp_red[:, int(img_w * 0.852) :] = 0
+        vp_red[: int(img_h * 0.30), int(img_w * 0.71) :] = 0
+        vp_red[int(img_h * 0.66) :, : int(img_w * 0.26)] = 0
+        vp_red[int(img_h * 0.42) : int(img_h * 0.58), int(img_w * 0.44) : int(img_w * 0.56)] = 0
+
+        rkw = max(8, int(round(14 * scale_x)))
+        rkh = max(2, int(round(3 * scale_y)))
+        r_closed = cv2.morphologyEx(
+            vp_red, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (rkw, rkh))
+        )
+        r_cnts, _ = cv2.findContours(r_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_rw = max(35, int(round(50 * scale_x)))
+        max_rw = max(120, int(round(280 * scale_x)))
+
+        for rcnt in r_cnts:
+            rx, ry, rcw, rch = cv2.boundingRect(rcnt)
+            if not (min_rw <= rcw <= max_rw and 3 <= rch <= int(25 * scale_y)):
+                continue
+            aspect = float(rcw) / float(max(1, rch))
+            if aspect < 3.2:
+                continue
+            m_x = max(0, rx - int(round(12 * scale_x)))
+            m_y = max(0, ry - int(round(6 * scale_y)))
+            m_w = min(img_w - m_x, rcw + int(round(24 * scale_x)))
+            m_h = min(img_h - m_y, int(rcw * 0.85) + int(round(40 * scale_y)))
+
+            cand_xyxy = (m_x, m_y, m_x + m_w, m_y + m_h)
+            if any(self._compute_iou_xyxy(cand_xyxy, pos_box) >= 0.25 for pos_box in existing_positive_boxes):
+                continue
+            monsters.append(
+                self._make_annotation(
+                    class_id=10,
+                    x=m_x,
+                    y=m_y,
+                    w=m_w,
+                    h=m_h,
+                    img_w=img_w,
+                    img_h=img_h,
+                    confidence=0.90,
+                    source="hostile_red_hp_bar_monster",
+                    material_name="monster_3d",
+                )
+            )
+
+        # ------------------------------------------------------------------
+        # Stage B2: Yellow/Olive Monster Nameplate Glyph Detector
+        # ------------------------------------------------------------------
         th_sz = max(5, int(round(7 * scale_x)) | 1)
         tophat = cv2.morphologyEx(
             gray,
@@ -720,28 +987,20 @@ class YOLOAutoLabeler:
             cv2.getStructuringElement(cv2.MORPH_RECT, (th_sz, th_sz)),
         )
 
-        # Monster nameplate yellow/olive text: Hue 21..30, Saturation >= 132, Value >= 145
-        # (Sunlit rocks/dry grass have Hue <= 20 or low saturation/stroke contrast)
         yellow_stroke = (
-            (hsv[:, :, 0] >= 21)
-            & (hsv[:, :, 0] <= 30)
-            & (hsv[:, :, 1] >= 132)
-            & (hsv[:, :, 2] >= 145)
-            & (tophat >= 10)
+            (hsv[:, :, 0] >= 20)
+            & (hsv[:, :, 0] <= 32)
+            & (hsv[:, :, 1] >= 90)
+            & (hsv[:, :, 2] >= 110)
+            & (tophat >= 8)
         )
         ym_u8 = (yellow_stroke.astype(np.uint8)) * 255
 
-        # Mask out non-3D-viewport HUD areas:
-        # 1) Top HUD & target boss bar (y < 0.11 * h)
         ym_u8[: int(img_h * 0.11), :] = 0
-        # 2) Bottom skill bar & XP bar (y > 0.78 * h)
         ym_u8[int(img_h * 0.78) :, :] = 0
-        # 3) Right-side Quest Tracker & Minimap (x > 0.852 * w, and y < 0.30 * h for x > 0.71 * w)
         ym_u8[:, int(img_w * 0.852) :] = 0
         ym_u8[: int(img_h * 0.30), int(img_w * 0.71) :] = 0
-        # 4) Bottom-left chat box (y > 0.66 * h and x < 0.26 * w)
         ym_u8[int(img_h * 0.66) :, : int(img_w * 0.26)] = 0
-        # 5) Player's own central nameplate ("Two-Faced / Muses" at x: 0.44..0.56, y: 0.42..0.58)
         ym_u8[
             int(img_h * 0.42) : int(img_h * 0.58),
             int(img_w * 0.44) : int(img_w * 0.56),
@@ -772,9 +1031,8 @@ class YOLOAutoLabeler:
 
             sub_ym = ym_u8[y : y + ch, x : x + cw]
             stroke_px = int(np.count_nonzero(sub_ym))
-            min_stroke = max(40, int(round(105 * scale_x * scale_y)))
+            min_stroke = max(35, int(round(90 * scale_x * scale_y)))
 
-            # Check for cyan diamond bracket tips (`< Monster >`) at left and right ends of targeted monster nameplate
             lx1 = max(0, x - int(round(26 * scale_x)))
             lx2 = min(img_w, x + int(round(6 * scale_x)))
             rx1 = max(0, x + cw - int(round(6 * scale_x)))
@@ -782,14 +1040,13 @@ class YOLOAutoLabeler:
             ty1 = max(0, y - int(round(6 * scale_y)))
             ty2 = min(img_h, y + ch + int(round(6 * scale_y)))
 
-            left_cyan = cv2.inRange(hsv[ty1:ty2, lx1:lx2], np.array([78, 80, 140]), np.array([105, 255, 255]))
-            right_cyan = cv2.inRange(hsv[ty1:ty2, rx1:rx2], np.array([78, 80, 140]), np.array([105, 255, 255]))
+            left_cyan = cv2.inRange(hsv[ty1:ty2, lx1:lx2], np.array([75, 70, 120]), np.array([105, 255, 255]))
+            right_cyan = cv2.inRange(hsv[ty1:ty2, rx1:rx2], np.array([75, 70, 120]), np.array([105, 255, 255]))
             has_diamond_tips = (
-                int(np.count_nonzero(left_cyan)) >= max(8, int(round(12 * scale_x * scale_y)))
-                and int(np.count_nonzero(right_cyan)) >= max(8, int(round(12 * scale_x * scale_y)))
+                int(np.count_nonzero(left_cyan)) >= max(4, int(round(8 * scale_x * scale_y)))
+                and int(np.count_nonzero(right_cyan)) >= max(4, int(round(8 * scale_x * scale_y)))
             )
 
-            # Check for centered red agro badge ('4') directly below the nameplate
             cx_label = x + cw // 2
             bx1 = max(0, cx_label - int(round(18 * scale_x)))
             bx2 = min(img_w, cx_label + int(round(18 * scale_x)))
@@ -803,12 +1060,10 @@ class YOLOAutoLabeler:
                 red_badge_px >= max(24, int(round(45 * scale_x * scale_y)))
             )
 
-            # Count distinct character-like connected components inside the text line
             num_labels, _ = cv2.connectedComponents(sub_ym)
             if not has_agro_badge and (stroke_px < min_stroke or num_labels < 7):
                 continue
 
-            # Verify dark text outline/shadow pixels exist immediately around the yellow glyphs
             dilated_stroke = cv2.dilate(sub_ym, np.ones((3, 3), dtype=np.uint8))
             border_ring = dilated_stroke - sub_ym
             ring_gray = gray[y : y + ch, x : x + cw][border_ring > 0]
@@ -818,21 +1073,20 @@ class YOLOAutoLabeler:
             if not has_agro_badge and dark_outline_ratio < 0.20:
                 continue
 
-            # Expand bounding box to cover diamond tips + monster body below nameplate if targeted/close
             if has_agro_badge:
-                # Targeted monster like `< Yellow-Maned Zaif >`: include diamond tips & 3D creature body below
                 final_x = max(0, x - int(round(24 * scale_x)))
                 final_y = max(0, y - int(round(8 * scale_y)))
                 final_w = min(img_w - final_x, cw + int(round(48 * scale_x)))
                 final_h = min(img_h - final_y, ch + int(round(105 * scale_y)))
                 conf = 0.95
+                is_weak = False
             else:
-                # Untargeted monster nameplate (`Highland Odyle Sparkie`)
                 final_x = max(0, x - int(round(6 * scale_x)))
                 final_y = max(0, y - int(round(4 * scale_y)))
                 final_w = min(img_w - final_x, cw + int(round(12 * scale_x)))
                 final_h = min(img_h - final_y, ch + int(round(8 * scale_y)))
-                conf = round(min(0.92, 0.78 + min(0.14, stroke_px / 900.0)), 4)
+                conf = round(min(0.68, 0.52 + min(0.16, stroke_px / 900.0)), 4)
+                is_weak = True
 
             cand_xyxy = (final_x, final_y, final_x + final_w, final_y + final_h)
             if any(self._compute_iou_xyxy(cand_xyxy, pos_box) >= 0.25 for pos_box in existing_positive_boxes):
@@ -850,10 +1104,497 @@ class YOLOAutoLabeler:
                     confidence=conf,
                     source="3d_monster_scanner",
                     material_name="monster_3d",
+                    weak=is_weak,
+                    trusted=not is_weak,
                 )
             )
 
         return monsters
+
+    # ------------------------------------------------------------------
+    # Stage A: Salient 3D Resources & Crestless Nodes (0..5, 12)
+    # ------------------------------------------------------------------
+    def _scan_salient_3d_resources(
+        self,
+        frame_bgr: np.ndarray,
+        hsv: np.ndarray,
+        existing_boxes: Sequence[Sequence[int]],
+        hint_material_name: str = "",
+        has_crest_or_prompt: bool = False,
+        shared_frame_context: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Stage A: Salient 3D Resources & Crestless Nodes (classes 0..5, 12).
+        Fallback ONLY when NO 3D crest (`vision_3d_crest`) or prompt icon is found.
+        Uses chromatic contour segmentation for ore/herb/crystal even if white wing crest is dim or occluded.
+        Validates candidate patches with `classify_3d_material_patch`.
+        Never assigns class_id > 12 (never assigns essence_*).
+        Confidence is strictly calibrated: conf = min(0.68, max(0.38, round(p_score * 0.75, 4))).
+        Marked as trusted=False, weak=True.
+        """
+        if has_crest_or_prompt:
+            return []
+
+        salient_anns: List[Dict[str, Any]] = []
+        img_h, img_w = frame_bgr.shape[:2]
+        if img_w < 500 or img_h < 300:
+            return salient_anns
+
+        scale_x = img_w / 2000.0
+        scale_y = img_h / 1124.0
+
+        vx1, vx2 = int(img_w * 0.16), int(img_w * 0.82)
+        vy1, vy2 = int(img_h * 0.18), int(img_h * 0.78)
+        roi_bgr = frame_bgr[vy1:vy2, vx1:vx2]
+        roi_hsv = hsv[vy1:vy2, vx1:vx2]
+        if roi_bgr.size == 0:
+            return salient_anns
+
+        sat_mask = cv2.inRange(roi_hsv, np.array([0, 75, 70]), np.array([180, 255, 255]))
+        ksize = max(5, int(round(7 * scale_x)) | 1)
+        closed = cv2.morphologyEx(sat_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize)))
+        cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        rw = vx2 - vx1
+        rh = vy2 - vy1
+        min_a = max(36.0, float(rw * rh) * 0.003)
+        max_a = float(rw * rh) * 0.25
+
+        valid_cnts = [c for c in cnts if min_a <= float(cv2.contourArea(c)) <= max_a]
+        valid_cnts.sort(key=cv2.contourArea, reverse=True)
+
+        for cnt in valid_cnts[:4]:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            aspect = float(bw) / float(max(1, bh))
+            if aspect < 0.25 or aspect > 4.0:
+                continue
+
+            abs_x = vx1 + bx
+            abs_y = vy1 + by
+            cand_xyxy = (abs_x, abs_y, abs_x + bw, abs_y + bh)
+            if any(self._compute_iou_xyxy(cand_xyxy, ebox) >= 0.20 for ebox in existing_boxes):
+                continue
+
+            patch = frame_bgr[abs_y : abs_y + bh, abs_x : abs_x + bw]
+            if patch.size == 0:
+                continue
+
+            try:
+                p_info = classify_3d_material_patch(patch, label_width_px=bw)
+            except Exception:
+                continue
+
+            p_score = float(p_info.get("confidence", p_info.get("score", 0.0)))
+            mat_name = str(p_info.get("name", ""))
+            if not mat_name or is_rejected_non_material(mat_name) or p_score < 0.20:
+                continue
+
+            cid = map_material_name_to_yolo_class_id(mat_name, default_id=12)
+            # Never assign class_id > 12 (never essence_*) or UI/monster classes in salient 3D resources
+            if cid > 12 or cid in (6, 7, 8, 9, 10, 11):
+                cid = 12
+                mat_name = "world_material"
+
+            # Strict calibrated confidence without artificial floors:
+            # conf = min(0.68, max(0.38, round(p_score * 0.75, 4)))
+            calibrated_conf = min(0.68, max(0.38, round(p_score * 0.75, 4)))
+
+            salient_anns.append(
+                self._make_annotation(
+                    class_id=cid,
+                    x=abs_x,
+                    y=abs_y,
+                    w=bw,
+                    h=bh,
+                    img_w=img_w,
+                    img_h=img_h,
+                    confidence=calibrated_conf,
+                    source="chromatic_salient_3d_resource",
+                    material_name=mat_name,
+                    trusted=False,
+                    weak=True,
+                )
+            )
+
+        return salient_anns
+
+    # ------------------------------------------------------------------
+    # Stage C: Genuine HUD & Skill Bar Detection (16, 17, 18, 19, 21, 22)
+    # ------------------------------------------------------------------
+    def _scan_hud_and_skills(
+        self,
+        frame_bgr: np.ndarray,
+        hsv: np.ndarray,
+        gray: np.ndarray,
+        source_stem: str = "",
+        shared_frame_context: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Genuine HUD & Skill Bar Detection (classes 16, 17, 18, 19, 21, 22):
+        - Player HP bar (16: player_hp_bar): horizontal red/green health bar in bottom HUD
+        - Player MP bar (17: player_mp_bar): horizontal blue mana bar in bottom HUD
+        - Upper Consumable Row (0.870*H..0.938*H): Buff scrolls (22: buff_scroll), HP potions (18: hp_potion), MP potions (19: mp_potion)
+        - Lower Combat Skills Row (>=0.940*H): Active combat skill slots (21: skill_slot)
+        - Center emblem exclusion: skips center level emblem (0.44..0.56*W, 0.85..0.95*H)
+        STRICT STEM GATING: ONLY execute on "learn_skills" or "learn_vitality" stems!
+        Normal gameplay/gathering frames must NEVER receive HUD annotations!
+        Without human approval, confidence capped at <= 0.70 (weak=True).
+        """
+        if not is_skill_learning_stem(source_stem):
+            return []
+
+        hud_anns: List[Dict[str, Any]] = []
+        img_h, img_w = frame_bgr.shape[:2]
+        if img_w < 500 or img_h < 300:
+            return hud_anns
+
+        scale_x = img_w / 2000.0
+        scale_y = img_h / 1124.0
+
+        y1, y2 = int(img_h * 0.80), int(img_h * 0.98)
+        x1, x2 = int(img_w * 0.18), int(img_w * 0.82)
+        roi_hsv = hsv[y1:y2, x1:x2]
+        roi_gray = gray[y1:y2, x1:x2]
+        if roi_hsv.size == 0:
+            return hud_anns
+
+        roi_w = x2 - x1
+        left_hsv = roi_hsv[:, : int(roi_w * 0.50)]
+        if left_hsv.size > 0:
+            red1 = cv2.inRange(left_hsv, np.array([0, 110, 80]), np.array([10, 255, 255]))
+            red2 = cv2.inRange(left_hsv, np.array([168, 110, 80]), np.array([180, 255, 255]))
+            hp_red = cv2.bitwise_or(red1, red2)
+            hp_green = cv2.inRange(left_hsv, np.array([35, 90, 80]), np.array([85, 255, 255]))
+            hp_mask = cv2.bitwise_or(hp_red, hp_green)
+
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, int(12 * scale_x)), max(2, int(3 * scale_y))))
+            hp_closed = cv2.morphologyEx(hp_mask, cv2.MORPH_CLOSE, kernel)
+            cnts, _ = cv2.findContours(hp_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            min_hp_w = max(40, int(60 * scale_x))
+            max_hp_w = max(100, int(260 * scale_x))
+
+            for c in cnts:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                aspect = float(bw) / float(max(1, bh))
+                if min_hp_w <= bw <= max_hp_w and 5 <= bh <= int(28 * scale_y) and aspect >= 3.8:
+                    abs_x = x1 + bx
+                    abs_y = y1 + by
+                    # Player HP bar strictly occupies y: 0.84*H..0.925*H above the action hotbar
+                    if abs_y + bh > int(img_h * 0.925) or abs_y < int(img_h * 0.83):
+                        continue
+                    hud_anns.append(
+                        self._make_annotation(
+                            class_id=16,
+                            x=abs_x,
+                            y=abs_y,
+                            w=bw,
+                            h=bh,
+                            img_w=img_w,
+                            img_h=img_h,
+                            confidence=0.70,
+                            source="hud_player_hp_bar",
+                            material_name="player_hp_bar",
+                            trusted=False,
+                            weak=True,
+                        )
+                    )
+                    break
+
+            mp_blue = cv2.inRange(left_hsv, np.array([95, 90, 80]), np.array([130, 255, 255]))
+            mp_closed = cv2.morphologyEx(mp_blue, cv2.MORPH_CLOSE, kernel)
+            mp_cnts, _ = cv2.findContours(mp_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in mp_cnts:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                aspect = float(bw) / float(max(1, bh))
+                if min_hp_w <= bw <= max_hp_w and 4 <= bh <= int(25 * scale_y) and aspect >= 3.8:
+                    abs_x = x1 + bx
+                    abs_y = y1 + by
+                    # Player MP bar strictly occupies y: 0.84*H..0.925*H above the action hotbar
+                    if abs_y + bh > int(img_h * 0.925) or abs_y < int(img_h * 0.83):
+                        continue
+                    hud_anns.append(
+                        self._make_annotation(
+                            class_id=17,
+                            x=abs_x,
+                            y=abs_y,
+                            w=bw,
+                            h=bh,
+                            img_w=img_w,
+                            img_h=img_h,
+                            confidence=0.70,
+                            source="hud_player_mp_bar",
+                            material_name="player_mp_bar",
+                            trusted=False,
+                            weak=True,
+                        )
+                    )
+                    break
+
+        # Edge map for HUD slots: check shared_frame_context
+        skill_roi_x1 = x1 + int(roi_w * 0.20)
+        skill_roi_x2 = x2
+        skill_roi_gray = gray[y1:y2, skill_roi_x1:skill_roi_x2]
+        if skill_roi_gray.size > 0:
+            if shared_frame_context is not None and "edges" in shared_frame_context and shared_frame_context["edges"] is not None:
+                edges = shared_frame_context["edges"][y1:y2, skill_roi_x1:skill_roi_x2]
+            else:
+                edges = cv2.Canny(skill_roi_gray, 50, 150)
+            sq_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            edges_dil = cv2.dilate(edges, sq_kernel)
+            cnts, _ = cv2.findContours(edges_dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            min_slot_sz = max(18, int(22 * scale_x))
+            max_slot_sz = max(40, int(60 * scale_x))
+
+            valid_slots: List[Tuple[int, int, int, int]] = []
+            for c in cnts:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                if min_slot_sz <= bw <= max_slot_sz and min_slot_sz <= bh <= max_slot_sz:
+                    aspect = float(bw) / float(max(1, bh))
+                    if 0.78 <= aspect <= 1.28:
+                        slot_edges = edges[by : by + bh, bx : bx + bw]
+                        if int(np.count_nonzero(slot_edges)) >= max(10, int(15 * scale_x)):
+                            valid_slots.append((bx, by, bw, bh))
+
+            for bx, by, bw, bh in valid_slots[:16]:
+                abs_x = skill_roi_x1 + bx
+                abs_y = y1 + by
+                cx = abs_x + bw * 0.5
+                cy = abs_y + bh * 0.5
+                norm_cx = cx / float(img_w)
+                norm_cy = cy / float(img_h)
+
+                # 1. Exclude the center character level '45' emblem (x: 0.44..0.56, y: 0.85..0.95)
+                if 0.44 <= norm_cx <= 0.56 and 0.85 <= norm_cy <= 0.95:
+                    continue
+
+                slot_bgr = frame_bgr[abs_y : abs_y + bh, abs_x : abs_x + bw]
+                slot_hsv = hsv[abs_y : abs_y + bh, abs_x : abs_x + bw]
+                if slot_bgr.size == 0 or slot_hsv.size == 0:
+                    continue
+
+                slot_area = bw * bh
+
+                # 2. Upper Consumable Row (y: 0.870 .. 0.938*H)
+                if 0.865 <= norm_cy <= 0.938:
+                    # Never label as skill_slot or skill_ui_prompt!
+                    # Check empty slot:
+                    sat_chan = slot_hsv[:, :, 1]
+                    val_chan = slot_hsv[:, :, 2]
+                    if float(np.mean(sat_chan)) < 28.0 and float(np.std(val_chan)) < 16.0:
+                        # Empty slot (e.g. F8) -> do not label
+                        continue
+
+                    # HP Potion (red liquid)
+                    r1 = cv2.inRange(slot_hsv, np.array([0, 105, 75]), np.array([12, 255, 255]))
+                    r2 = cv2.inRange(slot_hsv, np.array([165, 105, 75]), np.array([180, 255, 255]))
+                    hp_red_px = int(np.count_nonzero(r1 | r2))
+
+                    # MP Potion (blue or yellow liquid)
+                    b_mask = cv2.inRange(slot_hsv, np.array([95, 85, 75]), np.array([135, 255, 255]))
+                    y_mask = cv2.inRange(slot_hsv, np.array([20, 95, 95]), np.array([35, 255, 255]))
+                    mp_blue_yellow_px = int(np.count_nonzero(b_mask | y_mask))
+
+                    # Buff Scroll (rolled parchment icon: tan/golden/cream)
+                    scroll_mask = cv2.inRange(slot_hsv, np.array([12, 30, 85]), np.array([28, 175, 235]))
+                    scroll_px = int(np.count_nonzero(scroll_mask))
+
+                    min_colored = max(8, int(0.07 * slot_area))
+
+                    if hp_red_px >= min_colored and hp_red_px > mp_blue_yellow_px and hp_red_px > scroll_px:
+                        hud_anns.append(
+                            self._make_annotation(
+                                class_id=18,
+                                x=abs_x,
+                                y=abs_y,
+                                w=bw,
+                                h=bh,
+                                img_w=img_w,
+                                img_h=img_h,
+                                confidence=0.70,
+                                source="hud_hp_potion",
+                                material_name="hp_potion",
+                                trusted=False,
+                                weak=True,
+                            )
+                        )
+                    elif mp_blue_yellow_px >= min_colored and mp_blue_yellow_px > scroll_px:
+                        hud_anns.append(
+                            self._make_annotation(
+                                class_id=19,
+                                x=abs_x,
+                                y=abs_y,
+                                w=bw,
+                                h=bh,
+                                img_w=img_w,
+                                img_h=img_h,
+                                confidence=0.70,
+                                source="hud_mp_potion",
+                                material_name="mp_potion",
+                                trusted=False,
+                                weak=True,
+                            )
+                        )
+                    elif scroll_px >= max(10, int(0.09 * slot_area)):
+                        hud_anns.append(
+                            self._make_annotation(
+                                class_id=22,
+                                x=abs_x,
+                                y=abs_y,
+                                w=bw,
+                                h=bh,
+                                img_w=img_w,
+                                img_h=img_h,
+                                confidence=0.68,
+                                source="hud_buff_scroll",
+                                material_name="buff_scroll",
+                                trusted=False,
+                                weak=True,
+                            )
+                        )
+                    # Else: empty or unclassified slot -> do not label
+
+                # 3. Lower Combat Skills Row (y >= 0.940*H)
+                elif norm_cy >= 0.939:
+                    slot_edge_cnt = int(np.count_nonzero(edges[by : by + bh, bx : bx + bw]))
+                    if slot_edge_cnt >= max(10, int(15 * scale_x)):
+                        hud_anns.append(
+                            self._make_annotation(
+                                class_id=21,
+                                x=abs_x,
+                                y=abs_y,
+                                w=bw,
+                                h=bh,
+                                img_w=img_w,
+                                img_h=img_h,
+                                confidence=0.68,
+                                source="hud_skill_slot",
+                                material_name="skill_slot",
+                                trusted=False,
+                                weak=True,
+                            )
+                        )
+
+        return hud_anns
+
+    # ------------------------------------------------------------------
+    # Stage D: Walkable Path & Obstacle Segmentation (14, 15)
+    # ------------------------------------------------------------------
+    def _scan_path_and_obstacles(
+        self,
+        frame_bgr: np.ndarray,
+        hsv: np.ndarray,
+        gray: np.ndarray,
+        source_stem: str = "",
+        shared_frame_context: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Genuine Walkable Path & Obstacle Segmentation (classes 14: obstacle, 15: path_ground):
+        STRICT STEM GATING: ONLY execute when `is_path_learning_stem(source_stem)` or "learn_paths" in source_stem
+        or "learn_obstacles" in source_stem.
+        Normal gather/monster/boot frames (`boot_*`, `gather_*`, etc.) must NEVER receive 15: path_ground
+        or 14: obstacle annotations!
+        Without human approval, cap confidence at <= 0.68 (weak=True).
+        """
+        if not is_path_learning_stem(source_stem):
+            return []
+
+        path_anns: List[Dict[str, Any]] = []
+        img_h, img_w = frame_bgr.shape[:2]
+        if img_w < 500 or img_h < 300:
+            return path_anns
+
+        scale_x = img_w / 2000.0
+        scale_y = img_h / 1124.0
+
+        py1, py2 = int(img_h * 0.52), int(img_h * 0.85)
+        px1, px2 = int(img_w * 0.28), int(img_w * 0.72)
+        roi_gray = gray[py1:py2, px1:px2]
+        roi_hsv = hsv[py1:py2, px1:px2]
+        if roi_gray.size == 0:
+            return path_anns
+
+        sobel_key = f"sobel_{py1}_{py2}_{px1}_{px2}"
+        if shared_frame_context is not None and sobel_key in shared_frame_context:
+            mag = shared_frame_context[sobel_key]
+        else:
+            gx = cv2.Sobel(roi_gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(roi_gray, cv2.CV_32F, 0, 1, ksize=3)
+            mag = cv2.magnitude(gx, gy)
+            if shared_frame_context is not None:
+                shared_frame_context[sobel_key] = mag
+
+        mag_th = float(np.percentile(mag, 45))
+        smooth_ground = (mag <= max(18.0, mag_th)) & (roi_hsv[:, :, 1] <= 150) & (roi_hsv[:, :, 2] >= 35)
+        ground_u8 = (smooth_ground.astype(np.uint8)) * 255
+
+        ksize = max(9, int(round(15 * scale_x)) | 1)
+        ground_closed = cv2.morphologyEx(
+            ground_u8, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        )
+        cnts, _ = cv2.findContours(ground_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        rw = px2 - px1
+        rh = py2 - py1
+        min_path_area = float(rw * rh) * 0.08
+
+        path_cnt = None
+        for c in sorted(cnts, key=cv2.contourArea, reverse=True):
+            if float(cv2.contourArea(c)) >= min_path_area:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                if bw >= int(rw * 0.30) and bh >= int(rh * 0.25):
+                    path_cnt = c
+                    abs_x = px1 + bx
+                    abs_y = py1 + by
+                    # Without human approval, cap confidence at <= 0.68 (weak=True)
+                    raw_conf = float(np.clip(float(bw * bh) / float(max(1, rw * rh)) * 1.4, 0.25, 0.68))
+                    conf = min(0.68, max(0.35, round(raw_conf, 4)))
+                    path_anns.append(
+                        self._make_annotation(
+                            class_id=15,
+                            x=abs_x,
+                            y=abs_y,
+                            w=bw,
+                            h=bh,
+                            img_w=img_w,
+                            img_h=img_h,
+                            confidence=conf,
+                            source="visual_ground_path_segmenter",
+                            material_name="path_ground",
+                            trusted=False,
+                            weak=True,
+                        )
+                    )
+                    break
+
+        if path_cnt is not None:
+            high_mag = (mag >= float(np.percentile(mag, 85))).astype(np.uint8) * 255
+            obs_cnts, _ = cv2.findContours(high_mag, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for oc in sorted(obs_cnts, key=cv2.contourArea, reverse=True)[:2]:
+                if float(cv2.contourArea(oc)) >= float(rw * rh) * 0.04:
+                    obx, oby, obw, obh = cv2.boundingRect(oc)
+                    abs_ox = px1 + obx
+                    abs_oy = py1 + oby
+                    # Without human approval, cap confidence at <= 0.68 (weak=True)
+                    raw_obs_conf = float(np.clip(float(cv2.contourArea(oc)) / float(max(1, rw * rh)) * 3.5, 0.25, 0.68))
+                    obs_conf = min(0.68, max(0.35, round(raw_obs_conf, 4)))
+                    path_anns.append(
+                        self._make_annotation(
+                            class_id=14,
+                            x=abs_ox,
+                            y=abs_oy,
+                            w=obw,
+                            h=obh,
+                            img_w=img_w,
+                            img_h=img_h,
+                            confidence=obs_conf,
+                            source="visual_obstacle_segmenter",
+                            material_name="obstacle",
+                            trusted=False,
+                            weak=True,
+                        )
+                    )
+
+        return path_anns
 
     # ------------------------------------------------------------------
     # 3. Core Frame Auto-Labeling Pipeline
@@ -864,46 +1605,80 @@ class YOLOAutoLabeler:
         extra_detections: Optional[List[Dict[str, Any]]] = None,
         known_target_xy: Optional[Tuple[int, int]] = None,
         known_material_name: str = "",
+        fast_mode: bool = False,
+        source_path: Union[str, os.PathLike, None] = None,
+        shared_frame_context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Automatically detect and label all 12 Gatherion YOLO classes in `frame`:
-        1. Every `world_gather_crest` (`class_id = 6`) AND the **3D Plant/Ore/Gem Mesh**
-           directly below the crest (`x - 36..x + 36, y + 18..y + 115`, refined via HSV
-           saturation/value contour segmentation) classified into:
-           `0: herb_aria`, `1: herb_mela`, `2: herb_targena`, `3: ore_orichalcum`,
-           `4: gem_crystal`, or `5: tree_log`.
-        2. Any `[F Gather]` prompt (`class_id = 7`) and `[E]` floating resource box (`class_id = 8`),
-           plus the 3D resource mesh under/around the floating `[E]` box.
-        3. Every top-right minimap 3-leaf sprout icon (`class_id = 9: minimap_sprout`) AND
-           round white monster dot (`class_id = 11: minimap_monster_dot`).
-        4. Any 3D monster nameplate like `Yellow-Maned Zaif` or `Highland Odyle Sparkie`
-           (`class_id = 10: monster_3d`).
+        Automatically detect and label all Gatherion YOLO classes in `frame`:
+        1. 3D White Winged Gather Crests (`6: world_gather_crest`) & 3D Resource Mesh (`0..5`).
+        2. `[F Gather]` prompt (`7`) & `[E]/[F]` floating resource box (`8`).
+        3. Minimap 3-leaf sprout (`9`) & monster dot (`11`).
+        4. 3D Monsters & bodies (`10: monster_3d`) and Target HP Bars (`20: target_hp_bar`).
+        5. Salient 3D Resources & Crestless Nodes (Stage A, `0..5, 12`).
+        6. Genuine HUD & Skill Bar (Stage C, `16, 17, 18, 19, 21, 22`).
+        7. Walkable Path & Obstacles (Stage D, `14, 15`).
+
+        When `fast_mode=True`, reuses buffers and avoids running redundant template scans
+        if already resolved by `material_scanner`.
+        Reuses cached gray, hsv, and edge representations in `shared_frame_context` across sub-scanners.
         """
-        bgr = self._coerce_bgr_frame(frame)
+        if shared_frame_context is None:
+            shared_frame_context = {}
+
+        bgr = shared_frame_context.get("bgr")
+        if bgr is None:
+            bgr = self._coerce_bgr_frame(frame)
+            if bgr is not None and bgr.size > 0:
+                shared_frame_context["bgr"] = bgr
+
         if bgr is None or bgr.size == 0:
             return []
 
         img_h, img_w = bgr.shape[:2]
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+        if "hsv" in shared_frame_context and shared_frame_context["hsv"] is not None:
+            hsv = shared_frame_context["hsv"]
+        else:
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            shared_frame_context["hsv"] = hsv
+
+        if "gray" in shared_frame_context and shared_frame_context["gray"] is not None:
+            gray = shared_frame_context["gray"]
+        else:
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            shared_frame_context["gray"] = gray
+
+        # Cache full-frame edge representation in shared_frame_context for 3x speedup
+        if "edges" not in shared_frame_context or shared_frame_context["edges"] is None:
+            shared_frame_context["edges"] = cv2.Canny(gray, 50, 150)
+
         annotations: List[Dict[str, Any]] = []
 
-        # Run MaterialScanner for holistic 3D world, floating box, gather prompt & minimap detections
+        source_stem = ""
+        if source_path is not None:
+            source_stem = Path(source_path).stem
+        elif isinstance(frame, (str, os.PathLike)):
+            source_stem = Path(frame).stem
+
+        # Run MaterialScanner once for holistic 3D world, floating box, gather prompt & minimap detections
         ms_detections: List[DetectedMaterial] = self.material_scanner.scan_frame_for_materials(bgr)
 
         # ------------------------------------------------------------------
         # Stage 1: 3D White Winged Gather Crests (`6: world_gather_crest`)
         #          + 3D Plant/Ore/Gem Mesh Below Crest (`0..5`)
         # ------------------------------------------------------------------
-        ve_crests = self.vision_engine.detect_3d_gather_crests(
-            bgr, threshold=self.crest_threshold
-        )
+        if fast_mode:
+            ve_crests = []
+        else:
+            ve_crests = self.vision_engine.detect_3d_gather_crests(
+                bgr, threshold=self.crest_threshold
+            )
 
-        # Merge crests from VisionEngine and MaterialScanner (`source == "3d_world"`)
         merged_crests: List[Dict[str, Any]] = []
         for c in ve_crests:
             cb = c["bbox"]
             cx, cy = int(c["x"]), int(c["y"])
-            # Find matching MaterialScanner 3D detection if any for material_type hint
             mat_hint = known_material_name
             for md in ms_detections:
                 if md.source == "3d_world" and math.hypot(md.screen_x - cx, md.screen_y - cy) <= 95.0:
@@ -925,7 +1700,6 @@ class YOLOAutoLabeler:
             if md.source != "3d_world":
                 continue
             bx, by, bw, bh = md.bbox
-            # In MaterialScanner, `bbox` spans crest top down to nameplate bottom; crest sits at top ~29px
             crest_w = max(20, min(bw, int(round(30 * scale_x))))
             crest_h = max(20, min(bh, int(round(30 * scale_y))))
             crest_x = int(bx + (bw - crest_w) // 2)
@@ -980,37 +1754,39 @@ class YOLOAutoLabeler:
             annotations.append(mesh_ann)
 
         # ------------------------------------------------------------------
-        # Stage 2: `[F Gather]` Prompt (`7: f_gather_prompt`) &
-        #          `[E] / [F]` Floating Resource Box (`8: e_floating_icon`)
+        # Stage 2: `[F Gather]` Prompt (`7`) & Floating Resource Box (`8`)
         # ------------------------------------------------------------------
-        # 2A. Check floating `[E]` / `[F]` resource box first so we distinguish `8` vs `7`
-        e_found, e_conf, e_center, _e_key = self.vision_engine.detect_floating_resource_icon(
-            bgr,
-            threshold=self.floating_icon_threshold,
-            use_roi=True,
-        )
         floating_centers: List[Tuple[int, int]] = []
-        if e_found and e_center is not None:
-            ecx, ecy = int(e_center[0]), int(e_center[1])
-            ew = max(26, int(round(37 * scale_x)))
-            eh = max(26, int(round(36 * scale_y)))
-            ex = ecx - ew // 2
-            ey = ecy - eh // 2
-            floating_centers.append((ecx, ecy))
-            annotations.append(
-                self._make_annotation(
-                    class_id=8,
-                    x=ex,
-                    y=ey,
-                    w=ew,
-                    h=eh,
-                    img_w=img_w,
-                    img_h=img_h,
-                    confidence=float(e_conf),
-                    source="vision_floating_icon",
-                    material_name="e_floating_icon",
-                )
+        has_ms_floating = any(md.source == "3d_floating_icon" for md in ms_detections)
+
+        # In fast_mode, reuse ms_detections from material_scanner and skip redundant vision_engine scan
+        if not fast_mode:
+            e_found, e_conf, e_center, _e_key = self.vision_engine.detect_floating_resource_icon(
+                bgr,
+                threshold=self.floating_icon_threshold,
+                use_roi=True,
             )
+            if e_found and e_center is not None:
+                ecx, ecy = int(e_center[0]), int(e_center[1])
+                ew = max(26, int(round(37 * scale_x)))
+                eh = max(26, int(round(36 * scale_y)))
+                ex = ecx - ew // 2
+                ey = ecy - eh // 2
+                floating_centers.append((ecx, ecy))
+                annotations.append(
+                    self._make_annotation(
+                        class_id=8,
+                        x=ex,
+                        y=ey,
+                        w=ew,
+                        h=eh,
+                        img_w=img_w,
+                        img_h=img_h,
+                        confidence=float(e_conf),
+                        source="vision_floating_icon",
+                        material_name="e_floating_icon",
+                    )
+                )
 
         for md in ms_detections:
             if md.source == "3d_floating_icon":
@@ -1033,8 +1809,6 @@ class YOLOAutoLabeler:
                         )
                     )
 
-        # If a floating [E] resource icon is present without a 3D crest nearby, also classify and bound
-        # the 3D plant/resource mesh around/below the floating icon (e.g. Targena in pilgrims_ridge_1.jpg)
         for fcx, fcy in floating_centers:
             if any(math.hypot(fcx - mc["cx"], fcy - mc["cy"]) <= 110.0 for mc in merged_crests):
                 continue
@@ -1065,35 +1839,35 @@ class YOLOAutoLabeler:
                     )
                 )
 
-        # 2B. Check `[F Gather]` button prompt (`7: f_gather_prompt`)
-        p_found, p_conf_pct, p_bbox = self.vision_engine.detect_gather_prompt(
-            bgr,
-            threshold=self.prompt_threshold,
-            use_roi=True,
-        )
-        if p_found and p_bbox is not None:
-            px, py, pw, ph = p_bbox
-            pcx, pcy = px + pw // 2, py + ph // 2
-            # Only emit as class 7 (`f_gather_prompt`) if it's not the exact same box as `8: e_floating_icon`
-            is_e_box = (
-                self.vision_engine.last_detected_gather_key == "e"
-                and any(math.hypot(pcx - fx, pcy - fy) <= 20.0 for fx, fy in floating_centers)
+        # In fast_mode, reuse ms_detections from material_scanner and skip redundant vision_engine scan
+        if not fast_mode:
+            p_found, p_conf_pct, p_bbox = self.vision_engine.detect_gather_prompt(
+                bgr,
+                threshold=self.prompt_threshold,
+                use_roi=True,
             )
-            if not is_e_box:
-                annotations.append(
-                    self._make_annotation(
-                        class_id=7,
-                        x=px,
-                        y=py,
-                        w=pw,
-                        h=ph,
-                        img_w=img_w,
-                        img_h=img_h,
-                        confidence=float(p_conf_pct) / 100.0,
-                        source="vision_f_gather_prompt",
-                        material_name="f_gather_prompt",
-                    )
+            if p_found and p_bbox is not None:
+                px, py, pw, ph = p_bbox
+                pcx, pcy = px + pw // 2, py + ph // 2
+                is_e_box = (
+                    self.vision_engine.last_detected_gather_key == "e"
+                    and any(math.hypot(pcx - fx, pcy - fy) <= 20.0 for fx, fy in floating_centers)
                 )
+                if not is_e_box:
+                    annotations.append(
+                        self._make_annotation(
+                            class_id=7,
+                            x=px,
+                            y=py,
+                            w=pw,
+                            h=ph,
+                            img_w=img_w,
+                            img_h=img_h,
+                            confidence=float(p_conf_pct) / 100.0,
+                            source="vision_f_gather_prompt",
+                            material_name="f_gather_prompt",
+                        )
+                    )
 
         for md in ms_detections:
             if md.source == "gather_prompt":
@@ -1114,30 +1888,50 @@ class YOLOAutoLabeler:
                 )
 
         # ------------------------------------------------------------------
-        # Stage 3: Top-Right Minimap 3-Leaf Sprouts (`9: minimap_sprout`) &
-        #          Circular White Monster Dots (`11: minimap_monster_dot`)
+        # Stage 3: Top-Right Minimap 3-Leaf Sprouts (`9`) & Monster Dots (`11`)
         # ------------------------------------------------------------------
-        mm_res = self.minimap_scanner.scan_gatherable_materials(bgr)
-        sprout_Icon_sz = max(10, int(round(14 * scale_x)))
-
-        for snode in mm_res.get("gatherable_nodes", []):
-            sx = int(snode.get("screen_x", 0))
-            sy = int(snode.get("screen_y", 0))
-            s_conf = float(snode.get("confidence", 0.90))
-            annotations.append(
-                self._make_annotation(
-                    class_id=9,
-                    x=sx - sprout_Icon_sz // 2,
-                    y=sy - sprout_Icon_sz // 2,
-                    w=sprout_Icon_sz,
-                    h=sprout_Icon_sz,
-                    img_w=img_w,
-                    img_h=img_h,
-                    confidence=s_conf,
-                    source="minimap_scanner_sprout",
-                    material_name="minimap_sprout",
+        has_ms_minimap = any(md.source == "minimap" for md in ms_detections)
+        # In fast_mode, reuse ms_detections from material_scanner and skip redundant minimap scan
+        if not fast_mode:
+            mm_res = self.minimap_scanner.scan_gatherable_materials(bgr)
+            for snode in mm_res.get("gatherable_nodes", []):
+                sx = int(snode.get("screen_x", 0))
+                sy = int(snode.get("screen_y", 0))
+                s_conf = float(snode.get("confidence", 0.90))
+                annotations.append(
+                    self._make_annotation(
+                        class_id=9,
+                        x=sx - sprout_Icon_sz // 2,
+                        y=sy - sprout_Icon_sz // 2,
+                        w=sprout_Icon_sz,
+                        h=sprout_Icon_sz,
+                        img_w=img_w,
+                        img_h=img_h,
+                        confidence=s_conf,
+                        source="minimap_scanner_sprout",
+                        material_name="minimap_sprout",
+                    )
                 )
-            )
+
+            dot_sz = max(8, int(round(10 * scale_x)))
+            for mdot in mm_res.get("monster_dots", []):
+                mx = int(mdot.get("screen_x", 0))
+                my = int(mdot.get("screen_y", 0))
+                circ = float(mdot.get("circularity", 0.85))
+                annotations.append(
+                    self._make_annotation(
+                        class_id=11,
+                        x=mx - dot_sz // 2,
+                        y=my - dot_sz // 2,
+                        w=dot_sz,
+                        h=dot_sz,
+                        img_w=img_w,
+                        img_h=img_h,
+                        confidence=min(0.95, max(0.75, circ)),
+                        source="minimap_scanner_monster_dot",
+                        material_name="minimap_monster_dot",
+                    )
+                )
 
         for md in ms_detections:
             if md.source == "minimap":
@@ -1157,36 +1951,66 @@ class YOLOAutoLabeler:
                     )
                 )
 
-        dot_sz = max(8, int(round(10 * scale_x)))
-        for mdot in mm_res.get("monster_dots", []):
-            mx = int(mdot.get("screen_x", 0))
-            my = int(mdot.get("screen_y", 0))
-            circ = float(mdot.get("circularity", 0.85))
-            annotations.append(
-                self._make_annotation(
-                    class_id=11,
-                    x=mx - dot_sz // 2,
-                    y=my - dot_sz // 2,
-                    w=dot_sz,
-                    h=dot_sz,
-                    img_w=img_w,
-                    img_h=img_h,
-                    confidence=min(0.95, max(0.75, circ)),
-                    source="minimap_scanner_monster_dot",
-                    material_name="minimap_monster_dot",
-                )
-            )
-
         # ------------------------------------------------------------------
-        # Stage 4: 3D Monster Nameplates & Bodies (`10: monster_3d`)
+        # Stage 4: 3D Monster Nameplates, Bodies, and Target HP Bars
         # ------------------------------------------------------------------
         pos_boxes = [a["bbox_xyxy"] for a in annotations if not a.get("is_negative", False)]
         monster_anns = self._scan_3d_monsters(
             frame_bgr=bgr,
             hsv=hsv,
             existing_positive_boxes=pos_boxes,
+            gray=gray,
+            shared_frame_context=shared_frame_context,
         )
         annotations.extend(monster_anns)
+
+        # ------------------------------------------------------------------
+        # Stage A: Salient 3D Resources & Crestless Nodes (0..5, 12)
+        # Fallback ONLY when NO 3D crest or prompt icon found in frame
+        # ------------------------------------------------------------------
+        has_crest_or_prompt = any(
+            int(a.get("class_id", -1)) in (6, 7, 8)
+            or a.get("source") in ("vision_3d_crest", "vision_floating_icon", "vision_f_gather_prompt", "material_scanner_floating_icon", "material_scanner_f_gather_prompt")
+            or "crest" in str(a.get("source", ""))
+            or "gather_prompt" in str(a.get("source", ""))
+            or "floating" in str(a.get("source", ""))
+            for a in annotations
+        )
+        if not has_crest_or_prompt:
+            pos_boxes_updated = [a["bbox_xyxy"] for a in annotations if not a.get("is_negative", False)]
+            salient_anns = self._scan_salient_3d_resources(
+                frame_bgr=bgr,
+                hsv=hsv,
+                existing_boxes=pos_boxes_updated,
+                hint_material_name=known_material_name,
+                has_crest_or_prompt=False,
+                shared_frame_context=shared_frame_context,
+            )
+            annotations.extend(salient_anns)
+
+        # ------------------------------------------------------------------
+        # Stage C: Genuine HUD & Skill Bar (16, 17, 18, 19, 21, 22)
+        # ------------------------------------------------------------------
+        hud_anns = self._scan_hud_and_skills(
+            frame_bgr=bgr,
+            hsv=hsv,
+            gray=gray,
+            source_stem=source_stem,
+            shared_frame_context=shared_frame_context,
+        )
+        annotations.extend(hud_anns)
+
+        # ------------------------------------------------------------------
+        # Stage D: Walkable Path & Obstacle (14, 15)
+        # ------------------------------------------------------------------
+        path_anns = self._scan_path_and_obstacles(
+            frame_bgr=bgr,
+            hsv=hsv,
+            gray=gray,
+            source_stem=source_stem,
+            shared_frame_context=shared_frame_context,
+        )
+        annotations.extend(path_anns)
 
         # ------------------------------------------------------------------
         # Stage 5: Optional Known Target Hint (`known_target_xy` / `extra_detections`)
@@ -1194,7 +2018,6 @@ class YOLOAutoLabeler:
         if known_target_xy is not None and len(known_target_xy) >= 2:
             kx, ky = int(known_target_xy[0]), int(known_target_xy[1])
             if 0 <= kx < img_w and 0 <= ky < img_h:
-                # Check if any 3D mesh class (0..5) already covers (kx, ky)
                 covered = any(
                     0 <= int(a["class_id"]) <= 5
                     and math.hypot(
@@ -1285,7 +2108,19 @@ class YOLOAutoLabeler:
                         )
                     )
 
-        return self._deduplicate_annotations(annotations)
+        deduped = self._deduplicate_annotations(annotations)
+        if self.exemplar_memory is not None:
+            try:
+                deduped = self.exemplar_memory.refine_annotations(bgr, deduped)
+            except Exception as exc:
+                logger.debug("Exemplar memory refinement skipped: %s", exc)
+
+        try:
+            from dataset_factory.label_trust import filter_hud_false_positives
+
+            return filter_hud_false_positives(deduped, stem=source_stem, remap_sprout=False)
+        except Exception:
+            return deduped
 
     # ------------------------------------------------------------------
     # 4. YOLO `.txt` Formatting & File Export

@@ -40,6 +40,74 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def is_parchment_scroll_patch(patch: Optional[np.ndarray]) -> bool:
+    """
+    Rolled quest / skill / loot parchment.
+
+    A gather patch is an 80x80 minimap crop. A scroll icon is a thin bright
+    roller, a pale sheet, a dark ink blot inside that sheet, and a dark UI
+    gutter. Wood grain and parchment-colored ore lack that roller-plus-ink pair.
+    """
+    if patch is None or not isinstance(patch, np.ndarray) or patch.size == 0:
+        return False
+    gray = patch
+    if patch.ndim == 3:
+        if patch.shape[2] == 4:
+            gray = cv2.cvtColor(patch, cv2.COLOR_BGRA2GRAY)
+        else:
+            gray = cv2.cvtColor(patch[:, :, :3], cv2.COLOR_BGR2GRAY)
+    if gray.shape[0] < 24 or gray.shape[1] < 24:
+        return False
+    if gray.shape[0] != 80 or gray.shape[1] != 80:
+        gray = cv2.resize(gray, (80, 80), interpolation=cv2.INTER_AREA)
+    g = np.asarray(gray, dtype=np.uint8)
+
+    roller: Optional[Tuple[int, int]] = None
+    y = 6
+    while y < 64:
+        if int(np.count_nonzero(g[y] > 175)) < 34:
+            y += 1
+            continue
+        y2 = y
+        while y2 + 1 < 72 and int(np.count_nonzero(g[y2 + 1] > 175)) >= 34:
+            y2 += 1
+        thick = y2 - y + 1
+        if 2 <= thick <= 7:
+            above = g[max(0, y - 5) : y]
+            bar = g[y : y2 + 1]
+            if above.size and float(bar.mean()) - float(above.mean()) >= 55.0:
+                if float(np.mean(above < 90)) >= 0.35:
+                    roller = (y, y2)
+                    break
+        y = y2 + 1
+    if roller is None:
+        return False
+
+    _, y2 = roller
+    sheet = g[y2 + 2 : min(80, y2 + 38), 6:74]
+    if sheet.size < 180 or sheet.shape[0] < 8:
+        return False
+    pale = float(np.mean((sheet >= 100) & (sheet <= 210)))
+    ink = float(np.mean(sheet < 78))
+    if pale < 0.22 or ink < 0.035:
+        return False
+
+    ink_mask = (sheet < 78).astype(np.uint8)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(ink_mask, connectivity=8)
+    ink_blob = 0
+    for idx in range(1, count):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if 12 <= area <= 700:
+            ink_blob = max(ink_blob, area)
+    if ink_blob < 18:
+        return False
+
+    side = np.concatenate([g[:, :5].ravel(), g[:, -5:].ravel()])
+    if float(np.mean(side < 80)) < 0.28 and float(np.mean(g < 55)) < 0.18:
+        return False
+    return True
+
+
 def _resolve_project_path(rel_or_abs: str) -> Optional[str]:
     """Resolves a relative template or asset path against CWD and project root."""
     if not rel_or_abs:

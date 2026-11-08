@@ -50,12 +50,13 @@ arka planda kesintisiz haritalandıran ve her kaynağın 3 kez toplanabilme
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -68,13 +69,28 @@ from core.route_manager import (
     NodeData,
     RouteManager,
 )
+from core.node_quality_gate import MODEL_CONF_MIN, evaluate_node_candidate
 from core.vision_filters import (
     FeatherNegativeFilter,
     MonsterCircularityFilter,
     Pyramid3DCrestDetector,
     NameplateHSVIsolator,
     DynamicInteractionKeyReader,
+    is_parchment_scroll_patch,
 )
+
+try:
+    from dataset_factory.exemplar_memory import get_exemplar_memory
+except Exception:
+    get_exemplar_memory = None
+
+# Minimap sprout confidence floor aligned with MaterialScanner template score (≥0.68).
+MINIMAP_SPROUT_CONF_MIN: float = 0.68
+# 3D world detections below this without a harvest prompt are not persisted.
+WORLD_3D_CONF_MIN: float = 0.55
+# Drift / time that sets needs_map_calibrate for a world-map fix.
+ODOMETRY_CALIBRATE_DRIFT_PX: float = 48.0
+ODOMETRY_CALIBRATE_INTERVAL_SEC: float = 90.0
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -90,6 +106,8 @@ if not logger.handlers:
 # Sağ üst minimap ROI: x: 0.855..0.992 (w=0.137), y: 0.065..0.255 (h=0.190)
 MINIMAP_NORM_RECT: Tuple[float, float, float, float] = (0.855, 0.065, 0.137, 0.190)
 DEFAULT_DEDUP_RADIUS_PX: float = 22.0
+DEDUP_RADIUS_MIN_PX: float = 15.0
+DEDUP_RADIUS_MAX_PX: float = 25.0
 DEFAULT_EMA_ALPHA: float = 0.35
 REF_MAP_WIDTH: int = 1920
 REF_MAP_HEIGHT: int = 1080
@@ -115,6 +133,8 @@ class TrackedResourceNode:
     sightings_count: int = 1
     confidence: float = 1.0
     kalman_variance: float = 16.0
+    kalman_variance_x: float = 16.0
+    kalman_variance_y: float = 16.0
     patch_path: str = ""
     first_seen_timestamp: float = field(default_factory=time.time)
     last_seen_timestamp: float = field(default_factory=time.time)
@@ -123,6 +143,11 @@ class TrackedResourceNode:
     max_harvests: int = DEFAULT_MAX_HARVESTS
     current_harvests: int = 0
     source_type: str = "minimap_auto"
+    last_rel_dx: float = 0.0
+    last_rel_dy: float = 0.0
+    rel_track_valid: bool = False
+    node_type: str = "resource"
+    connected_waypoints: List[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.stack_count = max(1, int(self.stack_count))
@@ -132,6 +157,11 @@ class TrackedResourceNode:
             self.max_harvests = max(1, int(self.max_harvests))
         self.current_harvests = max(0, int(self.current_harvests))
         self.source_type = str(self.source_type or "minimap_auto")
+        self.node_type = str(self.node_type or "resource")
+        if not hasattr(self, "kalman_variance_x"):
+            self.kalman_variance_x = float(self.kalman_variance)
+        if not hasattr(self, "kalman_variance_y"):
+            self.kalman_variance_y = float(self.kalman_variance)
 
     @property
     def remaining_harvests(self) -> int:
@@ -160,6 +190,9 @@ class TrackedResourceNode:
             "in_air": bool(self.in_air),
             "sightings_count": int(self.sightings_count),
             "confidence": round(float(self.confidence), 4),
+            "kalman_variance": round(float(self.kalman_variance), 4),
+            "kalman_variance_x": round(float(getattr(self, "kalman_variance_x", self.kalman_variance)), 4),
+            "kalman_variance_y": round(float(getattr(self, "kalman_variance_y", self.kalman_variance)), 4),
             "patch_path": str(self.patch_path),
             "first_seen_timestamp": float(self.first_seen_timestamp),
             "last_seen_timestamp": float(self.last_seen_timestamp),
@@ -169,14 +202,266 @@ class TrackedResourceNode:
             "remaining_harvests": int(self.remaining_harvests),
             "is_depleted": bool(self.is_depleted),
             "source_type": str(self.source_type),
+            "node_type": str(getattr(self, "node_type", "resource")),
+            "connected_waypoints": list(getattr(self, "connected_waypoints", [])),
         }
+
+
+@dataclass
+class GraphWaypoint:
+    """Otonom keşif rotasındaki yürüyüş ve gezinme ara noktası (breadcrumb / waypoint)."""
+
+    waypoint_id: int
+    map_x: float
+    map_y: float
+    norm_x: float = 0.5
+    norm_y: float = 0.5
+    timestamp: float = field(default_factory=time.time)
+    connected_node_ids: List[int] = field(default_factory=list)
+    seq_index: int = 0
+    is_breadcrumb: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "waypoint_id": int(self.waypoint_id),
+            "map_x": round(float(self.map_x), 2),
+            "map_y": round(float(self.map_y), 2),
+            "norm_x": round(float(self.norm_x), 4),
+            "norm_y": round(float(self.norm_y), 4),
+            "timestamp": float(self.timestamp),
+            "connected_node_ids": list(self.connected_node_ids),
+            "seq_index": int(self.seq_index),
+            "is_breadcrumb": bool(self.is_breadcrumb),
+        }
+
+
+@dataclass
+class GraphEdge:
+    """Rota çizgesindeki iki nokta arasındaki bağlantı ve mesafe bilgisi."""
+
+    from_id: int
+    to_id: int
+    from_type: str = "waypoint"  # "waypoint" | "node"
+    to_type: str = "waypoint"  # "waypoint" | "node"
+    distance_px: float = 0.0
+    heading_deg: float = 0.0
+    bidirectional: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "from_id": int(self.from_id),
+            "to_id": int(self.to_id),
+            "from_type": str(self.from_type),
+            "to_type": str(self.to_type),
+            "distance_px": round(float(self.distance_px), 2),
+            "heading_deg": round(float(self.heading_deg), 1),
+            "bidirectional": bool(self.bidirectional),
+        }
+
+
+class RouteGraph:
+    """
+    Otonom keşif sırasında yürüyüş ayak izleri (breadcrumbs / waypoints) ile
+    keşfedilen materyal düğümlerini (resource nodes) birbirine bağlayan yönlü/yönsüz rota çizgesi.
+    """
+
+    def __init__(self, region: str = DEFAULT_REGION) -> None:
+        self.region: str = str(region or DEFAULT_REGION)
+        self.waypoints: Dict[int, GraphWaypoint] = {}
+        self.edges: List[GraphEdge] = []
+        self._next_wp_id: int = 1
+        self._adjacency: Dict[Tuple[str, int], List[Tuple[str, int, float]]] = {}
+
+    @property
+    def total_distance(self) -> float:
+        """Çizgedeki toplam rota uzunluğunu piksel cinsinden döndürür."""
+        return sum(float(e.distance_px) for e in self.edges)
+
+    @property
+    def node_count(self) -> int:
+        return len(self.waypoints)
+
+    @property
+    def edge_count(self) -> int:
+        return len(self.edges)
+
+    def add_waypoint(
+        self,
+        map_x: float,
+        map_y: float,
+        norm_x: Optional[float] = None,
+        norm_y: Optional[float] = None,
+        map_width: int = REF_MAP_WIDTH,
+        map_height: int = REF_MAP_HEIGHT,
+        is_breadcrumb: bool = True,
+        timestamp: Optional[float] = None,
+    ) -> GraphWaypoint:
+        """Yeni bir rota ara noktası (waypoint/breadcrumb) ekler."""
+        nx = float(norm_x if norm_x is not None else map_x / float(max(1, map_width)))
+        ny = float(norm_y if norm_y is not None else map_y / float(max(1, map_height)))
+        wp_id = self._next_wp_id
+        self._next_wp_id += 1
+        seq = len(self.waypoints) + 1
+        wp = GraphWaypoint(
+            waypoint_id=wp_id,
+            map_x=float(map_x),
+            map_y=float(map_y),
+            norm_x=round(nx, 4),
+            norm_y=round(ny, 4),
+            timestamp=float(timestamp or time.time()),
+            seq_index=seq,
+            is_breadcrumb=is_breadcrumb,
+        )
+        self.waypoints[wp_id] = wp
+        return wp
+
+    def add_edge(
+        self,
+        from_id: int,
+        to_id: int,
+        from_type: str = "waypoint",
+        to_type: str = "waypoint",
+        distance_px: Optional[float] = None,
+        heading_deg: float = 0.0,
+        bidirectional: bool = True,
+    ) -> GraphEdge:
+        """İki nokta arasında bağlantı kenarı ekler."""
+        if distance_px is None:
+            p1 = self.waypoints.get(from_id) if from_type == "waypoint" else None
+            p2 = self.waypoints.get(to_id) if to_type == "waypoint" else None
+            if p1 and p2:
+                distance_px = math.hypot(p2.map_x - p1.map_x, p2.map_y - p1.map_y)
+                heading_deg = (
+                    math.degrees(math.atan2(p2.map_x - p1.map_x, -(p2.map_y - p1.map_y)))
+                ) % 360.0
+            else:
+                distance_px = 0.0
+
+        edge = GraphEdge(
+            from_id=int(from_id),
+            to_id=int(to_id),
+            from_type=str(from_type),
+            to_type=str(to_type),
+            distance_px=float(distance_px),
+            heading_deg=float(heading_deg),
+            bidirectional=bool(bidirectional),
+        )
+        self.edges.append(edge)
+
+        k1 = (from_type, int(from_id))
+        k2 = (to_type, int(to_id))
+        self._adjacency.setdefault(k1, []).append((to_type, int(to_id), float(distance_px)))
+        if bidirectional:
+            self._adjacency.setdefault(k2, []).append((from_type, int(from_id), float(distance_px)))
+
+        return edge
+
+    def get_nearest_waypoint(
+        self,
+        map_x: float,
+        map_y: float,
+    ) -> Tuple[Optional[GraphWaypoint], float]:
+        """`(map_x, map_y)` konumuna en yakın ara noktayı bulur."""
+        best: Optional[GraphWaypoint] = None
+        best_dist = float("inf")
+        for wp in self.waypoints.values():
+            d = math.hypot(wp.map_x - map_x, wp.map_y - map_y)
+            if d < best_dist:
+                best_dist = d
+                best = wp
+        return best, best_dist
+
+    def connect_node_to_nearest_waypoint(
+        self,
+        node_id: int,
+        node_map_x: float,
+        node_map_y: float,
+        max_connection_dist_px: float = 120.0,
+    ) -> Optional[GraphEdge]:
+        """Bir materyal düğümünü en yakın yürüyüş ara noktasına bağlar."""
+        nearest_wp, dist = self.get_nearest_waypoint(node_map_x, node_map_y)
+        if nearest_wp is not None and dist <= max_connection_dist_px:
+            if node_id not in nearest_wp.connected_node_ids:
+                nearest_wp.connected_node_ids.append(node_id)
+            return self.add_edge(
+                from_id=nearest_wp.waypoint_id,
+                to_id=node_id,
+                from_type="waypoint",
+                to_type="node",
+                distance_px=dist,
+                bidirectional=True,
+            )
+        return None
+
+    def build_connected_sequence(self, loop: bool = True) -> List[Dict[str, Any]]:
+        """
+        Graf üzerindeki tüm ara noktaları ve kaynak düğümlerini
+        kesintisiz, oynanabilir bir navigasyon rotasına dönüştürür.
+        """
+        sequence: List[Dict[str, Any]] = []
+        sorted_wps = sorted(self.waypoints.values(), key=lambda w: w.seq_index)
+        for wp in sorted_wps:
+            item = wp.to_dict()
+            item["target_type"] = "waypoint"
+            sequence.append(item)
+            for nid in wp.connected_node_ids:
+                sequence.append({
+                    "target_type": "node",
+                    "node_id": nid,
+                    "connected_from_wp": wp.waypoint_id,
+                })
+        return sequence
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Çizgeyi JSON uyumlu sözlük olarak serileştirir."""
+        return {
+            "region": self.region,
+            "waypoints": [
+                wp.to_dict() for wp in sorted(self.waypoints.values(), key=lambda w: w.waypoint_id)
+            ],
+            "edges": [e.to_dict() for e in self.edges],
+            "total_distance_px": round(self.total_distance, 2),
+            "waypoint_count": len(self.waypoints),
+            "edge_count": len(self.edges),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> RouteGraph:
+        """Sözlükten RouteGraph örneği oluşturur."""
+        g = cls(region=data.get("region", DEFAULT_REGION))
+        for wp_d in data.get("waypoints", []):
+            wp = GraphWaypoint(
+                waypoint_id=int(wp_d["waypoint_id"]),
+                map_x=float(wp_d["map_x"]),
+                map_y=float(wp_d["map_y"]),
+                norm_x=float(wp_d.get("norm_x", 0.5)),
+                norm_y=float(wp_d.get("norm_y", 0.5)),
+                timestamp=float(wp_d.get("timestamp", 0.0)),
+                connected_node_ids=list(wp_d.get("connected_node_ids", [])),
+                seq_index=int(wp_d.get("seq_index", 0)),
+                is_breadcrumb=bool(wp_d.get("is_breadcrumb", True)),
+            )
+            g.waypoints[wp.waypoint_id] = wp
+            if wp.waypoint_id >= g._next_wp_id:
+                g._next_wp_id = wp.waypoint_id + 1
+        for e_d in data.get("edges", []):
+            g.add_edge(
+                from_id=int(e_d["from_id"]),
+                to_id=int(e_d["to_id"]),
+                from_type=str(e_d.get("from_type", "waypoint")),
+                to_type=str(e_d.get("to_type", "waypoint")),
+                distance_px=float(e_d.get("distance_px", 0.0)),
+                heading_deg=float(e_d.get("heading_deg", 0.0)),
+                bidirectional=bool(e_d.get("bidirectional", True)),
+            )
+        return g
 
 
 class VisualOdometryTracker:
     """
     Minimap doku kayması (`cv2.phaseCorrelate` + Lucas-Kanade Optik Akış + ORB)
-    üzerinden oyuncunun dünya/bölge haritası koordinatlarını `(map_x, map_y)` takip eden
-    görsel odometri sınıfı.
+    ve dead-reckoning yer değiştirme üzerinden oyuncunun dünya/bölge haritası koordinatlarını
+    `(map_x, map_y)` takip eden görsel odometri sınıfı.
     """
 
     def __init__(
@@ -203,6 +488,13 @@ class VisualOdometryTracker:
         self._hann_window: Optional[np.ndarray] = None
         self._orb: Optional[Any] = None
         self.cumulative_drift_px: float = 0.0
+
+        # Dead-reckoning ve hız takibi
+        self.velocity_x: float = 0.0
+        self.velocity_y: float = 0.0
+        self.dead_reckoning_dx: float = 0.0
+        self.dead_reckoning_dy: float = 0.0
+        self.last_update_ts: float = time.time()
 
         try:
             self._orb = cv2.ORB_create(nfeatures=120, fastThreshold=12)
@@ -238,9 +530,64 @@ class VisualOdometryTracker:
         self.map_y = float(np.clip(map_y, 0.0, float(self.map_height - 1)))
         self.norm_x = round(self.map_x / float(max(1, self.map_width)), 4)
         self.norm_y = round(self.map_y / float(max(1, self.map_height)), 4)
+        self.dead_reckoning_dx = 0.0
+        self.dead_reckoning_dy = 0.0
         if record_trajectory:
             self.append_trajectory()
         return self.get_position()
+
+    def update_displacement(
+        self,
+        dx: float,
+        dy: float,
+        dt: Optional[float] = None,
+        is_minimap_shift: bool = True,
+    ) -> Tuple[float, float]:
+        """
+        Yer değiştirmeyi odometriye ekler, hızı günceller ve dead-reckoning durumunu yeniler.
+        """
+        now = time.time()
+        elapsed = dt if (dt is not None and dt > 0) else max(0.01, now - self.last_update_ts)
+        self.last_update_ts = now
+
+        scale = self.minimap_to_map_scale if is_minimap_shift else 1.0
+        step_x = float(dx) * scale
+        step_y = float(dy) * scale
+
+        self.map_x = float(np.clip(self.map_x + step_x, 0.0, float(self.map_width - 1)))
+        self.map_y = float(np.clip(self.map_y + step_y, 0.0, float(self.map_height - 1)))
+        self.norm_x = round(self.map_x / float(max(1, self.map_width)), 4)
+        self.norm_y = round(self.map_y / float(max(1, self.map_height)), 4)
+
+        if elapsed > 0:
+            self.velocity_x = step_x / elapsed
+            self.velocity_y = step_y / elapsed
+        self.dead_reckoning_dx = 0.0
+        self.dead_reckoning_dy = 0.0
+        return step_x, step_y
+
+    def apply_dead_reckoning(self, dt: Optional[float] = None) -> Tuple[float, float]:
+        """
+        Görsel odometri kaybolduğunda (örtülme, karanlık vb.) hız tahminine göre
+        dead-reckoning yer değiştirmesini hesaplar ve harita konumuna ekler.
+        """
+        now = time.time()
+        elapsed = dt if (dt is not None and dt > 0) else max(0.01, now - self.last_update_ts)
+        self.last_update_ts = now
+
+        if (abs(self.velocity_x) > 0.05 or abs(self.velocity_y) > 0.05) and elapsed < 3.0:
+            step_x = self.velocity_x * elapsed
+            step_y = self.velocity_y * elapsed
+            self.dead_reckoning_dx += step_x
+            self.dead_reckoning_dy += step_y
+            self.map_x = float(np.clip(self.map_x + step_x, 0.0, float(self.map_width - 1)))
+            self.map_y = float(np.clip(self.map_y + step_y, 0.0, float(self.map_height - 1)))
+            self.norm_x = round(self.map_x / float(max(1, self.map_width)), 4)
+            self.norm_y = round(self.map_y / float(max(1, self.map_height)), 4)
+            self.velocity_x *= 0.96
+            self.velocity_y *= 0.96
+            return step_x, step_y
+        return 0.0, 0.0
 
     def append_trajectory(self, timestamp: Optional[float] = None) -> None:
         """Güncel konumu zaman damgasıyla birlikte yürüyüş izine ekler."""
@@ -251,21 +598,32 @@ class VisualOdometryTracker:
             excess = len(self.walk_trajectory) - self.max_trajectory_len
             del self.walk_trajectory[:excess]
 
-    def offset_to_world_coords(self, dx: float, dy: float) -> Tuple[float, float, float, float]:
+    def offset_to_world_coords(
+        self,
+        dx: float,
+        dy: float,
+        is_map_offset: Optional[bool] = None,
+        dead_reckoning_dx: float = 0.0,
+        dead_reckoning_dy: float = 0.0,
+    ) -> Tuple[float, float, float, float]:
         """
-        Minimap merkezindeki oyuncu okuna göre `(dx, dy)` piksel ofsetini
+        Minimap veya radar merkezindeki oyuncu okuna göre `(dx, dy)` ofsetini
         dünya/harita koordinatlarına `(world_x, world_y, norm_x, norm_y)` dönüştürür.
+        `is_map_offset=True` ise `dx, dy` doğrudan harita piksel ofsetidir;
+        `is_map_offset=False` veya `None` ise minimap piksel ofsetidir ve `minimap_to_map_scale` ile çarpılır.
+        Dead-reckoning yer değiştirmesi varsa ofsete dahil edilir.
         """
+        scale = 1.0 if is_map_offset is True else self.minimap_to_map_scale
         world_x = float(
             np.clip(
-                self.map_x + float(dx) * self.minimap_to_map_scale,
+                self.map_x + float(dx) * scale + float(dead_reckoning_dx),
                 0.0,
                 float(self.map_width - 1),
             )
         )
         world_y = float(
             np.clip(
-                self.map_y + float(dy) * self.minimap_to_map_scale,
+                self.map_y + float(dy) * scale + float(dead_reckoning_dy),
                 0.0,
                 float(self.map_height - 1),
             )
@@ -287,8 +645,33 @@ class VisualOdometryTracker:
         self.norm_y = round(self.map_y / float(max(1, self.map_height)), 4)
         self._prev_minimap_clean = None
         self.cumulative_drift_px = 0.0
+        self.velocity_x = 0.0
+        self.velocity_y = 0.0
+        self.dead_reckoning_dx = 0.0
+        self.dead_reckoning_dy = 0.0
+        self.last_update_ts = time.time()
         if clear_trajectory:
             self.walk_trajectory.clear()
+
+
+def _essence_name_near_box(frame_bgr: np.ndarray, screen_x: float, screen_y: float) -> str:
+    """Name the essence under a floating gather icon. Falls back to a plant label."""
+    height, width = frame_bgr.shape[:2]
+    x1 = max(0, int(screen_x) - 48)
+    y1 = max(0, int(screen_y) - 20)
+    x2 = min(width, int(screen_x) + 48)
+    y2 = min(height, int(screen_y) + 90)
+    patch = frame_bgr[y1:y2, x1:x2]
+    if patch.size == 0:
+        return "Gatherable Plant"
+    try:
+        from config.materials_db import classify_3d_material_patch
+
+        info = classify_3d_material_patch(patch)
+        name = str(info.get("name") or "").strip()
+    except Exception:
+        name = ""
+    return name or "Gatherable Plant"
 
 
 class AutoCartographer:
@@ -318,16 +701,20 @@ class AutoCartographer:
         map_height: int = REF_MAP_HEIGHT,
         minimap_to_map_scale: float = 1.0,
         max_trajectory_len: int = 10000,
+        exemplar_memory: Optional[Any] = None,
     ) -> None:
         self.route_manager: Optional[RouteManager] = route_manager
         self.vision_engine: Optional[Any] = vision_engine
+        self.exemplar_memory: Optional[Any] = exemplar_memory
         self.minimap_norm_rect: Tuple[float, float, float, float] = (
             float(minimap_norm_rect[0]),
             float(minimap_norm_rect[1]),
             float(minimap_norm_rect[2]),
             float(minimap_norm_rect[3]),
         )
-        self.dedup_radius_px: float = max(1.0, float(dedup_radius_px))
+        self.dedup_radius_px: float = float(
+            np.clip(dedup_radius_px, DEDUP_RADIUS_MIN_PX, DEDUP_RADIUS_MAX_PX)
+        )
         self.ema_alpha: float = float(np.clip(ema_alpha, 0.05, 0.95))
 
         self.map_width: int = max(160, int(map_width))
@@ -368,10 +755,26 @@ class AutoCartographer:
         # Bölge bazlı takip edilen kaynak düğümleri: region -> List[TrackedResourceNode]
         self._tracked_nodes: Dict[str, List[TrackedResourceNode]] = {}
 
+        # Otonom Rota Çizgesi ve Breadcrumb Üreteci (AUTO CARTOGRAPHY / Oto-Keşif)
+        self.auto_cartography_enabled: bool = False
+        self.auto_mapped_count: int = 0
+        self.last_mapped_info: Optional[Dict[str, Any]] = None
+        self.breadcrumb_interval_px: float = 30.0
+        self._last_breadcrumb_x: Optional[float] = None
+        self._last_breadcrumb_y: Optional[float] = None
+        self._last_breadcrumb_wp_id: Optional[int] = None
+        self._active_region: str = DEFAULT_REGION
+        self._route_graphs: Dict[str, RouteGraph] = {}
+        self.route_graph: RouteGraph = self.get_route_graph(DEFAULT_REGION)
+
         # Kaynak bazlı haritalandırma istatistik sayaçları
         self.total_minimap_recorded: int = 0
         self.total_3d_recorded: int = 0
         self.total_harvest_recorded: int = 0
+        # Envanter kapanış animasyonu boyunca materyal kaydını tut (saniye).
+        self._inventory_block_until: float = 0.0
+        self._orbit_rel_step_px: float = 36.0
+        self._orbit_rel_max_age_sec: float = 3.5
 
         # Vision filter instances for enhanced confidence safeguard
         self.feather_negative_filter: FeatherNegativeFilter = FeatherNegativeFilter()
@@ -380,8 +783,570 @@ class AutoCartographer:
         self.nameplate_isolator: NameplateHSVIsolator = NameplateHSVIsolator()
         self.key_reader: DynamicInteractionKeyReader = DynamicInteractionKeyReader()
 
+        # Lazy Gatherion ONNX gate (CPU). Loaded on first new-node candidate.
+        self._quality_detector: Any = None
+        self._quality_detector_failed: bool = False
+        self.total_gate_rejected: int = 0
+        self.needs_map_calibrate: bool = False
+
+        # Dead-reckoning yer değiştirme ve hız takibi
+        self.velocity_x: float = 0.0
+        self.velocity_y: float = 0.0
+        self.dead_reckoning_dx: float = 0.0
+        self.dead_reckoning_dy: float = 0.0
+        self._last_odometry_update_ts: float = time.time()
+        self.player_heading_deg: float = 0.0
+
+        # Gerçek zamanlı radar ve harita olay bildirim dinleyicileri (callbacks / listeners)
+        self._node_discovered_callbacks: List[Callable[[Dict[str, Any]], None]] = []
+        self._node_updated_callbacks: List[Callable[[Dict[str, Any]], None]] = []
+        self._radar_event_callbacks: List[Callable[[str, Dict[str, Any]], None]] = []
+        self._ui_listeners: List[Any] = []
+
         if self.route_manager is not None:
             self._sync_existing_nodes_from_route_manager(self.route_manager)
+            if getattr(self.route_manager, "active_region", None):
+                self._active_region = str(self.route_manager.active_region)
+                self.route_graph = self.get_route_graph(self._active_region)
+
+    @property
+    def active_region(self) -> str:
+        """Kullanılan aktif bölge adı."""
+        if self.route_manager is not None and getattr(self.route_manager, "active_region", None):
+            return str(self.route_manager.active_region)
+        return getattr(self, "_active_region", DEFAULT_REGION)
+
+    @active_region.setter
+    def active_region(self, val: str) -> None:
+        self._active_region = str(val or DEFAULT_REGION)
+        if self.route_manager is not None:
+            self.route_manager.active_region = self._active_region
+        self.route_graph = self.get_route_graph(self._active_region)
+
+    @property
+    def auto_cartography_mode(self) -> bool:
+        """Otonom haritalandırma modu açık mı?"""
+        return bool(self.auto_cartography_enabled)
+
+    @auto_cartography_mode.setter
+    def auto_cartography_mode(self, enabled: bool) -> None:
+        self.enable_auto_cartography(enabled)
+
+    def enable_auto_cartography(self, enabled: bool = True) -> bool:
+        """AUTO CARTOGRAPHY modunu açar veya kapatır."""
+        self.auto_cartography_enabled = bool(enabled)
+        target_reg = str(self.active_region or DEFAULT_REGION)
+        self.route_graph = self.get_route_graph(target_reg)
+        logger.info(
+            "AutoCartographer: AUTO CARTOGRAPHY modu %s (Bölge: %s)",
+            "aktif" if self.auto_cartography_enabled else "pasif",
+            target_reg,
+        )
+        return self.auto_cartography_enabled
+
+    def set_auto_cartography_mode(self, enabled: bool) -> None:
+        """AUTO CARTOGRAPHY modunu ayarlar."""
+        self.enable_auto_cartography(enabled)
+
+    def is_auto_cartography_active(self) -> bool:
+        """AUTO CARTOGRAPHY modunun aktif olup olmadığını döndürür."""
+        return bool(self.auto_cartography_enabled)
+
+    def get_route_graph(self, region: Optional[str] = None) -> RouteGraph:
+        """Belirtilen bölgenin rota çizgesini (RouteGraph) döndürür."""
+        target_reg = str(region or self.active_region or DEFAULT_REGION)
+        if target_reg not in self._route_graphs:
+            self._route_graphs[target_reg] = RouteGraph(region=target_reg)
+        return self._route_graphs[target_reg]
+
+    def build_route_graph(self, region: Optional[str] = None) -> RouteGraph:
+        """Tüm kayıtlı düğümleri ve ara noktaları çizgeye entegre eder."""
+        target_reg = str(region or self.active_region or DEFAULT_REGION)
+        rg = self.get_route_graph(target_reg)
+        for tracked in self._tracked_nodes.get(target_reg, []):
+            rg.connect_node_to_nearest_waypoint(
+                node_id=tracked.node_id,
+                node_map_x=tracked.map_x,
+                node_map_y=tracked.map_y,
+            )
+        return rg
+
+    def export_route_graph(self, region: Optional[str] = None) -> Dict[str, Any]:
+        """Bölgenin rota çizgesini sözlük olarak dışa aktarır."""
+        return self.build_route_graph(region).to_dict()
+
+    def get_navigation_sequence(
+        self, region: Optional[str] = None, loop: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Otonom keşif için sıralı gezinme listesini döndürür."""
+        rg = self.build_route_graph(region)
+        return rg.build_connected_sequence(loop=loop)
+
+    def _record_breadcrumb_if_moved(
+        self,
+        map_x: float,
+        map_y: float,
+        timestamp: Optional[float] = None,
+        region: Optional[str] = None,
+    ) -> Optional[GraphWaypoint]:
+        """
+        AUTO CARTOGRAPHY modundayken, oyuncu her `breadcrumb_interval_px`
+        yürüdüğünde yeni bir navigasyon ara noktası (waypoint) oluşturur ve önceki noktayla kenar kurar.
+        """
+        if not self.auto_cartography_enabled:
+            return None
+
+        target_reg = str(region or self.active_region or DEFAULT_REGION)
+        rg = self.get_route_graph(target_reg)
+        ts = float(timestamp or time.time())
+
+        if self._last_breadcrumb_x is None or self._last_breadcrumb_y is None:
+            wp = rg.add_waypoint(
+                map_x=map_x,
+                map_y=map_y,
+                norm_x=self.norm_x,
+                norm_y=self.norm_y,
+                map_width=self.map_width,
+                map_height=self.map_height,
+                timestamp=ts,
+            )
+            self._last_breadcrumb_x = float(map_x)
+            self._last_breadcrumb_y = float(map_y)
+            self._last_breadcrumb_wp_id = wp.waypoint_id
+            self.auto_mapped_count += 1
+            self.last_mapped_info = {
+                "type": "waypoint",
+                "waypoint_id": wp.waypoint_id,
+                "map_x": round(float(map_x), 2),
+                "map_y": round(float(map_y), 2),
+                "timestamp": ts,
+            }
+            return wp
+
+        dist = math.hypot(map_x - self._last_breadcrumb_x, map_y - self._last_breadcrumb_y)
+        if dist >= self.breadcrumb_interval_px:
+            wp = rg.add_waypoint(
+                map_x=map_x,
+                map_y=map_y,
+                norm_x=self.norm_x,
+                norm_y=self.norm_y,
+                map_width=self.map_width,
+                map_height=self.map_height,
+                timestamp=ts,
+            )
+            if self._last_breadcrumb_wp_id is not None:
+                rg.add_edge(
+                    from_id=self._last_breadcrumb_wp_id,
+                    to_id=wp.waypoint_id,
+                    from_type="waypoint",
+                    to_type="waypoint",
+                    distance_px=dist,
+                    bidirectional=True,
+                )
+            self._last_breadcrumb_x = float(map_x)
+            self._last_breadcrumb_y = float(map_y)
+            self._last_breadcrumb_wp_id = wp.waypoint_id
+            self.auto_mapped_count += 1
+            self.last_mapped_info = {
+                "type": "waypoint",
+                "waypoint_id": wp.waypoint_id,
+                "map_x": round(float(map_x), 2),
+                "map_y": round(float(map_y), 2),
+                "timestamp": ts,
+            }
+            return wp
+
+        return None
+
+    def persist_to_region_data(
+        self,
+        region: Optional[str] = None,
+        base_dir: str = "routes",
+    ) -> bool:
+        """
+        Otonom haritalandırma verilerini (düğümler, rota çizgesi ve istatistikler)
+        doğrudan `routes/<region>/region_data.json` dosyasına atomik olarak yazar.
+        """
+        try:
+            target_region = str(region or self.active_region or DEFAULT_REGION)
+            reg_dir = os.path.join(base_dir, target_region)
+            os.makedirs(reg_dir, exist_ok=True)
+            patches_dir = os.path.join(reg_dir, "patches")
+            os.makedirs(patches_dir, exist_ok=True)
+
+            if self.route_manager is not None:
+                self.route_manager.save_region(target_region)
+
+            json_path = os.path.join(reg_dir, "region_data.json")
+            existing_data: Dict[str, Any] = {}
+            if os.path.isfile(json_path):
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        existing_data = json.load(f)
+                except Exception:
+                    existing_data = {}
+
+            rg = self.build_route_graph(target_region)
+            nodes_data = existing_data.get("nodes", [])
+            if not nodes_data:
+                nodes_data = [t.to_dict() for t in self._tracked_nodes.get(target_region, [])]
+
+            payload = {
+                "region": target_region,
+                "routes": existing_data.get("routes", [DEFAULT_ROUTE]),
+                "nodes": nodes_data,
+                "route_graph": rg.to_dict(),
+                "cartography_stats": self.get_cartography_stats(target_region),
+                "updated_at": time.time(),
+            }
+
+            tmp_path = json_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except (AttributeError, OSError):
+                    pass
+
+            for _ in range(5):
+                try:
+                    os.replace(tmp_path, json_path)
+                    return True
+                except PermissionError:
+                    time.sleep(0.02)
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            return False
+        except Exception as exc:
+            logger.error("persist_to_region_data hatası: %s", exc)
+            return False
+
+    @property
+    def cluster_radius(self) -> float:
+        """Uzamsal kümeleme ve tekilleştirme yarıçapı (15-25 piksel)."""
+        return float(np.clip(self.dedup_radius_px, DEDUP_RADIUS_MIN_PX, DEDUP_RADIUS_MAX_PX))
+
+    @cluster_radius.setter
+    def cluster_radius(self, radius: float) -> None:
+        self.dedup_radius_px = float(np.clip(radius, DEDUP_RADIUS_MIN_PX, DEDUP_RADIUS_MAX_PX))
+
+    def set_position(
+        self,
+        map_x: float,
+        map_y: float,
+        map_width: Optional[int] = None,
+        map_height: Optional[int] = None,
+        record_trajectory: bool = True,
+    ) -> Tuple[float, float, float, float]:
+        """Oyuncunun harita konumunu ayarlar ve odometri takipçisini senkronize eder."""
+        if map_width is not None and map_width >= 160:
+            self.map_width = int(map_width)
+            self.odometry_tracker.map_width = int(map_width)
+        if map_height is not None and map_height >= 120:
+            self.map_height = int(map_height)
+            self.odometry_tracker.map_height = int(map_height)
+        self.map_x = float(np.clip(map_x, 0.0, float(self.map_width - 1)))
+        self.map_y = float(np.clip(map_y, 0.0, float(self.map_height - 1)))
+        self.norm_x = round(self.map_x / float(max(1, self.map_width)), 4)
+        self.norm_y = round(self.map_y / float(max(1, self.map_height)), 4)
+        self.odometry_tracker.map_x = float(self.map_x)
+        self.odometry_tracker.map_y = float(self.map_y)
+        self.odometry_tracker.norm_x = float(self.norm_x)
+        self.odometry_tracker.norm_y = float(self.norm_y)
+        self.dead_reckoning_dx = 0.0
+        self.dead_reckoning_dy = 0.0
+        if record_trajectory:
+            self._append_trajectory()
+        return self.get_position()
+
+    def offset_to_world_coords(
+        self,
+        dx: float,
+        dy: float,
+        is_map_offset: bool = True,
+        dead_reckoning_dx: float = 0.0,
+        dead_reckoning_dy: float = 0.0,
+    ) -> Tuple[float, float, float, float]:
+        """
+        Harita veya radar ofsetini güncel oyuncu konumuna ve odometriye göre
+        dünya koordinatlarına `(world_x, world_y, norm_x, norm_y)` dönüştürür.
+        Merkeze sabitlenmeyi (center-sticking) önlemek için odometri takipçisiyle
+        tam senkronize çalışır ve dead-reckoning yer değiştirmesini hesaba katar.
+        """
+        self.odometry_tracker.map_x = float(self.map_x)
+        self.odometry_tracker.map_y = float(self.map_y)
+        self.odometry_tracker.map_width = int(self.map_width)
+        self.odometry_tracker.map_height = int(self.map_height)
+        return self.odometry_tracker.offset_to_world_coords(
+            dx=dx,
+            dy=dy,
+            is_map_offset=is_map_offset,
+            dead_reckoning_dx=float(dead_reckoning_dx or self.dead_reckoning_dx),
+            dead_reckoning_dy=float(dead_reckoning_dy or self.dead_reckoning_dy),
+        )
+
+    # ------------------------------------------------------------------
+    # Radar & Harita Olay Bildirim Sistemi (Callbacks & UI Listeners)
+    # ------------------------------------------------------------------
+    def add_node_discovered_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Yeni bir düğüm haritalandırıldığında anında tetiklenecek geri çağırma işlevini ekler."""
+        if callable(callback) and callback not in self._node_discovered_callbacks:
+            self._node_discovered_callbacks.append(callback)
+
+    def remove_node_discovered_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Düğüm keşif dinleyicisini kaldırır."""
+        if callback in self._node_discovered_callbacks:
+            self._node_discovered_callbacks.remove(callback)
+
+    def add_node_updated_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Mevcut düğüm yeni gözlemle güncellendiğinde/tekilleştirildiğinde tetiklenecek dinleyiciyi ekler."""
+        if callable(callback) and callback not in self._node_updated_callbacks:
+            self._node_updated_callbacks.append(callback)
+
+    def remove_node_updated_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Düğüm güncelleme dinleyicisini kaldırır."""
+        if callback in self._node_updated_callbacks:
+            self._node_updated_callbacks.remove(callback)
+
+    def add_radar_event_callback(self, callback: Callable[[str, Dict[str, Any]], None]) -> None:
+        """Genel radar olayları (node_discovered, node_updated vb.) için dinleyici ekler."""
+        if callable(callback) and callback not in self._radar_event_callbacks:
+            self._radar_event_callbacks.append(callback)
+
+    def remove_radar_event_callback(self, callback: Callable[[str, Dict[str, Any]], None]) -> None:
+        """Genel radar olay dinleyicisini kaldırır."""
+        if callback in self._radar_event_callbacks:
+            self._radar_event_callbacks.remove(callback)
+
+    def register_ui_listener(self, listener: Any) -> None:
+        """Radar tuvali (SequentialMapCanvas/CartographyRadarDialog) veya Harita (MapViewerWindow) bağlar."""
+        if listener is not None and listener not in self._ui_listeners:
+            self._ui_listeners.append(listener)
+
+    def unregister_ui_listener(self, listener: Any) -> None:
+        """UI dinleyicisini kaldırır."""
+        if listener in self._ui_listeners:
+            self._ui_listeners.remove(listener)
+
+    def _emit_node_discovered(self, node_dict: Dict[str, Any]) -> None:
+        """Yeni düğüm keşfedildiğinde tüm kayıtlı dinleyicileri ve UI bileşenlerini anında haberdar eder."""
+        for cb in list(self._node_discovered_callbacks):
+            try:
+                cb(node_dict)
+            except Exception as exc:
+                logger.debug("node_discovered_callback hatası: %s", exc)
+        for listener in list(self._ui_listeners):
+            try:
+                if hasattr(listener, "add_discovered_node"):
+                    listener.add_discovered_node(node_dict, trigger_pulse=True)
+                elif hasattr(listener, "reload_map_and_nodes"):
+                    listener.reload_map_and_nodes()
+                elif hasattr(listener, "emit") and callable(listener.emit):
+                    listener.emit(node_dict)
+            except Exception as exc:
+                logger.debug("UI listener node_discovered hatası: %s", exc)
+        self._emit_radar_event("node_discovered", node_dict)
+
+    def _emit_node_updated(self, node_dict: Dict[str, Any]) -> None:
+        """Mevcut düğüm güncellendiğinde UI'ı ve dinleyicileri anında günceller."""
+        for cb in list(self._node_updated_callbacks):
+            try:
+                cb(node_dict)
+            except Exception as exc:
+                logger.debug("node_updated_callback hatası: %s", exc)
+        for listener in list(self._ui_listeners):
+            try:
+                if hasattr(listener, "update_node"):
+                    listener.update_node(node_dict)
+                elif hasattr(listener, "reload_map_and_nodes"):
+                    listener.reload_map_and_nodes()
+            except Exception as exc:
+                logger.debug("UI listener node_updated hatası: %s", exc)
+        self._emit_radar_event("node_updated", node_dict)
+
+    def _emit_radar_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Genel radar olayını yayınlar."""
+        for cb in list(self._radar_event_callbacks):
+            try:
+                cb(event_type, data)
+            except Exception as exc:
+                logger.debug("radar_event_callback hatası: %s", exc)
+
+    def cluster_detections(
+        self,
+        parsed_items: List[Dict[str, Any]],
+        cluster_radius: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Aynı kare veya ardışık akış içindeki birden fazla materyal tespitini
+        belirtilen `cluster_radius` (15-25 px aralığına kenetlenmiş) içinde
+        güven ağırlıklı merkez hesaplamasıyla (confidence-weighted centroid) kümeleyerek
+        üst üste binen sahte düğüm ve mükerrer yığılma (duplicate piling) üretimini önler.
+        """
+        raw_r = cluster_radius if cluster_radius is not None else self.dedup_radius_px
+        radius = float(np.clip(raw_r, DEDUP_RADIUS_MIN_PX, DEDUP_RADIUS_MAX_PX))
+        if not parsed_items or len(parsed_items) <= 1:
+            return list(parsed_items or [])
+
+        SOURCE_PRIORITY: Dict[str, int] = {
+            "harvest_auto": 4,
+            "minimap_auto": 3,
+            "3d_auto": 2,
+            "radar_auto": 1,
+        }
+
+        clusters: List[Dict[str, Any]] = []
+        for item in parsed_items:
+            ix = float(item.get("rel_map_dx", 0.0))
+            iy = float(item.get("rel_map_dy", 0.0))
+            item_exact_x = item.get("exact_map_x")
+            item_exact_y = item.get("exact_map_y")
+            item_conf = float(np.clip(float(item.get("confidence", 0.5)), 0.05, 1.0))
+            item_source = str(item.get("source_type", "minimap_auto"))
+
+            matched_cluster: Optional[Dict[str, Any]] = None
+            min_d = float("inf")
+
+            for cl in clusters:
+                cx = float(cl.get("rel_map_dx", 0.0))
+                cy = float(cl.get("rel_map_dy", 0.0))
+                # Mutlak koordinat varsa onu da uzamsal mesafede kullan
+                if item_exact_x is not None and cl.get("exact_map_x") is not None:
+                    d = math.hypot(float(item_exact_x) - float(cl["exact_map_x"]), float(item_exact_y) - float(cl["exact_map_y"]))
+                else:
+                    d = math.hypot(ix - cx, iy - cy)
+
+                if d <= radius and d < min_d:
+                    min_d = d
+                    matched_cluster = cl
+
+            if matched_cluster is not None:
+                cnt = int(matched_cluster.get("_cluster_count", 1))
+                new_cnt = cnt + 1
+                matched_cluster["_cluster_count"] = new_cnt
+
+                # Güven ağırlıklı merkez (confidence-weighted centroid)
+                cl_conf = float(np.clip(float(matched_cluster.get("confidence", 0.5)), 0.05, 1.0))
+                w_old = cl_conf * float(cnt)
+                w_new = item_conf
+                w_sum = max(0.001, w_old + w_new)
+
+                matched_cluster["rel_map_dx"] = round(
+                    (w_old * float(matched_cluster["rel_map_dx"]) + w_new * ix) / w_sum, 3
+                )
+                matched_cluster["rel_map_dy"] = round(
+                    (w_old * float(matched_cluster["rel_map_dy"]) + w_new * iy) / w_sum, 3
+                )
+
+                if item_exact_x is not None and matched_cluster.get("exact_map_x") is not None:
+                    matched_cluster["exact_map_x"] = round(
+                        (w_old * float(matched_cluster["exact_map_x"]) + w_new * float(item_exact_x)) / w_sum, 3
+                    )
+                    matched_cluster["exact_map_y"] = round(
+                        (w_old * float(matched_cluster["exact_map_y"]) + w_new * float(item_exact_y)) / w_sum, 3
+                    )
+
+                if "screen_x" in item and "screen_x" in matched_cluster:
+                    matched_cluster["screen_x"] = int(round(
+                        (w_old * float(matched_cluster["screen_x"]) + w_new * float(item["screen_x"])) / w_sum
+                    ))
+                if "screen_y" in item and "screen_y" in matched_cluster:
+                    matched_cluster["screen_y"] = int(round(
+                        (w_old * float(matched_cluster["screen_y"]) + w_new * float(item["screen_y"])) / w_sum
+                    ))
+
+                matched_cluster["confidence"] = round(max(cl_conf, item_conf), 3)
+                matched_cluster["stack_count"] = max(
+                    int(matched_cluster.get("stack_count", 1)),
+                    int(item.get("stack_count", 1)),
+                )
+                matched_cluster["max_harvests"] = max(
+                    int(matched_cluster.get("max_harvests", DEFAULT_MAX_HARVESTS)),
+                    int(item.get("max_harvests", DEFAULT_MAX_HARVESTS)),
+                )
+
+                # Kaynak tipi belirleme: genel isim yerine daima spesifik ismi koru
+                item_res = str(item.get("resource_type", "")).strip()
+                cur_res = str(matched_cluster.get("resource_type", "")).strip()
+                generic_names = (DEFAULT_RESOURCE_TYPE, "Gatherable Material", "resource", "unknown", "")
+                if item_res and item_res not in generic_names:
+                    matched_cluster["resource_type"] = item_res
+                elif cur_res in generic_names and item_res:
+                    matched_cluster["resource_type"] = item_res
+
+                # Kaynak kaynağı güvenilirlik önceliği
+                cl_source = str(matched_cluster.get("source_type", "minimap_auto"))
+                if SOURCE_PRIORITY.get(item_source, 0) > SOURCE_PRIORITY.get(cl_source, 0):
+                    matched_cluster["source_type"] = item_source
+            else:
+                new_cl = dict(item)
+                new_cl["_cluster_count"] = 1
+                clusters.append(new_cl)
+
+        return clusters
+
+    def _get_quality_detector(self) -> Any:
+        """Lazy-load gatherion CPU detector for the pre-save quality gate."""
+        if self._quality_detector is not None:
+            return self._quality_detector
+        if self._quality_detector_failed:
+            return None
+        try:
+            from core.wrong_node_scan import load_gatherion_detector
+
+            self._quality_detector = load_gatherion_detector()
+        except Exception as exc:
+            self._quality_detector_failed = True
+            logger.info("Haritalama AI kapısı modeli yüklenemedi (CV-only devam): %s", exc)
+            self._quality_detector = None
+        return self._quality_detector
+
+    def _get_exemplar_memory(self) -> Optional[Any]:
+        """Lazy-load or return ExemplarMemory singleton instance."""
+        if getattr(self, "exemplar_memory", None) is not None:
+            return self.exemplar_memory
+        try:
+            from dataset_factory.exemplar_memory import get_exemplar_memory
+            return get_exemplar_memory()
+        except Exception as exc:
+            logger.debug("Failed to get ExemplarMemory in AutoCartographer: %s", exc)
+            return None
+
+    def evaluate_node_candidate(
+        self,
+        patch: Optional[np.ndarray],
+        source_type: str = "minimap_auto",
+        resource_type: str = "",
+        conf_min: float = MODEL_CONF_MIN,
+        exemplar_memory: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> GateVerdict:
+        """Evaluates a candidate node patch against the multi-signal gate including ExemplarMemory."""
+        mem = exemplar_memory or self._get_exemplar_memory()
+        return evaluate_node_candidate(
+            patch,
+            source_type=source_type,
+            resource_type=resource_type,
+            detector=self._get_quality_detector(),
+            conf_min=conf_min,
+            exemplar_memory=mem,
+            check_feather=kwargs.get("check_feather", True),
+            check_monster=kwargs.get("check_monster", source_type.startswith("minimap")),
+            check_exemplars=kwargs.get("check_exemplars", True),
+            check_terrain=kwargs.get("check_terrain", True),
+        )
+
+    def _refresh_calibration_flag(self) -> None:
+        """Set needs_map_calibrate when drift or wall-clock interval warrants a world-map fix."""
+        now = time.time()
+        stale = (now - float(self._last_calibration_ts or 0.0)) >= ODOMETRY_CALIBRATE_INTERVAL_SEC
+        drifted = float(self._cumulative_drift_px) >= ODOMETRY_CALIBRATE_DRIFT_PX
+        uncalibrated = not bool(self._is_calibrated_on_world_map)
+        self.needs_map_calibrate = bool(uncalibrated or stale or drifted)
 
     # ------------------------------------------------------------------
     # Yardımcı Görüntü & ROI Metodları
@@ -597,6 +1562,8 @@ class AutoCartographer:
         self.odometry_tracker.map_width = int(self.map_width)
         self.odometry_tracker.map_height = int(self.map_height)
         self.odometry_tracker.append_trajectory(timestamp=timestamp)
+        if self.auto_cartography_enabled:
+            self._record_breadcrumb_if_moved(self.map_x, self.map_y, timestamp=timestamp)
 
     def calibrate_on_world_map(
         self,
@@ -683,6 +1650,17 @@ class AutoCartographer:
             self.norm_x = round(self.map_x / float(max(1, w)), 4)
             self.norm_y = round(self.map_y / float(max(1, h)), 4)
 
+            self.odometry_tracker.map_x = float(self.map_x)
+            self.odometry_tracker.map_y = float(self.map_y)
+            self.odometry_tracker.norm_x = float(self.norm_x)
+            self.odometry_tracker.norm_y = float(self.norm_y)
+            self.odometry_tracker.map_width = int(w)
+            self.odometry_tracker.map_height = int(h)
+            self.velocity_x = 0.0
+            self.velocity_y = 0.0
+            self.dead_reckoning_dx = 0.0
+            self.dead_reckoning_dy = 0.0
+
             now_cal = time.time()
             prev_log_x = getattr(self, "_last_logged_cal_x", -999.0)
             prev_log_y = getattr(self, "_last_logged_cal_y", -999.0)
@@ -692,6 +1670,7 @@ class AutoCartographer:
             self._last_calibration_ts = now_cal
             self._cumulative_drift_px = 0.0
             self.odometry_tracker.cumulative_drift_px = 0.0
+            self.needs_map_calibrate = False
             self._append_trajectory(self._last_calibration_ts)
 
             if (
@@ -830,6 +1809,7 @@ class AutoCartographer:
         """
         Sağ üstteki Minimap bölgesini (`Pilgrim's Ridge`, `x: 0.855..0.992, y: 0.065..0.255`)
         takip ederek oyuncunun harita üzerindeki `(map_x, map_y, norm_x, norm_y)` konumunu günceller.
+        Odometri kaybolduğunda dead-reckoning yer değiştirmesini devreye alır.
         Dünya haritası (`M`) açıksa `calibrate_on_world_map` ile sıfır hatayla kalibre eder.
         """
         try:
@@ -865,6 +1845,10 @@ class AutoCartographer:
             self._last_valid_minimap_bgr = minimap_bgr.copy()
             curr_clean = self._clean_minimap_for_odometry(minimap_bgr)
 
+            now_t = time.time()
+            dt = max(0.01, now_t - float(self._last_odometry_update_ts or 0.0)) if self._last_odometry_update_ts > 0 else 0.1
+            self._last_odometry_update_ts = now_t
+
             if self._prev_minimap_clean is not None and self._prev_minimap_clean.shape == curr_clean.shape:
                 dx_terrain, dy_terrain, conf = self._estimate_minimap_shift(
                     self._prev_minimap_clean,
@@ -882,9 +1866,49 @@ class AutoCartographer:
                     self._cumulative_drift_px += drift_inc
                     self.odometry_tracker.cumulative_drift_px = self._cumulative_drift_px
 
+                    if dt > 0:
+                        self.velocity_x = player_dx / dt
+                        self.velocity_y = player_dy / dt
+                    self.dead_reckoning_dx = 0.0
+                    self.dead_reckoning_dy = 0.0
+                else:
+                    # Düşük güvende dead-reckoning ile konum devamlılığı sağla
+                    if (abs(self.velocity_x) > 0.05 or abs(self.velocity_y) > 0.05) and dt < 2.5:
+                        dr_x = self.velocity_x * dt
+                        dr_y = self.velocity_y * dt
+                        self.dead_reckoning_dx += dr_x
+                        self.dead_reckoning_dy += dr_y
+                        self.map_x = float(np.clip(self.map_x + dr_x, 0.0, float(self.map_width - 1)))
+                        self.map_y = float(np.clip(self.map_y + dr_y, 0.0, float(self.map_height - 1)))
+                        self.norm_x = round(self.map_x / float(max(1, self.map_width)), 4)
+                        self.norm_y = round(self.map_y / float(max(1, self.map_height)), 4)
+                        self.velocity_x *= 0.95
+                        self.velocity_y *= 0.95
+
+            # Odometri takipçisi konum ve durumunu senkronize tut
+            self.odometry_tracker.map_x = float(self.map_x)
+            self.odometry_tracker.map_y = float(self.map_y)
+            self.odometry_tracker.norm_x = float(self.norm_x)
+            self.odometry_tracker.norm_y = float(self.norm_y)
+            self.odometry_tracker.velocity_x = float(self.velocity_x)
+            self.odometry_tracker.velocity_y = float(self.velocity_y)
+            self.odometry_tracker.dead_reckoning_dx = float(self.dead_reckoning_dx)
+            self.odometry_tracker.dead_reckoning_dy = float(self.dead_reckoning_dy)
+
+            # Minimap üzerinden yön açısını güncelle
+            try:
+                from core.minimap_scanner import MinimapScanner
+                m_scanner = MinimapScanner()
+                ok_h, h_val = m_scanner.detect_player_heading(bgr)
+                if ok_h:
+                    self.player_heading_deg = float(h_val)
+            except Exception:
+                pass
+
             self._prev_minimap_clean = curr_clean
             self._prev_minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
             self._append_trajectory()
+            self._refresh_calibration_flag()
             return self.get_position()
         except Exception as exc:
             logger.error("update_player_position hatası: %s", exc)
@@ -1140,12 +2164,17 @@ class AutoCartographer:
                 icx = float(cents_w[idx][0])
                 icy = float(cents_w[idx][1])
 
-                # Optional vision_filters FeatherNegativeFilter & MonsterCircularityFilter safeguard check
+                # Feather + monster circularity safeguards (required on save path)
                 try:
-                    icon_patch_bgr = minimap_bgr[max(0, by-2):min(mh, by+bh+2), max(0, bx-2):min(mw, bx+bw+2)]
+                    icon_patch_bgr = minimap_bgr[
+                        max(0, by - 2) : min(mh, by + bh + 2),
+                        max(0, bx - 2) : min(mw, bx + bw + 2),
+                    ]
                     if icon_patch_bgr.size > 0 and hasattr(self, "feather_negative_filter"):
-                        is_f, f_score = self.feather_negative_filter.is_feather_icon(icon_patch_bgr)
-                        if is_f and float(f_score) >= 0.88:
+                        if self.feather_negative_filter.is_feather_icon(icon_patch_bgr):
+                            continue
+                    if icon_patch_bgr.size > 0 and hasattr(self, "monster_circularity_filter"):
+                        if self.monster_circularity_filter.is_monster_dot(icon_patch_bgr):
                             continue
                 except Exception as exc_vf:
                     logger.debug("vision_filters minimap safeguard skipped: %s", exc_vf)
@@ -1171,7 +2200,13 @@ class AutoCartographer:
                         "screen_y": int(round(y1_mm + icy)),
                         "resource_type": "Gatherable Material",
                         "in_air": False,
-                        "confidence": round(min(0.95, 0.76 + (contrast - 115.0) / 500.0), 3),
+                        "confidence": round(
+                            max(
+                                MINIMAP_SPROUT_CONF_MIN,
+                                min(0.95, 0.76 + (contrast - 115.0) / 500.0),
+                            ),
+                            3,
+                        ),
                         "stack_count": int(stack_count),
                         "max_harvests": int(DEFAULT_MAX_HARVESTS * stack_count),
                         "current_harvests": 0,
@@ -1190,25 +2225,51 @@ class AutoCartographer:
         screen_y: float,
         frame_w: int,
         frame_h: int,
+        heading_deg: Optional[float] = None,
     ) -> Tuple[float, float]:
         """
         3D oyun ekranındaki `(screen_x, screen_y)` noktasını oyuncunun ayak merkezine
-        `(frame_w * 0.50, frame_h * 0.54)` göre perspektif düzeltmeli harita ofsetine
-        `(rel_map_dx, rel_map_dy)` dönüştürür.
+        `(frame_w * 0.50, frame_h * 0.54)` göre perspektif düzeltmeli ve oyuncu yön açısına
+        (`heading_deg`) göre döndürülmüş harita ofsetine `(rel_map_dx, rel_map_dy)` dönüştürür.
+        Normalize edilmiş koordinatlar (0..1) otomatik olarak piksel koordinatlarına çevrilir.
         """
-        player_x = float(frame_w) * self.PLAYER_FEET_X_RATIO
-        player_y = float(frame_h) * self.PLAYER_FEET_Y_RATIO
+        fw = max(1, int(frame_w))
+        fh = max(1, int(frame_h))
+        sx = float(screen_x)
+        sy = float(screen_y)
 
-        raw_dx = float(screen_x) - player_x
-        raw_dy = float(screen_y) - player_y
+        # Normalize koordinatları piksel koordinatlarına dönüştür (merkeze yapışmayı önler)
+        if 0.0 <= sx <= 1.5 and 0.0 <= sy <= 1.5 and fw > 10 and fh > 10:
+            sx = sx * float(fw)
+            sy = sy * float(fh)
 
-        norm_dx = raw_dx * (float(self.REF_SCREEN_WIDTH) / float(max(1, frame_w)))
-        norm_dy = raw_dy * (float(self.REF_SCREEN_HEIGHT) / float(max(1, frame_h)))
+        player_x = float(fw) * self.PLAYER_FEET_X_RATIO
+        player_y = float(fh) * self.PLAYER_FEET_Y_RATIO
 
-        vertical_ratio = max(0.25, min(1.8, (player_y / float(max(1.0, float(screen_y)))) ** 1.15))
-        rel_map_dx = round(norm_dx * self.PERSPECTIVE_SCALE_X * vertical_ratio, 3)
-        rel_map_dy = round(norm_dy * self.PERSPECTIVE_SCALE_Y * vertical_ratio, 3)
-        return float(rel_map_dx), float(rel_map_dy)
+        raw_dx = sx - player_x
+        raw_dy = sy - player_y
+
+        norm_dx = raw_dx * (float(self.REF_SCREEN_WIDTH) / float(fw))
+        norm_dy = raw_dy * (float(self.REF_SCREEN_HEIGHT) / float(fh))
+
+        vertical_ratio = max(0.35, min(1.45, (player_y / float(max(1.0, sy))) ** 1.15))
+        base_dx = norm_dx * self.PERSPECTIVE_SCALE_X * vertical_ratio
+        base_dy = norm_dy * self.PERSPECTIVE_SCALE_Y * vertical_ratio
+
+        # Oyuncu yön açısına göre dünya haritası yönüne döndür
+        # Kuzey = 0°, Doğu = 90°, Güney = 180°, Batı = 270°
+        h_deg = heading_deg if heading_deg is not None else getattr(self, "player_heading_deg", 0.0)
+        if abs(h_deg) > 0.01:
+            rad = math.radians(float(h_deg))
+            cos_a = math.cos(rad)
+            sin_a = math.sin(rad)
+            forward_map = -base_dy
+            lateral_map = base_dx
+            rot_dx = lateral_map * cos_a + forward_map * sin_a
+            rot_dy = lateral_map * sin_a - forward_map * cos_a
+            return float(round(rot_dx, 3)), float(round(rot_dy, 3))
+
+        return float(round(base_dx, 3)), float(round(base_dy, 3))
 
     def _detect_3d_world_gatherables(
         self,
@@ -1290,26 +2351,18 @@ class AutoCartographer:
                 mesh_hsv = hsv[my1:my2, mx1:mx2]
 
                 resource_type = DEFAULT_RESOURCE_TYPE
-                if mesh_hsv.size > 0:
-                    # Aria: mor / menekşe kristal bitki (H: 125..165, S >= 45, V >= 60)
-                    purple_px = int(
-                        np.count_nonzero(cv2.inRange(mesh_hsv, (125, 45, 60), (165, 255, 255)))
-                    )
-                    # Mela: kırmızı / mercan meyveli yeşil çalı
-                    red_px = int(
-                        np.count_nonzero(cv2.inRange(mesh_hsv, (0, 80, 80), (12, 255, 255)))
-                    ) + int(
-                        np.count_nonzero(cv2.inRange(mesh_hsv, (166, 80, 80), (180, 255, 255)))
-                    )
-                    green_px = int(
-                        np.count_nonzero(cv2.inRange(mesh_hsv, (30, 45, 50), (78, 255, 255)))
-                    )
-                    if purple_px >= max(20, int(round(30 * scale_x * scale_y))):
-                        resource_type = "Aria"
-                    elif red_px >= max(40, int(round(60 * scale_x * scale_y))) or (
-                        red_px >= max(15, int(round(20 * scale_x * scale_y))) and green_px >= 10
-                    ):
-                        resource_type = "Mela"
+                mesh_bgr = frame_bgr[my1:my2, mx1:mx2]
+                if mesh_bgr.size > 0:
+                    try:
+                        from config.materials_db import classify_3d_material_patch
+
+                        classified = classify_3d_material_patch(
+                            mesh_bgr,
+                            label_width_px=int(cw),
+                        )
+                        resource_type = str(classified.get("name") or resource_type)
+                    except Exception as classify_exc:
+                        logger.debug("3B essence sınıfı okunamadı: %s", classify_exc)
 
                 node_sx = float(cx_mid)
                 node_sy = float(min(h - 1, y + ch + int(round(26 * scale_y))))
@@ -1366,7 +2419,9 @@ class AutoCartographer:
                                 "rel_map_dy": rel_dy,
                                 "screen_x": int(round(abs_sx)),
                                 "screen_y": int(round(abs_sy)),
-                                "resource_type": "Gatherable Plant",
+                                "resource_type": _essence_name_near_box(
+                                    frame_bgr, abs_sx, abs_sy
+                                ),
                                 "in_air": False,
                                 "confidence": 0.89,
                                 "stack_count": 1,
@@ -1497,7 +2552,10 @@ class AutoCartographer:
             for reg_name in regions_to_sync:
                 if not reg_name:
                     continue
-                existing_nodes = route_manager.get_route_nodes(region_name=reg_name, route_name=DEFAULT_ROUTE)
+                try:
+                    existing_nodes = route_manager.get_nodes(region=reg_name)
+                except Exception:
+                    existing_nodes = route_manager.get_route_nodes(region_name=reg_name)
                 tracked_list = self._tracked_nodes.setdefault(reg_name, [])
                 tracked_ids = {t.node_id for t in tracked_list}
                 for n in existing_nodes:
@@ -1539,10 +2597,12 @@ class AutoCartographer:
         frame_h: int,
     ) -> Optional[Dict[str, Any]]:
         """
-        `MaterialScanner` veya harici dedektörler tarafından üretilen materyal/gem tespit
+        `MaterialScanner`, radar veya harici YZ dedektörleri tarafından üretilen materyal/gem tespit
         öğesini (dict, nesne veya tuple) standart sözlük yapısına
         (`rel_map_dx`, `rel_map_dy`, `resource_type`, `in_air`, `confidence`,
         `stack_count`, `max_harvests`, `current_harvests`, `source_type`) çevirir.
+        Merkeze sabitlenmeyi (center-sticking) önler; radar kutupsal (açı/mesafe) koordinatlarını,
+        normalize edilmiş YZ kutularını ve mutlak harita koordinatlarını hatasız ayrıştırır.
         """
         try:
             if item is None:
@@ -1567,39 +2627,80 @@ class AutoCartographer:
             else:
                 return None
 
-            # Kaynak türü (minimap_auto, 3d_auto, harvest_auto) belirleme
+            # Kaynak türü (minimap_auto, 3d_auto, harvest_auto, radar_auto) belirleme
             raw_source = str(raw.get("source_type") or raw.get("source") or "").strip().lower()
-            if raw_source in ("minimap", "minimap_auto"):
+            if raw_source in ("minimap", "minimap_auto", "yz_minimap"):
                 source_type = "minimap_auto"
             elif raw_source in ("gather_prompt", "harvest", "harvest_auto", "f_gather"):
                 source_type = "harvest_auto"
-            elif raw_source in ("3d_world", "3d_auto", "3d", "world"):
+            elif raw_source in ("radar", "radar_auto"):
+                source_type = "radar_auto"
+            elif raw_source in ("3d_world", "3d_auto", "3d", "world", "yz_3d"):
                 source_type = "3d_auto"
             else:
                 source_type = "minimap_auto"
 
-            # 1. Doğrudan göreli harita ofseti (rel_map_dx, rel_map_dy) kontrolü
             rel_dx: Optional[float] = None
             rel_dy: Optional[float] = None
+            exact_map_x: Optional[float] = None
+            exact_map_y: Optional[float] = None
 
-            for kx, ky in (
-                ("rel_map_dx", "rel_map_dy"),
-                ("map_dx", "map_dy"),
-                ("rel_dx", "rel_dy"),
-                ("dx", "dy"),
-                ("offset_x", "offset_y"),
+            # 1. Mutlak harita koordinatları doğrudan verilmişse (exact_map_x / map_x)
+            if "exact_map_x" in raw and "exact_map_y" in raw and raw["exact_map_x"] is not None and raw["exact_map_y"] is not None:
+                exact_map_x = float(raw["exact_map_x"])
+                exact_map_y = float(raw["exact_map_y"])
+                rel_dx = exact_map_x - float(self.map_x)
+                rel_dy = exact_map_y - float(self.map_y)
+            elif "map_x" in raw and "map_y" in raw and raw["map_x"] is not None and raw["map_y"] is not None:
+                exact_map_x = float(raw["map_x"])
+                exact_map_y = float(raw["map_y"])
+                rel_dx = exact_map_x - float(self.map_x)
+                rel_dy = exact_map_y - float(self.map_y)
+            elif "norm_x" in raw and "norm_y" in raw and raw["norm_x"] is not None and raw["norm_y"] is not None:
+                exact_map_x = float(raw["norm_x"]) * float(self.map_width)
+                exact_map_y = float(raw["norm_y"]) * float(self.map_height)
+                rel_dx = exact_map_x - float(self.map_x)
+                rel_dy = exact_map_y - float(self.map_y)
+
+            # 2. Radar kutupsal koordinatları (polar coordinates: mesafe ve açı)
+            if (rel_dx is None or rel_dy is None) and (
+                any(k in raw for k in ("bearing_deg", "angle_deg", "bearing", "radar_angle"))
+                and any(k in raw for k in ("distance", "dist", "range", "radar_distance"))
             ):
-                if kx in raw and ky in raw and raw[kx] is not None and raw[ky] is not None:
-                    rel_dx = float(raw[kx])
-                    rel_dy = float(raw[ky])
-                    break
+                bearing_val = float(
+                    raw.get("bearing_deg", raw.get("angle_deg", raw.get("bearing", raw.get("radar_angle", 0.0))))
+                )
+                dist_val = float(
+                    raw.get("distance", raw.get("dist", raw.get("range", raw.get("radar_distance", 0.0))))
+                )
+                rad = math.radians(bearing_val)
+                # Kuzey = 0° (dy < 0), Doğu = 90° (dx > 0)
+                rel_dx = dist_val * math.sin(rad)
+                rel_dy = -dist_val * math.cos(rad)
+                if not raw_source:
+                    source_type = "radar_auto"
 
-            # 2. Minimap içi koordinat verildiyse minimap merkezine göre ofseti hesapla
+            # 3. Doğrudan göreli harita ofseti (rel_map_dx, rel_map_dy) kontrolü
+            if rel_dx is None or rel_dy is None:
+                for kx, ky in (
+                    ("rel_map_dx", "rel_map_dy"),
+                    ("map_dx", "map_dy"),
+                    ("rel_dx", "rel_dy"),
+                    ("dx", "dy"),
+                    ("offset_x", "offset_y"),
+                    ("radar_dx", "radar_dy"),
+                ):
+                    if kx in raw and ky in raw and raw[kx] is not None and raw[ky] is not None:
+                        rel_dx = float(raw[kx])
+                        rel_dy = float(raw[ky])
+                        break
+
+            # 4. Minimap içi koordinat verildiyse minimap merkezine göre ofseti hesapla
             if rel_dx is None or rel_dy is None:
                 x1, y1, x2, y2 = self._get_minimap_pixel_rect(frame_w, frame_h)
-                mcx = (x2 - x1) / 2.0
-                mcy = (y2 - y1) * 0.545
-                if "minimap_x" in raw and "minimap_y" in raw:
+                mcx = max(1.0, float(x2 - x1)) * 0.50
+                mcy = max(1.0, float(y2 - y1)) * 0.545
+                if "minimap_x" in raw and "minimap_y" in raw and raw["minimap_x"] is not None:
                     mx = float(raw["minimap_x"])
                     my = float(raw["minimap_y"])
                     if mx >= x1 and my >= y1:
@@ -1607,15 +2708,24 @@ class AutoCartographer:
                         my -= float(y1)
                     rel_dx = (mx - mcx) * self.minimap_to_map_scale
                     rel_dy = (my - mcy) * self.minimap_to_map_scale
+                    # Minimap oyuncu oku merkez artefaktını reddet (merkeze yapışmayı önler)
+                    if math.hypot(rel_dx, rel_dy) < 3.5:
+                        return None
                     source_type = "minimap_auto"
 
-            # 3. 3D Dünya ekran koordinatı (screen_x, screen_y veya bbox) verildiyse perspektif izdüşümü
+            # 5. 3D Dünya ekran koordinatı (screen_x, screen_y veya bbox / cx, cy) verildiyse
             if rel_dx is None or rel_dy is None:
                 sx: Optional[float] = None
                 sy: Optional[float] = None
                 if "screen_x" in raw and "screen_y" in raw:
                     sx = float(raw["screen_x"])
                     sy = float(raw["screen_y"])
+                elif "cx" in raw and "cy" in raw:
+                    sx = float(raw["cx"])
+                    sy = float(raw["cy"])
+                elif "center_x" in raw and "center_y" in raw:
+                    sx = float(raw["center_x"])
+                    sy = float(raw["center_y"])
                 elif "x" in raw and "y" in raw:
                     sx = float(raw["x"])
                     sy = float(raw["y"])
@@ -1623,22 +2733,56 @@ class AutoCartographer:
                     bx, by, bw, bh = [float(v) for v in raw["bbox"][:4]]
                     sx = bx + bw / 2.0
                     sy = by + bh / 2.0
+                elif any(k in raw for k in ("x1", "xmin", "left")) and any(k in raw for k in ("x2", "xmax", "right")):
+                    bx1 = float(raw.get("x1", raw.get("xmin", raw.get("left", 0.0))))
+                    by1 = float(raw.get("y1", raw.get("ymin", raw.get("top", 0.0))))
+                    bx2 = float(raw.get("x2", raw.get("xmax", raw.get("right", 0.0))))
+                    by2 = float(raw.get("y2", raw.get("ymax", raw.get("bottom", 0.0))))
+                    sx = (bx1 + bx2) / 2.0
+                    sy = (by1 + by2) / 2.0
 
                 if sx is not None and sy is not None:
+                    # Normalize koordinatları (0.0..1.0) piksele çevir (merkeze yapışmayı önler)
+                    if 0.0 <= sx <= 1.5 and 0.0 <= sy <= 1.5 and frame_w > 10 and frame_h > 10:
+                        sx *= float(frame_w)
+                        sy *= float(frame_h)
+
                     x1, y1, x2, y2 = self._get_minimap_pixel_rect(frame_w, frame_h)
                     if x1 <= sx <= x2 and y1 <= sy <= y2:
+                        # Minimap ROI içinde bir tespit (sprout vb.)
                         mcx = (x1 + x2) / 2.0
                         mcy = y1 + (y2 - y1) * 0.545
                         rel_dx = (sx - mcx) * self.minimap_to_map_scale
                         rel_dy = (sy - mcy) * self.minimap_to_map_scale
+                        if math.hypot(rel_dx, rel_dy) < 3.5:
+                            return None
                         source_type = "minimap_auto"
                     else:
-                        rel_dx, rel_dy = self._project_3d_screen_to_map_offset(sx, sy, frame_w, frame_h)
+                        # 3D kamera görünümü tespiti (yön açısı ve perspektif foreshortening ile)
+                        heading = raw.get("heading_deg", raw.get("player_heading", self.player_heading_deg))
+                        rel_dx, rel_dy = self._project_3d_screen_to_map_offset(
+                            sx, sy, frame_w, frame_h, heading_deg=heading
+                        )
                         if source_type == "minimap_auto" and not raw_source:
                             source_type = "3d_auto"
 
+            # 6. Dead-reckoning yer değiştirme ofsetini ekle
+            dr_x = float(raw.get("dead_reckoning_dx", raw.get("dr_dx", 0.0)))
+            dr_y = float(raw.get("dead_reckoning_dy", raw.get("dr_dy", 0.0)))
+
             if rel_dx is None or rel_dy is None:
-                rel_dx, rel_dy = 0.0, 0.0
+                if source_type == "harvest_auto":
+                    rel_dx, rel_dy = 0.0, 0.0
+                else:
+                    # Koordinat bilgisi olmayan tespitler merkeze yapışmasın diye elenir
+                    return None
+
+            rel_dx += dr_x
+            rel_dy += dr_y
+
+            # 3D dünya tespitlerinde oyuncunun doğrudan ayak ucuna düşen sahte merkez kutuları ele
+            if source_type == "3d_auto" and math.hypot(rel_dx, rel_dy) < 3.0:
+                return None
 
             resource_type = str(
                 raw.get("resource_type")
@@ -1673,7 +2817,7 @@ class AutoCartographer:
                 max_harvests = DEFAULT_MAX_HARVESTS * stack_count
             current_harvests = max(0, int(raw.get("current_harvests", 0) or 0))
 
-            return {
+            parsed_res: Dict[str, Any] = {
                 "rel_map_dx": float(rel_dx),
                 "rel_map_dy": float(rel_dy),
                 "resource_type": resource_type,
@@ -1684,29 +2828,119 @@ class AutoCartographer:
                 "current_harvests": int(current_harvests),
                 "source_type": str(source_type),
             }
+            if exact_map_x is not None and exact_map_y is not None:
+                parsed_res["exact_map_x"] = round(float(exact_map_x), 3)
+                parsed_res["exact_map_y"] = round(float(exact_map_y), 3)
+                parsed_res["has_absolute_map_coords"] = True
+
+            return parsed_res
         except Exception as exc:
             logger.error("Materyal tespiti ayrıştırılırken hata: %s", exc)
             return None
+
+    def _inventory_recording_blocked(self, frame_bgr: np.ndarray) -> bool:
+        """
+        Çanta açıksa veya yeni kapanmışsa materyal kaydı yapma.
+        Kapanıştan sonra kısa süre (geçiş kareleri) de bloklu kalır.
+        """
+        now = time.time()
+        open_now = False
+        try:
+            if self.vision_engine is not None and hasattr(self.vision_engine, "is_inventory_open"):
+                open_now = bool(self.vision_engine.is_inventory_open(frame_bgr))
+            else:
+                from core.vision import detect_inventory_panel
+
+                open_now = bool(detect_inventory_panel(frame_bgr))
+        except Exception as exc:
+            logger.debug("Envanter kapısı okunamadı: %s", exc)
+            open_now = False
+        if open_now:
+            self._inventory_block_until = now + 0.9
+            return True
+        return now < float(self._inventory_block_until)
+
+    def _note_rel_track(
+        self,
+        tracked: TrackedResourceNode,
+        rel_dx: float,
+        rel_dy: float,
+        count_sighting: bool,
+    ) -> None:
+        """Kamerayla dönen aynı ikonun göreli ofsetini günceller. Konumu sürüklemez."""
+        if count_sighting:
+            tracked.sightings_count += 1
+            tracked.last_seen_timestamp = time.time()
+        tracked.last_rel_dx = float(rel_dx)
+        tracked.last_rel_dy = float(rel_dy)
+        tracked.rel_track_valid = True
+
+    def _find_orbit_continuation(
+        self,
+        region: str,
+        rel_dx: float,
+        rel_dy: float,
+    ) -> Optional[TrackedResourceNode]:
+        """
+        Aynı materyalin etrafında tur atınca ekran/minimap ofseti kayar ve dünya
+        koordinatı ``dedup_radius_px`` (22) dışına düşer. Son görülen göreli ofsete
+        yakın ve taze bir iz aynı ziyarettir; yeni düğüm açılmaz.
+        """
+        now = time.time()
+        best: Optional[TrackedResourceNode] = None
+        best_d = float("inf")
+        for tracked in self._tracked_nodes.get(region, []):
+            if not tracked.rel_track_valid:
+                continue
+            if (now - float(tracked.last_seen_timestamp)) > self._orbit_rel_max_age_sec:
+                continue
+            dist = math.hypot(rel_dx - tracked.last_rel_dx, rel_dy - tracked.last_rel_dy)
+            if dist <= self._orbit_rel_step_px and dist < best_d:
+                best = tracked
+                best_d = dist
+        return best
 
     def _find_nearest_tracked_node(
         self,
         region: str,
         node_map_x: float,
         node_map_y: float,
+        resource_type: Optional[str] = None,
     ) -> Tuple[Optional[TrackedResourceNode], float]:
         """
         Belirtilen bölgede `(node_map_x, node_map_y)` koordinatına `dedup_radius_px`
-        yarıçapı içindeki en yakın kayıtlı düğümü bulur.
+        (15-25px) yarıçapı içindeki en yakın kayıtlı düğümü bulur.
+        Sınır bölgelerinde (22-25px) mükerrer yığılmayı (duplicate piling) önler.
         """
         candidates = self._tracked_nodes.get(region, [])
+        if not candidates and self.route_manager is not None:
+            self._sync_existing_nodes_from_route_manager(self.route_manager, region=region)
+            candidates = self._tracked_nodes.get(region, [])
+
+        effective_radius = float(np.clip(self.dedup_radius_px, DEDUP_RADIUS_MIN_PX, DEDUP_RADIUS_MAX_PX))
         nearest: Optional[TrackedResourceNode] = None
         min_dist = float("inf")
 
         for tracked in candidates:
             dist = math.hypot(float(node_map_x - tracked.map_x), float(node_map_y - tracked.map_y))
-            if dist <= self.dedup_radius_px and dist < min_dist:
+            if dist <= effective_radius and dist < min_dist:
                 min_dist = dist
                 nearest = tracked
+
+        # Sınır bölgesi (effective_radius..25px) tekilleştirme koruması
+        if nearest is None and effective_radius < DEDUP_RADIUS_MAX_PX:
+            for tracked in candidates:
+                dist = math.hypot(float(node_map_x - tracked.map_x), float(node_map_y - tracked.map_y))
+                if dist <= DEDUP_RADIUS_MAX_PX and dist < min_dist:
+                    # Aynı materyal türü veya az sayıda görülmüş taze düğüm ise tekilleştir
+                    if (
+                        resource_type is None
+                        or resource_type in (DEFAULT_RESOURCE_TYPE, "Gatherable Material")
+                        or tracked.resource_type == resource_type
+                        or tracked.sightings_count <= 3
+                    ):
+                        min_dist = dist
+                        nearest = tracked
 
         return nearest, min_dist
 
@@ -1723,31 +2957,51 @@ class AutoCartographer:
         obs_resource_type: Optional[str] = None,
     ) -> None:
         """
-        Mevcut düğümün koordinatını 1D/2D Kalman kazancı ve EMA (Exponential Moving Average)
-        ağırlıklı ortalamasıyla daha hassas hale getirir ve `sightings_count` değerini artırır.
+        Mevcut düğümün koordinatını 2D Kalman kazancı ve EMA (Exponential Moving Average)
+        ağırlıklı ortalamasıyla daha hassas hale getirir; aykırı gözlemleri (outliers) sınırlayarak
+        merkeze yapışmayı (center-sticking) ve ani koordinat sıçramalarını önler.
         """
         try:
             tracked.sightings_count += 1
             tracked.last_seen_timestamp = time.time()
 
+            # Aykırı gözlem filtreleme ve sıçrama sınırlaması (outlier gating)
+            dx = float(obs_map_x) - tracked.map_x
+            dy = float(obs_map_y) - tracked.map_y
+            dist_obs = math.hypot(dx, dy)
+            if dist_obs > DEDUP_RADIUS_MAX_PX:
+                scale = 4.0 / dist_obs
+                clamped_obs_x = tracked.map_x + dx * scale
+                clamped_obs_y = tracked.map_y + dy * scale
+            else:
+                clamped_obs_x = float(obs_map_x)
+                clamped_obs_y = float(obs_map_y)
+
+            # 2D Kalman filtresi durum güncellemesi
             measurement_var = max(1.5, 12.0 / max(0.15, float(obs_confidence)))
             process_var = 0.25
-            pred_var = tracked.kalman_variance + process_var
-            kalman_gain = pred_var / (pred_var + measurement_var)
+            var_x = getattr(tracked, "kalman_variance_x", tracked.kalman_variance)
+            var_y = getattr(tracked, "kalman_variance_y", tracked.kalman_variance)
 
-            effective_weight = float(
-                np.clip(
-                    0.5 * kalman_gain + 0.5 * (self.ema_alpha / math.sqrt(tracked.sightings_count)),
-                    0.05,
-                    0.65,
-                )
-            )
+            pred_var_x = var_x + process_var
+            pred_var_y = var_y + process_var
+            gain_x = pred_var_x / (pred_var_x + measurement_var)
+            gain_y = pred_var_y / (pred_var_y + measurement_var)
 
-            tracked.map_x = (1.0 - effective_weight) * tracked.map_x + effective_weight * float(obs_map_x)
-            tracked.map_y = (1.0 - effective_weight) * tracked.map_y + effective_weight * float(obs_map_y)
+            # EMA ağırlığı ile Kalman kazancını birleştir
+            ema_weight = self.ema_alpha / math.sqrt(max(1, tracked.sightings_count))
+            eff_weight_x = float(np.clip(0.5 * gain_x + 0.5 * ema_weight, 0.04, 0.55))
+            eff_weight_y = float(np.clip(0.5 * gain_y + 0.5 * ema_weight, 0.04, 0.55))
+
+            tracked.map_x = (1.0 - eff_weight_x) * tracked.map_x + eff_weight_x * clamped_obs_x
+            tracked.map_y = (1.0 - eff_weight_y) * tracked.map_y + eff_weight_y * clamped_obs_y
             tracked.norm_x = round(tracked.map_x / float(max(1, self.map_width)), 4)
             tracked.norm_y = round(tracked.map_y / float(max(1, self.map_height)), 4)
-            tracked.kalman_variance = (1.0 - kalman_gain) * pred_var
+
+            tracked.kalman_variance_x = (1.0 - gain_x) * pred_var_x
+            tracked.kalman_variance_y = (1.0 - gain_y) * pred_var_y
+            tracked.kalman_variance = round(0.5 * (tracked.kalman_variance_x + tracked.kalman_variance_y), 4)
+
             tracked.confidence = round(
                 min(1.0, max(tracked.confidence, float(obs_confidence)) + 0.02),
                 4,
@@ -1767,6 +3021,17 @@ class AutoCartographer:
 
             if route and route != DEFAULT_ROUTE and route not in tracked.routes:
                 tracked.routes.append(route)
+
+            if self.auto_cartography_enabled:
+                self.last_mapped_info = {
+                    "type": "node_update",
+                    "node_id": tracked.node_id,
+                    "resource_type": tracked.resource_type,
+                    "map_x": int(round(tracked.map_x)),
+                    "map_y": int(round(tracked.map_y)),
+                    "timestamp": time.time(),
+                    "sightings": tracked.sightings_count,
+                }
 
             rm = route_manager or self.route_manager
             if rm is not None:
@@ -1802,6 +3067,9 @@ class AutoCartographer:
         `current_harvests = 0` olarak kaydeder.
         """
         newly_discovered_nodes: List[Dict[str, Any]] = []
+        if not parsed_items:
+            return newly_discovered_nodes
+
         rm = route_manager or self.route_manager
         target_region = str(
             region
@@ -1817,7 +3085,18 @@ class AutoCartographer:
         if rm is not None:
             self._sync_existing_nodes_from_route_manager(rm, region=target_region)
 
-        for parsed in parsed_items:
+        # 1. Aynı kare/tespit grubu içindeki tespitleri dedup_radius_px ile kümele
+        clustered_items = self.cluster_detections(parsed_items, cluster_radius=self.dedup_radius_px)
+
+        # Odometri takipçisi konumunu güncel tut
+        self.odometry_tracker.map_x = float(self.map_x)
+        self.odometry_tracker.map_y = float(self.map_y)
+        self.odometry_tracker.map_width = int(self.map_width)
+        self.odometry_tracker.map_height = int(self.map_height)
+        self.odometry_tracker.dead_reckoning_dx = float(self.dead_reckoning_dx)
+        self.odometry_tracker.dead_reckoning_dy = float(self.dead_reckoning_dy)
+
+        for parsed in clustered_items:
             rel_dx = float(parsed["rel_map_dx"])
             rel_dy = float(parsed["rel_map_dy"])
             resource_type = str(parsed["resource_type"])
@@ -1831,14 +3110,81 @@ class AutoCartographer:
             current_harvests = max(0, int(parsed.get("current_harvests", 0)))
             source_type = str(parsed.get("source_type", "minimap_auto"))
 
-            node_map_x, node_map_y, norm_x, norm_y = self.odometry_tracker.offset_to_world_coords(
-                rel_dx, rel_dy
+            if parsed.get("has_absolute_map_coords") and parsed.get("exact_map_x") is not None and parsed.get("exact_map_y") is not None:
+                node_map_x = float(parsed["exact_map_x"])
+                node_map_y = float(parsed["exact_map_y"])
+                norm_x = round(node_map_x / float(max(1, self.map_width)), 4)
+                norm_y = round(node_map_y / float(max(1, self.map_height)), 4)
+            else:
+                node_map_x, node_map_y, norm_x, norm_y = self.odometry_tracker.offset_to_world_coords(
+                    rel_dx,
+                    rel_dy,
+                    is_map_offset=True,
+                    dead_reckoning_dx=self.dead_reckoning_dx,
+                    dead_reckoning_dy=self.dead_reckoning_dy,
+                )
+
+            # Yeni kaynak veya aday için patch kırp ve kapıdan geçir
+            patch_80 = self.extract_clean_minimap_patch(
+                frame_bgr=bgr,
+                rel_map_dx=rel_dx,
+                rel_map_dy=rel_dy,
             )
+            if is_parchment_scroll_patch(patch_80):
+                logger.info(
+                    "Parşömen ikonu toplanabilir değil, düğüm yazılmadı (%s, konum=%.0f,%.0f)",
+                    resource_type,
+                    node_map_x,
+                    node_map_y,
+                )
+                self.total_gate_rejected += 1
+                continue
+
+            # Low-confidence 3D projections without a harvest prompt are too noisy.
+            if source_type == "3d_auto" and confidence < WORLD_3D_CONF_MIN:
+                logger.info(
+                    "3D aday düşük güven (%.2f < %.2f), düğüm yazılmadı (%s)",
+                    confidence,
+                    WORLD_3D_CONF_MIN,
+                    resource_type,
+                )
+                self.total_gate_rejected += 1
+                continue
+
+            gate = evaluate_node_candidate(
+                patch_80,
+                source_type=source_type,
+                resource_type=resource_type,
+                detector=self._get_quality_detector(),
+                conf_min=MODEL_CONF_MIN,
+                check_feather=True,
+                check_monster=source_type.startswith("minimap"),
+                exemplar_memory=self._get_exemplar_memory(),
+            )
+            if gate.reject:
+                self.total_gate_rejected += 1
+                logger.info(
+                    "AI/CV/Exemplar kapısı reddetti [%s]: reasons=%s class=%s conf=%s (%s @ %.0f,%.0f)",
+                    source_type,
+                    gate.reasons,
+                    gate.class_id,
+                    None if gate.confidence is None else round(float(gate.confidence), 3),
+                    resource_type,
+                    node_map_x,
+                    node_map_y,
+                )
+                continue
+
+            if getattr(gate, "verified_resource_type", None):
+                resource_type = gate.verified_resource_type
+            if getattr(gate, "exemplar_sim", None):
+                confidence = max(confidence, float(gate.exemplar_sim))
 
             existing_node, dist_px = self._find_nearest_tracked_node(
                 region=target_region,
                 node_map_x=node_map_x,
                 node_map_y=node_map_y,
+                resource_type=resource_type,
             )
 
             if existing_node is not None:
@@ -1853,6 +3199,10 @@ class AutoCartographer:
                     obs_max_harvests=max_harvests,
                     obs_resource_type=resource_type,
                 )
+                self._note_rel_track(existing_node, rel_dx, rel_dy, count_sighting=False)
+                self._emit_node_updated(existing_node.to_dict())
+                if self.auto_cartography_enabled:
+                    self.persist_to_region_data(target_region)
                 logger.debug(
                     "Mevcut kaynak tekilleştirildi (ID=#%d, mesafe=%.2f px <= %.1f px): "
                     "güncel konum=(%.2f, %.2f), sightings=%d, max_harvests=%d",
@@ -1866,12 +3216,17 @@ class AutoCartographer:
                 )
                 continue
 
-            # Yeni kaynak keşfedildi -> Minimap'ten 80x80 gri patch kırp
-            patch_80 = self.extract_clean_minimap_patch(
-                frame_bgr=bgr,
-                rel_map_dx=rel_dx,
-                rel_map_dy=rel_dy,
-            )
+            orbit_node = self._find_orbit_continuation(target_region, rel_dx, rel_dy)
+            if orbit_node is not None:
+                self._note_rel_track(orbit_node, rel_dx, rel_dy, count_sighting=True)
+                self._emit_node_updated(orbit_node.to_dict())
+                logger.debug(
+                    "Aynı ziyaret (tur) tekilleştirildi ID=#%d rel=(%.1f, %.1f) -> yeni kayıt yok",
+                    orbit_node.node_id,
+                    rel_dx,
+                    rel_dy,
+                )
+                continue
 
             routes_list = [target_route] if target_route and target_route != DEFAULT_ROUTE else []
             created_node: Optional[NodeData] = None
@@ -1938,6 +3293,7 @@ class AutoCartographer:
                 current_harvests=current_harvests,
                 source_type=source_type,
             )
+            self._note_rel_track(tracked_new, rel_dx, rel_dy, count_sighting=False)
             self._tracked_nodes.setdefault(target_region, []).append(tracked_new)
 
             if source_type == "minimap_auto":
@@ -1950,6 +3306,24 @@ class AutoCartographer:
 
             node_dict = tracked_new.to_dict()
             newly_discovered_nodes.append(node_dict)
+            self._emit_node_discovered(node_dict)
+
+            if self.auto_cartography_enabled:
+                self.auto_mapped_count += 1
+                self.last_mapped_info = {
+                    "type": "node",
+                    "node_id": assigned_id,
+                    "resource_type": resource_type,
+                    "map_x": int(round(node_map_x)),
+                    "map_y": int(round(node_map_y)),
+                    "timestamp": time.time(),
+                    "source_type": source_type,
+                    "confidence": round(confidence, 3),
+                }
+                rg = self.get_route_graph(target_region)
+                rg.connect_node_to_nearest_waypoint(assigned_id, node_map_x, node_map_y)
+                self.persist_to_region_data(target_region)
+
             logger.info(
                 "Yeni materyal otomatik haritalandırıldı [%s]: Bölge=%s, Rota=%s, ID=#%d (%s) "
                 "konum=(%d, %d), max_harvests=%d (stack=%d), patch=%dx%d -> %s",
@@ -1988,6 +3362,9 @@ class AutoCartographer:
         try:
             bgr = self._ensure_bgr(frame)
             if bgr is None:
+                return []
+
+            if self._inventory_recording_blocked(bgr):
                 return []
 
             if update_odometry or not self.walk_trajectory:
@@ -2222,6 +3599,9 @@ class AutoCartographer:
             if bgr is None:
                 return []
 
+            if self._inventory_recording_blocked(bgr):
+                return []
+
             if update_odometry or not self.walk_trajectory:
                 self.update_player_position(bgr)
 
@@ -2248,6 +3628,196 @@ class AutoCartographer:
         except Exception as exc:
             logger.error("process_frame_discoveries hatası: %s", exc)
             return []
+
+    def record_node(
+        self,
+        patch_or_frame: Optional[np.ndarray] = None,
+        *args: Any,
+        patch: Optional[np.ndarray] = None,
+        frame: Optional[np.ndarray] = None,
+        map_x: Optional[float] = None,
+        map_y: Optional[float] = None,
+        resource_type: Optional[str] = None,
+        route_manager: Optional[RouteManager] = None,
+        region: Optional[str] = None,
+        route: Optional[str] = None,
+        source_type: str = "manual_auto",
+        exemplar_memory: Optional[Any] = None,
+        in_air: bool = False,
+        stack_count: int = 1,
+        max_harvests: Optional[int] = None,
+        confidence: float = 0.95,
+        **kwargs: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Directly inspects and records a candidate node patch or position:
+        1. Inspects candidate patch against ExemplarMemory (and multi-signal gate):
+           - Drops candidate patches matching negative exemplars immediately so false
+             nodes never enter RouteManager or the map.
+           - Tags candidate patches matching positive exemplars with their verified material class.
+        2. Performs spatial deduplication and Kalman/EMA coordinate refinement if existing
+           node within dedup_radius_px.
+        3. Persists clean nodes to RouteManager and notifies radar/UI listeners.
+        """
+        try:
+            target_patch = patch
+            target_frame = frame
+            if target_patch is None and patch_or_frame is not None:
+                if isinstance(patch_or_frame, np.ndarray):
+                    if patch_or_frame.ndim in (2, 3) and max(patch_or_frame.shape[:2]) <= 120:
+                        target_patch = patch_or_frame
+                    else:
+                        target_frame = patch_or_frame
+
+            node_map_x = float(map_x if map_x is not None else self.map_x)
+            node_map_y = float(map_y if map_y is not None else self.map_y)
+
+            if target_patch is None:
+                if target_frame is not None:
+                    target_patch = self.extract_clean_minimap_patch(
+                        frame_bgr=target_frame,
+                        rel_map_dx=0.0,
+                        rel_map_dy=0.0,
+                    )
+                else:
+                    target_patch = np.full((80, 80, 3), 120, dtype=np.uint8)
+
+            mem = exemplar_memory or self._get_exemplar_memory()
+
+            gate = evaluate_node_candidate(
+                target_patch,
+                source_type=source_type,
+                resource_type=resource_type or DEFAULT_RESOURCE_TYPE,
+                detector=self._get_quality_detector(),
+                conf_min=MODEL_CONF_MIN,
+                exemplar_memory=mem,
+                check_feather=kwargs.get("check_feather", True),
+                check_monster=kwargs.get("check_monster", source_type.startswith("minimap")),
+                check_exemplars=kwargs.get("check_exemplars", True),
+                check_terrain=kwargs.get("check_terrain", True),
+            )
+            if gate.reject:
+                self.total_gate_rejected += 1
+                logger.info(
+                    "AutoCartographer.record_node: candidate patch rejected [%s]: reasons=%s class=%s conf=%s",
+                    source_type,
+                    gate.reasons,
+                    gate.class_id,
+                    None if gate.confidence is None else round(float(gate.confidence), 3),
+                )
+                return None
+
+            final_res = str(
+                gate.verified_resource_type
+                or resource_type
+                or DEFAULT_RESOURCE_TYPE
+            )
+            final_conf = max(float(confidence), float(gate.exemplar_sim or 0.0))
+            st_cnt = max(1, int(stack_count))
+            max_h = max(DEFAULT_MAX_HARVESTS * st_cnt, int(max_harvests or (DEFAULT_MAX_HARVESTS * st_cnt)))
+
+            rm = route_manager or self.route_manager
+            target_region = str(region or (rm.active_region if rm else DEFAULT_REGION) or DEFAULT_REGION).strip()
+            target_route = str(route or (rm.active_route if rm else DEFAULT_ROUTE) or DEFAULT_ROUTE).strip()
+
+            # Kara liste (Blacklist) kontrolü: Engellenmiş koordinata kayıt yapılmaz
+            try:
+                from core.blacklist_manager import get_blacklist_manager
+                bl_mgr = get_blacklist_manager()
+                is_bl, _ = bl_mgr.is_blacklisted(target_region, node_map_x, node_map_y)
+                if is_bl:
+                    logger.debug(
+                        "[AutoCartographer] Kara listede bulunan konum atlandı: %s (%.1f, %.1f)",
+                        target_region,
+                        node_map_x,
+                        node_map_y,
+                    )
+                    return None
+            except Exception:
+                pass
+
+            if rm is not None:
+                self._sync_existing_nodes_from_route_manager(rm, region=target_region)
+
+            existing_node, dist_px = self._find_nearest_tracked_node(
+                region=target_region,
+                node_map_x=node_map_x,
+                node_map_y=node_map_y,
+            )
+
+            if existing_node is not None:
+                self._refine_existing_node_kalman_ema(
+                    tracked=existing_node,
+                    obs_map_x=node_map_x,
+                    obs_map_y=node_map_y,
+                    obs_confidence=final_conf,
+                    route_manager=rm,
+                    route=target_route,
+                    obs_stack_count=st_cnt,
+                    obs_max_harvests=max_h,
+                    obs_resource_type=final_res,
+                )
+                self._emit_node_updated(existing_node.to_dict())
+                return existing_node.to_dict()
+
+            norm_x = round(node_map_x / float(max(1, self.map_width)), 4)
+            norm_y = round(node_map_y / float(max(1, self.map_height)), 4)
+            routes_list = [target_route] if target_route and target_route != DEFAULT_ROUTE else []
+            created_node: Optional[NodeData] = None
+
+            if rm is not None:
+                created_node = rm.add_node(
+                    region=target_region,
+                    route=target_route,
+                    patch_img=target_patch,
+                    in_air=in_air,
+                    map_x=int(round(node_map_x)),
+                    map_y=int(round(node_map_y)),
+                    norm_x=norm_x,
+                    norm_y=norm_y,
+                    resource_type=final_res,
+                )
+                if created_node is not None:
+                    setattr(created_node, "max_harvests", int(max_h))
+                    setattr(created_node, "current_harvests", 0)
+                    setattr(created_node, "stack_count", int(st_cnt))
+                    setattr(created_node, "source_type", str(source_type))
+                    self._save_direct_region_node_patch(
+                        base_dir=rm.base_dir,
+                        region=target_region,
+                        node_id=created_node.id,
+                        patch_img=target_patch,
+                    )
+
+            assigned_id = int(created_node.id) if created_node is not None else len(self._tracked_nodes.get(target_region, [])) + 1
+            patch_path = created_node.patch_path if created_node is not None else f"routes/{target_region}/node_{assigned_id:02d}.png"
+
+            tracked_new = TrackedResourceNode(
+                node_id=assigned_id,
+                region=target_region,
+                routes=routes_list,
+                resource_type=final_res,
+                map_x=node_map_x,
+                map_y=node_map_y,
+                norm_x=norm_x,
+                norm_y=norm_y,
+                in_air=in_air,
+                sightings_count=1,
+                confidence=final_conf,
+                patch_path=patch_path,
+                patch_img=target_patch,
+                stack_count=st_cnt,
+                max_harvests=max_h,
+                current_harvests=0,
+                source_type=source_type,
+            )
+            self._tracked_nodes.setdefault(target_region, []).append(tracked_new)
+            node_dict = tracked_new.to_dict()
+            self._emit_node_discovered(node_dict)
+            return node_dict
+        except Exception as exc:
+            logger.error("AutoCartographer.record_node error: %s", exc)
+            return None
 
     def record_node_harvest(
         self,
@@ -2285,6 +3855,15 @@ class AutoCartographer:
 
             if target_node is None:
                 return None
+
+            if rm is not None:
+                existing = rm.get_node(target_node.node_id, region=target_region)
+                if existing is not None and bool(getattr(existing, "not_gatherable", False)):
+                    logger.info(
+                        "Düğüm #%d parşömen, hasat sayılmadı",
+                        int(target_node.node_id),
+                    )
+                    return None
 
             target_node.current_harvests = min(
                 target_node.max_harvests,
@@ -2325,11 +3904,20 @@ class AutoCartographer:
         """
         try:
             nodes = self.get_tracked_nodes(region=region)
+            target_region = str(region or self.active_region or DEFAULT_REGION)
+            rg = self.get_route_graph(target_region)
             total_max_harvests = sum(int(n.get("max_harvests", DEFAULT_MAX_HARVESTS)) for n in nodes)
             total_current_harvests = sum(int(n.get("current_harvests", 0)) for n in nodes)
             total_available_harvests = sum(int(n.get("remaining_harvests", DEFAULT_MAX_HARVESTS)) for n in nodes)
             return {
                 "total_nodes": len(nodes),
+                "auto_mapped": int(self.auto_mapped_count),
+                "last_mapped": dict(self.last_mapped_info) if self.last_mapped_info else None,
+                "auto_cartography_mode": bool(self.auto_cartography_enabled),
+                "graph_nodes_count": len(nodes),
+                "graph_waypoints_count": len(rg.waypoints),
+                "graph_edges_count": len(rg.edges),
+                "graph_total_distance_px": round(float(rg.total_distance), 2),
                 "total_minimap_recorded": int(self.total_minimap_recorded),
                 "total_3d_recorded": int(self.total_3d_recorded),
                 "total_harvest_recorded": int(self.total_harvest_recorded),
@@ -2348,6 +3936,13 @@ class AutoCartographer:
             logger.error("get_cartography_stats hatası: %s", exc)
             return {
                 "total_nodes": 0,
+                "auto_mapped": int(self.auto_mapped_count),
+                "last_mapped": dict(self.last_mapped_info) if self.last_mapped_info else None,
+                "auto_cartography_mode": bool(self.auto_cartography_enabled),
+                "graph_nodes_count": 0,
+                "graph_waypoints_count": 0,
+                "graph_edges_count": 0,
+                "graph_total_distance_px": 0.0,
                 "total_minimap_recorded": int(self.total_minimap_recorded),
                 "total_3d_recorded": int(self.total_3d_recorded),
                 "total_harvest_recorded": int(self.total_harvest_recorded),
@@ -2413,7 +4008,15 @@ class AutoCartographer:
 
 
 def get_auto_cartographer_capabilities() -> list:
-    return ["auto_cartographer", "minimap_mapping", "diagnostic_snapshot"]
+    return [
+        "auto_cartographer",
+        "minimap_mapping",
+        "diagnostic_snapshot",
+        "autonomous_route_graph",
+        "spatial_clustering_15_25px",
+        "kalman_ema_smoothing",
+        "exemplar_learning_filter",
+    ]
 
 
 def validate_auto_cartographer_contract() -> bool:

@@ -9,7 +9,10 @@
         "inter_harvest_delay_max": 1.4,
         "retry_on_extraction_fail": true,
         "max_retries_per_harvest_stage": 2,
-        "gather_key": "f"
+        "gather_key": "f",
+        "selective_gather_enabled": false,
+        "selected_materials": [],
+        "proximity_route_auto": true
     },
     "route": {
         "rest_minutes": 5,
@@ -18,21 +21,24 @@
         "fly_unreachable": true,
         "check_odyle_minimap": true,
         "reclick_node_sec": 10,
-        "time_to_reach_sec": 60,
+        "time_to_reach_sec": 58,
         "gather_on_the_way": false,
         "wait_min_after_failed": 5,
         "max_failed_in_row": 10,
         "remove_node_after_failures": 0,
         "pause_after_no_gather_min": 15,
-        "fight_back": true,
-        "fight_stop_gather_sec": 3,
+        "fight_back": false,
+        "fight_stop_gather_sec": 0,
         "harvests_per_node": 3,
         "minimap_auto_record": true,
         "minimap_ignore_monsters": true,
         "minimap_auto_filter_check": true,
         "minimap_cluster_stack_bonus": true,
         "hybrid_3d_and_minimap_record": true,
-        "auto_record_3d_crests": true
+        "auto_record_3d_crests": true,
+        "mp_full_threshold": 0.95,
+        "ucb_explore_ratio": 0.2,
+        "skill_discovery_enabled": true
     },
     "breaks": {
         "break_every_min": 0,
@@ -40,7 +46,19 @@
         "break_lasts_min": 10,
         "break_lasts_variance": 1
     },
+    "hotkeys": {
+        "toggle_menu_f9": "ctrl+alt+f9",
+        "record_node_f8": "ctrl+alt+f8",
+        "pause_resume_f10": "ctrl+alt+f10",
+        "emergency_exit": "esc"
+    },
+    "display": {
+        "ui_proportion": "Medium",
+        "monitor_idx": 1,
+        "last_tab": "yolo"
+    },
     "active_region": "Altgard",
     "active_route": "Dredgion Crash Site",
-    "version": "v1.6.15"
+    "version": "v1.6.15",
+    "reflex_model": "yolov8"
 }

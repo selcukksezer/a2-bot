@@ -14,6 +14,7 @@ Exclusive Owner: Dataset Factory Sub-Agent 5 (`dataset_factory/dataset_curator.p
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import errno
 import json
 import logging
 import math
@@ -48,24 +49,57 @@ if not logger.handlers:
 # Canonical 12-Class YOLO Taxonomy for Aion 2 Resource Nodes
 # =============================================================================
 
-TARGET_DATASET_GOAL: int = 5000
+TARGET_DATASET_GOAL: int = 100000
 
 YOLO_12_CLASS_NAMES: Dict[int, str] = {
     0: "herb_aria",
     1: "herb_mela",
     2: "herb_targena",
-    3: "herb_calendula",
-    4: "ore_orichalcum",
-    5: "ore_iron_silver",
-    6: "gem_sapphire",
-    7: "gem_ruby",
-    8: "gem_diamond",
-    9: "gem_crystal",
-    10: "log_yggdrasil",
-    11: "aether_odyle",
+    3: "ore_orichalcum",
+    4: "gem_crystal",
+    5: "wood_tree",
+    6: "world_gather_crest",
+    7: "f_gather_prompt",
+    8: "combo_skill_prompt",
+    9: "minimap_sprout",
+    10: "monster_3d",
+    11: "minimap_monster_dot",
+    12: "world_material",
+    13: "skill_ui_prompt",
+    14: "obstacle",
+    15: "path_ground",
+}
+
+# Old curator aliases used a different 12-id layout. Translate those ids onto the
+# stable train ids. Integer ids already stored in txt files are not translated.
+_LEGACY_MATERIAL_ID_TO_STABLE: Dict[int, int] = {
+    0: 0,
+    1: 1,
+    2: 2,
+    3: 2,
+    4: 3,
+    5: 3,
+    6: 4,
+    7: 4,
+    8: 4,
+    9: 4,
+    10: 5,
+    11: 4,
 }
 
 CLASS_NAME_TO_ID: Dict[str, int] = {name: cid for cid, name in YOLO_12_CLASS_NAMES.items()}
+
+try:
+    from dataset_factory.class_taxonomy import dataset_class_names as _taxonomy_class_names
+
+    _expanded_names = _taxonomy_class_names()
+except Exception:
+    _expanded_names = {}
+if _expanded_names:
+    YOLO_12_CLASS_NAMES.clear()
+    YOLO_12_CLASS_NAMES.update(_expanded_names)
+    CLASS_NAME_TO_ID.clear()
+    CLASS_NAME_TO_ID.update({name: cid for cid, name in YOLO_12_CLASS_NAMES.items()})
 
 # High-contrast BGR colors for preview bounding boxes per class ID
 CLASS_PREVIEW_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
@@ -173,7 +207,7 @@ MATERIAL_ALIAS_TO_CLASS_ID: Dict[str, int] = {
 def resolve_yolo_class_id_and_name(raw_value: Union[int, str, None]) -> Tuple[int, str]:
     """
     Resolve an integer class ID, YOLO class key, or Aion 2 material name into
-    a canonical `(class_id, class_name)` pair in `0..11`.
+    a canonical `(class_id, class_name)` pair. Ids 0..11 stay stable; 12..15 are appended.
     """
     if raw_value is None:
         return 0, YOLO_12_CLASS_NAMES[0]
@@ -191,36 +225,202 @@ def resolve_yolo_class_id_and_name(raw_value: Union[int, str, None]) -> Tuple[in
         return cid, YOLO_12_CLASS_NAMES[cid]
 
     lowered = text.lower()
+    if lowered in CLASS_NAME_TO_ID:
+        cid = CLASS_NAME_TO_ID[lowered]
+        return cid, YOLO_12_CLASS_NAMES[cid]
+
+    try:
+        from dataset_factory.class_taxonomy import class_id_for_material_text
+
+        specific = class_id_for_material_text(lowered)
+    except Exception:
+        specific = None
+    if specific is not None and specific in YOLO_12_CLASS_NAMES:
+        return int(specific), YOLO_12_CLASS_NAMES[int(specific)]
+
+    if "gatherable plant" in lowered or "gatherable material" in lowered or "world_material" in lowered:
+        return 12, YOLO_12_CLASS_NAMES[12]
+    if "skill" in lowered or "cooldown" in lowered or "vitality" in lowered:
+        return 13, YOLO_12_CLASS_NAMES[13]
+    if "obstacle" in lowered or "engel" in lowered or "cliff" in lowered:
+        return 14, YOLO_12_CLASS_NAMES[14]
+    if "path_ground" in lowered or "walking path" in lowered:
+        return 15, YOLO_12_CLASS_NAMES[15]
+    if "sprout" in lowered or "filiz" in lowered:
+        return 9, YOLO_12_CLASS_NAMES[9]
+    if "minimap_monster" in lowered or "monster_dot" in lowered:
+        return 11, YOLO_12_CLASS_NAMES[11]
+    if "monster" in lowered or "canavar" in lowered:
+        return 10, YOLO_12_CLASS_NAMES[10]
+    if "crest" in lowered or "amblem" in lowered:
+        return 6, YOLO_12_CLASS_NAMES[6]
+    if "f_gather" in lowered or "f gather" in lowered:
+        return 7, YOLO_12_CLASS_NAMES[7]
+    if "e_gather" in lowered or "e_floating" in lowered or "floating" in lowered:
+        return 8, YOLO_12_CLASS_NAMES[8]
+
     if lowered in MATERIAL_ALIAS_TO_CLASS_ID:
-        cid = MATERIAL_ALIAS_TO_CLASS_ID[lowered]
+        legacy = int(MATERIAL_ALIAS_TO_CLASS_ID[lowered])
+        cid = _LEGACY_MATERIAL_ID_TO_STABLE.get(legacy, 12)
         return cid, YOLO_12_CLASS_NAMES[cid]
 
     if "aria" in lowered:
         return 0, YOLO_12_CLASS_NAMES[0]
     if "mela" in lowered or "berry" in lowered or "fruit" in lowered:
         return 1, YOLO_12_CLASS_NAMES[1]
-    if "targena" in lowered or "lura" in lowered:
+    if "targena" in lowered or "lura" in lowered or "calendula" in lowered or "azpha" in lowered or "herb" in lowered:
         return 2, YOLO_12_CLASS_NAMES[2]
-    if "calendula" in lowered or "azpha" in lowered or "herb" in lowered:
+    if "orichalcum" in lowered or "ore" in lowered or "iron" in lowered or "silver" in lowered or "copper" in lowered or "gold" in lowered:
         return 3, YOLO_12_CLASS_NAMES[3]
-    if "orichalcum" in lowered:
+    if (
+        "sapphire" in lowered
+        or "aquamarine" in lowered
+        or "ruby" in lowered
+        or "garnet" in lowered
+        or "diamond" in lowered
+        or "crystal" in lowered
+        or "quartz" in lowered
+        or "amethyst" in lowered
+        or "gem" in lowered
+        or "odyle" in lowered
+        or "aether" in lowered
+    ):
         return 4, YOLO_12_CLASS_NAMES[4]
-    if "ore" in lowered or "iron" in lowered or "silver" in lowered or "copper" in lowered or "gold" in lowered:
-        return 5, YOLO_12_CLASS_NAMES[5]
-    if "sapphire" in lowered or "aquamarine" in lowered:
-        return 6, YOLO_12_CLASS_NAMES[6]
-    if "ruby" in lowered or "garnet" in lowered:
-        return 7, YOLO_12_CLASS_NAMES[7]
-    if "diamond" in lowered:
-        return 8, YOLO_12_CLASS_NAMES[8]
-    if "crystal" in lowered or "quartz" in lowered or "amethyst" in lowered or "gem" in lowered:
-        return 9, YOLO_12_CLASS_NAMES[9]
     if "log" in lowered or "tree" in lowered or "yggdrasil" in lowered or "asvata" in lowered or "wood" in lowered:
-        return 10, YOLO_12_CLASS_NAMES[10]
-    if "odyle" in lowered or "aether" in lowered or "gather" in lowered or "sprout" in lowered:
-        return 11, YOLO_12_CLASS_NAMES[11]
+        return 5, YOLO_12_CLASS_NAMES[5]
 
-    return 4, YOLO_12_CLASS_NAMES[4]
+    return 12, YOLO_12_CLASS_NAMES[12]
+
+
+# =============================================================================
+# Calibrated Trust Scoring & Unverified Heuristic Source Constants
+# =============================================================================
+
+try:
+    from dataset_factory.label_trust import UNVERIFIED_HEURISTIC_SOURCES
+except (ImportError, AttributeError):
+    UNVERIFIED_HEURISTIC_SOURCES = frozenset({
+        "chromatic_salient_3d_resource",
+        "visual_ground_path_segmenter",
+        "visual_obstacle_segmenter",
+        "hud_skill_slot",
+        "hud_player_hp_bar",
+        "hud_player_mp_bar",
+        "dataset_requeue",
+        "legacy_auto",
+        "center_anchor_fallback",
+        "gather_material_hint",
+    })
+
+
+def calibrate_box_trust(
+    box: Dict[str, Any],
+    stem: str = "",
+    emin_threshold: float = 0.85,
+) -> Dict[str, Any]:
+    """
+    Calibrate box confidence score and determine trusted (🟢 Emin) vs weak (🟠 Şüpheli).
+    Delegates to dataset_factory.label_trust.calibrate_box_confidence_and_trust if available,
+    otherwise strictly applies proof-based immunity, unverified heuristic caps (<= 0.68),
+    and stem-mismatch penalties (<= 0.45).
+    """
+    try:
+        from dataset_factory.label_trust import calibrate_box_confidence_and_trust as _lt_cal
+
+        if callable(_lt_cal):
+            return _lt_cal(box, stem=stem, emin_threshold=emin_threshold)
+    except (ImportError, AttributeError):
+        pass
+
+    b = dict(box)
+    source = str(b.get("source", "")).strip().lower()
+    cid = int(b.get("class_id", -1))
+    try:
+        conf = float(b.get("confidence", b.get("conf", 0.0)))
+    except (TypeError, ValueError):
+        conf = 0.0
+
+    # 1. Dokunulmazlık Kalkanı (Immunity Shield):
+    # hand_label, human_approved, approved, or F/E gather prompt seed
+    is_immune = (
+        b.get("hand_label") is True
+        or b.get("human_approved") is True
+        or b.get("approved") is True
+        or b.get("confirmed") is True
+        or any(tok in source for tok in ("hand", "manual", "human"))
+        or source.startswith("gather_crest")
+        or (cid == 7 and any(tok in source for tok in ("f_gather", "gather_prompt", "f_template")))
+        or (cid == 8 and any(tok in source for tok in ("e_gather", "floating", "e_template")))
+    )
+
+    if is_immune:
+        conf = max(0.90, conf)
+        b["confidence"] = round(conf, 4)
+        b["trusted"] = True
+        b["weak"] = False
+        return b
+
+    # 2. Exemplar match (verified by ExemplarMemory)
+    if b.get("exemplar_match") is True and conf >= emin_threshold:
+        b["confidence"] = round(conf, 4)
+        b["trusted"] = True
+        b["weak"] = False
+        return b
+
+    # 3. UNVERIFIED_HEURISTIC_SOURCES:
+    # Never trusted without human approval, strictly capped at <= 0.68
+    try:
+        from dataset_factory.label_trust import UNVERIFIED_HEURISTIC_SOURCES as _sources
+    except (ImportError, AttributeError):
+        _sources = UNVERIFIED_HEURISTIC_SOURCES
+
+    is_unverified = (
+        source in _sources
+        or any(src in source for src in _sources)
+        or source.startswith("omni_")
+        or b.get("omni_synthetic") is True
+    )
+
+    if is_unverified:
+        conf = min(conf, 0.68)
+        b["confidence"] = round(conf, 4)
+        b["trusted"] = False
+        b["weak"] = True
+        return b
+
+    # 4. Stem-based material mismatch penalty
+    stem_lower = str(stem or "").lower()
+    canonical_materials = {
+        0: "aria",
+        1: "mela",
+        2: "targena",
+        3: "calendula",
+        4: "orichalcum",
+        5: "iron",
+        6: "sapphire",
+        7: "ruby",
+        8: "diamond",
+        9: "crystal",
+    }
+    stem_mat_cid = None
+    for mcid, mname in canonical_materials.items():
+        if mname in stem_lower:
+            stem_mat_cid = mcid
+            break
+
+    if stem_mat_cid is not None and cid in canonical_materials and cid != stem_mat_cid:
+        conf = min(conf, 0.45)
+        b["confidence"] = round(conf, 4)
+        b["trusted"] = False
+        b["weak"] = True
+        return b
+
+    # 5. Standard confidence threshold check
+    is_emin = conf >= float(emin_threshold)
+    b["confidence"] = round(conf, 4)
+    b["trusted"] = bool(is_emin)
+    b["weak"] = not bool(is_emin)
+    return b
 
 
 # =============================================================================
@@ -231,12 +431,22 @@ def imread_unicode(path: Union[str, Path], flags: int = cv2.IMREAD_COLOR) -> Opt
     """
     Safely read an image file from disk when the path contains non-ASCII / Turkish
     characters (such as `C:\\Users\\selçuk\\Desktop\\a2`) using `np.fromfile` + `cv2.imdecode`.
+    Fast-paths ASCII paths directly via OpenCV C++ backend to release Python GIL.
     """
     file_path = Path(path)
     if not file_path.is_file():
         return None
     try:
-        raw_bytes = np.fromfile(str(file_path), dtype=np.uint8)
+        p_str = str(file_path)
+        try:
+            p_str.encode("ascii")
+            img = cv2.imread(p_str, flags)
+            if img is not None:
+                return img
+        except (UnicodeEncodeError, Exception):
+            pass
+
+        raw_bytes = np.fromfile(p_str, dtype=np.uint8)
         if raw_bytes.size == 0:
             return None
         return cv2.imdecode(raw_bytes, flags)
@@ -245,16 +455,80 @@ def imread_unicode(path: Union[str, Path], flags: int = cv2.IMREAD_COLOR) -> Opt
         return None
 
 
+
+def _prepare_image_for_encode(image: Any) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """
+    Return a contiguous uint8 array, or a rejection reason.
+
+    None, empty, and 0-size arrays are rejected. Non-contiguous and non-uint8
+    numeric arrays are repaired before `cv2.imencode` so a bad buffer is not
+    reported as a path `Errno 22`.
+    """
+    if image is None:
+        return None, "image is None"
+    if not isinstance(image, np.ndarray):
+        return None, f"image type {type(image).__name__} is not a numpy array"
+    if image.ndim == 0 or image.size == 0 or any(int(dim) == 0 for dim in image.shape):
+        return None, f"image is empty shape={tuple(int(dim) for dim in image.shape)}"
+
+    if image.dtype == np.uint8:
+        if image.flags.c_contiguous:
+            return image, None
+        return np.ascontiguousarray(image), None
+
+    if np.issubdtype(image.dtype, np.floating):
+        if not bool(np.isfinite(image).all()):
+            return None, f"image dtype {image.dtype} contains non-finite values"
+        peak = float(np.max(image))
+        floor = float(np.min(image))
+        scaled = image * 255.0 if floor >= 0.0 and peak <= 1.0 else image
+        return np.ascontiguousarray(np.clip(scaled, 0, 255).astype(np.uint8)), None
+
+    if np.issubdtype(image.dtype, np.integer):
+        return np.ascontiguousarray(np.clip(image, 0, 255).astype(np.uint8)), None
+
+    return None, f"image dtype {image.dtype} cannot be encoded"
+
+
+def _write_encoded_bytes(out_path: Path, payload: bytes) -> None:
+    """
+    Write encoded bytes with `open(path, "wb")`.
+
+    On Windows, truncating a file that is already memory-mapped raises
+    `[Errno 22] Invalid argument: '<path>'`. Overwriting in place with
+    `r+b` still succeeds in that case. `Errno 28` (disk full) is re-raised.
+    """
+    try:
+        with open(out_path, "wb") as handle:
+            written = handle.write(payload)
+    except OSError as exc:
+        if exc.errno != errno.EINVAL or not out_path.is_file():
+            raise
+        with open(out_path, "r+b") as handle:
+            written = handle.write(payload)
+            handle.truncate()
+    if written != len(payload):
+        raise OSError(
+            errno.EIO,
+            f"short image write {written} of {len(payload)} bytes",
+            str(out_path),
+        )
+
+
 def imwrite_unicode(
     path: Union[str, Path],
     image: np.ndarray,
     jpeg_quality: int = 95,
 ) -> bool:
     """
-    Safely encode and write an image to a path containing non-ASCII / Unicode characters
-    using `cv2.imencode` + `Path.write_bytes`.
+    Encode with `cv2.imencode` and write the buffer with Python `open`.
+
+    Does not call `cv2.imwrite` or `Path.write_bytes`. A disk-full `Errno 28`
+    is logged and re-raised instead of being returned as success.
     """
-    if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+    prepared, reject_reason = _prepare_image_for_encode(image)
+    if prepared is None:
+        logger.error("Rejected image write %s: %s", path, reject_reason)
         return False
 
     out_path = Path(path)
@@ -270,12 +544,67 @@ def imwrite_unicode(
         params = [int(cv2.IMWRITE_PNG_COMPRESSION), 3]
 
     try:
-        ok, encoded = cv2.imencode(ext, image, params)
-        if not ok or encoded is None:
-            return False
-        out_path.write_bytes(encoded.tobytes())
-        return True
+        ok, encoded = cv2.imencode(ext, prepared, params)
     except Exception as exc:
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+            logger.error("Failed to write image %s: disk full: %s", out_path, exc)
+            raise
+        logger.error(
+            "Rejected image encode for %s: %s (shape=%s dtype=%s)",
+            out_path,
+            exc,
+            prepared.shape,
+            prepared.dtype,
+        )
+        return False
+    if not ok or encoded is None or int(encoded.size) == 0:
+        logger.error(
+            "Rejected image encode for %s: encoder returned an empty buffer (shape=%s dtype=%s)",
+            out_path,
+            prepared.shape,
+            prepared.dtype,
+        )
+        return False
+
+    payload = encoded.tobytes()
+    try:
+        _write_encoded_bytes(out_path, payload)
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            logger.error("Failed to write image %s: disk full: %s", out_path, exc)
+            raise
+        # Windows preview lock (Errno 13 / EACCES): try temp+replace, then skip.
+        locked = exc.errno in (
+            errno.EACCES,
+            getattr(errno, "EPERM", 1),
+            13,
+        ) or (
+            isinstance(getattr(exc, "winerror", None), int)
+            and int(exc.winerror) in (5, 32)
+        )
+        if locked:
+            tmp_path = out_path.with_name(out_path.name + ".tmp_write")
+            try:
+                _write_encoded_bytes(tmp_path, payload)
+                try:
+                    tmp_path.replace(out_path)
+                    return True
+                except OSError:
+                    logger.warning(
+                        "Preview locked, skip write %s (%s)", out_path, exc
+                    )
+                    try:
+                        if tmp_path.is_file():
+                            tmp_path.unlink()
+                    except OSError:
+                        pass
+                    return False
+            except OSError as retry_exc:
+                logger.warning(
+                    "Preview write skipped (locked) %s: %s", out_path, retry_exc
+                )
+                return False
         logger.error("Failed to write image %s: %s", out_path, exc)
         return False
 
@@ -499,18 +828,36 @@ class DatasetCurator:
             if w_clamped * h_clamped < 0.00002:
                 continue
 
-            normalized_list.append(
-                {
-                    "class_id": int(cid),
-                    "class_name": self.class_names.get(int(cid), cname),
-                    "cx": round(cx_clamped, 6),
-                    "cy": round(cy_clamped, 6),
-                    "w": round(w_clamped, 6),
-                    "h": round(h_clamped, 6),
-                    "confidence": round(float(np.clip(conf, 0.01, 1.0)), 4),
-                    "source": source,
-                }
-            )
+            entry = {
+                "class_id": int(cid),
+                "class_name": self.class_names.get(int(cid), cname),
+                "cx": round(cx_clamped, 6),
+                "cy": round(cy_clamped, 6),
+                "w": round(w_clamped, 6),
+                "h": round(h_clamped, 6),
+                "confidence": round(float(np.clip(conf, 0.01, 1.0)), 4),
+                "source": source,
+            }
+            if isinstance(item, dict):
+                for k in (
+                    "hand_label",
+                    "human_approved",
+                    "approved",
+                    "confirmed",
+                    "exemplar_match",
+                    "exemplar_pos_sim",
+                    "exemplar_neg_sim",
+                    "exemplar_repair_sim",
+                    "exemplar_repair_class_id",
+                    "exemplar_repair_class_name",
+                    "gather_key",
+                    "key",
+                    "trusted",
+                    "weak",
+                ):
+                    if k in item:
+                        entry[k] = item[k]
+            normalized_list.append(entry)
 
         return self._apply_class_aware_nms(normalized_list, iou_threshold=0.65)
 
@@ -733,12 +1080,17 @@ class DatasetCurator:
             if not ok_img:
                 raise RuntimeError(f"Failed to write dataset image to {image_path}")
 
-            yolo_lines = [
-                f"{int(a['class_id'])} {float(a['cx']):.6f} {float(a['cy']):.6f} {float(a['w']):.6f} {float(a['h']):.6f}"
-                for a in norm_anns
-            ]
-            label_text = ("\n".join(yolo_lines) + "\n") if yolo_lines else ""
-            label_path.write_text(label_text, encoding="utf-8")
+            from dataset_factory.label_trust import commit_split_labels
+
+            trust_info = commit_split_labels(
+                dataset_dir=self.dataset_dir,
+                split=split_norm,
+                stem=clean_stem,
+                label_path=label_path,
+                annotations=norm_anns,
+            )
+            trusted_anns = list(trust_info.get("trusted", []))
+            weak_anns = list(trust_info.get("weak", []))
 
             saved_preview_path: Optional[str] = None
             if save_preview:
@@ -755,8 +1107,11 @@ class DatasetCurator:
                 "image_path": str(image_path),
                 "label_path": str(label_path),
                 "preview_path": saved_preview_path,
-                "box_count": len(norm_anns),
-                "annotations": norm_anns,
+                "box_count": len(trusted_anns),
+                "weak_box_count": len(weak_anns),
+                "annotations": trusted_anns,
+                "weak_annotations": weak_anns,
+                "has_trusted_seed": bool(trust_info.get("has_trusted_seed")),
                 "manifest_stats": manifest,
             }
 
@@ -893,15 +1248,16 @@ class DatasetCurator:
         return self._scanner
 
     def _get_auto_labeler(self) -> Optional[Any]:
-        """Lazily load `YOLOAutoLabeler` from `dataset_factory.auto_labeler` if available."""
+        """Lazily load `YOLOAutoLabeler` from `dataset_factory.yolo_auto_labeler` if available."""
         if self._auto_labeler is not None:
             return self._auto_labeler
         try:
-            from dataset_factory.auto_labeler import YOLOAutoLabeler  # type: ignore
+            from dataset_factory.yolo_auto_labeler import YOLOAutoLabeler
 
             self._auto_labeler = YOLOAutoLabeler()
             return self._auto_labeler
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to initialize YOLOAutoLabeler: %s", exc)
             return None
 
     def _get_augmentor(self) -> Optional[Any]:
@@ -936,6 +1292,7 @@ class DatasetCurator:
         self,
         frame: np.ndarray,
         source_path: Optional[Union[str, Path]] = None,
+        fast_mode: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Auto-label a gameplay screenshot or video frame into normalized YOLO annotations.
@@ -983,7 +1340,11 @@ class DatasetCurator:
         if labeler is not None:
             try:
                 if hasattr(labeler, "auto_label_frame"):
-                    ext_res = labeler.auto_label_frame(frame)
+                    ext_res = labeler.auto_label_frame(
+                        frame,
+                        fast_mode=fast_mode,
+                        source_path=source_path,
+                    )
                 elif hasattr(labeler, "label_frame"):
                     ext_res = labeler.label_frame(frame)
                 elif callable(labeler):
@@ -1009,41 +1370,41 @@ class DatasetCurator:
             except Exception as exc:
                 logger.debug("External YOLOAutoLabeler skipped on %s: %s", stem_lower, exc)
 
-        # Stage 2: Built-in MaterialScanner (3D Crests, Nameplates, Floating [E]/[F], F Gather, Minimap Sprouts)
-        try:
-            scanner = self._get_material_scanner()
-            scanner_dets = scanner.scan_frame_for_materials(frame)
-            if scanner_dets:
-                for det in scanner_dets:
-                    # Override generic material type if filename explicitly identifies Aria or Mela
-                    if material_hint in ("herb_aria", "herb_mela") and det.source in (
-                        "3d_world",
-                        "gather_prompt",
-                        "3d_floating_icon",
-                    ):
-                        det_copy = DetectedMaterial(
-                            material_type=material_hint,
-                            source=det.source,
-                            screen_x=det.screen_x,
-                            screen_y=det.screen_y,
-                            bbox=det.bbox,
-                            rel_map_dx=det.rel_map_dx,
-                            rel_map_dy=det.rel_map_dy,
-                            estimated_distance_m=det.estimated_distance_m,
-                            confidence=det.confidence,
-                            in_air=det.in_air,
-                            stack_count=det.stack_count,
-                            harvests_remaining=det.harvests_remaining,
-                        )
-                        collected.extend(
-                            self.normalize_annotations([det_copy], img_w=img_w, img_h=img_h)
-                        )
-                    else:
-                        collected.extend(
-                            self.normalize_annotations([det], img_w=img_w, img_h=img_h)
-                        )
-        except Exception as exc:
-            logger.debug("MaterialScanner fallback failed on %s: %s", stem_lower, exc)
+        # Stage 2: Built-in MaterialScanner (run only as fallback if Stage 1 found nothing)
+        if not collected:
+            try:
+                scanner = self._get_material_scanner()
+                scanner_dets = scanner.scan_frame_for_materials(frame)
+                if scanner_dets:
+                    for det in scanner_dets:
+                        if material_hint in ("herb_aria", "herb_mela") and det.source in (
+                            "3d_world",
+                            "gather_prompt",
+                            "3d_floating_icon",
+                        ):
+                            det_copy = DetectedMaterial(
+                                material_type=material_hint,
+                                source=det.source,
+                                screen_x=det.screen_x,
+                                screen_y=det.screen_y,
+                                bbox=det.bbox,
+                                rel_map_dx=det.rel_map_dx,
+                                rel_map_dy=det.rel_map_dy,
+                                estimated_distance_m=det.estimated_distance_m,
+                                confidence=det.confidence,
+                                in_air=det.in_air,
+                                stack_count=det.stack_count,
+                                harvests_remaining=det.harvests_remaining,
+                            )
+                            collected.extend(
+                                self.normalize_annotations([det_copy], img_w=img_w, img_h=img_h)
+                            )
+                        else:
+                            collected.extend(
+                                self.normalize_annotations([det], img_w=img_w, img_h=img_h)
+                            )
+            except Exception as exc:
+                logger.debug("MaterialScanner fallback failed on %s: %s", stem_lower, exc)
 
         # Stage 3: Salient 3D Resource & HSV Patch Classifier Fallback if frame had no scanner hits
         if not collected:
@@ -1083,27 +1444,35 @@ class DatasetCurator:
             rx1, ry1 = 0, 0
 
         # Classify the dominant 3D material signature in the ROI
-        resolved_cid, resolved_cname = resolve_yolo_class_id_and_name(material_hint or "ore_orichalcum")
-        resolved_conf = 0.86
+        resolved_cid: Optional[int] = None
+        resolved_cname: str = ""
+        resolved_conf: float = 0.86
 
-        if not material_hint:
+        if material_hint:
+            resolved_cid, resolved_cname = resolve_yolo_class_id_and_name(material_hint)
+        else:
             try:
                 matches = classify_3d_material_patch(
                     bgr_patch=roi_bgr,
                     region_name="Pilgrim's Ridge",
                     top_k=1,
-                    min_score=0.02,
+                    min_score=0.15,
                 )
-                if matches:
+                if matches and float(matches[0].get("score", 0.0)) >= 0.05:
                     best = matches[0]
                     resolved_cid, resolved_cname = resolve_yolo_class_id_and_name(
                         best.get("base_material") or best.get("name")
                     )
-                    resolved_conf = float(np.clip(0.80 + float(best.get("score", 0.1)), 0.78, 0.96))
+                    raw_score = float(best.get("score", 0.2))
+                    resolved_conf = float(np.clip(raw_score, 0.05, 0.99))
             except Exception:
                 pass
 
-        # Locate the highest-contrast chromatic resource cluster inside `roi_bgr`
+        # If no verified material is found via hint or classification, do not generate fake boxes
+        if resolved_cid is None:
+            return []
+
+        # Locate chromatic resource clusters inside `roi_bgr`
         hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
         sat_val_mask = cv2.inRange(hsv, (0, 70, 75), (180, 255, 255))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
@@ -1145,14 +1514,16 @@ class DatasetCurator:
                         bgr_patch=sub_patch,
                         region_name="Pilgrim's Ridge",
                         top_k=1,
-                        min_score=0.02,
+                        min_score=0.15,
                     )
-                    if sub_matches:
+                    if sub_matches and float(sub_matches[0].get("score", 0.0)) >= 0.15:
                         sub_cid, sub_cname = resolve_yolo_class_id_and_name(
                             sub_matches[0].get("base_material") or sub_matches[0].get("name")
                         )
+                    else:
+                        continue  # Skip unverified patch
                 except Exception:
-                    pass
+                    continue
 
             cx = float(np.clip((abs_x + 0.5 * bw) / float(img_w), 0.05, 0.95))
             cy = float(np.clip((abs_y + 0.5 * bh) / float(img_h), 0.05, 0.95))
@@ -1173,18 +1544,7 @@ class DatasetCurator:
             )
 
         if not results:
-            results.append(
-                {
-                    "class_id": int(resolved_cid),
-                    "class_name": self.class_names.get(int(resolved_cid), resolved_cname),
-                    "cx": 0.50,
-                    "cy": 0.54,
-                    "w": 0.14,
-                    "h": 0.16,
-                    "confidence": round(resolved_conf, 4),
-                    "source": "center_anchor_fallback",
-                }
-            )
+            return []
 
         return self.normalize_annotations(results, img_w=img_w, img_h=img_h)
 
@@ -1294,7 +1654,9 @@ class DatasetCurator:
             Summary dictionary with counts of scanned, base, augmented, train, and val samples,
             total bounding boxes, per-class distribution, and `manifest_stats`.
         """
-        with self._lock:
+        # Do not hold `_lock` across image decode. A multi-minute lock stalls BotWorker
+        # heartbeats and the Qt refresh that rebuilds the manifest. Each save locks itself.
+        if True:
             self.ensure_dataset_structure()
             augment_factor = max(0, int(augment_factor))
 
@@ -1425,88 +1787,11 @@ class DatasetCurator:
         sample_counter_start: int = 0,
     ) -> int:
         """
-        Ensure every one of the 12 YOLO classes (`0: herb_aria` .. `11: aether_odyle`)
-        has at least one training and validation bounding box exemplar derived from real
-        base screenshots tinted to the exact catalog HSV signature of that material class.
+        Synthetic center rectangle generation across missing classes is disabled.
+        Active learning uses genuine visual detections and human-confirmed ExemplarMemory
+        rather than stamped/painted rectangular patches.
         """
-        current_stats = self.rebuild_manifest_stats()
-        class_id_counts = current_stats.get("class_id_counts", {})
-
-        # Pick a clean 3D world base screenshot from reference_screenshots or video_frames
-        base_frame: Optional[np.ndarray] = None
-        for _, candidate_path in source_files:
-            img = imread_unicode(candidate_path, cv2.IMREAD_COLOR)
-            if img is not None and img.shape[0] >= 360 and img.shape[1] >= 600:
-                base_frame = img
-                break
-
-        if base_frame is None:
-            return 0
-
-        # Canonical HSV target hue/saturation/value signatures for the 12 classes
-        class_target_hsv: Dict[int, Tuple[int, int, int]] = {
-            0: (145, 180, 210),   # herb_aria (purple crystal herb)
-            1: (4, 200, 210),     # herb_mela (crimson berry bush)
-            2: (30, 195, 220),    # herb_targena (golden-yellow herb)
-            3: (16, 215, 225),    # herb_calendula (orange marigold)
-            4: (18, 175, 195),    # ore_orichalcum (amber-bronze ore vein)
-            5: (100, 35, 200),    # ore_iron_silver (silver-iron metallic vein)
-            6: (110, 210, 230),   # gem_sapphire (deep cyan-blue crystal)
-            7: (174, 215, 225),   # gem_ruby (crimson crystal spire)
-            8: (98, 25, 245),     # gem_diamond (brilliant ice-white crystal)
-            9: (150, 145, 230),   # gem_crystal (rose quartz / amethyst crystal)
-            10: (15, 125, 120),   # log_yggdrasil (woody brown tree trunk)
-            11: (92, 160, 240),   # aether_odyle (glowing cyan-white aether orb)
-        }
-
-        added = 0
-        h, w = base_frame.shape[:2]
-        cx_px, cy_px = int(w * 0.50), int(h * 0.56)
-        bw_px, bh_px = max(48, int(w * 0.08)), max(48, int(h * 0.12))
-        x1 = max(0, cx_px - bw_px // 2)
-        y1 = max(0, cy_px - bh_px // 2)
-        x2 = min(w, x1 + bw_px)
-        y2 = min(h, y1 + bh_px)
-
-        for cid, cname in sorted(self.class_names.items()):
-            existing_count = int(class_id_counts.get(str(cid), 0))
-            if existing_count >= 2:
-                continue
-
-            target_h, target_s, target_v = class_target_hsv.get(cid, (90, 180, 210))
-            for split_idx, split_name in enumerate(("train", "val")):
-                synth = base_frame.copy()
-                patch_hsv = cv2.cvtColor(synth[y1:y2, x1:x2], cv2.COLOR_BGR2HSV).astype(np.int32)
-                patch_hsv[:, :, 0] = (target_h + split_idx * 2) % 180
-                patch_hsv[:, :, 1] = np.clip((patch_hsv[:, :, 1] + target_s) // 2, 20, 255)
-                patch_hsv[:, :, 2] = np.clip((patch_hsv[:, :, 2] + target_v) // 2, 45, 255)
-                synth[y1:y2, x1:x2] = cv2.cvtColor(patch_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-                ann = [
-                    {
-                        "class_id": int(cid),
-                        "class_name": cname,
-                        "cx": round((x1 + 0.5 * (x2 - x1)) / float(w), 6),
-                        "cy": round((y1 + 0.5 * (y2 - y1)) / float(h), 6),
-                        "w": round((x2 - x1) / float(w), 6),
-                        "h": round((y2 - y1) / float(h), 6),
-                        "confidence": 0.93,
-                        "source": "catalog_hsv_exemplar",
-                    }
-                ]
-                stem = f"exemplar_cls{cid:02d}_{cname}_{split_name}"
-                self.save_labeled_sample(
-                    frame=synth,
-                    annotations=ann,
-                    split=split_name,
-                    prefix="exemplar",
-                    save_preview=(split_name == "train"),
-                    sample_name=stem,
-                    update_manifest=False,
-                )
-                added += 1
-
-        return added
+        return 0
 
     def get_curator_health_summary(self) -> dict:
         """Return DatasetCurator health and Unicode I/O readiness summary."""
@@ -1524,15 +1809,298 @@ class DatasetCurator:
     def get_dataset_curator_diagnostic_snapshot(self) -> dict:
         return {"module": "dataset_curator", "status": "ok", "ready": True}
 
+    @property
+    def label_cache_path(self) -> Path:
+        return self.dataset_dir / ".label_cache.json"
+
+    def load_label_cache(self) -> Dict[str, Any]:
+        if self.label_cache_path.is_file():
+            try:
+                return json.loads(self.label_cache_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def save_label_cache(self, cache: Dict[str, Any]) -> None:
+        try:
+            tmp = self.label_cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+            if tmp.exists():
+                tmp.replace(self.label_cache_path)
+        except Exception as exc:
+            logger.debug("Failed to save label cache: %s", exc)
+
+    def relabel_dataset_batch(
+        self,
+        image_paths: Optional[Sequence[Union[str, Path]]] = None,
+        *,
+        max_workers: Optional[int] = None,
+        incremental: bool = True,
+        force_all: bool = False,
+        conf_floor: float = 0.45,
+        emin_threshold: float = 0.85,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        High-throughput multi-core batch relabeler with incremental caching (.label_cache.json).
+        - Skips unchanged images in milliseconds if incremental=True and mtime/size/exemplar match.
+        - NEVER skips 0-box images thinking they are done.
+        - Skips writing disk previews during bulk batch runs for maximum throughput.
+        - Emits live throughput metrics (fps, ETA, processed/total).
+        """
+        import concurrent.futures
+        import os
+
+        if max_workers is None:
+            max_workers = min(16, (os.cpu_count() or 4) * 2)
+
+        # 1. Discover target images
+        target_paths: List[Path] = []
+        if image_paths is not None and len(image_paths) > 0:
+            for p in image_paths:
+                path_obj = Path(p)
+                if path_obj.is_file():
+                    target_paths.append(path_obj)
+        else:
+            for split_dir in (self.images_train_dir, self.images_val_dir):
+                if split_dir.is_dir():
+                    for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"):
+                        target_paths.extend(sorted(split_dir.glob(ext)))
+
+        total_images = len(target_paths)
+        if total_images == 0:
+            return {
+                "total": 0,
+                "processed": 0,
+                "labeled": 0,
+                "skipped": 0,
+                "total_boxes": 0,
+                "fps": 0.0,
+                "elapsed_seconds": 0.0,
+            }
+
+        # Pre-create review and label directories once to avoid per-thread mkdir lock contention
+        for split_name in ("train", "val"):
+            (self.dataset_dir / "review" / split_name).mkdir(parents=True, exist_ok=True)
+            (self.dataset_dir / "labels" / split_name).mkdir(parents=True, exist_ok=True)
+
+        cache = self.load_label_cache()
+        ex_rev = 0
+        ex_file = self.dataset_dir / "learned_exemplars.json"
+        if ex_file.is_file():
+            try:
+                ex_rev = int(ex_file.stat().st_mtime_ns)
+            except Exception:
+                ex_rev = 0
+
+        # Thread local labeler instance
+        _tls = threading.local()
+
+        def _get_worker_labeler():
+            if not hasattr(_tls, "labeler") or _tls.labeler is None:
+                from dataset_factory.yolo_auto_labeler import YOLOAutoLabeler
+                _tls.labeler = YOLOAutoLabeler()
+            return _tls.labeler
+
+        from dataset_factory.label_trust import train_txt_boxes, _rewrite_label_txt
+
+        def _process_one(img_p: Path) -> Dict[str, Any]:
+            frame = None
+            raw_anns = None
+            norm_anns = None
+            try:
+                st = img_p.stat()
+                stem = img_p.stem
+                is_val = ("val" in img_p.parts) or (img_p.parent.name == "val")
+                split = "val" if is_val else "train"
+
+                review_file = self.dataset_dir / "review" / split / f"{stem}.json"
+                label_file = self.dataset_dir / "labels" / split / f"{stem}.txt"
+
+                cache_key = img_p.name
+                c_entry = cache.get(cache_key)
+
+                # Incremental skip check: only skip if genuinely has boxes (>0) and matching stat
+                if (
+                    not force_all
+                    and incremental
+                    and c_entry is not None
+                    and review_file.is_file()
+                    and label_file.is_file()
+                ):
+                    mtime_match = (c_entry.get("mtime_ns") == st.st_mtime_ns)
+                    size_match = (c_entry.get("size") == st.st_size)
+                    rev_match = (c_entry.get("exemplar_rev") == ex_rev)
+                    box_cnt = c_entry.get("box_count", 0)
+                    if mtime_match and size_match and rev_match and box_cnt > 0:
+                        return {
+                            "stem": stem,
+                            "status": "skipped",
+                            "boxes": box_cnt,
+                            "cached": True,
+                            "key": cache_key,
+                        }
+
+                frame = imread_unicode(img_p, cv2.IMREAD_COLOR)
+                if frame is None or frame.size == 0:
+                    return {
+                        "stem": stem,
+                        "status": "error",
+                        "boxes": 0,
+                        "error": "decode_fail",
+                        "key": cache_key,
+                    }
+
+                labeler = _get_worker_labeler()
+                raw_anns = labeler.auto_label_frame(frame, fast_mode=True, source_path=img_p)
+                norm_anns = self.normalize_annotations(
+                    raw_anns, img_w=frame.shape[1], img_h=frame.shape[0]
+                )
+
+                trusted_list: List[Dict[str, Any]] = []
+                weak_list: List[Dict[str, Any]] = []
+                for b in norm_anns:
+                    b_cal = calibrate_box_trust(b, stem=stem, emin_threshold=emin_threshold)
+                    if b_cal.get("trusted") is True:
+                        trusted_list.append(b_cal)
+                    else:
+                        weak_list.append(b_cal)
+
+                # Persist review json (skip preview image generation to maximize batch throughput)
+                rev_payload = {
+                    "stem": stem,
+                    "image_path": str(img_p),
+                    "trusted": trusted_list,
+                    "weak": weak_list,
+                    "requeued_at": time.time(),
+                }
+                review_file.write_text(
+                    json.dumps(rev_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+
+                # Persist label txt
+                emit_boxes = train_txt_boxes(
+                    trusted_list, weak_list, stem=stem, floor=conf_floor
+                )
+                _rewrite_label_txt(label_file, emit_boxes)
+
+                return {
+                    "stem": stem,
+                    "status": "labeled",
+                    "boxes": len(norm_anns),
+                    "trusted": len(trusted_list),
+                    "weak": len(weak_list),
+                    "mtime_ns": st.st_mtime_ns,
+                    "size": st.st_size,
+                    "exemplar_rev": ex_rev,
+                    "key": cache_key,
+                }
+            except Exception as exc:
+                return {
+                    "stem": img_p.stem,
+                    "status": "error",
+                    "boxes": 0,
+                    "error": str(exc),
+                    "key": img_p.name,
+                }
+            finally:
+                # Explicit cleanup to ensure immediate memory freeing without leaks
+                del frame
+                del raw_anns
+                del norm_anns
+
+        start_time = time.time()
+        processed = 0
+        labeled_count = 0
+        skipped_count = 0
+        total_boxes = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_process_one, p) for p in target_paths]
+            for fut in concurrent.futures.as_completed(futures):
+                res = fut.result()
+                processed += 1
+                status = res.get("status")
+                boxes = res.get("boxes", 0)
+                total_boxes += boxes
+
+                if status == "skipped":
+                    skipped_count += 1
+                elif status == "labeled":
+                    labeled_count += 1
+                    cache_key = res.get("key")
+                    if cache_key:
+                        cache[cache_key] = {
+                            "mtime_ns": res.get("mtime_ns"),
+                            "size": res.get("size"),
+                            "box_count": boxes,
+                            "exemplar_rev": res.get("exemplar_rev"),
+                            "updated_at": time.time(),
+                        }
+
+                now = time.time()
+                elapsed = max(0.001, now - start_time)
+                fps = processed / elapsed
+                eta_s = (total_images - processed) / max(0.1, fps)
+
+                if progress_callback:
+                    try:
+                        progress_callback(
+                            {
+                                "processed": processed,
+                                "total": total_images,
+                                "fps": round(fps, 1),
+                                "eta_s": round(eta_s, 1),
+                                "stem": res.get("stem"),
+                                "boxes": boxes,
+                                "status": status,
+                            }
+                        )
+                    except Exception:
+                        pass
+
+        # Calculate pure batch processing duration and fps before disk metadata sync
+        batch_duration = max(0.001, time.time() - start_time)
+        batch_fps = round(processed / batch_duration, 1)
+
+        # Save cache and manifest
+        self.save_label_cache(cache)
+        manifest = self.rebuild_manifest_stats()
+        elapsed_total = max(0.001, time.time() - start_time)
+
+        return {
+            "total": total_images,
+            "processed": processed,
+            "labeled": labeled_count,
+            "skipped": skipped_count,
+            "total_boxes": total_boxes,
+            "fps": batch_fps,
+            "elapsed_seconds": round(batch_duration, 2),
+            "manifest_stats": manifest,
+        }
+
+
+def relabel_dataset_batch(
+    image_paths: Optional[Sequence[Union[str, Path]]] = None,
+    dataset_dir: Optional[Union[str, Path]] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Convenience function running batch relabeling via DatasetCurator."""
+    curator = DatasetCurator(dataset_dir=dataset_dir) if dataset_dir else DatasetCurator()
+    return curator.relabel_dataset_batch(image_paths=image_paths, **kwargs)
+
 
 __all__ = [
     "TARGET_DATASET_GOAL",
     "YOLO_12_CLASS_NAMES",
     "CLASS_NAME_TO_ID",
     "DatasetCurator",
+    "relabel_dataset_batch",
     "resolve_yolo_class_id_and_name",
     "imread_unicode",
     "imwrite_unicode",
+    "UNVERIFIED_HEURISTIC_SOURCES",
+    "calibrate_box_trust",
     "get_dataset_curator_baseline_metrics",
     "get_dataset_curator_readiness_status",
     "get_dataset_curator_audit_record",

@@ -1,0 +1,31 @@
+{
+  "region": "Verteron",
+  "routes": [
+    "All"
+  ],
+  "nodes": [
+    {
+      "id": 1,
+      "region": "Verteron",
+      "routes": [],
+      "patch_path": "routes/Verteron/patches/node_1.png",
+      "in_air": false,
+      "gathered_count": 0,
+      "last_visited_timestamp": 0.0,
+      "rest_duration_sec": 300,
+      "consecutive_failures": 0,
+      "map_x": 400,
+      "map_y": 300,
+      "norm_x": 0.1771,
+      "norm_y": 0.125,
+      "resource_type": "Orichalcum Ore",
+      "max_harvests": 3,
+      "current_harvests": 0,
+      "source_type": "manual",
+      "state": "active",
+      "seq_index": 1,
+      "not_gatherable": false
+    }
+  ],
+  "updated_at": 1794127389.2203891
+}

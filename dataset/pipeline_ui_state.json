@@ -1,0 +1,30 @@
+{
+  "step": 1,
+  "trained": true,
+  "validated": true,
+  "published": true,
+  "scanned": true,
+  "imbalance_fixed": false,
+  "frozen": true,
+  "last_train_metrics": {
+    "mAP50": 0.31961,
+    "mAP50_95": 0.13715,
+    "precision": 0.75402,
+    "recall": 0.30556,
+    "box_loss": 2.00184,
+    "cls_loss": 2.08871,
+    "epochs": 100,
+    "epoch": 33,
+    "mode": "ultralytics_cuda_fp16",
+    "status": "completed",
+    "artifacts": {
+      "onnx_model": "F:\\a2\\models\\yolov8n_gatherion.onnx",
+      "custom_detector_json": "F:\\a2\\models\\gatherion_custom_detector.json",
+      "train_bat_script": "F:\\a2\\train_rtx_yolo.bat",
+      "ultralytics_best_pt": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16\\weights\\best.pt",
+      "run_dir": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16",
+      "results_csv": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16\\results.csv"
+    }
+  },
+  "train_completed_at": "2026-11-08T11:33:17"
+}

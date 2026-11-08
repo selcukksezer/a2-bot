@@ -2,11 +2,37 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple, Union
+
+Field = field
 
 logger = logging.getLogger(__name__)
 
 VALID_GATHER_KEYS = ("f", "e", "auto")
+
+
+def _coerce(value: Any, caster: Any, default: Any) -> Any:
+    """Use default for this field only. A bad value must not reset the whole file."""
+    try:
+        return caster(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def merge_settings_payload(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay incoming values. Keys that exist only in the file stay."""
+    if not isinstance(existing, dict):
+        return dict(incoming) if isinstance(incoming, dict) else {}
+    if not isinstance(incoming, dict):
+        return dict(existing)
+    merged = dict(existing)
+    for key, value in incoming.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = merge_settings_payload(current, value)
+        else:
+            merged[key] = value
+    return merged
 
 
 @dataclass
@@ -21,6 +47,9 @@ class GatheringSettings:
     retry_on_extraction_fail: bool = True
     max_retries_per_harvest_stage: int = 2
     gather_key: str = "f"
+    selective_gather_enabled: bool = False
+    selected_materials: List[str] = field(default_factory=list)
+    proximity_route_auto: bool = True
 
     def validate(self) -> "GatheringSettings":
         try:
@@ -63,29 +92,40 @@ class GatheringSettings:
 
         raw_key = str(self.gather_key if self.gather_key is not None else "f").strip().lower()
         self.gather_key = raw_key if raw_key in VALID_GATHER_KEYS else "f"
+
+        self.selective_gather_enabled = bool(self.selective_gather_enabled)
+        if not isinstance(self.selected_materials, (list, tuple, set)):
+            self.selected_materials = list(self.selected_materials) if self.selected_materials else []
+        self.selected_materials = [str(m).strip() for m in self.selected_materials if str(m).strip()]
+        self.proximity_route_auto = bool(self.proximity_route_auto)
         return self
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GatheringSettings":
-        try:
-            if not isinstance(data, dict):
-                return cls().validate()
-            instance = cls(
-                f_interval_min=float(data.get("f_interval_min", 1.5)),
-                f_interval_max=float(data.get("f_interval_max", 3.0)),
-                test_mode=bool(data.get("test_mode", False)),
-                show_overlay=bool(data.get("show_overlay", True)),
-                harvests_per_node=int(data.get("harvests_per_node", 3)),
-                inter_harvest_delay_min=float(data.get("inter_harvest_delay_min", 0.6)),
-                inter_harvest_delay_max=float(data.get("inter_harvest_delay_max", 1.4)),
-                retry_on_extraction_fail=bool(data.get("retry_on_extraction_fail", True)),
-                max_retries_per_harvest_stage=int(data.get("max_retries_per_harvest_stage", 2)),
-                gather_key=str(data.get("gather_key", "f")).strip().lower(),
-            )
-            return instance.validate()
-        except Exception as exc:
-            logger.error("Error parsing GatheringSettings from dict: %s", exc)
+        if not isinstance(data, dict):
             return cls().validate()
+        raw_mats = data.get("selected_materials", [])
+        if not isinstance(raw_mats, (list, tuple, set)):
+            raw_mats = [raw_mats] if raw_mats else []
+        instance = cls(
+            f_interval_min=_coerce(data.get("f_interval_min", 1.5), float, 1.5),
+            f_interval_max=_coerce(data.get("f_interval_max", 3.0), float, 3.0),
+            test_mode=bool(data.get("test_mode", False)),
+            show_overlay=bool(data.get("show_overlay", True)),
+            harvests_per_node=_coerce(data.get("harvests_per_node", 3), int, 3),
+            inter_harvest_delay_min=_coerce(data.get("inter_harvest_delay_min", 0.6), float, 0.6),
+            inter_harvest_delay_max=_coerce(data.get("inter_harvest_delay_max", 1.4), float, 1.4),
+            retry_on_extraction_fail=bool(data.get("retry_on_extraction_fail", True)),
+            max_retries_per_harvest_stage=_coerce(data.get("max_retries_per_harvest_stage", 2), int, 2),
+            gather_key=str(data.get("gather_key", "f")).strip().lower(),
+            selective_gather_enabled=bool(data.get("selective_gather_enabled", False)),
+            selected_materials=[str(m).strip() for m in raw_mats if str(m).strip()],
+            proximity_route_auto=bool(data.get("proximity_route_auto", True)),
+        )
+        return instance.validate()
+
+
+GatheringConfig = GatheringSettings
 
 
 @dataclass
@@ -111,6 +151,9 @@ class RouteSettings:
     minimap_cluster_stack_bonus: bool = True
     hybrid_3d_and_minimap_record: bool = True
     auto_record_3d_crests: bool = True
+    mp_full_threshold: float = 0.95
+    ucb_explore_ratio: float = 0.20
+    skill_discovery_enabled: bool = True
 
     def validate(self) -> "RouteSettings":
         try:
@@ -177,40 +220,51 @@ class RouteSettings:
         self.minimap_cluster_stack_bonus = bool(self.minimap_cluster_stack_bonus)
         self.hybrid_3d_and_minimap_record = bool(self.hybrid_3d_and_minimap_record)
         self.auto_record_3d_crests = bool(self.auto_record_3d_crests)
+
+        try:
+            self.mp_full_threshold = max(0.5, min(1.0, float(self.mp_full_threshold)))
+        except (TypeError, ValueError):
+            self.mp_full_threshold = 0.95
+
+        try:
+            self.ucb_explore_ratio = max(0.05, min(0.5, float(self.ucb_explore_ratio)))
+        except (TypeError, ValueError):
+            self.ucb_explore_ratio = 0.20
+
+        self.skill_discovery_enabled = bool(self.skill_discovery_enabled)
         return self
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RouteSettings":
-        try:
-            if not isinstance(data, dict):
-                return cls().validate()
-            instance = cls(
-                rest_minutes=int(data.get("rest_minutes", 5)),
-                climb_air_max_sec=int(data.get("climb_air_max_sec", 10)),
-                gathered_join_active_route=bool(data.get("gathered_join_active_route", True)),
-                fly_unreachable=bool(data.get("fly_unreachable", True)),
-                check_odyle_minimap=bool(data.get("check_odyle_minimap", True)),
-                reclick_node_sec=int(data.get("reclick_node_sec", 10)),
-                time_to_reach_sec=int(data.get("time_to_reach_sec", 60)),
-                gather_on_the_way=bool(data.get("gather_on_the_way", False)),
-                wait_min_after_failed=int(data.get("wait_min_after_failed", 5)),
-                max_failed_in_row=int(data.get("max_failed_in_row", 10)),
-                remove_node_after_failures=int(data.get("remove_node_after_failures", 0)),
-                pause_after_no_gather_min=int(data.get("pause_after_no_gather_min", 15)),
-                fight_back=bool(data.get("fight_back", True)),
-                fight_stop_gather_sec=int(data.get("fight_stop_gather_sec", 3)),
-                harvests_per_node=int(data.get("harvests_per_node", 3)),
-                minimap_auto_record=bool(data.get("minimap_auto_record", True)),
-                minimap_ignore_monsters=bool(data.get("minimap_ignore_monsters", True)),
-                minimap_auto_filter_check=bool(data.get("minimap_auto_filter_check", True)),
-                minimap_cluster_stack_bonus=bool(data.get("minimap_cluster_stack_bonus", True)),
-                hybrid_3d_and_minimap_record=bool(data.get("hybrid_3d_and_minimap_record", True)),
-                auto_record_3d_crests=bool(data.get("auto_record_3d_crests", True)),
-            )
-            return instance.validate()
-        except Exception as exc:
-            logger.error("Error parsing RouteSettings from dict: %s", exc)
+        if not isinstance(data, dict):
             return cls().validate()
+        instance = cls(
+            rest_minutes=_coerce(data.get("rest_minutes", 5), int, 5),
+            climb_air_max_sec=_coerce(data.get("climb_air_max_sec", 10), int, 10),
+            gathered_join_active_route=bool(data.get("gathered_join_active_route", True)),
+            fly_unreachable=bool(data.get("fly_unreachable", True)),
+            check_odyle_minimap=bool(data.get("check_odyle_minimap", True)),
+            reclick_node_sec=_coerce(data.get("reclick_node_sec", 10), int, 10),
+            time_to_reach_sec=_coerce(data.get("time_to_reach_sec", 60), int, 60),
+            gather_on_the_way=bool(data.get("gather_on_the_way", False)),
+            wait_min_after_failed=_coerce(data.get("wait_min_after_failed", 5), int, 5),
+            max_failed_in_row=_coerce(data.get("max_failed_in_row", 10), int, 10),
+            remove_node_after_failures=_coerce(data.get("remove_node_after_failures", 0), int, 0),
+            pause_after_no_gather_min=_coerce(data.get("pause_after_no_gather_min", 15), int, 15),
+            fight_back=bool(data.get("fight_back", True)),
+            fight_stop_gather_sec=_coerce(data.get("fight_stop_gather_sec", 3), int, 3),
+            harvests_per_node=_coerce(data.get("harvests_per_node", 3), int, 3),
+            minimap_auto_record=bool(data.get("minimap_auto_record", True)),
+            minimap_ignore_monsters=bool(data.get("minimap_ignore_monsters", True)),
+            minimap_auto_filter_check=bool(data.get("minimap_auto_filter_check", True)),
+            minimap_cluster_stack_bonus=bool(data.get("minimap_cluster_stack_bonus", True)),
+            hybrid_3d_and_minimap_record=bool(data.get("hybrid_3d_and_minimap_record", True)),
+            auto_record_3d_crests=bool(data.get("auto_record_3d_crests", True)),
+            mp_full_threshold=_coerce(data.get("mp_full_threshold", 0.95), float, 0.95),
+            ucb_explore_ratio=_coerce(data.get("ucb_explore_ratio", 0.20), float, 0.20),
+            skill_discovery_enabled=bool(data.get("skill_discovery_enabled", True)),
+        )
+        return instance.validate()
 
 
 @dataclass
@@ -245,30 +299,112 @@ class BreakSettings:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "BreakSettings":
-        try:
-            if not isinstance(data, dict):
-                return cls().validate()
-            instance = cls(
-                break_every_min=int(data.get("break_every_min", 0)),
-                break_every_variance=int(data.get("break_every_variance", 1)),
-                break_lasts_min=int(data.get("break_lasts_min", 10)),
-                break_lasts_variance=int(data.get("break_lasts_variance", 1)),
-            )
-            return instance.validate()
-        except Exception as exc:
-            logger.error("Error parsing BreakSettings from dict: %s", exc)
+        if not isinstance(data, dict):
             return cls().validate()
+        instance = cls(
+            break_every_min=_coerce(data.get("break_every_min", 0), int, 0),
+            break_every_variance=_coerce(data.get("break_every_variance", 1), int, 1),
+            break_lasts_min=_coerce(data.get("break_lasts_min", 10), int, 10),
+            break_lasts_variance=_coerce(data.get("break_lasts_variance", 1), int, 1),
+        )
+        return instance.validate()
+
+
+DEFAULT_NODE_CHORD = "ctrl+alt+f8"
+DEFAULT_MENU_CHORD = "ctrl+alt+f9"
+DEFAULT_PAUSE_CHORD = "ctrl+alt+f10"
+BARE_BLOCKED_HOTKEYS = frozenset({"f8", "f9", "f10"})
+
+_MOD_ORDER = ("ctrl", "alt", "shift", "win")
+_MOD_ALIASES = {
+    "ctrl": "ctrl",
+    "control": "ctrl",
+    "ctl": "ctrl",
+    "alt": "alt",
+    "shift": "shift",
+    "win": "win",
+    "windows": "win",
+    "meta": "win",
+    "super": "win",
+    "cmd": "win",
+}
+_MOD_LABELS = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win"}
+
+
+def parse_hotkey_chord(spec: str) -> Tuple[str, FrozenSet[str]]:
+    """Split 'ctrl+alt+f10' into ('f10', {'ctrl','alt'}). Bare 'f10' has no modifiers."""
+    text = str(spec or "").strip().lower().replace(" ", "")
+    if not text:
+        return "", frozenset()
+    mods = []
+    key = ""
+    for part in text.split("+"):
+        if not part:
+            continue
+        alias = _MOD_ALIASES.get(part)
+        if alias:
+            if alias not in mods:
+                mods.append(alias)
+        else:
+            key = part
+    return key, frozenset(mods)
+
+
+def canonical_hotkey_chord(spec: str, fallback: str) -> str:
+    """Normalize a chord. Bare F8/F9/F10 fall back so the bot cannot bind them alone."""
+    key, mods = parse_hotkey_chord(spec)
+    if not key or (key in BARE_BLOCKED_HOTKEYS and not mods):
+        key, mods = parse_hotkey_chord(fallback)
+    ordered = [name for name in _MOD_ORDER if name in mods]
+    return "+".join(ordered + ([key] if key else []))
+
+
+def format_hotkey_label(spec: str) -> str:
+    """User-facing chord, e.g. ctrl+alt+f10 -> Ctrl+Alt+F10."""
+    key, mods = parse_hotkey_chord(spec)
+    parts = [_MOD_LABELS[name] for name in _MOD_ORDER if name in mods]
+    if key.startswith("f") and key[1:].isdigit():
+        parts.append(key.upper())
+    elif len(key) == 1:
+        parts.append(key.upper())
+    elif key:
+        parts.append(key.upper())
+    return "+".join(parts)
+
+
+def match_hotkey_action(
+    key_name: str,
+    held_modifiers: Iterable[str],
+    chords: Dict[str, str],
+) -> Optional[str]:
+    """
+    Return the action id when key+modifiers equal a configured chord.
+    Bare F8/F9/F10 never match, even if a stored spec forgot its modifiers.
+    """
+    name = str(key_name or "").strip().lower()
+    held = frozenset(str(item).strip().lower() for item in (held_modifiers or ()) if item)
+    if name in BARE_BLOCKED_HOTKEYS and not held:
+        return None
+    for action, spec in chords.items():
+        key, mods = parse_hotkey_chord(spec)
+        if not key or not mods:
+            continue
+        if name == key and held == mods:
+            return action
+    return None
 
 
 @dataclass
 class HotkeysSettings:
-    toggle_menu_f9: str = "f9"
-    record_node_f8: str = "f8"
+    toggle_menu_f9: str = DEFAULT_MENU_CHORD
+    record_node_f8: str = DEFAULT_NODE_CHORD
+    pause_resume_f10: str = DEFAULT_PAUSE_CHORD
     emergency_exit: str = "esc"
 
     def validate(self) -> "HotkeysSettings":
-        self.toggle_menu_f9 = str(self.toggle_menu_f9 or "f9").strip().lower() or "f9"
-        self.record_node_f8 = str(self.record_node_f8 or "f8").strip().lower() or "f8"
+        self.toggle_menu_f9 = canonical_hotkey_chord(self.toggle_menu_f9, DEFAULT_MENU_CHORD)
+        self.record_node_f8 = canonical_hotkey_chord(self.record_node_f8, DEFAULT_NODE_CHORD)
+        self.pause_resume_f10 = canonical_hotkey_chord(self.pause_resume_f10, DEFAULT_PAUSE_CHORD)
         self.emergency_exit = str(self.emergency_exit or "esc").strip().lower() or "esc"
         return self
 
@@ -277,8 +413,9 @@ class HotkeysSettings:
         if not isinstance(data, dict):
             return cls().validate()
         return cls(
-            toggle_menu_f9=str(data.get("toggle_menu_f9", "f9")),
-            record_node_f8=str(data.get("record_node_f8", "f8")),
+            toggle_menu_f9=str(data.get("toggle_menu_f9", DEFAULT_MENU_CHORD)),
+            record_node_f8=str(data.get("record_node_f8", DEFAULT_NODE_CHORD)),
+            pause_resume_f10=str(data.get("pause_resume_f10", DEFAULT_PAUSE_CHORD)),
             emergency_exit=str(data.get("emergency_exit", "esc")),
         ).validate()
 
@@ -287,6 +424,7 @@ class HotkeysSettings:
 class DisplaySettings:
     ui_proportion: str = "Medium"
     monitor_idx: int = 1
+    last_tab: str = "settings"
 
     def validate(self) -> "DisplaySettings":
         self.ui_proportion = str(self.ui_proportion or "Medium").strip() or "Medium"
@@ -294,6 +432,7 @@ class DisplaySettings:
             self.monitor_idx = max(1, min(8, int(self.monitor_idx)))
         except (TypeError, ValueError):
             self.monitor_idx = 1
+        self.last_tab = str(self.last_tab or "settings").strip() or "settings"
         return self
 
     @classmethod
@@ -302,7 +441,8 @@ class DisplaySettings:
             return cls().validate()
         return cls(
             ui_proportion=str(data.get("ui_proportion", "Medium")),
-            monitor_idx=int(data.get("monitor_idx", 1)),
+            monitor_idx=_coerce(data.get("monitor_idx", 1), int, 1),
+            last_tab=str(data.get("last_tab", "settings") or "settings"),
         ).validate()
 
 
@@ -316,6 +456,8 @@ class BotSettings:
     active_region: str = "Altgard"
     active_route: str = "Dredgion Crash Site"
     version: str = "v2.0"
+    reflex_model: str = "yolov8"
+    blacklist: List[Dict[str, Any]] = field(default_factory=list)
 
     def validate(self) -> "BotSettings":
         if not isinstance(self.gathering, GatheringSettings):
@@ -365,6 +507,16 @@ class BotSettings:
             str(self.active_route or "Dredgion Crash Site").strip() or "Dredgion Crash Site"
         )
         self.version = str(self.version or "v1.6.15").strip() or "v1.6.15"
+        reflex = str(self.reflex_model or "yolov8").strip().lower().replace("-", "").replace("_", "")
+        if reflex in ("yolo11", "yolov11", "v11"):
+            self.reflex_model = "yolo11"
+        elif reflex in ("rtdetr", "rtdetrl"):
+            self.reflex_model = "rtdetr"
+        else:
+            self.reflex_model = "yolov8"
+
+        if not isinstance(self.blacklist, list):
+            self.blacklist = []
         return self
 
     def to_dict(self) -> Dict[str, Any]:
@@ -377,9 +529,13 @@ class BotSettings:
                 "gathering": asdict(self.gathering),
                 "route": asdict(self.route),
                 "breaks": asdict(self.breaks),
+                "hotkeys": asdict(self.hotkeys),
+                "display": asdict(self.display),
                 "active_region": self.active_region,
                 "active_route": self.active_route,
                 "version": self.version,
+                "reflex_model": self.reflex_model,
+                "blacklist": list(self.blacklist) if isinstance(self.blacklist, list) else [],
             }
 
     @classmethod
@@ -399,6 +555,7 @@ class BotSettings:
                     gathering_data = dict(gathering_data)
                     gathering_data["harvests_per_node"] = route_data["harvests_per_node"]
 
+            raw_bl = data.get("blacklist", [])
             instance = cls(
                 gathering=GatheringSettings.from_dict(gathering_data),
                 route=RouteSettings.from_dict(route_data),
@@ -408,11 +565,13 @@ class BotSettings:
                 active_region=str(data.get("active_region", "Altgard")),
                 active_route=str(data.get("active_route", "Dredgion Crash Site")),
                 version=str(data.get("version", "v2.0")),
+                reflex_model=str(data.get("reflex_model", "yolov8")),
+                blacklist=list(raw_bl) if isinstance(raw_bl, list) else [],
             )
             return instance.validate()
         except Exception as exc:
             logger.error("Error parsing BotSettings from dict: %s", exc)
-            return cls().validate()
+            raise
 
 
 # Alias AppSettings to BotSettings for callers referencing AppSettings.validate()
@@ -429,6 +588,7 @@ class SettingsManager:
                 self.settings_path = candidate
 
         self.settings: BotSettings = BotSettings()
+        self._allow_overwrite = True
         try:
             if not self.settings_path.exists():
                 logger.info(
@@ -440,6 +600,7 @@ class SettingsManager:
                 self.load()
         except Exception as exc:
             logger.error("Failed to initialize SettingsManager: %s", exc)
+            self._allow_overwrite = not self.settings_path.exists()
             self.settings = BotSettings().validate()
 
     def load(self) -> BotSettings:
@@ -449,25 +610,54 @@ class SettingsManager:
                     "Settings file %s does not exist during load(). Creating defaults.",
                     self.settings_path,
                 )
+                self._allow_overwrite = True
                 return self.reset_to_defaults()
 
             raw_text = self.settings_path.read_text(encoding="utf-8")
             data = json.loads(raw_text)
+            if not isinstance(data, dict):
+                raise ValueError("settings root must be an object")
             self.settings = BotSettings.from_dict(data)
+            self._allow_overwrite = True
             logger.info("Successfully loaded settings from %s", self.settings_path)
             return self.settings
         except Exception as exc:
             logger.error("Error loading settings from %s: %s", self.settings_path, exc)
+            # Keep the file. A later close must not replace it with defaults.
+            self._allow_overwrite = False
             self.settings = BotSettings().validate()
             return self.settings
+
+    def export_payload(self) -> Dict[str, Any]:
+        """In-memory settings over the file. Unknown file keys stay in the result."""
+        self.settings.validate()
+        incoming = self.settings.to_dict()
+        existing: Dict[str, Any] = {}
+        try:
+            if self.settings_path.exists():
+                raw = json.loads(self.settings_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    existing = raw
+        except Exception as exc:
+            logger.debug("Settings merge base unreadable, using in-memory payload: %s", exc)
+            existing = {}
+        return merge_settings_payload(existing, incoming)
 
     def save(self, settings: Optional[BotSettings] = None) -> bool:
         try:
             if settings is not None:
                 self.settings = settings
+                self._allow_overwrite = True
+            if not getattr(self, "_allow_overwrite", True) and self.settings_path.exists():
+                logger.error(
+                    "Refusing to overwrite %s after a failed load.",
+                    self.settings_path,
+                )
+                return False
             self.settings.validate()
             self.settings_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = self.settings.to_dict()
+            # Source of truth: config/settings.json. settings.enc is an encrypted mirror and is never loaded over this file.
+            payload = self.export_payload()
             json_text = json.dumps(payload, indent=4, ensure_ascii=False)
             self.settings_path.write_text(json_text, encoding="utf-8")
             enc_candidate = self.settings_path.parent / "settings.enc"
@@ -491,6 +681,7 @@ class SettingsManager:
 
     def reset_to_defaults(self) -> BotSettings:
         try:
+            self._allow_overwrite = True
             self.settings = BotSettings().validate()
             self.save(self.settings)
             logger.info("Settings have been reset to defaults.")
@@ -547,6 +738,13 @@ class SettingsManager:
                     cast_val = float(value)
                 elif isinstance(current_val, str):
                     cast_val = str(value)
+                elif isinstance(current_val, list):
+                    if isinstance(value, (list, tuple, set)):
+                        cast_val = [str(x).strip() for x in value if str(x).strip()]
+                    elif isinstance(value, str):
+                        cast_val = [str(x).strip() for x in value.split(",") if str(x).strip()]
+                    else:
+                        cast_val = list(value) if value else []
                 else:
                     cast_val = value
                 setattr(section_obj, key, cast_val)

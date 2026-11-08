@@ -768,6 +768,14 @@ class TelemetryEngine:
                     except Exception as _ps_err:
                         logger.debug("SessionProfitSimulator record_gather error: %s", _ps_err)
 
+            # Kalıcı lifetime sayaç (oturum reset'inden bağımsız; tek kaynak: telemetry.record_gather)
+            try:
+                from core.lifetime_stats import get_lifetime_stats
+
+                get_lifetime_stats().record_material(clean_resource, count=1)
+            except Exception as _lt_err:
+                logger.debug("lifetime material record skipped: %s", _lt_err)
+
             logger.info(
                 f"Gather kaydedildi: Node #{node_id} | {clean_resource} | "
                 f"{clean_region}/{clean_route} | Yürüyüş: {clean_walk:.2f}s | Eşleşme: %{clean_match}"
@@ -812,6 +820,15 @@ class TelemetryEngine:
             }
             with self._lock:
                 self.combat_events.append(event)
+
+            # CLEARED / WIN tarzı sonuçlarda kalıcı canavar sayacı (debounce store içinde)
+            if clean_outcome in ("CLEARED", "WIN", "VICTORY", "KILLED", "SUCCESS"):
+                try:
+                    from core.lifetime_stats import get_lifetime_stats
+
+                    get_lifetime_stats().record_monster_kill(mob_key=f"combat:{clean_outcome}")
+                except Exception as _lt_err:
+                    logger.debug("lifetime combat kill skipped: %s", _lt_err)
 
             logger.info(f"Savaş kaydedildi: Süre {clean_duration:.2f}s | Sonuç: {clean_outcome}")
             return event

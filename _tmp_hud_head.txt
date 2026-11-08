@@ -1,0 +1,81 @@
+﻿<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="data:," />
+    <title>Gatherion HUD Prototipi</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Chakra+Petch:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: dark;
+        --gold: #e9b949;
+        --gold-soft: #f5cf6a;
+        --green: #43d68a;
+        --red: #ff6a5e;
+        --amber: #f0a63c;
+        --cyan: #3fc1d4;
+        --blue: #6aa8ff;
+        --ink: #eaf1f7;
+        --ink-dim: #9fb2c3;
+        --ink-faint: #6d8093;
+        --panel: rgba(8, 13, 21, 0.88);
+        --panel-2: rgba(16, 24, 36, 0.92);
+        --line: rgba(255, 255, 255, 0.09);
+        --line-strong: rgba(255, 255, 255, 0.16);
+        --btn: #1b2735;
+        --btn-hover: #243447;
+        --radius: 14px;
+        --font-ui: "Barlow", system-ui, sans-serif;
+        --font-disp: "Chakra Petch", "Barlow", sans-serif;
+        --font-mono: "JetBrains Mono", ui-monospace, monospace;
+      }
+      * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        font-family: var(--font-ui);
+        color: var(--ink);
+        background: #06090f;
+        overflow: hidden;
+      }
+      button { font-family: inherit; }
+      button:focus-visible, [tabindex]:focus-visible {
+        outline: 2px solid var(--gold);
+        outline-offset: 2px;
+      }
+
+      /* ---------- Sahne ---------- */
+      .scene { position: fixed; inset: 0; z-index: 0; }
+      .scene-img {
+        position: absolute; inset: 0;
+        width: 100%; height: 100%;
+        object-fit: cover;
+        opacity: 0;
+        transition: opacity 1.4s ease;
+      }
+      .scene-img.is-active { opacity: 1; }
+      .scene-shade {
+        position: absolute; inset: 0;
+        background: linear-gradient(180deg, rgba(4,7,12,.42) 0%, rgba(4,7,12,0) 26%, rgba(4,7,12,0) 55%, rgba(4,7,12,.55) 100%);
+      }
+      .scene-vignette {
+        position: absolute; inset: 0;
+        box-shadow: inset 0 0 180px rgba(0,0,0,.55);
+      }
+
+      /* ---------- Tespit kutuları ---------- */
+      .boxes { position: absolute; inset: 0; }
+      .det-box {
+        position: absolute;
+        border: 1.5px solid rgba(67, 214, 138, .55);
+        border-radius: 3px;
+        transition: opacity .5s ease, border-color .3s ease;
+      }

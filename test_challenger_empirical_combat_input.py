@@ -1,0 +1,783 @@
+# -*- coding: utf-8 -*-
+"""
+Empirical Challenger Test Suite: Combat, Input, and Gather Mode Stress Verification.
+Conducted by Challenger 1 (teamwork_challenger_1).
+
+Tests:
+1. Round-robin skill keys (1,2,3,4,q,e,r) over 50+ ticks (no single key stuck).
+2. Burst and GCD latency in ms scale (<100ms trusted, <180ms fallback).
+3. Boot logging of COMBAT SKILL KNOBS format and idempotence.
+4. Gather mode combat suppression (0 keys pressed, no fight_back) under hostile attack.
+5. Interception single-fire (no soft double-injection).
+"""
+
+import collections
+import logging
+import math
+import os
+import sys
+import time
+import unittest
+from typing import Any, List
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+from PyQt6.QtCore import QThread
+
+from core.combat_recovery import CombatRecovery
+from core.human_timing import (
+    HumanTimingEngine,
+    align_to_gcd,
+    get_burst_inter_key_delay_sec,
+    get_human_timing_engine,
+)
+from core.input_driver import InputController
+from core.skill_bar_reader import SkillBarReader
+from core.state_machine import BotMode, BotState, BotWorker
+
+
+class MockInputDriver:
+    """Mock input driver tracking all key press and release calls."""
+
+    def __init__(self, trusted: bool = True):
+        self.pressed: List[str] = []
+        self.released: List[str] = []
+        self.history: List[str] = []
+        self._trusted = trusted
+
+    def keyboard_inject_trusted(self) -> bool:
+        return self._trusted
+
+    def is_keyboard_trusted(self) -> bool:
+        return self._trusted
+
+    def press_key(self, key: str, **kwargs) -> bool:
+        k = str(key).lower().strip()
+        self.pressed.append(k)
+        self.history.append(k)
+        return True
+
+    def key_down(self, key: str, **kwargs) -> bool:
+        k = str(key).lower().strip()
+        self.pressed.append(k)
+        self.history.append(k)
+        return True
+
+    def key_up(self, key: str, **kwargs) -> bool:
+        k = str(key).lower().strip()
+        self.released.append(k)
+        return True
+
+    def clear(self):
+        self.pressed.clear()
+        self.released.clear()
+
+
+class TestEmpiricalChallenger(unittest.TestCase):
+    """Adversarial stress-test suite for Combat, Input, and Gather modes."""
+
+    def setUp(self):
+        self.worker = BotWorker.__new__(BotWorker)
+        QThread.__init__(self.worker)
+        import threading
+        self.worker._lock = threading.RLock()
+        self.worker._paused = False
+        self.worker._state = BotState.WAITING.value
+        self.worker._mode = BotMode.COMBAT_MODE.value
+        self.worker.config = {
+            "test_mode": False,
+            "fight_back": False,
+            "combat_skill_keys": ["1", "2", "3", "4", "q", "e", "r"],
+        }
+        self.driver = MockInputDriver(trusted=True)
+        self.worker.input_driver = self.driver
+        self.worker._keyboard_trusted_for_combat = lambda: self.driver.is_keyboard_trusted()
+
+    # =========================================================================
+    # AREA 1: ROUND-ROBIN SKILL KEYS OVER 50+ TICKS
+    # =========================================================================
+
+    def test_state_machine_send_configured_combat_skill_50_ticks_round_robin_trusted(self):
+        """
+        Stress test: simulate 70 combat burst ticks in trusted mode (per_burst=4).
+        Assert that all 7 keys (1, 2, 3, 4, q, e, r) rotate with balanced frequency
+        and never get stuck on '2' or any single key.
+        """
+        w = self.worker
+        w.config["test_mode"] = False
+        self.driver._trusted = True
+
+        burst_sec = w._combat_skill_burst_sec()  # 0.080s
+        gcd_sec = w._combat_skill_cooldown_sec("1")  # 0.120s
+
+        # Advance simulated time across 70 ticks
+        simulated_now = 1000.0
+        keys_fired_per_tick = []
+
+        for tick in range(70):
+            # Advance time past burst cooldown
+            simulated_now += max(burst_sec + 0.005, 0.085)
+            with patch("core.state_machine.time.time", return_value=simulated_now):
+                fired = w._send_configured_combat_skill()
+                self.assertTrue(fired, f"Burst failed to fire at tick {tick}")
+                # Record keys fired in this tick
+                keys_fired_per_tick.append(list(self.driver.pressed))
+                self.driver.clear()
+
+        all_fired_keys = [k for tick_keys in keys_fired_per_tick for k in tick_keys]
+        self.assertGreaterEqual(len(all_fired_keys), 70 * 2)
+
+        # 1. Assert all 7 expected keys are fired
+        expected_keys = {"1", "2", "3", "4", "q", "e", "r"}
+        fired_unique = set(all_fired_keys)
+        self.assertEqual(
+            expected_keys,
+            fired_unique,
+            f"Expected all 7 keys to be used. Missing: {expected_keys - fired_unique}",
+        )
+
+        # 2. Check distribution balance
+        counts = collections.Counter(all_fired_keys)
+        total = len(all_fired_keys)
+        expected_ratio = 1.0 / 7.0
+
+        for key, count in counts.items():
+            ratio = count / total
+            # Each key should receive roughly 1/7 (~14.3%) of presses, tolerance +/- 6%
+            self.assertGreater(
+                ratio,
+                0.08,
+                f"Key '{key}' was under-represented: count={count}/{total} ({ratio:.2%})",
+            )
+            self.assertLess(
+                ratio,
+                0.22,
+                f"Key '{key}' was over-represented: count={count}/{total} ({ratio:.2%})",
+            )
+
+        # 3. Specifically verify '2' is NOT sticky
+        self.assertLess(
+            counts["2"] / total,
+            0.20,
+            f"Key '2' appears sticky! Ratio is {counts['2'] / total:.2%}",
+        )
+
+    def test_state_machine_send_configured_combat_skill_50_ticks_round_robin_fallback(self):
+        """
+        Stress test: simulate 60 combat burst ticks in untrusted fallback mode (per_burst=2).
+        Assert round-robin rotation across all 7 keys.
+        """
+        w = self.worker
+        w.config["test_mode"] = False
+        self.driver._trusted = False
+
+        burst_sec = w._combat_skill_burst_sec()  # 0.150s
+        simulated_now = 2000.0
+        all_fired_keys = []
+
+        for tick in range(60):
+            simulated_now += burst_sec + 0.040  # 0.190s > gcd 0.180s
+            with patch("core.state_machine.time.time", return_value=simulated_now):
+                fired = w._send_configured_combat_skill()
+                self.assertTrue(fired, f"Fallback burst failed at tick {tick}")
+                all_fired_keys.extend(self.driver.pressed)
+                self.driver.clear()
+
+        expected_keys = {"1", "2", "3", "4", "q", "e", "r"}
+        fired_unique = set(all_fired_keys)
+        self.assertEqual(expected_keys, fired_unique)
+
+        counts = collections.Counter(all_fired_keys)
+        for key in expected_keys:
+            self.assertGreaterEqual(counts[key], 10, f"Key '{key}' fired too rarely: {counts[key]}")
+
+    def test_combat_recovery_fight_back_step_70_ticks_round_robin(self):
+        """
+        Verify CombatRecovery.fight_back_step cycles all 7 keys (1,2,3,4,q,e,r)
+        strictly sequentially over 70 ticks without skipping or getting stuck on '2'.
+        """
+        cr = CombatRecovery()
+        # Mock enemy bar present so it doesn't search tab/loot
+        cr._detect_enemy_target_bar = MagicMock(return_value=True)
+
+        class MockCtrl:
+            def __init__(self):
+                self.keys = []
+                self.clicks = []
+
+            def press_key(self, k, **kw):
+                self.keys.append(str(k).lower())
+
+            def click_mouse(self, button, **kw):
+                self.clicks.append(button)
+
+            def human_click(self, button, **kw):
+                self.clicks.append(button)
+
+        ctrl = MockCtrl()
+        dummy_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        for _ in range(70):
+            cr.fight_back_step(input_ctrl=ctrl, frame=dummy_frame)
+
+        # Filter out 'tab' and 'f' keys, keeping only combat skill keys
+        combat_keys = [k for k in ctrl.keys if k not in {"tab", "f"}]
+        self.assertGreaterEqual(len(combat_keys), 30)
+
+        # Verify strict 7-key cycling order: 1, 2, 3, 4, q, e, r, 1, 2, ...
+        expected_sequence = ["1", "2", "3", "4", "q", "e", "r"]
+        for idx, k in enumerate(combat_keys):
+            expected_k = expected_sequence[idx % len(expected_sequence)]
+            self.assertEqual(
+                k,
+                expected_k,
+                f"Sequence mismatch at index {idx}: got '{k}', expected '{expected_k}'",
+            )
+
+        counts = collections.Counter(combat_keys)
+        self.assertEqual(len(counts), 7)
+        # Min and max count must differ by at most 1 in strict round-robin
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+
+    def test_skill_bar_reader_select_best_ready_skill_70_ticks_unbiased(self):
+        """
+        Verify SkillBarReader.select_best_ready_skill does not stick to '2'
+        over 70 consecutive calls on a real or synthesized frame.
+        """
+        reader = SkillBarReader()
+        ref_path = "reference_screenshots/pilgrims_ridge_1.jpg"
+        if os.path.exists(ref_path):
+            import cv2
+            img = cv2.imread(ref_path)
+        else:
+            # Synthetic 1280x720 frame
+            img = np.full((720, 1280, 3), 100, dtype=np.uint8)
+
+        selections = [reader.select_best_ready_skill(img) for _ in range(70)]
+
+        # Must select multiple distinct skills
+        unique_skills = set(selections)
+        self.assertGreaterEqual(len(unique_skills), 3, f"Too few unique skills: {unique_skills}")
+
+        # '2' must not exceed 30% of total selections
+        count_2 = sum(1 for s in selections if str(s).strip() == "2")
+        self.assertLess(
+            count_2 / 70.0,
+            0.30,
+            f"SkillBarReader stuck on '2'! {count_2}/70 selections ({count_2/70.0:.1%})",
+        )
+
+    # =========================================================================
+    # AREA 2: BURST AND GCD LATENCY IN MS SCALE
+    # =========================================================================
+
+    def test_state_machine_burst_latency_knobs(self):
+        """
+        Verify burst latency knob:
+        - Trusted Interception: < 100ms (0.080s)
+        - Untrusted fallback: < 180ms (0.150s)
+        """
+        w = self.worker
+
+        # Trusted
+        self.driver._trusted = True
+        burst_trusted = w._combat_skill_burst_sec()
+        self.assertLess(
+            burst_trusted,
+            0.100,
+            f"Trusted burst latency too high: {burst_trusted*1000:.1f}ms (must be < 100ms)",
+        )
+        self.assertGreaterEqual(burst_trusted, 0.020)
+        self.assertEqual(burst_trusted, 0.080)
+
+        # Untrusted
+        self.driver._trusted = False
+        burst_untrusted = w._combat_skill_burst_sec()
+        self.assertLess(
+            burst_untrusted,
+            0.180,
+            f"Fallback burst latency too high: {burst_untrusted*1000:.1f}ms (must be < 180ms)",
+        )
+        self.assertGreaterEqual(burst_untrusted, 0.050)
+        self.assertEqual(burst_untrusted, 0.150)
+
+    def test_state_machine_gcd_latency_knobs(self):
+        """
+        Verify GCD latency floor:
+        - Trusted: 0.120s (120ms)
+        - Fallback: 0.180s (180ms)
+        """
+        w = self.worker
+
+        self.driver._trusted = True
+        gcd_trusted = w._combat_skill_cooldown_sec("1")
+        self.assertEqual(gcd_trusted, 0.120)
+
+        self.driver._trusted = False
+        gcd_untrusted = w._combat_skill_cooldown_sec("1")
+        self.assertEqual(gcd_untrusted, 0.180)
+
+    def test_human_timing_burst_inter_key_distribution_1000_samples(self):
+        """
+        Empirically generate 1,000 samples for trusted and untrusted burst delays.
+        Assert that every single sample is strictly within latency bounds.
+        """
+        engine = get_human_timing_engine()
+
+        # 1. Trusted: [0.028s, 0.045s], mean ~0.035s. All must be < 100ms.
+        samples_trusted = [engine.get_burst_inter_key_delay_sec(trusted=True) for _ in range(1000)]
+        min_t, max_t = min(samples_trusted), max(samples_trusted)
+        mean_t = sum(samples_trusted) / 1000.0
+
+        self.assertGreaterEqual(min_t, 0.028, f"Trusted burst below min: {min_t}")
+        self.assertLessEqual(max_t, 0.045, f"Trusted burst above max: {max_t}")
+        self.assertLess(max_t, 0.100, f"Trusted burst exceeded 100ms limit: {max_t}")
+        self.assertAlmostEqual(mean_t, 0.035, delta=0.003)
+
+        # 2. Untrusted: [0.048s, 0.075s], mean ~0.060s. All must be < 180ms.
+        samples_untrusted = [engine.get_burst_inter_key_delay_sec(trusted=False) for _ in range(1000)]
+        min_u, max_u = min(samples_untrusted), max(samples_untrusted)
+        mean_u = sum(samples_untrusted) / 1000.0
+
+        self.assertGreaterEqual(min_u, 0.048, f"Untrusted burst below min: {min_u}")
+        self.assertLessEqual(max_u, 0.075, f"Untrusted burst above max: {max_u}")
+        self.assertLess(max_u, 0.180, f"Untrusted burst exceeded 180ms limit: {max_u}")
+        self.assertAlmostEqual(mean_u, 0.060, delta=0.004)
+
+    def test_human_timing_align_to_gcd(self):
+        """
+        Verify align_to_gcd calculates correct delay respecting min_gap_sec and GCD boundary.
+        """
+        # When burst takes 0.050s and gcd is 0.120s, remaining time is ~0.070s
+        rem = align_to_gcd(burst_duration_sec=0.050, gcd_sec=0.120, min_gap_sec=0.020)
+        self.assertGreaterEqual(rem, 0.020)
+        self.assertLessEqual(rem, 0.120)
+
+        # When burst exceeds GCD, min_gap_sec jitter is returned
+        rem_over = align_to_gcd(burst_duration_sec=0.200, gcd_sec=0.120, min_gap_sec=0.025)
+        self.assertGreaterEqual(rem_over, 0.025)
+        self.assertLessEqual(rem_over, 0.045)
+
+    # =========================================================================
+    # AREA 3: BOOT LOGGING OF COMBAT SKILL KNOBS
+    # =========================================================================
+
+    def test_boot_logging_combat_skill_knobs_trusted(self):
+        """
+        Verify COMBAT SKILL KNOBS trusted=True burst=0.080s gcd=0.120s per_burst=4 keys=1,2,3,4,q,e,r
+        is logged with exact formatting.
+        """
+        w = self.worker
+        self.driver._trusted = True
+        setattr(w, "_combat_skill_knobs_logged", False)
+
+        captured_logs = []
+        with patch.object(w, "_emit_log", side_effect=captured_logs.append):
+            with patch("core.state_machine.logger.info", side_effect=captured_logs.append):
+                w._log_combat_skill_knobs_once()
+
+        self.assertGreaterEqual(len(captured_logs), 1)
+        expected_substring = "COMBAT SKILL KNOBS trusted=True burst=0.080s gcd=0.120s per_burst=4 keys=1,2,3,4,q,e,r"
+        found = any(expected_substring in str(msg) for msg in captured_logs)
+        self.assertTrue(found, f"Expected log not found. Logs: {captured_logs}")
+
+    def test_boot_logging_combat_skill_knobs_untrusted(self):
+        """
+        Verify COMBAT SKILL KNOBS trusted=False burst=0.150s gcd=0.180s per_burst=2 keys=1,2,3,4,q,e,r
+        is logged with exact formatting.
+        """
+        w = self.worker
+        self.driver._trusted = False
+        setattr(w, "_combat_skill_knobs_logged", False)
+
+        captured_logs = []
+        with patch.object(w, "_emit_log", side_effect=captured_logs.append):
+            with patch("core.state_machine.logger.info", side_effect=captured_logs.append):
+                w._log_combat_skill_knobs_once()
+
+        expected_substring = "COMBAT SKILL KNOBS trusted=False burst=0.150s gcd=0.180s per_burst=2 keys=1,2,3,4,q,e,r"
+        found = any(expected_substring in str(msg) for msg in captured_logs)
+        self.assertTrue(found, f"Expected log not found. Logs: {captured_logs}")
+
+    def test_boot_logging_idempotence(self):
+        """
+        Verify calling _log_combat_skill_knobs_once multiple times does NOT emit duplicate logs.
+        """
+        w = self.worker
+        setattr(w, "_combat_skill_knobs_logged", False)
+
+        captured_logs = []
+        with patch.object(w, "_emit_log", side_effect=captured_logs.append):
+            w._log_combat_skill_knobs_once()
+            w._log_combat_skill_knobs_once()
+            w._log_combat_skill_knobs_once()
+
+        self.assertEqual(
+            len(captured_logs),
+            1,
+            f"Expected exactly 1 log emission, got {len(captured_logs)}",
+        )
+
+    # =========================================================================
+    # AREA 4: GATHER MODE COMBAT SUPPRESSION (0 KEYS PRESSED, NO FIGHT_BACK)
+    # =========================================================================
+
+    def test_gather_route_mode_zero_skill_keys_under_simulated_attack(self):
+        """
+        Adversarial test: Bot is in ROUTE_MODE ("TOPLAMA").
+        Simulate hostile mob attack:
+        - Target bar visible = True
+        - HP dropping = True (from 100% to 40%)
+        - Under attack = True
+        - Even with fight_back = True in config!
+
+        Assert:
+        - Exactly 0 skill keys are pressed.
+        - fight_back_step / fight_back are never called.
+        - Right mouse button is released (not held).
+        """
+        w = self.worker
+        w._mode = BotMode.ROUTE_MODE.value
+        w.config["fight_back"] = True
+        w.config["test_mode"] = False
+
+        # Set up combat recovery mock indicating aggressive hostile attack
+        cr = MagicMock()
+        cr.is_dead.return_value = False
+        cr.check_under_attack.return_value = (True, 0.40)  # HP down to 40%
+        cr.fight_back_step = MagicMock()
+        cr.fight_back = MagicMock()
+        w.combat_recovery = cr
+
+        # Target bar visible and HP dropped
+        w._enemy_target_bar_visible = MagicMock(return_value=True)
+        w._note_player_hp_drop = MagicMock(return_value=True)
+        w._grab_frame = MagicMock(return_value=np.zeros((720, 1280, 3), dtype=np.uint8))
+
+        # Run 50 ticks of _handle_combat_and_death
+        for tick in range(50):
+            w._handle_combat_and_death()
+
+        # 1. Assert ZERO skill keys pressed
+        self.assertEqual(
+            len(self.driver.pressed),
+            0,
+            f"Combat suppression violated! Keys pressed: {self.driver.pressed}",
+        )
+
+        # 2. Assert fight_back / fight_back_step NEVER called
+        self.assertEqual(
+            cr.fight_back_step.call_count,
+            0,
+            f"fight_back_step was called {cr.fight_back_step.call_count} times in ROUTE_MODE!",
+        )
+        self.assertEqual(
+            cr.fight_back.call_count,
+            0,
+            f"fight_back was called {cr.fight_back.call_count} times in ROUTE_MODE!",
+        )
+
+        # 3. Assert right mouse button is NOT held
+        self.assertFalse(
+            getattr(w, "_combat_right_button_held", False),
+            "Combat right button remained held in ROUTE_MODE!",
+        )
+
+    def test_gather_route_mode_aliases_combat_suppression(self):
+        """
+        Test all ROUTE mode alias strings ("route", "toplama", "route_mode", BotMode.ROUTE_MODE.value)
+        under attack; verify 100% combat suppression across all alias representations.
+        """
+        w = self.worker
+        w.config["fight_back"] = True
+        w.config["test_mode"] = False
+
+        cr = MagicMock()
+        cr.is_dead.return_value = False
+        cr.check_under_attack.return_value = (True, 0.50)
+        cr.fight_back_step = MagicMock()
+        w.combat_recovery = cr
+
+        w._enemy_target_bar_visible = MagicMock(return_value=True)
+        w._note_player_hp_drop = MagicMock(return_value=True)
+        w._grab_frame = MagicMock(return_value=np.zeros((720, 1280, 3), dtype=np.uint8))
+
+        mode_aliases = ["route", "toplama", "route_mode", BotMode.ROUTE_MODE.value]
+        for mode_alias in mode_aliases:
+            w._mode = mode_alias
+            self.driver.clear()
+            cr.fight_back_step.reset_mock()
+
+            for _ in range(15):
+                w._handle_combat_and_death()
+
+            self.assertEqual(
+                len(self.driver.pressed),
+                0,
+                f"Leak detected in mode alias '{mode_alias}': keys={self.driver.pressed}",
+            )
+            self.assertEqual(cr.fight_back_step.call_count, 0)
+
+    def test_active_gathering_state_suppression(self):
+        """
+        When bot state is GATHERING (harvesting a node), ensure under-attack signals
+        never divert into fight_back skills.
+        """
+        w = self.worker
+        w._mode = BotMode.ROUTE_MODE.value
+        w._state = BotState.GATHERING.value
+        w.config["fight_back"] = True
+        w.config["fight_stop_gather_sec"] = 0
+
+        cr = MagicMock()
+        cr.is_dead.return_value = False
+        cr.check_under_attack.return_value = (True, 0.85)
+        w.combat_recovery = cr
+
+        w._handle_combat_and_death()
+        self.assertEqual(len(self.driver.pressed), 0)
+
+    # =========================================================================
+    # AREA 5: INTERCEPTION SINGLE-FIRE (NO SOFT DOUBLE-INJECTION)
+    # =========================================================================
+
+    def test_interception_success_prevents_all_soft_fallbacks_key_down(self):
+        """
+        Empirically verify that when Interception succeeds in key_down:
+        1. Interception send_key is called.
+        2. Returns True immediately.
+        3. _sendinput_key is NEVER called (0 times).
+        4. _keybd_event_key is NEVER called (0 times).
+        5. pydirectinput.keyDown is NEVER called (0 times).
+        6. keyboard.press is NEVER called (0 times).
+        """
+        ctrl = InputController.__new__(InputController)
+        ctrl.test_mode = False
+        ctrl._sending_virtual_key = False
+        ctrl._last_virtual_key_ts = 0.0
+
+        # Mock serial HID as unavailable
+        ctrl._serial_hid = None
+        ctrl.ensure_serial_hid = MagicMock()
+
+        # Mock Interception as available and returning True
+        mock_interception = MagicMock()
+        mock_interception.available = True
+        mock_interception.send_key.return_value = True
+        ctrl._interception = mock_interception
+        ctrl._faker = None
+
+        # Spy on soft fallback methods
+        ctrl._sendinput_key = MagicMock()
+        ctrl._keybd_event_key = MagicMock()
+        ctrl._post_key_to_game = MagicMock()
+
+        with patch("core.input_driver.pydirectinput") as mock_pydirectinput:
+            with patch("core.input_driver.logger.warning") as mock_log_warn:
+                result = ctrl.key_down("1")
+
+                # 1. Assert return True
+                self.assertTrue(result, "key_down should return True on Interception success")
+
+                # 2. Assert Interception was called
+                mock_interception.send_key.assert_called_once()
+                scancode_arg = mock_interception.send_key.call_args[0][0]
+                is_down_arg = mock_interception.send_key.call_args[0][1]
+                self.assertEqual(scancode_arg, 2)  # Scancode for '1' is 2 (0x02)
+                self.assertTrue(is_down_arg)
+
+                # 3. Assert soft fallbacks were NOT called (0 double-injection)
+                ctrl._sendinput_key.assert_not_called()
+                ctrl._keybd_event_key.assert_not_called()
+                ctrl._post_key_to_game.assert_not_called()
+                mock_pydirectinput.keyDown.assert_not_called()
+
+                # 4. Assert NO opsec fallback warning was logged
+                fallback_warnings = [
+                    call for call in mock_log_warn.call_args_list if "OPSEC FALLBACK" in str(call)
+                ]
+                self.assertEqual(
+                    len(fallback_warnings),
+                    0,
+                    f"OPSEC FALLBACK logged despite Interception success: {fallback_warnings}",
+                )
+
+    def test_interception_success_prevents_all_soft_fallbacks_key_up(self):
+        """
+        Empirically verify that when Interception succeeds in key_up:
+        1. Interception send_key(..., False) is called.
+        2. Soft key release fallbacks are NOT called.
+        """
+        ctrl = InputController.__new__(InputController)
+        ctrl.test_mode = False
+        ctrl._sending_virtual_key = False
+        ctrl._last_virtual_key_ts = 0.0
+
+        ctrl._serial_hid = None
+        mock_interception = MagicMock()
+        mock_interception.available = True
+        mock_interception.send_key.return_value = True
+        ctrl._interception = mock_interception
+        ctrl._faker = None
+
+        ctrl._sendinput_key = MagicMock()
+        ctrl._keybd_event_key = MagicMock()
+
+        with patch("core.input_driver.pydirectinput") as mock_pydirectinput:
+            with patch("core.input_driver.logger.warning") as mock_log_warn:
+                ctrl.key_up("1")
+
+                # 1. Interception send_key called with is_down=False
+                mock_interception.send_key.assert_called_once()
+                self.assertFalse(mock_interception.send_key.call_args[0][1])
+
+                # 2. Soft fallbacks not called
+                ctrl._sendinput_key.assert_not_called()
+                ctrl._keybd_event_key.assert_not_called()
+                mock_pydirectinput.keyUp.assert_not_called()
+
+                fallback_warnings = [
+                    call for call in mock_log_warn.call_args_list if "OPSEC FALLBACK" in str(call)
+                ]
+                self.assertEqual(len(fallback_warnings), 0)
+
+    def test_interception_unavailable_falls_back_with_opsec_warning(self):
+        """
+        Verify that when Interception is unavailable or fails:
+        1. Soft fallbacks execute.
+        2. OPSEC FALLBACK warning is clearly emitted in logs.
+        """
+        ctrl = InputController.__new__(InputController)
+        ctrl.test_mode = False
+        ctrl._sending_virtual_key = False
+        ctrl._last_virtual_key_ts = 0.0
+
+        ctrl._serial_hid = None
+        ctrl.ensure_serial_hid = MagicMock()
+        # Interception not available
+        ctrl._interception = None
+        ctrl._faker = None
+
+        ctrl._sendinput_key = MagicMock(return_value=True)
+        ctrl._keybd_event_key = MagicMock(return_value=True)
+        ctrl._post_key_to_game = MagicMock(return_value=False)
+
+        warning_messages = []
+        with patch("core.input_driver.logger.warning", side_effect=lambda msg, *args: warning_messages.append(msg % args if args else msg)):
+            result = ctrl.key_down("1")
+
+            self.assertTrue(result)
+            ctrl._sendinput_key.assert_called_once()
+
+            # Verify OPSEC FALLBACK was logged
+            found_opsec = any("[OPSEC FALLBACK]" in str(msg) for msg in warning_messages)
+            self.assertTrue(
+                found_opsec,
+                f"Expected [OPSEC FALLBACK] warning on soft fallback. Logged: {warning_messages}",
+            )
+
+    def test_stress_100_keys_single_fire_invariance(self):
+        """
+        Stress test: generate 100 keystrokes across diverse game keys
+        (1, 2, 3, 4, q, e, r, w, s, a, d, space, tab, f).
+        Verify 100% single-fire rate: Interception called exactly once per keystroke,
+        zero soft calls, zero exceptions.
+        """
+        ctrl = InputController.__new__(InputController)
+        ctrl.test_mode = False
+        ctrl._sending_virtual_key = False
+        ctrl._last_virtual_key_ts = 0.0
+        ctrl._serial_hid = None
+        ctrl.ensure_serial_hid = MagicMock()
+
+        mock_interception = MagicMock()
+        mock_interception.available = True
+        mock_interception.send_key.return_value = True
+        ctrl._interception = mock_interception
+        ctrl._faker = None
+
+        ctrl._sendinput_key = MagicMock()
+        ctrl._keybd_event_key = MagicMock()
+        ctrl._post_key_to_game = MagicMock()
+
+        test_keys = ["1", "2", "3", "4", "q", "e", "r", "w", "s", "a", "d", "space", "tab", "f"]
+
+        for i in range(100):
+            k = test_keys[i % len(test_keys)]
+            res = ctrl.key_down(k)
+            self.assertTrue(res, f"Key down failed for '{k}' on iteration {i}")
+            ctrl.key_up(k)
+
+        # 100 key_down + 100 key_up = 200 Interception calls
+        self.assertEqual(mock_interception.send_key.call_count, 200)
+
+        # 0 soft fallback calls
+        self.assertEqual(ctrl._sendinput_key.call_count, 0)
+        self.assertEqual(ctrl._keybd_event_key.call_count, 0)
+        self.assertEqual(ctrl._post_key_to_game.call_count, 0)
+
+    # =========================================================================
+    # INTEGRATION & FAULT TOLERANCE TESTS
+    # =========================================================================
+
+    def test_step_combat_mode_50_ticks_round_robin_integration(self):
+        """
+        Full state machine integration test: run _step_combat_mode across 50 ticks
+        with a locked target. Verify that exactly 7 keys rotate with perfect balance.
+        """
+        w = self.worker
+        w._mode = BotMode.COMBAT_MODE.value
+        w._state = BotState.WAITING.value
+        w.route_manager = None
+        w.hud_snapshot = None
+        w._emit_hud_snapshot = lambda **kw: None
+        w.combat_recovery = None
+        w._grab_frame = lambda grayscale=False: np.zeros((720, 1280, 3), dtype=np.uint8)
+        w._combat_has_hostile_lock = lambda f: True
+        w._real_target_for_skills = lambda b: True
+
+        sim_now = 5000.0
+        with patch("core.state_machine.time.time", side_effect=lambda: sim_now):
+            for tick in range(50):
+                sim_now += 0.085  # burst interval
+                w._step_combat_mode()
+
+        counts = collections.Counter(self.driver.pressed)
+        expected_keys = {"1", "2", "3", "4", "q", "e", "r"}
+        self.assertEqual(set(counts.keys()), expected_keys)
+        # Verify perfect balance: each key executed exactly 25 or 26 times
+        for k in expected_keys:
+            self.assertGreaterEqual(counts[k], 20)
+            self.assertLessEqual(counts[k], 30)
+
+    def test_step_combat_mode_target_flicker_grace_tick(self):
+        """
+        Verify target flicker grace tick:
+        - Tick 1 (first target loss frame): fires skills, does NOT choke into TAB.
+        - Tick 2 (confirmed lost frame): fires TAB to search.
+        """
+        w = self.worker
+        w._mode = BotMode.COMBAT_MODE.value
+        w._state = BotState.FIGHTING.value
+        w.route_manager = None
+        w._emit_hud_snapshot = lambda **kw: None
+        w.combat_recovery = None
+        w._combat_was_targeting = True
+        w._combat_no_target_streak = 0
+        w._grab_frame = lambda grayscale=False: np.zeros((720, 1280, 3), dtype=np.uint8)
+        w._combat_has_hostile_lock = lambda f: False
+        w._real_target_for_skills = lambda b: True
+
+        # Tick 1: flicker frame
+        w._step_combat_mode()
+        self.assertNotIn("tab", self.driver.pressed)
+        self.assertGreater(len(self.driver.pressed), 0)
+
+        # Tick 2: confirmed loss
+        self.driver.clear()
+        w._step_combat_mode()
+        self.assertIn("tab", self.driver.pressed)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

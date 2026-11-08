@@ -213,6 +213,115 @@ class RouteOptimizer:
 
         return order
 
+    @staticmethod
+    def _segments_intersect(
+        a1: Tuple[float, float],
+        a2: Tuple[float, float],
+        b1: Tuple[float, float],
+        b2: Tuple[float, float],
+    ) -> bool:
+        """İki 2B doğru parçasının uç noktalar hariç kesişip kesişmediğini döndürür."""
+        def _ccw(p1: Tuple[float, float], p2: Tuple[float, float], p3: Tuple[float, float]) -> float:
+            return (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
+
+        eps = 1e-6
+        if (
+            math.hypot(a1[0] - b1[0], a1[1] - b1[1]) < eps
+            or math.hypot(a1[0] - b2[0], a1[1] - b2[1]) < eps
+            or math.hypot(a2[0] - b1[0], a2[1] - b1[1]) < eps
+            or math.hypot(a2[0] - b2[0], a2[1] - b2[1]) < eps
+        ):
+            return False
+
+        d1 = _ccw(a1, a2, b1)
+        d2 = _ccw(a1, a2, b2)
+        d3 = _ccw(b1, b2, a1)
+        d4 = _ccw(b1, b2, a2)
+
+        if ((d1 > eps and d2 < -eps) or (d1 < -eps and d2 > eps)) and (
+            (d3 > eps and d4 < -eps) or (d3 < -eps and d4 > eps)
+        ):
+            return True
+        return False
+
+    def count_crossings(
+        self,
+        nodes: Sequence[Any],
+        closed_loop: bool = True,
+    ) -> int:
+        """Rotadaki kendi kendini kesen kenar çifti sayısını döndürür."""
+        if not nodes or len(nodes) < 4:
+            return 0
+        use_pixels = self._uses_pixel_coords(nodes)
+        coords = [self._get_node_xy(node, use_pixel_space=use_pixels) for node in nodes]
+        return self._count_coords_crossings(coords, closed_loop=closed_loop)
+
+    def _count_coords_crossings(
+        self,
+        coords: Sequence[Tuple[float, float]],
+        closed_loop: bool = True,
+    ) -> int:
+        n = len(coords)
+        if n < 4:
+            return 0
+        edges = []
+        num_e = n if closed_loop else (n - 1)
+        for i in range(num_e):
+            edges.append((coords[i], coords[(i + 1) % n]))
+
+        crossings = 0
+        for i in range(num_e):
+            a1, a2 = edges[i]
+            for j in range(i + 2, num_e):
+                if closed_loop and i == 0 and j == num_e - 1:
+                    continue
+                b1, b2 = edges[j]
+                if self._segments_intersect(a1, a2, b1, b2):
+                    crossings += 1
+        return crossings
+
+    def is_non_intersecting(
+        self,
+        nodes: Sequence[Any],
+        closed_loop: bool = True,
+    ) -> bool:
+        """Rotanın kesişimsiz (non-intersecting) olduğunu doğrular."""
+        return self.count_crossings(nodes, closed_loop=closed_loop) == 0
+
+    def _eliminate_crossings(
+        self,
+        order: List[int],
+        coords: Sequence[Tuple[float, float]],
+        closed_loop: bool = True,
+        max_passes: int = 60,
+    ) -> List[int]:
+        """Kesişen kenarları 2-Opt ters çevirme ile tamamen ortadan kaldırır."""
+        n = len(order)
+        if n < 4:
+            return list(order)
+
+        route = list(order)
+        num_edges = n if closed_loop else (n - 1)
+        for _ in range(min(max_passes, n * 3)):
+            found_crossing = False
+            for i in range(num_edges - 2):
+                a1 = coords[route[i]]
+                a2 = coords[route[(i + 1) % n]]
+                for j in range(i + 2, num_edges):
+                    if closed_loop and i == 0 and j == num_edges - 1:
+                        continue
+                    b1 = coords[route[j]]
+                    b2 = coords[route[(j + 1) % n]]
+                    if self._segments_intersect(a1, a2, b1, b2):
+                        route[i + 1 : j + 1] = reversed(route[i + 1 : j + 1])
+                        found_crossing = True
+                        break
+                if found_crossing:
+                    break
+            if not found_crossing:
+                break
+        return route
+
     def _two_opt_improve(
         self,
         order: List[int],
@@ -273,14 +382,24 @@ class RouteOptimizer:
         """
         Dugum listesini (NodeData nesneleri veya dict formatinda map_x, map_y,
         norm_x, norm_y iceren dugumler) alir; Nearest Neighbor + 2-Opt TSP
-        uygulayarak toplam yuruyus mesafesini minimize eden sirali listeyi dondurur.
+        uygulayarak kesişimsiz (non-intersecting) ve toplam mesafeyi minimize
+        eden sirali listeyi dondurur. Her dugumun seq_index degerini (1..N) gunceller.
         """
         try:
             if not nodes:
                 return []
             n = len(nodes)
             if n <= 2:
-                return list(nodes)
+                result_nodes = list(nodes)
+                for idx, node_item in enumerate(result_nodes, start=1):
+                    if isinstance(node_item, dict):
+                        node_item["seq_index"] = idx
+                    elif hasattr(node_item, "seq_index"):
+                        try:
+                            node_item.seq_index = idx
+                        except Exception:
+                            pass
+                return result_nodes
 
             use_pixels = self._uses_pixel_coords(nodes)
             coords: List[Tuple[float, float]] = [
@@ -326,6 +445,13 @@ class RouteOptimizer:
                 closed_loop=True,
             )
 
+            # Kesişen kenarları kesin olarak gidererek non-intersecting tur elde et
+            optimized_order = self._eliminate_crossings(
+                optimized_order,
+                coords,
+                closed_loop=True,
+            )
+
             # Eger start_pos verilmisse en yakin dugumun 0. indekste kalmasini garanti et
             if norm_start is not None:
                 nearest_idx = min(
@@ -340,8 +466,10 @@ class RouteOptimizer:
                 optimized_order, dist_matrix, closed_loop=True
             )
 
-            # Eger orijinal sira zaten daha kisa ise onu koru
-            if unoptimized_dist < optimized_dist:
+            # Eger orijinal sira zaten daha kisa ise ve kesişim içermiyorsa onu koru
+            opt_crossings = self._count_coords_crossings([coords[i] for i in optimized_order], closed_loop=True)
+            init_crossings = self._count_coords_crossings(coords, closed_loop=True)
+            if unoptimized_dist < optimized_dist and (init_crossings <= opt_crossings):
                 optimized_order = initial_order
                 optimized_dist = unoptimized_dist
 
@@ -371,11 +499,36 @@ class RouteOptimizer:
                 optimized_dist,
                 improvement_pct,
             )
-            return [nodes[idx] for idx in optimized_order]
+
+            ordered_nodes = [nodes[idx] for idx in optimized_order]
+            for seq_idx, node_item in enumerate(ordered_nodes, start=1):
+                if isinstance(node_item, dict):
+                    node_item["seq_index"] = seq_idx
+                elif hasattr(node_item, "seq_index"):
+                    try:
+                        node_item.seq_index = seq_idx
+                    except Exception:
+                        pass
+                elif hasattr(node_item, "__setitem__"):
+                    try:
+                        node_item["seq_index"] = seq_idx
+                    except Exception:
+                        pass
+
+            return ordered_nodes
 
         except Exception as exc:
             logger.error("optimize_node_sequence hatasi: %s", exc)
-            return list(nodes) if nodes else []
+            fallback_nodes = list(nodes) if nodes else []
+            for seq_idx, node_item in enumerate(fallback_nodes, start=1):
+                if isinstance(node_item, dict):
+                    node_item["seq_index"] = seq_idx
+                elif hasattr(node_item, "seq_index"):
+                    try:
+                        node_item.seq_index = seq_idx
+                    except Exception:
+                        pass
+            return fallback_nodes
 
     # ------------------------------------------------------------------
     # Rota Mesafe Istatistikleri

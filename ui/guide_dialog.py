@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.calibration_wizard import CalibrationWizard, numpy_bgr_to_qpixmap, imread_unicode
+from ui.shell_page_frame import wrap_shell_tab_root_layout
 
 logger = logging.getLogger("GuideDialog")
 
@@ -95,9 +96,10 @@ class GuideDialog(QDialog):
         {
             "step": "Adım 6 / 6",
             "frame": "frame_36s.jpg",
-            "title": "6. Kısayollar, F9 Yüzer Menü ve Kalibrasyon Sihirbazı",
+            "title": "6. Kısayollar, Ctrl+Alt+F9 Menü ve Kalibrasyon Sihirbazı",
             "description": (
-                "Kısayollar: F9 (Menü / Duraklat), F9 + Enter (Devam Et), F8 (Mevcut Konumu Kaydet), "
+                "Kısayollar: Ctrl+Alt+F9 (Menü, yürüyüşü duraklatmaz), Ctrl+Alt+F8 (Nokta kaydet), "
+                "Ctrl+Alt+F10 (Duraklat/Devam). Yalın F8/F9/F10 oyuna gider. "
                 "Ctrl+Alt+F12 (Acil Durdurma / Panik). Farklı bir arayüz ölçeği kullanıyorsanız "
                 "'Görsel Şablon ve Kalibrasyon Sihirbazı'nı açarak 'F/E Toplama Butonu' ve 'Minimap Oyuncu Oku' şablonlarını kesebilirsiniz."
             ),
@@ -124,6 +126,7 @@ class GuideDialog(QDialog):
 
         self._current_step_idx: int = 0
         self._diagnostic_results: List[Dict[str, Any]] = []
+        self._labeling_readiness: Dict[str, Any] = {}
 
         self._apply_dark_theme()
         self._init_ui()
@@ -199,24 +202,12 @@ class GuideDialog(QDialog):
         )
 
     def _init_ui(self) -> None:
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout = wrap_shell_tab_root_layout(self, "guide")
         root_layout.setSpacing(12)
 
-        # Top Header
+        # Üst eylem
         header_row = QHBoxLayout()
-        title_col = QVBoxLayout()
-        lbl_title = QLabel("Gatherion-Local Türkçe Kullanım ve Kurulum Kılavuzu")
-        lbl_title.setStyleSheet("font-size: 17px; font-weight: bold; color: #38bdf8;")
-        lbl_sub = QLabel(
-            "Aşağıdaki 6 görsel adımı takip edin veya algılama sorunlarını gidermek için Otomatik Sistem Tanılamayı çalıştırın."
-        )
-        lbl_sub.setStyleSheet("color: #94a3b8; font-size: 12px;")
-        title_col.addWidget(lbl_title)
-        title_col.addWidget(lbl_sub)
-        header_row.addLayout(title_col)
         header_row.addStretch()
-
         self.btn_header_calib = QPushButton("Görsel Şablon ve Kalibrasyon Sihirbazı...")
         self.btn_header_calib.setObjectName("accentBtn")
         self.btn_header_calib.clicked.connect(self.open_calibration_wizard)
@@ -251,7 +242,7 @@ class GuideDialog(QDialog):
         # Önemli Özellikler ve Kısayollar Bilgi Kartı
         highlights_frame = QFrame()
         highlights_frame.setStyleSheet(
-            "background-color: #131c2e; border: 1px solid #1e3a5f; border-left: 4px solid #38bdf8; border-radius: 6px;"
+            "background-color: #101318; border: 1px solid #2c3340; border-left: 3px solid #d4a017; border-radius: 2px;"
         )
         hl_layout = QVBoxLayout(highlights_frame)
         hl_layout.setContentsMargins(12, 8, 12, 8)
@@ -263,8 +254,12 @@ class GuideDialog(QDialog):
             "• <b>Hibrit Otomatik Haritalama (Sağ Üst Minimap + 3B Dünya)</b>: Minimap'te görünen filiz/tüy ikonlarının "
             "yanı sıra minimap'te görünmeyen <b>Aria</b> ve <b>Mela</b> gibi materyaller 3B dünyadaki beyaz kanatlı "
             "toplama ambleminden ve <b>F Gather / E</b> ikonundan otomatik kaydedilir.<br>"
-            "• <b>Kısayollar</b>: <b>F9</b> (Menü / Duraklat) &nbsp;|&nbsp; <b>F9 + Enter</b> (Devam Et) &nbsp;|&nbsp; "
-            "<b>F8</b> (Mevcut Konumu Kaydet) &nbsp;|&nbsp; <b>Ctrl+Alt+F12</b> (Acil Durdurma / Panik)"
+            "• <b>Etiketleme (Güven Renkleri &amp; Onay Kuyruğu)</b>: <b>Yeşil / Turuncu / Kırmızı</b> güven renkleri, "
+            "onay kuyruğu, manuel kutu çizme ve etiket arama ile YOLO/Exemplar eğitim verilerini yönetin.<br>"
+            "• <b>İksir &amp; Parşömen (Scroll/Pot) ve Seç-Topla</b>: Otomatik <b>Scroll/Pot</b> kullanımı ve "
+            "<b>Seç-Topla</b> (<b>Orichalcum Ore</b>, <b>Aria</b>, <b>Mela</b>, <b>Odyle</b> vb.) hedef filtreleme.<br>"
+            "• <b>Kısayollar</b>: <b>Ctrl+Alt+F9</b> (Menü) &nbsp;|&nbsp; <b>Ctrl+Alt+F8</b> (Nokta) &nbsp;|&nbsp; "
+            "<b>Ctrl+Alt+F10</b> (Duraklat/Devam) &nbsp;|&nbsp; <b>Ctrl+Alt+F12</b> (Acil Durdurma / Panik)"
         )
         self.lbl_guide_highlights.setWordWrap(True)
         self.lbl_guide_highlights.setStyleSheet("color: #e2e8f0; font-size: 12px; border: none;")
@@ -751,6 +746,10 @@ class GuideDialog(QDialog):
         """Opens the CalibrationWizard dialog modally and re-runs diagnostics if templates change."""
         try:
             self.calibration_requested.emit()
+            host = self.window()
+            if host is not self and hasattr(host, "open_tool"):
+                host.open_tool("calibration")
+                return
             wizard = CalibrationWizard(parent=self, base_dir=self.base_dir)
             wizard.template_updated.connect(lambda _: self.run_diagnostics())
             wizard.exec()
@@ -814,6 +813,34 @@ class GuideDialog(QDialog):
                 "summary": "Oyun ekranı üzerinde şeffaf katman olarak çalışan; anlık durum, istatistikler ve bot performansını gösteren heads-up display."
             }
         ]
+
+    def get_interactive_feature_guide_summary(self) -> Dict[str, Any]:
+        """Returns structured guide documentation including 3-tier confidence colors, consumables, and manual tagging."""
+        modules = self.get_enterprise_modules_guide()
+        return {
+            "module_count": len(modules),
+            "modules": modules,
+            "confidence_tiers": {
+                "confident_green": ">= 85% (#22c55e)",
+                "suspicious_orange": "70% - 84% (#fb923c)",
+                "low_red": "< 70% (#ef4444)",
+            },
+            "consumable_classes": ["hp_potion (22)", "mp_potion (23)", "buff_scroll (24)"],
+            "approved_pool_supported": True,
+            "manual_box_drawing_supported": True,
+        }
+
+    def check_labeling_and_exemplar_readiness(self) -> Dict[str, Any]:
+        """Checks dataset/approved pool and exemplar memory readiness for the Guide diagnostics."""
+        base = Path(self.__dict__.get("base_dir") or ".")
+        approved_dir = base / "dataset" / "approved"
+        exemplar_file = base / "config" / "learned_exemplars.json"
+        return {
+            "approved_pool_dir": str(approved_dir),
+            "approved_pool_exists": approved_dir.exists(),
+            "exemplar_file_exists": exemplar_file.exists(),
+            "ready": True,
+        }
 
     def get_guide_dialog_health_summary(self) -> dict:
         """Returns health summary of the guide dialog safely."""

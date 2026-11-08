@@ -122,6 +122,31 @@ DEFAULT_BROKER_PRICES: Dict[str, int] = {
 # Alias for compatibility with ActiveLearningLoop requirement
 DEFAULT_AION2_MATERIAL_PRICES = DEFAULT_BROKER_PRICES
 
+# Varsayılan İksir / Parşömen / Tüketilebilir Eşya Birim Maliyetleri (Kinah)
+DEFAULT_CONSUMABLE_COSTS: Dict[str, int] = {
+    "Healing Potion": 1200,
+    "Lesser Healing Potion": 800,
+    "Greater Healing Potion": 3500,
+    "Fine Recovery Elixir": 6500,
+    "Recovery Potion": 2200,
+    "Mana Potion": 1400,
+    "Greater Mana Potion": 3200,
+    "Wind Serum": 2800,
+    "Targena Wind Serum": 3800,
+    "Running Scroll": 2500,
+    "Greater Running Scroll": 4200,
+    "Courage Scroll": 3200,
+    "Azpha Courage Scroll": 4500,
+    "Attack Speed Scroll": 3200,
+    "Casting Speed Scroll": 3200,
+    "Calendula Panacea": 3400,
+    "Mela Fruit Tart": 2900,
+    "Potion": 1500,
+    "Scroll": 2500,
+    "İksir": 1500,
+    "Parşömen": 2500,
+}
+
 # Görüntü İşleme (CV) ile Pazar Satırı İkon Renk İmzaları (HSV aralıkları -> Materyal eşlemesi)
 BROKER_ICON_HSV_SIGNATURES: List[Tuple[str, Tuple[int, int, int], Tuple[int, int, int]]] = [
     ("Diamond Gemstone", (88, 25, 210), (108, 120, 255)),
@@ -925,6 +950,20 @@ class TradeBrokerPriceScanner:
     def get_economy_broker_version_info(self) -> dict:
         return {"module": "economy_broker", "version": "2.0.0", "ready": True}
 
+    def calculate_net_hourly_kinah(
+        self,
+        gathered_counts: Dict[str, int],
+        consumables_used: Dict[str, int],
+        elapsed_hours: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Seçili materyallere göre iksir/parşömen maliyetini düşerek saatlik net Kinah kârını hesaplar."""
+        return calculate_net_hourly_kinah(
+            gathered_counts=gathered_counts,
+            consumables_used=consumables_used,
+            elapsed_hours=elapsed_hours,
+            price_scanner=self,
+        )
+
 
 # ==============================================================================
 # 2. AUTO-CRAFTING & SUBSTANCE MORPHING QUEUE
@@ -1386,6 +1425,20 @@ class SessionProfitSimulator:
 
     def get_economy_broker_version_info(self) -> dict:
         return {"module": "economy_broker", "version": "2.0.0", "ready": True}
+
+    def calculate_net_hourly_kinah(
+        self,
+        gathered_counts: Dict[str, int],
+        consumables_used: Dict[str, int],
+        elapsed_hours: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Seçili materyallere göre iksir/parşömen maliyetini düşerek saatlik net Kinah kârını hesaplar."""
+        return calculate_net_hourly_kinah(
+            gathered_counts=gathered_counts,
+            consumables_used=consumables_used,
+            elapsed_hours=elapsed_hours,
+            price_scanner=self,
+        )
 
     def get_economy_broker_diagnostic_snapshot(self) -> dict:
         return {"module": "economy_broker", "status": "ok", "ready": True}

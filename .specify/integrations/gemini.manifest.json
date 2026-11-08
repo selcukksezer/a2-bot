@@ -1,0 +1,16 @@
+{
+  "integration": "gemini",
+  "version": "1.3.2",
+  "installed_at": "2026-11-07T07:40:58.257047+00:00",
+  "files": {
+    ".gemini/commands/speckit.analyze.toml": "4b420b73a4a20b977df05ed7f23ae459da606a9ee52452d4f7184ec3d03eb27a",
+    ".gemini/commands/speckit.clarify.toml": "00f8dc0d848d987d9ccf5b2bfa72b788d698b8b72ac42509b768c752c32b31cb",
+    ".gemini/commands/speckit.constitution.toml": "c220664c3546920b980ca88fea0a64428c71895d9d93ba76a70fb069ac396d15",
+    ".gemini/commands/speckit.implement.toml": "f7f0bc8e6d10fe5de3c818e8a98578ff17e0bafcfc167699f212d586406d0345",
+    ".gemini/commands/speckit.converge.toml": "ea9c8695a394b2d7eb57c629c7591d1b5ff25137a783ef5c17957467dc142c6d",
+    ".gemini/commands/speckit.plan.toml": "7204af64afa802f2443990cab11bc63bccc7c48cb7e0796ab71a7ed683b93cca",
+    ".gemini/commands/speckit.checklist.toml": "5fc9c0b795d20bd1685553e1d8c5bcd2cafec424011fbd6a9dcade9fba8922a4",
+    ".gemini/commands/speckit.specify.toml": "317d4f4783a6b703f944d52ce2c795257eaffafe920d5636e1399b470bcc5e9c",
+    ".gemini/commands/speckit.tasks.toml": "f3e8ffb6705e3f91e3b3508944471448b7edffb230cbaf496f5970bfc7639032"
+  }
+}

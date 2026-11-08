@@ -1,0 +1,363 @@
+# -*- coding: utf-8 -*-
+"""
+Tests for Pre-Training Quality & Hygiene Gate (`dataset_factory/dataset_hygiene_gate.py`).
+"""
+
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+import time
+import unittest
+
+from dataset_factory.dataset_hygiene_gate import (
+    CANONICAL_CLASS_IDS,
+    CANONICAL_CLASS_NAMES,
+    audit_dataset_hygiene,
+    is_canonical_class,
+    is_hand_or_human_approved,
+    is_training_box_verified,
+    pre_training_dataset_hygiene_gate,
+    validate_and_clamp_box,
+)
+
+
+class TestDatasetHygieneGate(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="test_hygiene_gate_")
+        self.root = Path(self.temp_dir)
+        self.labels_train = self.root / "labels" / "train"
+        self.labels_val = self.root / "labels" / "val"
+        self.images_train = self.root / "images" / "train"
+        self.images_val = self.root / "images" / "val"
+        self.review_train = self.root / "review" / "train"
+        self.review_val = self.root / "review" / "val"
+
+        for p in (
+            self.labels_train,
+            self.labels_val,
+            self.images_train,
+            self.images_val,
+            self.review_train,
+            self.review_val,
+        ):
+            p.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _create_image(self, split: str, stem: str) -> Path:
+        img_p = self.root / "images" / split / f"{stem}.jpg"
+        img_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32)
+        return img_p
+
+    def _create_label(self, split: str, stem: str, lines: list[str]) -> Path:
+        lbl_p = self.root / "labels" / split / f"{stem}.txt"
+        lbl_p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return lbl_p
+
+    def _create_review(self, split: str, stem: str, trusted: list = None, weak: list = None) -> Path:
+        rev_p = self.root / "review" / split / f"{stem}.json"
+        data = {
+            "stem": stem,
+            "trusted": trusted or [],
+            "weak": weak or [],
+        }
+        rev_p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return rev_p
+
+    def test_canonical_classes(self):
+        """Verify only canonical classes 0..21 are accepted."""
+        self.assertEqual(len(CANONICAL_CLASS_IDS), 22)
+        for cid in range(22):
+            self.assertTrue(is_canonical_class(cid))
+            self.assertIn(cid, CANONICAL_CLASS_NAMES)
+        self.assertFalse(is_canonical_class(-1))
+        self.assertFalse(is_canonical_class(22))
+        self.assertFalse(is_canonical_class(98))
+        self.assertFalse(is_canonical_class("invalid"))
+
+    def test_geometry_validation_and_clamping(self):
+        """Verify zero-area, unnormalized, and clamped boxes."""
+        # Zero area
+        valid, coords, reason = validate_and_clamp_box(0.5, 0.5, 0.0, 0.05)
+        self.assertFalse(valid)
+        self.assertIn("Zero or sub-minimal", reason)
+
+        # Negative area
+        valid, coords, reason = validate_and_clamp_box(0.5, 0.5, -0.1, 0.1)
+        self.assertFalse(valid)
+
+        # Spurious full screen
+        valid, coords, reason = validate_and_clamp_box(0.5, 0.5, 0.99, 0.99)
+        self.assertFalse(valid)
+
+        # Wildly out of bounds
+        valid, coords, reason = validate_and_clamp_box(1.5, 0.5, 0.1, 0.1)
+        self.assertFalse(valid)
+
+        # Minor rounding clamped
+        valid, coords, reason = validate_and_clamp_box(1.0001, -0.0001, 0.1, 0.1)
+        self.assertTrue(valid)
+        self.assertIsNotNone(coords)
+        cx, cy, w, h = coords
+        self.assertAlmostEqual(cx, 0.9999)
+        self.assertAlmostEqual(cy, 0.0001)
+
+    def test_check_1_purges_invalid_class_ids(self):
+        """Check 1: Non-canonical class IDs (e.g. 98, 70, 22) are purged from .txt and .json."""
+        stem = "test_invalid_cid"
+        self._create_image("train", stem)
+        self._create_label(
+            "train",
+            stem,
+            [
+                "0 0.500000 0.500000 0.100000 0.100000",
+                "98 0.400000 0.400000 0.200000 0.200000",  # Invalid!
+                "3 0.600000 0.600000 0.150000 0.150000",
+            ],
+        )
+        self._create_review(
+            "train",
+            stem,
+            trusted=[
+                {"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1, "confidence": 0.95, "source": "hand_label"},
+                {"class_id": 98, "cx": 0.4, "cy": 0.4, "w": 0.2, "h": 0.2, "confidence": 0.90, "source": "exemplar_match"},
+                {"class_id": 3, "cx": 0.6, "cy": 0.6, "w": 0.15, "h": 0.15, "confidence": 0.92, "source": "hand_label"},
+            ],
+        )
+
+        report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
+        self.assertTrue(report["clean"])
+        self.assertGreaterEqual(report["purged_boxes"], 1)
+        self.assertGreaterEqual(report["invalid_class_ids_purged"], 1)
+
+        # Inspect resulting .txt
+        lbl_content = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lbl_content), 2)
+        cids = [int(line.split()[0]) for line in lbl_content]
+        self.assertIn(0, cids)
+        self.assertIn(3, cids)
+        self.assertNotIn(98, cids)
+
+        # Inspect resulting review JSON
+        rev_data = json.loads((self.review_train / f"{stem}.json").read_text(encoding="utf-8"))
+        rev_cids = [b["class_id"] for b in rev_data["trusted"]]
+        self.assertNotIn(98, rev_cids)
+
+    def test_check_2_purges_unapproved_boxes_in_train(self):
+        """Check 2: Unapproved heuristic boxes in training set are purged and demoted."""
+        stem = "boot_aria_sample"
+        self._create_image("train", stem)
+        self._create_label(
+            "train",
+            stem,
+            [
+                "0 0.500000 0.500000 0.100000 0.100000",
+                "15 0.450000 0.680000 0.340000 0.320000",  # Unverified heuristic path_ground!
+            ],
+        )
+        self._create_review(
+            "train",
+            stem,
+            trusted=[
+                {"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1, "confidence": 0.95, "source": "vision_3d_crest", "trusted": True},
+                {
+                    "class_id": 15,
+                    "cx": 0.45,
+                    "cy": 0.68,
+                    "w": 0.34,
+                    "h": 0.32,
+                    "confidence": 0.92,
+                    "source": "visual_ground_path_segmenter",
+                    "trusted": True,
+                },
+            ],
+        )
+
+        report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
+        self.assertTrue(report["clean"])
+        self.assertGreaterEqual(report["unapproved_boxes_purged"], 1)
+
+        # Label .txt should now ONLY have aria (0)
+        lbl_content = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lbl_content), 1)
+        self.assertTrue(lbl_content[0].startswith("0 "))
+
+        # Review JSON should demote path_ground to weak
+        rev_data = json.loads((self.review_train / f"{stem}.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(rev_data["trusted"]), 1)
+        self.assertEqual(rev_data["trusted"][0]["class_id"], 0)
+        self.assertEqual(len(rev_data["weak"]), 1)
+        self.assertEqual(rev_data["weak"][0]["class_id"], 15)
+
+    def test_check_3_purges_zero_area_and_corrupt_boxes(self):
+        """Check 3: Corrupted lines and zero-area boxes are eliminated."""
+        stem = "test_corrupted_boxes"
+        self._create_image("train", stem)
+        self._create_label(
+            "train",
+            stem,
+            [
+                "0 0.500000 0.500000 0.100000 0.100000",
+                "3 0.200000 0.200000 0.000000 0.000000",  # Zero area!
+                "corrupted line with random words",         # Syntax error!
+                "4 0.300000 0.300000 0.050000",             # Missing dimension!
+                "5 0.700000 0.700000 0.080000 0.080000",
+            ],
+        )
+        self._create_review(
+            "train",
+            stem,
+            trusted=[
+                {"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1, "confidence": 0.95, "source": "hand_label"},
+                {"class_id": 5, "cx": 0.7, "cy": 0.7, "w": 0.08, "h": 0.08, "confidence": 0.92, "source": "hand_label"},
+            ],
+        )
+
+        report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
+        self.assertTrue(report["clean"])
+        self.assertGreaterEqual(report["corrupted_boxes_purged"], 3)
+
+        lbl_content = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lbl_content), 2)
+        cids = [int(line.split()[0]) for line in lbl_content]
+        self.assertEqual(cids, [0, 5])
+
+    def test_check_4_mismatched_images_and_orphaned_files(self):
+        """Check 4: Orphaned labels without images and missing labels for images are cleaned."""
+        # 1. Orphaned label (no image)
+        self._create_label("train", "orphan_label", ["0 0.5 0.5 0.1 0.1"])
+        self._create_review("train", "orphan_label", trusted=[{"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1}])
+
+        # 2. Image without label file
+        self._create_image("train", "orphan_image")
+
+        report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
+        self.assertTrue(report["clean"])
+        self.assertGreaterEqual(report["mismatched_files_fixed"], 2)
+
+        # Orphaned label and review should be deleted
+        self.assertFalse((self.labels_train / "orphan_label.txt").exists())
+        self.assertFalse((self.review_train / "orphan_label.json").exists())
+
+        # Missing label for orphan_image should be created as clean empty file
+        self.assertTrue((self.labels_train / "orphan_image.txt").exists())
+        self.assertEqual((self.labels_train / "orphan_image.txt").read_text().strip(), "")
+
+    def test_auto_repairs_malformed_json(self):
+        """Test auto-repair of malformed review JSON (e.g. trailing blocks like learn_skills_*)."""
+        stem = "test_malformed_json"
+        self._create_image("train", stem)
+        self._create_label("train", stem, ["0 0.5 0.5 0.1 0.1"])
+
+        # Corrupted JSON with duplicate braces / leftover text
+        corrupted_content = (
+            '{\n'
+            '  "stem": "' + stem + '",\n'
+            '  "trusted": [{"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1, "confidence": 0.95, "source": "hand_label"}],\n'
+            '  "weak": []\n'
+            '}\n'
+            '"extra_garbage_after_close": true\n'
+        )
+        rev_p = self.review_train / f"{stem}.json"
+        rev_p.write_text(corrupted_content, encoding="utf-8")
+
+        report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
+        self.assertTrue(report["clean"])
+
+        # Review JSON should now be valid readable JSON
+        repaired_data = json.loads(rev_p.read_text(encoding="utf-8"))
+        self.assertEqual(repaired_data["stem"], stem)
+        self.assertEqual(len(repaired_data["trusted"]), 1)
+
+    def test_subsecond_performance(self):
+        """Verify performance on 500 generated label and review files is sub-second (< 1.0s)."""
+        for i in range(500):
+            stem = f"perf_sample_{i:04d}"
+            self._create_image("train", stem)
+            self._create_label(
+                "train",
+                stem,
+                [
+                    f"0 0.500000 0.500000 0.100000 0.100000",
+                    f"3 0.300000 0.300000 0.080000 0.080000",
+                ],
+            )
+            self._create_review(
+                "train",
+                stem,
+                trusted=[
+                    {"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1, "confidence": 0.95, "source": "hand_label"},
+                    {"class_id": 3, "cx": 0.3, "cy": 0.3, "w": 0.08, "h": 0.08, "confidence": 0.90, "source": "hand_label"},
+                ],
+            )
+
+        t0 = time.perf_counter()
+        report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
+        elapsed = time.perf_counter() - t0
+
+        self.assertTrue(report["clean"])
+        self.assertLess(elapsed, 1.0, f"Expected sub-second runtime, took {elapsed:.3f}s")
+        self.assertGreaterEqual(report["scanned_labels"], 500)
+
+    def test_minimap_hud_false_positives_purged(self):
+        """Verify world resource boxes centered in minimap HUD are purged."""
+        stem = "test_hud_false_positive"
+        self._create_image("train", stem)
+        # Class 0 (aria) centered at cx=0.92, cy=0.10 (inside minimap HUD)
+        self._create_label(
+            "train",
+            stem,
+            [
+                "0 0.920000 0.100000 0.050000 0.050000",
+                "9 0.950000 0.150000 0.010000 0.020000",  # minimap_sprout is allowed in minimap
+            ],
+        )
+        self._create_review(
+            "train",
+            stem,
+            trusted=[
+                {"class_id": 0, "cx": 0.92, "cy": 0.10, "w": 0.05, "h": 0.05, "confidence": 0.90, "source": "vision_3d_crest", "trusted": True},
+                {"class_id": 9, "cx": 0.95, "cy": 0.15, "w": 0.01, "h": 0.02, "confidence": 0.95, "source": "material_scanner_minimap_sprout", "trusted": True},
+            ],
+        )
+
+        report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
+        self.assertTrue(report["clean"])
+        self.assertGreaterEqual(report["unapproved_boxes_purged"], 1)
+
+        # Label .txt should ONLY contain sprout (9)
+        lbl_content = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lbl_content), 1)
+        self.assertTrue(lbl_content[0].startswith("9 "))
+
+    def test_audit_dry_run_mode(self):
+        """Verify audit mode detects issues without modifying files on disk."""
+        stem = "test_audit_mode"
+        self._create_image("train", stem)
+        self._create_label(
+            "train",
+            stem,
+            ["99 0.500000 0.500000 0.100000 0.100000"],  # Invalid
+        )
+
+        report = audit_dataset_hygiene(self.root)
+        self.assertTrue(report["clean"])
+        self.assertGreaterEqual(report["purged_boxes"], 1)
+        # File should NOT be modified in dry-run audit mode
+        raw = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip()
+        self.assertTrue(raw.startswith("99 "))
+
+    def test_nonexistent_dataset_directory(self):
+        """Verify non-existent directory returns clean=False with error message."""
+        non_existent = self.root / "does_not_exist"
+        report = pre_training_dataset_hygiene_gate(non_existent)
+        self.assertFalse(report["clean"])
+        self.assertIn("does not exist", report["details"][0])
+
+
+if __name__ == "__main__":
+    unittest.main()
+

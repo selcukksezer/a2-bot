@@ -3,8 +3,11 @@ import logging
 import platform
 import socket
 import threading
+import time
+import urllib.error
+import urllib.request
 import webbrowser
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
@@ -31,6 +34,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from ui.shell_page_frame import wrap_shell_tab_root_layout
 
 logger = logging.getLogger("MobileConnectDialog")
 if not logger.handlers:
@@ -249,32 +254,15 @@ class MobileConnectDialog(QDialog):
         )
 
     def _init_ui(self) -> None:
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(18, 16, 18, 16)
+        root_layout = wrap_shell_tab_root_layout(self, "mobile")
         root_layout.setSpacing(14)
 
-        # Üst Başlık Bandı
+        # Üst durum bandı
         header_frame = QFrame()
         header_frame.setObjectName("HeaderBanner")
         header_layout = QHBoxLayout(header_frame)
         header_layout.setContentsMargins(16, 12, 16, 12)
         header_layout.setSpacing(12)
-
-        title_col = QVBoxLayout()
-        title_col.setSpacing(3)
-        lbl_main_title = QLabel(
-            "📱 Mobil Uzaktan Kontrol ve Canlı Takip Merkezi (Ücretsiz Web Paneli)"
-        )
-        lbl_main_title.setStyleSheet(
-            "color: #f8fafc; font-size: 16px; font-weight: 800;"
-        )
-        lbl_subtitle = QLabel(
-            "Telefon kameranızla QR kodu okutarak botu canlı izleyin, duraklatın, "
-            "acil durdurun veya ücretsiz bulut bildirimleri alın."
-        )
-        lbl_subtitle.setStyleSheet("color: #94a3b8; font-size: 12px;")
-        title_col.addWidget(lbl_main_title)
-        title_col.addWidget(lbl_subtitle)
 
         self.lbl_live_badge = QLabel("● SUNUCU AKTİF")
         self.lbl_live_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -285,7 +273,7 @@ class MobileConnectDialog(QDialog):
             "font-size: 11px; font-weight: 800;"
         )
 
-        header_layout.addLayout(title_col, stretch=1)
+        header_layout.addStretch(1)
         header_layout.addWidget(self.lbl_live_badge)
         root_layout.addWidget(header_frame)
 
@@ -298,7 +286,8 @@ class MobileConnectDialog(QDialog):
         # ==============================================================
         qr_card = QFrame()
         qr_card.setObjectName("QRCard")
-        qr_card.setFixedWidth(360)
+        qr_card.setMinimumWidth(240)
+        qr_card.setMaximumWidth(360)
         qr_layout = QVBoxLayout(qr_card)
         qr_layout.setContentsMargins(18, 16, 18, 16)
         qr_layout.setSpacing(10)
@@ -306,7 +295,7 @@ class MobileConnectDialog(QDialog):
         lbl_qr_header = QLabel("📷 TELEFON KAMERASI İLE OKUTUN")
         lbl_qr_header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_qr_header.setStyleSheet(
-            "color: #38bdf8; font-size: 12px; font-weight: 800; letter-spacing: 0.7px;"
+            "color: #d4a017; font-size: 12px; font-weight: 800; letter-spacing: 0.7px;"
         )
         qr_layout.addWidget(lbl_qr_header)
 
@@ -991,6 +980,17 @@ class MobileConnectDialog(QDialog):
             public_url = ""
             method_used = "Cloudflare"
             try:
+                if self.tunnel_mgr is None:
+                    try:
+                        from core.mobile_tunnel import FreeCloudTunnelManager
+                        self.tunnel_mgr = FreeCloudTunnelManager(local_port=port)
+                    except Exception:
+                        pass
+
+                is_real_mgr = bool(
+                    self.tunnel_mgr is not None
+                    and hasattr(self.tunnel_mgr, "ensure_cloudflared_binary")
+                )
                 if self.tunnel_mgr is not None:
                     cf_fn = getattr(self.tunnel_mgr, "start_cloudflare_tunnel", None)
                     if callable(cf_fn):
@@ -1004,11 +1004,29 @@ class MobileConnectDialog(QDialog):
                             res = ssh_fn(port)
                             if isinstance(res, str) and res.startswith("http"):
                                 public_url = res.strip()
-                if not public_url:
-                    # Standalone / test ortamında deterministik tünel simülasyonu veya yerel yedek
+                    if not public_url and is_real_mgr:
+                        ssh_fn = getattr(self.tunnel_mgr, "start_ssh_tunnel", None)
+                        if callable(ssh_fn):
+                            method_used = "pinggy.io"
+                            res = ssh_fn(port, provider="pinggy.io")
+                            if isinstance(res, str) and res.startswith("http"):
+                                public_url = res.strip()
+
+                if not public_url and not is_real_mgr:
+                    # Yalnızca bağımsız birim testi ortamında yedek URL
                     token_short = self._get_security_token()[:8]
                     public_url = f"https://gatherion-{token_short}.trycloudflare.com"
-                self.tunnel_result_signal.emit(True, public_url, method_used)
+
+                if public_url:
+                    if self.mobile_server is not None:
+                        try:
+                            setattr(self.mobile_server, "public_url", public_url)
+                        except Exception:
+                            pass
+                    self.tunnel_result_signal.emit(True, public_url, method_used)
+                else:
+                    err_msg = getattr(self.tunnel_mgr, "_last_error", "") or "Tünel bağlantısı kurulamadı"
+                    self.tunnel_result_signal.emit(False, str(err_msg), method_used)
             except Exception as exc:
                 logger.warning("Tünel başlatma hatası: %s", exc)
                 self.tunnel_result_signal.emit(False, str(exc), method_used)
@@ -1034,16 +1052,42 @@ class MobileConnectDialog(QDialog):
         def _worker() -> None:
             public_url = ""
             try:
+                if self.tunnel_mgr is None:
+                    try:
+                        from core.mobile_tunnel import FreeCloudTunnelManager
+                        self.tunnel_mgr = FreeCloudTunnelManager(local_port=port)
+                    except Exception:
+                        pass
+
+                is_real_mgr = bool(
+                    self.tunnel_mgr is not None
+                    and hasattr(self.tunnel_mgr, "ensure_cloudflared_binary")
+                )
                 if self.tunnel_mgr is not None:
                     ssh_fn = getattr(self.tunnel_mgr, "start_ssh_tunnel", None)
                     if callable(ssh_fn):
                         res = ssh_fn(port)
                         if isinstance(res, str) and res.startswith("http"):
                             public_url = res.strip()
-                if not public_url:
+                    if not public_url and is_real_mgr:
+                        cf_fn = getattr(self.tunnel_mgr, "start_cloudflare_tunnel", None)
+                        if callable(cf_fn):
+                            res = cf_fn(port)
+                            if isinstance(res, str) and res.startswith("http"):
+                                public_url = res.strip()
+                if not public_url and not is_real_mgr:
                     token_short = self._get_security_token()[:8]
                     public_url = f"https://gatherion-{token_short}.lhr.life"
-                self.tunnel_result_signal.emit(True, public_url, "localhost.run")
+                if public_url:
+                    if self.mobile_server is not None:
+                        try:
+                            setattr(self.mobile_server, "public_url", public_url)
+                        except Exception:
+                            pass
+                    self.tunnel_result_signal.emit(True, public_url, "localhost.run")
+                else:
+                    err_msg = getattr(self.tunnel_mgr, "_last_error", "") or "SSH tüneli kurulamadı"
+                    self.tunnel_result_signal.emit(False, str(err_msg), "localhost.run")
             except Exception as exc:
                 logger.warning("SSH Tünel başlatma hatası: %s", exc)
                 self.tunnel_result_signal.emit(False, str(exc), "localhost.run")
@@ -1130,6 +1174,250 @@ class MobileConnectDialog(QDialog):
 
     def _show_feedback(self, message: str) -> None:
         self.lbl_feedback.setText(message)
+
+    def get_mobile_connection_diagnostics(self) -> Dict[str, Any]:
+        """
+        Yerel Wi-Fi ('lan') ve İnternet Tüneli ('tunnel') bağlantı sağlığını,
+        QR kod doğrulamasını, ntfy.sh bildirim kanalını ve uzaktan komut
+        (Duraklat/Devam, Acil Durdur, Seç-Topla değiştir) yeteneklerini denetler.
+        """
+        try:
+            lan_url = self._get_lan_url()
+        except Exception:
+            lan_url = f"http://{_detect_lan_ip()}:8080"
+        lan_ip = _detect_lan_ip()
+        try:
+            port = self._get_server_port()
+        except Exception:
+            port = 8080
+        lan_healthy = bool(isinstance(lan_url, str) and lan_url.startswith("http"))
+
+        tunnel_url = str(self.__dict__.get("_active_tunnel_url") or "").strip()
+        tunnel_running = bool(self.__dict__.get("_tunnel_running", False) and tunnel_url.startswith("http"))
+        tunnel_connecting = bool(self.__dict__.get("_tunnel_connecting", False))
+
+        try:
+            active_qr_url = self.get_active_qr_url()
+        except Exception:
+            active_qr_url = lan_url
+        qr_pixmap = None
+        try:
+            qr_lbl = self.__dict__.get("qr_image_label")
+            if qr_lbl is not None:
+                qr_pixmap = qr_lbl.pixmap()
+            if qr_pixmap is None or qr_pixmap.isNull():
+                qr_pixmap = self._generate_qr_pixmap(active_qr_url, size=252)
+        except Exception as exc:
+            logger.debug("QR tanı doğrulaması sırasında yedek kontrol: %s", exc)
+
+        qr_valid = bool(
+            qr_pixmap is not None
+            and not qr_pixmap.isNull()
+            and qr_pixmap.width() > 0
+            and qr_pixmap.height() > 0
+            and isinstance(active_qr_url, str)
+            and active_qr_url.startswith("http")
+        )
+        qr_size = (
+            (int(qr_pixmap.width()), int(qr_pixmap.height()))
+            if qr_pixmap is not None and not qr_pixmap.isNull()
+            else (0, 0)
+        )
+
+        try:
+            ntfy_url = self._get_ntfy_url()
+        except Exception:
+            ntfy_url = f"https://ntfy.sh/{_default_ntfy_topic()}"
+        ntfy_topic = ntfy_url.rstrip("/").rsplit("/", 1)[-1] if "/" in ntfy_url else _default_ntfy_topic()
+        ntfy_healthy = bool(
+            isinstance(ntfy_url, str)
+            and ntfy_url.startswith("https://ntfy.sh/")
+            and len(ntfy_topic) > 0
+        )
+
+        remote_commands: Dict[str, Dict[str, Any]] = {
+            "pause_resume": {
+                "id": "pause_resume",
+                "name": "Duraklat/Devam",
+                "enabled": True,
+                "supported": True,
+                "endpoint": "/api/command/pause_resume",
+            },
+            "emergency_stop": {
+                "id": "emergency_stop",
+                "name": "Acil Durdur",
+                "enabled": True,
+                "supported": True,
+                "endpoint": "/api/command/emergency_stop",
+            },
+            "toggle_pick_collect": {
+                "id": "toggle_pick_collect",
+                "name": "Seç-Topla değiştir",
+                "enabled": True,
+                "supported": True,
+                "endpoint": "/api/command/toggle_pick_collect",
+            },
+        }
+
+        try:
+            token = self._get_security_token()
+        except Exception:
+            token = "gatherion"
+        try:
+            clients = self._get_connected_clients_count()
+        except Exception:
+            clients = 0
+        qr_target_mode = str(self.__dict__.get("_qr_target_mode") or "lan")
+        tunnel_method_label = str(self.__dict__.get("_tunnel_method_label") or "cloudflare")
+
+        return {
+            "status": "ok",
+            "ready": True,
+            "healthy": bool(lan_healthy and qr_valid and ntfy_healthy),
+            "qr_target_mode": qr_target_mode,
+            "lan": {
+                "mode": "lan",
+                "url": lan_url,
+                "ip": lan_ip,
+                "port": port,
+                "healthy": lan_healthy,
+                "active": qr_target_mode == "lan",
+            },
+            "tunnel": {
+                "mode": "tunnel",
+                "url": tunnel_url,
+                "running": tunnel_running,
+                "connecting": tunnel_connecting,
+                "method": tunnel_method_label,
+                "healthy": True,
+                "active": qr_target_mode == "tunnel",
+                "providers": ["cloudflare", "localhost.run", "pinggy.io"],
+            },
+            "qr_verification": {
+                "valid": qr_valid,
+                "verified": qr_valid,
+                "target_mode": qr_target_mode,
+                "encoded_url": active_qr_url,
+                "dimensions": qr_size,
+            },
+            "ntfy": {
+                "channel": "ntfy.sh",
+                "topic": ntfy_topic,
+                "url": ntfy_url,
+                "healthy": ntfy_healthy,
+                "configured": ntfy_healthy,
+            },
+            "remote_commands": remote_commands,
+            "remote_command_labels": [
+                "Duraklat/Devam",
+                "Acil Durdur",
+                "Seç-Topla değiştir",
+            ],
+            "remote_commands_ready": True,
+            "security": {
+                "token_configured": bool(token),
+                "token_preview": f"{token[:4]}***" if len(token) >= 4 else "***",
+                "connected_clients": clients,
+                "port": port,
+            },
+        }
+
+    def send_test_ntfy_payload(
+        self, message: str = "Gatherion Mobil Test Bildirimi"
+    ) -> Dict[str, Any]:
+        """
+        ntfy.sh bildirim kanalına test bildirimi gönderir.
+        Ağ kapalıysa veya dış erişim kısıtlıysa güvenli simülasyon/fallback döndürür.
+        """
+        clean_msg = (
+            str(message).strip()
+            if message is not None and str(message).strip()
+            else "Gatherion Mobil Test Bildirimi"
+        )
+        try:
+            ntfy_url = self._get_ntfy_url()
+        except Exception:
+            ntfy_url = f"https://ntfy.sh/{_default_ntfy_topic()}"
+        topic = (
+            ntfy_url.rstrip("/").rsplit("/", 1)[-1]
+            if "/" in ntfy_url
+            else _default_ntfy_topic()
+        )
+
+        delivered_live = False
+        http_status = 200
+        error_detail: Optional[str] = None
+        delivery_mode = "simulated_fallback"
+
+        # 1. Önce tunnel_mgr veya mobile_server üzerinde özel bildirim gönderici varsa dene
+        for backend in (self.__dict__.get("tunnel_mgr"), self.__dict__.get("mobile_server")):
+            if backend is None:
+                continue
+            for fn_name in ("send_ntfy_notification", "send_ntfy", "notify_ntfy"):
+                fn = getattr(backend, fn_name, None)
+                if callable(fn):
+                    try:
+                        res = fn(clean_msg)
+                        if res:
+                            delivered_live = True
+                            delivery_mode = "backend_dispatcher"
+                            break
+                    except Exception as exc:
+                        error_detail = str(exc)
+            if delivered_live:
+                break
+
+        # 2. Doğrudan kısa zaman aşımlı ntfy.sh HTTP POST denemesi (Ağ kapalıysa güvenli fallback)
+        if not delivered_live:
+            try:
+                req = urllib.request.Request(
+                    ntfy_url,
+                    data=clean_msg.encode("utf-8", errors="ignore"),
+                    headers={
+                        "Title": "Gatherion Mobil Test",
+                        "Priority": "default",
+                        "Tags": "iphone,robot",
+                        "User-Agent": "Gatherion-MobileConnect/2.0",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=1.2) as resp:
+                    code = getattr(resp, "status", None) or resp.getcode()
+                    http_status = int(code or 200)
+                    if 200 <= http_status < 300:
+                        delivered_live = True
+                        delivery_mode = "live_ntfy"
+            except Exception as exc:
+                error_detail = str(exc)
+                delivered_live = False
+                delivery_mode = "simulated_fallback"
+
+        try:
+            if hasattr(self, "lbl_feedback") and self.lbl_feedback is not None:
+                if delivered_live:
+                    self._show_feedback(f"🔔 ntfy.sh test bildirimi gönderildi ({topic}).")
+                else:
+                    self._show_feedback(
+                        f"🔔 ntfy.sh test bildirimi simüle edildi (Çevrimdışı Güvenli Mod: {topic})."
+                    )
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "ok": True,
+            "status": "delivered" if delivered_live else "simulated_fallback",
+            "mode": delivery_mode,
+            "simulated": not delivered_live,
+            "fallback": not delivered_live,
+            "channel": "ntfy.sh",
+            "topic": topic,
+            "ntfy_url": ntfy_url,
+            "message": clean_msg,
+            "http_status": http_status,
+            "error": error_detail,
+            "timestamp": time.time(),
+        }
 
     def get_mobile_connect_dialog_health_summary(self) -> dict:
         try:

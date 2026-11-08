@@ -1,0 +1,40 @@
+{
+  "version": "1.3.2",
+  "integration_state_schema": 1,
+  "installed_integrations": [
+    "cursor-agent",
+    "claude",
+    "codex",
+    "copilot",
+    "gemini",
+    "kiro-cli"
+  ],
+  "integration_settings": {
+    "cursor-agent": {
+      "script": "ps",
+      "invoke_separator": "-"
+    },
+    "claude": {
+      "script": "ps",
+      "invoke_separator": "-"
+    },
+    "codex": {
+      "script": "ps",
+      "invoke_separator": "-"
+    },
+    "copilot": {
+      "script": "ps",
+      "invoke_separator": "-"
+    },
+    "gemini": {
+      "script": "ps",
+      "invoke_separator": "."
+    },
+    "kiro-cli": {
+      "script": "ps",
+      "invoke_separator": "."
+    }
+  },
+  "integration": "cursor-agent",
+  "default_integration": "cursor-agent"
+}

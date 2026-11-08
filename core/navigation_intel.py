@@ -68,6 +68,479 @@ MOUNT_DISTANCE_THRESHOLD_M: float = 35.0  # > 35m otomatik binek (Madde 24)
 DISMOUNT_DISTANCE_THRESHOLD_M: float = 8.0  # <= 8m otomatik inme (Madde 24)
 MAPLESS_DISTANCE_THRESHOLD_M: float = 40.0  # < 40m haritasız mikro-navigasyon (Madde 25)
 
+DEFAULT_DEADBAND_DEG: float = 6.0
+MIN_DEADBAND_DEG: float = 5.0
+MAX_DEADBAND_DEG: float = 8.0
+DEFAULT_WAYPOINT_RADIUS_PX: float = 20.0
+DEFAULT_WAYPOINT_RADIUS_M: float = 3.0
+DEFAULT_STUCK_TIMEOUT_SEC: float = 3.0
+
+
+def compute_bearing(from_pos: Tuple[float, float], to_pos: Tuple[float, float]) -> float:
+    """
+    Minimap / pusula koordinatlarında (0° = Kuzey, 90° = Doğu, 180° = Güney, 270° = Batı)
+    hedef kerteriz açısını (bearing) hesaplar.
+    Ekran koordinatlarında Y aşağı doğru büyüdüğünden, Kuzey = -Y yönüdür.
+    Kartezyen (0° = Doğu) ile Minimap ok yönü (0° = Kuzey) arasındaki
+    180° terslik (inversion) hatasını tamamen ortadan kaldırır.
+    """
+    dx = float(to_pos[0]) - float(from_pos[0])
+    dy = float(to_pos[1]) - float(from_pos[1])
+    if abs(dx) <= 1e-6 and abs(dy) <= 1e-6:
+        return 0.0
+    angle = math.degrees(math.atan2(dx, -dy))
+    return round((angle + 360.0) % 360.0, 2)
+
+
+def compute_angle_diff(target_bearing: float, player_heading: float) -> float:
+    """
+    Oyuncu yönünden (player_heading) hedef kerteriz açısına (target_bearing)
+    en kısa dönüş yolunu (shortest rotational path) [-180.0°, +180.0°] aralığında hesaplar:
+        angle_diff = (target_bearing - player_heading + 180) % 360 - 180
+    Pozitif (+) değerler sağa (saat yönü), negatif (-) değerler sola dönüşü gösterir.
+    """
+    diff = (float(target_bearing) - float(player_heading) + 180.0) % 360.0 - 180.0
+    return round(diff, 2)
+
+
+def apply_turn_damping(
+    angle_diff: float,
+    deadband_deg: float = DEFAULT_DEADBAND_DEG,
+    min_turn_sec: float = 0.04,
+    max_turn_sec: float = 0.35,
+    max_error_deg: float = 180.0,
+) -> Dict[str, Any]:
+    """
+    Ölü bölge (deadband zone: ±5° ila ±8°) uygulayarak hedef kerterize yakınken
+    sağ-sol hızlı yalpalanmayı (oscillation) engeller. Açı hatasına göre dönüş
+    süresini pürüzsüz biçimde enterpole eder.
+    """
+    clamped_deadband = max(MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg)))
+    abs_err = abs(float(angle_diff))
+    in_deadband = bool(abs_err <= clamped_deadband)
+
+    if in_deadband:
+        return {
+            "angle_diff": round(float(angle_diff), 2),
+            "abs_error": round(abs_err, 2),
+            "in_deadband": True,
+            "turn_needed": False,
+            "turn_direction": "straight",
+            "turn_duration_sec": 0.0,
+            "deadband_deg": clamped_deadband,
+        }
+
+    direction = "right" if angle_diff > 0.0 else "left"
+    span = max(1.0, float(max_error_deg) - clamped_deadband)
+    norm = min(1.0, max(0.0, (abs_err - clamped_deadband) / span))
+    smooth_t = norm * norm * (3.0 - 2.0 * norm)
+    turn_duration = float(min_turn_sec) + smooth_t * (float(max_turn_sec) - float(min_turn_sec))
+
+    return {
+        "angle_diff": round(float(angle_diff), 2),
+        "abs_error": round(abs_err, 2),
+        "in_deadband": False,
+        "turn_needed": True,
+        "turn_direction": direction,
+        "turn_duration_sec": round(turn_duration, 4),
+        "deadband_deg": clamped_deadband,
+    }
+
+
+class TurnDampingController:
+    """
+    Yalpalanmayı önleyici durum denetleyicisi: ±5°..±8° ölü bölge uygular
+    ve dönüş sürelerini yumuşak enterpolasyonla sınırlar.
+    """
+    def __init__(
+        self,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+        min_turn_sec: float = 0.04,
+        max_turn_sec: float = 0.35,
+        reversal_cooldown_sec: float = 0.12,
+    ):
+        self.deadband_deg = max(MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg)))
+        self.min_turn_sec = float(min_turn_sec)
+        self.max_turn_sec = float(max_turn_sec)
+        self.reversal_cooldown_sec = float(reversal_cooldown_sec)
+        self.last_turn_direction: Optional[str] = None
+        self.last_turn_ts: float = 0.0
+
+    def calculate_turn(
+        self,
+        target_bearing: float,
+        player_heading: float,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        curr_ts = time.time() if now is None else float(now)
+        diff = compute_angle_diff(target_bearing, player_heading)
+        res = apply_turn_damping(
+            angle_diff=diff,
+            deadband_deg=self.deadband_deg,
+            min_turn_sec=self.min_turn_sec,
+            max_turn_sec=self.max_turn_sec,
+        )
+        if res["turn_needed"]:
+            if (
+                self.last_turn_direction is not None
+                and self.last_turn_direction != res["turn_direction"]
+                and (curr_ts - self.last_turn_ts) < self.reversal_cooldown_sec
+            ):
+                res["turn_duration_sec"] = round(res["turn_duration_sec"] * 0.65, 4)
+                res["reversal_damped"] = True
+            else:
+                res["reversal_damped"] = False
+            self.last_turn_direction = res["turn_direction"]
+            self.last_turn_ts = curr_ts
+        else:
+            res["reversal_damped"] = False
+        return res
+
+
+class RadarStuckDetector:
+    """
+    Radar Intel Tabanlı Takılma Tespiti ve Kurtarma:
+    Oyuncu hareket tuşları (W / strafe) basılı iken oyuncunun minimap / dünya
+    konumunun değişip değişmediğini izler. Konum > 3.0 saniye boyunca değişmezse
+    takılma (stuck) tespit eder ve kurtulma manevrasını (Space -> A+W/D+W -> Realign) tetikler.
+    """
+    def __init__(
+        self,
+        stuck_timeout_sec: float = DEFAULT_STUCK_TIMEOUT_SEC,
+        movement_threshold_px: float = 2.0,
+        movement_threshold_m: float = 0.5,
+        strafe_duration_sec: float = 1.0,
+    ) -> None:
+        self.stuck_timeout_sec: float = float(max(0.5, stuck_timeout_sec))
+        self.movement_threshold_px: float = float(max(0.1, movement_threshold_px))
+        self.movement_threshold_m: float = float(max(0.05, movement_threshold_m))
+        self.strafe_duration_sec: float = float(max(0.1, strafe_duration_sec))
+
+        self.last_pos: Optional[Tuple[float, float]] = None
+        self.last_pos_ts: Optional[float] = None
+        self.stuck_start_ts: Optional[float] = None
+        self.is_stuck: bool = False
+        self.stuck_count: int = 0
+        self.history: List[Dict[str, Any]] = []
+
+    def reset(self) -> None:
+        self.last_pos = None
+        self.last_pos_ts = None
+        self.stuck_start_ts = None
+        self.is_stuck = False
+
+    def update_position(
+        self,
+        player_pos: Optional[Tuple[float, float]],
+        movement_keys_held: bool = True,
+        distance_is_meters: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Oyuncu konumunu günceller ve hareket tuşları basılı iken > 3.0s
+        boyunca konum değişmezse is_stuck=True durumuna geçer.
+        """
+        curr_ts = time.time() if now is None else float(now)
+
+        if player_pos is None or not movement_keys_held:
+            self.last_pos = player_pos
+            self.last_pos_ts = curr_ts
+            self.stuck_start_ts = None
+            self.is_stuck = False
+            return {
+                "is_stuck": False,
+                "stuck_elapsed_sec": 0.0,
+                "movement_distance": 0.0,
+                "movement_keys_held": bool(movement_keys_held),
+            }
+
+        px, py = float(player_pos[0]), float(player_pos[1])
+        thresh = self.movement_threshold_m if distance_is_meters else self.movement_threshold_px
+
+        if self.last_pos is None:
+            self.last_pos = (px, py)
+            self.last_pos_ts = curr_ts
+            self.stuck_start_ts = None
+            self.is_stuck = False
+            return {
+                "is_stuck": False,
+                "stuck_elapsed_sec": 0.0,
+                "movement_distance": 0.0,
+                "movement_keys_held": True,
+            }
+
+        dist = math.hypot(px - self.last_pos[0], py - self.last_pos[1])
+
+        if dist >= thresh:
+            self.last_pos = (px, py)
+            self.last_pos_ts = curr_ts
+            self.stuck_start_ts = None
+            self.is_stuck = False
+            stuck_elapsed = 0.0
+        else:
+            if self.stuck_start_ts is None:
+                self.stuck_start_ts = self.last_pos_ts if self.last_pos_ts is not None else curr_ts
+            stuck_elapsed = max(0.0, curr_ts - self.stuck_start_ts)
+            if stuck_elapsed >= self.stuck_timeout_sec:
+                self.is_stuck = True
+
+        return {
+            "is_stuck": bool(self.is_stuck),
+            "stuck_elapsed_sec": round(stuck_elapsed, 3),
+            "movement_distance": round(dist, 3),
+            "movement_keys_held": True,
+            "threshold": thresh,
+            "stuck_timeout_sec": self.stuck_timeout_sec,
+        }
+
+    def execute_unstick_maneuver(
+        self,
+        input_controller: Any = None,
+        target_bearing: Optional[float] = None,
+        player_heading: Optional[float] = None,
+        sleep_fn: Optional[Callable[[float], None]] = None,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+    ) -> Dict[str, Any]:
+        """
+        Takılma durumunda fiziksel kurtulma manevrası:
+        1. Space (Zıpla)
+        2. A+W veya dönüşümlü D+W strafe
+        3. En kısa açı farkıyla hedefe yeniden hizalanma (Realign)
+        """
+        strafe_key = "a" if (self.stuck_count % 2 == 0) else "d"
+        self.stuck_count += 1
+        wait_fn = sleep_fn if callable(sleep_fn) else (lambda s: None)
+        actions: List[str] = []
+
+        actions.append("SPACE")
+        if input_controller is not None:
+            if hasattr(input_controller, "tap_key") and callable(input_controller.tap_key):
+                input_controller.tap_key("space")
+            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+                input_controller.press_key("space")
+            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+                input_controller.key_down("space")
+                wait_fn(0.06)
+                input_controller.key_up("space")
+
+        combo = f"{strafe_key.upper()}+W"
+        actions.append(combo)
+        if input_controller is not None:
+            if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
+                input_controller.hold_keys([strafe_key, "w"], duration=self.strafe_duration_sec)
+            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+                input_controller.key_down("w")
+                input_controller.key_down(strafe_key)
+                wait_fn(self.strafe_duration_sec)
+                input_controller.key_up(strafe_key)
+                input_controller.key_up("w")
+            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+                input_controller.press_key(strafe_key)
+                input_controller.press_key("w")
+                wait_fn(self.strafe_duration_sec)
+        else:
+            wait_fn(self.strafe_duration_sec)
+
+        actions.append("REALIGN")
+        angle_diff = 0.0
+        damped = None
+        if target_bearing is not None and player_heading is not None:
+            angle_diff = compute_angle_diff(target_bearing, player_heading)
+            damped = apply_turn_damping(angle_diff, deadband_deg=deadband_deg)
+
+        if input_controller is not None:
+            if damped is None or damped["turn_needed"]:
+                if hasattr(input_controller, "turn_by_angle") and callable(input_controller.turn_by_angle):
+                    turn_dur = damped.get("turn_duration_sec") if damped else None
+                    try:
+                        input_controller.turn_by_angle(angle_diff, duration=turn_dur)
+                    except TypeError:
+                        input_controller.turn_by_angle(angle_diff)
+                elif hasattr(input_controller, "realign_to_target") and callable(input_controller.realign_to_target):
+                    input_controller.realign_to_target(target_bearing)
+
+        self.stuck_start_ts = None
+        self.is_stuck = False
+        self.last_pos = None
+
+        logger.info(
+            "[RadarStuckDetector] Kurtarma manevrası #%d uygulandı: %s (strafe=%.2fs, açı=%.1f°)",
+            self.stuck_count,
+            " -> ".join(actions),
+            self.strafe_duration_sec,
+            angle_diff,
+        )
+
+        res = {
+            "executed": True,
+            "actions": actions,
+            "sequence": actions,
+            "strafe_key": strafe_key,
+            "strafe_combo": combo,
+            "strafe_duration_sec": self.strafe_duration_sec,
+            "angle_diff_deg": round(angle_diff, 2),
+            "in_deadband": bool(damped.get("in_deadband", False)) if damped else False,
+            "turn_needed": bool(damped.get("turn_needed", True)) if damped else True,
+            "stuck_count": self.stuck_count,
+        }
+        self.history.append(res)
+        return res
+
+
+class WaypointArrivalDetector:
+    """
+    Hedef düğüm varış yarıçapı (örneğin <= 20px veya <= 3.0m) tespiti ve
+    sıradaki ardışık düğüme (Next in Sequence) temiz geçiş yöneticisi.
+    """
+    def __init__(
+        self,
+        waypoint_radius_px: float = DEFAULT_WAYPOINT_RADIUS_PX,
+        waypoint_radius_m: float = DEFAULT_WAYPOINT_RADIUS_M,
+        meters_per_px: float = 0.55,
+    ) -> None:
+        self.waypoint_radius_px: float = float(max(1.0, waypoint_radius_px))
+        self.waypoint_radius_m: float = float(max(0.5, waypoint_radius_m))
+        self.meters_per_px: float = float(max(0.05, meters_per_px))
+        self.transitions_count: int = 0
+        self.history: List[Dict[str, Any]] = []
+
+    def is_arrival_reached(
+        self,
+        player_pos: Optional[Tuple[float, float]],
+        waypoint_pos: Optional[Tuple[float, float]],
+        distance_m: Optional[float] = None,
+        pixel_distance: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Oyuncunun hedef düğüm yarıçapına ulaşıp ulaşmadığını belirler.
+        """
+        if pixel_distance is not None:
+            px_dist = float(pixel_distance)
+        elif player_pos is not None and waypoint_pos is not None:
+            px_dist = math.hypot(
+                float(waypoint_pos[0]) - float(player_pos[0]),
+                float(waypoint_pos[1]) - float(player_pos[1]),
+            )
+        else:
+            px_dist = 9999.0
+
+        if distance_m is not None:
+            m_dist = float(distance_m)
+        else:
+            m_dist = px_dist * self.meters_per_px
+
+        reached_px = px_dist <= self.waypoint_radius_px
+        reached_m = m_dist <= self.waypoint_radius_m
+        arrived = bool(reached_px or reached_m)
+
+        return {
+            "arrived": arrived,
+            "pixel_distance": round(px_dist, 3),
+            "distance_m": round(m_dist, 2),
+            "radius_px": self.waypoint_radius_px,
+            "radius_m": self.waypoint_radius_m,
+            "reached_px": reached_px,
+            "reached_m": reached_m,
+        }
+
+    def transition_to_next_node(
+        self,
+        nodes: Sequence[Any],
+        current_index: int,
+        route_planner: Optional[Any] = None,
+        stay_on_partial_harvest: bool = False,
+        now: Optional[float] = None,
+    ) -> Tuple[Optional[Any], int, bool]:
+        """
+        Sıradaki düğüme temiz geçiş yapar.
+        """
+        node_list = list(nodes) if nodes else []
+        n = len(node_list)
+        if n == 0:
+            return None, -1, False
+
+        curr_idx = int(current_index) if current_index >= 0 else 0
+
+        if route_planner is not None and hasattr(route_planner, "select_next_sequential_node"):
+            next_node, next_idx = route_planner.select_next_sequential_node(
+                nodes=node_list,
+                current_seq_pos=curr_idx,
+                stay_on_partial_harvest=stay_on_partial_harvest,
+                now=now,
+            )
+            self.transitions_count += 1
+            return next_node, next_idx, True
+
+        next_idx = (curr_idx + 1) % n
+        next_node = node_list[next_idx]
+        self.transitions_count += 1
+        return next_node, next_idx, True
+
+    def check_and_transition(
+        self,
+        player_pos: Optional[Tuple[float, float]],
+        waypoint_pos: Optional[Tuple[float, float]],
+        nodes: Sequence[Any],
+        current_index: int,
+        distance_m: Optional[float] = None,
+        pixel_distance: Optional[float] = None,
+        route_planner: Optional[Any] = None,
+        stay_on_partial_harvest: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Varış kontrolü yapar ve ulaşıldıysa sıradaki düğüme temiz geçiş tetikler.
+        """
+        arrival_info = self.is_arrival_reached(
+            player_pos=player_pos,
+            waypoint_pos=waypoint_pos,
+            distance_m=distance_m,
+            pixel_distance=pixel_distance,
+        )
+
+        if not arrival_info["arrived"]:
+            node_list = list(nodes) if nodes else []
+            active_node = node_list[current_index] if (node_list and 0 <= current_index < len(node_list)) else None
+            return {
+                "arrived": False,
+                "transitioned": False,
+                "current_index": current_index,
+                "active_node": active_node,
+                "next_index": current_index,
+                "next_node": active_node,
+                **arrival_info,
+            }
+
+        next_node, next_idx, transitioned = self.transition_to_next_node(
+            nodes=nodes,
+            current_index=current_index,
+            route_planner=route_planner,
+            stay_on_partial_harvest=stay_on_partial_harvest,
+            now=now,
+        )
+
+        record = {
+            "arrived": True,
+            "transitioned": bool(transitioned),
+            "previous_index": current_index,
+            "current_index": next_idx,
+            "active_node": next_node,
+            "next_index": next_idx,
+            "next_node": next_node,
+            **arrival_info,
+        }
+        self.history.append(record)
+        logger.info(
+            "[WaypointArrival] Hedef düğüme ulaşıldı (mesafe=%.1fpx / %.2fm <= eşik %.1fpx / %.1fm) -> "
+            "Sıradaki düğüme (#%d) geçildi.",
+            arrival_info["pixel_distance"],
+            arrival_info["distance_m"],
+            self.waypoint_radius_px,
+            self.waypoint_radius_m,
+            next_idx,
+        )
+        return record
+
 
 # ==============================================================================
 # YARDIMCI FONKSİYONLAR
@@ -1560,8 +2033,10 @@ class MaplessMicroNavigator:
         input_controller: Any = None,
         vision_engine: Any = None,
         max_micro_nav_distance_m: float = MAPLESS_DISTANCE_THRESHOLD_M,
-        arrival_distance_m: float = 3.5,
+        arrival_distance_m: float = DEFAULT_WAYPOINT_RADIUS_M,
         meters_per_minimap_px: float = 0.55,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+        waypoint_radius_px: float = DEFAULT_WAYPOINT_RADIUS_PX,
         screen_width: int = 1920,
         screen_height: int = 1080,
         test_mode: bool = False,
@@ -1575,6 +2050,8 @@ class MaplessMicroNavigator:
         self.max_micro_nav_distance_m: float = float(max_micro_nav_distance_m)
         self.arrival_distance_m: float = max(0.5, float(arrival_distance_m))
         self.meters_per_minimap_px: float = max(0.05, float(meters_per_minimap_px))
+        self.deadband_deg: float = max(MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg)))
+        self.waypoint_radius_px: float = float(max(1.0, waypoint_radius_px))
         self.screen_width: int = max(320, int(screen_width))
         self.screen_height: int = max(240, int(screen_height))
         self.test_mode: bool = bool(test_mode)
@@ -1631,7 +2108,7 @@ class MaplessMicroNavigator:
         Sağ-üst minimap ofsetinden (`minimap_offset = (dx, dy)`) veya oyuncu/hedef
         koordinatlarından yönelim vektörünü `(dx, dy)`, birim vektörü `(unit_dx, unit_dy)`,
         pusula açısını (`heading_angle_deg`) ve 3D ekran yönelim noktasını (`screen_steer_point`)
-        hesaplar.
+        hesaplar. ±5°..±8° ölü bölge sönümlemesi uygulayarak yalpalanmayı önler.
         """
         if minimap_offset is not None:
             dx = float(minimap_offset[0])
@@ -1663,6 +2140,7 @@ class MaplessMicroNavigator:
             if player_heading_deg is not None
             else 0.0
         )
+        damped = apply_turn_damping(heading_error, deadband_deg=self.deadband_deg)
 
         sw, sh = screen_size if screen_size is not None else (self.screen_width, self.screen_height)
         center_x = float(sw) * 0.50
@@ -1684,6 +2162,11 @@ class MaplessMicroNavigator:
             "heading_deg": target_heading,
             "player_heading_deg": round(float(player_heading_deg), 2) if player_heading_deg is not None else None,
             "heading_error_deg": heading_error,
+            "deadband_deg": self.deadband_deg,
+            "in_deadband": damped["in_deadband"],
+            "turn_needed": damped["turn_needed"],
+            "turn_direction": damped["turn_direction"],
+            "turn_duration_sec": damped["turn_duration_sec"],
             "screen_steer_point": (steer_x, steer_y),
         }
 
@@ -1924,10 +2407,15 @@ class MaplessMicroNavigator:
             "heading_deg": steer_data["heading_deg"],
             "player_heading_deg": steer_data["player_heading_deg"],
             "heading_error_deg": steer_data["heading_error_deg"],
+            "deadband_deg": steer_data.get("deadband_deg", self.deadband_deg),
+            "in_deadband": steer_data.get("in_deadband", False),
+            "turn_needed": steer_data.get("turn_needed", True),
+            "turn_direction": steer_data.get("turn_direction", "straight"),
+            "turn_duration_sec": steer_data.get("turn_duration_sec", 0.0),
             "visible_on_minimap": is_vis,
             "screen_steer_point": (sx, sy),
             "steered": bool(steered),
-            "arrived": effective_dist_m <= self.arrival_distance_m,
+            "arrived": bool(effective_dist_m <= self.arrival_distance_m or steer_data["pixel_distance"] <= self.waypoint_radius_px),
         }
         self.last_steering_result = result
         logger.debug(
@@ -1949,11 +2437,221 @@ from core.route_manager import NodeData, RouteManager  # noqa: E402,F401
 
 class NavigationIntel:
     """
-    NavigationIntel sınıfı, toplanan harita, binek ve navigasyon zekası modüllerini
+    NavigationIntel sınıfı, toplanan harita, binek, radar takılma tespiti,
+    ölü bölge (deadband) sönümlemesi ve ardışık düğüm navigasyon zekası modüllerini
     bir araya getiren ana koordinasyon sınıfıdır.
     """
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        waypoint_radius_px: float = DEFAULT_WAYPOINT_RADIUS_PX,
+        waypoint_radius_m: float = DEFAULT_WAYPOINT_RADIUS_M,
+        stuck_timeout_sec: float = DEFAULT_STUCK_TIMEOUT_SEC,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+        input_controller: Any = None,
+        route_manager: Optional[RouteManager] = None,
+        vision_engine: Any = None,
+        **kwargs: Any,
+    ) -> None:
         self.kwargs = kwargs
+        self.input_controller = input_controller
+        self.route_manager = route_manager
+        self.vision_engine = vision_engine
+
+        self.waypoint_radius_px = float(waypoint_radius_px)
+        self.waypoint_radius_m = float(waypoint_radius_m)
+        self.stuck_timeout_sec = float(stuck_timeout_sec)
+        self.deadband_deg = max(MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg)))
+
+        self.stuck_detector = RadarStuckDetector(
+            stuck_timeout_sec=self.stuck_timeout_sec,
+        )
+        self.waypoint_detector = WaypointArrivalDetector(
+            waypoint_radius_px=self.waypoint_radius_px,
+            waypoint_radius_m=self.waypoint_radius_m,
+        )
+        self.turn_damper = TurnDampingController(
+            deadband_deg=self.deadband_deg,
+        )
+        self.micro_navigator = MaplessMicroNavigator(
+            input_controller=self.input_controller,
+            vision_engine=self.vision_engine,
+            deadband_deg=self.deadband_deg,
+            waypoint_radius_px=self.waypoint_radius_px,
+            arrival_distance_m=self.waypoint_radius_m,
+        )
+
+    def compute_bearing(self, from_pos: Tuple[float, float], to_pos: Tuple[float, float]) -> float:
+        """Calculates compass bearing (0°=North, 90°=East) from from_pos to to_pos."""
+        return compute_bearing(from_pos, to_pos)
+
+    def compute_angle_diff(self, target_bearing: float, player_heading: float) -> float:
+        """Calculates shortest rotational angle difference in [-180°..+180°]."""
+        return compute_angle_diff(target_bearing, player_heading)
+
+    def apply_turn_damping(
+        self,
+        angle_diff: float,
+        deadband_deg: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Applies deadband (±5° to ±8°) and smooth turn duration interpolation."""
+        db = float(deadband_deg) if deadband_deg is not None else self.deadband_deg
+        return apply_turn_damping(angle_diff, deadband_deg=db)
+
+    def check_waypoint_arrival(
+        self,
+        player_pos: Optional[Tuple[float, float]],
+        waypoint_pos: Optional[Tuple[float, float]],
+        distance_m: Optional[float] = None,
+        pixel_distance: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Checks if player reached waypoint radius (<=20px or <=3m)."""
+        return self.waypoint_detector.is_arrival_reached(
+            player_pos=player_pos,
+            waypoint_pos=waypoint_pos,
+            distance_m=distance_m,
+            pixel_distance=pixel_distance,
+        )
+
+    def transition_to_next_node(
+        self,
+        nodes: Sequence[Any],
+        current_index: int,
+        route_planner: Optional[Any] = None,
+        stay_on_partial_harvest: bool = False,
+        now: Optional[float] = None,
+    ) -> Tuple[Optional[Any], int, bool]:
+        """Triggers clean transition to next sequential node."""
+        return self.waypoint_detector.transition_to_next_node(
+            nodes=nodes,
+            current_index=current_index,
+            route_planner=route_planner or self.route_manager,
+            stay_on_partial_harvest=stay_on_partial_harvest,
+            now=now,
+        )
+
+    def check_arrival_and_transition(
+        self,
+        player_pos: Optional[Tuple[float, float]],
+        waypoint_pos: Optional[Tuple[float, float]],
+        nodes: Sequence[Any],
+        current_index: int,
+        distance_m: Optional[float] = None,
+        pixel_distance: Optional[float] = None,
+        route_planner: Optional[Any] = None,
+        stay_on_partial_harvest: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Checks arrival within radius (20px / 3m) and triggers sequential transition."""
+        return self.waypoint_detector.check_and_transition(
+            player_pos=player_pos,
+            waypoint_pos=waypoint_pos,
+            nodes=nodes,
+            current_index=current_index,
+            distance_m=distance_m,
+            pixel_distance=pixel_distance,
+            route_planner=route_planner or self.route_manager,
+            stay_on_partial_harvest=stay_on_partial_harvest,
+            now=now,
+        )
+
+    def update_stuck_status(
+        self,
+        player_pos: Optional[Tuple[float, float]],
+        movement_keys_held: bool = True,
+        distance_is_meters: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Tracks player position. Detects stuck if position unchanged for >3.0s while moving."""
+        return self.stuck_detector.update_position(
+            player_pos=player_pos,
+            movement_keys_held=movement_keys_held,
+            distance_is_meters=distance_is_meters,
+            now=now,
+        )
+
+    def execute_unstick(
+        self,
+        input_controller: Any = None,
+        target_bearing: Optional[float] = None,
+        player_heading: Optional[float] = None,
+        sleep_fn: Optional[Callable[[float], None]] = None,
+    ) -> Dict[str, Any]:
+        """Triggers unstick maneuver (Space -> Strafe A+W/D+W -> Realign)."""
+        ctrl = input_controller or self.input_controller
+        return self.stuck_detector.execute_unstick_maneuver(
+            input_controller=ctrl,
+            target_bearing=target_bearing,
+            player_heading=player_heading,
+            sleep_fn=sleep_fn,
+            deadband_deg=self.deadband_deg,
+        )
+
+    def step_navigation_cycle(
+        self,
+        player_pos: Optional[Tuple[float, float]],
+        player_heading: Optional[float],
+        waypoint_pos: Optional[Tuple[float, float]],
+        nodes: Sequence[Any],
+        current_index: int,
+        movement_keys_held: bool = True,
+        input_controller: Any = None,
+        distance_m: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Unified navigation cycle step:
+        1. Stuck detection: monitors position over 3.0s while movement keys held.
+        2. Arrival & sequencing: within 20px / 3m -> clean transition to next sequential node.
+        3. Bearing & shortest turn calculation (North=0°, East=90°, 180° inversion eliminated).
+        4. Turn damping & deadband (±5° to ±8°) preventing rapid steering oscillation.
+        """
+        curr_ts = time.time() if now is None else float(now)
+        ctrl = input_controller or self.input_controller
+
+        # 1. Stuck check
+        stuck_info = self.update_stuck_status(
+            player_pos=player_pos,
+            movement_keys_held=movement_keys_held,
+            now=curr_ts,
+        )
+        unstick_res: Optional[Dict[str, Any]] = None
+        if stuck_info["is_stuck"]:
+            target_b = compute_bearing(player_pos, waypoint_pos) if (player_pos and waypoint_pos) else None
+            unstick_res = self.execute_unstick(
+                input_controller=ctrl,
+                target_bearing=target_b,
+                player_heading=player_heading,
+            )
+
+        # 2. Waypoint arrival check & transition
+        arrival_res = self.check_arrival_and_transition(
+            player_pos=player_pos,
+            waypoint_pos=waypoint_pos,
+            nodes=nodes,
+            current_index=current_index,
+            distance_m=distance_m,
+            now=curr_ts,
+        )
+
+        # 3. Bearing & Damped Steering
+        bearing = None
+        turn_data = None
+        if player_pos is not None and waypoint_pos is not None:
+            bearing = compute_bearing(player_pos, waypoint_pos)
+            if player_heading is not None:
+                diff = compute_angle_diff(bearing, player_heading)
+                turn_data = apply_turn_damping(diff, deadband_deg=self.deadband_deg)
+
+        return {
+            "stuck_detected": bool(stuck_info["is_stuck"]),
+            "stuck_info": stuck_info,
+            "unstick_executed": bool(unstick_res is not None),
+            "unstick_info": unstick_res,
+            "arrival_info": arrival_res,
+            "target_bearing": bearing,
+            "player_heading": player_heading,
+            "turn_data": turn_data,
+        }
 
     def get_navigation_intel_health_summary(self) -> dict:
         return {"module": "navigation_intel", "ready": True}
@@ -1965,7 +2663,14 @@ class NavigationIntel:
         return {"module": "navigation_intel", "version": "2.0.0", "ready": True}
 
     def get_navigation_intel_diagnostic_snapshot(self) -> dict:
-        return {"module": "navigation_intel", "status": "ok", "ready": True}
+        return {
+            "module": "navigation_intel",
+            "status": "ok",
+            "ready": True,
+            "stuck_count": self.stuck_detector.stuck_count,
+            "transitions_count": self.waypoint_detector.transitions_count,
+            "deadband_deg": self.deadband_deg,
+        }
 
 
 __all__ = [
@@ -1974,11 +2679,24 @@ __all__ = [
     "MOUNT_DISTANCE_THRESHOLD_M",
     "DISMOUNT_DISTANCE_THRESHOLD_M",
     "MAPLESS_DISTANCE_THRESHOLD_M",
+    "DEFAULT_DEADBAND_DEG",
+    "MIN_DEADBAND_DEG",
+    "MAX_DEADBAND_DEG",
+    "DEFAULT_WAYPOINT_RADIUS_PX",
+    "DEFAULT_WAYPOINT_RADIUS_M",
+    "DEFAULT_STUCK_TIMEOUT_SEC",
     "ThreeStageHarvestController",
     "PartialNodeDetector",
     "handle_extraction_failure",
     "AutoMountManager",
     "MaplessMicroNavigator",
+    "RadarStuckDetector",
+    "WaypointArrivalDetector",
+    "TurnDampingController",
+    "NavigationIntel",
+    "compute_bearing",
+    "compute_angle_diff",
+    "apply_turn_damping",
     "get_navigation_intel_readiness_status",
     "get_navigation_intel_audit_record",
     "get_navigation_intel_operational_digest",
@@ -1991,7 +2709,7 @@ __all__ = [
 
 
 def get_navigation_intel_capabilities() -> list:
-    return ["navigation_intel", "spatial_heuristics", "diagnostic_snapshot"]
+    return ["navigation_intel", "spatial_heuristics", "heading_alignment", "turn_damping", "stuck_detection", "waypoint_sequencing", "diagnostic_snapshot"]
 
 
 def validate_navigation_intel_contract() -> bool:

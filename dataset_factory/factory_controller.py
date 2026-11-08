@@ -67,6 +67,7 @@ from dataset_factory.frame_time_machine import (
     FrameSnapshot,
     PreGatherTimeMachineBuffer,
 )
+from dataset_factory.game_frame_gate import is_valid_game_frame
 from dataset_factory.quality_dedup_gate import (
     DatasetQualityGate,
     QualityGateDecision,
@@ -85,6 +86,9 @@ from dataset_factory.yolo_auto_labeler import (
 )
 
 logger = logging.getLogger("DatasetFactory.Controller")
+
+# Shown on the YOLO status line when AION 2 is open. CUDA training must not start.
+GAME_BLOCKS_TRAINING_REASON = "Eğitim, oyun kapanana kadar bekliyor."
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(
@@ -95,6 +99,20 @@ if not logger.handlers:
     )
     logger.addHandler(_handler)
     logger.setLevel(logging.INFO)
+
+
+def cuda_training_blocked_by_game() -> str:
+    """Non-empty when AION 2 / Aion2 / 'AION 2' is running. CUDA training must wait."""
+    try:
+        from core.game_gpu_throttle import find_aion_game_processes
+
+        pids = find_aion_game_processes()
+    except Exception:
+        logger.debug("AION süreç kontrolü atlandı", exc_info=True)
+        return ""
+    if pids:
+        return GAME_BLOCKS_TRAINING_REASON
+    return ""
 
 
 # ==============================================================================
@@ -109,10 +127,14 @@ FACTORY_12_CLASS_NAMES: Dict[int, str] = {
     5: "wood_tree",
     6: "world_gather_crest",
     7: "f_gather_prompt",
-    8: "e_gather_icon",
+    8: "combo_skill_prompt",
     9: "minimap_sprout",
-    10: "monster_3d_negative",
-    11: "minimap_monster_negative",
+    10: "monster_3d",
+    11: "minimap_monster_dot",
+    12: "world_material",
+    13: "skill_ui_prompt",
+    14: "obstacle",
+    15: "path_ground",
 }
 
 FACTORY_12_CLASS_LABELS_TR: Dict[int, str] = {
@@ -124,11 +146,29 @@ FACTORY_12_CLASS_LABELS_TR: Dict[int, str] = {
     5: "5: Ağaç / Kereste (Yggdrasil/Asvata)",
     6: "6: 3B Amblem (Beyaz Kanatlı İkon)",
     7: "7: F Gather (Etkileşim İstem Kutusu)",
-    8: "8: E İkonu (Yüzen Kaynak Kutusu)",
+    8: "8: Kombo İkonu (Q/E)",
     9: "9: Minimap Filiz (3 Yapraklı İkon)",
-    10: "10: Canavar (3B Negatif Sınıf)",
-    11: "11: Minimap Canavar (Yuvarlak Nokta Negatif)",
+    10: "10: 3B Canavar (monster_3d)",
+    11: "11: Minimap Canavar (minimap_monster_dot)",
+    12: "12: Dünya Malzemesi (adı bilinmeyen)",
+    13: "13: Skill/Arayüz (F/E değil)",
+    14: "14: Engel",
+    15: "15: Yol/Zemin",
 }
+
+try:
+    from dataset_factory.class_taxonomy import dataset_class_names as _taxonomy_class_names
+    from dataset_factory.class_taxonomy import dataset_labels_tr as _taxonomy_labels_tr
+
+    for _cid, _name in _taxonomy_class_names().items():
+        FACTORY_12_CLASS_NAMES.setdefault(int(_cid), _name)
+        if int(_cid) >= 16:
+            FACTORY_12_CLASS_LABELS_TR.setdefault(
+                int(_cid),
+                f"{int(_cid)}: {_taxonomy_labels_tr().get(int(_cid), _name)}",
+            )
+except Exception:
+    pass
 
 
 class AutoLabelingDatasetFactory:
@@ -145,7 +185,7 @@ class AutoLabelingDatasetFactory:
       - `ActiveLearningLoop` & `ShadowGameplayRecorder` (hard-example mining & passive shadow mode)
     """
 
-    DEFAULT_TARGET_IMAGES: int = 5000
+    DEFAULT_TARGET_IMAGES: int = 100000
     DEFAULT_LOOKBACK_SEC: float = 2.0
     DEFAULT_PUSH_INTERVAL_SEC: float = 0.25
 
@@ -359,6 +399,12 @@ class AutoLabelingDatasetFactory:
         if not isinstance(frame, np.ndarray) or frame.size == 0 or not annotations:
             return
 
+        # Central Game Frame Gate: unconditionally drop non-game captures before saving to disk
+        valid_game, gate_reason = is_valid_game_frame(frame, require_foreground=False)
+        if not valid_game:
+            logger.debug("Shadow sample dropped by GameFrameGate: %s", gate_reason)
+            return
+
         decision = self.quality_gate.evaluate_frame(
             frame=frame,
             annotations=annotations,
@@ -384,8 +430,16 @@ class AutoLabelingDatasetFactory:
                 self._last_saved_image_path = str(save_res["image_path"])
 
     # ==========================================================================
-    # 1. Live Frame Ingestion (`ingest_live_frame`)
+    # 1. Live Frame Ingestion (`ingest_live_frame` & `feed_live_frame`)
     # ==========================================================================
+    def feed_live_frame(
+        self,
+        frame: np.ndarray,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Backward-compatible alias for `ingest_live_frame` called by BotWorker."""
+        return self.ingest_live_frame(frame, **kwargs)
+
     def ingest_live_frame(
         self,
         frame: np.ndarray,
@@ -419,6 +473,17 @@ class AutoLabelingDatasetFactory:
                 "reason": "empty_or_invalid_frame",
                 "buffered_frames": len(self.time_machine),
                 "span_seconds": self.time_machine.span_seconds,
+            }
+
+        # Central Game Frame Gate: unconditionally drop non-game captures before saving or buffering
+        is_valid, gate_reason = is_valid_game_frame(frame, require_foreground=True)
+        if not is_valid:
+            logger.debug("Live frame dropped by GameFrameGate: %s", gate_reason)
+            return {
+                "ingested": False,
+                "reason": f"game_frame_gate_rejected: {gate_reason}",
+                "buffered_frames": len(self.time_machine),
+                "span_seconds": round(self.time_machine.span_seconds, 3),
             }
 
         ts = float(timestamp) if timestamp is not None else time.time()
@@ -547,7 +612,7 @@ class AutoLabelingDatasetFactory:
           5. Generates synthetic augmented variants (`SyntheticYOLOAugmentor`) if
              `auto_augment_on_gather=True` (or `synthetic_augment_10x=True`), scaled by
              `ActiveLearningLoop.compute_sample_priority(...)`.
-          6. If `total_images >= auto_train_threshold` (default `5000`), flags
+          6. If `total_images >= auto_train_threshold` (default `100000`), flags
              `auto_train_ready=True` and optionally triggers 1-Click RTX training!
         """
         with self._lock:
@@ -604,6 +669,20 @@ class AutoLabelingDatasetFactory:
                 "gather_event_index": gather_seq,
             }
 
+        # Central Game Frame Gate: unconditionally drop non-game captures before saving to disk
+        valid_gate, gate_reason = is_valid_game_frame(target_frame, require_foreground=False)
+        if not valid_gate and not force_save:
+            logger.warning("Gather sample dropped by GameFrameGate: %s", gate_reason)
+            with self._lock:
+                self._gather_samples_rejected += 1
+            return {
+                "saved": False,
+                "reason": f"game_frame_gate_rejected: {gate_reason}",
+                "used_time_machine": used_time_machine,
+                "actual_lookback_sec": round(actual_lookback_sec, 3),
+                "gather_event_index": gather_seq,
+            }
+
         # Extract optional hints from node_info
         node_dict = dict(node_info) if isinstance(node_info, dict) else {}
         resolved_material = str(
@@ -645,6 +724,7 @@ class AutoLabelingDatasetFactory:
             has_mesh_box = any(0 <= int(a.get("class_id", -1)) <= 5 for a in annotations)
             if not has_mesh_box and 0 <= expected_cid <= 5:
                 img_h, img_w = target_frame.shape[:2]
+                # Hint only — never a high-conf train box without a real mesh hit.
                 annotations.append(
                     {
                         "class_id": int(expected_cid),
@@ -653,8 +733,11 @@ class AutoLabelingDatasetFactory:
                         "cy": 0.55,
                         "w": 0.11,
                         "h": 0.15,
-                        "confidence": 0.92,
+                        "confidence": 0.35,
                         "source": "gather_material_hint",
+                        "trusted": False,
+                        "weak": True,
+                        "synthetic_fallback": True,
                     }
                 )
             elif has_mesh_box and 0 <= expected_cid <= 5:
@@ -849,7 +932,7 @@ class AutoLabelingDatasetFactory:
     def get_factory_status(self) -> Dict[str, Any]:
         """
         Returns live statistics in Turkish & structured JSON:
-          - `total_images`, `target_images: 5000`, `progress_pct`
+          - `total_images`, `target_images: 100000`, `progress_pct`
           - `train_images`, `val_images`, `total_boxes`
           - `class_counts` (canonical 12 class names -> box count, plus `class_counts_by_id` & `class_counts_tr`)
           - `gpu_info` (hardware probe from `RTXTrainerEngine`)
@@ -878,7 +961,7 @@ class AutoLabelingDatasetFactory:
             class_counts_by_id: Dict[int, int] = {}
             class_counts_tr: Dict[str, int] = {}
 
-            for cid in range(12):
+            for cid in range(len(FACTORY_12_CLASS_NAMES)):
                 cnt = int(raw_id_counts.get(str(cid), raw_id_counts.get(cid, 0)))
                 cname = FACTORY_12_CLASS_NAMES[cid]
                 ctr = FACTORY_12_CLASS_LABELS_TR[cid]
@@ -1011,6 +1094,8 @@ class AutoLabelingDatasetFactory:
         batch: int = 16,
         async_mode: bool = False,
         force_fallback: bool = False,
+        model: str = "yolo11n.pt",
+        allow_opencv_fallback: bool = False,
     ) -> Dict[str, Any]:
         """
         Launches `RTXTrainerEngine` on `dataset/data.yaml`.
@@ -1025,28 +1110,35 @@ class AutoLabelingDatasetFactory:
                         `start_training_async`; if False (default), runs synchronously
                         and returns the completed training result dictionary.
             force_fallback: Force built-in OpenCV/NumPy prototype trainer mode.
+            model: Ultralytics weights name (e.g. `yolo11m.pt`).
+            allow_opencv_fallback: Factory default False — never fake-complete via Mode B.
 
         Returns:
             Dictionary containing final training metrics (`mAP50`, `mAP50_95`, `box_loss`,
             `cls_loss`, `precision`, `recall`), exported model paths (`artifacts`), and
             hardware environment details.
         """
-        self.curator.ensure_dataset_structure()
-
-        # If dataset is currently empty on disk, automatically bootstrap from reference_screenshots
-        manifest = self.curator.get_manifest_stats()
-        if int(manifest.get("total_images", 0)) == 0:
-            self.bootstrap_from_existing_frames(augment_multiplier=3)
-
         if async_mode:
-            return self.rtx_trainer.start_training_async(
-                data_yaml_path=self.data_yaml_path,
+            return self._schedule_one_click_rtx_training(
                 epochs=int(epochs),
                 progress_callback=progress_callback,
                 imgsz=int(imgsz),
                 batch=int(batch),
                 force_fallback=bool(force_fallback),
+                model=str(model),
+                allow_opencv_fallback=bool(allow_opencv_fallback),
             )
+
+        prepared = self.prepare_one_click_dataset()
+        blocked = cuda_training_blocked_by_game()
+        if blocked:
+            logger.info("%s", blocked)
+            return {
+                "started": False,
+                "waiting_for_game_exit": True,
+                "reason": blocked,
+                "bootstrap": prepared,
+            }
 
         return self.rtx_trainer.run_training_sync(
             data_yaml_path=self.data_yaml_path,
@@ -1055,7 +1147,110 @@ class AutoLabelingDatasetFactory:
             imgsz=int(imgsz),
             batch=int(batch),
             force_fallback=bool(force_fallback),
+            model=str(model),
+            allow_opencv_fallback=bool(allow_opencv_fallback),
         )
+
+    def stop_training(self) -> None:
+        """Signals active training (RTXTrainerEngine / YOLOTrainer) to stop immediately."""
+        if hasattr(self, "rtx_trainer") and self.rtx_trainer is not None:
+            try:
+                self.rtx_trainer.stop_training()
+            except Exception as exc:
+                logger.warning("rtx_trainer.stop_training failed: %s", exc)
+        if hasattr(self, "trainer") and self.trainer is not None and self.trainer is not getattr(self, "rtx_trainer", None):
+            try:
+                self.trainer.stop_training()
+            except Exception as exc:
+                logger.warning("trainer.stop_training failed: %s", exc)
+
+    def prepare_one_click_dataset(self) -> Dict[str, Any]:
+        """Bootstrap only when the manifest is empty. Call this off the GUI thread."""
+        self.curator.ensure_dataset_structure()
+        manifest = self.curator.get_manifest_stats()
+        total = int(manifest.get("total_images", 0) or 0)
+        if total == 0:
+            return self.bootstrap_from_existing_frames(augment_multiplier=3)
+        return {
+            "bootstrapped": False,
+            "skipped": True,
+            "total_images": total,
+            "train_count": int(manifest.get("train_count", 0) or 0),
+            "val_count": int(manifest.get("val_count", 0) or 0),
+            "total_boxes": int(manifest.get("total_boxes", 0) or 0),
+        }
+
+    def _schedule_one_click_rtx_training(
+        self,
+        epochs: int,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+        imgsz: int,
+        batch: int,
+        force_fallback: bool,
+        model: str = "yolo11n.pt",
+        allow_opencv_fallback: bool = False,
+    ) -> Dict[str, Any]:
+        """Return immediately. Dataset bootstrap and the CUDA launch run on a side thread."""
+        existing = getattr(self, "_one_click_thread", None)
+        if existing is not None and existing.is_alive():
+            return {
+                "started": False,
+                "reason": "Training is already running in the background.",
+            }
+
+        def _job() -> None:
+            try:
+                prepared = self.prepare_one_click_dataset()
+                blocked = cuda_training_blocked_by_game()
+                if blocked:
+                    logger.info("%s", blocked)
+                    payload = {
+                        "started": False,
+                        "waiting_for_game_exit": True,
+                        "reason": blocked,
+                        "bootstrap": prepared,
+                    }
+                    self._last_one_click_result = payload
+                    if progress_callback is not None:
+                        progress_callback(dict(payload))
+                    return
+                self._last_one_click_result = self.rtx_trainer.start_training_async(
+                    data_yaml_path=self.data_yaml_path,
+                    epochs=int(epochs),
+                    progress_callback=progress_callback,
+                    imgsz=int(imgsz),
+                    batch=int(batch),
+                    force_fallback=bool(force_fallback),
+                    model=str(model),
+                    allow_opencv_fallback=bool(allow_opencv_fallback),
+                )
+            except Exception as exc:
+                logger.exception("One-click dataset bootstrap failed: %s", exc)
+                payload = {
+                    "started": False,
+                    "state": "failed",
+                    "error": str(exc),
+                    "reason": str(exc),
+                }
+                self._last_one_click_result = payload
+                if progress_callback is not None:
+                    try:
+                        progress_callback(dict(payload))
+                    except Exception:
+                        logger.debug("progress_callback failed", exc_info=True)
+
+        thread = threading.Thread(
+            target=_job,
+            name="GatherionDatasetBootstrap",
+            daemon=True,
+        )
+        self._one_click_thread = thread
+        thread.start()
+        return {
+            "started": True,
+            "bootstrap_pending": True,
+            "thread_name": thread.name,
+        }
 
     # ==========================================================================
     # 5. Bootstrap & UI Integration Helpers

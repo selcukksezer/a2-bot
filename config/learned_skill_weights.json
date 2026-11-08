@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "updated_at": 1794127750.0799599,
+  "weights": {
+    "1": 0.644,
+    "2": 0.804,
+    "3": 0.705,
+    "4": 0.76,
+    "5": 0.76,
+    "Q": 0.705,
+    "E": 1.0,
+    "R": 1.148
+  },
+  "skill_stats": {
+    "1": {
+      "casts": 19,
+      "hits": 0,
+      "total_hp_drop": 0.0,
+      "avg_hp_drop": 0.0,
+      "max_hp_drop": 0.0,
+      "weight": 0.644,
+      "last_cast_ts": 1794127745.3221035
+    },
+    "2": {
+      "casts": 8,
+      "hits": 1,
+      "total_hp_drop": 0.4,
+      "avg_hp_drop": 0.4,
+      "max_hp_drop": 0.4,
+      "weight": 0.804,
+      "last_cast_ts": 1794127640.0441482
+    },
+    "3": {
+      "casts": 2,
+      "hits": 0,
+      "total_hp_drop": 0.0,
+      "avg_hp_drop": 0.0,
+      "max_hp_drop": 0.0,
+      "weight": 0.705,
+      "last_cast_ts": 1794127599.431585
+    },
+    "4": {
+      "casts": 4,
+      "hits": 0,
+      "total_hp_drop": 0.0,
+      "avg_hp_drop": 0.0,
+      "max_hp_drop": 0.0,
+      "weight": 0.76,
+      "last_cast_ts": 1794127745.3221035
+    },
+    "5": {
+      "casts": 5,
+      "hits": 0,
+      "total_hp_drop": 0.0,
+      "avg_hp_drop": 0.0,
+      "max_hp_drop": 0.0,
+      "weight": 0.76,
+      "last_cast_ts": 1794127745.3221035
+    },
+    "Q": {
+      "casts": 1,
+      "hits": 0,
+      "total_hp_drop": 0.0,
+      "avg_hp_drop": 0.0,
+      "max_hp_drop": 0.0,
+      "weight": 0.705,
+      "last_cast_ts": 1794127327.439482
+    },
+    "E": {
+      "casts": 0,
+      "hits": 0,
+      "total_hp_drop": 0.0,
+      "avg_hp_drop": 0.0,
+      "max_hp_drop": 0.0,
+      "weight": 1.0,
+      "last_cast_ts": 0.0
+    },
+    "R": {
+      "casts": 6,
+      "hits": 1,
+      "total_hp_drop": 0.6,
+      "avg_hp_drop": 0.6,
+      "max_hp_drop": 0.6,
+      "weight": 1.148,
+      "last_cast_ts": 1794127637.6731808
+    }
+  },
+  "encounter_stats": {
+    "total_encounters": 5,
+    "fast_encounters": 2,
+    "slow_encounters": 3,
+    "avg_encounter_duration": 10.4,
+    "last_encounter_duration": 4.75,
+    "last_encounter_dps": 0.0,
+    "last_encounter_speed_rating": "slow",
+    "in_encounter": false
+  }
+}

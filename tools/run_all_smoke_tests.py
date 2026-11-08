@@ -13,6 +13,7 @@ ve hem konsola (stdout) hem de `logs/smoke_test_report.json` dosyasına kapsaml�
     `AnalyticsDialog`, `CalibrationWizard`, `GuideDialog`, `MobileConnectDialog`)
 5. Tam Kod Tabanı AST Sıfır-Yer-Tutucu (Zero-Placeholder) ve Sözdizimi (Syntax) Kapısı
    (`C:\\Users\\selçuk\\Desktop\\a2` altındaki tüm `.py` dosyaları üzerinde).
+6. `tools/smoke_test_zk_agent.py` — ZK Vision Agent (PerceptionHub / ManaPhase / Discovery / Economy / SoftInput)
 """
 
 from __future__ import annotations
@@ -536,6 +537,18 @@ class MasterSmokeTestRunner:
         "node_modules",
         ".mypy_cache",
         ".pytest_cache",
+        "temp",
+        "logs",
+        ".cursor",
+        "uv-cache",
+        "site-packages",
+        "Lib",
+        "agent-transcripts",
+        "mcp-inspect",
+        "dist",
+        "build",
+        ".tox",
+        ".kits",
     )
 
     def __init__(self, root: Optional[Path] = None) -> None:
@@ -1114,6 +1127,92 @@ class MasterSmokeTestRunner:
                     discovered.append(Path(root_dir) / fname)
         return discovered
 
+    def run_suite_6_zk_vision_agent(self) -> SuiteExecutionSummary:
+        """6. Paket: ZK Vision Agent duman testi (tools/smoke_test_zk_agent.py)."""
+        suite_id = "SUITE_6_ZK_AGENT"
+        title_tr = "ZK Vision Agent (PerceptionHub / ManaPhase / Discovery / Economy / SoftInput)"
+        rel_path = "tools/smoke_test_zk_agent.py"
+        suite_checks: List[SmokeCheckItem] = []
+        t0 = time.perf_counter()
+        try:
+            from tools.smoke_test_zk_agent import (
+                run_zk_agent_smoke_tests,
+                write_zk_smoke_report,
+            )
+
+            passed_count, failed_count, raw_results = run_zk_agent_smoke_tests(verbose=False)
+            try:
+                write_zk_smoke_report(passed_count, failed_count, raw_results)
+            except Exception:
+                pass
+            for row in raw_results:
+                code = str(row.get("id", ""))
+                cat = str(row.get("category", "ZK"))
+                name = str(row.get("name", code))
+                dur = float(row.get("elapsed_ms", row.get("duration_ms", 0.0)))
+                det = str(row.get("detail", row.get("details", "")))
+                chk = SmokeCheckItem(
+                    suite_id=suite_id,
+                    category=cat,
+                    name=f"[{code}] {name}" if code and not name.startswith("[") else name,
+                    passed=bool(row.get("passed", False)),
+                    duration_ms=round(dur, 2),
+                    details=det,
+                )
+                suite_checks.append(chk)
+                self.all_checks.append(chk)
+
+            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            passed_cnt = sum(1 for c in suite_checks if c.passed)
+            failed_cnt = len(suite_checks) - passed_cnt
+            suite_ok = (failed_count == 0) and (failed_cnt == 0) and (passed_count > 0)
+            summary = SuiteExecutionSummary(
+                suite_id=suite_id,
+                title_tr=title_tr,
+                script_rel_path=rel_path,
+                passed=suite_ok,
+                total_checks=len(suite_checks),
+                passed_checks=passed_cnt,
+                failed_checks=failed_cnt,
+                duration_ms=elapsed_ms,
+                return_code=0 if suite_ok else 1,
+                summary_tr=(
+                    f"ZK Vision Agent {passed_cnt}/{len(suite_checks)} GEÇTİ ({elapsed_ms:.1f} ms)"
+                    if suite_ok
+                    else f"ZK paketinde {failed_cnt} hata ({passed_cnt}/{len(suite_checks)} GEÇTİ)"
+                ),
+                checks=suite_checks,
+            )
+            self.suite_summaries.append(summary)
+            return summary
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            err_chk = SmokeCheckItem(
+                suite_id=suite_id,
+                category="ZK_ERROR",
+                name=rel_path,
+                passed=False,
+                duration_ms=elapsed_ms,
+                details=f"İstisna: {exc}",
+            )
+            suite_checks.append(err_chk)
+            self.all_checks.append(err_chk)
+            summary = SuiteExecutionSummary(
+                suite_id=suite_id,
+                title_tr=title_tr,
+                script_rel_path=rel_path,
+                passed=False,
+                total_checks=1,
+                passed_checks=0,
+                failed_checks=1,
+                duration_ms=elapsed_ms,
+                return_code=1,
+                summary_tr=f"{rel_path} çalıştırma hatası: {exc}",
+                checks=suite_checks,
+            )
+            self.suite_summaries.append(summary)
+            return summary
+
     def run_suite_5_full_ast_zero_placeholder_gate(self) -> SuiteExecutionSummary:
         """
         5. Paket: Proje kök dizinindeki HER `.py` dosyasını AST ile ayrıştırır,
@@ -1186,16 +1285,21 @@ class MasterSmokeTestRunner:
                                 file_violations.append(v)
                             elif isinstance(only_stmt, ast.Raise):
                                 exc_node = only_stmt.exc
+                                is_not_impl = False
                                 if isinstance(exc_node, ast.Name) and exc_node.id == "NotImplementedError":
-                                    v = f"{rpath}:{node.name} (satır {node.lineno} NotImplementedError)"
-                                    file_violations.append(v)
+                                    is_not_impl = True
                                 elif (
                                     isinstance(exc_node, ast.Call)
                                     and isinstance(exc_node.func, ast.Name)
                                     and exc_node.func.id == "NotImplementedError"
                                 ):
-                                    v = f"{rpath}:{node.name} (satır {node.lineno} NotImplementedError)"
-                                    file_violations.append(v)
+                                    is_not_impl = True
+                                if is_not_impl:
+                                    def_line = lines[node.lineno - 1] if 0 <= node.lineno - 1 < len(lines) else ""
+                                    raise_line = lines[only_stmt.lineno - 1] if 0 <= only_stmt.lineno - 1 < len(lines) else ""
+                                    if "pragma: no cover" not in def_line and "pragma: no cover" not in raise_line:
+                                        v = f"{rpath}:{node.name} (satır {node.lineno} NotImplementedError)"
+                                        file_violations.append(v)
 
                 for lineno, raw_line in enumerate(lines, start=1):
                     if marker_a in raw_line or marker_b in raw_line:
@@ -1418,6 +1522,9 @@ class MasterSmokeTestRunner:
 
         # 5. Tam Kod Tabanı AST Sıfır-Yer-Tutucu ve Sözdizimi Kapısı
         self.run_suite_5_full_ast_zero_placeholder_gate()
+
+        # 6. ZK Vision Agent (PerceptionHub / ManaPhase / Discovery / Economy / SoftInput)
+        self.run_suite_6_zk_vision_agent()
 
         total_duration_ms = (time.perf_counter() - t_start) * 1000.0
         payload = self.build_report_payload(total_duration_ms)

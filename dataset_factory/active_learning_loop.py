@@ -207,9 +207,18 @@ def normalize_material_class_key(raw_key: Union[int, str, None]) -> str:
 
 
 def resolve_class_id(raw_key: Union[int, str, None]) -> int:
-    """Resolve an annotation class identifier or material name to an integer class ID in 0..11."""
+    """Resolve an annotation class identifier or material name to a train class id."""
     if isinstance(raw_key, (int, np.integer)):
-        return int(np.clip(int(raw_key), 0, len(CANONICAL_12_YOLO_CLASSES) - 1))
+        cid = int(raw_key)
+        return cid if cid >= 0 else 0
+    try:
+        from dataset_factory.class_taxonomy import class_id_for_material_text
+
+        specific = class_id_for_material_text(str(raw_key or ""))
+    except Exception:
+        specific = None
+    if specific is not None:
+        return int(specific)
     canonical = normalize_material_class_key(raw_key)
     return CLASS_NAME_TO_ID.get(canonical, 0)
 

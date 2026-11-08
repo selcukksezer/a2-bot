@@ -63,12 +63,35 @@ class NodeRecorder:
         # 4. Close map immediately (flashes open for fraction of a second)
         self.navigator.close_map()
 
+        # 4.5. Kara Liste (Blacklist) kontrolü
+        if getattr(self.routes, "blacklist_manager", None) is not None:
+            is_bl, bl_entry = self.routes.blacklist_manager.is_blacklisted(
+                getattr(self.routes, "active_region", "Altgard"),
+                center_x,
+                center_y,
+            )
+            if is_bl:
+                print(f"[Recorder] ⛔ Bu konum ({center_x}, {center_y}) KARA LİSTEDE! Kayıt engellendi.")
+                try:
+                    winsound.Beep(600, 250)
+                except Exception:
+                    pass
+                return None
+
         # 5. Save to database
         node = self.routes.add_node(
             map_x=center_x,
             map_y=center_y,
             patch_img=patch
         )
+
+        if node is None:
+            print(f"[Recorder] ⛔ Düğüm eklenemedi (kara liste engeli veya kayıt hatası).")
+            try:
+                winsound.Beep(600, 250)
+            except Exception:
+                pass
+            return None
 
         print(f"[Recorder] {node['name']} başarıyla kaydedildi! (Konum: {center_x}, {center_y})")
         try:

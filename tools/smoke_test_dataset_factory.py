@@ -176,7 +176,7 @@ class _UnifiedAutoLabelingFactoryFallback:
         lookback_seconds: float = 2.0,
         auto_augment_on_gather: bool = True,
         augment_variants_per_gather: int = 2,
-        auto_train_threshold: int = 5000,
+        auto_train_threshold: int = 100000,
     ) -> None:
         self.project_root = Path(project_root).resolve() if project_root else PROJECT_ROOT
         self.lookback_seconds = float(lookback_seconds)
@@ -293,7 +293,7 @@ class _UnifiedAutoLabelingFactoryFallback:
         gpu_info = self.rtx_trainer.probe_gpu_environment()
         return {
             "total_images": int(manifest.get("total_images", 0)),
-            "target_images": int(manifest.get("target_goal", 5000)),
+            "target_images": int(manifest.get("target_goal", 100000)),
             "progress_pct": float(manifest.get("progress_pct", 0.0)),
             "train_images": int(manifest.get("train_count", 0)),
             "val_images": int(manifest.get("val_count", 0)),
@@ -407,8 +407,12 @@ def _test_df_2_yolo_auto_labeler() -> str:
     geçerli YOLO `.txt` satırlarını (`class_id cx cy w h` in `[0.0, 1.0]`) doğrular.
     """
     labeler = YOLOAutoLabeler()
-    assert len(YOLO_CLASSES) == 12 and len(YOLO_CLASSES_TR) == 12, (
-        "YOLO_CLASSES ve YOLO_CLASSES_TR 12 sınıflı olmalıdır!"
+    assert len(YOLO_CLASSES) >= 22 and len(YOLO_CLASSES_TR) >= 22, (
+        "YOLO sınıfları essence, can barı ve skill yuvalarını da içermeli!"
+    )
+    assert YOLO_CLASSES[15] == "path_ground" or YOLO_CLASSES.get(15) in (
+        "path_ground",
+        "Yol / zemin",
     )
 
     target_screenshots: Tuple[Tuple[str, str], ...] = (
@@ -618,7 +622,12 @@ def _test_df_5_dataset_curator_and_data_yaml() -> str:
     assert "train: images/train" in yaml_text and "val: images/val" in yaml_text, (
         "data.yaml içerisinde train/val yolları eksik!"
     )
-    assert "nc: 12" in yaml_text, "data.yaml içerisinde 'nc: 12' tanımı eksik!"
+    assert "herb_aria" in yaml_text and "path_ground" in yaml_text and "player_hp_bar" in yaml_text, (
+        "data.yaml essence ve can barı sınıflarını içermeli!"
+    )
+    nc_line = next((line for line in yaml_text.splitlines() if line.startswith("nc:")), "")
+    nc_value = int(nc_line.split(":", 1)[1].strip()) if ":" in nc_line else 0
+    assert nc_value >= 22, f"data.yaml nc en az 22 olmalı, gelen: {nc_line}"
 
     stats = curator.rebuild_manifest_stats()
     if int(stats.get("train_count", 0)) == 0 or int(stats.get("val_count", 0)) == 0:
@@ -934,7 +943,7 @@ def _test_df_9_yolo_factory_dialog_offscreen_ui() -> str:
 
     # İlerleme çubuğu ve 12 YOLO sınıf satırı kontrolü
     prog_text = dialog.dataset_progress_label.text()
-    assert "Otomatik Etiketlenen Veri Seti İlerlemesi:" in prog_text and "5.000 Fotoğraf" in prog_text, (
+    assert "100.000" in prog_text, (
         f"Üst ilerleme etiketi hatalı: '{prog_text}'"
     )
     assert len(dialog.class_rows) == 12, (
@@ -1038,7 +1047,7 @@ def run_dataset_factory_smoke_tests(
         (
             "DF.9",
             "Türkçe PyQt6 UI",
-            "YOLOFactoryDialog Offscreen Arayüz (12 Sınıf, 5.000 Hedef & RTX Kontrolleri)",
+            "YOLOFactoryDialog Offscreen Arayüz (12 Sınıf, 100.000 Hedef & RTX Kontrolleri)",
             _test_df_9_yolo_factory_dialog_offscreen_ui,
         ),
     ]

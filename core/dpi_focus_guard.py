@@ -464,6 +464,8 @@ class ForegroundFocusGuard:
         "purple",
         "unrealwindow",
         "game",
+        "rise",
+        "client",
     )
 
     DEFAULT_BLOCKED_APPS = (
@@ -486,6 +488,9 @@ class ForegroundFocusGuard:
         "whatsapp",
         "slack",
         "spotify",
+        "program manager",
+        "desktop",
+        "masaüstü",
     )
 
     def __init__(
@@ -572,11 +577,14 @@ class ForegroundFocusGuard:
         (Discord, Chrome, Explorer, etc.), or does not match the allowed game title/PID criteria.
         """
         hwnd, pid, title = self.query_foreground_window_info()
-        if hwnd == 0 and self._simulated_foreground_title is None:
+        if (hwnd == 0 or not title.strip()) and self._simulated_foreground_title is None:
             self._last_focus_loss_reason = "No active foreground window (Desktop/LockScreen)"
             return False, self._last_focus_loss_reason
 
-        title_lower = title.lower()
+        title_lower = title.lower().strip()
+        if title_lower in ("program manager", "workerw", "progman", "desktop", "masaüstü", ""):
+            self._last_focus_loss_reason = f"Masaüstü odakta: '{title or '<Desktop>'}' (PID={pid})"
+            return False, self._last_focus_loss_reason
 
         # 1. Explicit PID match (if registered)
         if self.allowed_pids and pid in self.allowed_pids:

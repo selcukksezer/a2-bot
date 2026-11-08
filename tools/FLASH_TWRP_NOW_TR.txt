@@ -1,0 +1,29 @@
+FLASH TWRP NOW (TR) — sadece kullanıcı "evet" dedikten sonra
+SM-G950F dreamlte | OEM LOCK OFF | KG satırı yok | Magisk denemesi onaylanabilir
+FLASH YOK bu kart yazılırken. Goal AÇIK kalır.
+
+=== PATHS (hazır) ===
+ODIN   F:\a2\vendor\android_hid\s8_root\odin\Odin3_v3.14.1\Odin3 v3.14.1.exe
+TWRP   F:\a2\vendor\android_hid\s8_root\twrp-3.7.0_9-0-dreamlte.img.tar
+MDIS   F:\a2\vendor\android_hid\s8_root\multidisabler-samsung-3.1-flashable.zip
+MAGISK F:\a2\vendor\android_hid\s8_root\Magisk-v31.1.zip
+
+=== KOPYALA-YAPIŞTIR (evet sonrası) ===
+1) Yedek / şarj >60%. Knox zaten trip olabilir — kabul.
+2) Telefon KAPALI → Vol− + Bixby + Power → Download (“Downloading…”).
+3) Odin.exe sağ tık → Yönetici. Log: <ID:COMx> Added!!
+4) Options: Auto Reboot OFF, Re-Partition OFF.
+5) AP = twrp-3.7.0_9-0-dreamlte.img.tar → Start → PASS.
+6) HEMEN recovery: Vol+ + Bixby + Power (sisteme boot etme).
+7) TWRP: şifreliyse Format Data (yes).
+8) Zips /sdcard (MTP veya adb push):
+      multidisabler-samsung-3.1-flashable.zip
+      Magisk-v31.1.zip
+   veya: tools\push_magisk_to_twrp.bat (Magisk); MDIS ayrıca push.
+9) Install → ÖNCE multidisabler → (gerekirse reboot recovery).
+10) Install → SONRA Magisk-v31.1.zip → Reboot System.
+11) Doğrula: adb shell su -c id  → uid=0
+12) Sonra: tools\after_magisk_hid.bat
+
+SIRALAMA: multidisabler → Magisk. vbmeta A10+ image YOK (A9 dreamlte).
+Prenormal / “Only official released binaries…” görürsen DUR — Start yok.

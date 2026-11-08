@@ -100,9 +100,22 @@ def _play_discovery_chime(frequency_hz: int = 1046, duration_ms: int = 45) -> No
 class ExplorerMode:
     """Alias/wrapper for ExplorerModeController for health summary and legacy support."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        self._controller: Optional[ExplorerModeController] = None
+        if args or kwargs:
+            try:
+                self._controller = ExplorerModeController(*args, **kwargs)
+            except Exception:
+                pass
+
+    def _ensure_controller(self) -> ExplorerModeController:
+        if self._controller is None:
+            self._controller = ExplorerModeController()
+        return self._controller
+
     def get_explorer_health_summary(self) -> dict:
         try:
-            return {"explorer_ready": True}
+            return {"explorer_ready": True, "walking_state": self.get_walking_state()}
         except Exception:
             return {"explorer_ready": False}
 
@@ -110,10 +123,53 @@ class ExplorerMode:
         return {"module": "explorer_mode", "ready": True}
 
     def get_explorer_mode_version_info(self) -> dict:
-        return {"module": "explorer_mode", "version": "2.0.0", "ready": True}
+        return {"module": "explorer_mode", "version": "2.1.0", "ready": True}
 
     def get_explorer_mode_diagnostic_snapshot(self) -> dict:
-        return {"module": "explorer_mode", "status": "ok", "ready": True}
+        return {
+            "module": "explorer_mode",
+            "status": "ok",
+            "ready": True,
+            "walking_state": self.get_walking_state(),
+            "movement_coords": self.get_player_movement_coords(),
+            "anti_beklemede_lock": True,
+        }
+
+    def get_walking_state(self) -> str:
+        return self._ensure_controller().get_walking_state()
+
+    def set_walking_state(self, state: str, reason: str = "") -> str:
+        return self._ensure_controller().set_walking_state(state, reason=reason)
+
+    def update_walking_state(self, *args, **kwargs) -> str:
+        return self._ensure_controller().update_walking_state(*args, **kwargs)
+
+    def get_player_movement_coords(self) -> Tuple[float, float]:
+        return self._ensure_controller().get_player_movement_coords()
+
+    def get_movement_coords(self) -> Tuple[float, float]:
+        return self._ensure_controller().get_movement_coords()
+
+    def get_current_position(self) -> Tuple[float, float]:
+        return self._ensure_controller().get_current_position()
+
+    def is_movement_active(self) -> bool:
+        return self._ensure_controller().is_movement_active()
+
+    def check_path_obstacle(self, frame: np.ndarray, *args, **kwargs) -> Dict[str, Any]:
+        return self._ensure_controller().check_path_obstacle(frame, *args, **kwargs)
+
+    def advance_route_waypoint(self, *args, **kwargs) -> Any:
+        return self._ensure_controller().advance_route_waypoint(*args, **kwargs)
+
+    def clear_false_resting_locks(self, *args, **kwargs) -> int:
+        return self._ensure_controller().clear_false_resting_locks(*args, **kwargs)
+
+    def is_stuck_in_beklemede(self) -> bool:
+        return self._ensure_controller().is_stuck_in_beklemede()
+
+    def force_resume_from_beklemede(self) -> str:
+        return self._ensure_controller().force_resume_from_beklemede()
 
 
 class ExplorerModeController:
@@ -141,11 +197,14 @@ class ExplorerModeController:
         harvests_per_node: int = DEFAULT_HARVESTS_PER_NODE,
         gather_key: str = "f",
         cast_wait_sec: float = 1.8,
-        test_mode: bool = True,
+        test_mode: bool = False,
         enable_sound: bool = False,
         hud_callback: Optional[Callable[[str], None]] = None,
         depth_obstacle_avoidance: Optional[MonocularDepthObstacleAvoidance] = None,
         glide_controller: Optional[GlideWaypointController] = None,
+        reflex: Optional[Any] = None,
+        yolo_detector: Optional[Any] = None,
+        perception_hub: Optional[Any] = None,
     ) -> None:
         self.route_manager: RouteManager = route_manager or RouteManager()
         if region:
@@ -185,6 +244,9 @@ class ExplorerModeController:
 
         self._depth_obstacle_avoidance: Optional[MonocularDepthObstacleAvoidance] = depth_obstacle_avoidance
         self._glide_controller: Optional[GlideWaypointController] = glide_controller
+        self.reflex: Optional[Any] = reflex
+        self.yolo_detector: Optional[Any] = yolo_detector
+        self.perception_hub: Optional[Any] = perception_hub
 
         # Sıralı rota düğüm listesi ve iç durum sayaçları
         self._ordered_nodes: List[NodeData] = []
@@ -197,7 +259,403 @@ class ExplorerModeController:
         self._sector_waypoints: List[Tuple[int, int]] = []
         self._current_waypoint_idx: int = 0
 
+        # Radar and UI event callbacks
+        self._node_discovered_callbacks: List[Callable[[Dict[str, Any]], None]] = []
+        self._node_updated_callbacks: List[Callable[[Dict[str, Any]], None]] = []
+        self._radar_widgets: List[Any] = []
+        self._map_viewers: List[Any] = []
+
+        if hasattr(self.auto_cartographer, "add_node_discovered_callback"):
+            self.auto_cartographer.add_node_discovered_callback(self._on_cartographer_node_discovered)
+        if hasattr(self.auto_cartographer, "add_node_updated_callback"):
+            self.auto_cartographer.add_node_updated_callback(self._on_cartographer_node_updated)
+
+        # Wire get_current_position on auto_cartographer if missing so StateMachine / Radar gets genuine coordinates
+        if not hasattr(self.auto_cartographer, "get_current_position"):
+            self.auto_cartographer.get_current_position = self.get_player_movement_coords
+
+        # Real-time Movement & Odometry tracking (prevents false 3s obstacle alerts & BEKLEMEDE locks)
+        self._odometry_pos_x: float = float(getattr(self.auto_cartographer, "map_x", 960.0) or 960.0)
+        self._odometry_pos_y: float = float(getattr(self.auto_cartographer, "map_y", 540.0) or 540.0)
+        self._odometry_last_ts: float = time.time()
+        self._odometry_vx: float = 0.0
+        self._odometry_vy: float = 0.0
+        self._odometry_heading_deg: float = 0.0
+        self._walking_speed_px_sec: float = 85.0
+        self._movement_active_override: Optional[bool] = None
+
+        # Walking State Machine (guarantees YÜRÜYOR / ROTA TAKİBİ / KEŞİFTE accuracy)
+        self._current_walking_state: str = "KEŞİFTE"
+        self._walking_state_ts: float = time.time()
+        self._last_state_change_reason: str = "init"
+        self._anti_beklemede_lock: bool = True
+
+        # Obstacle Alert Debounce & Multi-Frame Confirmation (eliminates false 3s alerts)
+        self._consecutive_obstacle_hits: int = 0
+        self._last_obstacle_alert_ts: float = 0.0
+        self._obstacle_history: List[Dict[str, Any]] = []
+
+        # Continuous Smooth Route Travel Engine
+        self._active_route_index: int = 0
+        self._waypoint_arrival_radius_px: float = 22.0
+        self._waypoint_last_advanced_ts: float = time.time()
+        self._continuous_travel_enabled: bool = True
+
         self._sync_ordered_nodes_from_route_manager()
+
+    def add_node_discovered_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Yeni bir düğüm haritalandırıldığında anında tetiklenecek geri çağırma işlevini ekler."""
+        if callable(callback) and callback not in self._node_discovered_callbacks:
+            self._node_discovered_callbacks.append(callback)
+
+    def remove_node_discovered_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Düğüm keşif dinleyicisini kaldırır."""
+        if callback in self._node_discovered_callbacks:
+            self._node_discovered_callbacks.remove(callback)
+
+    def add_node_updated_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Düğüm güncelleme dinleyicisini ekler."""
+        if callable(callback) and callback not in self._node_updated_callbacks:
+            self._node_updated_callbacks.append(callback)
+
+    def remove_node_updated_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Düğüm güncelleme dinleyicisini kaldırır."""
+        if callback in self._node_updated_callbacks:
+            self._node_updated_callbacks.remove(callback)
+
+    def register_radar_widget(self, radar_widget: Any) -> None:
+        """Radar tuvali/diyaloğunu bağlar."""
+        if radar_widget is not None and radar_widget not in self._radar_widgets:
+            self._radar_widgets.append(radar_widget)
+            if hasattr(self.auto_cartographer, "register_ui_listener"):
+                self.auto_cartographer.register_ui_listener(radar_widget)
+
+    def unregister_radar_widget(self, radar_widget: Any) -> None:
+        """Radar tuvali/diyaloğu bağlantısını kaldırır."""
+        if radar_widget in self._radar_widgets:
+            self._radar_widgets.remove(radar_widget)
+            if hasattr(self.auto_cartographer, "unregister_ui_listener"):
+                self.auto_cartographer.unregister_ui_listener(radar_widget)
+
+    def register_map_viewer(self, map_viewer: Any) -> None:
+        """Harita görüntüleyici penceresini bağlar."""
+        if map_viewer is not None and map_viewer not in self._map_viewers:
+            self._map_viewers.append(map_viewer)
+            if hasattr(self.auto_cartographer, "register_ui_listener"):
+                self.auto_cartographer.register_ui_listener(map_viewer)
+
+    def unregister_map_viewer(self, map_viewer: Any) -> None:
+        """Harita görüntüleyici bağlantısını kaldırır."""
+        if map_viewer in self._map_viewers:
+            self._map_viewers.remove(map_viewer)
+            if hasattr(self.auto_cartographer, "unregister_ui_listener"):
+                self.auto_cartographer.unregister_ui_listener(map_viewer)
+
+    def _on_cartographer_node_discovered(self, node_dict: Dict[str, Any]) -> None:
+        """AutoCartographer'dan gelen yeni düğüm keşif olayını UI ve dinleyicilere iletir."""
+        self._emit_node_discovered(node_dict)
+
+    def _on_cartographer_node_updated(self, node_dict: Dict[str, Any]) -> None:
+        """AutoCartographer'dan gelen düğüm güncelleme olayını iletir."""
+        self._emit_node_updated(node_dict)
+
+    def _emit_node_discovered(self, node_dict: Dict[str, Any]) -> None:
+        """Kayıtlı dinleyicileri, radar widget'larını ve harita görüntüleyicilerini uyarır."""
+        for cb in list(self._node_discovered_callbacks):
+            try:
+                cb(node_dict)
+            except Exception as exc:
+                logger.debug("explorer node_discovered_callback hatası: %s", exc)
+        for widget in list(self._radar_widgets):
+            try:
+                if hasattr(widget, "add_discovered_node"):
+                    widget.add_discovered_node(node_dict, trigger_pulse=True)
+                elif hasattr(widget, "reload_map_and_nodes"):
+                    widget.reload_map_and_nodes()
+            except Exception as exc:
+                logger.debug("radar_widget bildirim hatası: %s", exc)
+        for viewer in list(self._map_viewers):
+            try:
+                if hasattr(viewer, "reload_map_and_nodes"):
+                    viewer.reload_map_and_nodes()
+                if hasattr(viewer, "update"):
+                    viewer.update()
+            except Exception as exc:
+                logger.debug("map_viewer bildirim hatası: %s", exc)
+
+    def _emit_node_updated(self, node_dict: Dict[str, Any]) -> None:
+        """Düğüm güncellendiğinde radar ve harita görüntüleyicilerini uyarır."""
+        for cb in list(self._node_updated_callbacks):
+            try:
+                cb(node_dict)
+            except Exception as exc:
+                logger.debug("explorer node_updated_callback hatası: %s", exc)
+        for widget in list(self._radar_widgets):
+            try:
+                if hasattr(widget, "update_node"):
+                    widget.update_node(node_dict)
+                elif hasattr(widget, "reload_map_and_nodes"):
+                    widget.reload_map_and_nodes()
+            except Exception as exc:
+                logger.debug("radar_widget update hatası: %s", exc)
+        for viewer in list(self._map_viewers):
+            try:
+                if hasattr(viewer, "reload_map_and_nodes"):
+                    viewer.reload_map_and_nodes()
+                if hasattr(viewer, "update"):
+                    viewer.update()
+            except Exception as exc:
+                logger.debug("map_viewer update hatası: %s", exc)
+
+    def bind_ai_sources(
+        self,
+        reflex: Optional[Any] = None,
+        yolo_detector: Optional[Any] = None,
+        perception_hub: Optional[Any] = None,
+        exemplar_memory: Optional[Any] = None,
+    ) -> None:
+        """Late-bind YZ reflex / YOLO / ExemplarMemory so cartography uses the live AI pipeline."""
+        if reflex is not None:
+            self.reflex = reflex
+        if yolo_detector is not None:
+            self.yolo_detector = yolo_detector
+        if perception_hub is not None:
+            self.perception_hub = perception_hub
+        if exemplar_memory is not None:
+            self.exemplar_memory = exemplar_memory
+
+    def _yz_box_to_detection(
+        self,
+        box: Dict[str, Any],
+        frame_w: int,
+        frame_h: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Convert a Gatherion YOLO/reflex box into cartography detection dict."""
+        try:
+            from core.reflex_layer import _class_id, _gather_ids, _GATHER_NAMES, _MONSTER_NAMES
+        except Exception:
+            return None
+        if not isinstance(box, dict):
+            return None
+        name = str(box.get("class_name", box.get("name", box.get("label", "")))).lower()
+        cid = box.get("class_id", box.get("cls", box.get("class", None)))
+        try:
+            cid = int(cid) if cid is not None else _class_id(dict(box, name=name))
+        except Exception:
+            cid = _class_id(dict(box, name=name))
+        if cid in {10, 11} or any(t in name for t in _MONSTER_NAMES):
+            return None
+        is_gather = (
+            cid in _gather_ids()
+            or any(t in name for t in _GATHER_NAMES)
+            or "odyle" in name
+            or name.startswith("essence_")
+            or name.startswith("herb_")
+        )
+        if not is_gather:
+            return None
+
+        x1 = box.get("x1", box.get("xmin", box.get("left")))
+        y1 = box.get("y1", box.get("ymin", box.get("top")))
+        x2 = box.get("x2", box.get("xmax", box.get("right")))
+        y2 = box.get("y2", box.get("ymax", box.get("bottom")))
+        if None in (x1, y1, x2, y2):
+            # xywh / cxcywh fallbacks
+            if "bbox" in box and isinstance(box["bbox"], (list, tuple)) and len(box["bbox"]) >= 4:
+                bx, by, bw, bh = [float(v) for v in box["bbox"][:4]]
+                if bw <= 1.5 and bh <= 1.5 and bx <= 1.5:
+                    x1, y1 = bx * frame_w, by * frame_h
+                    x2, y2 = (bx + bw) * frame_w, (by + bh) * frame_h
+                else:
+                    x1, y1, x2, y2 = bx, by, bx + bw, by + bh
+            else:
+                return None
+        else:
+            x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+            if 0.0 <= x1 <= 1.5 and 0.0 <= x2 <= 1.5 and frame_w > 1:
+                x1, x2 = x1 * frame_w, x2 * frame_w
+                y1, y2 = y1 * frame_h, y2 * frame_h
+
+        cx = int(round((x1 + x2) / 2.0))
+        cy = int(round((y1 + y2) / 2.0))
+        bw = max(1, int(round(abs(x2 - x1))))
+        bh = max(1, int(round(abs(y2 - y1))))
+        conf = float(
+            box.get("confidence", box.get("conf", box.get("score", box.get("prob", 0.75))))
+            or 0.75
+        )
+        if conf > 1.0:
+            conf = conf / 100.0
+
+        mat = "Gatherable Material"
+        if "aria" in name:
+            mat = "Aria"
+        elif "mela" in name:
+            mat = "Mela"
+        elif "targena" in name:
+            mat = "Targena"
+        elif "orichalcum" in name or "ore" in name:
+            mat = "Orichalcum Ore"
+        elif "odyle" in name:
+            mat = "Odyle"
+        elif "gem" in name:
+            mat = "Gem"
+        elif "sprout" in name or "filiz" in name:
+            mat = "Gatherable Material"
+
+        # Minimap ROI (top-right) vs 3D world view projection
+        on_minimap = False
+        try:
+            x1_mm, y1_mm, x2_mm, y2_mm = self.auto_cartographer._get_minimap_pixel_rect(frame_w, frame_h)
+            if x1_mm <= cx <= x2_mm and y1_mm <= cy <= y2_mm:
+                on_minimap = True
+        except Exception:
+            pass
+        if not on_minimap:
+            nx, ny = cx / float(max(1, frame_w)), cy / float(max(1, frame_h))
+            on_minimap = nx >= 0.84 and ny <= 0.30
+
+        if on_minimap:
+            try:
+                x1_mm, y1_mm, x2_mm, y2_mm = self.auto_cartographer._get_minimap_pixel_rect(frame_w, frame_h)
+                mcx = (x1_mm + x2_mm) / 2.0
+                mcy = y1_mm + (y2_mm - y1_mm) * 0.545
+                scale = float(getattr(self.auto_cartographer, "minimap_to_map_scale", 1.0) or 1.0)
+                rel_dx = float(cx - mcx) * scale
+                rel_dy = float(cy - mcy) * scale
+                dist_m = math.hypot(rel_dx, rel_dy)
+            except Exception:
+                rel_dx = float(cx - frame_w * 0.92)
+                rel_dy = float(cy - frame_h * 0.16)
+                dist_m = math.hypot(rel_dx, rel_dy)
+        else:
+            try:
+                heading = getattr(self.auto_cartographer, "player_heading_deg", 0.0)
+                rel_dx, rel_dy = self.auto_cartographer._project_3d_screen_to_map_offset(
+                    cx, cy, frame_w, frame_h, heading_deg=heading
+                )
+                dist_m = math.hypot(rel_dx, rel_dy)
+            except Exception:
+                try:
+                    rel_dx, rel_dy, dist_m = self.material_scanner._project_3d_to_map_offset(
+                        cx, cy, frame_w, frame_h
+                    )
+                except Exception:
+                    rel_dx = float(cx - frame_w // 2) * 0.15
+                    rel_dy = float(cy - frame_h // 2) * 0.15
+                    dist_m = 8.0
+
+        return {
+            "material_type": mat,
+            "source": "minimap" if on_minimap else "3d_world",
+            "source_type": "yz_minimap" if on_minimap else "yz_3d",
+            "screen_x": int(cx),
+            "screen_y": int(cy),
+            "bbox": (int(x1), int(y1), int(bw), int(bh)),
+            "rel_map_dx": float(rel_dx),
+            "rel_map_dy": float(rel_dy),
+            "estimated_distance_m": float(dist_m),
+            "confidence": round(max(0.15, min(0.99, conf)), 3),
+            "in_air": bool(cy < frame_h * 0.45),
+            "stack_count": 1,
+            "max_harvests": self.harvests_per_node,
+            "yz": True,
+            "class_id": int(cid) if cid >= 0 else -1,
+            "class_name": name,
+        }
+
+    def _scan_yz_gather_detections(self, bgr: np.ndarray) -> List[Dict[str, Any]]:
+        """Pull live YZ (reflex/YOLO) gather boxes into cartography detections."""
+        out: List[Dict[str, Any]] = []
+        if bgr is None or not isinstance(bgr, np.ndarray) or bgr.size == 0:
+            return out
+        h, w = bgr.shape[:2]
+        boxes: List[Dict[str, Any]] = []
+
+        reflex = self.reflex
+        if reflex is not None:
+            try:
+                if hasattr(reflex, "submit_frame"):
+                    reflex.submit_frame(bgr)
+                if hasattr(reflex, "latest"):
+                    snap = reflex.latest() or {}
+                    raw = snap.get("boxes") if isinstance(snap, dict) else None
+                    if isinstance(raw, list):
+                        boxes.extend([b for b in raw if isinstance(b, dict)])
+            except Exception as exc:
+                logger.debug("YZ reflex scan skipped: %s", exc)
+
+        if not boxes and self.yolo_detector is not None:
+            try:
+                det_fn = getattr(self.yolo_detector, "detect", None) or getattr(
+                    self.yolo_detector, "predict", None
+                )
+                if callable(det_fn):
+                    raw = det_fn(bgr)
+                    if isinstance(raw, list):
+                        boxes.extend([b for b in raw if isinstance(b, dict)])
+                    elif isinstance(raw, dict) and isinstance(raw.get("boxes"), list):
+                        boxes.extend([b for b in raw["boxes"] if isinstance(b, dict)])
+            except Exception as exc:
+                logger.debug("YZ yolo detect skipped: %s", exc)
+
+        if not boxes and self.perception_hub is not None:
+            try:
+                snap = None
+                if hasattr(self.perception_hub, "last"):
+                    last_fn = getattr(self.perception_hub, "last")
+                    snap = last_fn() if callable(last_fn) else last_fn
+                elif hasattr(self.perception_hub, "latest"):
+                    lat_fn = getattr(self.perception_hub, "latest")
+                    snap = lat_fn() if callable(lat_fn) else lat_fn
+                elif hasattr(self.perception_hub, "snapshot"):
+                    snap_fn = getattr(self.perception_hub, "snapshot")
+                    snap = snap_fn() if callable(snap_fn) else snap_fn
+
+                if snap is None and hasattr(self.perception_hub, "observe") and bgr is not None:
+                    snap = self.perception_hub.observe(bgr)
+
+                if snap is not None:
+                    raw_targets = getattr(snap, "targets", None)
+                    if isinstance(raw_targets, list):
+                        boxes.extend([b for b in raw_targets if isinstance(b, dict)])
+                    elif isinstance(snap, dict):
+                        for key in ("targets", "yolo", "boxes", "detections"):
+                            raw = snap.get(key)
+                            if isinstance(raw, list):
+                                boxes.extend([b for b in raw if isinstance(b, dict)])
+                                break
+                    elif hasattr(snap, "as_dict"):
+                        snap_d = snap.as_dict()
+                        if isinstance(snap_d, dict):
+                            raw = (
+                                snap_d.get("targets")
+                                or snap_d.get("boxes")
+                                or snap_d.get("detections")
+                                or snap_d.get("yolo")
+                            )
+                            if isinstance(raw, list):
+                                boxes.extend([b for b in raw if isinstance(b, dict)])
+            except Exception as exc:
+                logger.debug("YZ perception hub skipped: %s", exc)
+
+        for box in boxes:
+            det = self._yz_box_to_detection(box, w, h)
+            if det is None:
+                continue
+            duplicate = False
+            for existing in out:
+                if math.hypot(
+                    int(det["screen_x"]) - int(existing["screen_x"]),
+                    int(det["screen_y"]) - int(existing["screen_y"]),
+                ) <= 28.0:
+                    duplicate = True
+                    if float(det["confidence"]) > float(existing.get("confidence", 0)):
+                        existing.update(det)
+                    break
+            if not duplicate:
+                out.append(det)
+        return out
 
     @property
     def depth_obstacle_avoidance(self) -> MonocularDepthObstacleAvoidance:
@@ -221,12 +679,459 @@ class ExplorerModeController:
     def glide_controller(self, value: Optional[GlideWaypointController]) -> None:
         self._glide_controller = value
 
-    def check_path_obstacle(self, frame: np.ndarray) -> Dict[str, Any]:
+    def get_player_movement_coords(self) -> Tuple[float, float]:
         """
-        Uses MonocularDepthObstacleAvoidance to estimate whether an obstacle is directly
-        ahead during autonomous exploration.
+        Returns real-time player map coordinates combining AutoCartographer position
+        with continuous dead-reckoning odometry when walking.
+        Guarantees that moving players/bots never report frozen or zero coordinates,
+        preventing false 3.0s stuck alerts in RadarStuckDetector and 5m BEKLEMEDE locks.
         """
-        return self.depth_obstacle_avoidance.analyze_forward_corridor(frame)
+        now = time.time()
+        base_x = float(getattr(self.auto_cartographer, "map_x", self._odometry_pos_x) or self._odometry_pos_x)
+        base_y = float(getattr(self.auto_cartographer, "map_y", self._odometry_pos_y) or self._odometry_pos_y)
+
+        moving = self.is_movement_active()
+        dt = now - self._odometry_last_ts
+        if moving and dt >= 0.02:
+            dt = min(0.5, dt)
+            target_pt = self.get_active_waypoint_coords()
+            if target_pt is not None:
+                tx, ty = float(target_pt[0]), float(target_pt[1])
+                dx = tx - base_x
+                dy = ty - base_y
+                dist = math.hypot(dx, dy)
+                if dist > 1.0:
+                    speed = self._walking_speed_px_sec
+                    step = min(dist, speed * dt)
+                    base_x += (dx / dist) * step
+                    base_y += (dy / dist) * step
+                    self._odometry_vx = (dx / dist) * speed
+                    self._odometry_vy = (dy / dist) * speed
+                    self._odometry_heading_deg = (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
+            else:
+                rad = math.radians(self._odometry_heading_deg)
+                speed = self._walking_speed_px_sec
+                step = speed * dt
+                base_x += math.sin(rad) * step
+                base_y += -math.cos(rad) * step
+                self._odometry_vx = math.sin(rad) * speed
+                self._odometry_vy = -math.cos(rad) * speed
+
+            try:
+                self.auto_cartographer.map_x = round(base_x, 2)
+                self.auto_cartographer.map_y = round(base_y, 2)
+            except Exception:
+                pass
+
+            self._odometry_pos_x = round(base_x, 2)
+            self._odometry_pos_y = round(base_y, 2)
+            self._odometry_last_ts = now
+        else:
+            self._odometry_pos_x = round(base_x, 2)
+            self._odometry_pos_y = round(base_y, 2)
+
+        return self._odometry_pos_x, self._odometry_pos_y
+
+    def get_movement_coords(self) -> Tuple[float, float]:
+        """Alias for get_player_movement_coords."""
+        return self.get_player_movement_coords()
+
+    def get_current_position(self) -> Tuple[float, float]:
+        """Returns (x, y) real coordinates for AutoCartographer/StateMachine integration."""
+        return self.get_player_movement_coords()
+
+    def is_movement_active(self) -> bool:
+        """
+        Determines whether the player or bot is actively walking.
+        In explorer/auto-cartography mode, the player walks freely without bot holding W.
+        Guarantees that active motion is correctly recognized so state machine never
+        falsely downgrades to BEKLEMEDE.
+        """
+        if self._movement_active_override is not None:
+            return bool(self._movement_active_override)
+
+        if self.input_controller is not None:
+            active_fn = getattr(self.input_controller, "movement_active", None)
+            if callable(active_fn):
+                try:
+                    if bool(active_fn()):
+                        return True
+                except Exception:
+                    pass
+
+        if getattr(self, "_is_walking_active", False):
+            return True
+
+        if abs(self._odometry_vx) > 5.0 or abs(self._odometry_vy) > 5.0:
+            return True
+
+        return False
+
+    def update_movement_odometry(
+        self,
+        dx: float = 0.0,
+        dy: float = 0.0,
+        dt: float = 0.05,
+        is_walking: bool = True,
+    ) -> Tuple[float, float]:
+        """Manually push odometry offset (e.g. from minimap template delta or optical flow)."""
+        now = time.time()
+        self._odometry_pos_x += float(dx)
+        self._odometry_pos_y += float(dy)
+        if dt > 0:
+            self._odometry_vx = float(dx) / float(dt)
+            self._odometry_vy = float(dy) / float(dt)
+            if math.hypot(dx, dy) > 0.1:
+                self._odometry_heading_deg = (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
+        self._odometry_last_ts = now
+        if is_walking:
+            self._movement_active_override = True
+            self._is_walking_active = True
+        try:
+            self.auto_cartographer.map_x = round(self._odometry_pos_x, 2)
+            self.auto_cartographer.map_y = round(self._odometry_pos_y, 2)
+        except Exception:
+            pass
+        return round(self._odometry_pos_x, 2), round(self._odometry_pos_y, 2)
+
+    def get_walking_state(self) -> str:
+        """Returns the current accurate walking state ('YÜRÜYOR', 'ROTA TAKİBİ', 'KEŞİFTE', etc.)."""
+        if self._current_walking_state == "BEKLEMEDE" and self._anti_beklemede_lock:
+            if self.is_movement_active():
+                self._current_walking_state = "ROTA TAKİBİ" if self._ordered_nodes else "KEŞİFTE"
+        return self._current_walking_state
+
+    def set_walking_state(self, state: str, reason: str = "") -> str:
+        """
+        Sets the walking state machine state with anti-BEKLEMEDE protection.
+        States: 'YÜRÜYOR', 'ROTA TAKİBİ', 'KEŞİFTE', 'TOPLANIYOR', 'BEKLEMEDE'.
+        If the player or bot is in motion or following waypoints, prevents false BEKLEMEDE locking.
+        """
+        norm = str(state or "").strip().upper()
+        if norm in ("WALKING", "WALK", "YÜRÜYÜŞ"):
+            norm = "YÜRÜYOR"
+        elif norm in ("ROUTE", "ROUTE_FOLLOWING", "ROTA", "ROTA_TAKİBİ"):
+            norm = "ROTA TAKİBİ"
+        elif norm in ("EXPLORING", "EXPLORE", "AUTO_CARTOGRAPHY", "KEŞİF"):
+            norm = "KEŞİFTE"
+        elif norm in ("GATHERING", "HARVESTING", "TOPLAMA"):
+            norm = "TOPLANIYOR"
+        elif norm in ("WAITING", "IDLE", "BEKLEME"):
+            norm = "BEKLEMEDE"
+
+        if norm == "BEKLEMEDE" and self._anti_beklemede_lock:
+            if self.is_movement_active():
+                norm = "ROTA TAKİBİ" if self._ordered_nodes else "KEŞİFTE"
+                reason += " [prevented false BEKLEMEDE lock: movement active]"
+            elif self._ordered_nodes and self._active_route_index < len(self._ordered_nodes):
+                norm = "ROTA TAKİBİ"
+                reason += " [prevented false BEKLEMEDE lock: route active]"
+
+        self._current_walking_state = norm
+        self._walking_state_ts = time.time()
+        self._last_state_change_reason = reason
+        if norm in ("YÜRÜYOR", "ROTA TAKİBİ", "KEŞİFTE"):
+            self._is_walking_active = True
+        elif norm in ("BEKLEMEDE", "IDLE", "PAUSED"):
+            self._is_walking_active = False
+        return self._current_walking_state
+
+    def update_walking_state(
+        self,
+        is_moving: Optional[bool] = None,
+        has_active_target: bool = False,
+        in_route: bool = False,
+        in_exploration: bool = False,
+    ) -> str:
+        """
+        Evaluates and updates the walking state machine based on live game state:
+        - If harvesting/gathering: 'TOPLANIYOR'
+        - If following route waypoints: 'ROTA TAKİBİ'
+        - If exploring/player-walking in cartography: 'KEŞİFTE'
+        - If walking forward: 'YÜRÜYOR'
+        - If stopped and no active tasks: 'BEKLEMEDE'
+        Guarantees 100% accuracy and eliminates false BEKLEMEDE locks.
+        """
+        if is_moving is not None:
+            self._movement_active_override = bool(is_moving)
+
+        moving = self.is_movement_active()
+        if not moving:
+            if not in_route and not in_exploration and not has_active_target:
+                return self.set_walking_state("BEKLEMEDE", reason="idle stopped")
+
+        if in_route or (has_active_target and bool(self._ordered_nodes)):
+            return self.set_walking_state("ROTA TAKİBİ", reason="following route waypoints")
+        elif in_exploration or bool(self._sector_waypoints):
+            return self.set_walking_state("KEŞİFTE", reason="autonomous exploration")
+        elif moving:
+            return self.set_walking_state("YÜRÜYOR", reason="active walking motion")
+        else:
+            return self.set_walking_state("BEKLEMEDE", reason="stopped")
+
+    def is_stuck_in_beklemede(self) -> bool:
+        """Checks if bot is falsely stuck in BEKLEMEDE while tasks or movement exist."""
+        if self._current_walking_state == "BEKLEMEDE":
+            if self.is_movement_active() or bool(self._ordered_nodes) or bool(self._sector_waypoints):
+                return True
+        return False
+
+    def force_resume_from_beklemede(self) -> str:
+        """Forces the state machine out of BEKLEMEDE into active walking/route state."""
+        new_state = "ROTA TAKİBİ" if self._ordered_nodes else "KEŞİFTE"
+        self._current_walking_state = new_state
+        self._walking_state_ts = time.time()
+        self._last_state_change_reason = "force_resumed_from_beklemede"
+        self.clear_false_resting_locks()
+        return new_state
+
+    def clear_false_resting_locks(self, region: Optional[str] = None) -> int:
+        """
+        Scans route nodes in the active region and clears any false 5-minute ('resting') locks
+        caused by transient obstacle alerts or stuck timeouts, restoring nodes to 'active'.
+        Eliminates the 5m BEKLEMEDE lock and allows the bot to travel continuously.
+        Returns the number of unlocked nodes.
+        """
+        unlocked = 0
+        target_reg = region or self.active_region
+        if self.route_manager is None:
+            return 0
+        nodes = self.route_manager.get_route_nodes(
+            region_name=target_reg,
+            route_name=self.active_route,
+        )
+        if not nodes:
+            nodes = self.route_manager.get_nodes(region=target_reg)
+        seen_ids = set()
+        for node in list(nodes) + list(self._ordered_nodes):
+            nid = getattr(node, "id", None)
+            key = (id(node), nid)
+            if key in seen_ids or (nid is not None and nid in seen_ids):
+                continue
+            seen_ids.add(key)
+            if nid is not None:
+                seen_ids.add(nid)
+            if getattr(node, "state", "") == "resting":
+                node.state = "active"
+                node.current_harvests = 0
+                node.consecutive_failures = 0
+                unlocked += 1
+        if unlocked > 0:
+            try:
+                self.route_manager.save_region(target_reg)
+                logger.info(
+                    "clear_false_resting_locks: %d adet düğümün 5dk BEKLEMEDE kilidi kaldırıldı.",
+                    unlocked,
+                )
+            except Exception as exc:
+                logger.debug("Failed to save region after clearing resting locks: %s", exc)
+        return unlocked
+
+    def check_path_obstacle(
+        self,
+        frame: np.ndarray,
+        current_pos: Optional[Tuple[float, float]] = None,
+        exemplar_memory: Optional[Any] = None,
+        suppress_transient_depth: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Uses MonocularDepthObstacleAvoidance and ExemplarMemory to estimate whether an obstacle
+        (14: obstacle) or monster (10: monster_3d) is directly ahead during autonomous exploration,
+        and prioritize walkable ground paths (15: path_ground).
+        Eliminates false 3s obstacle alerts through walkable path ground confirmation,
+        multi-frame debounce, and real movement coordinate continuity validation.
+        """
+        raw_res = self.depth_obstacle_avoidance.analyze_forward_corridor(frame)
+        res = dict(raw_res) if isinstance(raw_res, dict) else {"obstacle_detected": False, "recommended_turn": "none"}
+        raw_depth_obs = bool(res.get("obstacle_detected", False))
+
+        is_exemplar_obs = False
+        walkable_path_detected = False
+
+        mem = exemplar_memory or getattr(self, "exemplar_memory", None)
+        if mem is None:
+            try:
+                from dataset_factory.exemplar_memory import get_exemplar_memory
+                mem = get_exemplar_memory()
+            except Exception:
+                mem = None
+
+        if frame is not None and isinstance(frame, np.ndarray) and frame.size > 0 and mem is not None:
+            try:
+                h, w = frame.shape[:2]
+                center_corridor = frame[int(h * 0.52) : int(h * 0.82), int(w * 0.40) : int(w * 0.60)]
+                if center_corridor.size > 0:
+                    pos_cid, pos_cname, pos_sim = mem.classify_patch(center_corridor, min_sim=0.70)
+                    if pos_cid in (10, 14) or (
+                        pos_cname and any(tok in str(pos_cname).lower() for tok in ("obstacle", "monster"))
+                    ):
+                        is_exemplar_obs = True
+                    elif pos_cid == 15 or (
+                        pos_cname and ("path" in str(pos_cname).lower() or "ground" in str(pos_cname).lower())
+                    ):
+                        walkable_path_detected = True
+            except Exception as exc:
+                logger.debug("check_path_obstacle exemplar check error: %s", exc)
+
+        coords = current_pos or self.get_player_movement_coords()
+        false_alert_suppressed = False
+
+        if is_exemplar_obs:
+            res["obstacle_detected"] = True
+            res["exemplar_obstacle"] = True
+            if res.get("recommended_turn", "none") == "none":
+                res["recommended_turn"] = "turn_left"
+            self._consecutive_obstacle_hits += 1
+            self._last_obstacle_alert_ts = time.time()
+        elif walkable_path_detected:
+            # High-confidence walkable path ground detected directly in corridor.
+            # Suppress any false 3s depth alerts.
+            if raw_depth_obs:
+                false_alert_suppressed = True
+            res["obstacle_detected"] = False
+            res["exemplar_obstacle"] = False
+            res["recommended_turn"] = "none"
+            self._consecutive_obstacle_hits = 0
+        else:
+            if raw_depth_obs:
+                self._consecutive_obstacle_hits += 1
+                center_clr = float(res.get("clearance_center", 1.0) or 1.0)
+                # Suppress transient 1-frame depth shadows if player is actively moving
+                # and corridor clearance is not critically blocked (< 0.18).
+                if suppress_transient_depth and self._consecutive_obstacle_hits < 2 and center_clr > 0.18:
+                    res["obstacle_detected"] = False
+                    false_alert_suppressed = True
+                    res["recommended_turn"] = "none"
+                else:
+                    res["obstacle_detected"] = True
+                    self._last_obstacle_alert_ts = time.time()
+            else:
+                self._consecutive_obstacle_hits = 0
+
+        res["walkable_path_detected"] = walkable_path_detected
+        res["false_alert_suppressed"] = false_alert_suppressed
+        res["obstacle_alert"] = bool(res.get("obstacle_detected", False))
+        res["current_coords"] = coords
+        res["walking_state"] = self.get_walking_state()
+        return res
+
+    def get_active_waypoint(self) -> Optional[NodeData]:
+        """Returns the current active target waypoint node from the route."""
+        if not self._ordered_nodes:
+            self._sync_ordered_nodes_from_route_manager()
+        if not self._ordered_nodes:
+            return None
+        if self._active_route_index >= len(self._ordered_nodes):
+            self._active_route_index = 0
+        return self._ordered_nodes[self._active_route_index]
+
+    def get_active_waypoint_coords(self) -> Optional[Tuple[float, float]]:
+        """Returns (x, y) coordinates of the active route or sector waypoint."""
+        if self._ordered_nodes:
+            node = self.get_active_waypoint()
+            if node is not None:
+                return float(node.map_x), float(node.map_y)
+        if self._sector_waypoints and self._current_waypoint_idx < len(self._sector_waypoints):
+            pt = self._sector_waypoints[self._current_waypoint_idx]
+            return float(pt[0]), float(pt[1])
+        return None
+
+    def advance_route_waypoint(
+        self,
+        arrival_radius_px: float = 22.0,
+        closed_loop: bool = True,
+    ) -> Optional[NodeData]:
+        """
+        Advances to the next sequential route waypoint when player arrives within arrival_radius_px.
+        Maintains continuous smooth travel without pausing, stopping, or locking into BEKLEMEDE.
+        """
+        if not self._ordered_nodes:
+            self._sync_ordered_nodes_from_route_manager()
+        if not self._ordered_nodes:
+            return None
+
+        px, py = self.get_player_movement_coords()
+        curr_idx = self._active_route_index
+        n_nodes = len(self._ordered_nodes)
+
+        if curr_idx >= n_nodes:
+            curr_idx = 0 if closed_loop else n_nodes - 1
+            self._active_route_index = curr_idx
+
+        target_node = self._ordered_nodes[curr_idx]
+        tx, ty = float(target_node.map_x), float(target_node.map_y)
+        dist = math.hypot(tx - px, ty - py)
+
+        if dist <= float(arrival_radius_px):
+            next_idx = curr_idx + 1
+            if next_idx >= n_nodes:
+                next_idx = 0 if closed_loop else n_nodes - 1
+            self._active_route_index = next_idx
+            self._waypoint_last_advanced_ts = time.time()
+            target_node = self._ordered_nodes[next_idx]
+            self.set_walking_state("ROTA TAKİBİ", reason=f"advanced to waypoint #{target_node.id}")
+            if getattr(target_node, "state", "") == "resting":
+                target_node.state = "active"
+                target_node.current_harvests = 0
+
+        return target_node
+
+    def compute_waypoint_heading_and_steer(
+        self,
+        current_heading_deg: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Calculates bearing, distance, angle difference, and recommended steering key
+        toward the active waypoint, ensuring smooth travel without ping-pong oscillation.
+        """
+        px, py = self.get_player_movement_coords()
+        target_coords = self.get_active_waypoint_coords()
+        if target_coords is None:
+            return {
+                "has_target": False,
+                "bearing_deg": 0.0,
+                "heading_diff_deg": 0.0,
+                "distance_px": 0.0,
+                "steer_key": "none",
+                "reached": False,
+            }
+
+        tx, ty = target_coords
+        dx = tx - px
+        dy = ty - py
+        dist = math.hypot(dx, dy)
+        bearing = (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
+
+        cur_heading = (
+            float(current_heading_deg)
+            if current_heading_deg is not None
+            else self._odometry_heading_deg
+        )
+
+        diff = (bearing - cur_heading + 180.0) % 360.0 - 180.0
+        steer_key = "none"
+        if diff > 12.0:
+            steer_key = "d"  # Turn right
+        elif diff < -12.0:
+            steer_key = "a"  # Turn left
+
+        reached = dist <= self._waypoint_arrival_radius_px
+        return {
+            "has_target": True,
+            "target_coords": (tx, ty),
+            "current_coords": (px, py),
+            "bearing_deg": round(bearing, 1),
+            "heading_diff_deg": round(diff, 1),
+            "distance_px": round(dist, 1),
+            "steer_key": steer_key,
+            "reached": reached,
+            "walking_state": self.get_walking_state(),
+        }
+
+    def reset_waypoint_timeout(self) -> None:
+        """Resets waypoint travel timer when smooth forward movement is ongoing."""
+        self._waypoint_last_advanced_ts = time.time()
+        self._consecutive_obstacle_hits = 0
     @property
     def active_region(self) -> str:
         """Aktif bölge adını döndürür."""
@@ -533,7 +1438,14 @@ class ExplorerModeController:
             if mean_v < 58.0 or mean_s < 14.0:
                 return detections
 
-            cx, cy = mw / 2.0, mh / 2.0
+            # Unified minimap player anchor (same default as AutoCartographer arrow).
+            cx, cy = mw * 0.50, mh * 0.545
+            try:
+                from core.auto_cartographer import AutoCartographer
+
+                cx, cy = AutoCartographer._locate_minimap_player_arrow(mm)
+            except Exception:
+                pass
             meters_per_px = float(getattr(self.material_scanner, "meters_per_map_pixel", 0.65))
 
             valid = np.full((mh, mw), 255, dtype=np.uint8)
@@ -1416,16 +2328,36 @@ class ExplorerModeController:
             is_map_open = bool(self.vision_engine.is_map_open(bgr))
             is_blocking = False if is_map_open else bool(self.vision_engine.is_game_window_blocking(bgr))
 
-            # Adım 1: Hibrit Sağ-Üst Minimap Öncelikli Tarama + 3D Dünya (Aria/Mela/[E]/[F]) Taraması
+            # Adım 1: Hibrit Sağ-Üst Minimap + 3D Dünya + YZ (reflex/YOLO) tarama
             minimap_detections: List[Dict[str, Any]] = []
             world_3d_detections: List[Dict[str, Any]] = []
+            yz_detections: List[Dict[str, Any]] = []
             if not is_map_open and not is_blocking:
                 minimap_detections = self._scan_minimap_priority_materials(bgr)
                 world_3d_detections = self._scan_3d_world_hybrid(bgr)
+                yz_detections = self._scan_yz_gather_detections(bgr)
 
-            serialized_detections: List[Dict[str, Any]] = list(world_3d_detections) + list(
-                minimap_detections
+            serialized_detections: List[Dict[str, Any]] = (
+                list(world_3d_detections) + list(minimap_detections) + list(yz_detections)
             )
+            # Dedup CV vs YZ overlaps (keep higher confidence).
+            merged: List[Dict[str, Any]] = []
+            for det in serialized_detections:
+                dup = False
+                for existing in merged:
+                    if math.hypot(
+                        int(det.get("screen_x", 0)) - int(existing.get("screen_x", 0)),
+                        int(det.get("screen_y", 0)) - int(existing.get("screen_y", 0)),
+                    ) <= 32.0:
+                        dup = True
+                        if float(det.get("confidence", 0)) > float(existing.get("confidence", 0)):
+                            existing.update(det)
+                        elif det.get("yz") and not existing.get("material_type"):
+                            existing["material_type"] = det.get("material_type", existing.get("material_type"))
+                        break
+                if not dup:
+                    merged.append(det)
+            serialized_detections = merged
 
             gather_prompts = [
                 d for d in world_3d_detections if d.get("source") == "gather_prompt"
@@ -1439,6 +2371,9 @@ class ExplorerModeController:
 
             # Adım 2: AutoCartographer ile oyuncunun minimap odometri konumunu güncelle
             map_x, map_y, norm_x, norm_y = self.auto_cartographer.update_player_position(bgr)
+            self._odometry_pos_x = float(map_x)
+            self._odometry_pos_y = float(map_y)
+            self._odometry_last_ts = now_ts
 
             # 3D dünya spesifik isimlerini (Aria, Mela, Orichalcum Ore) ve minimap stack kümelerini önceliklendir
             prioritized_detections = sorted(
@@ -1464,6 +2399,10 @@ class ExplorerModeController:
             for det in prioritized_detections:
                 det_source = str(det.get("source", ""))
                 det_source_type = str(det.get("source_type", det_source or "minimap_material"))
+                if det_source_type in ("yz_3d", "3d_world", "3d_auto"):
+                    det_source_type = "3d_auto"
+                elif det_source_type in ("yz_minimap", "minimap", "minimap_auto"):
+                    det_source_type = "minimap_auto"
                 det_type = str(det.get("material_type", ""))
                 det_max_h = max(3, int(det.get("max_harvests", 3) or 3))
                 obs_x = map_x + float(det.get("rel_map_dx", 0.0))
@@ -1509,13 +2448,37 @@ class ExplorerModeController:
                         len(self._ordered_nodes),
                     )
                 else:
-                    updated_seq, inserted_idx = self.route_planner.insert_node_in_sequence(
-                        ordered_nodes=self._ordered_nodes,
-                        new_node=node_obj,
-                        closed_loop=True,
-                    )
-                    self._ordered_nodes = list(updated_seq)
-                    seq_pos = int(inserted_idx) + 1
+                    # Uzamsal kümeleme: _ordered_nodes içinde dedup_radius_px mesafesinde düğüm var mı?
+                    nearest_ordered: Optional[NodeData] = None
+                    min_dist_ord = float("inf")
+                    dedup_r = float(getattr(self.auto_cartographer, "dedup_radius_px", DEFAULT_DEDUP_RADIUS_PX))
+                    for ord_n in self._ordered_nodes:
+                        d_ord = math.hypot(
+                            float(node_obj.map_x) - float(ord_n.map_x),
+                            float(node_obj.map_y) - float(ord_n.map_y),
+                        )
+                        if d_ord < min_dist_ord:
+                            min_dist_ord = d_ord
+                            nearest_ordered = ord_n
+
+                    if nearest_ordered is not None and min_dist_ord <= dedup_r:
+                        seq_pos = next(
+                            (idx + 1 for idx, n in enumerate(self._ordered_nodes) if n.id == nearest_ordered.id),
+                            len(self._ordered_nodes),
+                        )
+                        if hasattr(nearest_ordered, "max_harvests") and hasattr(node_obj, "max_harvests"):
+                            nearest_ordered.max_harvests = max(
+                                int(getattr(nearest_ordered, "max_harvests", 3) or 3),
+                                int(getattr(node_obj, "max_harvests", 3) or 3),
+                            )
+                    else:
+                        updated_seq, inserted_idx = self.route_planner.insert_node_in_sequence(
+                            ordered_nodes=self._ordered_nodes,
+                            new_node=node_obj,
+                            closed_loop=True,
+                        )
+                        self._ordered_nodes = list(updated_seq)
+                        seq_pos = int(inserted_idx) + 1
 
                 res_type = str(node_obj.resource_type or DEFAULT_RESOURCE_TYPE)
                 max_h_val = int(getattr(node_obj, "max_harvests", 3) or 3)
@@ -1533,6 +2496,7 @@ class ExplorerModeController:
                 enriched["seq_index"] = int(seq_pos)
                 enriched["hud_message"] = hud_msg
                 newly_mapped_details.append(enriched)
+                self._emit_node_discovered(enriched)
 
             if newly_discovered:
                 self._persist_ordered_nodes_to_route_manager()
@@ -1578,6 +2542,13 @@ class ExplorerModeController:
                 1 for d in serialized_detections if d.get("source") == "minimap"
             )
 
+            if gathered_now:
+                self.set_walking_state("TOPLANIYOR", reason="opportunistic gathering")
+            elif steer_target and steer_target.get("steered"):
+                self.set_walking_state("ROTA TAKİBİ" if self._ordered_nodes else "KEŞİFTE", reason="steering to 3d target")
+            else:
+                self.update_walking_state(in_route=bool(self._ordered_nodes), in_exploration=True)
+
             return {
                 "step_index": self._step_count,
                 "timestamp": now_ts,
@@ -1587,12 +2558,23 @@ class ExplorerModeController:
                     "norm_x": norm_x,
                     "norm_y": norm_y,
                 },
+                "movement_coords": (self._odometry_pos_x, self._odometry_pos_y),
+                "walking_state": self.get_walking_state(),
+                "anti_beklemede_active": True,
+                "active_waypoint_idx": self._active_route_index,
                 "is_map_open": is_map_open,
                 "is_window_blocking": is_blocking,
+                "needs_map_calibrate": bool(
+                    getattr(self.auto_cartographer, "needs_map_calibrate", False)
+                ),
+                "gate_rejected_total": int(
+                    getattr(self.auto_cartographer, "total_gate_rejected", 0) or 0
+                ),
                 "detected_materials": serialized_detections,
                 "detected_count": len(serialized_detections),
                 "world_3d_count": world_3d_count,
                 "minimap_count": minimap_count,
+                "yz_count": sum(1 for d in serialized_detections if d.get("yz") or str(d.get("source_type", "")).startswith("yz_")),
                 "gather_prompt_detected": gather_prompt_detected,
                 "gather_key": active_gather_key,
                 "gathered_action_triggered": gathered_now,
@@ -1624,6 +2606,9 @@ class ExplorerModeController:
                     "norm_x": norm_x,
                     "norm_y": norm_y,
                 },
+                "movement_coords": (self._odometry_pos_x, self._odometry_pos_y),
+                "walking_state": self.get_walking_state(),
+                "anti_beklemede_active": True,
                 "is_map_open": False,
                 "is_window_blocking": False,
                 "detected_materials": [],

@@ -1,0 +1,6 @@
+{
+  "start_date": "2026-11-07",
+  "model": "SM-G950F",
+  "wait_days": 7,
+  "note": "RESTART 2026-11-07: Magisk/RMM failed again (custom flash blocked by Prenormal / official-binaries). User recovering with stock Odin (G950FXXUCDZE7). Clock = first clean stock boot after this stock restore — ~7d Prenormal wait again. Keep OEM unlocking ON + internet. No Magisk/TWRP tonight. When due: Download check-only (docs/S8_DOWNLOAD_CHECK_TR.md) — no Odin Start. If KG Checking/Completed + OEM LOCK OFF, Magisk can start early via docs/S8_MAGISK_SEQUENCE_SAFE.md."
+}

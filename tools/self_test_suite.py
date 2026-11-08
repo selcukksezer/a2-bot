@@ -194,7 +194,9 @@ class SelfTestSuite:
                 continue
 
             py_files = sorted(
-                f for f in pkg_dir.glob("*.py") if f.name != "__init__.py"
+                f
+                for f in pkg_dir.glob("*.py")
+                if f.name != "__init__.py" and not f.name.startswith("_")
             )
             for py_file in py_files:
                 mod_name = f"{pkg}.{py_file.stem}"

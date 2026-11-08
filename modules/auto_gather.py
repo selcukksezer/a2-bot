@@ -29,12 +29,12 @@ class AutoGatherBot:
         self.paused = False
         print("\n" + "=" * 60)
         print("AION 2 AUTO-GATHER (AUTO-RECORD) MODU BAŞLATILDI")
-        print("Kontroller: [F9] Duraklat / Devam Et | [ESC] Çıkış")
+        print("Kontroller: [Ctrl+Alt+F9] Duraklat / Devam Et | [ESC] Çıkış")
         print("Karakterinle kaynakların yanına git, bot otomatik toplayacaktır.")
         print("=" * 60 + "\n")
 
         # Setup hotkeys
-        keyboard.add_hotkey('f9', self.toggle_pause)
+        keyboard.add_hotkey('ctrl+alt+f9', self.toggle_pause, suppress=False)
 
         last_f_time = 0
         is_gathering = False

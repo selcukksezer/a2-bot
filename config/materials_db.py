@@ -951,40 +951,695 @@ def _mask_count(hsv: np.ndarray, lower: HSVBound, upper: HSVBound) -> int:
     return int(np.count_nonzero(mask))
 
 
+def _more_specific_catalog_material(
+    hsv: np.ndarray,
+    chosen_name: str,
+    coarse_ratio: float,
+    region_name: str,
+    ore_ratio: float,
+) -> Optional[str]:
+    """Prefer a catalog essence when its color is clearer than the coarse family."""
+    # Only allow refinement when chosen_name is a coarse fallback (e.g. weak Orichalcum Ore)
+    if chosen_name != "Orichalcum Ore":
+        return None
+
+    chosen_spec = AION2_MATERIALS_CATALOG.get(chosen_name)
+    if not chosen_spec:
+        return None
+    target_category = chosen_spec.category
+
+    # If Orichalcum has strong vein signal, keep Orichalcum Ore
+    if ore_ratio >= 0.04:
+        return None
+
+    region_specs = get_region_expected_materials(region_name) if region_name else []
+    region_bases = {spec.base_material.lower() for spec in region_specs}
+    best_name = ""
+    best_score = 0.0
+    seen = set()
+    for spec in AION2_MATERIALS_CATALOG:
+        # Category boundary guard: NEVER cross categories (e.g. Gemstone -> Ore, Tree -> Ore)
+        if spec.category != target_category:
+            continue
+        base_key = spec.base_material.strip().lower()
+        if base_key in seen or spec.grade not in ("Standard", ""):
+            continue
+        seen.add(base_key)
+        if spec.name == chosen_name or spec.base_material == chosen_name:
+            continue
+        # If region is specified, require regional presence
+        if region_bases and base_key not in region_bases:
+            continue
+        ratio = 0.0
+        for lower, upper in spec.hsv_ranges:
+            ratio = max(ratio, _mask_ratio(hsv, lower, upper))
+        if ratio < 0.08:
+            continue
+        score = ratio + (0.02 if base_key in region_bases else 0.0)
+        if score > best_score:
+            best_score = score
+            best_name = spec.name
+    if not best_name:
+        return None
+    if best_score >= float(coarse_ratio) + 0.15:
+        return best_name
+    return None
+
+
+@dataclass
+class MaterialVisualDescriptor:
+    """Real-time visual feature descriptors extracted from a 3D resource mesh patch.
+
+    Captures genuine computer vision features without synthetic shortcuts:
+    - Multi-bin HSV color distributions & statistical color masks
+    - 3D texture energy, directional edge gradients, and specular highlights
+    - Morphological aspect ratios and spatial profiles
+    - Bilateral symmetry and brightness of 3D winged crests
+    """
+
+    # 1. HSV Color Distributions
+    hue_histogram: List[float] = field(default_factory=lambda: [0.0] * 16)
+    dominant_hue: float = 0.0
+    mean_hsv: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    std_hsv: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    color_ratios: Dict[str, float] = field(default_factory=dict)
+
+    # 2. 3D Texture & Crest Features
+    texture_contrast: float = 0.0
+    gradient_magnitude_mean: float = 0.0
+    vertical_edge_ratio: float = 0.5
+    horizontal_edge_ratio: float = 0.5
+    specular_highlight_ratio: float = 0.0
+    spot_cluster_count: int = 0
+    crest_symmetry_score: float = 0.0
+    crest_brightness: float = 0.0
+
+    # 3. Geometric & Aspect Ratio Features
+    aspect_ratio: float = 1.0  # width / height
+    height_width_ratio: float = 1.0  # height / width
+    morphological_profile: str = "balanced"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize descriptor to plain dictionary."""
+        return asdict(self)
+
+
+def compute_hsv_color_distribution(mesh_bgr: np.ndarray) -> Dict[str, Any]:
+    """Compute multi-bin HSV color distributions and statistical color masks."""
+    if (
+        mesh_bgr is None
+        or not isinstance(mesh_bgr, np.ndarray)
+        or mesh_bgr.size == 0
+        or mesh_bgr.ndim != 3
+        or mesh_bgr.shape[2] < 3
+    ):
+        return {
+            "hue_histogram": [0.0] * 16,
+            "dominant_hue": 0.0,
+            "mean_hsv": (0.0, 0.0, 0.0),
+            "std_hsv": (0.0, 0.0, 0.0),
+            "color_ratios": {},
+            "total_px": 0,
+        }
+
+    hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
+    total_px = float(max(1, hsv.shape[0] * hsv.shape[1]))
+
+    # Compute 16-bin Hue histogram for chromatic pixels (S >= 25, 20 <= V <= 250)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    chroma_mask = (sat >= 25) & (val >= 20) & (val <= 250)
+    chroma_count = int(np.count_nonzero(chroma_mask))
+
+    if chroma_count > 0:
+        hist = cv2.calcHist(
+            [hsv], [0], chroma_mask.astype(np.uint8), [16], [0, 180]
+        ).flatten()
+        norm_hist = [float(c) / float(chroma_count) for c in hist]
+        dom_bin = int(np.argmax(hist))
+        dominant_hue = float(dom_bin * 11.25 + 5.625)
+    else:
+        norm_hist = [0.0] * 16
+        dominant_hue = 0.0
+
+    mean_hsv = (
+        float(np.mean(hsv[:, :, 0])),
+        float(np.mean(hsv[:, :, 1])),
+        float(np.mean(hsv[:, :, 2])),
+    )
+    std_hsv = (
+        float(np.std(hsv[:, :, 0])),
+        float(np.std(hsv[:, :, 1])),
+        float(np.std(hsv[:, :, 2])),
+    )
+
+    # Specific color masks for taxonomy categories
+    aria_px = _mask_count(hsv, (125, 65, 75), (165, 255, 255))
+    red_berry_px = _mask_count(hsv, (0, 100, 85), (12, 255, 255)) + _mask_count(
+        hsv, (168, 100, 85), (180, 255, 255)
+    )
+    ruby_crystal_px = _mask_count(hsv, (0, 140, 140), (10, 255, 255)) + _mask_count(
+        hsv, (168, 140, 140), (180, 255, 255)
+    )
+    green_leaf_px = _mask_count(hsv, (35, 50, 40), (78, 255, 240))
+    green_broad_px = _mask_count(hsv, (26, 40, 35), (82, 255, 245))
+    targena_px = _mask_count(hsv, (22, 65, 65), (45, 255, 255))
+    calendula_px = _mask_count(hsv, (10, 120, 140), (24, 255, 255))
+    sapphire_px = _mask_count(hsv, (95, 120, 140), (125, 255, 255))
+    azpha_px = _mask_count(hsv, (105, 70, 90), (135, 255, 255))
+    diamond_px = _mask_count(hsv, (85, 10, 200), (115, 65, 255))
+    odyle_px = _mask_count(hsv, (58, 105, 145), (94, 255, 255))
+    bronze_ore_px = _mask_count(hsv, (6, 65, 55), (26, 230, 225))
+    teal_ore_px = _mask_count(hsv, (72, 45, 65), (98, 210, 225))
+    dark_rock_px = _mask_count(hsv, (0, 0, 20), (180, 65, 115))
+    bark_px = _mask_count(hsv, (8, 45, 35), (22, 165, 140))
+
+    color_ratios = {
+        "aria_purple": round(aria_px / total_px, 4),
+        "red_berry": round(red_berry_px / total_px, 4),
+        "ruby_crystal": round(ruby_crystal_px / total_px, 4),
+        "green_leaf": round(green_leaf_px / total_px, 4),
+        "green_broad": round(green_broad_px / total_px, 4),
+        "targena_gold_green": round(targena_px / total_px, 4),
+        "calendula_orange": round(calendula_px / total_px, 4),
+        "sapphire_blue": round(sapphire_px / total_px, 4),
+        "azpha_blue_violet": round(azpha_px / total_px, 4),
+        "diamond_ice": round(diamond_px / total_px, 4),
+        "odyle_orb": round(odyle_px / total_px, 4),
+        "orichalcum_vein": round((bronze_ore_px + teal_ore_px) / total_px, 4),
+        "bronze_ore": round(bronze_ore_px / total_px, 4),
+        "teal_ore": round(teal_ore_px / total_px, 4),
+        "dark_rock": round(dark_rock_px / total_px, 4),
+        "bark_trunk": round(bark_px / total_px, 4),
+    }
+
+    return {
+        "hue_histogram": norm_hist,
+        "dominant_hue": round(dominant_hue, 2),
+        "mean_hsv": tuple(round(v, 2) for v in mean_hsv),
+        "std_hsv": tuple(round(v, 2) for v in std_hsv),
+        "color_ratios": color_ratios,
+        "total_px": int(total_px),
+    }
+
+
+def compute_3d_crest_texture(
+    mesh_bgr: np.ndarray, crest_bgr: Optional[np.ndarray] = None
+) -> Dict[str, Any]:
+    """Compute 3D crest and mesh texture descriptors: directional edge gradients, specular highlights, and symmetry."""
+    if (
+        mesh_bgr is None
+        or not isinstance(mesh_bgr, np.ndarray)
+        or mesh_bgr.size == 0
+        or mesh_bgr.ndim != 3
+        or mesh_bgr.shape[2] < 3
+    ):
+        return {
+            "texture_contrast": 0.0,
+            "gradient_magnitude_mean": 0.0,
+            "vertical_edge_ratio": 0.5,
+            "horizontal_edge_ratio": 0.5,
+            "specular_highlight_ratio": 0.0,
+            "spot_cluster_count": 0,
+            "crest_symmetry_score": 0.0,
+            "crest_brightness": 0.0,
+        }
+
+    gray = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    total_px = float(max(1, h * w))
+
+    contrast = float(np.std(gray)) / 255.0
+
+    # Sobel directional gradients (ksize=3)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    grad_mean = float(np.mean(mag)) / 255.0
+
+    sum_gx = float(np.sum(np.abs(gx)))
+    sum_gy = float(np.sum(np.abs(gy)))
+    total_g = sum_gx + sum_gy + 1e-6
+    vert_ratio = sum_gx / total_g
+    horiz_ratio = sum_gy / total_g
+
+    # Specular highlights (characteristic of crystal facets and reflective ore)
+    hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    spec_mask = (val >= 210) & ((sat <= 50) | ((val >= 240) & (sat >= 90)))
+    spec_ratio = float(np.count_nonzero(spec_mask)) / total_px
+
+    # Connected component spot clustering (characteristic of Mela red berries)
+    red_mask = cv2.inRange(hsv, (0, 100, 85), (12, 255, 255)) | cv2.inRange(
+        hsv, (168, 100, 85), (180, 255, 255)
+    )
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+        red_mask.astype(np.uint8), connectivity=8
+    )
+    spot_cluster_count = sum(
+        1 for i in range(1, num_labels) if 3 <= stats[i, cv2.CC_STAT_AREA] <= 180
+    )
+
+    # 3D Winged Crest symmetry and brightness
+    crest_crop = crest_bgr
+    if crest_crop is None and h >= 24:
+        crest_crop = mesh_bgr[: max(8, int(h * 0.25)), :]
+
+    crest_symmetry = 0.0
+    crest_bright = 0.0
+    if crest_crop is not None and crest_crop.size > 0:
+        cg = cv2.cvtColor(crest_crop, cv2.COLOR_BGR2GRAY)
+        crest_bright = float(np.mean(cg)) / 255.0
+        cw = cg.shape[1]
+        mid = cw // 2
+        if mid >= 4:
+            left = cg[:, :mid].astype(float)
+            right = np.fliplr(cg[:, mid + (cw % 2) :]).astype(float)
+            diff = float(np.mean(np.abs(left - right))) / 255.0
+            crest_symmetry = max(0.0, 1.0 - diff * 2.2)
+
+    return {
+        "texture_contrast": round(contrast, 4),
+        "gradient_magnitude_mean": round(grad_mean, 4),
+        "vertical_edge_ratio": round(vert_ratio, 4),
+        "horizontal_edge_ratio": round(horiz_ratio, 4),
+        "specular_highlight_ratio": round(spec_ratio, 4),
+        "spot_cluster_count": int(spot_cluster_count),
+        "crest_symmetry_score": round(crest_symmetry, 4),
+        "crest_brightness": round(crest_bright, 4),
+    }
+
+
+def compute_aspect_ratio_features(
+    mesh_bgr: np.ndarray,
+    bbox_aspect_ratio: Optional[float] = None,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+) -> Dict[str, Any]:
+    """Compute aspect ratio and morphological profile of the resource node."""
+    if bbox_aspect_ratio is not None and bbox_aspect_ratio > 0:
+        ar = float(bbox_aspect_ratio)
+    elif bbox is not None and len(bbox) == 4 and bbox[3] > 0:
+        ar = float(bbox[2]) / float(bbox[3])
+    elif (
+        mesh_bgr is not None
+        and isinstance(mesh_bgr, np.ndarray)
+        and mesh_bgr.ndim >= 2
+        and mesh_bgr.shape[0] > 0
+    ):
+        ar = float(mesh_bgr.shape[1]) / float(mesh_bgr.shape[0])
+    else:
+        ar = 1.0
+
+    ar = round(max(0.05, min(10.0, ar)), 3)
+    hw_ratio = round(1.0 / max(0.01, ar), 3)
+
+    if hw_ratio >= 1.35:
+        profile = "vertical_trunk"
+    elif ar >= 1.35:
+        profile = "horizontal_vein"
+    elif ar >= 1.08:
+        profile = "squat_bush"
+    elif hw_ratio >= 1.10:
+        profile = "upright_herb"
+    else:
+        profile = "balanced"
+
+    return {
+        "aspect_ratio": ar,
+        "height_width_ratio": hw_ratio,
+        "morphological_profile": profile,
+    }
+
+
+def extract_visual_descriptor(
+    mesh_bgr: np.ndarray,
+    bbox_aspect_ratio: Optional[float] = None,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    crest_bgr: Optional[np.ndarray] = None,
+) -> MaterialVisualDescriptor:
+    """Extract full real-time visual feature descriptors from a 3D resource mesh patch."""
+    hsv_data = compute_hsv_color_distribution(mesh_bgr)
+    tex_data = compute_3d_crest_texture(mesh_bgr, crest_bgr=crest_bgr)
+    ar_data = compute_aspect_ratio_features(
+        mesh_bgr, bbox_aspect_ratio=bbox_aspect_ratio, bbox=bbox
+    )
+
+    return MaterialVisualDescriptor(
+        hue_histogram=hsv_data["hue_histogram"],
+        dominant_hue=hsv_data["dominant_hue"],
+        mean_hsv=hsv_data["mean_hsv"],
+        std_hsv=hsv_data["std_hsv"],
+        color_ratios=hsv_data["color_ratios"],
+        texture_contrast=tex_data["texture_contrast"],
+        gradient_magnitude_mean=tex_data["gradient_magnitude_mean"],
+        vertical_edge_ratio=tex_data["vertical_edge_ratio"],
+        horizontal_edge_ratio=tex_data["horizontal_edge_ratio"],
+        specular_highlight_ratio=tex_data["specular_highlight_ratio"],
+        spot_cluster_count=tex_data["spot_cluster_count"],
+        crest_symmetry_score=tex_data["crest_symmetry_score"],
+        crest_brightness=tex_data["crest_brightness"],
+        aspect_ratio=ar_data["aspect_ratio"],
+        height_width_ratio=ar_data["height_width_ratio"],
+        morphological_profile=ar_data["morphological_profile"],
+    )
+
+
+AION2_TAXONOMY_HIERARCHY: Dict[str, Dict[str, Any]] = {
+    "Herbs": {
+        "category_tr": "Bitkiler / Otlar",
+        "profession": "Alchemy",
+        "harvest_type": "Vitality Extraction",
+        "interaction_keys": ("f", "e"),
+        "primary_materials": {
+            "Aria": {
+                "name_tr": "Aria (Mor Kristal Bitki)",
+                "visual_profile": "purple_violet_crystal_herb",
+                "hsv_range": ((125, 65, 75), (165, 255, 255)),
+                "expected_aspect": "upright_herb",
+                "typical_aspect_ratio": 0.85,
+            },
+            "Targena": {
+                "name_tr": "Targena Otu",
+                "visual_profile": "golden_yellow_green_herb",
+                "hsv_range": ((22, 65, 65), (45, 255, 255)),
+                "expected_aspect": "upright_herb",
+                "typical_aspect_ratio": 0.90,
+            },
+            "Calendula": {
+                "name_tr": "Calendula (Aynısafa Otu)",
+                "visual_profile": "orange_gold_marigold",
+                "hsv_range": ((10, 120, 140), (24, 255, 255)),
+                "expected_aspect": "upright_herb",
+                "typical_aspect_ratio": 0.95,
+            },
+            "Azpha": {
+                "name_tr": "Azpha Otu",
+                "visual_profile": "blue_violet_highland_herb",
+                "hsv_range": ((105, 70, 90), (135, 255, 255)),
+                "expected_aspect": "upright_herb",
+                "typical_aspect_ratio": 0.88,
+            },
+        },
+    },
+    "Cooking & Fibers": {
+        "category_tr": "Meyve / Sebze / Deniz Ürünleri",
+        "profession": "Cooking & Tailoring",
+        "harvest_type": "Vitality Extraction",
+        "interaction_keys": ("f", "e"),
+        "primary_materials": {
+            "Mela": {
+                "name_tr": "Mela (Kırmızı Meyveli Çalı)",
+                "visual_profile": "red_berries_green_bush",
+                "hsv_range": ((0, 100, 85), (12, 255, 255)),
+                "secondary_hsv_range": ((35, 50, 40), (78, 255, 240)),
+                "expected_aspect": "squat_bush",
+                "typical_aspect_ratio": 1.45,
+            },
+        },
+    },
+    "Ores & Metals": {
+        "category_tr": "Madenler / Cevherler",
+        "profession": "Blacksmithing / Armorsmithing",
+        "harvest_type": "Vitality Extraction",
+        "interaction_keys": ("f", "e"),
+        "primary_materials": {
+            "Orichalcum Ore": {
+                "name_tr": "Orichalcum Cevheri",
+                "visual_profile": "bronze_teal_gold_vein",
+                "hsv_range": ((6, 65, 55), (26, 230, 225)),
+                "secondary_hsv_range": ((72, 45, 65), (98, 210, 225)),
+                "expected_aspect": "horizontal_vein",
+                "typical_aspect_ratio": 1.55,
+            },
+        },
+    },
+    "Gemstones": {
+        "category_tr": "Değerli Taşlar / Gemler",
+        "profession": "Handicrafting",
+        "harvest_type": "Vitality Extraction",
+        "interaction_keys": ("f", "e"),
+        "primary_materials": {
+            "Sapphire Gemstone": {
+                "name_tr": "Safir Değerli Taş",
+                "visual_profile": "deep_cyan_blue_crystal",
+                "hsv_range": ((95, 120, 140), (125, 255, 255)),
+                "expected_aspect": "crystal_spire",
+                "typical_aspect_ratio": 0.80,
+            },
+            "Ruby Gemstone": {
+                "name_tr": "Yakut Değerli Taş",
+                "visual_profile": "crimson_crystal_spire",
+                "hsv_range": ((0, 140, 140), (10, 255, 255)),
+                "expected_aspect": "crystal_spire",
+                "typical_aspect_ratio": 0.70,
+            },
+            "Diamond Gemstone": {
+                "name_tr": "Elmas Değerli Taş",
+                "visual_profile": "brilliant_white_ice_crystal",
+                "hsv_range": ((85, 10, 200), (115, 65, 255)),
+                "expected_aspect": "crystal_spire",
+                "typical_aspect_ratio": 0.85,
+            },
+        },
+    },
+    "Logs & Trees": {
+        "category_tr": "Ağaçlar / Keresteler",
+        "profession": "Woodcutting",
+        "harvest_type": "Vitality Extraction",
+        "interaction_keys": ("f", "e"),
+        "primary_materials": {
+            "Yggdrasil Log": {
+                "name_tr": "Yggdrasil Kerestesi",
+                "visual_profile": "brown_bark_trunk_canopy",
+                "hsv_range": ((8, 45, 35), (22, 165, 140)),
+                "secondary_hsv_range": ((35, 55, 45), (78, 255, 215)),
+                "expected_aspect": "vertical_trunk",
+                "typical_aspect_ratio": 0.55,
+            },
+            "Asvata Log": {
+                "name_tr": "Asvata Kerestesi",
+                "visual_profile": "asmodian_rugged_bark_trunk",
+                "hsv_range": ((8, 45, 35), (22, 165, 140)),
+                "secondary_hsv_range": ((35, 55, 45), (78, 255, 215)),
+                "expected_aspect": "vertical_trunk",
+                "typical_aspect_ratio": 0.50,
+            },
+        },
+    },
+    "Odyle & Aether": {
+        "category_tr": "Odyle / Enerji Küresi",
+        "profession": "Flight / Ground Extraction",
+        "harvest_type": "Aether Extraction",
+        "interaction_keys": ("f", "e"),
+        "primary_materials": {
+            "Odyle": {
+                "name_tr": "Odyle Enerji Küresi",
+                "visual_profile": "floating_teal_green_energy_orb",
+                "hsv_range": ((58, 105, 145), (94, 255, 255)),
+                "expected_aspect": "balanced",
+                "typical_aspect_ratio": 1.0,
+            },
+        },
+    },
+}
+
+
+def map_descriptors_to_taxonomy(
+    descriptor: MaterialVisualDescriptor,
+    region_name: str = "",
+    label_width_px: int = 0,
+) -> Dict[str, Any]:
+    """Map visual feature descriptors (HSV distributions, 3D textures, aspect ratios) to exact Aion 2 material taxonomy."""
+    cr = descriptor.color_ratios
+    reg_low = (region_name or "").strip().lower()
+    is_asmodian_region = any(
+        r in reg_low for r in ("altgard", "morheim", "ishalgen", "beluslan", "gelkmaros")
+    )
+
+    # 1. Aria: Purple/violet crystal plant
+    aria_score = cr.get("aria_purple", 0.0) * 3.8
+    if cr.get("aria_purple", 0.0) >= 0.025 and cr.get("aria_purple", 0.0) > cr.get("red_berry", 0.0) * 1.3:
+        aria_score += 0.45
+    if descriptor.aspect_ratio <= 1.35:
+        aria_score += 0.05
+
+    # 2. Mela: Red berries + green foliage bush
+    mela_score = cr.get("red_berry", 0.0) * 2.8 + cr.get("green_leaf", 0.0) * 1.2
+    if cr.get("red_berry", 0.0) >= 0.035 and (
+        cr.get("green_leaf", 0.0) >= 0.02
+        or cr.get("green_broad", 0.0) >= 0.04
+        or descriptor.spot_cluster_count >= 1
+    ):
+        mela_score += 0.44
+    if descriptor.aspect_ratio >= 1.05:
+        mela_score += 0.08
+    if cr.get("green_leaf", 0.0) < 0.015 and descriptor.specular_highlight_ratio >= 0.02:
+        mela_score -= 0.35  # Distinguish from Ruby Gemstone
+
+    # 3. Ruby Gemstone: Crimson crystal spire, specular highlights, zero/negligible foliage
+    ruby_score = cr.get("ruby_crystal", 0.0) * 3.4 + descriptor.specular_highlight_ratio * 1.5
+    if cr.get("ruby_crystal", 0.0) >= 0.03 and cr.get("green_leaf", 0.0) < 0.02:
+        ruby_score += 0.44
+    if descriptor.height_width_ratio >= 1.15:
+        ruby_score += 0.08
+    if cr.get("green_leaf", 0.0) >= 0.035:
+        ruby_score -= 0.40  # Foliage indicates fruit bush, not crystal
+
+    # 4. Sapphire Gemstone: Deep glowing blue/cyan crystal
+    sapphire_score = cr.get("sapphire_blue", 0.0) * 3.4 + descriptor.specular_highlight_ratio * 1.4
+    if cr.get("sapphire_blue", 0.0) >= 0.03 and cr.get("green_leaf", 0.0) < 0.06:
+        sapphire_score += 0.42
+
+    # 5. Diamond Gemstone: Brilliant white/ice crystal
+    diamond_score = cr.get("diamond_ice", 0.0) * 3.0 + descriptor.specular_highlight_ratio * 1.6
+    if cr.get("diamond_ice", 0.0) >= 0.05 and cr.get("green_leaf", 0.0) < 0.08:
+        diamond_score += 0.40
+
+    # 6. Odyle: Floating teal/green energy orb
+    odyle_score = cr.get("odyle_orb", 0.0) * 3.4
+    if cr.get("odyle_orb", 0.0) >= 0.045 and cr.get("targena_gold_green", 0.0) < 0.15:
+        odyle_score += 0.42
+
+    # 7. Targena: Golden-yellow & green leafy herb
+    targena_score = cr.get("targena_gold_green", 0.0) * 2.6 + cr.get("green_leaf", 0.0) * 0.8
+    if cr.get("targena_gold_green", 0.0) >= 0.04 or (
+        cr.get("green_leaf", 0.0) >= 0.22 and cr.get("targena_gold_green", 0.0) >= 0.01
+    ):
+        targena_score += 0.40
+    if descriptor.aspect_ratio <= 1.40:
+        targena_score += 0.05
+
+    # 8. Calendula: Orange-gold marigold blossom
+    calendula_score = cr.get("calendula_orange", 0.0) * 3.2
+    if cr.get("calendula_orange", 0.0) >= 0.04 and cr.get("green_leaf", 0.0) >= 0.02:
+        calendula_score += 0.38
+
+    # 9. Azpha: Blue-violet Asmodian herb
+    azpha_score = cr.get("azpha_blue_violet", 0.0) * 3.0 + cr.get("green_leaf", 0.0) * 0.8
+    if cr.get("azpha_blue_violet", 0.0) >= 0.035 and cr.get("green_leaf", 0.0) >= 0.04:
+        azpha_score += 0.36
+    if is_asmodian_region:
+        azpha_score += 0.04
+
+    # 10. Tree Logs: Yggdrasil / Asvata (tall vertical trunk aspect ratio, vertical bark texture)
+    tree_score = cr.get("bark_trunk", 0.0) * 3.4
+    if cr.get("bark_trunk", 0.0) >= 0.14:
+        tree_score += 0.35
+    if descriptor.height_width_ratio >= 1.25:
+        tree_score += 0.25  # Tall vertical aspect ratio
+    if descriptor.vertical_edge_ratio >= 0.52:
+        tree_score += 0.15  # Vertical bark striations
+    if cr.get("green_leaf", 0.0) >= 0.05:
+        tree_score += 0.10  # Canopy foliage
+    if cr.get("dark_rock", 0.0) >= 0.35:
+        tree_score -= 0.25
+
+    # 11. Orichalcum Ore: Metallic bronze/teal/gold vein on dark rock
+    ore_score = cr.get("orichalcum_vein", 0.0) * 3.0 + cr.get("dark_rock", 0.0) * 0.7
+    if cr.get("orichalcum_vein", 0.0) >= 0.015 or cr.get("dark_rock", 0.0) >= 0.20 or label_width_px >= 75:
+        ore_score += 0.35
+    if descriptor.aspect_ratio >= 1.15:
+        ore_score += 0.12  # Horizontal rock vein
+    if descriptor.height_width_ratio >= 1.30:
+        ore_score -= 0.60  # Vertical columns are trees or spires, NOT horizontal ore veins!
+    if descriptor.gradient_magnitude_mean >= 0.12:
+        ore_score += 0.06  # Rough rock surface texture
+
+    scores: Dict[str, float] = {
+        "Aria": round(float(aria_score), 4),
+        "Mela": round(float(mela_score), 4),
+        "Ruby Gemstone": round(float(ruby_score), 4),
+        "Sapphire Gemstone": round(float(sapphire_score), 4),
+        "Diamond Gemstone": round(float(diamond_score), 4),
+        "Odyle": round(float(odyle_score), 4),
+        "Targena": round(float(targena_score), 4),
+        "Calendula": round(float(calendula_score), 4),
+        "Azpha": round(float(azpha_score), 4),
+        "Asvata Log" if is_asmodian_region else "Yggdrasil Log": round(float(tree_score), 4),
+        "Orichalcum Ore": round(float(ore_score), 4),
+    }
+
+    # Region prior slight boost
+    if region_name:
+        reg_specs = get_region_expected_materials(region_name)
+        reg_bases = {s.base_material.lower() for s in reg_specs}
+        for mat_name in list(scores.keys()):
+            spec = AION2_MATERIALS_CATALOG.get(mat_name)
+            if spec and spec.base_material.lower() in reg_bases:
+                scores[mat_name] = round(scores[mat_name] + 0.03, 4)
+
+    sorted_scores = sorted(scores.items(), key=lambda it: it[1], reverse=True)
+    best_candidate, best_val = sorted_scores[0]
+    second_val = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
+
+    margin = best_val - second_val
+    confidence = min(0.98, max(0.55, 0.74 + min(0.14, margin * 0.3) + min(0.10, best_val * 0.1)))
+
+    # Fallback to Orichalcum Ore if no candidate has meaningful signal
+    if best_val < 0.20:
+        best_candidate = "Orichalcum Ore"
+        confidence = 0.65
+
+    category = "Ores & Metals"
+    profession = "Blacksmithing / Armorsmithing"
+    harvest_type = "Vitality Extraction"
+    for cat_name, cat_data in AION2_TAXONOMY_HIERARCHY.items():
+        if best_candidate in cat_data.get("primary_materials", {}):
+            category = cat_name
+            profession = cat_data.get("profession", profession)
+            harvest_type = cat_data.get("harvest_type", harvest_type)
+            break
+
+    return {
+        "chosen_name": best_candidate,
+        "confidence": round(float(confidence), 3),
+        "scores": scores,
+        "taxonomy": {
+            "category": category,
+            "category_tr": MATERIAL_CATEGORIES.get(category, category),
+            "profession": profession,
+            "harvest_type": harvest_type,
+            "candidate": best_candidate,
+        },
+    }
+
+
 def classify_3d_material_patch(
     mesh_bgr: np.ndarray,
     region_name: str = "",
     label_width_px: int = 0,
+    aspect_ratio: Optional[float] = None,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    crest_patch_bgr: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
-    """Classify a 3D world plant/crystal/ore/tree/orb mesh patch below the white gather crest.
+    """Classify a 3D world resource mesh patch below the white gather crest using real-time visual descriptors.
 
-    Analyzes HSV color distributions of the 3D mesh patch:
-    - Purple/violet crystal foliage (H=125..165, S=70..255, V=90..255) -> `Aria`
-    - Red berries (H=0..12 / 168..180) + green bush foliage (H=26..80) -> `Mela`
-    - Deep glowing blue/cyan crystal (H=95..125, S=120..255, V=140..255) -> `Sapphire Gemstone`
-    - Crimson/red glowing crystal (H=0..10 / 168..180, S=140..255, V=140..255, low green) -> `Ruby Gemstone`
-    - Brilliant white/ice crystal (H=85..115, S=10..65, V=200..255) -> `Diamond Gemstone`
-    - Metallic bronze/teal/gold rock vein -> `Orichalcum Ore`
-    - Golden-yellow/green herb (H=22..45, S=90..255, V=120..255) -> `Targena`
-    - Orange-gold marigold herb (H=10..24, S=120..255, V=140..255) -> `Calendula`
-    - Blue-violet herb in Asmodian regions (H=105..135, S=70..255, V=90..255) -> `Azpha`
-    - Brown bark trunk + green canopy -> `Yggdrasil Log` / `Asvata Log`
-    - Glowing green/teal orb (H=58..94, S=105..255, V=145..255) -> `Odyle`
+    Analyzes multi-channel HSV color distributions, 3D crest textures, directional gradients,
+    specular highlights, and morphological aspect ratios, mapping directly to Aion 2 taxonomy:
+    - `Aria`: Purple/violet crystal-petaled herb below winged gather crest (Alchemy)
+    - `Mela`: Red berries + green bush foliage with squat dome aspect ratio (Cooking & Tailoring)
+    - `Targena`: Golden-yellow and green herb with delicate leaf texture (Alchemy)
+    - `Calendula`: Orange-gold marigold blossom herb (Alchemy)
+    - `Azpha`: Blue-violet highland herb in Asmodian territories (Alchemy)
+    - `Sapphire Gemstone`: Deep glowing cyan/blue crystal with faceted specularity (Handicrafting)
+    - `Ruby Gemstone`: Crimson crystal spire with vertical aspect ratio and zero foliage (Handicrafting)
+    - `Diamond Gemstone`: Brilliant white/ice crystal cluster (Handicrafting)
+    - `Yggdrasil Log` / `Asvata Log`: Tall vertical trunk aspect ratio with directional bark grain (Woodcutting)
+    - `Orichalcum Ore`: Metallic bronze/teal/gold vein on dark rock strata (Blacksmithing / Armorsmithing)
+    - `Odyle`: Floating glowing teal/green energy orb in 3D world (Flight / Ground Extraction)
 
     Args:
         mesh_bgr: BGR image crop of the 3D resource mesh below the crest or around the [E]/[F] icon.
         region_name: Optional active region name for regional prior disambiguation.
         label_width_px: Optional width in pixels of the cyan 3D nameplate above the mesh.
+        aspect_ratio: Optional bounding box aspect ratio (width / height).
+        bbox: Optional (x, y, w, h) bounding box coordinates.
+        crest_patch_bgr: Optional separate crop of the 3D winged gather crest or nameplate.
 
     Returns:
-        Dictionary with keys:
-        - `name`: Canonical English material name (e.g. "Aria", "Mela", "Targena", "Orichalcum Ore")
-        - `name_tr`: Turkish material name
-        - `category`: English category name
-        - `category_tr`: Turkish category name
-        - `max_harvests`: Default harvest capacity (3)
-        - `confidence`: Classification confidence in [0.0, 0.99]
-        - `color_ratios`: Dict of diagnostic HSV color ratios
+        Enriched dictionary containing canonical material names, categories, calibrated confidence,
+        diagnostic color ratios, visual descriptors, texture features, aspect ratio features, and taxonomy.
     """
     default_spec = AION2_MATERIALS_CATALOG["Orichalcum Ore"]
     if (
@@ -999,158 +1654,76 @@ def classify_3d_material_patch(
             "name_tr": default_spec.name_tr,
             "category": default_spec.category,
             "category_tr": default_spec.category_tr,
+            "grade": default_spec.grade,
             "max_harvests": DEFAULT_MAX_HARVESTS,
             "confidence": 0.50,
+            "region_matched": False,
             "color_ratios": {},
+            "visual_descriptor": MaterialVisualDescriptor().to_dict(),
+            "texture_features": {},
+            "aspect_ratio_features": {
+                "aspect_ratio": 1.0,
+                "height_width_ratio": 1.0,
+                "morphological_profile": "balanced",
+            },
+            "taxonomy": {
+                "category": default_spec.category,
+                "category_tr": default_spec.category_tr,
+                "profession": default_spec.profession,
+            },
+            "scores": {},
         }
 
+    # Extract real-time visual feature descriptors
+    desc = extract_visual_descriptor(
+        mesh_bgr,
+        bbox_aspect_ratio=aspect_ratio,
+        bbox=bbox,
+        crest_bgr=crest_patch_bgr,
+    )
+
+    # Map descriptors to Aion 2 material taxonomy
+    mapped = map_descriptors_to_taxonomy(
+        descriptor=desc,
+        region_name=region_name,
+        label_width_px=label_width_px,
+    )
+
+    chosen_name = mapped["chosen_name"]
+    confidence = float(mapped["confidence"])
+    scores = mapped["scores"]
+    taxonomy_info = mapped["taxonomy"]
+
+    # Catalog essence refinement if a specific regional essence has higher match
     hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
-    total_px = float(max(1, hsv.shape[0] * hsv.shape[1]))
+    coarse_ratio = desc.color_ratios.get("orichalcum_vein", 0.0)
+    if chosen_name == "Aria":
+        coarse_ratio = desc.color_ratios.get("aria_purple", 0.0)
+    elif chosen_name == "Mela":
+        coarse_ratio = desc.color_ratios.get("red_berry", 0.0)
+    elif chosen_name in ("Yggdrasil Log", "Asvata Log"):
+        coarse_ratio = desc.color_ratios.get("bark_trunk", 0.0)
+    elif chosen_name == "Targena":
+        coarse_ratio = desc.color_ratios.get("targena_gold_green", 0.0)
+    elif chosen_name == "Sapphire Gemstone":
+        coarse_ratio = desc.color_ratios.get("sapphire_blue", 0.0)
+    elif chosen_name == "Ruby Gemstone":
+        coarse_ratio = desc.color_ratios.get("ruby_crystal", 0.0)
+    elif chosen_name == "Diamond Gemstone":
+        coarse_ratio = desc.color_ratios.get("diamond_ice", 0.0)
+    elif chosen_name == "Odyle":
+        coarse_ratio = desc.color_ratios.get("odyle_orb", 0.0)
 
-    # 1. Aria: Purple/violet crystal plant (H=125..165, S=65..255, V=75..255)
-    aria_px = _mask_count(hsv, (125, 65, 75), (165, 255, 255))
-    aria_ratio = aria_px / total_px
-
-    # 2. Red berries / Ruby crystal
-    red_berry_px = _mask_count(hsv, (0, 100, 85), (12, 255, 255)) + _mask_count(
-        hsv, (168, 100, 85), (180, 255, 255)
+    specific_name = _more_specific_catalog_material(
+        hsv,
+        chosen_name=chosen_name,
+        coarse_ratio=float(coarse_ratio),
+        region_name=region_name,
+        ore_ratio=float(desc.color_ratios.get("orichalcum_vein", 0.0)),
     )
-    red_berry_ratio = red_berry_px / total_px
-
-    ruby_crystal_px = _mask_count(hsv, (0, 140, 140), (10, 255, 255)) + _mask_count(
-        hsv, (168, 140, 140), (180, 255, 255)
-    )
-    ruby_crystal_ratio = ruby_crystal_px / total_px
-
-    # 3. Green bush leaves (for Mela and herbs)
-    green_leaf_px = _mask_count(hsv, (35, 50, 40), (78, 255, 240))
-    green_broad_px = _mask_count(hsv, (26, 40, 35), (82, 255, 245))
-    green_leaf_ratio = green_leaf_px / total_px
-
-    # 4. Golden-yellow/green herb (Targena: H=22..45, S=65..255, V=65..255)
-    targena_px = _mask_count(hsv, (22, 65, 65), (45, 255, 255))
-    targena_ratio = targena_px / total_px
-
-    # 5. Orange-gold marigold herb (Calendula: H=10..24, S=120..255, V=140..255)
-    calendula_px = _mask_count(hsv, (10, 120, 140), (24, 255, 255))
-    calendula_ratio = calendula_px / total_px
-
-    # 6. Sapphire Gemstone (Deep glowing blue/cyan crystal: H=95..125, S=120..255, V=140..255)
-    sapphire_px = _mask_count(hsv, (95, 120, 140), (125, 255, 255))
-    sapphire_ratio = sapphire_px / total_px
-
-    # 7. Azpha (Blue-violet herb: H=105..135, S=70..255, V=90..255)
-    azpha_px = _mask_count(hsv, (105, 70, 90), (135, 255, 255))
-    azpha_ratio = azpha_px / total_px
-
-    # 8. Diamond Gemstone (Brilliant white/ice crystal: H=85..115, S=10..65, V=200..255)
-    diamond_px = _mask_count(hsv, (85, 10, 200), (115, 65, 255))
-    diamond_ratio = diamond_px / total_px
-
-    # 9. Glowing green/teal orb (Odyle: H=58..94, S=105..255, V=145..255)
-    odyle_px = _mask_count(hsv, (58, 105, 145), (94, 255, 255))
-    odyle_ratio = odyle_px / total_px
-
-    # 10. Metallic bronze/teal/gold rock vein (Orichalcum Ore)
-    bronze_ore_px = _mask_count(hsv, (6, 65, 55), (26, 230, 225))
-    teal_ore_px = _mask_count(hsv, (72, 45, 65), (98, 210, 225))
-    dark_rock_px = _mask_count(hsv, (0, 0, 20), (180, 65, 115))
-    ore_ratio = (bronze_ore_px + teal_ore_px) / total_px
-    dark_rock_ratio = dark_rock_px / total_px
-
-    # 11. Brown bark trunk (Yggdrasil / Asvata Log: H=8..22, S=45..165, V=35..140)
-    bark_px = _mask_count(hsv, (8, 45, 35), (22, 165, 140))
-    bark_ratio = bark_px / total_px
-
-    color_ratios: Dict[str, float] = {
-        "aria_purple": round(aria_ratio, 4),
-        "red_berry": round(red_berry_ratio, 4),
-        "ruby_crystal": round(ruby_crystal_ratio, 4),
-        "green_leaf": round(green_leaf_ratio, 4),
-        "targena_gold_green": round(targena_ratio, 4),
-        "calendula_orange": round(calendula_ratio, 4),
-        "sapphire_blue": round(sapphire_ratio, 4),
-        "azpha_blue_violet": round(azpha_ratio, 4),
-        "diamond_ice": round(diamond_ratio, 4),
-        "odyle_orb": round(odyle_ratio, 4),
-        "orichalcum_vein": round(ore_ratio, 4),
-        "bark_trunk": round(bark_ratio, 4),
-    }
-
-    reg_low = (region_name or "").strip().lower()
-    is_asmodian_region = any(
-        r in reg_low for r in ("altgard", "morheim", "ishalgen", "beluslan", "gelkmaros")
-    )
-
-    chosen_name = "Orichalcum Ore"
-    confidence = 0.72
-
-    # Priority 1: Aria (distinctive purple/violet crystal petals)
-    if aria_px >= 90 and aria_ratio >= 0.025 and aria_px > red_berry_px * 1.5:
-        chosen_name = "Aria"
-        confidence = min(0.98, 0.84 + min(0.14, aria_ratio * 1.8))
-
-    # Priority 2: Mela (red berries + green/olive bush leaves)
-    elif red_berry_px >= 100 and red_berry_ratio >= 0.04 and (green_leaf_px >= 25 or green_broad_px >= 60):
-        chosen_name = "Mela"
-        confidence = min(0.98, 0.85 + min(0.13, red_berry_ratio * 0.4))
-
-    # Priority 3: Sapphire Gemstone (deep glowing blue/cyan crystal)
-    elif sapphire_px >= 80 and sapphire_ratio >= 0.035 and sapphire_px >= aria_px:
-        if is_asmodian_region and azpha_px > sapphire_px * 1.25 and green_leaf_ratio > 0.08:
-            chosen_name = "Azpha"
-            confidence = min(0.94, 0.80 + min(0.14, azpha_ratio * 1.2))
-        else:
-            chosen_name = "Sapphire Gemstone"
-            confidence = min(0.97, 0.84 + min(0.13, sapphire_ratio * 1.5))
-
-    # Priority 4: Ruby Gemstone (crimson/red glowing crystal with negligible green foliage)
-    elif ruby_crystal_px >= 80 and ruby_crystal_ratio >= 0.035 and green_leaf_ratio < 0.015:
-        chosen_name = "Ruby Gemstone"
-        confidence = min(0.96, 0.83 + min(0.13, ruby_crystal_ratio * 1.4))
-
-    # Priority 5: Diamond Gemstone (brilliant white/ice crystal cluster)
-    elif diamond_px >= 110 and diamond_ratio >= 0.06 and green_leaf_ratio < 0.08:
-        chosen_name = "Diamond Gemstone"
-        confidence = min(0.95, 0.82 + min(0.13, diamond_ratio * 1.2))
-
-    # Priority 6: Odyle (floating glowing green/teal energy orb)
-    elif odyle_px >= 90 and odyle_ratio >= 0.05 and targena_ratio < 0.15:
-        chosen_name = "Odyle"
-        confidence = min(0.96, 0.83 + min(0.13, odyle_ratio * 1.3))
-
-    # Priority 7: Targena / Calendula (golden-yellow & lush green herb patch, e.g. Pilgrim's Ridge [E] plant)
-    elif (
-        (targena_px >= 100 and targena_ratio >= 0.05)
-        or (green_leaf_ratio >= 0.25 and targena_ratio >= 0.01)
-        or (green_leaf_ratio >= 0.45 and bark_ratio < 0.15)
-    ):
-        if calendula_ratio > targena_ratio * 1.25 and calendula_px >= 100:
-            chosen_name = "Calendula"
-            confidence = min(0.95, 0.82 + min(0.13, calendula_ratio * 1.2))
-        else:
-            chosen_name = "Targena"
-            confidence = min(0.97, 0.84 + min(0.13, (targena_ratio + green_leaf_ratio) * 0.12))
-
-    # Priority 8: Calendula (vivid orange-gold marigold blossom)
-    elif calendula_px >= 95 and calendula_ratio >= 0.045 and green_leaf_ratio >= 0.03:
-        chosen_name = "Calendula"
-        confidence = min(0.94, 0.81 + min(0.13, calendula_ratio * 1.3))
-
-    # Priority 9: Azpha (blue-violet herb)
-    elif azpha_px >= 85 and azpha_ratio >= 0.035:
-        chosen_name = "Azpha"
-        confidence = min(0.93, 0.80 + min(0.13, azpha_ratio * 1.3))
-
-    # Priority 10: Yggdrasil Log / Asvata Log (wooden bark trunk with canopy foliage and long label)
-    elif bark_ratio >= 0.18 and green_leaf_ratio >= 0.08 and dark_rock_ratio < 0.35:
-        chosen_name = "Asvata Log" if is_asmodian_region else "Yggdrasil Log"
-        confidence = min(0.92, 0.78 + min(0.14, bark_ratio * 0.4))
-
-    # Priority 11: Orichalcum Ore (metallic bronze/teal/gold vein on rock)
-    elif ore_ratio >= 0.015 or dark_rock_ratio >= 0.20 or label_width_px >= 75:
-        chosen_name = "Orichalcum Ore"
-        confidence = min(0.95, 0.80 + min(0.15, ore_ratio * 1.2 + dark_rock_ratio * 0.2))
+    if specific_name:
+        chosen_name = specific_name
+        confidence = min(0.95, max(confidence, 0.78 + min(0.14, coarse_ratio)))
 
     spec = AION2_MATERIALS_CATALOG.get(chosen_name, default_spec) or default_spec
     expected_in_region = True
@@ -1167,7 +1740,25 @@ def classify_3d_material_patch(
         "max_harvests": spec.max_harvests,
         "confidence": round(float(confidence), 3),
         "region_matched": bool(expected_in_region),
-        "color_ratios": color_ratios,
+        "color_ratios": desc.color_ratios,
+        "visual_descriptor": desc.to_dict(),
+        "texture_features": {
+            "texture_contrast": desc.texture_contrast,
+            "gradient_magnitude_mean": desc.gradient_magnitude_mean,
+            "vertical_edge_ratio": desc.vertical_edge_ratio,
+            "horizontal_edge_ratio": desc.horizontal_edge_ratio,
+            "specular_highlight_ratio": desc.specular_highlight_ratio,
+            "spot_cluster_count": desc.spot_cluster_count,
+            "crest_symmetry_score": desc.crest_symmetry_score,
+            "crest_brightness": desc.crest_brightness,
+        },
+        "aspect_ratio_features": {
+            "aspect_ratio": desc.aspect_ratio,
+            "height_width_ratio": desc.height_width_ratio,
+            "morphological_profile": desc.morphological_profile,
+        },
+        "taxonomy": taxonomy_info,
+        "scores": scores,
     }
 
 
@@ -1202,6 +1793,13 @@ __all__ = [
     "get_material_spec",
     "get_region_expected_materials",
     "is_rejected_non_material",
+    "MaterialVisualDescriptor",
+    "compute_hsv_color_distribution",
+    "compute_3d_crest_texture",
+    "compute_aspect_ratio_features",
+    "extract_visual_descriptor",
+    "AION2_TAXONOMY_HIERARCHY",
+    "map_descriptors_to_taxonomy",
     "classify_3d_material_patch",
     "get_materials_db_summary",
     "get_materials_db_health_summary",

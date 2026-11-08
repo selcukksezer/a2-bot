@@ -558,8 +558,11 @@ class AdaptiveFramePacer:
         "APPROACHING": (20.0, 30.0),
         "GATHERING": (20.0, 30.0),
         "LOOTING": (20.0, 30.0),
-        "COMBAT": (15.0, 22.0),
-        "ATTACKING": (15.0, 22.0),
+        # Combat ticks must stay fast enough for ms-scale skill bursts (was 6–10 FPS /
+        # ~100–166ms idle between bursts — felt sticky with Tab+soft-aim overhead).
+        "COMBAT": (12.0, 18.0),
+        "ATTACKING": (12.0, 18.0),
+        "FIGHTING": (12.0, 18.0),
         "PAUSED": (2.0, 4.0),
         "BREAK": (2.0, 4.0),
         "AFK": (2.0, 4.0),

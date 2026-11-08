@@ -120,6 +120,135 @@ def _node_identifier(node: Any) -> Union[int, str]:
 
 
 # ==============================================================================
+# HEADING VS BEARING ALIGNMENT & TURN DAMPING (OSCILLATION PREVENTION)
+# ==============================================================================
+DEFAULT_DEADBAND_DEG: float = 6.0
+MIN_DEADBAND_DEG: float = 5.0
+MAX_DEADBAND_DEG: float = 8.0
+
+
+def compute_bearing(from_pos: Point2D, to_pos: Point2D) -> float:
+    """
+    Minimap / pusula koordinatlarında (0° = Kuzey, 90° = Doğu, 180° = Güney, 270° = Batı)
+    hedef kerteriz açısını (bearing) hesaplar.
+    Ekran koordinatlarında Y aşağı doğru büyüdüğünden, Kuzey = -Y yönüdür.
+    Böylece Kartezyen (0° = Doğu) ile Minimap ok yönü (0° = Kuzey) arasındaki
+    180° terslik (inversion) hatasını tamamen ortadan kaldırır.
+    """
+    dx = float(to_pos[0]) - float(from_pos[0])
+    dy = float(to_pos[1]) - float(from_pos[1])
+    if abs(dx) <= 1e-6 and abs(dy) <= 1e-6:
+        return 0.0
+    angle = math.degrees(math.atan2(dx, -dy))
+    return round((angle + 360.0) % 360.0, 2)
+
+
+def compute_angle_diff(target_bearing: float, player_heading: float) -> float:
+    """
+    Oyuncu yönünden (player_heading) hedef açıya (target_bearing) en kısa
+    dönüş yolunu (shortest rotational path) [-180.0°, +180.0°] aralığında hesaplar:
+        angle_diff = (target_bearing - player_heading + 180) % 360 - 180
+    Pozitif (+) değerler sağa (saat yönü), negatif (-) değerler sola dönüşü gösterir.
+    """
+    diff = (float(target_bearing) - float(player_heading) + 180.0) % 360.0 - 180.0
+    return round(diff, 2)
+
+
+def apply_turn_damping(
+    angle_diff: float,
+    deadband_deg: float = DEFAULT_DEADBAND_DEG,
+    min_turn_sec: float = 0.04,
+    max_turn_sec: float = 0.35,
+    max_error_deg: float = 180.0,
+) -> Dict[str, Any]:
+    """
+    Ölü bölge (deadband zone: ±5° ila ±8°) uygulayarak hedef kerterize yakınken
+    sağ-sol hızlı yalpalanmayı (oscillation) engeller. Açı hatasına göre dönüş
+    süresini pürüzsüz biçimde enterpole eder.
+    """
+    clamped_deadband = max(MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg)))
+    abs_err = abs(float(angle_diff))
+    in_deadband = bool(abs_err <= clamped_deadband)
+
+    if in_deadband:
+        return {
+            "angle_diff": round(float(angle_diff), 2),
+            "abs_error": round(abs_err, 2),
+            "in_deadband": True,
+            "turn_needed": False,
+            "turn_direction": "straight",
+            "turn_duration_sec": 0.0,
+            "deadband_deg": clamped_deadband,
+        }
+
+    direction = "right" if angle_diff > 0.0 else "left"
+    span = max(1.0, float(max_error_deg) - clamped_deadband)
+    norm = min(1.0, max(0.0, (abs_err - clamped_deadband) / span))
+    smooth_t = norm * norm * (3.0 - 2.0 * norm)
+    turn_duration = float(min_turn_sec) + smooth_t * (float(max_turn_sec) - float(min_turn_sec))
+
+    return {
+        "angle_diff": round(float(angle_diff), 2),
+        "abs_error": round(abs_err, 2),
+        "in_deadband": False,
+        "turn_needed": True,
+        "turn_direction": direction,
+        "turn_duration_sec": round(turn_duration, 4),
+        "deadband_deg": clamped_deadband,
+    }
+
+
+class TurnDampingController:
+    """
+    Yalpalanmayı önleyici durum denetleyicisi: ±5°..±8° ölü bölge uygular
+    ve dönüş sürelerini yumuşak enterpolasyonla sınırlar.
+    """
+    def __init__(
+        self,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+        min_turn_sec: float = 0.04,
+        max_turn_sec: float = 0.35,
+        reversal_cooldown_sec: float = 0.12,
+    ):
+        self.deadband_deg = max(MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg)))
+        self.min_turn_sec = float(min_turn_sec)
+        self.max_turn_sec = float(max_turn_sec)
+        self.reversal_cooldown_sec = float(reversal_cooldown_sec)
+        self.last_turn_direction: Optional[str] = None
+        self.last_turn_ts: float = 0.0
+
+    def calculate_turn(
+        self,
+        target_bearing: float,
+        player_heading: float,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        curr_ts = time.time() if now is None else float(now)
+        diff = compute_angle_diff(target_bearing, player_heading)
+        res = apply_turn_damping(
+            angle_diff=diff,
+            deadband_deg=self.deadband_deg,
+            min_turn_sec=self.min_turn_sec,
+            max_turn_sec=self.max_turn_sec,
+        )
+        if res["turn_needed"]:
+            if (
+                self.last_turn_direction is not None
+                and self.last_turn_direction != res["turn_direction"]
+                and (curr_ts - self.last_turn_ts) < self.reversal_cooldown_sec
+            ):
+                res["turn_duration_sec"] = round(res["turn_duration_sec"] * 0.65, 4)
+                res["reversal_damped"] = True
+            else:
+                res["reversal_damped"] = False
+            self.last_turn_direction = res["turn_direction"]
+            self.last_turn_ts = curr_ts
+        else:
+            res["reversal_damped"] = False
+        return res
+
+
+# ==============================================================================
 # MADDE 26 — 3B ENGEL AŞMA (PhaseCorrelate Jump + Strafe Unstuck Maneuver)
 # ==============================================================================
 class PhaseCorrelateUnstuckManeuver:
@@ -137,31 +266,41 @@ class PhaseCorrelateUnstuckManeuver:
     def __init__(
         self,
         stuck_threshold_px: float = 1.2,
-        stuck_duration_sec: float = 2.5,
+        stuck_duration_sec: float = 2.0,
         strafe_duration_sec: float = 1.2,
+        reverse_duration_sec: float = 1.2,
+        reverse_pivot_duration_sec: float = 0.4,
+        optical_flow_threshold_px: float = 0.6,
         minimap_roi: Tuple[int, int, int, int] = (1640, 40, 240, 240),
         center_mask_radius: int = 16,
     ) -> None:
         self.stuck_threshold_px: float = float(max(0.1, stuck_threshold_px))
         self.stuck_duration_sec: float = float(max(0.5, stuck_duration_sec))
         self.strafe_duration_sec: float = float(max(0.2, strafe_duration_sec))
+        self.reverse_duration_sec: float = float(max(0.2, reverse_duration_sec))
+        self.reverse_pivot_duration_sec: float = float(max(0.1, reverse_pivot_duration_sec))
+        self.optical_flow_threshold_px: float = float(max(0.1, optical_flow_threshold_px))
         self.minimap_roi: Tuple[int, int, int, int] = minimap_roi
         self.center_mask_radius: int = int(max(0, center_mask_radius))
 
         self._prev_terrain_f32: Optional[np.ndarray] = None
+        self._prev_viewport_gray: Optional[np.ndarray] = None
         self._hann_window: Optional[np.ndarray] = None
         self._stuck_start_ts: Optional[float] = None
         self._last_update_ts: Optional[float] = None
         self._unstuck_count: int = 0
         self._last_shift_px: float = 0.0
+        self._last_flow_px: float = 0.0
         self._recent_shifts: List[float] = []
 
     def reset(self) -> None:
-        """Faz korelasyon geçmişini ve takılma zamanlayıcısını sıfırlar."""
+        """Faz korelasyon geçmişini, optik akış referansını ve takılma zamanlayıcısını sıfırlar."""
         self._prev_terrain_f32 = None
+        self._prev_viewport_gray = None
         self._stuck_start_ts = None
         self._last_update_ts = None
         self._last_shift_px = 0.0
+        self._last_flow_px = 0.0
         self._recent_shifts.clear()
 
     def extract_minimap_terrain_gray(
@@ -238,16 +377,80 @@ class PhaseCorrelateUnstuckManeuver:
         shift_px = float(math.hypot(dx, dy))
         return shift_px, (float(dx), float(dy)), float(response)
 
+    def compute_viewport_optical_flow(
+        self,
+        frame: Optional[np.ndarray],
+        viewport_roi: Optional[Tuple[int, int, int, int]] = None,
+    ) -> float:
+        """
+        Karakter 3B dünyada ileri yürürken ekranın alt-orta koridorundaki
+        (yürünen zemin) optik akış (optical flow) büyüklüğünü hesaplar.
+        Karakter engele (kaya/ağaç/duvar) takıldığında zemin pikselleri akmayı durdurur.
+        """
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return 0.0
+        h, w = frame.shape[:2]
+        if h < 80 or w < 120:
+            return 0.0
+
+        if viewport_roi is not None:
+            vx, vy, vw, vh = viewport_roi
+            crop = frame[max(0, vy) : min(h, vy + vh), max(0, vx) : min(w, vx + vw)]
+        else:
+            # 3B alt koridor / zemin bölgesi
+            crop = frame[int(h * 0.55) : int(h * 0.85), int(w * 0.35) : int(w * 0.65)]
+
+        if crop.size == 0:
+            return 0.0
+
+        if crop.ndim == 3:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = crop.copy()
+
+        # Düşük hesaplama yükü için 80x45 boyutuna küçült
+        small_gray = cv2.resize(gray, (80, 45), interpolation=cv2.INTER_AREA)
+
+        if self._prev_viewport_gray is None or self._prev_viewport_gray.shape != small_gray.shape:
+            self._prev_viewport_gray = small_gray
+            return 1.0  # İlk kare referansı
+
+        try:
+            flow = cv2.calcOpticalFlowFarneback(
+                self._prev_viewport_gray,
+                small_gray,
+                None,
+                pyr_scale=0.5,
+                levels=2,
+                winsize=11,
+                iterations=2,
+                poly_n=5,
+                poly_sigma=1.1,
+                flags=0,
+            )
+            mag = float(np.mean(np.hypot(flow[..., 0], flow[..., 1])))
+        except Exception:
+            # Yedek: mutlak kare farkı üzerinden kaba hareket kestirimi
+            diff = cv2.absdiff(self._prev_viewport_gray, small_gray)
+            mag = float(np.mean(diff)) / 12.0
+
+        self._prev_viewport_gray = small_gray
+        self._last_flow_px = mag
+        return mag
+
     def update_walking_frame(
         self,
         frame_or_minimap: np.ndarray,
         is_walking: bool = True,
         now: Optional[float] = None,
         minimap_roi: Optional[Tuple[int, int, int, int]] = None,
+        viewport_roi: Optional[Tuple[int, int, int, int]] = None,
     ) -> Dict[str, Any]:
         """
         Karakter yürürken (`is_walking=True`, `W` basılı) her karede çağrılır.
-        `2.5 saniye` boyunca minimap arazi kayması `< 1.2 px` kalırsa `is_stuck=True` döndürür.
+        Minimap phaseCorrelate kayması (< 1.2 px) ve 3B koridor optik akışı
+        birlikte değerlendirilir; < 2.5s (varsayılan 2.0s) boyunca takılma sürerse
+        `is_stuck=True` döndürür.
         """
         curr_ts = time.time() if now is None else float(now)
 
@@ -256,6 +459,7 @@ class PhaseCorrelateUnstuckManeuver:
             return {
                 "is_stuck": False,
                 "shift_px": 0.0,
+                "flow_px": 0.0,
                 "dx": 0.0,
                 "dy": 0.0,
                 "stuck_elapsed_sec": 0.0,
@@ -269,11 +473,17 @@ class PhaseCorrelateUnstuckManeuver:
             return {
                 "is_stuck": False,
                 "shift_px": 0.0,
+                "flow_px": 0.0,
                 "dx": 0.0,
                 "dy": 0.0,
                 "stuck_elapsed_sec": 0.0,
                 "phase_response": 0.0,
             }
+
+        # Optik akış analizi (eğer tam ekran kare verilmişse)
+        flow_px = 0.0
+        if frame_or_minimap.ndim >= 2 and frame_or_minimap.shape[1] >= 300 and frame_or_minimap.shape[0] >= 200:
+            flow_px = self.compute_viewport_optical_flow(frame_or_minimap, viewport_roi=viewport_roi)
 
         if self._prev_terrain_f32 is None or self._prev_terrain_f32.shape != curr_terrain.shape:
             self._prev_terrain_f32 = curr_terrain
@@ -282,6 +492,7 @@ class PhaseCorrelateUnstuckManeuver:
             return {
                 "is_stuck": False,
                 "shift_px": 0.0,
+                "flow_px": round(flow_px, 4),
                 "dx": 0.0,
                 "dy": 0.0,
                 "stuck_elapsed_sec": 0.0,
@@ -299,7 +510,10 @@ class PhaseCorrelateUnstuckManeuver:
         if len(self._recent_shifts) > 30:
             self._recent_shifts.pop(0)
 
-        if shift_px < self.stuck_threshold_px:
+        # Takılma tespiti: minimap shift < eşik (1.2px)
+        minimap_stuck = shift_px < self.stuck_threshold_px
+
+        if minimap_stuck:
             if self._stuck_start_ts is None:
                 self._stuck_start_ts = curr_ts
             stuck_elapsed = max(0.0, curr_ts - self._stuck_start_ts)
@@ -311,11 +525,120 @@ class PhaseCorrelateUnstuckManeuver:
         return {
             "is_stuck": is_stuck,
             "shift_px": round(shift_px, 4),
+            "flow_px": round(flow_px, 4),
             "dx": round(dx, 4),
             "dy": round(dy, 4),
             "stuck_elapsed_sec": round(stuck_elapsed, 3),
             "phase_response": round(response, 4),
         }
+
+    def execute_jump(
+        self,
+        input_controller: Any = None,
+        wait_fn: Optional[Callable[[float], None]] = None,
+    ) -> bool:
+        """Fiziksel zıplama (Space) komutunu yürütür."""
+        fn = wait_fn if callable(wait_fn) else (lambda s: None)
+        if input_controller is not None:
+            if hasattr(input_controller, "tap_key") and callable(input_controller.tap_key):
+                input_controller.tap_key("space")
+            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+                input_controller.press_key("space")
+            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+                input_controller.key_down("space")
+                fn(0.06)
+                input_controller.key_up("space")
+        return True
+
+    def execute_lateral_strafe(
+        self,
+        strafe_key: str = "a",
+        duration: Optional[float] = None,
+        input_controller: Any = None,
+        wait_fn: Optional[Callable[[float], None]] = None,
+    ) -> bool:
+        """Yanal sıyrılma (A+W veya D+W strafe) manevrasını yürütür."""
+        dur = float(duration if duration is not None else self.strafe_duration_sec)
+        fn = wait_fn if callable(wait_fn) else (lambda s: None)
+        k = strafe_key.lower()
+        if input_controller is not None:
+            if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
+                input_controller.hold_keys([k, "w"], duration=dur)
+            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+                input_controller.key_down("w")
+                input_controller.key_down(k)
+                fn(dur)
+                input_controller.key_up(k)
+                input_controller.key_up("w")
+            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+                input_controller.press_key(k)
+                input_controller.press_key("w")
+                fn(dur)
+        else:
+            fn(dur)
+        return True
+
+    def execute_reverse_backout(
+        self,
+        duration: Optional[float] = None,
+        pivot_direction: str = "a",
+        input_controller: Any = None,
+        wait_fn: Optional[Callable[[float], None]] = None,
+    ) -> bool:
+        """
+        Fiziksel geri çekilme (reverse-backout) manevrası:
+        1. W tuşunu bırak.
+        2. S tuşu ile geri geri yürü (1.0 - 1.2 sn).
+        3. S + A/D ile kuyruk açısı vererek engelin köşesinden çık (0.4 sn).
+        4. Space ile zıpla (tümsek/kök kurtarma).
+        """
+        dur = float(duration if duration is not None else self.reverse_duration_sec)
+        pivot_dur = float(self.reverse_pivot_duration_sec)
+        fn = wait_fn if callable(wait_fn) else (lambda s: None)
+        pk = pivot_direction.lower()
+
+        if input_controller is not None:
+            # 1. W tuşunu güvenli bırak
+            if hasattr(input_controller, "release_key") and callable(input_controller.release_key):
+                input_controller.release_key("w")
+            elif hasattr(input_controller, "key_up") and callable(input_controller.key_up):
+                input_controller.key_up("w")
+
+            # 2. S ile geri çık
+            if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
+                input_controller.hold_keys(["s"], duration=dur)
+            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+                input_controller.key_down("s")
+                fn(dur)
+                input_controller.key_up("s")
+            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+                input_controller.press_key("s")
+                fn(dur)
+            else:
+                fn(dur)
+
+            # 3. Yanal geri dönüş (S + A veya S + D)
+            if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
+                input_controller.hold_keys(["s", pk], duration=pivot_dur)
+            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+                input_controller.key_down("s")
+                input_controller.key_down(pk)
+                fn(pivot_dur)
+                input_controller.key_up(pk)
+                input_controller.key_up("s")
+            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+                input_controller.press_key("s")
+                input_controller.press_key(pk)
+                fn(pivot_dur)
+            else:
+                fn(pivot_dur)
+
+            # 4. Zıpla
+            self.execute_jump(input_controller=input_controller, wait_fn=fn)
+        else:
+            fn(dur + pivot_dur)
+
+        return True
 
     def execute_unstuck_sequence(
         self,
@@ -324,87 +647,159 @@ class PhaseCorrelateUnstuckManeuver:
         current_angle_deg: Optional[float] = None,
         realign_callback: Optional[Callable[[Optional[float]], None]] = None,
         sleep_fn: Optional[Callable[[float], None]] = None,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+        maneuver_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Takılma tespit edildiğinde tam olarak şu sırayı uygular:
-            1. `Space` (Zıpla)
-            2. `A + W` (`1.2 sn` ileri-sol strafe; ardışık denemelerde `D + W` ile dönüşümlü)
-            3. Hedefe doğru yeniden hizalanma (`re-align toward target`)
+        Takılma tespit edildiğinde fiziksel kurtulma manevralarını uygular:
+        - maneuver_type="jump": Sadece Zıpla (Space).
+        - maneuver_type="lateral_strafe": Yanal strafe (A+W veya D+W).
+        - maneuver_type="reverse_backout": Geri çekilme (Stop W -> S -> S+A/D -> Space -> Realign).
+        - maneuver_type=None (otomatik kademelendirme):
+            1. deneme: Space -> A + W (1.2s) -> Realign
+            2. deneme: Space -> D + W (1.2s) -> Realign
+            3. deneme: Reverse-Backout (Stop W -> S 1.2s -> S+A 0.4s -> Space -> Realign)
+            4. deneme: Extended Reverse + Request Repath
         """
-        strafe_key = "a" if (self._unstuck_count % 2 == 0) else "d"
+        tier = (self._unstuck_count) % 4
         self._unstuck_count += 1
         wait_fn = sleep_fn if callable(sleep_fn) else (lambda s: None)
 
-        actions_taken: List[str] = []
-
-        # 1. SPACE (Zıpla)
-        actions_taken.append("SPACE")
-        if input_controller is not None:
-            if hasattr(input_controller, "tap_key") and callable(input_controller.tap_key):
-                input_controller.tap_key("space")
-            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
-                input_controller.press_key("space")
-            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
-                input_controller.key_down("space")
-                wait_fn(0.06)
-                input_controller.key_up("space")
-
-        # 2. A + W (veya dönüşümlü D + W) 1.2s ileri-strafe
-        combo_label = f"{strafe_key.upper()}+W"
-        actions_taken.append(combo_label)
-        if input_controller is not None:
-            if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
-                input_controller.hold_keys([strafe_key, "w"], duration=self.strafe_duration_sec)
-            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
-                input_controller.key_down("w")
-                input_controller.key_down(strafe_key)
-                wait_fn(self.strafe_duration_sec)
-                input_controller.key_up(strafe_key)
-                input_controller.key_up("w")
-            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
-                input_controller.press_key(strafe_key)
-                input_controller.press_key("w")
-                wait_fn(self.strafe_duration_sec)
+        # Manevra türü belirleme
+        chosen_maneuver = maneuver_type
+        if chosen_maneuver is None:
+            if tier == 0:
+                chosen_maneuver = "jump_strafe"
+                strafe_key = "a"
+            elif tier == 1:
+                chosen_maneuver = "jump_strafe"
+                strafe_key = "d"
+            elif tier == 2:
+                chosen_maneuver = "reverse_backout"
+                strafe_key = "a"
+            else:
+                chosen_maneuver = "repath"
+                strafe_key = "d"
         else:
-            wait_fn(self.strafe_duration_sec)
+            strafe_key = "a" if (self._unstuck_count % 2 == 1) else "d"
 
-        # 3. Hedefe yeniden hizalanma (Re-align toward target)
+        actions_taken: List[str] = []
+        combo_label = f"{strafe_key.upper()}+W"
+        request_repath = False
+
+        if chosen_maneuver == "jump":
+            actions_taken.append("SPACE")
+            self.execute_jump(input_controller=input_controller, wait_fn=wait_fn)
+
+        elif chosen_maneuver == "lateral_strafe":
+            actions_taken.append(combo_label)
+            self.execute_lateral_strafe(
+                strafe_key=strafe_key,
+                duration=self.strafe_duration_sec,
+                input_controller=input_controller,
+                wait_fn=wait_fn,
+            )
+
+        elif chosen_maneuver == "reverse_backout":
+            actions_taken.extend(["STOP_W", "REVERSE_S", "REVERSE_STRAFE", "SPACE"])
+            self.execute_reverse_backout(
+                duration=self.reverse_duration_sec,
+                pivot_direction=strafe_key,
+                input_controller=input_controller,
+                wait_fn=wait_fn,
+            )
+
+        elif chosen_maneuver == "repath":
+            request_repath = True
+            actions_taken.extend(["STOP_W", "EXTENDED_REVERSE", "PIVOT_90", "SPACE", "REQUEST_REPATH"])
+            self.execute_reverse_backout(
+                duration=self.reverse_duration_sec * 1.3,
+                pivot_direction=strafe_key,
+                input_controller=input_controller,
+                wait_fn=wait_fn,
+            )
+            if input_controller is not None and hasattr(input_controller, "turn_by_angle") and callable(input_controller.turn_by_angle):
+                turn_deg = 90.0 if strafe_key == "d" else -90.0
+                try:
+                    input_controller.turn_by_angle(turn_deg, duration=0.25)
+                except TypeError:
+                    input_controller.turn_by_angle(turn_deg)
+
+        else:
+            # Default "jump_strafe" (Tier 0 & 1): Space -> A+W/D+W
+            actions_taken.append("SPACE")
+            self.execute_jump(input_controller=input_controller, wait_fn=wait_fn)
+
+            actions_taken.append(combo_label)
+            self.execute_lateral_strafe(
+                strafe_key=strafe_key,
+                duration=self.strafe_duration_sec,
+                input_controller=input_controller,
+                wait_fn=wait_fn,
+            )
+
+        # Hedefe yeniden hizalanma (Re-align toward target via shortest rotational path + deadband)
         actions_taken.append("REALIGN")
         angle_delta = 0.0
+        damped_turn: Optional[Dict[str, Any]] = None
+        realigned_flag = False
+
         if target_angle_deg is not None and current_angle_deg is not None:
             angle_delta = ((float(target_angle_deg) - float(current_angle_deg) + 180.0) % 360.0) - 180.0
+            damped_turn = apply_turn_damping(angle_delta, deadband_deg=deadband_deg)
 
-        if callable(realign_callback):
+        if callable(realign_callback) and target_angle_deg is not None:
             realign_callback(target_angle_deg)
-        elif input_controller is not None:
-            if hasattr(input_controller, "realign_to_target") and callable(
-                input_controller.realign_to_target
-            ):
-                input_controller.realign_to_target(target_angle_deg)
-            elif hasattr(input_controller, "turn_by_angle") and callable(
-                input_controller.turn_by_angle
-            ):
-                input_controller.turn_by_angle(angle_delta)
+            realigned_flag = True
+        elif input_controller is not None and target_angle_deg is not None:
+            if damped_turn is None or damped_turn["turn_needed"]:
+                if hasattr(input_controller, "realign_to_target") and callable(
+                    input_controller.realign_to_target
+                ):
+                    input_controller.realign_to_target(target_angle_deg)
+                    realigned_flag = True
+                elif hasattr(input_controller, "turn_by_angle") and callable(
+                    input_controller.turn_by_angle
+                ):
+                    turn_dur = damped_turn.get("turn_duration_sec") if damped_turn else None
+                    try:
+                        input_controller.turn_by_angle(angle_delta, duration=turn_dur)
+                    except TypeError:
+                        input_controller.turn_by_angle(angle_delta)
+                    realigned_flag = True
+            else:
+                realigned_flag = True
+        else:
+            realigned_flag = True
 
         # Takılma sayacını sıfırla ki yeni manevra sonrası temiz ölçüm başlasın
         self._stuck_start_ts = None
 
         logger.info(
-            "3B Engel Aşma (Unstuck #%d) uygulandı: %s (strafe=%.2fs, açı_farkı=%.1f°)",
+            "Fiziksel Kurtulma (#%d, manevra=%s) uygulandı: %s (strafe=%.2fs, açı_farkı=%.1f°, ölü_bölge=%s, repath=%s)",
             self._unstuck_count,
+            chosen_maneuver,
             " -> ".join(actions_taken),
             self.strafe_duration_sec,
             angle_delta,
+            bool(damped_turn and damped_turn.get("in_deadband")),
+            request_repath,
         )
 
         return {
             "executed": True,
+            "maneuver_type": chosen_maneuver,
             "sequence": actions_taken,
             "strafe_key": strafe_key,
             "strafe_combo": combo_label,
             "strafe_duration_sec": self.strafe_duration_sec,
-            "realigned": True,
+            "reverse_duration_sec": self.reverse_duration_sec if "REVERSE" in str(actions_taken) else 0.0,
+            "request_repath": bool(request_repath),
+            "realigned": bool(realigned_flag),
             "angle_delta_deg": round(angle_delta, 2),
+            "in_deadband": bool(damped_turn.get("in_deadband", False)) if damped_turn else False,
+            "turn_needed": bool(damped_turn.get("turn_needed", True)) if damped_turn else True,
+            "turn_duration_sec": float(damped_turn.get("turn_duration_sec", 0.0)) if damped_turn else 0.0,
             "unstuck_count": self._unstuck_count,
         }
 
@@ -1150,6 +1545,7 @@ class CorridorNavigator:
         prewalk_scheduler: Optional[PredictivePreWalkScheduler] = None,
         drift_corrector: Optional[CentroidDriftCorrector] = None,
         contested_detector: Optional[ContestedNodeDetector] = None,
+        turn_damper: Optional[TurnDampingController] = None,
     ) -> None:
         self.route_planner = route_planner
         self.unstuck_maneuver = unstuck_maneuver or PhaseCorrelateUnstuckManeuver()
@@ -1157,6 +1553,268 @@ class CorridorNavigator:
         self.prewalk_scheduler = prewalk_scheduler or PredictivePreWalkScheduler()
         self.drift_corrector = drift_corrector or CentroidDriftCorrector()
         self.contested_detector = contested_detector or ContestedNodeDetector()
+        self.turn_damper = turn_damper or TurnDampingController()
+
+    def compute_bearing(self, from_pos: Point2D, to_pos: Point2D) -> float:
+        """Calculates compass bearing (0°=North, 90°=East) from from_pos to to_pos."""
+        return compute_bearing(from_pos, to_pos)
+
+    def compute_angle_diff(self, target_bearing: float, player_heading: float) -> float:
+        """Calculates shortest rotational angle difference in [-180°..+180°]."""
+        return compute_angle_diff(target_bearing, player_heading)
+
+    def apply_turn_damping(
+        self,
+        angle_diff: float,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+        min_turn_sec: float = 0.04,
+        max_turn_sec: float = 0.35,
+    ) -> Dict[str, Any]:
+        """Applies deadband zone (±5° to ±8°) and smooth turn duration interpolation."""
+        return apply_turn_damping(
+            angle_diff=angle_diff,
+            deadband_deg=deadband_deg,
+            min_turn_sec=min_turn_sec,
+            max_turn_sec=max_turn_sec,
+        )
+
+    def calculate_turn(
+        self,
+        player_heading: float,
+        target_bearing: float,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+    ) -> Dict[str, Any]:
+        """Calculates damped steering turn command towards target bearing."""
+        diff = compute_angle_diff(target_bearing, player_heading)
+        return apply_turn_damping(diff, deadband_deg=deadband_deg)
+
+    def evaluate_corridor_path(
+        self,
+        frame: Optional[np.ndarray],
+        yolo_detections: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Evaluates the forward walking corridor in the lower-middle 3D viewport
+        (y: 0.52..0.82, x: 0.28..0.72) across 3 sub-lanes (Left, Center, Right):
+        - Compares patches against learned obstacles (14: obstacle) and monsters (10: monster_3d)
+        - Compares patches against learned walkable ground paths (15: path_ground)
+        - Incorporates live YOLO detections (class 14, 10, 15) when available
+        - Calculates steering adjustment (left bias, right bias, or center clear).
+        Returns: {
+            "obstacle_detected": bool,
+            "monster_detected": bool,
+            "path_detected": bool,
+            "steering_bias": str ("clear", "steer_left", "steer_right"),
+            "recommended_turn_offset_deg": float,
+            "lane_scores": {"left": float, "center": float, "right": float},
+        }
+        """
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return {
+                "obstacle_detected": False,
+                "monster_detected": False,
+                "path_detected": False,
+                "steering_bias": "clear",
+                "recommended_turn_offset_deg": 0.0,
+                "lane_scores": {"left": 0.5, "center": 0.5, "right": 0.5},
+            }
+
+        try:
+            from dataset_factory.exemplar_memory import get_exemplar_memory
+            mem = get_exemplar_memory()
+        except Exception:
+            mem = None
+
+        h, w = frame.shape[:2]
+        y1, y2 = int(h * 0.52), int(h * 0.82)
+        lanes = {
+            "left": (int(w * 0.28), int(w * 0.44)),
+            "center": (int(w * 0.44), int(w * 0.56)),
+            "right": (int(w * 0.56), int(w * 0.72)),
+        }
+
+        lane_scores = {"left": 0.50, "center": 0.50, "right": 0.50}
+        obstacle_detected = False
+        monster_detected = False
+        path_detected = False
+
+        # 1. Visual Patch Scanning via ExemplarMemory
+        for lane_name, (lx1, lx2) in lanes.items():
+            patch = frame[y1:y2, lx1:lx2]
+            if patch.size == 0:
+                continue
+
+            score = 0.50
+
+            if mem is not None:
+                # Negative exemplar check (rejected false targets / impassable rocks)
+                is_neg, neg_sim, _ = mem.is_negative_patch(patch, threshold=0.72)
+                if is_neg:
+                    obstacle_detected = True
+                    score -= 0.40 * float(neg_sim)
+
+                # Class-specific positive exemplar checks:
+                # 14: obstacle
+                obs_sim, _ = mem.match_class(patch, class_id=14)
+                if obs_sim >= 0.70:
+                    obstacle_detected = True
+                    score -= 0.50 * float(obs_sim)
+
+                # 10: monster_3d (steer around aggro/patrol monsters while pathing)
+                mob_sim, _ = mem.match_class(patch, class_id=10)
+                if mob_sim >= 0.70:
+                    monster_detected = True
+                    score -= 0.60 * float(mob_sim)
+
+                # 15: path_ground (walkable ground corridor)
+                ground_sim, _ = mem.match_class(patch, class_id=15)
+                if ground_sim >= 0.68:
+                    path_detected = True
+                    score += 0.45 * float(ground_sim)
+
+                # General positive exemplar classification fallback
+                pos_cid, pos_cname, pos_sim = mem.classify_patch(patch, min_sim=0.70)
+                if pos_cid is not None:
+                    cname_low = str(pos_cname or "").lower()
+                    if pos_cid == 14 or "obstacle" in cname_low or "engel" in cname_low:
+                        obstacle_detected = True
+                        score -= 0.50 * float(pos_sim)
+                    elif pos_cid == 10 or "monster" in cname_low or "mob" in cname_low:
+                        monster_detected = True
+                        score -= 0.60 * float(pos_sim)
+                    elif pos_cid == 15 or "path" in cname_low or "ground" in cname_low:
+                        path_detected = True
+                        score += 0.40 * float(pos_sim)
+
+            lane_scores[lane_name] = round(float(np.clip(score, 0.05, 0.95)), 3)
+
+        # 2. Live YOLO Detections Integration (class 14, 10, 15)
+        if yolo_detections:
+            for det in yolo_detections:
+                if not isinstance(det, dict):
+                    continue
+                cid = det.get("class_id")
+                cname = str(det.get("class_name", "")).lower()
+                conf = float(det.get("confidence", 0.70))
+
+                cx, cy = None, None
+                if "cx" in det and "cy" in det:
+                    cx, cy = float(det["cx"]), float(det["cy"])
+                elif "bbox" in det and len(det["bbox"]) == 4:
+                    b = det["bbox"]
+                    if max(b) <= 1.0:
+                        cx, cy = float(b[0]), float(b[1])
+                    else:
+                        cx, cy = float(b[0]) / float(w), float(b[1]) / float(h)
+                elif "bbox_xyxy" in det and len(det["bbox_xyxy"]) == 4:
+                    b = det["bbox_xyxy"]
+                    cx = (float(b[0]) + float(b[2])) / (2.0 * float(w))
+                    cy = (float(b[1]) + float(b[3])) / (2.0 * float(h))
+                elif "bbox_xywh" in det and len(det["bbox_xywh"]) == 4:
+                    b = det["bbox_xywh"]
+                    cx = (float(b[0]) + 0.5 * float(b[2])) / float(w)
+                    cy = (float(b[1]) + 0.5 * float(b[3])) / float(h)
+
+                if cx is None or cy is None or not (0.30 <= cy <= 0.95):
+                    continue
+
+                det_lane = None
+                if 0.20 <= cx < 0.44:
+                    det_lane = "left"
+                elif 0.44 <= cx <= 0.56:
+                    det_lane = "center"
+                elif 0.56 < cx <= 0.80:
+                    det_lane = "right"
+
+                if not det_lane:
+                    continue
+
+                is_obstacle = (cid == 14) or ("obstacle" in cname) or ("engel" in cname)
+                is_monster = (cid == 10) or ("monster" in cname) or ("mob" in cname)
+                is_path = (cid == 15) or ("path_ground" in cname) or ("path" in cname and "ground" in cname)
+
+                if is_obstacle:
+                    obstacle_detected = True
+                    lane_scores[det_lane] = round(float(np.clip(lane_scores[det_lane] - 0.45 * conf, 0.05, 0.95)), 3)
+                elif is_monster:
+                    monster_detected = True
+                    lane_scores[det_lane] = round(float(np.clip(lane_scores[det_lane] - 0.55 * conf, 0.05, 0.95)), 3)
+                elif is_path:
+                    path_detected = True
+                    lane_scores[det_lane] = round(float(np.clip(lane_scores[det_lane] + 0.40 * conf, 0.05, 0.95)), 3)
+
+        c_score = lane_scores["center"]
+        l_score = lane_scores["left"]
+        r_score = lane_scores["right"]
+
+        steering_bias = "clear"
+        turn_offset = 0.0
+
+        # Avoid hazards in center corridor or reverse if all lanes are blocked
+        if c_score < 0.35 and l_score < 0.35 and r_score < 0.35:
+            steering_bias = "reverse_needed"
+            turn_offset = 180.0
+        elif c_score < 0.42 or (obstacle_detected and c_score < max(l_score, r_score)) or (monster_detected and c_score < 0.45):
+            if l_score >= r_score:
+                steering_bias = "steer_left"
+                turn_offset = -20.0 if monster_detected else -18.0
+            else:
+                steering_bias = "steer_right"
+                turn_offset = 20.0 if monster_detected else 18.0
+        elif path_detected:
+            # Walkable ground preference: steer towards the best ground corridor
+            best_lane = max(lane_scores, key=lambda k: lane_scores[k])
+            if best_lane == "left" and l_score > c_score + 0.12:
+                steering_bias = "steer_left"
+                turn_offset = -10.0
+            elif best_lane == "right" and r_score > c_score + 0.12:
+                steering_bias = "steer_right"
+                turn_offset = 10.0
+
+        return {
+            "obstacle_detected": obstacle_detected,
+            "monster_detected": monster_detected,
+            "path_detected": path_detected,
+            "steering_bias": steering_bias,
+            "recommended_turn_offset_deg": turn_offset,
+            "lane_scores": lane_scores,
+            "clear_terrain_found": bool(max(lane_scores.values()) >= 0.45),
+        }
+
+    def steer_step(
+        self,
+        current_pos: Point2D,
+        target_pos: Point2D,
+        player_heading: float,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+        frame: Optional[np.ndarray] = None,
+        yolo_detections: Optional[Sequence[Dict[str, Any]]] = None,
+        live_detections: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, Any]:
+        """Calculates bearing, shortest angular error, and damped turn command with obstacle avoidance."""
+        bearing = compute_bearing(current_pos, target_pos)
+        dets = yolo_detections if yolo_detections is not None else live_detections
+        corridor_eval = (
+            self.evaluate_corridor_path(frame, yolo_detections=dets)
+            if frame is not None
+            else None
+        )
+        adjusted_bearing = bearing
+        if corridor_eval and corridor_eval.get("recommended_turn_offset_deg"):
+            adjusted_bearing = (bearing + corridor_eval["recommended_turn_offset_deg"] + 360.0) % 360.0
+
+        turn_data = self.calculate_turn(
+            player_heading=player_heading,
+            target_bearing=adjusted_bearing,
+            deadband_deg=deadband_deg,
+        )
+        return {
+            "target_bearing": bearing,
+            "adjusted_bearing": adjusted_bearing,
+            "player_heading": round(float(player_heading), 2),
+            "corridor_eval": corridor_eval,
+            **turn_data,
+        }
 
     def step_navigation(
         self,
@@ -1172,19 +1830,34 @@ class CorridorNavigator:
         target_angle_deg: Optional[float] = None,
         current_angle_deg: Optional[float] = None,
         now: Optional[float] = None,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+        yolo_detections: Optional[Sequence[Dict[str, Any]]] = None,
+        live_detections: Optional[Sequence[Any]] = None,
+        force_unstick_maneuver: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Her navigasyon adımında:
         1. Hedef düğümde rakip oyuncu (`ContestedNodeDetector`) varsa anında
            sıradaki (`Next in Sequence`) düğüme geçer.
-        2. Yürürken (`W` basılı) minimap `cv2.phaseCorrelate` ile `2.5 sn` boyunca `< 1.2 px`
-           kayma tespit edilirse `Space -> A+W (1.2s) -> Realign` kurtulma manevrasını tetikler.
+        2. Yürürken (`W` basılı) minimap `cv2.phaseCorrelate` + optik akış ile `< 2.5 sn`
+           kayma tespit edilirse fiziksel kurtulma (jump, lateral strafe, reverse-backout) uygular.
+        3. Açısal hizalama ve ±5°..±8° ölü bölge sönümlemesiyle yalpalanmayı önler.
+        4. İleri koridor görsel analizi (engel/canavar kaçınma, patika zemin önceliği).
         """
         curr_ts = time.time() if now is None else float(now)
         node_list = list(nodes) if nodes else []
         n = len(node_list)
         active_idx = int(current_seq_pos) % n if (n > 0 and current_seq_pos >= 0) else 0
         active_node = node_list[active_idx] if n > 0 else None
+
+        # Turn evaluation if angles are provided
+        turn_eval: Optional[Dict[str, Any]] = None
+        if target_angle_deg is not None and current_angle_deg is not None:
+            turn_eval = self.calculate_turn(
+                player_heading=current_angle_deg,
+                target_bearing=target_angle_deg,
+                deadband_deg=deadband_deg,
+            )
 
         # Madde 30: Rakip oyuncu kontrolü
         if (
@@ -1208,11 +1881,20 @@ class CorridorNavigator:
                 "unstuck_triggered": False,
                 "selected_node": next_node,
                 "selected_index": next_idx,
+                "turn_evaluation": turn_eval,
             }
 
-        # Madde 26: 3B Engel Aşma (PhaseCorrelate Unstuck)
+        # Madde 26: 3B Engel Aşma & Fiziksel Kurtulma (PhaseCorrelate + Optical Flow Unstuck)
         unstuck_result: Optional[Dict[str, Any]] = None
-        if frame is not None and is_walking:
+        if force_unstick_maneuver:
+            unstuck_result = self.unstuck_maneuver.execute_unstuck_sequence(
+                input_controller=input_controller,
+                target_angle_deg=target_angle_deg,
+                current_angle_deg=current_angle_deg,
+                deadband_deg=deadband_deg,
+                maneuver_type=force_unstick_maneuver,
+            )
+        elif frame is not None and is_walking:
             walk_state = self.unstuck_maneuver.update_walking_frame(
                 frame, is_walking=True, now=curr_ts
             )
@@ -1221,16 +1903,109 @@ class CorridorNavigator:
                     input_controller=input_controller,
                     target_angle_deg=target_angle_deg,
                     current_angle_deg=current_angle_deg,
+                    deadband_deg=deadband_deg,
                 )
+
+        dets = yolo_detections if yolo_detections is not None else live_detections
+        corridor_eval = (
+            self.evaluate_corridor_path(frame, yolo_detections=dets)
+            if frame is not None
+            else None
+        )
+
+        # Eğer koridor tamamen tıkalıysa ve yürünüyorsa acil reverse-backout tetikle
+        if (
+            corridor_eval
+            and corridor_eval.get("steering_bias") == "reverse_needed"
+            and not unstuck_result
+            and is_walking
+        ):
+            unstuck_result = self.unstuck_maneuver.execute_unstuck_sequence(
+                input_controller=input_controller,
+                target_angle_deg=target_angle_deg,
+                current_angle_deg=current_angle_deg,
+                deadband_deg=deadband_deg,
+                maneuver_type="reverse_backout",
+            )
+
+        if (
+            corridor_eval
+            and corridor_eval.get("recommended_turn_offset_deg")
+            and target_angle_deg is not None
+            and current_angle_deg is not None
+            and not unstuck_result
+        ):
+            adjusted_target_angle = (target_angle_deg + corridor_eval["recommended_turn_offset_deg"] + 360.0) % 360.0
+            turn_eval = self.calculate_turn(
+                player_heading=current_angle_deg,
+                target_bearing=adjusted_target_angle,
+                deadband_deg=deadband_deg,
+            )
+            turn_eval["corridor_adjusted"] = True
+            turn_eval["original_target_bearing"] = target_angle_deg
+
+        repath_requested = bool(unstuck_result.get("request_repath", False)) if unstuck_result else False
+        selected_node = active_node
+        selected_index = active_idx if n > 0 else -1
+
+        if repath_requested:
+            next_node, next_idx = self._advance_to_next_node(
+                node_list,
+                active_idx,
+                player_pos=player_pos,
+                is_flying=is_flying,
+                player_altitude_band=player_altitude_band,
+                now=curr_ts,
+            )
+            selected_node = next_node
+            selected_index = next_idx
 
         return {
             "status": "unstuck_executed" if unstuck_result else "navigating",
             "contested": False,
             "unstuck_triggered": bool(unstuck_result is not None),
             "unstuck_info": unstuck_result,
-            "selected_node": active_node,
-            "selected_index": active_idx if n > 0 else -1,
+            "selected_node": selected_node,
+            "selected_index": selected_index,
+            "turn_evaluation": turn_eval,
+            "corridor_eval": corridor_eval,
+            "repath_requested": repath_requested,
         }
+
+    def execute_physical_unstick(
+        self,
+        maneuver_type: str = "reverse_backout",
+        input_controller: Any = None,
+        target_angle_deg: Optional[float] = None,
+        current_angle_deg: Optional[float] = None,
+        deadband_deg: float = DEFAULT_DEADBAND_DEG,
+    ) -> Dict[str, Any]:
+        """Fiziksel kurtulma manevrasını (jump, lateral strafe, reverse-backout) doğrudan çalıştırır."""
+        return self.unstuck_maneuver.execute_unstuck_sequence(
+            input_controller=input_controller,
+            target_angle_deg=target_angle_deg,
+            current_angle_deg=current_angle_deg,
+            deadband_deg=deadband_deg,
+            maneuver_type=maneuver_type,
+        )
+
+    def is_corridor_clear(
+        self,
+        frame: Optional[np.ndarray],
+        live_detections: Optional[Sequence[Any]] = None,
+    ) -> bool:
+        """İleri koridorun engellerden ve canavarlardan tamamen temiz olup olmadığını döndürür."""
+        eval_res = self.evaluate_corridor_path(frame, yolo_detections=live_detections)
+        return bool(eval_res.get("steering_bias") == "clear" and not eval_res.get("obstacle_detected") and not eval_res.get("monster_detected"))
+
+    def get_corridor_steering_recommendation(
+        self,
+        frame: Optional[np.ndarray],
+        live_detections: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, Any]:
+        """İleri koridor için sapma açısı ve şerit puanlarını döndürür."""
+        return self.evaluate_corridor_path(frame, yolo_detections=live_detections)
+
 
     def on_gather_success(
         self,
@@ -1321,7 +2096,22 @@ class CorridorNavigator:
 
 
 def get_corridor_navigator_capabilities() -> list:
-    return ["corridor_navigator", "corridor_steering", "diagnostic_snapshot"]
+    return [
+        "corridor_navigator",
+        "corridor_steering",
+        "heading_alignment",
+        "turn_damping",
+        "diagnostic_snapshot",
+        "obstacle_avoidance",
+        "monster_avoidance",
+        "ground_path_steering",
+        "optical_flow_stuck_detection",
+        "physical_unstick_recovery",
+        "reverse_backout",
+    ]
+
+
+CorridorStuckDetector = PhaseCorrelateUnstuckManeuver
 
 
 def validate_corridor_navigator_contract() -> bool:

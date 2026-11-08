@@ -1,7 +1,7 @@
 task: detect
 mode: train
 model: yolov8n.pt
-data: C:\Users\selçuk\Desktop\a2\dataset\data.yaml
+data: F:\a2\dataset\data.yaml
 epochs: 6
 time: null
 patience: 15
@@ -111,4 +111,4 @@ auto_augment: randaugment
 erasing: 0.4
 cfg: null
 tracker: tracktrack.yaml
-save_dir: C:\Users\selçuk\Desktop\a2\runs\detect\models\rtx_runs\gatherion_rtx_fp16
+save_dir: F:\a2\runs\detect\models\rtx_runs\gatherion_rtx_fp16

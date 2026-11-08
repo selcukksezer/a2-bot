@@ -98,6 +98,15 @@ class CombatRecovery:
     # Saldırı tuş havuzu
     COMBAT_SKILL_KEYS: Tuple[str, ...] = ("1", "2", "3", "4", "q", "e", "r")
 
+    # Olive-green mob detection HSV threshold bounds (AION 2 Yellow-Maned Zaif, Sparkie, etc.)
+    OLIVE_MOB_HUE_MIN: int = 26
+    OLIVE_MOB_HUE_MAX: int = 68
+    OLIVE_MOB_SAT_MIN: int = 80
+    OLIVE_MOB_VAL_MIN: int = 80
+
+    # Fast TAB acquisition timing
+    FAST_TAB_INTERVAL_SEC: float = 0.55
+
     def __init__(
         self,
         fly_unreachable: Any = True,
@@ -140,18 +149,33 @@ class CombatRecovery:
         )
         self.last_status_message: str = "IDLE"
 
+        # Fast TAB cycling and 1-frame targeting flicker grace
+        self.fast_tab_interval_sec: float = float(self.FAST_TAB_INTERVAL_SEC)
+        self.last_tab_time: float = 0.0
+        self.tab_cycle_count: int = 0
+        self.max_flicker_grace_ticks: int = 1
+        self._flicker_grace_counter: int = 0
+        self.is_flicker_grace_active: bool = False
+        self._last_raw_target_detected: bool = False
+        self._last_grace_tick_ts: float = 0.0
+
         # Anti-AFK zamanlayıcıları
         self.last_anti_afk_time: float = time.monotonic()
         self.next_anti_afk_interval_sec: float = random.uniform(
             self.anti_afk_min_interval_sec, self.anti_afk_max_interval_sec
         )
         self._anti_afk_step_counter: int = 0
+        self._fight_step_counter: int = 0
+        self._fight_skill_idx: int = 0
+        self._no_target_steps: int = 0
 
         logger.info(
-            "CombatRecovery başlatıldı | fly_unreachable=%s | anti_afk=[%.0fs..%.0fs]",
+            "CombatRecovery başlatıldı | fly_unreachable=%s | anti_afk=[%.0fs..%.0fs] | fast_tab=%.2fs | flicker_grace=%d",
             self.fly_unreachable,
             self.anti_afk_min_interval_sec,
             self.anti_afk_max_interval_sec,
+            self.fast_tab_interval_sec,
+            self.max_flicker_grace_ticks,
         )
 
     # ========================================================================
@@ -334,6 +358,180 @@ class CombatRecovery:
                 self._safe_press_key(input_ctrl, forward_key, min_hold=hold_sec * 0.7, max_hold=hold_sec * 1.1)
         except Exception as exc:
             logger.error("Çapraz hareket manevrası hatası (%s + %s): %s", strafe_key, forward_key, exc)
+
+    # ========================================================================
+    # FAST TAB CYCLING & 1-FRAME TARGETING FLICKER GRACE
+    # ========================================================================
+
+    def reset_flicker_grace(self) -> None:
+        """Resets the targeting flicker grace counters and status."""
+        self._flicker_grace_counter = 0
+        self._consecutive_no_target_frames = 0
+        self.is_flicker_grace_active = False
+        self._last_raw_target_detected = False
+        self._last_grace_tick_ts = 0.0
+
+    def is_targeting_flicker_grace(self) -> bool:
+        """Returns True if the current target lock is sustained via 1-frame flicker grace."""
+        return bool(self.is_flicker_grace_active)
+
+    def fast_tab_cycle(
+        self,
+        input_ctrl: Any,
+        min_interval_sec: Optional[float] = None,
+        force: bool = False,
+    ) -> bool:
+        """
+        Fast TAB target cycling for rapid target acquisition.
+        Dispatches humanized hardware-compliant key press (35-65ms) with
+        configurable interval (default fast_tab_interval_sec ~0.55s).
+        """
+        if input_ctrl is None:
+            return False
+        now = time.monotonic()
+        interval = (
+            float(min_interval_sec)
+            if min_interval_sec is not None
+            else self.fast_tab_interval_sec
+        )
+        fast_mode = getattr(input_ctrl, "test_mode", False)
+        if fast_mode:
+            interval = min(0.05, interval)
+
+        if force or (now - self.last_tab_time) >= interval:
+            pressed = self._safe_press_key(
+                input_ctrl, "tab", min_hold=0.035, max_hold=0.065
+            )
+            if pressed:
+                self.last_tab_time = now
+                self.tab_cycle_count += 1
+                return True
+        return False
+
+    @staticmethod
+    def get_olive_mob_mask(bgr_roi: np.ndarray) -> np.ndarray:
+        """
+        Extracts binary mask for olive-green mob HP bars and nameplates
+        (Hue 26..68, Sat 80..255, Val 80..255).
+        """
+        if bgr_roi is None or not isinstance(bgr_roi, np.ndarray) or bgr_roi.size == 0:
+            return np.zeros((0, 0), dtype=np.uint8)
+        try:
+            hsv = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
+            mask_olive = (
+                (hsv[:, :, 0] >= CombatRecovery.OLIVE_MOB_HUE_MIN)
+                & (hsv[:, :, 0] <= CombatRecovery.OLIVE_MOB_HUE_MAX)
+                & (hsv[:, :, 1] >= CombatRecovery.OLIVE_MOB_SAT_MIN)
+                & (hsv[:, :, 2] >= CombatRecovery.OLIVE_MOB_VAL_MIN)
+            ).astype(np.uint8)
+            return mask_olive
+        except Exception as exc:
+            logger.error("Olive mob mask extraction error: %s", exc)
+            return np.zeros((bgr_roi.shape[0], bgr_roi.shape[1]), dtype=np.uint8)
+
+    def detect_olive_mob_bar(
+        self,
+        frame: np.ndarray,
+        roi_norm: Optional[Tuple[float, float, float, float]] = None,
+    ) -> bool:
+        """
+        Detects horizontal olive-green mob HP bar or nameplate in the specified
+        or default combat zone ROI (x: 22%..78%, y: 12%..55%).
+        Filters out self-overhead player bar.
+        """
+        try:
+            bgr = self._ensure_bgr(frame)
+            if bgr is None:
+                return False
+            h, w, _ = bgr.shape
+            if roi_norm is not None:
+                rx1, rx2, ry1, ry2 = roi_norm
+                x1 = max(0, int(round(w * rx1)))
+                x2 = min(w, int(round(w * rx2)))
+                y1 = max(0, int(round(h * ry1)))
+                y2 = min(h, int(round(h * ry2)))
+            else:
+                x1 = max(0, int(round(w * self.COMBAT_ZONE_X1_NORM)))
+                x2 = min(w, int(round(w * self.COMBAT_ZONE_X2_NORM)))
+                y1 = max(0, int(round(h * self.COMBAT_ZONE_Y1_NORM)))
+                y2 = min(h, int(round(h * min(0.55, self.COMBAT_ZONE_Y2_NORM))))
+
+            if x2 <= x1 or y2 <= y1:
+                return False
+
+            roi = bgr[y1:y2, x1:x2].copy()
+            # Mask self overhead bar
+            sx1 = max(0, int(round(w * self.SELF_OVERHEAD_X1_NORM)) - x1)
+            sx2 = min(roi.shape[1], int(round(w * self.SELF_OVERHEAD_X2_NORM)) - x1)
+            sy1 = max(0, int(round(h * self.SELF_OVERHEAD_Y1_NORM)) - y1)
+            sy2 = min(roi.shape[0], int(round(h * self.SELF_OVERHEAD_Y2_NORM)) - y1)
+            if sx2 > sx1 and sy2 > sy1:
+                roi[sy1:sy2, sx1:sx2] = 0
+
+            mask_olive = self.get_olive_mob_mask(roi)
+            if mask_olive.size == 0:
+                return False
+
+            scale = float(w * h) / float(1280 * 720)
+            linear_scale = float(np.sqrt(max(0.25, scale)))
+            kernel = np.ones((2, max(3, int(round(5 * linear_scale)))), np.uint8)
+            mask_olive = cv2.morphologyEx(mask_olive, cv2.MORPH_CLOSE, kernel)
+
+            num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_olive)
+            min_w = max(26, int(round(34 * linear_scale)))
+            max_h = max(12, int(round(22 * linear_scale)))
+            min_area = max(55, int(round(80 * scale)))
+
+            for idx in range(1, num_labels):
+                _, _, bw, bh, area = stats[idx]
+                aspect = float(bw) / float(max(1, bh))
+                if bw >= min_w and 2 <= bh <= max_h and aspect >= 2.2 and area >= min_area:
+                    return True
+            return False
+        except Exception as exc:
+            logger.error("detect_olive_mob_bar error: %s", exc)
+            return False
+
+    def _apply_targeting_flicker_grace(
+        self,
+        raw_detected: bool,
+        use_flicker_grace: bool = True,
+        frame: Optional[np.ndarray] = None,
+    ) -> bool:
+        """
+        Applies 1-frame targeting flicker grace ticks to prevent premature combat aborts.
+        If raw detection is True: clears grace counter and records positive lock.
+        If raw detection is False: grants up to max_flicker_grace_ticks (default 1) grace frames
+        if combat was active or target was confirmed on the previous frame.
+        """
+        if raw_detected:
+            self._last_raw_target_detected = True
+            self._consecutive_no_target_frames = 0
+            self._flicker_grace_counter = 0
+            self.is_flicker_grace_active = False
+            return True
+
+        # Target lost on this frame. Check if eligible for 1-frame flicker grace.
+        self._consecutive_no_target_frames = getattr(self, "_consecutive_no_target_frames", 0) + 1
+        if (
+            use_flicker_grace
+            and self._last_raw_target_detected
+            and self._consecutive_no_target_frames <= self.max_flicker_grace_ticks
+        ):
+            self._flicker_grace_counter = self._consecutive_no_target_frames
+            self.is_flicker_grace_active = True
+            logger.debug(
+                "Targeting 1-frame flicker grace active (frame %d/%d) - combat sustained",
+                self._consecutive_no_target_frames,
+                self.max_flicker_grace_ticks,
+            )
+            return True
+
+        # Grace expired or not eligible -> confirmed target loss
+        self.is_flicker_grace_active = False
+        self._last_raw_target_detected = False
+        self._flicker_grace_counter = 0
+        return False
 
     # ========================================================================
     # 1. SAVAŞ ALGILAMA (CHECK_UNDER_ATTACK & HP / TARGET BAR ANALİZİ)
@@ -582,11 +780,12 @@ class CombatRecovery:
             logger.error("HUD görünürlük kontrolünde hata: %s", exc)
             return False
 
-    def _detect_enemy_target_bar(self, frame: np.ndarray) -> bool:
+    def _raw_detect_enemy_target_bar(self, frame: np.ndarray) -> bool:
         """
-        Ekranın üst-ortasında (Target Frame) veya merkez savaş bölgesinde (Enemy Nameplate)
-        saldırgan hedef kırmızı can barı olup olmadığını tespit eder.
-        Oyuncunun kendi baş üstü HP/MP barını ve uzaktaki küçük ikonları filtreler.
+        Doğrudan bilgisayarlı görü ile ekranın üst-ortasında (Target Frame) veya
+        merkez savaş bölgesinde (Enemy Nameplate / Mob Bar) kırmızı, pembe veya
+        zeytin-yeşili (olive-green) hedef can barı olup olmadığını zamansal tolerans
+        olmadan (raw) tespit eder.
         """
         try:
             bgr = self._ensure_bgr(frame)
@@ -606,82 +805,189 @@ class CombatRecovery:
             if ta_x2 > ta_x1 and ta_y2 > ta_y1:
                 roi_top = bgr[ta_y1:ta_y2, ta_x1:ta_x2]
                 hsv_top = cv2.cvtColor(roi_top, cv2.COLOR_BGR2HSV)
-                mask_top = (
+                # AION2 top frame: red + pink/magenta fill + olive-green mob fill.
+                mask_red = (
                     ((hsv_top[:, :, 0] <= 12) | (hsv_top[:, :, 0] >= 168))
-                    & (hsv_top[:, :, 1] >= 115)
-                    & (hsv_top[:, :, 2] >= 95)
-                ).astype(np.uint8)
+                    & (hsv_top[:, :, 1] >= 90)
+                    & (hsv_top[:, :, 2] >= 80)
+                )
+                mask_pink = (
+                    (hsv_top[:, :, 0] >= 140)
+                    & (hsv_top[:, :, 0] <= 175)
+                    & (hsv_top[:, :, 1] >= 60)
+                    & (hsv_top[:, :, 2] >= 100)
+                )
+                mask_olive = (
+                    (hsv_top[:, :, 0] >= self.OLIVE_MOB_HUE_MIN)
+                    & (hsv_top[:, :, 0] <= self.OLIVE_MOB_HUE_MAX)
+                    & (hsv_top[:, :, 1] >= self.OLIVE_MOB_SAT_MIN)
+                    & (hsv_top[:, :, 2] >= self.OLIVE_MOB_VAL_MIN)
+                )
+                mask_top = (mask_red | mask_pink | mask_olive).astype(np.uint8)
                 kernel = np.ones((2, max(3, int(round(5 * linear_scale)))), np.uint8)
                 mask_top = cv2.morphologyEx(mask_top, cv2.MORPH_CLOSE, kernel)
 
                 num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_top)
-                min_w_top = max(24, int(round(32 * linear_scale)))
-                max_h_top = max(12, int(round(30 * linear_scale)))
-                min_area_top = max(55, int(round(80 * scale)))
+                min_w_top = max(28, int(round(36 * linear_scale)))
+                max_h_top = max(14, int(round(32 * linear_scale)))
+                min_area_top = max(60, int(round(90 * scale)))
 
                 for idx in range(1, num_labels):
                     _, _, bw, bh, area = stats[idx]
                     aspect = float(bw) / float(max(1, bh))
-                    if bw >= min_w_top and 2 <= bh <= max_h_top and aspect >= 2.6 and area >= min_area_top:
+                    if bw >= min_w_top and 2 <= bh <= max_h_top and aspect >= 2.4 and area >= min_area_top:
                         return True
 
-            # 2. BÖLGE: Merkez/Üst savaş alanı kırmızı düşman can barı (y=15.5%..60%, x=22%..78%)
-            cz_x1 = max(0, int(round(w * self.COMBAT_ZONE_X1_NORM)))
-            cz_x2 = min(w, int(round(w * self.COMBAT_ZONE_X2_NORM)))
-            cz_y1 = max(0, int(round(h * self.COMBAT_ZONE_Y1_NORM)))
-            cz_y2 = min(h, int(round(h * self.COMBAT_ZONE_Y2_NORM)))
+            # 2. BÖLGE: üst-orta savaş alanı pembe/kırmızı/zeytin-yeşili hedef HP şeridi.
+            try:
+                if self._detect_combat_zone_hostile_bar(
+                    bgr, linear_scale=linear_scale, scale=scale
+                ):
+                    return True
+            except Exception:
+                pass
 
-            if cz_x2 > cz_x1 and cz_y2 > cz_y1:
-                roi_cz = bgr[cz_y1:cz_y2, cz_x1:cz_x2].copy()
+            # 3. BÖLGE: Özel olive-green mob HP barı / isimliği tespiti
+            try:
+                if self.detect_olive_mob_bar(bgr):
+                    return True
+            except Exception:
+                pass
 
-                # Oyuncunun kendi karakterinin baş üstü HP bar bölgesini maskele
-                self_x1 = max(0, int(round(w * self.SELF_OVERHEAD_X1_NORM)) - cz_x1)
-                self_x2 = min(roi_cz.shape[1], int(round(w * self.SELF_OVERHEAD_X2_NORM)) - cz_x1)
-                self_y1 = max(0, int(round(h * self.SELF_OVERHEAD_Y1_NORM)) - cz_y1)
-                self_y2 = min(roi_cz.shape[0], int(round(h * self.SELF_OVERHEAD_Y2_NORM)) - cz_y1)
-                if self_x2 > self_x1 and self_y2 > self_y1:
-                    roi_cz[self_y1:self_y2, self_x1:self_x2] = 0
-
-                hsv_cz = cv2.cvtColor(roi_cz, cv2.COLOR_BGR2HSV)
-                # Doygun kırmızı UI barı eşiği (kırmızımsı çimen/toprak dokularını filtreler)
-                mask_cz = (
-                    ((hsv_cz[:, :, 0] <= 8) | (hsv_cz[:, :, 0] >= 171))
-                    & (hsv_cz[:, :, 1] >= 145)
-                    & (hsv_cz[:, :, 2] >= 110)
-                ).astype(np.uint8)
-                kernel_cz = np.ones((2, max(3, int(round(5 * linear_scale)))), np.uint8)
-                mask_cz = cv2.morphologyEx(mask_cz, cv2.MORPH_CLOSE, kernel_cz)
-
-                num_cz, _, stats_cz, _ = cv2.connectedComponentsWithStats(mask_cz)
-                min_w_cz = max(30, int(round(42 * linear_scale)))
-                max_h_cz = max(10, int(round(20 * linear_scale)))
-                min_area_cz = max(90, int(round(130 * scale)))
-
-                for idx in range(1, num_cz):
-                    bx, by, bw, bh, area = stats_cz[idx]
-                    aspect = float(bw) / float(max(1, bh))
-                    if bw >= min_w_cz and 3 <= bh <= max_h_cz and aspect >= 3.5 and area >= min_area_cz:
-                        # Altında mavi/camgöbeği oyuncu mana barı varsa oyuncu barıdır, atla
-                        abs_x1 = cz_x1 + bx
-                        abs_x2 = min(w, cz_x1 + bx + bw)
-                        abs_y2 = cz_y1 + by + bh
-                        below_h = max(5, int(round(8 * linear_scale)))
-                        below_roi = bgr[abs_y2 : min(h, abs_y2 + below_h), abs_x1:abs_x2]
-                        if below_roi.size > 0:
-                            hsv_below = cv2.cvtColor(below_roi, cv2.COLOR_BGR2HSV)
-                            blue_mask = (
-                                (hsv_below[:, :, 0] >= 82)
-                                & (hsv_below[:, :, 0] <= 125)
-                                & (hsv_below[:, :, 1] >= 70)
-                                & (hsv_below[:, :, 2] >= 65)
-                            )
-                            if float(np.mean(blue_mask)) >= 0.18:
-                                continue
-                        return True
-
+            # 4. BÖLGE: Soft cyan/blue selection reticle under character (AION2 lock ring).
+            try:
+                if self._detect_selection_reticle(
+                    bgr, linear_scale=linear_scale, scale=scale
+                ):
+                    return True
+            except Exception:
+                pass
             return False
         except Exception as exc:
             logger.error("Düşman hedef barı analizi sırasında hata: %s", exc)
+            return False
+
+    def _detect_enemy_target_bar(
+        self,
+        frame: np.ndarray,
+        use_flicker_grace: bool = True,
+    ) -> bool:
+        """
+        Ekranın üst-ortasında (Target Frame) veya merkez savaş bölgesinde (Enemy Nameplate)
+        saldırgan hedef (kırmızı, pembe veya zeytin-yeşili mob) barı olup olmadığını tespit eder.
+        1-frame targeting flicker grace ticks uygular, böylece savaş esnasındaki
+        anlık görsel titreşimlerde savaşın erken sonlanmasını (abort) önler.
+        """
+        raw = self._raw_detect_enemy_target_bar(frame)
+        return self._apply_targeting_flicker_grace(raw, use_flicker_grace=use_flicker_grace, frame=frame)
+
+    def detect_enemy_target_bar(
+        self,
+        frame: np.ndarray,
+        use_flicker_grace: bool = True,
+    ) -> bool:
+        """Public arayüz: Hedef canavar barı / zeytin-yeşili mob tespiti."""
+        return self._detect_enemy_target_bar(frame, use_flicker_grace=use_flicker_grace)
+
+    def _detect_combat_zone_hostile_bar(
+        self,
+        bgr: np.ndarray,
+        *,
+        linear_scale: float = 1.0,
+        scale: float = 1.0,
+    ) -> bool:
+        """Pink/red/olive hostile & mob HP strip in mid viewport — not bottom HUD / self overhead."""
+        h, w, _ = bgr.shape
+        y1 = max(0, int(round(h * self.COMBAT_ZONE_Y1_NORM)))
+        y2 = min(h, int(round(h * min(0.42, self.COMBAT_ZONE_Y2_NORM))))
+        x1 = max(0, int(round(w * self.COMBAT_ZONE_X1_NORM)))
+        x2 = min(w, int(round(w * self.COMBAT_ZONE_X2_NORM)))
+        if y2 <= y1 or x2 <= x1:
+            return False
+        roi = bgr[y1:y2, x1:x2].copy()
+        # Mask self overhead HP/MP so player bars never count as enemy lock.
+        sx1 = max(0, int(round(w * self.SELF_OVERHEAD_X1_NORM)) - x1)
+        sx2 = min(roi.shape[1], int(round(w * self.SELF_OVERHEAD_X2_NORM)) - x1)
+        sy1 = max(0, int(round(h * self.SELF_OVERHEAD_Y1_NORM)) - y1)
+        sy2 = min(roi.shape[0], int(round(h * self.SELF_OVERHEAD_Y2_NORM)) - y1)
+        if sx2 > sx1 and sy2 > sy1:
+            roi[sy1:sy2, sx1:sx2] = 0
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask_red = (
+            ((hsv[:, :, 0] <= 12) | (hsv[:, :, 0] >= 168))
+            & (hsv[:, :, 1] >= 100)
+            & (hsv[:, :, 2] >= 90)
+        )
+        mask_pink = (
+            (hsv[:, :, 0] >= 140)
+            & (hsv[:, :, 0] <= 175)
+            & (hsv[:, :, 1] >= 70)
+            & (hsv[:, :, 2] >= 110)
+        )
+        mask_olive = (
+            (hsv[:, :, 0] >= self.OLIVE_MOB_HUE_MIN)
+            & (hsv[:, :, 0] <= self.OLIVE_MOB_HUE_MAX)
+            & (hsv[:, :, 1] >= self.OLIVE_MOB_SAT_MIN)
+            & (hsv[:, :, 2] >= self.OLIVE_MOB_VAL_MIN)
+        )
+        mask = (mask_red | mask_pink | mask_olive).astype(np.uint8)
+        kernel = np.ones((2, max(3, int(round(5 * linear_scale)))), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        min_w = max(36, int(round(48 * linear_scale)))
+        max_h = max(12, int(round(22 * linear_scale)))
+        min_area = max(80, int(round(110 * scale)))
+        for idx in range(1, num_labels):
+            _, _, bw, bh, area = stats[idx]
+            aspect = float(bw) / float(max(1, bh))
+            if bw >= min_w and 3 <= bh <= max_h and aspect >= 3.0 and area >= min_area:
+                return True
+        return False
+
+    def _detect_selection_reticle(
+        self,
+        bgr: np.ndarray,
+        *,
+        linear_scale: float = 1.0,
+        scale: float = 1.0,
+    ) -> bool:
+        """True when a cyan/blue soft-target ring is under/near the character."""
+        try:
+            h, w, _ = bgr.shape
+            # Karakter ayakları / yakın zemin (3. şahıs)
+            y1 = max(0, int(round(h * 0.48)))
+            y2 = min(h, int(round(h * 0.78)))
+            x1 = max(0, int(round(w * 0.32)))
+            x2 = min(w, int(round(w * 0.68)))
+            if y2 <= y1 or x2 <= x1:
+                return False
+            roi = bgr[y1:y2, x1:x2]
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            cyan = (
+                (hsv[:, :, 0] >= 85)
+                & (hsv[:, :, 0] <= 115)
+                & (hsv[:, :, 1] >= 85)
+                & (hsv[:, :, 2] >= 110)
+            ).astype(np.uint8)
+            px = int(np.count_nonzero(cyan))
+            # Stricter than HUD chrome / water tint false positives.
+            min_px = max(180, int(round(320 * scale)))
+            if px < min_px:
+                return False
+            # Yatay yayılım: halka genişliği dar bir blob olmamalı
+            cols = np.where(cyan.sum(axis=0) > 0)[0]
+            rows = np.where(cyan.sum(axis=1) > 0)[0]
+            if cols.size < 2 or rows.size < 2:
+                return False
+            span_x = int(cols[-1] - cols[0] + 1)
+            span_y = int(rows[-1] - rows[0] + 1)
+            min_span = max(36, int(round(52 * linear_scale)))
+            max_span_x = max(120, int(round(220 * linear_scale)))
+            # Full-width cyan UI bands are not a soft-target ring.
+            if span_x > max_span_x:
+                return False
+            return span_x >= min_span and span_y >= max(14, int(round(18 * linear_scale)))
+        except Exception:
             return False
 
     def check_under_attack(self, frame: Optional[np.ndarray] = None) -> Tuple[bool, float]:
@@ -707,7 +1013,7 @@ class CombatRecovery:
             hp_ratio = self._read_hp_ratio(bgr)
             tot_agro = self._detect_target_of_target_agro(bgr)
             vignette_flash = self._detect_red_vignette_flash(bgr)
-            enemy_bar_detected = tot_agro or self._detect_enemy_target_bar(bgr)
+            enemy_bar_detected = tot_agro or self._detect_enemy_target_bar(bgr, use_flicker_grace=True)
             hud_visible = self._is_bottom_hud_visible(bgr)
 
             # Ardışık örneklem geçmişini güncelle
@@ -786,8 +1092,8 @@ class CombatRecovery:
             clear_streak = 0
             prev_combat_hp: Optional[float] = None
 
-            # İlk hedef kilitleme (Tab)
-            self._safe_press_key(input_ctrl, "tab", min_hold=0.045, max_hold=0.085)
+            # İlk hedef kilitleme (Fast TAB)
+            self.fast_tab_cycle(input_ctrl, force=True)
             last_tab_time = time.monotonic()
 
             # Hızlı birim testlerinde döngü adım süresini uyarla
@@ -799,6 +1105,7 @@ class CombatRecovery:
                 if is_cancelled_fn is not None and callable(is_cancelled_fn) and is_cancelled_fn():
                     logger.info("Savaş döngüsü kullanıcı/sistem tarafından iptal edildi.")
                     self.in_combat = False
+                    self.reset_flicker_grace()
                     return "CANCELLED"
 
                 elapsed = time.monotonic() - fight_start
@@ -806,6 +1113,7 @@ class CombatRecovery:
                     timeout_msg = "Paused: a fight lasted over 2 min"
                     logger.warning("Savaş zaman aşımı (%.1fs >= %.1fs)! %s", elapsed, float(max_fight_sec), timeout_msg)
                     self.in_combat = False
+                    self.reset_flicker_grace()
                     self._notify_status(
                         status_callback,
                         "PAUSED",
@@ -820,6 +1128,7 @@ class CombatRecovery:
                         dead_msg = "Paused: your character died"
                         logger.warning("Savaş sırasında karakter öldü! %s", dead_msg)
                         self.in_combat = False
+                        self.reset_flicker_grace()
                         self._notify_status(
                             status_callback,
                             "PAUSED",
@@ -828,7 +1137,7 @@ class CombatRecovery:
                         )
                         return "DEAD"
 
-                    enemy_bar = self._detect_enemy_target_bar(frame)
+                    enemy_bar = self._detect_enemy_target_bar(frame, use_flicker_grace=True)
                     current_hp = self.get_player_hp_ratio(frame)
                     hp_still_dropping = (
                         prev_combat_hp is not None
@@ -843,15 +1152,38 @@ class CombatRecovery:
                         clear_streak = 0
 
                     # Hedef barı kaybolduysa ve can düşüşü durduysa hedef ölmüştür
+                    # (1-frame flicker grace + 2 confirmed frames = 3 frames total protection)
                     if clear_streak >= 2:
-                        logger.info("Saldırgan hedef etkisiz hale getirildi. Ganimet (F) toplanıyor...")
+                        logger.info("Saldırgan canavar etkisiz hale getirildi. Ganimet (F) toplanıyor...")
+                        # 1. Ganimeti topla (F)
+                        self._safe_press_key(input_ctrl, "f", min_hold=0.05, max_hold=0.09)
+                        time.sleep(0.35 if not fast_mode else 0.05)
+                        # 2. Sıradaki canavarı seçmek için Fast TAB tuşuna bas!
+                        logger.info("Sıradaki canavarı hedeflemek için Fast TAB cycling...")
+                        self.fast_tab_cycle(input_ctrl, force=True)
+                        last_tab_time = time.monotonic()
+                        time.sleep(0.25 if not fast_mode else 0.05)
+
+                        # Sıradaki canavar hedeflendi mi kontrol et
+                        new_frame = self._grab_frame_from_capture(capture)
+                        if new_frame is not None and self._detect_enemy_target_bar(new_frame, use_flicker_grace=False):
+                            logger.info("Yeni canavar hedeflendi! Savaş döngüsüne devam ediliyor...")
+                            clear_streak = 0
+                            continue
                         break
 
-                # Belirli aralıklarla Tab ile aktif saldırganı yeniden hedefle
+                # Fast TAB cycling: Hedef aranıyorsa (~0.55s), kilitliyse periyodik (~4.2-6.5s)
                 now = time.monotonic()
-                if now - last_tab_time >= (0.25 if fast_mode else random.uniform(4.2, 6.5)):
-                    self._safe_press_key(input_ctrl, "tab", min_hold=0.04, max_hold=0.08)
-                    last_tab_time = now
+                tab_cadence = (
+                    self.fast_tab_interval_sec
+                    if (not enemy_bar or self.is_flicker_grace_active)
+                    else random.uniform(4.2, 6.5)
+                )
+                if fast_mode:
+                    tab_cadence = 0.10
+                if (now - last_tab_time) >= tab_cadence:
+                    if self.fast_tab_cycle(input_ctrl, min_interval_sec=tab_cadence):
+                        last_tab_time = now
 
                 # İnsanlaştırılmış saldırı rotasyonu: Sol/Sağ tık + 1,2,3,4,q,e,r
                 if rotation_idx % 3 == 0:
@@ -876,6 +1208,7 @@ class CombatRecovery:
             while time.monotonic() < wait_end:
                 if is_cancelled_fn is not None and callable(is_cancelled_fn) and is_cancelled_fn():
                     self.in_combat = False
+                    self.reset_flicker_grace()
                     return "CANCELLED"
                 remaining = wait_end - time.monotonic()
                 if remaining <= 0:
@@ -883,6 +1216,7 @@ class CombatRecovery:
                 time.sleep(min(0.1, remaining))
 
             self.in_combat = False
+            self.reset_flicker_grace()
             self._hp_history.clear()
             self._enemy_bar_history.clear()
             self._notify_status(
@@ -896,6 +1230,7 @@ class CombatRecovery:
         except Exception as exc:
             logger.error("execute_combat_loop sırasında beklenmeyen hata: %s", exc)
             self.in_combat = False
+            self.reset_flicker_grace()
             return "ERROR"
 
     # ========================================================================
@@ -1080,40 +1415,79 @@ class CombatRecovery:
             logger.error("wait_for_revive sırasında hata: %s", exc)
             return False
 
-    def fight_back_step(self, input_ctrl: Optional[Any] = None) -> bool:
+    def fight_back_step(
+        self,
+        input_ctrl: Optional[Any] = None,
+        frame: Optional[np.ndarray] = None,
+    ) -> bool:
         """
-        StateMachine tarafından her savaş döngüsü adımında çağrılabilen tek adımlık
-        insanlaştırılmış karşı saldırı (Tab + Yetenek/Fare tıklaması).
+        StateMachine tarafından her savaş döngüsü adımında çağrılabilen
+        insanlaştırılmış karşı saldırı (Tab + Yetenek/Fare tıklaması + Öldüğünde F ve Tab ile sıradaki hedef).
         """
         try:
             ctrl = input_ctrl if input_ctrl is not None else getattr(self, "input_ctrl", None)
+            if ctrl is None and hasattr(self, "vision") and hasattr(self.vision, "driver"):
+                ctrl = self.vision.driver
+            if ctrl is None and hasattr(self, "driver"):
+                ctrl = getattr(self, "driver", None)
             if ctrl is None:
                 return False
 
             step_idx = getattr(self, "_fight_step_counter", 0)
             setattr(self, "_fight_step_counter", step_idx + 1)
 
-            if step_idx % 5 == 0:
-                self._safe_press_key(ctrl, "tab", min_hold=0.04, max_hold=0.08)
+            # Hedef kontrolü
+            img = frame
+            if img is None and hasattr(self, "vision") and self.vision is not None:
+                img = self._grab_frame_from_capture(self.vision)
 
+            has_target = True
+            if img is not None:
+                has_target = self._detect_enemy_target_bar(img, use_flicker_grace=True)
+
+            if not has_target:
+                no_tgt = getattr(self, "_no_target_steps", 0) + 1
+                setattr(self, "_no_target_steps", no_tgt)
+                if no_tgt >= 2:
+                    # Canavar öldü -> Önce F basıp ganimeti al, ardından Fast TAB basarak diğer canavarı seç
+                    logger.info("Canavar öldü -> Ganimet toplanıyor (F) ve sıradaki canavar seçiliyor (Tab)...")
+                    self._safe_press_key(ctrl, "f", min_hold=0.05, max_hold=0.09)
+                    time.sleep(0.15)
+                    self.fast_tab_cycle(ctrl, force=True)
+                    setattr(self, "_no_target_steps", 0)
+                    return True
+                else:
+                    self.fast_tab_cycle(ctrl, force=True)
+                    return True
+            else:
+                setattr(self, "_no_target_steps", 0)
+
+            # Savaşırken düzenli olarak Tab ile en yakın hedefi kilitle (her 3 adımda bir)
             if step_idx % 3 == 0:
-                btn = "right" if (step_idx % 6 == 0) else "left"
+                self.fast_tab_cycle(ctrl, min_interval_sec=1.2)
+
+            # Yetenek ve vuruş rotasyonu
+            if step_idx % 2 == 0:
+                btn = "right" if (step_idx % 4 == 0) else "left"
                 self._safe_mouse_click(ctrl, button=btn, min_hold=0.045, max_hold=0.09)
             else:
-                skill_key = self.COMBAT_SKILL_KEYS[step_idx % len(self.COMBAT_SKILL_KEYS)]
+                skill_idx = getattr(self, "_fight_skill_idx", 0)
+                combat_keys = list(self.COMBAT_SKILL_KEYS)
+                skill_key = combat_keys[skill_idx % len(combat_keys)]
+                setattr(self, "_fight_skill_idx", (skill_idx + 1) % len(combat_keys))
                 self._safe_press_key(ctrl, skill_key, min_hold=0.045, max_hold=0.09)
             return True
         except Exception as exc:
             logger.error("fight_back_step sırasında hata: %s", exc)
             return False
 
-    def fight_back(self, input_ctrl: Optional[Any] = None) -> bool:
+    def fight_back(self, input_ctrl: Optional[Any] = None, frame: Optional[np.ndarray] = None) -> bool:
         """StateMachine uyumluluğu için karşı saldırı adımı tetikler."""
-        return self.fight_back_step(input_ctrl=input_ctrl)
+        return self.fight_back_step(input_ctrl=input_ctrl, frame=frame)
 
-    def execute_combat_step(self, input_ctrl: Optional[Any] = None) -> bool:
+    def execute_combat_step(self, input_ctrl: Optional[Any] = None, frame: Optional[np.ndarray] = None) -> bool:
         """StateMachine uyumluluğu için karşı saldırı adımı tetikler."""
-        return self.fight_back_step(input_ctrl=input_ctrl)
+        return self.fight_back_step(input_ctrl=input_ctrl, frame=frame)
 
     def recover_from_death(self, capture: Optional[Any] = None) -> bool:
         """

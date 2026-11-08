@@ -13,8 +13,20 @@ logs/
 # Auto-Generated YOLO Dataset Images/Labels & Intermediate PyTorch Checkpoints
 dataset/images/
 dataset/labels/
+dataset/approved/
+dataset/game_learning/
+dataset/review/
+dataset/previews/
+dataset/dataset/
 dataset/*.cache
+dataset/**/*.jpg
+dataset/**/*.jpeg
+dataset/**/*.png
 models/rtx_runs/
+runs/
+offload_from_c/
+_scroll_dbg/
+_tmp_mapcheck/
 *.pt
 
 # Secrets, Tokens & Encrypted Local Vault
@@ -23,3 +35,26 @@ config/gatherion_256bit_token.txt
 config/mobile_token.txt
 config/mobile_relay.json
 config/settings.enc
+
+# Large Binaries, Vendor Firmware & Local Temp Caches
+tools/cloudflared.exe
+*.exe
+vendor/
+temp/
+temp_exemplar.json
+test_localsystem.txt
+.pytest_cache/
+.agents/
+models/*.onnx
+!models/yolov8n_gatherion.onnx
+
+# Android Gradle & Build Outputs
+.gradle/
+**/build/
+*.apk
+*.aar
+local.properties
+android/**/.gradle/
+android/**/build/
+android/**/local.properties
+

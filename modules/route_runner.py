@@ -50,14 +50,14 @@ class RouteRunner:
         print("\n" + "=" * 65)
         print("AION 2 ROTA VE OTO-TOPLAMA MOTORU (ROUTE MODE)")
         print("Kontroller:")
-        print("  [F8]  - Bulunduğun yerdeki kaynağı anında rotaya kaydet")
-        print("  [F9]  - Duraklat / Devam Et")
+        print("  [Ctrl+Alt+F8]  - Bulunduğun yerdeki kaynağı anında rotaya kaydet")
+        print("  [Ctrl+Alt+F9]  - Duraklat / Devam Et")
         print("  [ESC] - Çıkış")
         print("=" * 65 + "\n")
 
         # Global hotkeys
-        keyboard.add_hotkey('f8', self.recorder.record_current_node)
-        keyboard.add_hotkey('f9', self.toggle_pause)
+        keyboard.add_hotkey('ctrl+alt+f8', self.recorder.record_current_node, suppress=False)
+        keyboard.add_hotkey('ctrl+alt+f9', self.toggle_pause, suppress=False)
 
         try:
             walk_start_time = 0
@@ -108,8 +108,11 @@ class RouteRunner:
 
                     # Check walking timeout (e.g. character got stuck on geometry)
                     if time.time() - walk_start_time > self.walk_timeout_sec:
-                        print(f"\n[Runner] Zaman aşımı ({self.walk_timeout_sec}s): Düğüm {self.active_node['name']} ulaşılamadı!")
-                        self.routes.mark_node_failed(self.active_node["id"])
+                        print(f"\n[Runner] Zaman aşımı ({self.walk_timeout_sec}s): Düğüm {self.active_node.get('name', self.active_node.get('id'))} ulaşılamadı veya toplanacak kaynak yok!")
+                        self.routes.mark_node_failed(
+                            self.active_node["id"],
+                            active_route=getattr(self.routes, "active_route", None),
+                        )
                         self.state = BotState.NAVIGATING
                         time.sleep(1.0)
                         continue

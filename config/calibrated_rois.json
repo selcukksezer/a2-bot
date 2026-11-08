@@ -1,0 +1,437 @@
+{
+  "rois": {
+    "minimap_arrow": {
+      "key": "minimap_arrow",
+      "target": "Minimap Oyuncu Oku Şablonu Kes",
+      "normalized_roi": [
+        0.9165,
+        0.178389,
+        0.013,
+        0.026504
+      ],
+      "norm_x": 0.9165,
+      "norm_y": 0.178389,
+      "norm_w": 0.013,
+      "norm_h": 0.026504,
+      "bbox_px": [
+        1833,
+        175,
+        26,
+        26
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": null,
+      "class_name": "player_arrow",
+      "updated_at": "2026-11-07T18:53:55Z"
+    },
+    "crest_white_wing": {
+      "key": "crest_white_wing",
+      "target": "3B Beyaz Kanatlı Toplama Amblemi (Crest) Kes",
+      "normalized_roi": [
+        0.3885,
+        0.475025,
+        0.0165,
+        0.035678
+      ],
+      "norm_x": 0.3885,
+      "norm_y": 0.475025,
+      "norm_w": 0.0165,
+      "norm_h": 0.035678,
+      "bbox_px": [
+        777,
+        466,
+        33,
+        35
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": 6,
+      "class_name": "world_gather_crest",
+      "updated_at": "2026-11-07T18:54:24Z"
+    },
+    "node_aria": {
+      "key": "node_aria",
+      "target": "Kaynak: Aria Bitkisi (herb_aria) Kes",
+      "normalized_roi": [
+        0.3845,
+        0.561672,
+        0.0265,
+        0.066259
+      ],
+      "norm_x": 0.3845,
+      "norm_y": 0.561672,
+      "norm_w": 0.0265,
+      "norm_h": 0.066259,
+      "bbox_px": [
+        769,
+        551,
+        53,
+        65
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": 0,
+      "class_name": "herb_aria",
+      "updated_at": "2026-11-07T18:53:55Z"
+    },
+    "minimap_sprout": {
+      "key": "minimap_sprout",
+      "target": "Minimap 3 Yapraklı Filiz (Kaynak İkonu) Kes",
+      "normalized_roi": [
+        0.951,
+        0.138634,
+        0.007,
+        0.014271
+      ],
+      "norm_x": 0.951,
+      "norm_y": 0.138634,
+      "norm_w": 0.007,
+      "norm_h": 0.014271,
+      "bbox_px": [
+        1902,
+        136,
+        14,
+        14
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": 9,
+      "class_name": "minimap_sprout",
+      "updated_at": "2026-11-07T18:53:55Z"
+    },
+    "minimap_mob": {
+      "key": "minimap_mob",
+      "target": "Minimap Canavar Noktası (Negatif) Kes",
+      "normalized_roi": [
+        0.8985,
+        0.150866,
+        0.005,
+        0.010194
+      ],
+      "norm_x": 0.8985,
+      "norm_y": 0.150866,
+      "norm_w": 0.005,
+      "norm_h": 0.010194,
+      "bbox_px": [
+        1797,
+        148,
+        10,
+        10
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": 11,
+      "class_name": "minimap_monster_negative",
+      "updated_at": "2026-11-07T18:53:55Z"
+    },
+    "mob_nameplate": {
+      "key": "mob_nameplate",
+      "target": "3B Canavar / İsim Plakası (Hedef) Kes",
+      "normalized_roi": [
+        0.771,
+        0.391437,
+        0.0845,
+        0.025484
+      ],
+      "norm_x": 0.771,
+      "norm_y": 0.391437,
+      "norm_w": 0.0845,
+      "norm_h": 0.025484,
+      "bbox_px": [
+        1542,
+        384,
+        169,
+        25
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": 10,
+      "class_name": "monster_3d_negative",
+      "updated_at": "2026-11-07T18:53:55Z"
+    },
+    "player_hp_bar": {
+      "key": "player_hp_bar",
+      "target": "Oyuncu Can (HP) Barı Kes",
+      "normalized_roi": [
+        0.345,
+        0.879715,
+        0.14,
+        0.030581
+      ],
+      "norm_x": 0.345,
+      "norm_y": 0.879715,
+      "norm_w": 0.14,
+      "norm_h": 0.030581,
+      "bbox_px": [
+        690,
+        863,
+        280,
+        30
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": 16,
+      "class_name": "player_hp_bar",
+      "updated_at": "2026-11-07T18:53:55Z"
+    },
+    "skill_slot": {
+      "key": "skill_slot",
+      "target": "Yetenek / Skill Bar Yuvası Kes",
+      "normalized_roi": [
+        0.4675,
+        0.905199,
+        0.0375,
+        0.049949
+      ],
+      "norm_x": 0.4675,
+      "norm_y": 0.905199,
+      "norm_w": 0.0375,
+      "norm_h": 0.049949,
+      "bbox_px": [
+        935,
+        888,
+        75,
+        49
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": 13,
+      "class_name": "skill_ui_prompt",
+      "updated_at": "2026-11-07T18:53:55Z"
+    }
+  },
+  "minimap_arrow": {
+    "key": "minimap_arrow",
+    "target": "Minimap Oyuncu Oku Şablonu Kes",
+    "normalized_roi": [
+      0.9165,
+      0.178389,
+      0.013,
+      0.026504
+    ],
+    "norm_x": 0.9165,
+    "norm_y": 0.178389,
+    "norm_w": 0.013,
+    "norm_h": 0.026504,
+    "bbox_px": [
+      1833,
+      175,
+      26,
+      26
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": null,
+    "class_name": "player_arrow",
+    "updated_at": "2026-11-07T18:53:55Z"
+  },
+  "updated_at": "2026-11-07T18:54:24Z",
+  "crest_white_wing": {
+    "key": "crest_white_wing",
+    "target": "3B Beyaz Kanatlı Toplama Amblemi (Crest) Kes",
+    "normalized_roi": [
+      0.3885,
+      0.475025,
+      0.0165,
+      0.035678
+    ],
+    "norm_x": 0.3885,
+    "norm_y": 0.475025,
+    "norm_w": 0.0165,
+    "norm_h": 0.035678,
+    "bbox_px": [
+      777,
+      466,
+      33,
+      35
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": 6,
+    "class_name": "world_gather_crest",
+    "updated_at": "2026-11-07T18:54:24Z"
+  },
+  "node_aria": {
+    "key": "node_aria",
+    "target": "Kaynak: Aria Bitkisi (herb_aria) Kes",
+    "normalized_roi": [
+      0.3845,
+      0.561672,
+      0.0265,
+      0.066259
+    ],
+    "norm_x": 0.3845,
+    "norm_y": 0.561672,
+    "norm_w": 0.0265,
+    "norm_h": 0.066259,
+    "bbox_px": [
+      769,
+      551,
+      53,
+      65
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": 0,
+    "class_name": "herb_aria",
+    "updated_at": "2026-11-07T18:53:55Z"
+  },
+  "minimap_sprout": {
+    "key": "minimap_sprout",
+    "target": "Minimap 3 Yapraklı Filiz (Kaynak İkonu) Kes",
+    "normalized_roi": [
+      0.951,
+      0.138634,
+      0.007,
+      0.014271
+    ],
+    "norm_x": 0.951,
+    "norm_y": 0.138634,
+    "norm_w": 0.007,
+    "norm_h": 0.014271,
+    "bbox_px": [
+      1902,
+      136,
+      14,
+      14
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": 9,
+    "class_name": "minimap_sprout",
+    "updated_at": "2026-11-07T18:53:55Z"
+  },
+  "minimap_mob": {
+    "key": "minimap_mob",
+    "target": "Minimap Canavar Noktası (Negatif) Kes",
+    "normalized_roi": [
+      0.8985,
+      0.150866,
+      0.005,
+      0.010194
+    ],
+    "norm_x": 0.8985,
+    "norm_y": 0.150866,
+    "norm_w": 0.005,
+    "norm_h": 0.010194,
+    "bbox_px": [
+      1797,
+      148,
+      10,
+      10
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": 11,
+    "class_name": "minimap_monster_negative",
+    "updated_at": "2026-11-07T18:53:55Z"
+  },
+  "mob_nameplate": {
+    "key": "mob_nameplate",
+    "target": "3B Canavar / İsim Plakası (Hedef) Kes",
+    "normalized_roi": [
+      0.771,
+      0.391437,
+      0.0845,
+      0.025484
+    ],
+    "norm_x": 0.771,
+    "norm_y": 0.391437,
+    "norm_w": 0.0845,
+    "norm_h": 0.025484,
+    "bbox_px": [
+      1542,
+      384,
+      169,
+      25
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": 10,
+    "class_name": "monster_3d_negative",
+    "updated_at": "2026-11-07T18:53:55Z"
+  },
+  "player_hp_bar": {
+    "key": "player_hp_bar",
+    "target": "Oyuncu Can (HP) Barı Kes",
+    "normalized_roi": [
+      0.345,
+      0.879715,
+      0.14,
+      0.030581
+    ],
+    "norm_x": 0.345,
+    "norm_y": 0.879715,
+    "norm_w": 0.14,
+    "norm_h": 0.030581,
+    "bbox_px": [
+      690,
+      863,
+      280,
+      30
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": 16,
+    "class_name": "player_hp_bar",
+    "updated_at": "2026-11-07T18:53:55Z"
+  },
+  "skill_slot": {
+    "key": "skill_slot",
+    "target": "Yetenek / Skill Bar Yuvası Kes",
+    "normalized_roi": [
+      0.4675,
+      0.905199,
+      0.0375,
+      0.049949
+    ],
+    "norm_x": 0.4675,
+    "norm_y": 0.905199,
+    "norm_w": 0.0375,
+    "norm_h": 0.049949,
+    "bbox_px": [
+      935,
+      888,
+      75,
+      49
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": 13,
+    "class_name": "skill_ui_prompt",
+    "updated_at": "2026-11-07T18:53:55Z"
+  }
+}

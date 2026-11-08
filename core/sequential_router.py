@@ -46,6 +46,84 @@ except ImportError:
         ZAxisCliffFilter,
     )
 
+try:
+    from core.route_manager import (
+        RouteManager,
+        SUBREGION_BOUNDING_AREAS,
+        SUBREGION_CANONICAL_MAP,
+        SUBREGION_TO_CANONICAL,
+        build_proximity_material_route,
+        filter_nodes_by_material,
+        filter_nodes_by_subregion,
+        get_canonical_region,
+        get_subregion_bounding_area,
+        get_subregion_info,
+        is_subregion,
+        resolve_canonical_region,
+        sort_nodes_by_proximity,
+    )
+except ImportError:
+    from .route_manager import (  # type: ignore[no-redef]
+        RouteManager,
+        SUBREGION_BOUNDING_AREAS,
+        SUBREGION_CANONICAL_MAP,
+        SUBREGION_TO_CANONICAL,
+        build_proximity_material_route,
+        filter_nodes_by_material,
+        filter_nodes_by_subregion,
+        get_canonical_region,
+        get_subregion_bounding_area,
+        get_subregion_info,
+        is_subregion,
+        resolve_canonical_region,
+        sort_nodes_by_proximity,
+    )
+
+try:
+    from core.navigator import (
+        DEFAULT_DEADBAND_DEG,
+        DEFAULT_WAYPOINT_RADIUS_M,
+        DEFAULT_WAYPOINT_RADIUS_PX,
+        MAX_DEADBAND_DEG,
+        MIN_DEADBAND_DEG,
+        PIXEL_TO_METER_DEFAULT,
+        CyclicalRouteFollower,
+        TurnDampingController,
+        WaypointArrivalDetector,
+        anti_inversion_compass_heading,
+        apply_turn_damping,
+        cartesian_to_compass,
+        compass_to_cartesian,
+        compute_angle_diff,
+        compute_bearing,
+        extract_node_xy,
+        find_nearest_waypoint,
+        normalize_compass_heading,
+        resume_route_after_interrupt,
+    )
+except ImportError:
+    from .navigator import (  # type: ignore[no-redef]
+        DEFAULT_DEADBAND_DEG,
+        DEFAULT_WAYPOINT_RADIUS_M,
+        DEFAULT_WAYPOINT_RADIUS_PX,
+        MAX_DEADBAND_DEG,
+        MIN_DEADBAND_DEG,
+        PIXEL_TO_METER_DEFAULT,
+        CyclicalRouteFollower,
+        TurnDampingController,
+        WaypointArrivalDetector,
+        anti_inversion_compass_heading,
+        apply_turn_damping,
+        cartesian_to_compass,
+        compass_to_cartesian,
+        compute_angle_diff,
+        compute_bearing,
+        extract_node_xy,
+        find_nearest_waypoint,
+        normalize_compass_heading,
+        resume_route_after_interrupt,
+    )
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     _handler = logging.StreamHandler()
@@ -75,26 +153,39 @@ def _extract_xy(
             return float(node[0]), float(node[1])
 
         if isinstance(node, dict):
-            mx = node.get("map_x", node.get("x", 0))
-            my = node.get("map_y", node.get("y", 0))
-            if (mx is None or float(mx) == 0.0) and (my is None or float(my) == 0.0):
+            mx = node.get("map_x", node.get("x"))
+            my = node.get("map_y", node.get("y"))
+            if mx is None and my is None:
                 nx = node.get("norm_x")
                 ny = node.get("norm_y")
                 if nx is not None and ny is not None:
                     return float(nx) * fallback_width, float(ny) * fallback_height
+                return 0.0, 0.0
+            if float(mx or 0.0) == 0.0 and float(my or 0.0) == 0.0:
+                nx = node.get("norm_x")
+                ny = node.get("norm_y")
+                if nx is not None and ny is not None and not (float(nx) == 0.5 and float(ny) == 0.5):
+                    return float(nx) * fallback_width, float(ny) * fallback_height
             return float(mx or 0.0), float(my or 0.0)
 
-        mx = getattr(node, "map_x", getattr(node, "x", 0))
-        my = getattr(node, "map_y", getattr(node, "y", 0))
-        if (mx is None or float(mx) == 0.0) and (my is None or float(my) == 0.0):
+        mx = getattr(node, "map_x", getattr(node, "x", None))
+        my = getattr(node, "map_y", getattr(node, "y", None))
+        if mx is None and my is None:
             nx = getattr(node, "norm_x", None)
             ny = getattr(node, "norm_y", None)
             if nx is not None and ny is not None:
+                return float(nx) * fallback_width, float(ny) * fallback_height
+            return 0.0, 0.0
+        if float(mx or 0.0) == 0.0 and float(my or 0.0) == 0.0:
+            nx = getattr(node, "norm_x", None)
+            ny = getattr(node, "norm_y", None)
+            if nx is not None and ny is not None and not (float(nx) == 0.5 and float(ny) == 0.5):
                 return float(nx) * fallback_width, float(ny) * fallback_height
         return float(mx or 0.0), float(my or 0.0)
     except Exception as exc:
         logger.debug("Koordinat çıkarılamadı (%r): %s", node, exc)
         return 0.0, 0.0
+
 
 
 def _set_seq_index(node: Any, seq_idx: int) -> None:
@@ -108,6 +199,15 @@ def _set_seq_index(node: Any, seq_idx: int) -> None:
         logger.debug("seq_index atanamadı (%r): %s", node, exc)
 
 
+def _node_not_gatherable(node: Any) -> bool:
+    """Parşömen / toplanamaz düğüm. Yürüyüş ve hasat bunu atlar."""
+    if node is None:
+        return False
+    if isinstance(node, dict):
+        return bool(node.get("not_gatherable", False))
+    return bool(getattr(node, "not_gatherable", False))
+
+
 def _is_node_ready(
     node: Any,
     now: Optional[float] = None,
@@ -115,6 +215,8 @@ def _is_node_ready(
 ) -> bool:
     """Düğümün toplanmaya hazır (`is_ready`) olup olmadığını güvenli şekilde kontrol eder."""
     try:
+        if _node_not_gatherable(node):
+            return False
         if hasattr(node, "is_ready") and callable(node.is_ready):
             return bool(node.is_ready(now=now, rest_duration_sec=rest_duration_sec))
         if isinstance(node, dict):
@@ -331,7 +433,15 @@ class SequentialRoutePlanner:
       pürüzsüzlük (`0..100`) metriklerini üretir.
     """
 
-    VALID_MODES = ("smooth_loop", "walk_path", "corridor_sweep")
+    VALID_MODES = (
+        "smooth_loop",
+        "walk_path",
+        "corridor_sweep",
+        "proximity",
+        "nearest_neighbor",
+        "2opt",
+        "greedy_tsp",
+    )
 
     def __init__(
         self,
@@ -355,6 +465,141 @@ class SequentialRoutePlanner:
         self.contested_detector: ContestedNodeDetector = (
             contested_detector or ContestedNodeDetector()
         )
+        self.waypoint_radius_px: float = DEFAULT_WAYPOINT_RADIUS_PX
+        self.waypoint_radius_m: float = DEFAULT_WAYPOINT_RADIUS_M
+        self.deadband_deg: float = DEFAULT_DEADBAND_DEG
+        self.arrival_detector: WaypointArrivalDetector = WaypointArrivalDetector(
+            waypoint_radius_px=self.waypoint_radius_px,
+            waypoint_radius_m=self.waypoint_radius_m,
+        )
+        self.turn_controller: TurnDampingController = TurnDampingController(
+            deadband_deg=self.deadband_deg,
+        )
+
+    def resolve_canonical_region(self, region_name: Optional[str]) -> str:
+        """Verilen bölge veya alt bölge adının kanonik ana bölge karşılığını döndürür."""
+        return resolve_canonical_region(region_name)
+
+    def get_canonical_region(self, region_name: Optional[str]) -> str:
+        """resolve_canonical_region için eşanlamlı yardımcı metot."""
+        return resolve_canonical_region(region_name)
+
+    def is_subregion(self, name: Optional[str]) -> bool:
+        """Verilen adın bir alt bölge (subregion) olup olmadığını kontrol eder."""
+        return is_subregion(name)
+
+    def get_subregion_bounding_area(self, subregion: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
+        """Alt bölge (min_x, min_y, max_x, max_y) piksel sınırlayıcı kutusunu döndürür."""
+        return get_subregion_bounding_area(subregion)
+
+    def filter_nodes_by_subregion(self, nodes: Sequence[Any], subregion: str) -> List[Any]:
+        """Düğümleri alt bölgeye göre filtreler."""
+        return filter_nodes_by_subregion(nodes, subregion)
+
+    def filter_nodes_by_material(
+        self,
+        nodes: Sequence[Any],
+        target_materials: Any,
+    ) -> List[Any]:
+        """Filters nodes matching target_materials in canonical encyclopedia / taxonomy."""
+        return filter_nodes_by_material(nodes, target_materials)
+
+    def sort_nodes_by_proximity(
+        self,
+        nodes: Sequence[Any],
+        start_xy: Optional[Tuple[float, float]] = None,
+    ) -> List[Any]:
+        """Sorts nodes using Greedy Nearest-Neighbor + 2-Opt TSP proximity optimization."""
+        return sort_nodes_by_proximity(nodes, start_xy=start_xy)
+
+    def build_proximity_material_route(
+        self,
+        region_name: Any = None,
+        target_materials: Any = None,
+        start_xy: Optional[Tuple[float, float]] = None,
+        persist_route: bool = True,
+        route_manager: Optional[Any] = None,
+    ) -> List[Any]:
+        """
+        Builds, proximity-sorts (Nearest-Neighbor + 2-Opt), and optionally persists a route
+        filtered by target_materials from start_xy.
+        """
+        mgr = route_manager or RouteManager()
+        ordered = mgr.build_proximity_material_route(
+            region_name=region_name,
+            target_materials=target_materials,
+            start_xy=start_xy,
+            persist_route=persist_route,
+        )
+        self._active_nodes = ordered
+        self._current_seq_pos = 0
+        return ordered
+
+    def dynamic_proximity_reorder(
+        self,
+        nodes: Optional[Sequence[Any]] = None,
+        current_xy: Optional[Tuple[float, float]] = None,
+        only_ready: bool = False,
+        update_seq_indices: bool = True,
+    ) -> List[Any]:
+        """
+        Dynamically reorders active or specified route nodes in Greedy Nearest-Neighbor
+        + 2-Opt TSP proximity order from the player's current position (current_xy).
+        If only_ready=True, ready nodes are placed first in proximity order followed by resting nodes.
+        """
+        target_nodes = (
+            list(nodes)
+            if nodes is not None
+            else list(getattr(self, "_active_nodes", []))
+        )
+        if not target_nodes:
+            return []
+
+        if only_ready:
+            ready_nodes = [n for n in target_nodes if _is_node_ready(n)]
+            unready_nodes = [n for n in target_nodes if not _is_node_ready(n)]
+        else:
+            ready_nodes = target_nodes
+            unready_nodes = []
+
+        reordered = sort_nodes_by_proximity(ready_nodes, start_xy=current_xy) + unready_nodes
+        if update_seq_indices:
+            for idx, n in enumerate(reordered, start=1):
+                _set_seq_index(n, idx)
+
+        self._active_nodes = reordered
+        self._current_seq_pos = 0
+        return reordered
+
+    def resume_proximity_route(
+        self,
+        nodes: Sequence[Any],
+        player_pos: Tuple[float, float],
+        target_materials: Optional[Any] = None,
+        reorder_remaining: bool = True,
+    ) -> Tuple[Optional[Any], int, List[Any]]:
+        """
+        Dynamically reorders route from player_pos, optionally filtering by target_materials,
+        and resumes navigation from the closest node.
+        Returns: (next_node, next_index, reordered_nodes)
+        """
+        candidates = list(nodes)
+        if target_materials is not None:
+            candidates = filter_nodes_by_material(candidates, target_materials)
+        if not candidates:
+            return None, -1, []
+
+        if reorder_remaining:
+            ordered = sort_nodes_by_proximity(candidates, start_xy=player_pos)
+        else:
+            ordered = candidates
+
+        for idx, n in enumerate(ordered, start=1):
+            _set_seq_index(n, idx)
+
+        self._active_nodes = ordered
+        self._current_seq_pos = 0
+        return ordered[0], 0, ordered
 
     def record_approach_attempt(
         self,
@@ -388,6 +633,8 @@ class SequentialRoutePlanner:
         Düğümün uçurum (`ZAxisCliffFilter`, Madde 27) veya rakip oyuncu
         (`ContestedNodeDetector`, Madde 30) nedeniyle dışlanıp dışlanmadığını kontrol eder.
         """
+        if _node_not_gatherable(node):
+            return False
         if self.cliff_filter.is_node_excluded_by_cliff(
             node,
             is_flying=is_flying,
@@ -412,6 +659,8 @@ class SequentialRoutePlanner:
         Madde 28 (`PredictivePreWalkScheduler`) kapsamında erken yürüyüşe (`<= 8s` kalan
         ve `rest_remaining_sec <= estimated_walk_sec + 2.0`) uygun olup olmadığını döndürür.
         """
+        if _node_not_gatherable(node):
+            return False
         if _is_node_ready(node, now=now, rest_duration_sec=rest_duration_sec):
             return True
         if enable_predictive_prewalk and self.prewalk_scheduler.should_pre_walk_to_node(
@@ -462,7 +711,20 @@ class SequentialRoutePlanner:
 
             coords: List[Point2D] = [_extract_xy(item) for item in node_list]
 
-            if clean_mode == "walk_path":
+            if clean_mode in ("proximity", "nearest_neighbor", "2opt", "greedy_tsp"):
+                start_pt = None
+                if walk_trajectory and len(walk_trajectory) > 0:
+                    start_pt = (float(walk_trajectory[0][0]), float(walk_trajectory[0][1]))
+                ordered_nodes = sort_nodes_by_proximity(node_list, start_xy=start_pt)
+                for seq_idx, item in enumerate(ordered_nodes, start=1):
+                    _set_seq_index(item, seq_idx)
+                logger.info(
+                    "Sıralı rota oluşturuldu (proximity): mod=%s, düğüm_sayısı=%d",
+                    clean_mode,
+                    len(ordered_nodes),
+                )
+                return ordered_nodes
+            elif clean_mode == "walk_path":
                 order_indices = self._order_by_walk_path(coords, walk_trajectory)
             elif clean_mode == "corridor_sweep":
                 order_indices = self._order_by_corridor_sweep(coords)
@@ -506,6 +768,7 @@ class SequentialRoutePlanner:
                 return []
 
             target_region = region or getattr(route_manager, "active_region", "Verteron")
+            canon_region = resolve_canonical_region(target_region)
             target_route = route or getattr(route_manager, "active_route", "All")
 
             route_nodes = route_manager.get_route_nodes(
@@ -528,10 +791,10 @@ class SequentialRoutePlanner:
 
             # RouteManager içindeki bölge düğüm listesini sıralı hale getir
             regions_store = getattr(route_manager, "_regions", None)
-            if isinstance(regions_store, dict) and target_region in regions_store:
-                all_region_nodes: List[Any] = regions_store[target_region].get("nodes", [])
+            if isinstance(regions_store, dict) and canon_region in regions_store:
+                all_region_nodes: List[Any] = regions_store[canon_region].get("nodes", [])
                 if not target_route or target_route == "All" or len(ordered_nodes) == len(all_region_nodes):
-                    regions_store[target_region]["nodes"] = list(ordered_nodes)
+                    regions_store[canon_region]["nodes"] = list(ordered_nodes)
                 else:
                     ordered_set = {id(n) for n in ordered_nodes}
                     ordered_iter = iter(ordered_nodes)
@@ -541,20 +804,21 @@ class SequentialRoutePlanner:
                             merged_nodes.append(next(ordered_iter))
                         else:
                             merged_nodes.append(existing)
-                    regions_store[target_region]["nodes"] = merged_nodes
+                    regions_store[canon_region]["nodes"] = merged_nodes
 
                 if reassign_ids:
-                    for new_id, node_obj in enumerate(regions_store[target_region]["nodes"], start=1):
+                    for new_id, node_obj in enumerate(regions_store[canon_region]["nodes"], start=1):
                         if hasattr(node_obj, "id"):
                             node_obj.id = new_id
 
             # Son seçilen düğüm işaretçisini sıfırla ki yeni sıranın başından başlasın
             last_sel = getattr(route_manager, "_last_selected_node_id", None)
             if isinstance(last_sel, dict):
+                last_sel.pop((canon_region, target_route), None)
                 last_sel.pop((target_region, target_route), None)
 
             if hasattr(route_manager, "save_region") and callable(route_manager.save_region):
-                route_manager.save_region(target_region)
+                route_manager.save_region(canon_region)
             elif hasattr(route_manager, "_sync_legacy_data") and callable(route_manager._sync_legacy_data):
                 route_manager._sync_legacy_data()
 
@@ -1547,6 +1811,8 @@ class SequentialRoutePlanner:
                     if not allow_wrap:
                         break
                     cand_idx %= n
+                if n > 1 and cand_idx == curr_idx:
+                    continue
                 if cand_idx not in selectable_set:
                     continue
                 candidate = node_list[cand_idx]
@@ -1578,6 +1844,8 @@ class SequentialRoutePlanner:
             max_scan = n if allow_wrap else (n - 1 - curr_idx)
             for step in range(win + 1, max_scan + 1):
                 cand_idx = (curr_idx + step) % n
+                if n > 1 and cand_idx == curr_idx:
+                    continue
                 if cand_idx not in selectable_set:
                     continue
                 candidate = node_list[cand_idx]
@@ -1597,8 +1865,12 @@ class SequentialRoutePlanner:
             forward_selectables: List[int] = []
             for step in range(1, max_scan + 1):
                 c_idx = (curr_idx + step) % n
+                if n > 1 and c_idx == curr_idx:
+                    continue
                 if c_idx in selectable_set:
                     forward_selectables.append(c_idx)
+            if not forward_selectables:
+                forward_selectables = [c for c in selectable_indices if (n <= 1 or c != curr_idx)]
             if not forward_selectables:
                 forward_selectables = list(selectable_indices)
 
@@ -1900,6 +2172,217 @@ class SequentialRoutePlanner:
             logger.error("compute_route_efficiency_score error: %s", exc)
             return 0.0
 
+    def calculate_route_metrics(
+        self,
+        nodes: Sequence[Any],
+        meters_per_pixel: Optional[float] = None,
+    ) -> Dict[str, Union[int, float, bool]]:
+        """
+        Calculates standardized route metrics for cyclical and open routes.
+        Compatible with test_map_and_radar_suite.py and cartography radar displays.
+        """
+        scale = float(meters_per_pixel if meters_per_pixel is not None else 0.28)
+        n = len(nodes or [])
+        if n == 0:
+            return {
+                "discovered_nodes": 0,
+                "node_count": 0,
+                "smoothness_score_pct": 100.0,
+                "smoothness_score": 100.0,
+                "total_loop_distance_m": 0.0,
+                "total_distance_m": 0.0,
+                "total_distance_px": 0.0,
+                "avg_step_m": 0.0,
+                "avg_step_px": 0.0,
+                "max_jump_m": 0.0,
+                "max_jump_px": 0.0,
+                "min_step_m": 0.0,
+                "min_step_px": 0.0,
+                "ping_pong_jumps": 0,
+                "closed_loop": True,
+            }
+        quality = self.evaluate_sequence_quality(nodes, closed_loop=True)
+        tot_dist_px = float(quality.get("total_distance_px", 0.0))
+        tot_dist_m = round(tot_dist_px * scale, 2)
+        avg_px = float(quality.get("avg_step_px", 0.0))
+        max_px = float(quality.get("max_jump_px", 0.0))
+        min_px = float(quality.get("min_step_px", 0.0))
+        smooth_score = float(quality.get("smoothness_score", 100.0))
+
+        return {
+            "discovered_nodes": n,
+            "node_count": n,
+            "smoothness_score_pct": smooth_score,
+            "smoothness_score": smooth_score,
+            "total_loop_distance_m": tot_dist_m,
+            "total_distance_m": tot_dist_m,
+            "total_distance_px": tot_dist_px,
+            "avg_step_m": round(avg_px * scale, 2),
+            "avg_step_px": avg_px,
+            "max_jump_m": round(max_px * scale, 2),
+            "max_jump_px": max_px,
+            "min_step_m": round(min_px * scale, 2),
+            "min_step_px": min_px,
+            "ping_pong_jumps": int(quality.get("sharp_turns_count", 0)),
+            "closed_loop": n >= 3,
+        }
+
+    def get_next_cyclical_waypoint(
+        self,
+        nodes: Sequence[Any],
+        current_index: int,
+    ) -> Tuple[int, Optional[Any]]:
+        """
+        Returns the next sequential waypoint index and node in cyclical order:
+        (current_index + 1) % len(nodes).
+        Ensures continuous, unbroken looping across 3+ node routes without getting stuck.
+        """
+        if not nodes:
+            return -1, None
+        n = len(nodes)
+        next_idx = (int(current_index) + 1) % n
+        return next_idx, nodes[next_idx]
+
+    def advance_cyclical_sequence(
+        self,
+        nodes: Sequence[Any],
+        current_index: int,
+        player_pos: Tuple[float, float],
+        distance_m: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Checks arrival (<=20px / <=3m) at nodes[current_index] and smoothly advances
+        cyclically along the 3+ node route sequence.
+        """
+        if not nodes:
+            return {
+                "arrived": False,
+                "transitioned": False,
+                "current_index": -1,
+                "active_node": None,
+            }
+        curr_node = nodes[current_index % len(nodes)]
+        waypoint_xy = _extract_xy(curr_node)
+        transition = self.arrival_detector.check_and_transition(
+            player_pos=player_pos,
+            waypoint_pos=waypoint_xy,
+            nodes=nodes,
+            current_index=current_index,
+            distance_m=distance_m,
+            allow_cyclical=True,
+        )
+        if transition["transitioned"]:
+            self._current_seq_pos = transition["current_index"]
+        return transition
+
+    def find_nearest_waypoint(
+        self,
+        player_pos: Tuple[float, float],
+        nodes: Sequence[Any],
+    ) -> Tuple[int, Optional[Any], float]:
+        """Finds closest waypoint in sequence to player_pos."""
+        return find_nearest_waypoint(player_pos, nodes)
+
+    def resume_after_interrupt(
+        self,
+        nodes: Sequence[Any],
+        player_pos: Tuple[float, float],
+        previous_seq_pos: Optional[int] = None,
+        advance_if_reached: bool = False,
+    ) -> Tuple[Optional[Any], int]:
+        """
+        Resumes route following after F10 pause or combat interrupt:
+        - If player stayed near the route sequence, resumes from the nearest waypoint.
+        - If advance_if_reached=True and player has arrived at the nearest waypoint,
+          advances to the next cyclical waypoint.
+        - Sets self._current_seq_pos accordingly.
+        Returns: (resumed_node, resumed_index).
+        """
+        res = resume_route_after_interrupt(
+            player_pos=player_pos,
+            nodes=nodes,
+            last_index=previous_seq_pos,
+            waypoint_radius_px=self.waypoint_radius_px,
+            advance_if_reached=advance_if_reached,
+        )
+        idx = res.get("resumed_index", -1)
+        if idx >= 0:
+            self._current_seq_pos = idx
+            return nodes[idx], idx
+        return None, -1
+
+    def is_arrival_reached(
+        self,
+        player_pos: Tuple[float, float],
+        waypoint_pos: Tuple[float, float],
+        distance_m: Optional[float] = None,
+        pixel_distance: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Checks if player has reached arrival threshold (<=20px / <=3m)."""
+        return self.arrival_detector.is_arrival_reached(
+            player_pos=player_pos,
+            waypoint_pos=waypoint_pos,
+            distance_m=distance_m,
+            pixel_distance=pixel_distance,
+        )
+
+    def compute_bearing(
+        self,
+        from_pos: Tuple[float, float],
+        to_pos: Tuple[float, float],
+    ) -> float:
+        """Calculates anti-inversion compass bearing (0°=North, 90°=East)."""
+        return compute_bearing(from_pos, to_pos)
+
+    def compute_angle_diff(
+        self,
+        target_bearing: float,
+        player_heading: float,
+    ) -> float:
+        """Calculates shortest rotational angle diff in [-180°, +180°]."""
+        return compute_angle_diff(target_bearing, player_heading)
+
+    def apply_turn_damping(
+        self,
+        angle_diff: float,
+        deadband_deg: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Applies ±6° deadband turn damping and smooth interpolation."""
+        db = float(deadband_deg if deadband_deg is not None else self.deadband_deg)
+        return apply_turn_damping(angle_diff=angle_diff, deadband_deg=db)
+
+    def steer_step(
+        self,
+        player_pos: Tuple[float, float],
+        target_pos: Tuple[float, float],
+        player_heading: float,
+        deadband_deg: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Calculates damped steering toward target waypoint with anti-inversion bearing."""
+        bearing = compute_bearing(player_pos, target_pos)
+        cleaned_heading = normalize_compass_heading(player_heading)
+        diff = compute_angle_diff(bearing, cleaned_heading)
+        turn_data = self.apply_turn_damping(diff, deadband_deg=deadband_deg)
+        return {
+            "target_bearing": bearing,
+            "player_heading": cleaned_heading,
+            **turn_data,
+        }
+
+    def create_cyclical_follower(
+        self,
+        nodes: Optional[Sequence[Any]] = None,
+        start_index: int = 0,
+    ) -> CyclicalRouteFollower:
+        """Instantiates a dedicated CyclicalRouteFollower for cyclical 3+ node traversal."""
+        return CyclicalRouteFollower(
+            nodes=nodes,
+            waypoint_radius_px=self.waypoint_radius_px,
+            waypoint_radius_m=self.waypoint_radius_m,
+            deadband_deg=self.deadband_deg,
+            start_index=start_index,
+        )
+
     def get_sequential_router_health_summary(self) -> dict:
         try:
             return {"sequential_router_ready": True}
@@ -1994,6 +2477,18 @@ def get_sequential_router_audit_summary() -> dict:
         "audit_passed": validate_sequential_router_contract(),
         "probe": get_sequential_router_readiness_probe(),
     }
+
+
+# Canonical alias
+SequentialRouter = SequentialRoutePlanner
+
+__all__ = [
+    "SequentialRoutePlanner",
+    "SequentialRouter",
+    "filter_nodes_by_material",
+    "sort_nodes_by_proximity",
+    "build_proximity_material_route",
+]
 
 
 

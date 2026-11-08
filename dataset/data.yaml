@@ -1,8 +1,8 @@
 # Ultralytics YOLOv8 / YOLOv11 Dataset Configuration - Aion 2 Autonomous Dataset Factory
-path: C:/Users/selçuk/Desktop/a2/dataset
+path: F:/a2/dataset
 train: images/train
 val: images/val
-nc: 12
+nc: 27
 names:
   0: herb_aria
   1: herb_mela
@@ -12,7 +12,22 @@ names:
   5: wood_tree
   6: world_gather_crest
   7: f_gather_prompt
-  8: e_gather_icon
+  8: combo_skill_prompt
   9: minimap_sprout
-  10: monster_3d_negative
-  11: minimap_monster_negative
+  10: monster_3d
+  11: minimap_monster_dot
+  12: world_material
+  13: skill_ui_prompt
+  14: obstacle
+  15: path_ground
+  16: player_hp_bar
+  17: player_mp_bar
+  18: target_hp_bar
+  19: skill_bar
+  20: skill_slot_ready
+  21: skill_slot_cooldown
+  22: hp_potion
+  23: mp_potion
+  24: buff_scroll
+  25: kinah
+  26: player_character

@@ -8,32 +8,63 @@ Displays real-time Gatherion-style dark translucent status badge:
 - Live log stream
 """
 
+import ctypes
 import sys
 import time
+from typing import Any, Dict, List, Optional, Tuple
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QFont, QColor, QPalette
 
+from ui.overlay_hud import RadarProjectionOverlay, RadarProjectionWidget
+
+# Win32 extended style constants for non-intrusive click-through
+GWL_EXSTYLE: int = -20
+WS_EX_TRANSPARENT: int = 0x00000020
+WS_EX_LAYERED: int = 0x00080000
+WS_EX_TOOLWINDOW: int = 0x00000080
+SWP_NOSIZE: int = 0x0001
+SWP_NOMOVE: int = 0x0002
+SWP_NOZORDER: int = 0x0004
+SWP_NOACTIVATE: int = 0x0010
+SWP_FRAMECHANGED: int = 0x0020
+
+
 class OverlaySignals(QObject):
     update_signal = pyqtSignal(dict)
     log_signal = pyqtSignal(str)
 
+
 class GameOverlay(QWidget):
     def __init__(self):
         super().__init__()
+        self._click_through_enabled: bool = False
+        self._radar_projection: Optional[RadarProjectionOverlay] = None
+        self.radar_projection: Optional[RadarProjectionOverlay] = None
+        self._show_radar_projection: bool = True
         self.init_ui()
         self.logs = []
 
     def init_ui(self):
-        # Window Flags: Frameless, Always on Top, Tool window (no taskbar clutter)
+        # Window Flags: Frameless, Always on Top, Tool window, No Focus Stealing
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.SubWindow
+            Qt.WindowType.SubWindow |
+            Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+        try:
+            self._radar_projection = RadarProjectionOverlay()
+            self.radar_projection = self._radar_projection
+        except Exception:
+            self._radar_projection = None
+            self.radar_projection = None
 
         # Main Layout
         main_layout = QVBoxLayout(self)
@@ -169,6 +200,180 @@ class GameOverlay(QWidget):
             self.badge_lbl.setText(state)
             self.badge_lbl.setStyleSheet("background-color: #2b313a; color: #94a3b8; font-size: 11px; font-weight: bold; padding: 2px 8px; border-radius: 4px;")
 
+        # Forward mini-radar projection data
+        if hasattr(self, "_radar_projection") and self._radar_projection is not None:
+            has_radar_data = any(
+                k in data
+                for k in (
+                    "radar_blips",
+                    "blips",
+                    "target_bearing",
+                    "target_bearing_deg",
+                    "target_direction",
+                    "target_direction_deg",
+                    "target_distance",
+                    "target_distance_m",
+                    "target_node",
+                    "target_name",
+                    "player_pos",
+                    "player_x",
+                    "player_y",
+                    "heading_deg",
+                    "player_heading",
+                )
+            )
+            if has_radar_data:
+                p_pos = data.get("player_pos", (data.get("player_x", 0.0), data.get("player_y", 0.0)))
+                px = p_pos[0] if isinstance(p_pos, (tuple, list)) and len(p_pos) > 0 else 0.0
+                py = p_pos[1] if isinstance(p_pos, (tuple, list)) and len(p_pos) > 1 else 0.0
+                heading = data.get("heading_deg", data.get("player_heading", data.get("heading", 0.0)))
+                t_bearing = data.get(
+                    "target_bearing_deg",
+                    data.get(
+                        "target_bearing",
+                        data.get("target_direction_deg", data.get("target_direction", None)),
+                    ),
+                )
+                t_dist = data.get("target_distance_m", data.get("target_distance", data.get("target_dist", None)))
+                t_name = data.get("target_name", data.get("target_node", data.get("target", "")))
+                blips = data.get("radar_blips", data.get("blips", None))
+                r_range = data.get("radar_range_m", data.get("radar_range", None))
+
+                self._radar_projection.update_projection(
+                    player_x=px,
+                    player_y=py,
+                    heading_deg=heading,
+                    target_bearing_deg=t_bearing,
+                    target_distance_m=t_dist,
+                    target_name=t_name,
+                    blips=blips,
+                    range_m=r_range,
+                )
+
+    def set_click_through(self, enabled: bool = True) -> bool:
+        """Configures transparent click-through on GameOverlay and radar projection."""
+        self._click_through_enabled = bool(enabled)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, bool(enabled))
+        if sys.platform == "win32":
+            try:
+                hwnd = int(self.winId()) if self.winId() is not None else 0
+                if hwnd:
+                    user32 = ctypes.windll.user32
+                    cur_style = int(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))
+                    if enabled:
+                        new_style = cur_style | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW
+                    else:
+                        new_style = (
+                            cur_style | WS_EX_LAYERED | WS_EX_TOOLWINDOW
+                        ) & ~WS_EX_TRANSPARENT
+                    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+                    user32.SetWindowPos(
+                        hwnd,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE
+                        | SWP_NOSIZE
+                        | SWP_NOZORDER
+                        | SWP_NOACTIVATE
+                        | SWP_FRAMECHANGED,
+                    )
+            except Exception:
+                pass
+        if hasattr(self, "_radar_projection") and self._radar_projection is not None:
+            try:
+                self._radar_projection.set_click_through(enabled)
+            except Exception:
+                pass
+        return True
+
+    def nativeEvent(self, eventType: Any, message: Any) -> Tuple[bool, int]:
+        try:
+            if sys.platform == "win32" and eventType == b"windows_generic_MSG":
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                if int(msg.message) == 0x0021:  # WM_MOUSEACTIVATE
+                    return True, 3  # MA_NOACTIVATE
+        except Exception:
+            pass
+        handled = super().nativeEvent(eventType, message)
+        if isinstance(handled, tuple) and len(handled) == 2 and handled[1] is not None:
+            return bool(handled[0]), int(handled[1])
+        return False, 0
+
+    def show_radar_projection(self, visible: bool = True) -> None:
+        self._show_radar_projection = bool(visible)
+        if self._radar_projection is not None:
+            if visible and not self.isHidden():
+                self._radar_projection.show()
+            else:
+                self._radar_projection.hide()
+
+    def hide_radar_projection(self) -> None:
+        self.show_radar_projection(False)
+
+    def toggle_radar_projection(self) -> bool:
+        new_state = not getattr(self, "_show_radar_projection", True)
+        self.show_radar_projection(new_state)
+        return new_state
+
+    def update_radar_projection(
+        self,
+        player_x: float = 0.0,
+        player_y: float = 0.0,
+        heading_deg: float = 0.0,
+        target_bearing_deg: Optional[float] = None,
+        target_distance_m: Optional[float] = None,
+        target_name: str = "",
+        blips: Optional[List[Dict[str, Any]]] = None,
+        range_m: Optional[float] = None,
+    ) -> None:
+        if self._radar_projection is not None:
+            self._radar_projection.update_projection(
+                player_x=player_x,
+                player_y=player_y,
+                heading_deg=heading_deg,
+                target_bearing_deg=target_bearing_deg,
+                target_distance_m=target_distance_m,
+                target_name=target_name,
+                blips=blips,
+                range_m=range_m,
+            )
+
+    def set_radar_blips(self, blips: List[Dict[str, Any]]) -> None:
+        if self._radar_projection is not None:
+            self._radar_projection.set_blips(blips)
+
+    def set_target_direction(
+        self,
+        bearing_deg: float,
+        distance_m: float,
+        label: str = "",
+    ) -> None:
+        if self._radar_projection is not None:
+            self._radar_projection.set_target_direction(bearing_deg, distance_m, label)
+
+    def showEvent(self, event: Any) -> None:  # noqa: N802
+        super().showEvent(event)
+        if (
+            hasattr(self, "_radar_projection")
+            and self._radar_projection is not None
+            and getattr(self, "_show_radar_projection", True)
+        ):
+            self._radar_projection.show()
+
+    def hideEvent(self, event: Any) -> None:  # noqa: N802
+        if hasattr(self, "_radar_projection") and self._radar_projection is not None:
+            self._radar_projection.hide()
+        super().hideEvent(event)
+
+    def closeEvent(self, event: Any) -> None:  # noqa: N802
+        if hasattr(self, "_radar_projection") and self._radar_projection is not None:
+            self._radar_projection.close()
+        super().closeEvent(event)
+
+
     def add_log(self, text: str):
         now_str = time.strftime("%H:%M:%S")
         entry = f"{now_str} {text}"
@@ -246,5 +451,23 @@ def get_overlay_readiness_probe() -> dict:
 
 def get_overlay_audit_summary() -> dict:
     return {"module": "overlay", "audit_passed": validate_overlay_contract(), "probe": get_overlay_readiness_probe()}
+
+
+__all__ = [
+    "GameOverlay",
+    "OverlaySignals",
+    "RadarProjectionWidget",
+    "RadarProjectionOverlay",
+    "validate_overlay_contract",
+    "get_overlay_readiness_status",
+    "get_overlay_audit_record",
+    "get_overlay_operational_digest",
+    "get_overlay_telemetry_payload",
+    "get_overlay_integrity_seal",
+    "get_overlay_compliance_certificate",
+    "get_overlay_readiness_probe",
+    "get_overlay_audit_summary",
+]
+
 
 

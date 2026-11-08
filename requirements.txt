@@ -1,5 +1,6 @@
 # Core Desktop UI, Vision & Hardware Input Dependencies
 PyQt6>=6.6.0
+PyQt6-WebEngine>=6.6.0
 opencv-python>=4.8.0
 mss>=9.0.1
 numpy>=1.24.0
@@ -27,3 +28,7 @@ pyyaml>=6.0.1
 
 # Optional Audio Loopback DSP (WASAPI FFT Frequency Analysis)
 sounddevice>=0.4.6
+
+# Serial / Network HID (Leonardo COM + Android TCP bridge client uses same stack)
+pyserial>=3.5
+

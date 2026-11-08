@@ -317,6 +317,123 @@ class HumanTimingEngine:
             logger.error("get_key_hold_duration_sec hatası: %s", exc)
             return 0.062
 
+    def sample_gaussian_jitter(
+        self,
+        base_sec: float,
+        std_sec: float = 0.005,
+        min_sec: Optional[float] = None,
+        max_sec: Optional[float] = None,
+    ) -> float:
+        """
+        Gaussian (normal) dağılımla ortalama `base_sec` ve standart sapma `std_sec`
+        kullanarak insani jitter üretir. Sınırlar verilmezse [base - 3*std, base + 3*std]
+        ve en az 0.001s olarak otomatik sınırlandırır.
+        """
+        try:
+            clean_base = max(0.001, float(base_sec))
+            clean_std = max(0.0001, float(std_sec))
+            low = float(min_sec) if min_sec is not None else max(0.001, clean_base - 3.0 * clean_std)
+            high = float(max_sec) if max_sec is not None else (clean_base + 3.0 * clean_std)
+            if low > high:
+                low, high = high, low
+            with self._lock:
+                self._total_samples_generated += 1
+                for _ in range(32):
+                    candidate = self._rng.gauss(clean_base, clean_std)
+                    if low <= candidate <= high:
+                        return float(candidate)
+                return float(max(low, min(high, clean_base)))
+        except Exception as exc:
+            logger.error("sample_gaussian_jitter hatası: %s", exc)
+            return float(base_sec)
+
+    def get_key_release_guard_sec(self) -> float:
+        """
+        Tuş bırakıldıktan sonraki koruma gecikmesi:
+        Sabit 20ms (0.020s) yerine Gaussian insan jitter'ı (16ms - 28ms, ort ~21ms).
+        """
+        fatigue = self.get_fatigue_multiplier()
+        mu = 0.021 * min(1.05, fatigue)
+        sigma = 0.0025
+        return self.sample_gaussian_jitter(
+            base_sec=mu,
+            std_sec=sigma,
+            min_sec=0.016,
+            max_sec=0.028,
+        )
+
+    def get_burst_inter_key_delay_sec(self, trusted: bool = True) -> float:
+        """
+        Çoklu beceri (burst) basımları arasındaki bekleme süresi:
+        Sabit 35ms (trusted) / 60ms (untrusted) yerine Gaussian insan jitter'ı.
+        Trusted: 28ms - 45ms (ort ~35ms, std 3.5ms).
+        Untrusted: 48ms - 75ms (ort ~60ms, std 5.5ms).
+        """
+        fatigue = self.get_fatigue_multiplier()
+        if trusted:
+            mu = 0.035 * min(1.05, fatigue)
+            return self.sample_gaussian_jitter(
+                base_sec=mu,
+                std_sec=0.0035,
+                min_sec=0.028,
+                max_sec=0.045,
+            )
+        else:
+            mu = 0.060 * min(1.05, fatigue)
+            return self.sample_gaussian_jitter(
+                base_sec=mu,
+                std_sec=0.0055,
+                min_sec=0.048,
+                max_sec=0.075,
+            )
+
+    def align_to_gcd(
+        self,
+        burst_duration_sec: float,
+        gcd_sec: float = 0.12,
+        min_gap_sec: float = 0.020,
+    ) -> float:
+        """
+        Global Cooldown (GCD) ile zaman uyumu:
+        Beceri kullanım süresinin ardından bir sonraki becerinin GCD bitimine denk
+        gelmesi için kalan süreyi hesaplar ve insan parmak jitter'ı ekler.
+        `min_gap_sec` minimum dinlenme payını garanti eder.
+        """
+        try:
+            clean_gcd = max(0.05, float(gcd_sec))
+            clean_dur = max(0.0, float(burst_duration_sec))
+            clean_min = max(0.005, float(min_gap_sec))
+
+            rem = clean_gcd - (clean_dur % clean_gcd) if clean_gcd > 0 else clean_min
+            if rem < clean_min:
+                rem += clean_gcd
+
+            jittered = self.sample_gaussian_jitter(
+                base_sec=rem,
+                std_sec=0.004,
+                min_sec=clean_min,
+                max_sec=rem + 0.015,
+            )
+            return max(clean_min, jittered)
+        except Exception as exc:
+            logger.error("align_to_gcd hatası: %s", exc)
+            return max(0.020, float(gcd_sec) - float(burst_duration_sec))
+
+    def sleep_gaussian_jitter(
+        self,
+        base_sec: float,
+        std_sec: float = 0.005,
+        min_sec: Optional[float] = None,
+        max_sec: Optional[float] = None,
+    ) -> float:
+        """Gaussian jitter süresi kadar bekler ve uygulanan süreyi döndürür."""
+        delay = self.sample_gaussian_jitter(base_sec, std_sec=std_sec, min_sec=min_sec, max_sec=max_sec)
+        try:
+            time.sleep(delay)
+        except Exception as exc:
+            logger.error("sleep_gaussian_jitter hatası: %s", exc)
+        return delay
+
     def sleep_visual_reaction(self) -> float:
         """Görsel tepki gecikmesi kadar bekler ve beklenen süreyi döndürür."""
         delay = self.get_visual_reaction_delay_sec()
@@ -912,6 +1029,21 @@ def run_statistical_distribution_verification(n_samples: int = 1000) -> Dict[str
             140.0,
             260.0,
         ),
+        "key_release_guard_sec (0.016-0.028s)": (
+            engine.get_key_release_guard_sec,
+            0.016,
+            0.028,
+        ),
+        "burst_inter_key_trusted (0.028-0.045s)": (
+            lambda: engine.get_burst_inter_key_delay_sec(trusted=True),
+            0.028,
+            0.045,
+        ),
+        "burst_inter_key_untrusted (0.048-0.075s)": (
+            lambda: engine.get_burst_inter_key_delay_sec(trusted=False),
+            0.048,
+            0.075,
+        ),
     }
 
     report: Dict[str, Dict[str, float]] = {}
@@ -955,6 +1087,72 @@ def run_statistical_distribution_verification(n_samples: int = 1000) -> Dict[str
         )
 
     return report
+
+
+# ============================================================================
+# 4. GLOBAL TEKİL (SINGLETON) VE MODÜL SEVİYESİ YARDIMCI FONKSİYONLAR
+# ============================================================================
+
+_GLOBAL_HUMAN_TIMING_ENGINE: Optional[HumanTimingEngine] = None
+_GLOBAL_TIMING_LOCK = threading.Lock()
+
+
+def get_human_timing_engine() -> HumanTimingEngine:
+    """Global HumanTimingEngine tekil (singleton) örneğini döndürür."""
+    global _GLOBAL_HUMAN_TIMING_ENGINE
+    if _GLOBAL_HUMAN_TIMING_ENGINE is None:
+        with _GLOBAL_TIMING_LOCK:
+            if _GLOBAL_HUMAN_TIMING_ENGINE is None:
+                _GLOBAL_HUMAN_TIMING_ENGINE = HumanTimingEngine()
+    return _GLOBAL_HUMAN_TIMING_ENGINE
+
+
+def get_gaussian_jitter(
+    base_sec: float,
+    std_sec: float = 0.005,
+    min_sec: Optional[float] = None,
+    max_sec: Optional[float] = None,
+) -> float:
+    """Global HumanTimingEngine üzerinden Gaussian jitter üretir."""
+    return get_human_timing_engine().sample_gaussian_jitter(
+        base_sec, std_sec=std_sec, min_sec=min_sec, max_sec=max_sec
+    )
+
+
+def get_key_release_guard_sec() -> float:
+    """Global HumanTimingEngine üzerinden tuş bırakma koruma süresi üretir."""
+    return get_human_timing_engine().get_key_release_guard_sec()
+
+
+def get_burst_inter_key_delay_sec(trusted: bool = True) -> float:
+    """Global HumanTimingEngine üzerinden çoklu tuş aralığı gecikmesi üretir."""
+    return get_human_timing_engine().get_burst_inter_key_delay_sec(trusted=trusted)
+
+
+def align_to_gcd(
+    burst_duration_sec: float,
+    gcd_sec: float = 0.12,
+    min_gap_sec: float = 0.020,
+) -> float:
+    """Global HumanTimingEngine üzerinden GCD uyumlu bekleme süresi hesaplar."""
+    return get_human_timing_engine().align_to_gcd(
+        burst_duration_sec=burst_duration_sec, gcd_sec=gcd_sec, min_gap_sec=min_gap_sec
+    )
+
+
+def sleep_gaussian_jitter(
+    base_sec: float,
+    std_sec: float = 0.005,
+    min_sec: Optional[float] = None,
+    max_sec: Optional[float] = None,
+) -> float:
+    """Gaussian jitter süresi kadar bekler ve uygulanan süreyi döndürür."""
+    delay = get_gaussian_jitter(base_sec, std_sec=std_sec, min_sec=min_sec, max_sec=max_sec)
+    try:
+        time.sleep(delay)
+    except Exception as exc:
+        logger.error("sleep_gaussian_jitter hatası: %s", exc)
+    return delay
 
 
 if __name__ == "__main__":

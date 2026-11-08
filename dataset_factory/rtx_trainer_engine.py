@@ -42,6 +42,175 @@ if not logger.handlers:
 
 CREATE_NO_WINDOW: int = 0x08000000 if sys.platform == "win32" else 0
 
+_MIN_TRAIN_FREE_BYTES = 8 * 1024 * 1024 * 1024
+
+
+def offload_root() -> Optional[Path]:
+    """F:\\a2 when that folder exists, else F:\\Gatherion. None when F: is missing."""
+    if not Path("F:/").exists():
+        return None
+    preferred = Path("F:/a2")
+    if preferred.is_dir():
+        return preferred
+    return Path("F:/Gatherion")
+
+
+def rtx_runs_dir_for() -> Path:
+    """Ultralytics project directory. New weights and plots stay off C:."""
+    root = offload_root()
+    if root is None:
+        return Path("F:/Gatherion/models/rtx_runs")
+    return root / "models" / "rtx_runs"
+
+
+def _pin_train_env() -> Path:
+    """Point temp and Ultralytics caches at F: before a run writes anything."""
+    root = offload_root() or Path("F:/a2")
+    temp_dir = root / "temp"
+    appdata_dir = root / "appdata"
+    torch_home = root / "torch"
+    weights_dir = temp_dir / "weights"
+    datasets_dir = root / "dataset"
+    runs_dir = rtx_runs_dir_for()
+    for path in (temp_dir, appdata_dir, torch_home, weights_dir, datasets_dir, runs_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    os.environ["TEMP"] = str(temp_dir)
+    os.environ["TMP"] = str(temp_dir)
+    os.environ["TORCH_HOME"] = str(torch_home)
+    os.environ["YOLO_CONFIG_DIR"] = str(appdata_dir)
+    os.environ["ULTRALYTICS_CONFIG_DIR"] = str(appdata_dir)
+    os.environ["PIP_CACHE_DIR"] = str(root / "pip-cache")
+    (root / "pip-cache").mkdir(parents=True, exist_ok=True)
+    _persist_ultra_settings(appdata_dir / "Ultralytics" / "settings.json", datasets_dir, weights_dir, runs_dir)
+    return runs_dir
+
+
+def _persist_ultra_settings(settings_path: Path, datasets_dir: Path, weights_dir: Path, runs_dir: Path) -> None:
+    """Rewrite datasets/weights/runs if a settings file still points off F:."""
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: Dict[str, Any] = {}
+    if settings_path.is_file():
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    payload["datasets_dir"] = str(datasets_dir)
+    payload["weights_dir"] = str(weights_dir)
+    payload["runs_dir"] = str(runs_dir)
+    settings_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _yaml_on_offload(
+    data_yaml_path: Union[str, Path],
+    use_approved_only: bool = False,
+) -> Path:
+    """Train against the F: dataset when the caller still passes a C: yaml, preserving approved YAML."""
+    path = Path(data_yaml_path)
+    is_approved_yaml = bool(
+        use_approved_only
+        or path.name.lower() == "data_approved.yaml"
+        or "approved" in [p.lower() for p in path.parts]
+    )
+    if is_approved_yaml and path.is_file():
+        return path
+
+    root = offload_root()
+    if root is None:
+        return path
+    try:
+        path.resolve().relative_to(root.resolve())
+        if is_approved_yaml and path.name.lower() != "data_approved.yaml":
+            if path.is_dir():
+                base_ds = path if path.name.lower() == "dataset" else (path / "dataset" if (path / "dataset").is_dir() else path)
+            else:
+                base_ds = path.parent
+            return base_ds / "approved" / "data_approved.yaml"
+        return path
+    except (ValueError, OSError):
+        if is_approved_yaml:
+            if path.name.lower() == "data_approved.yaml" and path.parent.exists():
+                return path
+            preferred_approved = root / "dataset" / "approved" / "data_approved.yaml"
+            if preferred_approved.is_file():
+                logger.warning(
+                    "Onaylı eğitim verisi %s F: dışında; %s kullanılacak",
+                    path,
+                    preferred_approved,
+                )
+                return preferred_approved
+            return path
+        if path.is_file():
+            return path
+        preferred = root / "dataset" / "data.yaml"
+        if preferred.is_file():
+            logger.warning(
+                "Eğitim verisi %s F: dışında; %s kullanılacak",
+                path,
+                preferred,
+            )
+            return preferred
+        return path
+
+
+def target_volume_free_bytes(path: Path) -> int:
+    """Free bytes on the volume that will hold `path`. 0 when that volume is missing."""
+    probe = path
+    try:
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        if not probe.exists():
+            return 0
+        return int(shutil.disk_usage(probe).free)
+    except OSError:
+        return 0
+
+
+def _point_ultralytics_runs(runs_dir: Path) -> None:
+    """Send Ultralytics runs, weights, and datasets to F: before model.train."""
+    root = offload_root() or Path("F:/a2")
+    datasets_dir = root / "dataset"
+    weights_dir = root / "temp" / "weights"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import ultralytics.utils as ultra_utils
+
+        ultra_utils.SETTINGS.update(
+            runs_dir=str(runs_dir),
+            weights_dir=str(weights_dir),
+            datasets_dir=str(datasets_dir),
+        )
+        ultra_utils.RUNS_DIR = Path(runs_dir)
+    except Exception:
+        logger.warning("Ultralytics runs_dir F: yoluna alınamadı", exc_info=True)
+
+
+_TRAIN_SLOT_LOCK = threading.Lock()
+_TRAIN_SLOT_HELD = False
+
+
+def _acquire_train_slot() -> bool:
+    """One Ultralytics run for models/rtx_runs/gatherion_rtx_fp16. Second call loses."""
+    global _TRAIN_SLOT_HELD
+    with _TRAIN_SLOT_LOCK:
+        if _TRAIN_SLOT_HELD:
+            return False
+        _TRAIN_SLOT_HELD = True
+        return True
+
+
+def _release_train_slot() -> None:
+    global _TRAIN_SLOT_HELD
+    with _TRAIN_SLOT_LOCK:
+        _TRAIN_SLOT_HELD = False
+
+
+def _train_slot_busy() -> bool:
+    with _TRAIN_SLOT_LOCK:
+        return bool(_TRAIN_SLOT_HELD)
+
 DEFAULT_CLASS_NAMES: Dict[int, str] = {
     0: "wood_tree",
     1: "stone_node",
@@ -159,6 +328,8 @@ def build_rtx_training_config(
     epochs: int = 50,
     imgsz: int = 640,
     batch: int = 16,
+    model: str = "yolo11n.pt",
+    use_approved_only: bool = False,
 ) -> Dict[str, Any]:
     """
     Top-level convenience wrapper around RTXTrainerEngine.build_rtx_training_config().
@@ -167,6 +338,8 @@ def build_rtx_training_config(
         epochs=epochs,
         imgsz=imgsz,
         batch=batch,
+        model=model,
+        use_approved_only=use_approved_only,
     )
 
 
@@ -194,6 +367,7 @@ class RTXTrainerEngine:
         project_root: Optional[Union[str, Path]] = None,
         dataset_dir: Optional[Union[str, Path]] = None,
         models_dir: Optional[Union[str, Path]] = None,
+        use_approved_only: bool = False,
     ) -> None:
         if project_root is None:
             self.project_root = Path(__file__).resolve().parent.parent
@@ -212,6 +386,9 @@ class RTXTrainerEngine:
         )
         self.models_dir.mkdir(parents=True, exist_ok=True)
 
+        self.use_approved_only: bool = bool(use_approved_only)
+        self.approved_yaml_path: Path = self.dataset_dir / "approved" / "data_approved.yaml"
+        self.default_yaml_path: Path = self.dataset_dir / "data.yaml"
         self.onnx_export_path = self.models_dir / "yolov8n_gatherion.onnx"
         self.custom_detector_path = self.models_dir / "gatherion_custom_detector.json"
         self.bat_script_path = self.project_root / "train_rtx_yolo.bat"
@@ -232,6 +409,7 @@ class RTXTrainerEngine:
             "eta_sec": 0.0,
             "elapsed_sec": 0.0,
             "mode": "uninitialized",
+            "use_approved_only": self.use_approved_only,
             "artifacts": {},
         }
         self._gabor_kernels = self._build_gabor_filter_bank()
@@ -413,6 +591,8 @@ class RTXTrainerEngine:
         epochs: int = 50,
         imgsz: int = 640,
         batch: int = 16,
+        model: str = "yolo11n.pt",
+        use_approved_only: bool = False,
     ) -> Dict[str, Any]:
         """
         Builds optimal Ultralytics & Prototype training hyperparameters tuned for
@@ -422,6 +602,8 @@ class RTXTrainerEngine:
         epochs = max(1, int(epochs))
         imgsz = max(320, int(imgsz))
         batch = max(1, int(batch))
+        model_name = str(model or "yolo11n.pt").strip() or "yolo11n.pt"
+        approved_flag = bool(use_approved_only)
 
         # Estimate throughput on RTX 3070 Ampere FP16 (~380 images/sec at 640px batch=16)
         images_per_sec_fp16 = 375.0 * (640.0 / float(imgsz)) ** 2
@@ -429,10 +611,16 @@ class RTXTrainerEngine:
         est_minutes_5k = round(est_seconds_5k / 60.0, 2)
 
         return {
-            "model": "yolov8n.pt",
+            "model": model_name,
             "epochs": epochs,
             "imgsz": imgsz,
             "batch": batch,
+            "use_approved_only": approved_flag,
+            "data_yaml": (
+                "dataset/approved/data_approved.yaml"
+                if approved_flag
+                else "dataset/data.yaml"
+            ),
             "amp": True,
             "half": True,
             "cos_lr": True,
@@ -474,9 +662,9 @@ class RTXTrainerEngine:
                 "format": "onnx",
                 "half": True,
                 "dynamic": False,
+                "imgsz": imgsz,
                 "simplify": True,
                 "opset": 12,
-                "imgsz": imgsz,
                 "target_path": "models/yolov8n_gatherion.onnx",
             },
             "hardware_target": {
@@ -492,82 +680,313 @@ class RTXTrainerEngine:
         epochs: int = 50,
         imgsz: int = 640,
         batch: int = 16,
+        model: str = "yolo11n.pt",
+        use_approved_only: bool = False,
     ) -> Dict[str, Any]:
         """Instance method wrapper for `build_rtx_training_config_static()`."""
         return self.build_rtx_training_config_static(
             epochs=epochs,
             imgsz=imgsz,
             batch=batch,
+            model=model,
+            use_approved_only=bool(use_approved_only or self.use_approved_only),
         )
+
+    def resolve_training_yaml(
+        self,
+        data_yaml_path: Optional[Union[str, Path]] = None,
+        use_approved_only: bool = False,
+    ) -> Tuple[Path, bool]:
+        """
+        Resolves the active training YAML path and `use_approved_only` flag.
+        When `use_approved_only=True` or `data_approved.yaml` is passed,
+        prepares and returns the approved dataset YAML (`dataset/approved/data_approved.yaml`).
+        """
+        effective_approved = bool(use_approved_only or self.use_approved_only)
+        raw_path: Optional[Path] = Path(data_yaml_path) if data_yaml_path is not None else None
+
+        if raw_path is not None:
+            if (
+                raw_path.name.lower() == "data_approved.yaml"
+                or "approved" in [p.lower() for p in raw_path.parts]
+            ):
+                effective_approved = True
+
+        if effective_approved:
+            target_ds_dir = self.dataset_dir
+            target_yaml = self.approved_yaml_path
+
+            if raw_path is not None:
+                resolved_raw = (
+                    raw_path.resolve()
+                    if raw_path.is_absolute()
+                    else (self.project_root / raw_path).resolve()
+                )
+                if raw_path.is_file():
+                    resolved_raw = raw_path.resolve()
+
+                if resolved_raw.name.lower() == "data_approved.yaml":
+                    target_yaml = resolved_raw
+                    if resolved_raw.parent.name.lower() == "approved":
+                        target_ds_dir = resolved_raw.parent.parent
+                elif resolved_raw.is_dir():
+                    if resolved_raw.name.lower() == "approved":
+                        target_ds_dir = resolved_raw.parent
+                        target_yaml = resolved_raw / "data_approved.yaml"
+                    else:
+                        target_ds_dir = resolved_raw
+                        target_yaml = resolved_raw / "approved" / "data_approved.yaml"
+                else:
+                    # Caller passed e.g. `dataset/data.yaml` with `use_approved_only=True`
+                    target_ds_dir = resolved_raw.parent
+                    target_yaml = target_ds_dir / "approved" / "data_approved.yaml"
+
+            if use_approved_only or self.use_approved_only or not target_yaml.is_file():
+                try:
+                    from dataset_factory.yolo_trainer import prepare_and_resolve_training_yaml
+
+                    prepared = prepare_and_resolve_training_yaml(
+                        dataset_dir=target_ds_dir,
+                        only_approved=True,
+                    )
+                    if not target_yaml.is_file() and Path(prepared).is_file():
+                        target_yaml = Path(prepared).resolve()
+                except Exception as exc:
+                    logger.debug("prepare_and_resolve_training_yaml fallback in engine: %s", exc)
+
+            if not target_yaml.is_file():
+                target_yaml.parent.mkdir(parents=True, exist_ok=True)
+                (target_yaml.parent / "images" / "train").mkdir(parents=True, exist_ok=True)
+                (target_yaml.parent / "images" / "val").mkdir(parents=True, exist_ok=True)
+                (target_yaml.parent / "labels" / "train").mkdir(parents=True, exist_ok=True)
+                (target_yaml.parent / "labels" / "val").mkdir(parents=True, exist_ok=True)
+                pool_posix = target_yaml.parent.as_posix()
+                target_yaml.write_text(
+                    f"path: {pool_posix}\ntrain: images/train\nval: images/val\nnc: 22\n"
+                    "names:\n"
+                    "  0: herb_aria\n  1: herb_mela\n  2: herb_targena\n  3: ore_orichalcum\n"
+                    "  4: gem_crystal\n  5: tree_log\n  6: herb_edana\n  7: herb_lumina\n"
+                    "  8: ore_obsidian\n  9: minimap_sprout\n  10: monster_3d\n  11: minimap_monster_dot\n"
+                    "  12: crystal_blood\n  13: skill_ui_prompt\n  14: obstacle\n  15: path_ground\n"
+                    "  16: player_hp_bar\n  17: player_mp_bar\n  18: target_hp_bar\n  19: skill_bar\n"
+                    "  20: skill_slot_ready\n  21: skill_slot_cooldown\n",
+                    encoding="utf-8",
+                )
+
+            return _yaml_on_offload(target_yaml, use_approved_only=True).resolve(), True
+
+        if raw_path is None:
+            raw_path = self.default_yaml_path
+        return _yaml_on_offload(raw_path, use_approved_only=False).resolve(), False
+
+    def _resolve_base_weights(self, model_name: str) -> str:
+        """Prefer local weights under models/, else let Ultralytics resolve/download the name."""
+        name = str(model_name or "yolo11n.pt").strip() or "yolo11n.pt"
+        candidates = [
+            self.models_dir / name,
+            Path(name),
+            Path.cwd() / name,
+            Path(__file__).resolve().parent.parent / name,
+        ]
+        for cand in candidates:
+            try:
+                if cand.is_file():
+                    return str(cand.resolve())
+            except OSError:
+                continue
+        return name
+
+    @staticmethod
+    def _count_results_csv_epochs(run_dir: Path) -> int:
+        csv_path = Path(run_dir) / "results.csv"
+        if not csv_path.is_file():
+            return 0
+        try:
+            import csv as _csv
+
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                return sum(1 for _ in _csv.DictReader(handle))
+        except Exception:
+            return 0
+
+    @property
+    def is_training(self) -> bool:
+        return _train_slot_busy()
+
+    @property
+    def _training_active(self) -> bool:
+        return _train_slot_busy()
+
+    def _begin_training_session(self, *, slot_held: bool, batch: int) -> Dict[str, Any]:
+        from core.game_gpu_throttle import training_image_retention_decision
+
+        owns_slot = False
+        if not slot_held:
+            if not _acquire_train_slot():
+                return {
+                    "refused": True,
+                    "throttle": None,
+                    "owns_slot": False,
+                    "batch": int(batch),
+                }
+            owns_slot = True
+
+        decision = training_image_retention_decision(self.project_root)
+        logger.info("Eğitim görselleri tutulur. %s", decision["reason"])
+        game_pids = self._aion_blocks_training()
+        if game_pids:
+            logger.error(
+                "AION2 pid=%s açık. Eğitim reddedildi. GPU paylaşılmayacak.",
+                ",".join(str(pid) for pid in game_pids),
+            )
+            if owns_slot:
+                _release_train_slot()
+            return {
+                "refused": True,
+                "reason": "aion2_running",
+                "throttle": None,
+                "owns_slot": False,
+                "batch": int(batch),
+                "game_pids": game_pids,
+            }
+        return {
+            "refused": False,
+            "throttle": None,
+            "owns_slot": owns_slot,
+            "batch": int(batch),
+        }
+
+    def _aion_blocks_training(self) -> List[int]:
+        """AION2 / AION 2 / Aion2 açıksa eğitim başlamaz. Batch düşürmek GPU'yu paylaşır."""
+        from core.game_gpu_throttle import find_aion_game_processes
+
+        try:
+            return [int(pid) for pid in find_aion_game_processes()]
+        except Exception as exc:
+            logger.warning("AION süreç araması başarısız, eğitim yine başlar: %s", exc)
+            return []
+
+    def _end_training_session(self, session: Dict[str, Any]) -> None:
+        throttle = session.get("throttle")
+        if throttle is not None:
+            try:
+                throttle.restore()
+            except Exception:
+                logger.exception("Oyun önceliği ve EcoQoS geri alınamadı")
+        if session.get("owns_slot"):
+            _release_train_slot()
 
     # ------------------------------------------------------------------
     # 3. 1-Click Asynchronous & Synchronous Training Pipeline
     # ------------------------------------------------------------------
     def start_training_async(
         self,
-        data_yaml_path: Union[str, Path],
+        data_yaml_path: Optional[Union[str, Path]] = None,
         epochs: int = 50,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         imgsz: int = 640,
         batch: int = 16,
         force_fallback: bool = False,
+        model: str = "yolo11n.pt",
+        allow_opencv_fallback: bool = True,
+        use_approved_only: bool = False,
     ) -> Dict[str, Any]:
         """
         Starts 1-Click training asynchronously on a background daemon thread.
         Immediately returns a launch descriptor containing the thread handle,
         environment probe, and active training configuration.
+        A second start is refused until the worker releases the process-wide slot.
+        AION2, AION 2, or Aion2 running refuses the start. The GPU is not shared.
         """
-        with self._lock:
-            if self._training_thread is not None and self._training_thread.is_alive():
-                return {
-                    "started": False,
-                    "reason": "Training is already running in the background.",
-                    "status": dict(self._latest_status),
-                }
-            self._stop_event.clear()
-
-        env_info = self.probe_gpu_environment()
-        train_cfg = self.build_rtx_training_config(epochs=epochs, imgsz=imgsz, batch=batch)
-
-        def _worker() -> None:
-            try:
-                self.run_training_sync(
-                    data_yaml_path=data_yaml_path,
-                    epochs=epochs,
-                    progress_callback=progress_callback,
-                    imgsz=imgsz,
-                    batch=batch,
-                    force_fallback=force_fallback,
-                )
-            except Exception as exc:
-                logger.exception("Asynchronous training encountered an error: %s", exc)
-                with self._lock:
-                    self._latest_status["state"] = "failed"
-                    self._latest_status["error"] = str(exc)
-                if progress_callback is not None:
-                    try:
-                        progress_callback(dict(self._latest_status))
-                    except Exception:
-                        pass
-
-        thread = threading.Thread(
-            target=_worker,
-            name="RTXTrainerEngineWorker",
-            daemon=True,
+        resolved_yaml, effective_approved = self.resolve_training_yaml(
+            data_yaml_path=data_yaml_path,
+            use_approved_only=use_approved_only,
         )
-        with self._lock:
-            self._training_thread = thread
-            self._latest_status.update(
-                {
-                    "state": "running",
-                    "epoch": 0,
-                    "epochs": epochs,
-                    "mode": "opencv_centroid_prototype"
-                    if (force_fallback or not env_info["ultralytics_installed"])
-                    else "ultralytics_cuda_fp16",
-                }
+        game_pids = self._aion_blocks_training()
+        if game_pids:
+            logger.error(
+                "AION2 pid=%s açık. Eğitim reddedildi. GPU paylaşılmayacak.",
+                ",".join(str(pid) for pid in game_pids),
             )
-        thread.start()
+            return {
+                "started": False,
+                "state": "refused",
+                "reason": "aion2_running",
+                "game_pids": game_pids,
+                "use_approved_only": effective_approved,
+                "data_yaml_path": str(resolved_yaml),
+                "status": dict(self._latest_status),
+            }
+        if not _acquire_train_slot():
+            return {
+                "started": False,
+                "reason": "Training is already running in the background.",
+                "use_approved_only": effective_approved,
+                "data_yaml_path": str(resolved_yaml),
+                "status": dict(self._latest_status),
+            }
+        self._stop_event.clear()
+
+        try:
+            env_info = self.probe_gpu_environment()
+            train_cfg = self.build_rtx_training_config(
+                epochs=epochs,
+                imgsz=imgsz,
+                batch=batch,
+                model=model,
+                use_approved_only=effective_approved,
+            )
+
+            def _worker() -> None:
+                try:
+                    self.run_training_sync(
+                        data_yaml_path=resolved_yaml,
+                        epochs=epochs,
+                        progress_callback=progress_callback,
+                        imgsz=imgsz,
+                        batch=batch,
+                        force_fallback=force_fallback,
+                        slot_held=True,
+                        model=model,
+                        allow_opencv_fallback=allow_opencv_fallback,
+                        use_approved_only=effective_approved,
+                    )
+                except Exception as exc:
+                    logger.exception("Asynchronous training encountered an error: %s", exc)
+                    with self._lock:
+                        self._latest_status["state"] = "failed"
+                        self._latest_status["error"] = str(exc)
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(dict(self._latest_status))
+                        except Exception:
+                            pass
+                finally:
+                    _release_train_slot()
+
+            thread = threading.Thread(
+                target=_worker,
+                name="RTXTrainerEngineWorker",
+                daemon=True,
+            )
+            with self._lock:
+                self._training_thread = thread
+                self._latest_status.update(
+                    {
+                        "state": "running",
+                        "epoch": 0,
+                        "epochs": epochs,
+                        "use_approved_only": effective_approved,
+                        "data_yaml_path": str(resolved_yaml),
+                        "mode": "opencv_centroid_prototype"
+                        if (force_fallback or not env_info["ultralytics_installed"])
+                        else "ultralytics_cuda_fp16",
+                    }
+                )
+            thread.start()
+        except Exception:
+            _release_train_slot()
+            raise
 
         return {
             "started": True,
@@ -575,7 +994,8 @@ class RTXTrainerEngine:
             "environment": env_info,
             "config": train_cfg,
             "thread_name": thread.name,
-            "data_yaml_path": str(Path(data_yaml_path).resolve()),
+            "use_approved_only": effective_approved,
+            "data_yaml_path": str(resolved_yaml),
         }
 
     def wait_for_training(self, timeout: Optional[float] = None) -> Dict[str, Any]:
@@ -597,28 +1017,107 @@ class RTXTrainerEngine:
 
     def run_training_sync(
         self,
+        data_yaml_path: Optional[Union[str, Path]] = None,
+        epochs: int = 50,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        imgsz: int = 640,
+        batch: int = 16,
+        force_fallback: bool = False,
+        slot_held: bool = False,
+        model: str = "yolo11n.pt",
+        allow_opencv_fallback: bool = True,
+        use_approved_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Run one training job. A second caller gets started=False until this one finishes."""
+        runs_dir = _pin_train_env()
+        save_dir = runs_dir / "gatherion_rtx_fp16"
+        resolved_yaml, effective_approved = self.resolve_training_yaml(
+            data_yaml_path=data_yaml_path,
+            use_approved_only=use_approved_only,
+        )
+        free = target_volume_free_bytes(runs_dir)
+        if free < _MIN_TRAIN_FREE_BYTES:
+            logger.error(
+                "disk dolu: save_dir=%s free_bytes=%s need_bytes=%s",
+                save_dir,
+                free,
+                _MIN_TRAIN_FREE_BYTES,
+            )
+            payload = {
+                "started": False,
+                "state": "failed",
+                "error": "disk dolu",
+                "reason": "disk dolu",
+                "save_dir": str(save_dir),
+                "disk_free_bytes": free,
+                "use_approved_only": effective_approved,
+                "data_yaml_path": str(resolved_yaml),
+            }
+            with self._lock:
+                self._latest_status.update(payload)
+            payload["status"] = dict(self._latest_status)
+            return payload
+        session = self._begin_training_session(slot_held=slot_held, batch=batch)
+        if session["refused"]:
+            reason = str(session.get("reason") or "Training is already running.")
+            return {
+                "started": False,
+                "state": "refused" if reason == "aion2_running" else "busy",
+                "reason": reason,
+                "game_pids": list(session.get("game_pids") or []),
+                "use_approved_only": effective_approved,
+                "data_yaml_path": str(resolved_yaml),
+                "status": dict(self._latest_status),
+            }
+        try:
+            return self._run_training_sync_body(
+                data_yaml_path=resolved_yaml,
+                epochs=epochs,
+                progress_callback=progress_callback,
+                imgsz=imgsz,
+                batch=int(session["batch"]),
+                force_fallback=force_fallback,
+                model=model,
+                allow_opencv_fallback=allow_opencv_fallback,
+                use_approved_only=effective_approved,
+            )
+        finally:
+            self._end_training_session(session)
+
+    def _run_training_sync_body(
+        self,
         data_yaml_path: Union[str, Path],
         epochs: int = 50,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         imgsz: int = 640,
         batch: int = 16,
         force_fallback: bool = False,
+        model: str = "yolo11n.pt",
+        allow_opencv_fallback: bool = True,
+        use_approved_only: bool = False,
     ) -> Dict[str, Any]:
         """
         Executes the full training & export pipeline synchronously:
           - Always generates `train_rtx_yolo.bat` for 1-click CLI/standalone RTX execution.
-          - Runs Mode A (Ultralytics YOLOv8n FP16 CUDA + ONNX export) if `ultralytics` is
+          - Runs Mode A (Ultralytics YOLO FP16 CUDA + ONNX export) if `ultralytics` is
             installed and `force_fallback` is False.
-          - Runs Mode B (Fast OpenCV/NumPy Multi-Class HSV/Gabor/Hu-Moment + Template
-            Centroid Classifier Training & Validation) when `ultralytics` is not installed
-            or when `force_fallback=True` (and also saves `gatherion_custom_detector.json`
-            as a backup artifact in Mode A).
+          - Runs Mode B (OpenCV prototype) only when allowed — factory UI disables this
+            so a failed/missing Ultralytics launch cannot fake-complete in ~1s.
         """
         self._stop_event.clear()
-        yaml_path = Path(data_yaml_path).resolve()
+        yaml_path, effective_approved = self.resolve_training_yaml(
+            data_yaml_path=data_yaml_path,
+            use_approved_only=use_approved_only,
+        )
         epochs = max(1, int(epochs))
         env_info = self.probe_gpu_environment()
-        train_cfg = self.build_rtx_training_config(epochs=epochs, imgsz=imgsz, batch=batch)
+        train_cfg = self.build_rtx_training_config(
+            epochs=epochs,
+            imgsz=imgsz,
+            batch=batch,
+            model=model,
+            use_approved_only=effective_approved,
+        )
 
         # Always generate the 1-click batch launcher script for full RTX GPU training
         bat_path = self._generate_rtx_batch_script(
@@ -631,7 +1130,7 @@ class RTXTrainerEngine:
 
         if use_ultralytics:
             try:
-                return self._run_mode_a_ultralytics(
+                res_a = self._run_mode_a_ultralytics(
                     yaml_path=yaml_path,
                     epochs=epochs,
                     imgsz=imgsz,
@@ -640,14 +1139,61 @@ class RTXTrainerEngine:
                     env_info=env_info,
                     bat_path=bat_path,
                     progress_callback=progress_callback,
+                    model=model,
                 )
+                res_a["use_approved_only"] = effective_approved
+                res_a["data_yaml_path"] = str(yaml_path)
+                return res_a
             except Exception as exc:
+                if not allow_opencv_fallback:
+                    logger.error(
+                        "Mode A (Ultralytics) failed; OpenCV fallback disabled: %s",
+                        exc,
+                    )
+                    payload = {
+                        "started": False,
+                        "state": "failed",
+                        "status": "failed",
+                        "error": str(exc),
+                        "reason": f"Ultralytics eğitimi başarısız: {exc}",
+                        "mode": "ultralytics_failed",
+                        "use_approved_only": effective_approved,
+                        "data_yaml_path": str(yaml_path),
+                        "artifacts": {"train_bat_script": str(bat_path)},
+                        "environment": env_info,
+                        "config": train_cfg,
+                    }
+                    with self._lock:
+                        self._latest_status.update(payload)
+                    return payload
                 logger.warning(
                     "Mode A (Ultralytics) failed (%s); seamlessly falling back to Mode B OpenCV Prototype trainer.",
                     exc,
                 )
+        elif not allow_opencv_fallback:
+            reason = (
+                "ultralytics yüklü değil — YOLO fabrikası OpenCV prototipini kabul etmez."
+                if not env_info.get("ultralytics_installed")
+                else "force_fallback=True reddedildi (OpenCV fallback kapalı)."
+            )
+            payload = {
+                "started": False,
+                "state": "failed",
+                "status": "failed",
+                "error": reason,
+                "reason": reason,
+                "mode": "ultralytics_required",
+                "use_approved_only": effective_approved,
+                "data_yaml_path": str(yaml_path),
+                "artifacts": {"train_bat_script": str(bat_path)},
+                "environment": env_info,
+                "config": train_cfg,
+            }
+            with self._lock:
+                self._latest_status.update(payload)
+            return payload
 
-        return self._run_mode_b_opencv_prototype(
+        res_b = self._run_mode_b_opencv_prototype(
             yaml_path=yaml_path,
             epochs=epochs,
             imgsz=imgsz,
@@ -657,6 +1203,9 @@ class RTXTrainerEngine:
             bat_path=bat_path,
             progress_callback=progress_callback,
         )
+        res_b["use_approved_only"] = effective_approved
+        res_b["data_yaml_path"] = str(yaml_path)
+        return res_b
 
     # ------------------------------------------------------------------
     # Mode A: Full Ultralytics YOLOv8n CUDA FP16 Training + ONNX Export
@@ -671,14 +1220,24 @@ class RTXTrainerEngine:
         env_info: Dict[str, Any],
         bat_path: Path,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+        model: str = "yolo11n.pt",
     ) -> Dict[str, Any]:
         from ultralytics import YOLO  # type: ignore
 
         start_time = time.perf_counter()
         device_arg: Union[int, str] = 0 if env_info.get("cuda_available") else "cpu"
 
-        model_weights = self.models_dir / "yolov8n.pt"
-        base_model_str = str(model_weights) if model_weights.exists() else "yolov8n.pt"
+        base_model_str = self._resolve_base_weights(
+            str(model or train_cfg.get("model") or "yolo11n.pt")
+        )
+        logger.info(
+            "Mode A Ultralytics start: model=%s epochs=%s imgsz=%s batch=%s device=%s",
+            base_model_str,
+            epochs,
+            imgsz,
+            batch,
+            device_arg,
+        )
         model = YOLO(base_model_str)
 
         def _on_fit_epoch_end(trainer: Any) -> None:
@@ -739,14 +1298,51 @@ class RTXTrainerEngine:
 
             if self._stop_event.is_set():
                 setattr(trainer, "stop", True)
+                try:
+                    trainer.validate = lambda *args, **kwargs: ({}, 0.0)
+                except Exception:
+                    pass
+
+        _last_batch_ui_update = 0.0
+
+        def _on_train_batch_end(trainer: Any) -> None:
+            nonlocal _last_batch_ui_update
+            if self._stop_event.is_set():
+                setattr(trainer, "stop", True)
+                try:
+                    trainer.validate = lambda *args, **kwargs: ({}, 0.0)
+                except Exception:
+                    pass
+                return
+            now = time.monotonic()
+            if now - _last_batch_ui_update >= 2.5:
+                _last_batch_ui_update = now
+                try:
+                    cur_b = getattr(trainer, "batch", 0) + 1
+                    tot_b = len(getattr(trainer, "train_loader", [])) or 1
+                    cur_ep = getattr(trainer, "epoch", 0) + 1
+                    tot_ep = getattr(trainer, "epochs", epochs)
+                    if progress_callback is not None:
+                        progress_callback({
+                            "batch_step": True,
+                            "epoch": cur_ep,
+                            "epochs": tot_ep,
+                            "batch": cur_b,
+                            "total_batches": tot_b,
+                        })
+                except Exception:
+                    pass
 
         try:
+            model.add_callback("on_train_batch_end", _on_train_batch_end)
             model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
         except Exception:
             pass
 
-        runs_dir = self.models_dir / "rtx_runs"
+        runs_dir = rtx_runs_dir_for()
+        _point_ultralytics_runs(runs_dir)
         use_cuda_device = bool(env_info.get("cuda_available", False))
+        run_dir = runs_dir / "gatherion_rtx_fp16"
         model.train(
             data=str(yaml_path),
             epochs=epochs,
@@ -765,8 +1361,32 @@ class RTXTrainerEngine:
             project=str(runs_dir),
             name="gatherion_rtx_fp16",
             exist_ok=True,
+            resume=False,
             verbose=False,
         )
+
+        if self._stop_event.is_set():
+            logger.info("RTX eğitimi kullanıcı tarafından durduruldu.")
+            total_elapsed = round(time.perf_counter() - start_time, 3)
+            epochs_completed = int(self._count_results_csv_epochs(run_dir) or 0)
+            payload = {
+                "started": True,
+                "stopped": True,
+                "interrupted": True,
+                "state": "stopped",
+                "status": "stopped",
+                "reason": "Eğitim kullanıcı tarafından durduruldu.",
+                "mode": "ultralytics_cuda_fp16",
+                "elapsed_sec": total_elapsed,
+                "epoch": epochs_completed,
+                "epochs": epochs,
+                "epochs_completed": epochs_completed,
+                "use_approved_only": effective_approved,
+                "data_yaml_path": str(yaml_path),
+            }
+            with self._lock:
+                self._latest_status.update(payload)
+            return payload
 
         # Export trained weights to ONNX (FP16 when on GPU)
         exported_path = model.export(
@@ -777,8 +1397,32 @@ class RTXTrainerEngine:
         )
         if exported_path and Path(str(exported_path)).exists():
             shutil.copy2(str(exported_path), str(self.onnx_export_path))
+        else:
+            best_onnx = run_dir / "weights" / "best.onnx"
+            if best_onnx.exists():
+                shutil.copy2(str(best_onnx), str(self.onnx_export_path))
 
-        # Also build the fast OpenCV prototype detector JSON so hybrid inference works out of the box
+        # Real Ultralytics metrics from results.csv — never report Mode B prototype scores.
+        ultra_metrics = self._read_ultralytics_final_metrics(run_dir)
+        epochs_completed = int(
+            ultra_metrics.get("epochs_completed") or self._count_results_csv_epochs(run_dir) or 0
+        )
+        total_elapsed = round(time.perf_counter() - start_time, 3)
+        if epochs_completed < 1:
+            raise RuntimeError(
+                "Ultralytics results.csv has no completed epochs — training did not run."
+            )
+        # Refuse absurdly fast "success" for multi-epoch jobs (Mode B used to finish in ~1s).
+        if epochs >= 10 and total_elapsed < 5.0:
+            raise RuntimeError(
+                f"Training finished in {total_elapsed:.1f}s for {epochs} epochs — "
+                "refused as fake-complete (expected real Ultralytics epoch loop)."
+            )
+        best_pt = run_dir / "weights" / "best.pt"
+        if not best_pt.is_file():
+            raise RuntimeError(f"Missing Ultralytics weights after train: {best_pt}")
+
+        # Prototype JSON only. Do not overwrite yolov8n_gatherion.onnx with the stub artifact.
         proto_res = self._run_mode_b_opencv_prototype(
             yaml_path=yaml_path,
             epochs=min(5, epochs),
@@ -788,31 +1432,40 @@ class RTXTrainerEngine:
             env_info=env_info,
             bat_path=bat_path,
             progress_callback=None,
+            write_live_onnx=False,
         )
 
-        total_elapsed = round(time.perf_counter() - start_time, 3)
         final_result = {
             "state": "completed",
             "status": "completed",
             "mode": "ultralytics_cuda_fp16",
-            "epoch": epochs,
+            "epoch": epochs_completed,
             "epochs": epochs,
-            "box_loss": proto_res.get("box_loss", 0.018),
-            "cls_loss": proto_res.get("cls_loss", 0.011),
-            "precision": proto_res.get("precision", 0.999),
-            "recall": proto_res.get("recall", 0.998),
-            "mAP50": proto_res.get("mAP50", 0.999),
-            "mAP50_95": proto_res.get("mAP50_95", 0.942),
+            "epochs_completed": epochs_completed,
+            "box_loss": ultra_metrics.get("box_loss", 0.0),
+            "cls_loss": ultra_metrics.get("cls_loss", 0.0),
+            "precision": ultra_metrics.get("precision", 0.0),
+            "recall": ultra_metrics.get("recall", 0.0),
+            "mAP50": ultra_metrics.get("mAP50", 0.0),
+            "mAP50_95": ultra_metrics.get("mAP50_95", 0.0),
             "eta_sec": 0.0,
             "elapsed_sec": total_elapsed,
             "gpu_name": env_info.get("gpu_name"),
+            "base_model": base_model_str,
             "artifacts": {
                 "onnx_model": str(self.onnx_export_path),
                 "custom_detector_json": str(self.custom_detector_path),
                 "train_bat_script": str(bat_path),
+                "ultralytics_best_pt": str(best_pt),
+                "run_dir": str(run_dir),
+                "results_csv": str(run_dir / "results.csv"),
             },
             "environment": env_info,
             "config": train_cfg,
+            "prototype_sidecar": {
+                "mAP50": proto_res.get("mAP50"),
+                "custom_detector_json": str(self.custom_detector_path),
+            },
         }
         with self._lock:
             self._latest_status.update(final_result)
@@ -836,14 +1489,12 @@ class RTXTrainerEngine:
         env_info: Dict[str, Any],
         bat_path: Path,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+        write_live_onnx: bool = True,
     ) -> Dict[str, Any]:
         """
         Trains a real Multi-Class HSV + Gabor Texture + Hu-Moment + 16x16 Template
-        Centroid & Mahalanobis Prototype Detector from all labeled YOLO bounding boxes
-        in `dataset/images/train` and `dataset/labels/train`, validates on
-        `dataset/images/val` and `dataset/labels/val`, exports the trained model to
-        `models/gatherion_custom_detector.json` (plus an ONNX stub/graph at
-        `models/yolov8n_gatherion.onnx`), and emits epoch-by-epoch progress.
+        Centroid & Mahalanobis Prototype Detector from labeled YOLO boxes.
+        Writes the live ONNX path only when Mode B is the primary trainer.
         """
         start_time = time.perf_counter()
 
@@ -1107,14 +1758,30 @@ class RTXTrainerEngine:
             encoding="utf-8",
         )
 
-        # Also export a lightweight ONNX centroid graph or binary artifact at `models/yolov8n_gatherion.onnx`
-        self._export_fallback_onnx_artifact(
-            centroids=centroids,
-            feat_mean=feat_mean,
-            feat_std=feat_std,
-            unique_classes=unique_classes,
-            class_names=class_names,
-        )
+        # Only Mode B primary runs may write the live ONNX path. Mode A already
+        # exported a real Ultralytics graph; a prototype stub must not replace it.
+        if write_live_onnx:
+            self._export_fallback_onnx_artifact(
+                centroids=centroids,
+                feat_mean=feat_mean,
+                feat_std=feat_std,
+                unique_classes=unique_classes,
+                class_names=class_names,
+            )
+        else:
+            proto_path = self.models_dir / "gatherion_prototype.onnx"
+            saved = self.onnx_export_path
+            try:
+                self.onnx_export_path = proto_path
+                self._export_fallback_onnx_artifact(
+                    centroids=centroids,
+                    feat_mean=feat_mean,
+                    feat_std=feat_std,
+                    unique_classes=unique_classes,
+                    class_names=class_names,
+                )
+            finally:
+                self.onnx_export_path = saved
 
         total_elapsed = round(time.perf_counter() - start_time, 3)
         final_result: Dict[str, Any] = {
@@ -1577,6 +2244,60 @@ class RTXTrainerEngine:
     # ------------------------------------------------------------------
     # ONNX Fallback Exporter & 1-Click RTX Batch Script Generator
     # ------------------------------------------------------------------
+    def _read_ultralytics_final_metrics(self, run_dir: Path) -> Dict[str, float]:
+        """Best epoch from results.csv. Missing file returns zeros, never fake 0.99 defaults."""
+        csv_path = Path(run_dir) / "results.csv"
+        empty = {
+            "box_loss": 0.0,
+            "cls_loss": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "mAP50": 0.0,
+            "mAP50_95": 0.0,
+        }
+        if not csv_path.exists():
+            return empty
+        try:
+            import csv as _csv
+
+            best: Dict[str, float] = dict(empty)
+            best_map = -1.0
+            epochs_completed = 0
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = _csv.DictReader(handle)
+                for row in reader:
+                    epochs_completed += 1
+
+                    def _f(key: str, *alts: str) -> float:
+                        for name in (key,) + alts:
+                            raw = (row.get(name) or "").strip()
+                            if raw:
+                                try:
+                                    return float(raw)
+                                except ValueError:
+                                    continue
+                        return 0.0
+
+                    map50 = _f("metrics/mAP50(B)", "mAP50")
+                    if map50 < best_map:
+                        continue
+                    best_map = map50
+                    best = {
+                        "box_loss": _f("train/box_loss", "val/box_loss", "box_loss"),
+                        "cls_loss": _f("train/cls_loss", "val/cls_loss", "cls_loss"),
+                        "precision": _f("metrics/precision(B)", "precision"),
+                        "recall": _f("metrics/recall(B)", "recall"),
+                        "mAP50": map50,
+                        "mAP50_95": _f("metrics/mAP50-95(B)", "mAP50_95"),
+                        "epochs_completed": float(epochs_completed),
+                    }
+            if epochs_completed > 0 and "epochs_completed" not in best:
+                best["epochs_completed"] = float(epochs_completed)
+            return best
+        except Exception as exc:
+            logger.debug("Ultralytics results.csv okunamadı: %s", exc)
+            return empty
+
     def _export_fallback_onnx_artifact(
         self,
         centroids: Dict[int, np.ndarray],
@@ -1629,18 +2350,35 @@ class RTXTrainerEngine:
         mosaic = float(train_cfg.get("mosaic", 1.0))
         mixup = float(train_cfg.get("mixup", 0.15))
         patience = int(train_cfg.get("patience", 15))
-        onnx_out = str(self.onnx_export_path).replace("\\", "/")
-        yaml_str = str(data_yaml_path).replace("\\", "/")
+        home = offload_root() or Path("F:/a2")
+        runs_posix = str(rtx_runs_dir_for()).replace("\\", "/")
+        onnx_out = str((home / "models" / "yolov8n_gatherion.onnx")).replace("\\", "/")
+        yaml_on_f = _yaml_on_offload(data_yaml_path)
+        yaml_str = str(yaml_on_f).replace("\\", "/")
+        home_win = str(home)
 
         bat_content = f"""@echo off
-cd /d "%~dp0"
+set "GATHERION_HOME={home_win}"
+if not exist "%GATHERION_HOME%\\main.py" set "GATHERION_HOME=F:\\Gatherion"
+cd /d "%GATHERION_HOME%"
 set "PYTHONUTF8=1"
+set "TEMP=%GATHERION_HOME%\\temp"
+set "TMP=%GATHERION_HOME%\\temp"
+set "YOLO_CONFIG_DIR=%GATHERION_HOME%\\appdata"
+set "ULTRALYTICS_CONFIG_DIR=%GATHERION_HOME%\\appdata"
+set "TORCH_HOME=%GATHERION_HOME%\\torch"
+set "PIP_CACHE_DIR=%GATHERION_HOME%\\pip-cache"
+if not exist "%TEMP%" mkdir "%TEMP%"
+if not exist "%YOLO_CONFIG_DIR%" mkdir "%YOLO_CONFIG_DIR%"
+if not exist "%TORCH_HOME%" mkdir "%TORCH_HOME%"
+if not exist "%PIP_CACHE_DIR%" mkdir "%PIP_CACHE_DIR%"
 title Gatherion 1-Click RTX 3070 CUDA FP16 YOLO Trainer ^& ONNX Exporter
 echo ============================================================================
 echo   GATHERION AI - 1-CLICK RTX CUDA FP16 CUSTOM MODEL TRAINER
 echo   Detected GPU : {gpu_label}
-echo   Dataset YAML : dataset/data.yaml
-echo   Target ONNX  : models/yolov8n_gatherion.onnx
+echo   Dataset YAML : {yaml_str}
+echo   Target ONNX  : {onnx_out}
+echo   Runs         : {runs_posix}
 echo   Config       : epochs={epochs}, imgsz={imgsz}, batch={batch}, amp=True (FP16)
 echo ============================================================================
 echo.
@@ -1658,11 +2396,11 @@ pip install -U ultralytics onnx onnxslim onnxruntime-gpu
 
 :START_TRAIN
 echo [INFO] Starting RTX FP16 Mixed-Precision Training...
-python -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; print(f'[INFO] Active Training Device: {{dev}} (CUDA={{use_cuda}}, GPU={{torch.cuda.get_device_name(0) if use_cuda else \"CPU\"}})'); m = YOLO('yolov8n.pt'); m.train(data=str(Path('dataset/data.yaml').resolve()), epochs={epochs}, imgsz={imgsz}, batch={batch}, amp=use_cuda, cos_lr=True, mosaic={mosaic}, mixup={mixup}, optimizer='AdamW', lr0={lr0}, patience={patience}, device=dev, workers=0, project='models/rtx_runs', name='gatherion_rtx_fp16', exist_ok=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz={imgsz}); out_p = Path('models/yolov8n_gatherion.onnx').resolve(); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
+python -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; print(f'[INFO] Active Training Device: {{dev}} (CUDA={{use_cuda}}, GPU={{torch.cuda.get_device_name(0) if use_cuda else \"CPU\"}})'); m = YOLO('yolov8n.pt'); m.train(data=r'{yaml_str}', epochs={epochs}, imgsz={imgsz}, batch={batch}, amp=use_cuda, cos_lr=True, mosaic={mosaic}, mixup={mixup}, optimizer='AdamW', lr0={lr0}, patience={patience}, device=dev, workers=0, project=r'{runs_posix}', name='gatherion_rtx_fp16', exist_ok=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz={imgsz}); out_p = Path(r'{onnx_out}'); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
 if not errorlevel 1 goto :TRAIN_DONE
 
 echo [WARN] Ultralytics training exited with an error. Running built-in OpenCV Prototype Trainer fallback...
-python -c "from pathlib import Path; from dataset_factory.rtx_trainer_engine import RTXTrainerEngine; eng = RTXTrainerEngine(); res = eng.run_training_sync(Path('dataset/data.yaml').resolve(), epochs={epochs}, force_fallback=True); print('[SUCCESS] Trained custom detector:', res['artifacts'])"
+python -c "from pathlib import Path; from dataset_factory.rtx_trainer_engine import RTXTrainerEngine; eng = RTXTrainerEngine(); res = eng.run_training_sync(Path(r'{yaml_str}'), epochs={epochs}, force_fallback=True); print('[SUCCESS] Trained custom detector:', res['artifacts'])"
 
 :TRAIN_DONE
 echo.

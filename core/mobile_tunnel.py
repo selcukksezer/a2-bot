@@ -706,6 +706,8 @@ class FreeCloudTunnelManager:
             "--url",
             f"http://127.0.0.1:{port}",
             "--no-autoupdate",
+            "--protocol",
+            "http2",
         ]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
 
@@ -890,6 +892,19 @@ class FreeCloudTunnelManager:
             )
 
         return self.get_status()
+
+    def start_tunnel(
+        self,
+        port: Optional[int] = None,
+        auto_download_cloudflared: bool = True,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Convenience alias for start_best_free_tunnel."""
+        return self.start_best_free_tunnel(
+            local_port=port,
+            auto_download_cloudflared=auto_download_cloudflared,
+            **kwargs,
+        )
 
     def is_tunnel_running(self) -> bool:
         with self._lock:

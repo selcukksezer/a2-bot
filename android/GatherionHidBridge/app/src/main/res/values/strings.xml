@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Gatherion HID</string>
+    <string name="status_idle">Idle — start HID service</string>
+    <string name="notif_title">Gatherion HID bridge</string>
+    <string name="notif_text">BT keyboard + TCP :8765</string>
+</resources>

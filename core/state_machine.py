@@ -12,7 +12,7 @@ import random
 import threading
 import time
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -31,12 +31,14 @@ if not logger.handlers:
 class BotMode(str, Enum):
     """Supported operating modes for Gatherion A2 Bot."""
     ROUTE_MODE = "route"
+    COMBAT_MODE = "combat"
     MANUAL_RECORD = "manual_record"
     AUTO_RECORD = "auto_record"
     EXPLORER_MODE = "explorer"
 
     # Alias for convenience
     ROUTE = "route"
+    COMBAT = "combat"
     EXPLORER = "explorer"
 
 
@@ -58,7 +60,8 @@ class BotState(str, Enum):
 
 
 MODE_BADGE_MAP: Dict[str, str] = {
-    BotMode.ROUTE_MODE.value: "ROUTE",
+    BotMode.ROUTE_MODE.value: "TOPLAMA (ROUTE)",
+    BotMode.COMBAT_MODE.value: "SAVAŞ (COMBAT)",
     BotMode.MANUAL_RECORD.value: "MANUAL RECORD",
     BotMode.AUTO_RECORD.value: "AUTO RECORD",
     BotMode.EXPLORER_MODE.value: "AUTO CARTOGRAPHY",
@@ -132,7 +135,7 @@ class BotWorker(QThread):
         self._state: str = BotState.PAUSED.value
         self._running: bool = False
         self._paused: bool = True
-        self._pause_reason: str = "Duraklatıldı · Başlatmak için F9'a basın"
+        self._pause_reason: str = "Duraklatıldı · Devam için Ctrl+Alt+F10"
         self._f8_pending: bool = False
 
         # Session & timing metrics
@@ -154,7 +157,19 @@ class BotWorker(QThread):
         self.active_node: Optional[Any] = None
         self.active_node_distance_m: int = 0
         self._walk_start_time: float = 0.0
+        self._arrival_at_node_ts: float = 0.0
         self._last_reclick_time: float = 0.0
+        self._route_was_fighting: bool = False
+        self._route_fight_had_signal: bool = False
+        self._route_combat_confirmed: bool = False
+        self._route_saw_target_bar: bool = False
+        self._route_saw_hp_drop: bool = False
+        self._route_prev_hp_ratio: Optional[float] = None
+        self._route_last_loot_ts: float = 0.0
+        self._route_bar_since_loot: bool = False
+        self._map_open_backoff_until: float = 0.0
+        self._map_open_fail_announced: bool = False
+        self._last_nav_block: str = ""
         self._gather_lost_frames: int = 0
         self._is_gathering_active: bool = False
 
@@ -168,6 +183,7 @@ class BotWorker(QThread):
         self._stage_cast_in_progress: bool = False
         self._stage_cast_start_time: float = 0.0
         self._stage_cast_end_time: float = 0.0
+        self._last_detected_prompt_key: str = "f"
 
         # Strict sequential node commitment & cursor (prevents jumping 40 -> 84)
         self._current_target_node_id: Optional[Any] = None
@@ -244,6 +260,32 @@ class BotWorker(QThread):
         self.dataset_factory: Any = self._init_optional_subsystem(
             "dataset_factory.factory_controller", "AutoLabelingDatasetFactory"
         )
+        self.game_learner: Any = None
+        try:
+            from core.omni_game_learner import OmniGameLearner
+            self.game_learner = OmniGameLearner(
+                bot_worker=self,
+                save_screenshots=True,
+                min_sample_interval_sec=12.0,
+            )
+        except Exception as gl_exc:
+            logger.debug("OmniGameLearner başlatma hatası: %s", gl_exc)
+
+        self.action_bus: Any = None
+        try:
+            from core.game_action_bus import GameActionBus
+
+            self.action_bus = GameActionBus(
+                input_driver=self.input_driver,
+                skill_bar_reader=None,
+                vision=self.vision,
+                on_log=self._emit_log,
+                release_basic_attack=self._release_combat_right_button,
+                restore_basic_attack=lambda: self._sync_combat_right_button(True, force=True),
+            )
+        except Exception as bus_exc:
+            logger.debug("GameActionBus başlatma hatası: %s", bus_exc)
+
         self.mapless_navigator: Any = self._init_optional_subsystem(
             "core.navigation_intel", "MaplessMicroNavigator"
         )
@@ -294,6 +336,97 @@ class BotWorker(QThread):
         self.skill_bar_monitor: Any = self._init_optional_subsystem(
             "core.skill_bar_reader", "SkillBarReader"
         )
+        if self.action_bus is not None and hasattr(self.action_bus, "bind"):
+            try:
+                self.action_bus.bind(
+                    input_driver=self.input_driver,
+                    skill_bar_reader=self.skill_bar_monitor,
+                    vision=self.vision,
+                    on_log=self._emit_log,
+                    release_basic_attack=self._release_combat_right_button,
+                    restore_basic_attack=lambda: self._sync_combat_right_button(True, force=True),
+                )
+            except Exception as bind_exc:
+                logger.debug("GameActionBus bind skipped: %s", bind_exc)
+
+        # Zero-Knowledge Vision Agent layers (PerceptionHub → ManaPhase → Discovery → Economy)
+        self.input_port: Any = None
+        self.perception_hub: Any = None
+        self.mana_phase_combat: Any = None
+        self.skill_discovery: Any = None
+        self.slot_economy: Any = None
+        self.rl_reward_log: Any = None
+        self.obstacle_memory: Any = None
+        self._frame_cognition: Any = None
+        self._ucb_slot_hint: Any = None
+        self._discovery_probe: Any = None
+        try:
+            from core.hardware_input_port import (
+                SoftInputAdapter,
+                build_default_input_port,
+                resolve_serial_hid_port,
+            )
+
+            serial_port = resolve_serial_hid_port()
+            # SoftInputAdapter keeps mouse soft-aim; serial/Interception attach on InputController
+            self.input_port = build_default_input_port(
+                input_driver=self.input_driver,
+                serial_port=serial_port,
+            )
+            if not isinstance(self.input_port, SoftInputAdapter):
+                self.input_port = SoftInputAdapter(input_driver=self.input_driver)
+            if self.action_bus is not None and hasattr(self.action_bus, "bind_input_port"):
+                self.action_bus.bind_input_port(self.input_port)
+        except Exception as port_exc:
+            logger.debug("SoftInputAdapter skipped: %s", port_exc)
+        try:
+            from core.perception_hub import PerceptionHub
+
+            self.perception_hub = PerceptionHub(
+                game_learner=self.game_learner,
+                skill_bar_reader=self.skill_bar_monitor,
+                vision=self.vision,
+                yolo_detector=None,
+                combat_recovery=getattr(self, "combat_recovery", None),
+            )
+        except Exception as hub_exc:
+            logger.debug("PerceptionHub skipped: %s", hub_exc)
+        try:
+            from core.mana_phase_combat import ManaPhaseCombat
+
+            self.mana_phase_combat = ManaPhaseCombat(
+                mp_full_threshold=float(self._get_cfg("mp_full_threshold", 0.95) or 0.95),
+                on_log=self._emit_log,
+            )
+        except Exception as mana_exc:
+            logger.debug("ManaPhaseCombat skipped: %s", mana_exc)
+        try:
+            from core.skill_discovery import SkillDiscovery
+
+            self.skill_discovery = SkillDiscovery(on_log=self._emit_log)
+            if self.mana_phase_combat is not None and hasattr(self.mana_phase_combat, "set_lexicon"):
+                self.mana_phase_combat.set_lexicon(self.skill_discovery.lexicon())
+            if bool(self._get_cfg("skill_discovery_enabled", True)):
+                self.skill_discovery.start()
+        except Exception as disc_exc:
+            logger.debug("SkillDiscovery skipped: %s", disc_exc)
+        try:
+            from core.slot_economy import SlotEconomy
+
+            self.slot_economy = SlotEconomy(
+                explore_ratio=float(self._get_cfg("ucb_explore_ratio", 0.20) or 0.20),
+                on_log=self._emit_log,
+            )
+        except Exception as eco_exc:
+            logger.debug("SlotEconomy skipped: %s", eco_exc)
+        try:
+            from core.rl_reward_log import ObstacleMemory, RlRewardLog
+
+            self.rl_reward_log = RlRewardLog()
+            self.obstacle_memory = ObstacleMemory(slot_economy=self.slot_economy)
+        except Exception as rl_exc:
+            logger.debug("RlRewardLog skipped: %s", rl_exc)
+
         self.micro_camera_look: Any = self._init_optional_subsystem(
             "core.skill_bar_reader", "MicroCameraLookAround"
         )
@@ -318,6 +451,18 @@ class BotWorker(QThread):
         self.yolo_detector: Any = self._init_optional_subsystem(
             "core.neural_audio_perception", "ONNXYolo3DDetector"
         )
+        if self.perception_hub is not None and hasattr(self.perception_hub, "bind"):
+            try:
+                self.perception_hub.bind(
+                    yolo_detector=self.yolo_detector,
+                    combat_recovery=self.combat_recovery,
+                    skill_bar_reader=self.skill_bar_monitor,
+                    game_learner=self.game_learner,
+                    vision=self.vision,
+                )
+            except Exception:
+                pass
+        self.reflex: Any = self._init_reflex_scanner()
         self.audio_analyzer: Any = self._init_optional_subsystem(
             "core.neural_audio_perception", "AudioLoopbackFFTAnalyzer"
         )
@@ -339,6 +484,40 @@ class BotWorker(QThread):
 
         # Sync initial driver flags
         self._sync_input_driver_state()
+        self._rehydrate_saved_nodes_count()
+
+        # Selective gathering mode ("Seç-Topla")
+        self.selective_gather_enabled: bool = False
+        self.selected_gather_materials: list[str] = []
+        cfg_sel_en = self._get_cfg("selective_gather_enabled", None)
+        cfg_mats = self._get_cfg("selected_materials", None)
+        if cfg_mats:
+            self.set_selected_gather_materials(
+                cfg_mats,
+                enabled=bool(cfg_sel_en) if cfg_sel_en is not None else True,
+            )
+        elif cfg_sel_en is not None:
+            self.selective_gather_enabled = bool(cfg_sel_en)
+
+    def _rehydrate_saved_nodes_count(self) -> None:
+        """Rehydrate self.saved_nodes_count from route_manager across restarts."""
+        try:
+            rm = self._plain_attr("route_manager")
+            if rm is None:
+                return
+            count = 0
+            if hasattr(rm, "get_nodes"):
+                nodes = rm.get_nodes()
+                if isinstance(nodes, list):
+                    count = len(nodes)
+            elif hasattr(rm, "get_route_nodes"):
+                nodes = rm.get_route_nodes()
+                if isinstance(nodes, list):
+                    count = len(nodes)
+            if count > 0:
+                self.saved_nodes_count = max(int(self._plain_attr("saved_nodes_count", 0) or 0), count)
+        except Exception as exc:
+            logger.debug("Failed to rehydrate saved_nodes_count: %s", exc)
 
     @property
     def settings(self) -> Any:
@@ -351,6 +530,225 @@ class BotWorker(QThread):
     def active_mode(self) -> str:
         """Alias for self.mode."""
         return self.mode
+
+    def set_selected_gather_materials(
+        self,
+        materials: Sequence[str],
+        enabled: Optional[bool] = None,
+    ) -> None:
+        """Configure the active materials for selective gathering ('Seç-Topla')."""
+        if not materials:
+            self.selected_gather_materials = []
+            self.selective_gather_enabled = False if enabled is None else bool(enabled)
+        else:
+            filtered: list[str] = []
+            from core.material_scanner import normalize_material_name
+
+            for m in materials:
+                if not m:
+                    continue
+                s = str(m).strip()
+                norm = normalize_material_name(s)
+                if norm in ("tumu", "all", "*", "hepsi", "tum", "none"):
+                    continue
+                filtered.append(s)
+            self.selected_gather_materials = filtered
+            if enabled is not None:
+                self.selective_gather_enabled = bool(enabled)
+            else:
+                self.selective_gather_enabled = bool(filtered)
+
+        # Synchronize with MaterialScanner
+        mat_scan = self._plain_attr("material_scanner")
+        if mat_scan is not None and hasattr(mat_scan, "set_selected_materials"):
+            try:
+                if self.selective_gather_enabled:
+                    mat_scan.set_selected_materials(self.selected_gather_materials)
+                else:
+                    mat_scan.set_selected_materials([])
+            except Exception as exc:
+                logger.debug("Failed to set selected materials on MaterialScanner: %s", exc)
+
+        self._emit_log(
+            f"Seç-Topla: {'Aktif' if self.selective_gather_enabled else 'Devre Dışı'} · "
+            f"Materyaller: {', '.join(self.selected_gather_materials) if self.selected_gather_materials else 'Tümü'}"
+        )
+
+    def get_selected_gather_materials(self) -> list[str]:
+        """Return the list of currently selected materials for gathering."""
+        return list(getattr(self, "selected_gather_materials", []))
+
+    def is_material_selected_for_gather(self, mat_or_node: Any) -> bool:
+        """
+        Check if a given material string, DetectedMaterial, or route node matches
+        the currently selected materials for gathering.
+        If selective gathering is inactive, returns True.
+        """
+        if not getattr(self, "selective_gather_enabled", False):
+            return True
+        selected = getattr(self, "selected_gather_materials", [])
+        if not selected:
+            return True
+
+        from core.material_scanner import match_material_names
+
+        mat_str = ""
+        if isinstance(mat_or_node, str):
+            mat_str = mat_or_node
+        elif mat_or_node is not None:
+            for field in (
+                "resource_type",
+                "material_type",
+                "name",
+                "material",
+                "category",
+                "class_name",
+            ):
+                v = self._get_node_field(mat_or_node, field)
+                if v:
+                    mat_str = str(v)
+                    break
+            if not mat_str and hasattr(mat_or_node, "material_type"):
+                mat_str = str(getattr(mat_or_node, "material_type", "") or "")
+
+        if not mat_str:
+            return False
+
+        for target in selected:
+            if match_material_names(target, mat_str):
+                return True
+        return False
+
+    def _check_nearby_materials(
+        self,
+        frame_bgr: Optional[np.ndarray] = None,
+        max_distance_m: float = 25.0,
+    ) -> Optional[Any]:
+        """
+        Scan the frame for nearby gatherable materials using MaterialScanner.
+        In selective gathering mode, strictly filters candidates to match selected materials,
+        bypassing non-matching materials (e.g., herbs when mining Orichalcum).
+        Returns the highest-priority matching DetectedMaterial, or None.
+        """
+        mat_scan = self._plain_attr("material_scanner")
+        if mat_scan is None or not hasattr(mat_scan, "scan_frame_for_materials"):
+            return None
+
+        frame = frame_bgr if frame_bgr is not None else self.__dict__.get("_last_color_frame")
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            frame = self._grab_frame(grayscale=False)
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return None
+
+        # Synchronize scanner selection with worker selection
+        is_selective = getattr(self, "selective_gather_enabled", False) and bool(
+            getattr(self, "selected_gather_materials", None)
+        )
+        if hasattr(mat_scan, "set_selected_materials"):
+            try:
+                if is_selective:
+                    mat_scan.set_selected_materials(self.selected_gather_materials)
+                elif (
+                    hasattr(mat_scan, "get_selected_materials")
+                    and mat_scan.get_selected_materials()
+                ):
+                    mat_scan.set_selected_materials([])
+            except Exception:
+                pass
+
+        try:
+            candidates = mat_scan.scan_frame_for_materials(frame)
+        except Exception as exc:
+            logger.debug("_check_nearby_materials scan error: %s", exc)
+            return None
+
+        if not candidates:
+            return None
+
+        valid_targets = []
+        for cand in candidates:
+            dist = getattr(cand, "estimated_distance_m", 0.0) or 0.0
+            if max_distance_m > 0 and dist > max_distance_m:
+                continue
+
+            mtype = getattr(cand, "material_type", "") or ""
+            if is_selective:
+                if not self.is_material_selected_for_gather(mtype):
+                    # Strictly bypass unselected material
+                    continue
+            valid_targets.append(cand)
+
+        return valid_targets[0] if valid_targets else None
+
+    def _should_bypass_unselected_gather(
+        self, frame_bgr: Optional[np.ndarray] = None
+    ) -> bool:
+        """
+        Determines whether a detected gather prompt or nearby interaction should be bypassed
+        because selective gathering is active and the target material does not match selected materials.
+        """
+        if not getattr(self, "selective_gather_enabled", False):
+            return False
+        selected = getattr(self, "selected_gather_materials", [])
+        if not selected:
+            return False
+
+        # 1. If active_node is known, check if it matches
+        if self.active_node is not None:
+            return not self.is_material_selected_for_gather(self.active_node)
+
+        frame = frame_bgr if frame_bgr is not None else self.__dict__.get("_last_color_frame")
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            frame = self._grab_frame(grayscale=False)
+
+        # 2. If no active_node (opportunistic gather), inspect nearby materials via MaterialScanner
+        nearby = self._check_nearby_materials(frame_bgr=frame, max_distance_m=15.0)
+        if nearby is not None:
+            return False
+
+        # 3. Check what materials are detected on screen to confirm whether an unselected material exists
+        mat_scan = self._plain_attr("material_scanner")
+        if mat_scan is not None and hasattr(mat_scan, "scan_frame_for_materials"):
+            try:
+                if frame is not None and isinstance(frame, np.ndarray) and frame.size > 0:
+                    prev_sel = (
+                        mat_scan.get_selected_materials()
+                        if hasattr(mat_scan, "get_selected_materials")
+                        else []
+                    )
+                    if hasattr(mat_scan, "set_selected_materials"):
+                        mat_scan.set_selected_materials([])
+                    all_cands = mat_scan.scan_frame_for_materials(frame)
+                    if hasattr(mat_scan, "set_selected_materials"):
+                        mat_scan.set_selected_materials(prev_sel)
+
+                    if all_cands:
+                        for c in all_cands:
+                            c_type = getattr(c, "material_type", "")
+                            if self.is_material_selected_for_gather(c_type):
+                                return False
+                        return True
+            except Exception:
+                pass
+
+        # In selective mode without active node or confirmed match, bypass unknown prompt
+        return True
+
+    def _init_reflex_scanner(self) -> Any:
+        """Reflex scan thread. A missing yolo11/rtdetr file keeps the yolov8 onnx."""
+        try:
+            from core.reflex_layer import ReflexScanner
+
+            kind = "yolov8"
+            cfg = self.config
+            if cfg is not None and hasattr(cfg, "get"):
+                kind = str(cfg.get("", "reflex_model", "yolov8") or "yolov8")
+            elif cfg is not None and hasattr(cfg, "settings"):
+                kind = str(getattr(cfg.settings, "reflex_model", "yolov8") or "yolov8")
+            return ReflexScanner(kind=kind, shared_detector=self.yolo_detector)
+        except Exception as exc:
+            logger.debug("Reflex scanner skipped: %s", exc)
+            return None
 
     def _init_optional_subsystem(self, module_name: str, class_name: str) -> Any:
         try:
@@ -379,6 +777,7 @@ class BotWorker(QThread):
                 route_manager=self.route_manager,
                 vision_engine=self.vision,
                 input_driver=self.input_driver,
+                test_mode=False,
             )
         except Exception as exc:
             logger.debug("ExplorerModeController init skipped: %s", exc)
@@ -521,6 +920,16 @@ class BotWorker(QThread):
                 (None, "gather_key"),
                 ("gathering", "gather_key"),
             ),
+            "post_harvest_prompt_timeout": (
+                (None, "post_harvest_prompt_timeout"),
+                ("gathering", "post_harvest_prompt_timeout"),
+                ("gathering", "prompt_reappear_timeout"),
+            ),
+            "gather_cast_duration_sec": (
+                (None, "gather_cast_duration_sec"),
+                ("gathering", "gather_cast_duration_sec"),
+                ("gathering", "cast_duration_sec"),
+            ),
             "pause_on_keyboard_input": (
                 (None, "pause_on_keyboard_input"),
                 ("gathering", "pause_on_keyboard_input"),
@@ -546,6 +955,17 @@ class BotWorker(QThread):
                 (None, "reclick_node_sec"),
                 ("route", "reclick_node_sec"),
                 ("route", "reclick_interval_sec"),
+            ),
+            "selective_gather_enabled": (
+                (None, "selective_gather_enabled"),
+                ("gathering", "selective_gather_enabled"),
+                ("gathering", "selective_gather"),
+            ),
+            "selected_materials": (
+                (None, "selected_materials"),
+                ("gathering", "selected_materials"),
+                (None, "selected_gather_materials"),
+                ("gathering", "selected_gather_materials"),
             ),
             "gather_on_the_way": (
                 (None, "gather_on_the_way"),
@@ -599,6 +1019,58 @@ class BotWorker(QThread):
                 (None, "fight_back_when_attacked"),
                 ("route", "fight_back"),
                 ("route", "fight_back_when_attacked"),
+            ),
+            "fight_stop_gather_sec": (
+                (None, "fight_stop_gather_sec"),
+                ("route", "fight_stop_gather_sec"),
+            ),
+            "combat_skill_burst_sec": (
+                (None, "combat_skill_burst_sec"),
+                ("input", "skill_burst_sec"),
+                ("combat", "skill_burst_sec"),
+                ("route", "skill_burst_sec"),
+            ),
+            "skills_per_burst": (
+                (None, "skills_per_burst"),
+                ("input", "skills_per_burst"),
+                ("combat", "skills_per_burst"),
+                ("route", "skills_per_burst"),
+            ),
+            "combat_skill_gcd_sec": (
+                (None, "combat_skill_gcd_sec"),
+                ("input", "skill_gcd_sec"),
+                ("combat", "skill_gcd_sec"),
+                ("route", "skill_gcd_sec"),
+            ),
+            "mp_full_threshold": (
+                (None, "mp_full_threshold"),
+                ("route", "mp_full_threshold"),
+                ("combat", "mp_full_threshold"),
+            ),
+            "ucb_explore_ratio": (
+                (None, "ucb_explore_ratio"),
+                ("route", "ucb_explore_ratio"),
+            ),
+            "skill_discovery_enabled": (
+                (None, "skill_discovery_enabled"),
+                ("route", "skill_discovery_enabled"),
+                ("combat", "skill_discovery_enabled"),
+            ),
+            "combat_skill_keys": (
+                (None, "combat_skill_keys"),
+                (None, "skill_keys"),
+                ("combat", "combat_skill_keys"),
+                ("combat", "skill_keys"),
+                ("route", "combat_skill_keys"),
+                ("route", "skill_keys"),
+            ),
+            "skill_keys": (
+                (None, "skill_keys"),
+                (None, "combat_skill_keys"),
+                ("combat", "skill_keys"),
+                ("combat", "combat_skill_keys"),
+                ("route", "skill_keys"),
+                ("route", "combat_skill_keys"),
             ),
             "break_every_min": (
                 (None, "break_every_min"),
@@ -745,13 +1217,21 @@ class BotWorker(QThread):
 
     def set_mode(self, mode: str) -> None:
         """
-        Switches the active bot mode ('route', 'manual_record', 'auto_record', 'explorer')
+        Switches the active bot mode ('route', 'combat', 'manual_record', 'auto_record', 'explorer')
         and resets transient navigation variables.
         """
         try:
-            normalized = str(mode.value if isinstance(mode, Enum) else mode).strip().lower()
+            raw_str = str(mode.value if isinstance(mode, Enum) else mode).strip().lower()
+            if raw_str in ("combat", "combat_mode", "savas", "savaş", "fight"):
+                normalized = BotMode.COMBAT_MODE.value
+            elif raw_str in ("route", "route_mode", "gather", "topla"):
+                normalized = BotMode.ROUTE_MODE.value
+            else:
+                normalized = raw_str
+
             if normalized not in (
                 BotMode.ROUTE_MODE.value,
+                BotMode.COMBAT_MODE.value,
                 BotMode.MANUAL_RECORD.value,
                 BotMode.AUTO_RECORD.value,
                 BotMode.EXPLORER_MODE.value,
@@ -764,17 +1244,35 @@ class BotWorker(QThread):
                 self._mode = normalized
                 self.active_node = None
                 self._is_gathering_active = False
+                self._stage_cast_in_progress = False
+                self._waiting_for_next_stage_prompt = False
+                self._current_node_harvest_stage = 0
                 self._gather_lost_frames = 0
                 self._walk_start_time = 0.0
                 self._last_gather_time = time.time()
                 self._schedule_next_break()
+                # Leaving combat/route fight-back: drop sticky target so Toplama stays clean.
+                if normalized != BotMode.COMBAT_MODE.value:
+                    self._combat_was_targeting = False
+                    self._route_combat_confirmed = False
+                    self._route_was_fighting = False
 
+            if normalized != BotMode.COMBAT_MODE.value:
+                self._release_all_combat_inputs()
+            else:
+                self._release_route_motion()
+
+            with self._lock:
                 if normalized == BotMode.MANUAL_RECORD.value:
                     self._paused = False
                     self._set_state_internal(BotState.WAITING.value)
                 elif normalized in (BotMode.AUTO_RECORD.value, BotMode.EXPLORER_MODE.value):
                     self._paused = False
                     self._set_state_internal(BotState.WALKING.value)
+                elif normalized == BotMode.COMBAT_MODE.value:
+                    self._paused = False
+                    self._combat_skill_knobs_logged = False
+                    self._set_state_internal(BotState.FIGHTING.value)
                 else:
                     # When entering ROUTE_MODE: if called from GUI thread while worker is running,
                     # defer heavy sequential route sorting to the background worker thread so F9Menu never freezes!
@@ -784,6 +1282,22 @@ class BotWorker(QThread):
                         self._auto_sort_sequential_route()
                     if not self._paused:
                         self._set_state_internal(BotState.WALKING.value)
+
+            # pause() calls abort_motion(); modes that force-run must clear the input gate again.
+            if normalized in (
+                BotMode.MANUAL_RECORD.value,
+                BotMode.AUTO_RECORD.value,
+                BotMode.EXPLORER_MODE.value,
+                BotMode.COMBAT_MODE.value,
+            ):
+                driver = self.input_driver
+                if driver is not None:
+                    resume_fn = getattr(driver, "resume_motion", None)
+                    if callable(resume_fn):
+                        try:
+                            resume_fn()
+                        except Exception as exc:
+                            logger.debug("resume_motion after set_mode skipped: %s", exc)
 
             self._sync_input_driver_state()
             mode_label = MODE_BADGE_MAP.get(normalized, normalized.upper())
@@ -816,12 +1330,17 @@ class BotWorker(QThread):
     def pause(self, reason: str = "Paused by user") -> None:
         """Pauses the bot execution and sets HUD badge to PAUSED."""
         try:
+            self._halt_motion()
             with self._lock:
                 already_paused = self._paused and self._state == BotState.PAUSED.value
                 self._paused = True
                 self._pause_reason = reason or "Paused by user"
                 self.active_node = None
                 self._is_gathering_active = False
+                self._stage_cast_in_progress = False
+                self._waiting_for_next_stage_prompt = False
+                self._current_node_harvest_stage = 0
+                self._gather_lost_frames = 0
                 self._set_state_internal(BotState.PAUSED.value)
 
             self._sync_input_driver_state()
@@ -829,14 +1348,30 @@ class BotWorker(QThread):
                 self._emit_log(reason)
             self._emit_hud_snapshot(
                 title="Paused",
-                subtitle=f"{reason} · Press F9 to resume",
+                subtitle=f"{reason} · Devam: Ctrl+Alt+F10",
             )
         except Exception as exc:
             logger.error("Error in pause(): %s", exc, exc_info=True)
 
+    def _player_driven_mapping_mode(self) -> bool:
+        """Explorer / Oto-Kayıt: player walks; bot must not require held W for WALKING HUD."""
+        mode = self._plain_attr("_mode", None)
+        if mode is None:
+            try:
+                mode = self._mode
+            except Exception:
+                return False
+        return mode in (
+            BotMode.EXPLORER_MODE.value,
+            BotMode.AUTO_RECORD.value,
+        )
+
     def resume(self) -> None:
         """Resumes the bot from PAUSED or BREAK state."""
         try:
+            driver = self.input_driver
+            if driver is not None and hasattr(driver, "resume_motion"):
+                driver.resume_motion()
             with self._lock:
                 self._paused = False
                 self._pause_reason = ""
@@ -847,8 +1382,16 @@ class BotWorker(QThread):
 
                 if self._mode == BotMode.MANUAL_RECORD.value:
                     target_state = BotState.WAITING.value
-                else:
+                elif self._player_driven_mapping_mode() or self._walking_is_real():
                     target_state = BotState.WALKING.value
+                elif self._mode == BotMode.COMBAT_MODE.value:
+                    target_state = BotState.FIGHTING.value
+                else:
+                    target_state = (
+                        BotState.WALKING.value
+                        if self._walking_is_real()
+                        else BotState.WAITING.value
+                    )
                 self._set_state_internal(target_state)
 
             self._sync_input_driver_state()
@@ -883,15 +1426,25 @@ class BotWorker(QThread):
             return None
 
     def stop(self) -> None:
-        """Gracefully stops the QThread loop and waits briefly for termination."""
+        """Stops the loop and joins the thread so it cannot keep pythonw alive after quit()."""
         try:
+            self._halt_motion()
             with self._lock:
                 self._running = False
                 self._paused = True
             self._sync_input_driver_state()
             self._emit_log("Stopping bot worker")
-            if self.isRunning() and threading.current_thread() is not self:
-                self.wait(2500)
+            try:
+                self.requestInterruption()
+            except Exception:
+                logger.debug("BotWorker interruption request skipped", exc_info=True)
+            if threading.current_thread() is self:
+                return
+            if self.isRunning():
+                self.wait(4000)
+            if self.isRunning():
+                self.terminate()
+                self.wait(2000)
         except Exception as exc:
             logger.error("Error stopping BotWorker: %s", exc, exc_info=True)
 
@@ -906,7 +1459,7 @@ class BotWorker(QThread):
             clean_key = str(key_name).strip().lower()
 
             # Ignore hotkeys used to control the bot itself
-            if clean_key in ("f8", "f9"):
+            if clean_key in ("f8", "f9", "f10"):
                 return
 
             # Ignore synthetic key events generated by the bot
@@ -939,6 +1492,15 @@ class BotWorker(QThread):
     def run(self) -> None:
         """Main QThread execution loop."""
         logger.info("BotWorker thread started.")
+        try:
+            current = threading.current_thread()
+            if current is not threading.main_thread() and not current.daemon:
+                try:
+                    current.daemon = True
+                except Exception:
+                    current._daemonic = True
+        except Exception:
+            logger.debug("BotWorker daemon flag unchanged", exc_info=True)
         with self._lock:
             self._running = True
             self._session_start_time = time.time()
@@ -946,10 +1508,14 @@ class BotWorker(QThread):
             self._schedule_next_break()
 
         self._sync_input_driver_state()
+        self._rehydrate_saved_nodes_count()
         self._emit_hud_snapshot()
+        if self.reflex is not None and hasattr(self.reflex, "start"):
+            self.reflex.start()
+        self._log_combat_skill_knobs_once()
 
         try:
-            while self._is_running():
+            while self._is_running() and not self.isInterruptionRequested():
                 try:
                     # 1. Process any queued F8 node recording request
                     if self._consume_f8_request():
@@ -970,12 +1536,13 @@ class BotWorker(QThread):
                         except Exception as wd_exc:
                             logger.debug("Watchdog heartbeat error: %s", wd_exc)
 
-                    # 3. Check if paused
+                    # 3. Check if paused. One paused loop tick releases movement keys.
                     if self.is_paused:
+                        self._release_route_motion()
                         self._set_state_internal(BotState.PAUSED.value)
                         self._emit_hud_snapshot(
                             title="Paused",
-                            subtitle=f"{self._pause_reason} · Press F9 to resume",
+                            subtitle=f"{self._pause_reason} · Devam: Ctrl+Alt+F10",
                         )
                         self._sleep_adaptive(BotState.PAUSED.value, fallback_ms=150)
                         continue
@@ -991,6 +1558,10 @@ class BotWorker(QThread):
                     elif current_mode == BotMode.EXPLORER_MODE.value:
                         self._step_explorer_mode()
                         self._sleep_adaptive(self.state, fallback_ms=100)
+                    elif current_mode == BotMode.COMBAT_MODE.value:
+                        self._step_combat_mode()
+                        # Tight loop: skill bursts already sleep inter-key; keep tick short.
+                        self._sleep_adaptive(self.state, fallback_ms=40)
                     else:
                         self._step_route_mode()
                         self._sleep_adaptive(self.state, fallback_ms=100)
@@ -999,6 +1570,11 @@ class BotWorker(QThread):
                     logger.error("Error inside BotWorker iteration: %s", loop_exc, exc_info=True)
                     self.msleep(250)
         finally:
+            if self.reflex is not None and hasattr(self.reflex, "stop"):
+                try:
+                    self.reflex.stop()
+                except Exception as reflex_exc:
+                    logger.debug("Reflex stop skipped: %s", reflex_exc)
             self._sync_input_driver_state()
             logger.info("BotWorker thread exited.")
 
@@ -1015,15 +1591,19 @@ class BotWorker(QThread):
 
     def _sleep_adaptive(self, state: str, fallback_ms: int = 100) -> None:
         """Uses AdaptiveFramePacer (8-12 FPS walking, 20-30 FPS gathering, 2-4 FPS paused) if available."""
+        ms = int(fallback_ms)
         try:
             if self.frame_pacer is not None and hasattr(self.frame_pacer, "get_next_sleep_interval"):
                 sec = float(self.frame_pacer.get_next_sleep_interval(state))
                 ms = max(25, min(350, int(sec * 1000.0)))
-                self.msleep(ms)
-                return
         except Exception as exc:
             logger.debug("Adaptive sleep fallback: %s", exc)
-        self.msleep(fallback_ms)
+            ms = int(fallback_ms)
+        left = max(0, ms)
+        while left > 0 and self._is_running() and not self.isInterruptionRequested():
+            step = min(25, left)
+            self.msleep(step)
+            left -= step
 
     def _run_passive_auto_cartography(self, gather_while_exploring: bool = False) -> None:
         """
@@ -1031,12 +1611,24 @@ class BotWorker(QThread):
         deduplicates them via SLAM visual odometry, saves 80x80 patches, and inserts
         them into the route in sequential corridor order without requiring manual F8!
         """
+        # Renkli kareyi kartograf kapısından önce al: YZ öğrenimi gezinirken de beslensin.
+        frame_bgr = self._grab_frame(grayscale=False)
         if not self.auto_cartography_enabled or self.explorer_controller is None:
             return
         try:
-            frame_bgr = self._grab_frame(grayscale=False)
             if frame_bgr is None or not isinstance(frame_bgr, np.ndarray) or frame_bgr.size == 0:
                 return
+            # Keep explorer on the live YZ reflex / YOLO path every cartography tick.
+            bind = getattr(self.explorer_controller, "bind_ai_sources", None)
+            if callable(bind):
+                try:
+                    bind(
+                        reflex=getattr(self, "reflex", None),
+                        yolo_detector=getattr(self, "yolo_detector", None),
+                        perception_hub=getattr(self, "perception_hub", None),
+                    )
+                except Exception as bind_exc:
+                    logger.debug("explorer AI bind skipped: %s", bind_exc)
             result = self.explorer_controller.step_passive_cartography(
                 frame_bgr, gather_while_exploring=gather_while_exploring
             )
@@ -1050,8 +1642,694 @@ class BotWorker(QThread):
                     self.last_saved_str = f"Node {nid}"
                     self._emit_log(f"Auto-mapped #{nid} ({rtype}) in sequence")
                     self.node_recorded.emit(nd_dict)
+                yz_n = int(result.get("yz_count", 0) or 0)
+                det_n = int(result.get("detected_count", 0) or 0)
+                if yz_n > 0 or det_n > 0:
+                    logger.debug(
+                        "Cartography tick: detected=%d yz=%d new=%d gate_rejected=%s",
+                        det_n,
+                        yz_n,
+                        len(new_nodes),
+                        result.get("gate_rejected_total"),
+                    )
         except Exception as exc:
             logger.debug("Passive auto-cartography error: %s", exc)
+
+    # =========================================================================
+    # Mode -1: COMBAT_MODE ("combat" - Savaşma Modu / Otomatik Mob Avı)
+    # =========================================================================
+
+    def _normalize_combat_skill_keys(self, raw: Any) -> list:
+        """Turn a settings value into skill-slot keys. Movement and loot keys are not skills."""
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            text = raw.replace(";", ",").replace("|", ",")
+            parts = text.split(",") if "," in text else text.split()
+        elif isinstance(raw, (list, tuple)):
+            parts = list(raw)
+        else:
+            return []
+        skip = {
+            "",
+            "tab",
+            "f",
+            "w",
+            "a",
+            "s",
+            "d",
+            "space",
+            "esc",
+            "m",
+            "left",
+            "right",
+            "left_click",
+            "right_click",
+        }
+        keys = []
+        for part in parts:
+            key = str(part).strip().lower()
+            if key in skip or key in keys:
+                continue
+            keys.append(key)
+        return keys
+
+    def _plain_attr(self, name: str, default: Any = None) -> Any:
+        """Read a field without QObject getattr, which throws if BotWorker.__init__ was skipped."""
+        try:
+            return self.__dict__.get(name, default)
+        except Exception:
+            return default
+
+    def _known_combat_skill_slots(self) -> list:
+        """Skill slots the combat code already defines. No new layout."""
+        recovery = self._plain_attr("combat_recovery")
+        monitor = self._plain_attr("skill_bar_monitor")
+        for raw in (
+            getattr(recovery, "COMBAT_SKILL_KEYS", None),
+            getattr(monitor, "SKILL_SLOTS", None),
+        ):
+            keys = self._normalize_combat_skill_keys(raw)
+            if keys:
+                return keys
+        try:
+            from core.combat_recovery import CombatRecovery
+
+            keys = self._normalize_combat_skill_keys(CombatRecovery.COMBAT_SKILL_KEYS)
+            if keys:
+                return keys
+        except Exception:
+            logger.debug("Combat skill slot lookup skipped")
+        try:
+            from core.skill_bar_reader import SkillBarReader
+
+            return self._normalize_combat_skill_keys(SkillBarReader.SKILL_SLOTS)
+        except Exception:
+            logger.debug("Skill bar slot lookup skipped")
+            return []
+
+    def _configured_combat_skill_keys(self) -> list:
+        """Settings keys when present, otherwise full hotbar (1/2/3/4/q/e/r).
+
+        Do NOT prefer NaturalCombatRotation.DEFAULT_COOLDOWNS keys — that list is
+        only 1–4 and made live combat stick on a short subset (often just '2').
+        """
+        for name in ("combat_skill_keys", "skill_keys"):
+            keys = self._normalize_combat_skill_keys(self._get_cfg(name, None))
+            if keys:
+                return keys
+        known = self._known_combat_skill_slots()
+        if known:
+            return known
+        return ["1", "2", "3", "4", "q", "e", "r"]
+
+    def _log_combat_skill_knobs_once(self) -> None:
+        """Emit effective burst/gcd so live sessions prove settings were applied."""
+        if bool(self._plain_attr("_combat_skill_knobs_logged", False)):
+            return
+        self._combat_skill_knobs_logged = True
+        trusted = self._keyboard_trusted_for_combat()
+        keys = self._configured_combat_skill_keys()
+        burst = self._combat_skill_burst_sec()
+        gcd = self._combat_skill_cooldown_sec(keys[0] if keys else "1")
+        per = self._combat_skills_per_burst()
+        msg = (
+            f"COMBAT SKILL KNOBS trusted={trusted} burst={burst:.3f}s "
+            f"gcd={gcd:.3f}s per_burst={per} keys={','.join(keys)}"
+        )
+        try:
+            self._emit_log(msg)
+        except Exception:
+            pass
+        logger.info(msg)
+
+    def _keyboard_trusted_for_combat(self) -> bool:
+        driver = self._plain_attr("input_driver")
+        if driver is None:
+            return False
+        trusted = getattr(driver, "keyboard_inject_trusted", None)
+        try:
+            if callable(trusted):
+                return bool(trusted())
+            if isinstance(trusted, bool):
+                return bool(trusted)
+        except Exception:
+            return False
+        return False
+
+    def _combat_skill_burst_sec(self) -> float:
+        """Min seconds between skill bursts. Trusted Interception defaults fast (ms scale)."""
+        env = str(os.environ.get("GATHERION_SKILL_BURST_SEC", "") or "").strip()
+        if env:
+            try:
+                return max(0.02, float(env))
+            except (TypeError, ValueError):
+                pass
+        for name in ("combat_skill_burst_sec", "skill_burst_sec"):
+            raw = self._get_cfg(name, None)
+            if raw is not None:
+                try:
+                    return max(0.02, float(raw))
+                except (TypeError, ValueError):
+                    pass
+        return 0.08 if self._keyboard_trusted_for_combat() else 0.15
+
+    def _combat_skills_per_burst(self) -> int:
+        env = str(os.environ.get("GATHERION_SKILLS_PER_BURST", "") or "").strip()
+        if env:
+            try:
+                return max(1, min(8, int(env)))
+            except (TypeError, ValueError):
+                pass
+        raw = self._get_cfg("skills_per_burst", None)
+        if raw is not None:
+            try:
+                return max(1, min(8, int(raw)))
+            except (TypeError, ValueError):
+                pass
+        return 4 if self._keyboard_trusted_for_combat() else 2
+
+    def _combat_skill_hold_range(self) -> Tuple[float, float]:
+        if self._keyboard_trusted_for_combat():
+            return 0.03, 0.05
+        return 0.06, 0.10
+
+    def _combat_skill_cooldown_sec(self, key: str) -> float:
+        """Bot-side per-key floor. Trusted path stays short — game enforces real CD."""
+        env = str(os.environ.get("GATHERION_SKILL_GCD_SEC", "") or "").strip()
+        if env:
+            try:
+                return max(0.02, float(env))
+            except (TypeError, ValueError):
+                pass
+        for name in ("combat_skill_gcd_sec", "skill_gcd_sec"):
+            raw = self._get_cfg(name, None)
+            if raw is not None:
+                try:
+                    return max(0.02, float(raw))
+                except (TypeError, ValueError):
+                    pass
+        # Short ms-level bot-side floors so skills fire rapidly in round-robin sequence
+        if self._keyboard_trusted_for_combat():
+            return 0.12
+        return 0.18
+
+    def _is_route_fight_back_enabled(self) -> bool:
+        """
+        Returns True only if route-level aggro defense is explicitly enabled.
+        Under pure Toplama (route.fight_back=False or unset), combat skills are suppressed.
+        """
+        cfg = getattr(self, "config", None)
+        if isinstance(cfg, dict):
+            route_cfg = cfg.get("route")
+            if isinstance(route_cfg, dict):
+                if route_cfg.get("fight_back") is not None:
+                    return bool(route_cfg.get("fight_back"))
+                if route_cfg.get("fight_back_when_attacked") is not None:
+                    return bool(route_cfg.get("fight_back_when_attacked"))
+            if cfg.get("route_fight_back") is not None:
+                return bool(cfg.get("route_fight_back"))
+        elif cfg is not None and hasattr(cfg, "get"):
+            try:
+                val = cfg.get("route", "fight_back", fallback=None)
+                if val is not None:
+                    return bool(val)
+                val2 = cfg.get("route", "fight_back_when_attacked", fallback=None)
+                if val2 is not None:
+                    return bool(val2)
+            except Exception:
+                pass
+        return False
+
+    def is_combat_authorized(self, action: str = "skill") -> bool:
+        """
+        Mode Isolation Gate:
+        Enforces strict boundary separation between Combat and Gathering/Route operations.
+        Suppresses all combat skill execution, target cycling, and attack holds
+        whenever combat is not explicitly authorized.
+
+        Args:
+            action: "skill" (combat hotbar 1..5, q, e, r),
+                    "target" (TAB targeting, soft-aim reticle),
+                    "attack" (LMB / RMB continuous combat clicks/holds).
+        """
+        if getattr(self, "_paused", False) or getattr(self, "is_paused", False):
+            return False
+
+        current_mode = str(self._plain_attr("_mode", "")).strip().lower()
+        current_state = str(self._plain_attr("_state", "")).strip().upper()
+
+        # Active harvesting or GATHERING state ALWAYS strictly suppresses combat actions (zero leaks)
+        if bool(self._plain_attr("_is_gathering_active", False)) or current_state == BotState.GATHERING.value:
+            return False
+
+        # Dedicated COMBAT mode: authorized during combat step or fighting state
+        is_combat_mode = current_mode in (
+            BotMode.COMBAT_MODE.value.lower(),
+            "combat",
+            "combat_mode",
+            "savaş",
+            "savas",
+            "fight",
+        )
+        if is_combat_mode:
+            return True
+
+        # Non-combat modes (ROUTE_MODE / TOPLAMA, EXPLORER_MODE, MANUAL_RECORD, AUTO_RECORD):
+        is_route = current_mode in (
+            BotMode.ROUTE_MODE.value.lower(),
+            "route",
+            "toplama",
+            "route_mode",
+            "gather",
+        )
+        if is_route:
+            if not self._is_route_fight_back_enabled():
+                # Zero SKILL KEY leakage during Toplama when route.fight_back=False
+                return False
+        elif not bool(self._get_cfg("fight_back", False)):
+            return False
+
+        # When fight_back is enabled in route/other mode: authorized ONLY when character is confirmed in aggro defense
+        in_fighting_state = current_state == BotState.FIGHTING.value
+        has_aggro_signal = bool(
+            self._plain_attr("_route_combat_confirmed", False)
+            or self._plain_attr("_route_fight_had_signal", False)
+            or self._plain_attr("_combat_was_targeting", False)
+        )
+
+        if not (in_fighting_state and has_aggro_signal):
+            return False
+
+        if action == "target":
+            return in_fighting_state and has_aggro_signal and not bool(self._plain_attr("_route_was_fighting", False) and not self._enemy_target_bar_visible(None))
+
+        return True
+
+    def _release_all_combat_inputs(self) -> None:
+        """
+        Anti-stuck key release guard: guarantees all combat keys, attacks,
+        and modifier/targeting states are completely released on transitions.
+        Ensures zero stuck keys and zero key leakage between modes.
+        """
+        try:
+            self._sync_combat_right_button(False)
+        except Exception:
+            pass
+        try:
+            self._release_combat_left_button()
+        except Exception:
+            pass
+
+        bus = self._plain_attr("action_bus")
+        if bus is not None:
+            try:
+                if hasattr(bus, "release_left_attack"):
+                    bus.release_left_attack()
+                if hasattr(bus, "hold_basic_attack"):
+                    bus.hold_basic_attack(False)
+                if hasattr(bus, "end_exclusive"):
+                    bus.end_exclusive(False)
+            except Exception as exc:
+                logger.debug("action_bus release failed: %s", exc)
+
+        driver = getattr(self, "input_driver", None)
+        if driver is not None:
+            combat_keys = set(self._configured_combat_skill_keys())
+            combat_keys.update(["1", "2", "3", "4", "5", "q", "e", "r", "tab", "shift", "ctrl", "alt"])
+
+            hw_up = getattr(driver, "_hw_key_up", None)
+            release_key = getattr(driver, "release_key", None)
+            active_keys = getattr(driver, "_active_bot_keys", None)
+            to_release = set()
+            if isinstance(active_keys, set):
+                to_release = active_keys.intersection(combat_keys)
+            else:
+                to_release = set(combat_keys)
+
+            for k in to_release:
+                try:
+                    if callable(release_key):
+                        release_key(k)
+                    elif callable(hw_up):
+                        hw_up(k)
+                except Exception:
+                    pass
+
+            if hasattr(driver, "release_modifier_keys"):
+                try:
+                    driver.release_modifier_keys()
+                except Exception:
+                    pass
+
+        self._combat_was_targeting = False
+        self._combat_no_target_streak = 0
+        self._mark_right_button(False)
+
+    def _cast_one_combat_skill(self, key: str, frame: Any = None) -> None:
+        if not self.is_combat_authorized("skill"):
+            logger.debug("[CombatGate] _cast_one_combat_skill('%s') suppressed", key)
+            return
+        hold_min, hold_max = self._combat_skill_hold_range()
+        bus = self._plain_attr("action_bus")
+        if bus is not None and hasattr(bus, "cast_skill"):
+            try:
+                bus.cast_skill(key, frame=frame)
+                return
+            except Exception:
+                logger.debug("action_bus.cast_skill failed", exc_info=True)
+                self._release_combat_right_button()
+                self._press_key(key, min_hold=hold_min, max_hold=hold_max, release_mouse=True)
+                return
+        self._release_combat_right_button()
+        self._press_key(key, min_hold=hold_min, max_hold=hold_max, release_mouse=True)
+
+    def _send_configured_combat_skill(self) -> bool:
+        """Rotate hotbar skills. Trusted Interception: fast multi-key bursts (no sticky 'best')."""
+        if self.is_paused:
+            return False
+        if bool(self._get_cfg("test_mode", False)):
+            return False
+        if not self.is_combat_authorized("skill"):
+            return False
+        keys = self._configured_combat_skill_keys()
+        if not keys:
+            return False
+        now = time.time()
+        burst_gap = self._combat_skill_burst_sec()
+        last_burst = float(self._plain_attr("_combat_last_skill_burst_ts", 0.0) or 0.0)
+        if last_burst > 0.0 and (now - last_burst) < burst_gap:
+            return False
+        used = self._plain_attr("_combat_skill_used_at")
+        if not isinstance(used, dict):
+            used = {}
+            self._combat_skill_used_at = used
+        # Round-robin only. Re-anchoring to select_best_skill stuck on "2"/"1" forever.
+        start = int(self._plain_attr("_combat_skill_idx", 0) or 0) % len(keys)
+        per_burst = self._combat_skills_per_burst()
+        trusted = self._keyboard_trusted_for_combat()
+        frame = self.__dict__.get("_last_color_frame")
+        pressed = 0
+        last_offset = -1
+        for offset in range(len(keys)):
+            if pressed >= per_burst:
+                break
+            key = keys[(start + offset) % len(keys)]
+            last = float(used.get(key, 0.0) or 0.0)
+            if last > 0.0 and (now - last) < self._combat_skill_cooldown_sec(key):
+                continue
+            used[key] = now
+            last_offset = offset
+            self._cast_one_combat_skill(key, frame=frame)
+            pressed += 1
+            if pressed < per_burst:
+                # Inter-skill settle: ~35–50ms trusted, slightly slower soft path.
+                time.sleep(0.035 if trusted else 0.06)
+        if pressed <= 0:
+            return False
+        advance = last_offset + 1 if last_offset >= 0 else 1
+        self._combat_skill_idx = (start + advance) % len(keys)
+        self._combat_last_skill_burst_ts = now
+        return True
+
+    def _real_target_for_skills(self, has_bar: bool) -> bool:
+        """A skill is allowed when the target bar is up, or a monster already set the combat flag."""
+        if has_bar:
+            return True
+        if bool(self._plain_attr("_combat_was_targeting", False)):
+            return True
+        return bool(self._plain_attr("_route_saw_target_bar", False))
+
+    def _step_combat_mode(self) -> None:
+        """
+        Dedicated mob combat & hunting loop:
+        1. Checks character death or revive dialog.
+        2. Detects hostile monster target (Target frame / Center combat nameplate).
+        3. If no target:
+           - If target just died: loots with [F], then immediately presses [TAB] to acquire next target!
+           - If idle/searching: presses [TAB] every 1.2s to search for nearby hostiles.
+        4. If monster targeted:
+           - Executes humanized combat skill rotation (1, 2, 3, 4, Q, E, R, Sol/Sağ Tık).
+           - Tracks target HP bar. When target dies, immediately transitions to loot + TAB!
+        5. Emits COMBAT HUD snapshot.
+        """
+        if self.is_paused:
+            self._sync_combat_right_button(False)
+            self._release_combat_left_button()
+            return
+
+        now = time.time()
+        test_mode = bool(self._get_cfg("test_mode", False))
+
+        # 1. Death check
+        self._in_step_combat_mode = True
+        try:
+            if self._handle_combat_and_death():
+                return
+        finally:
+            self._in_step_combat_mode = False
+
+        frame_bgr = self._grab_frame(grayscale=False)
+        if frame_bgr is None:
+            return
+
+        # 2. Check if hostile enemy is targeted (bar / soft-lock reticle / learner)
+        has_enemy = self._combat_has_hostile_lock(frame_bgr)
+        # Do NOT clear a real bar/reticle lock just because HP OCR is 0/stale —
+        # that caused live HEDEF YOK + TAB spam while the game still had a target.
+        still_taking_damage = False
+        if self.combat_recovery is not None and hasattr(self.combat_recovery, "check_under_attack"):
+            try:
+                atk_res = self.combat_recovery.check_under_attack(frame_bgr)
+                still_taking_damage = bool(atk_res[0]) if isinstance(atk_res, tuple) else bool(atk_res)
+            except Exception:
+                still_taking_damage = False
+
+        was_fighting = getattr(self, "_combat_was_targeting", False)
+        no_target_streak = getattr(self, "_combat_no_target_streak", 0)
+
+        # 3. Handle monster death & targeting
+        if not has_enemy:
+            self._sync_combat_right_button(False)
+            self._release_combat_left_button()
+            no_target_streak += 1
+            setattr(self, "_combat_no_target_streak", no_target_streak)
+
+            # AION2 hedef UI titrer; hasar sürüyorsa ölüm ilan etme. Streak 2→5.
+            death_ready = was_fighting and no_target_streak >= 5 and not still_taking_damage
+            if death_ready:
+                # Target just died. Skills stop; loot is not an attack.
+                setattr(self, "_combat_was_targeting", False)
+                setattr(self, "_combat_no_target_streak", 0)
+                try:
+                    from core.lifetime_stats import get_lifetime_stats
+
+                    get_lifetime_stats().record_monster_kill(mob_key="combat_death")
+                except Exception:
+                    logger.debug("lifetime combat death kill skipped", exc_info=True)
+                self._emit_log("⚔️ Canavar öldü -> Ganimet toplanıyor (F)...")
+                self._emit_hud_snapshot(
+                    badge=BotState.FIGHTING.value,
+                    mode_badge="SAVAŞ (COMBAT)",
+                    title="Canavar Öldü: Ganimet Toplanıyor",
+                    subtitle="F ile ganimet toplanıyor, ardından sıradaki canavar seçilecek...",
+                )
+                if not test_mode:
+                    self._press_key("f")
+                    self.msleep(220)
+                    self._emit_log("Sıradaki canavarı seçmek için Tab tuşuna basılıyor...")
+                    self._press_combat_tab()
+                    self.msleep(200)
+                fresh = self._grab_frame(grayscale=False)
+                if self._combat_has_hostile_lock(fresh):
+                    frame_bgr = fresh
+                    has_enemy = True
+                else:
+                    return
+
+            # When targeting flickers for 1 frame, do not immediately choke into TAB / HEDEF YOK loop;
+            # allow skill grace ticks if combat was actively targeting.
+            is_flicker_grace = False
+            if was_fighting and no_target_streak < 2:
+                has_enemy = True
+                is_flicker_grace = True
+            else:
+                if was_fighting and no_target_streak >= 2:
+                    setattr(self, "_combat_was_targeting", False)
+
+                # No target -> Tab / soft-aim only (never cast until lock is real).
+                last_tab_ts = getattr(self, "_combat_last_tab_ts", 0.0)
+                # Faster Tab acquire (~0.55s) so lock loss does not idle 7–12s between skills.
+                if now - last_tab_ts >= 0.55:
+                    setattr(self, "_combat_last_tab_ts", now)
+                    tab_misses = int(self._plain_attr("_combat_tab_miss_count", 0) or 0) + 1
+                    self._combat_tab_miss_count = tab_misses
+                    if tab_misses in (5, 15, 40):
+                        self._warn_combat_input_blocked(tab_misses)
+                    self._emit_hud_snapshot(
+                        badge=BotState.FIGHTING.value,
+                        mode_badge="SAVAŞ (COMBAT)",
+                        title="Canavar Aranıyor (Tab)",
+                        subtitle="HEDEF YOK — Tab/soft-aim; skill yok (sahte savaş yok)",
+                    )
+                    if not test_mode:
+                        # Soft-aim cadence: first miss + every ~1.4s.
+                        last_soft = float(self._plain_attr("_combat_last_soft_aim_ts", 0.0) or 0.0)
+                        use_soft = tab_misses == 1 or (now - last_soft) >= 1.4
+                        if use_soft:
+                            self._combat_last_soft_aim_ts = now
+                        self._press_combat_tab(soft_aim=use_soft)
+                        self.msleep(80)
+                    fresh = self._grab_frame(grayscale=False)
+                    if self._combat_has_hostile_lock(fresh):
+                        frame_bgr = fresh
+                        has_enemy = True
+                    else:
+                        return
+                else:
+                    self._emit_hud_snapshot(
+                        badge=BotState.FIGHTING.value,
+                        mode_badge="SAVAŞ (COMBAT)",
+                        title="Savaş Modu: Bekleniyor",
+                        subtitle="Canavar aranıyor (Tab)...",
+                    )
+                    return
+
+        if not has_enemy:
+            return
+
+        # 4. Active enemy targeted!
+        setattr(self, "_combat_was_targeting", True)
+        if not locals().get("is_flicker_grace", False) and self._combat_has_hostile_lock(frame_bgr):
+            setattr(self, "_combat_no_target_streak", 0)
+            setattr(self, "_combat_tab_miss_count", 0)
+        self._set_state_internal(BotState.FIGHTING.value)
+
+        # PerceptionHub snapshot (fallback: OmniGameLearner)
+        # Use _plain_attr: unit tests skip QObject.__init__.
+        frame_cog = self._plain_attr("_frame_cognition")
+        perception_hub = self._plain_attr("perception_hub")
+        if frame_cog is None and perception_hub is not None and hasattr(perception_hub, "observe"):
+            try:
+                frame_cog = perception_hub.observe(frame_bgr)
+                self._frame_cognition = frame_cog
+            except Exception:
+                frame_cog = None
+        game_learner = self._plain_attr("game_learner")
+        cognition = {}
+        if game_learner is not None and hasattr(game_learner, "get_live_cognition_snapshot"):
+            try:
+                cognition = game_learner.get_live_cognition_snapshot() or {}
+            except Exception:
+                cognition = {}
+        if frame_cog is not None and hasattr(frame_cog, "as_dict"):
+            hub = frame_cog.as_dict()
+            hp_pct = hub.get("monster_hp_percent", cognition.get("monster_hp_percent", 100))
+            p_hp = hub.get("player_hp_percent", cognition.get("player_hp_percent", 100))
+            p_mp = hub.get("player_mp_percent", cognition.get("player_mp_percent", 100))
+            ready_skills = hub.get("ready_skills") or cognition.get("ready_skills", ["1"])
+            combo_seq = hub.get("combo_sequence") or cognition.get("combo_sequence", ["1"])
+            learned_cnt = hub.get("learned_frames", cognition.get("total_learned_frames", 0))
+            player_mp_ratio = float(hub.get("player_mp", p_mp / 100.0))
+            player_hp_ratio = float(hub.get("player_hp", p_hp / 100.0))
+            monster_hp_ratio = float(hub.get("monster_hp", hp_pct / 100.0))
+            buff_count = int(hub.get("buff_count", 0) or 0)
+        else:
+            hp_pct = cognition.get("monster_hp_percent", 100)
+            p_hp = cognition.get("player_hp_percent", 100)
+            p_mp = cognition.get("player_mp_percent", 100)
+            ready_skills = cognition.get("ready_skills", ["1"])
+            combo_seq = cognition.get("combo_sequence", ["1"])
+            learned_cnt = cognition.get("total_learned_frames", 0)
+            player_mp_ratio = float(p_mp) / 100.0
+            player_hp_ratio = float(p_hp) / 100.0
+            monster_hp_ratio = float(hp_pct) / 100.0
+            buff_count = 0
+
+        # Skill discovery probe (safe target present)
+        self._maybe_run_skill_discovery(
+            frame_bgr,
+            player_hp_ratio=player_hp_ratio,
+            monster_hp_ratio=monster_hp_ratio,
+            buff_count=buff_count,
+        )
+
+        phase_label = "B"
+        mana_brain = self._plain_attr("mana_phase_combat")
+        skill_discovery = self._plain_attr("skill_discovery")
+        action_bus = self._plain_attr("action_bus")
+        if mana_brain is not None and hasattr(mana_brain, "set_thresholds"):
+            try:
+                mana_brain.set_thresholds(
+                    mp_full_threshold=float(self._get_cfg("mp_full_threshold", 0.95) or 0.95)
+                )
+            except Exception:
+                pass
+
+        self._emit_hud_snapshot(
+            badge=BotState.FIGHTING.value,
+            mode_badge="SAVAŞ (COMBAT)",
+            title=f"⚔️ Savaş: Canavar [Can: %{hp_pct}] · YZ Öğrenimi ({learned_cnt} Kare)",
+            subtitle=f"Kombo: [{' → '.join(list(combo_seq)[:3])}] · Can: %{p_hp} · Mana: %{p_mp} · Ölünce Tab Basılacak",
+            col1_title="YZ KARELERİ",
+            col1_val=str(learned_cnt),
+            col2_title="CANAVAR CANI",
+            col2_val=f"%{hp_pct}",
+            col3_title="OYUNCU CAN/MANA",
+            col3_val=f"%{p_hp}/%{p_mp}",
+        )
+
+        if not test_mode:
+            # Sticky RMB off in mouse-look combat; LMB AA only. Skills need real lock.
+            self._sync_combat_right_button(False)
+            allow_skills = self._real_target_for_skills(bool(has_enemy))
+            decision = None
+            self._log_combat_skill_knobs_once()
+            if mana_brain is not None and hasattr(mana_brain, "decide"):
+                try:
+                    if skill_discovery is not None and hasattr(mana_brain, "set_lexicon"):
+                        mana_brain.set_lexicon(skill_discovery.lexicon())
+                    decision = mana_brain.decide(
+                        player_mp=player_mp_ratio,
+                        player_hp=player_hp_ratio,
+                        ready_skills=ready_skills,
+                        fallback_keys=self._configured_combat_skill_keys(),
+                    )
+                    phase_label = getattr(getattr(decision, "phase", None), "value", "B")
+                except Exception:
+                    logger.debug("ManaPhase decide skipped", exc_info=True)
+                    decision = None
+
+            try:
+                self._sync_combat_left_button(True)
+            except Exception:
+                if action_bus is not None and hasattr(action_bus, "hold_left_attack"):
+                    try:
+                        action_bus.hold_left_attack(True)
+                    except Exception:
+                        pass
+
+            if not allow_skills:
+                self._emit_log("Skill bekleniyor — gerçek hedef kilidi yok (HUD-only değil)")
+            else:
+                # Always round-robin full hotbar. ManaPhase skill_keys / ready_skills
+                # previously stuck on a single bright slot ('2') and ignored burst knobs.
+                try:
+                    burst_gap = self._combat_skill_burst_sec()
+                    gate_ok = True
+                    if mana_brain is not None and hasattr(mana_brain, "should_cast_skill"):
+                        gate_ok = bool(mana_brain.should_cast_skill(min_gap=burst_gap))
+                    if gate_ok:
+                        self._send_configured_combat_skill()
+                except Exception:
+                    logger.debug("Combat skill skipped", exc_info=True)
+
+            # Economy / reward tick (lightweight)
+            self._zk_post_combat_tick(
+                player_mp_ratio=player_mp_ratio,
+                monster_hp_ratio=monster_hp_ratio,
+                phase=phase_label,
+            )
 
     # =========================================================================
     # Mode 0: EXPLORER_MODE ("explorer" - Gezdikçe Otomatik Haritalandır & Sırala)
@@ -1095,7 +2373,7 @@ class BotWorker(QThread):
             badge=BotState.WAITING.value,
             mode_badge="MANUAL RECORD",
             title="Manual record",
-            subtitle="Walk around (auto-mapping active, or press F8)",
+            subtitle="Walk around (auto-mapping active, or press Ctrl+Alt+F8)",
             col1_title="SAVED",
             col1_val=str(self.saved_nodes_count),
             col2_title="NODES",
@@ -1123,12 +2401,23 @@ class BotWorker(QThread):
             self._gather_lost_frames = 0
             if not self._is_gathering_active:
                 self._is_gathering_active = True
+                self._stage_cast_in_progress = False
                 self._emit_log(f"Gather prompt found ({conf}%)")
                 self._emit_log("Gathering started")
 
             self._set_state_internal(BotState.GATHERING.value)
-            if now - self._last_f_press_time >= self._next_f_interval:
+            cast_dur = float(self._get_cfg("gather_cast_duration_sec", 3.0) or 3.0)
+            if self._stage_cast_in_progress:
+                is_cast, pct = self._check_gather_cast_progress()
+                if (is_cast and pct >= 90.0) or (now - self._stage_cast_start_time >= cast_dur):
+                    self._stage_cast_in_progress = False
+                    self.gathered_count += 1
+                    self._last_gather_time = now
+                    self._emit_log(f"Resource gathered (#{self.gathered_count})")
+            elif now - self._last_f_press_time >= self._next_f_interval:
                 self._press_gather_key()
+                self._stage_cast_in_progress = True
+                self._stage_cast_start_time = now
                 self._last_f_press_time = now
                 self._next_f_interval = self._sample_f_interval()
 
@@ -1146,13 +2435,39 @@ class BotWorker(QThread):
             )
         else:
             if self._is_gathering_active:
-                self._gather_lost_frames += 1
-                if self._gather_lost_frames >= 3:
-                    self._is_gathering_active = False
-                    self._gather_lost_frames = 0
-                    self.gathered_count += 1
-                    self._last_gather_time = now
-                    self._emit_log(f"Resource gathered (#{self.gathered_count})")
+                if self._stage_cast_in_progress:
+                    is_cast, pct = self._check_gather_cast_progress()
+                    cast_dur = float(self._get_cfg("gather_cast_duration_sec", 3.0) or 3.0)
+                    if (is_cast and pct >= 90.0) or (now - self._stage_cast_start_time >= cast_dur):
+                        self._stage_cast_in_progress = False
+                        self._is_gathering_active = False
+                        self._gather_lost_frames = 0
+                        self.gathered_count += 1
+                        self._last_gather_time = now
+                        self._emit_log(f"Resource gathered (#{self.gathered_count})")
+                else:
+                    self._gather_lost_frames += 1
+                    if self._gather_lost_frames >= 3:
+                        self._is_gathering_active = False
+                        self._gather_lost_frames = 0
+                        self.gathered_count += 1
+                        self._last_gather_time = now
+                        self._emit_log(f"Resource gathered (#{self.gathered_count})")
+
+                    # Same as route mode: YOLO / dataset factory captures t-2.0s frame on gather end
+                    if self.dataset_factory is not None and hasattr(
+                        self.dataset_factory, "on_gather_success"
+                    ):
+                        try:
+                            self.dataset_factory.on_gather_success(
+                                material_name="",
+                                harvest_stage=1,
+                                max_harvests=3,
+                            )
+                        except Exception as df_exc:
+                            logger.debug(
+                                "Dataset factory on_gather_success skipped: %s", df_exc
+                            )
 
                     if bool(self._get_cfg("gathered_join_route", True)):
                         self._execute_f8_record(auto_triggered=True)
@@ -1186,6 +2501,11 @@ class BotWorker(QThread):
         6. Gathering / walking / map navigation cycle
         """
         now = time.time()
+
+        # A pause tick must drop W/A/D. Walking only continues while TOPLAMA is running.
+        if self.is_paused:
+            self._release_route_motion()
+            return
 
         # 1. Active break or scheduled break trigger
         if self._state == BotState.BREAK.value or self._should_enter_break(now):
@@ -1224,32 +2544,685 @@ class BotWorker(QThread):
         if self._handle_blocking_game_window():
             return
 
-        # 6. Check for 'F Gather' prompt if gathering on the way is enabled or active node exists
+        # 6. Check for gather prompt or continue active gathering cycle
         gather_on_way = bool(self._get_cfg("gather_on_the_way", True))
         if gather_on_way or self.active_node is not None or self._is_gathering_active:
             detected, conf = self._detect_gather_prompt()
             self.last_prompt_match = conf
 
             if detected:
-                self._handle_route_gathering(conf, now)
-                return
-            elif self._is_gathering_active:
-                self._gather_lost_frames += 1
-                if self._gather_lost_frames >= 3:
-                    self._complete_route_gathering(now)
+                if not self._is_gathering_active and self._should_bypass_unselected_gather():
+                    self._emit_log("Bypassing non-matching material (selective gather active)")
+                else:
+                    self._handle_route_gathering(conf, now)
                     return
+            elif self._is_gathering_active:
+                if self._stage_cast_in_progress:
+                    # Casting is in progress: keep driving the gather state (cast progress monitor & HUD)
+                    self._handle_route_gathering(conf, now)
+                    return
+                elif self._waiting_for_next_stage_prompt:
+                    if now <= self._post_harvest_prompt_deadline:
+                        # Waiting for prompt to reappear after harvest stage completion
+                        self._handle_route_gathering(conf, now)
+                        return
+                    else:
+                        # Prompt did not reappear after stage completion -> early depletion
+                        node_id = self._extract_node_id(self.active_node)
+                        self._emit_log(
+                            f"Node {node_id} prompt timeout ({self._current_node_harvest_stage}/{self._target_harvests_for_active_node}) · node depleted early"
+                        )
+                        self._complete_route_gathering(now, depleted=True)
+                        return
+                else:
+                    self._gather_lost_frames += 1
+                    if self._gather_lost_frames >= 3:
+                        self._complete_route_gathering(now, depleted=True)
+                        return
 
         # 7. If no active node is selected, open map and navigate to next ready node
         if self.active_node is None:
+            if gather_on_way:
+                nearby = self._check_nearby_materials(max_distance_m=18.0)
+                if nearby is not None and getattr(nearby, "screen_x", None) is not None:
+                    m_type = getattr(nearby, "material_type", "Material")
+                    self._emit_log(f"Opportunistic gather: detected nearby {m_type}")
             self._select_and_navigate_next_node()
             return
 
         # 8. Currently walking to active_node: monitor timeout and periodic map reclick
         self._monitor_walking_to_node(now)
 
+    def _parse_attack_result(self, atk_res: Any) -> Tuple[bool, Optional[float]]:
+        """Split check_under_attack into (flag, hp ratio). A bool has no HP sample."""
+        if isinstance(atk_res, tuple):
+            under = bool(atk_res[0]) if atk_res else False
+            hp_ratio: Optional[float] = None
+            if len(atk_res) > 1 and atk_res[1] is not None:
+                try:
+                    hp_ratio = float(atk_res[1])
+                except (TypeError, ValueError):
+                    hp_ratio = None
+            return under, hp_ratio
+        return bool(atk_res), None
+
+    def _enemy_target_bar_visible(self, frame: Optional[np.ndarray]) -> bool:
+        """True when a hostile lock is visible (target bar or AION2 soft reticle)."""
+        return self._combat_has_hostile_lock(frame)
+
+    def _combat_has_hostile_lock(self, frame: Optional[np.ndarray]) -> bool:
+        """Hostile lock: real target bar / soft reticle / learner with HP > 0."""
+        if frame is None:
+            return False
+        recovery = self.combat_recovery
+        if recovery is not None:
+            for name in ("_detect_enemy_target_bar", "detect_enemy_target_bar"):
+                fn = getattr(recovery, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    if bool(fn(frame)):
+                        return True
+                except Exception:
+                    pass
+        learner = self._plain_attr("game_learner")
+        if learner is not None:
+            try:
+                # Target flag alone is enough — HP OCR can lag/zero while lock is real.
+                if bool(getattr(learner, "current_monster_targeted", False)):
+                    return True
+                snap_fn = getattr(learner, "get_live_cognition_snapshot", None)
+                if callable(snap_fn):
+                    snap = snap_fn() or {}
+                    if bool(snap.get("monster_targeted")):
+                        return True
+            except Exception:
+                pass
+        hub = self._plain_attr("_frame_cognition")
+        if hub is not None:
+            try:
+                if bool(getattr(hub, "has_target", False)):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _note_player_hp_drop(self, hp_ratio: Optional[float]) -> bool:
+        """True when this sample is a real HP drop. A missing bar is not a drop."""
+        if hp_ratio is None:
+            return False
+        prev = self._route_prev_hp_ratio
+        self._route_prev_hp_ratio = hp_ratio
+        if prev is None or prev <= 0.02 or hp_ratio <= 0.02:
+            return False
+        return (prev - hp_ratio) >= 0.015
+
+    def _remember_real_combat_signal(self, has_bar: bool, hp_dropped: bool) -> None:
+        """A fight is real only after a target bar or an HP drop. Then the flag may stay set."""
+        self._route_fight_had_signal = True
+        self._route_combat_confirmed = True
+        self._route_was_fighting = True
+        if has_bar:
+            self._route_saw_target_bar = True
+            self._route_bar_since_loot = True
+        if hp_dropped:
+            self._route_saw_hp_drop = True
+
+    def _confirmed_fight_ended(self, has_bar: bool, hp_dropped: bool) -> bool:
+        """Loot only after a real signal was present and has now ended."""
+        if has_bar or hp_dropped:
+            return False
+        had_real = bool(self._route_saw_target_bar or self._route_saw_hp_drop)
+        return bool(self._route_was_fighting and self._route_fight_had_signal and had_real)
+
+    def _loot_suppressed_empty_bar(self) -> bool:
+        """An empty bar cannot press F again inside 30s unless a new target bar or HP drop was seen."""
+        last = float(self._route_last_loot_ts or 0.0)
+        if last <= 0.0 or (time.time() - last) >= 30.0:
+            return False
+        return not (self._route_bar_since_loot or self._route_saw_hp_drop)
+
+    def _clear_route_combat(self) -> None:
+        """Drop a combat flag that has no target bar and no HP drop, so the route can walk."""
+        self._route_was_fighting = False
+        self._route_fight_had_signal = False
+        self._route_combat_confirmed = False
+        self._route_saw_target_bar = False
+        self._route_saw_hp_drop = False
+        recovery = getattr(self, "combat_recovery", None)
+        if recovery is not None and getattr(recovery, "in_combat", False):
+            recovery.in_combat = False
+        self._release_all_combat_inputs()
+        if getattr(self, "_state", None) == BotState.FIGHTING.value:
+            if getattr(self, "active_node", None) is not None:
+                self._set_state_internal(BotState.WALKING.value)
+            else:
+                self._set_state_internal(BotState.WAITING.value)
+
+    def _loot_confirmed_fight(self) -> None:
+        """Press gather once when a confirmed fight ends. An empty bar never starts this."""
+        if self.is_paused:
+            return
+        if self._loot_suppressed_empty_bar():
+            self._clear_route_combat()
+            self._route_bar_since_loot = False
+            return
+        self._route_last_loot_ts = time.time()
+        self._route_bar_since_loot = False
+        self._clear_route_combat()
+        try:
+            from core.lifetime_stats import get_lifetime_stats
+
+            get_lifetime_stats().record_monster_kill(mob_key="route_loot")
+        except Exception:
+            logger.debug("lifetime route loot kill skipped", exc_info=True)
+        self._emit_log("Saldırgan canavar öldü -> Ganimet alınıyor (F)...")
+        if not bool(self._get_cfg("test_mode", False)):
+            self._press_key("f")
+            self.msleep(200)
+            is_combat_mode = str(self._plain_attr("_mode", "")).strip().lower() in (
+                BotMode.COMBAT_MODE.value.lower(),
+                "combat",
+                "combat_mode",
+                "savaş",
+                "savas",
+                "fight",
+            )
+            if is_combat_mode:
+                self._press_combat_tab()
+                self.msleep(150)
+            else:
+                self._release_all_combat_inputs()
+                self._emit_log("⚔️ Savunma tamamlandı -> Rotaya geri dönülüyor...")
+                if getattr(self, "active_node", None) is not None:
+                    self._set_state_internal(BotState.WALKING.value)
+                else:
+                    self._set_state_internal(BotState.WAITING.value)
+
+    def _right_button_is_tracked(self) -> bool:
+        """Read the hold flag without touching an uninitialized QObject attribute."""
+        try:
+            return bool(self.__dict__.get("_combat_right_button_down", False))
+        except Exception:
+            return False
+
+    def _mark_right_button(self, held: bool) -> None:
+        try:
+            self.__dict__["_combat_right_button_down"] = bool(held)
+        except Exception:
+            try:
+                self._combat_right_button_down = bool(held)
+            except Exception:
+                logger.debug("Right-button flag was not stored", exc_info=True)
+
+    def _sync_combat_right_button(self, target_selected: bool, force: bool = False) -> None:
+        """Hold right click while a real target is selected. Release when it is gone or the user pauses."""
+        if not target_selected or self._combat_attack_paused() or not self.is_combat_authorized("attack"):
+            self._release_combat_right_button()
+            return
+        if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:
+            return
+        driver = self.input_driver
+        held = getattr(driver, "_mouse_buttons_down", None)
+        already = isinstance(held, (set, frozenset)) and "right" in held
+        if already and not force:
+            self._mark_right_button(True)
+            return
+        if (
+            not force
+            and self._right_button_is_tracked()
+            and not isinstance(held, (set, frozenset))
+        ):
+            return
+        # force=True: skill sonrası set bayrağı yanlış kalsa bile OS'e tekrar RIGHTDOWN yolla.
+        if force and already:
+            up = getattr(driver, "_hw_mouse_up", None)
+            if callable(up):
+                up("right")
+        down = getattr(driver, "_hw_mouse_down", None)
+        if callable(down):
+            down("right")
+            self._mark_right_button(True)
+            return
+        send = getattr(driver, "_sendinput_mouse_button", None)
+        if callable(send):
+            send("right", True)
+            self._mark_right_button(True)
+            return
+        click = getattr(driver, "human_click", None)
+        if not callable(click):
+            return
+        try:
+            click(button="right")
+        except TypeError:
+            click(None, None, "right")
+
+    def _combat_attack_paused(self) -> bool:
+        try:
+            if self.is_paused:
+                return True
+        except Exception:
+            if getattr(self, "_paused", False):
+                return True
+        driver = getattr(self, "input_driver", None)
+        aborted = getattr(driver, "motion_aborted", None) if driver is not None else None
+        if not callable(aborted):
+            return False
+        try:
+            return bool(aborted())
+        except Exception:
+            return False
+
+    def _release_combat_right_button(self) -> None:
+        driver = getattr(self, "input_driver", None)
+        held = getattr(driver, "_mouse_buttons_down", None) if driver is not None else None
+        tracked = self._right_button_is_tracked()
+        button_down = isinstance(held, (set, frozenset)) and "right" in held
+        if driver is None or not (button_down or tracked):
+            self._mark_right_button(False)
+            return
+        up = getattr(driver, "_hw_mouse_up", None)
+        if callable(up):
+            up("right")
+        else:
+            send = getattr(driver, "_sendinput_mouse_button", None)
+            if callable(send):
+                send("right", False)
+        self._mark_right_button(False)
+
+    def _warn_combat_input_blocked(self, tab_misses: int) -> None:
+        """HUD/log when Tab spam finds no target — often UAC integrity mismatch."""
+        admin = False
+        try:
+            from core.uac_elevator import is_admin
+
+            admin = bool(is_admin())
+        except Exception:
+            try:
+                import ctypes
+
+                admin = bool(ctypes.windll.shell32.IsUserAnAdmin() != 0)
+            except Exception:
+                admin = False
+        if admin:
+            msg = (
+                f"COMBAT Tab {tab_misses}x HEDEF YOK — bot elevated ama hedef yok: "
+                "AION2 Raw Input Tab/skill inject'i filtreliyor olabilir. "
+                "Mouse-only soft-aim aktif. FakerInputWrapper.dll yok — HID klavye yok. "
+                "Not: Steam de High ise tüm çocuklar (AION2) elevated kalır."
+            )
+        else:
+            msg = (
+                f"COMBAT Tab {tab_misses}x HEDEF YOK — bot YÖNETİCİ DEĞİL (Medium). "
+                "Steam+AION2 High ise UIPI SendInput (tuş+fare) sessizce düşer. "
+                "Çözüm: Android GatherionHidBridge + GATHERION_HID_TCP (docs/ANDROID_HID_KEYBOARD.md), "
+                "VEYA Leonardo GATHERION_HID_COM, VEYA Steam Medium (STEAM_UNELEVATED.bat)."
+            )
+        self._emit_log(msg)
+        logger.warning(msg)
+
+    def _sync_combat_left_button(self, hold: bool) -> None:
+        """Mana regen phase left-click hold (via GameActionBus / SoftInput)."""
+        if bool(self._get_cfg("test_mode", False)):
+            return
+        if hold and not self.is_combat_authorized("attack"):
+            self._release_combat_left_button()
+            return
+        bus = self._plain_attr("action_bus")
+        if bus is not None and hasattr(bus, "hold_left_attack"):
+            try:
+                bus.hold_left_attack(bool(hold))
+                return
+            except Exception as exc:
+                logger.debug("hold_left_attack via bus failed: %s", exc)
+        port = self._plain_attr("input_port")
+        if port is not None and hasattr(port, "mouse_button"):
+            try:
+                port.mouse_button("left", bool(hold))
+                return
+            except Exception:
+                pass
+        driver = getattr(self, "input_driver", None)
+        if driver is None:
+            return
+        try:
+            if hold:
+                down = getattr(driver, "_hw_mouse_down", None)
+                if callable(down):
+                    down("left")
+            else:
+                up = getattr(driver, "_hw_mouse_up", None)
+                if callable(up):
+                    up("left")
+        except Exception as exc:
+            logger.debug("left button sync failed: %s", exc)
+
+    def _release_combat_left_button(self) -> None:
+        self._sync_combat_left_button(False)
+
+    def _send_configured_combat_skill_from_keys(self, keys: list) -> bool:
+        """Cast ready keys from ManaPhase decision list (same bus path, fast when trusted)."""
+        if self.is_paused or bool(self._get_cfg("test_mode", False)):
+            return False
+        if not self.is_combat_authorized("skill"):
+            return False
+        norm = self._normalize_combat_skill_keys(keys)
+        if not norm:
+            return self._send_configured_combat_skill()
+        now = time.time()
+        burst_gap = self._combat_skill_burst_sec()
+        last_burst = float(self._plain_attr("_combat_last_skill_burst_ts", 0.0) or 0.0)
+        if last_burst > 0.0 and (now - last_burst) < burst_gap:
+            return False
+        used = self._plain_attr("_combat_skill_used_at")
+        if not isinstance(used, dict):
+            used = {}
+            self._combat_skill_used_at = used
+        per_burst = self._combat_skills_per_burst()
+        trusted = self._keyboard_trusted_for_combat()
+        frame = self.__dict__.get("_last_color_frame")
+        pressed = 0
+        for key in norm:
+            if pressed >= per_burst:
+                break
+            last = float(used.get(key, 0.0) or 0.0)
+            if last > 0.0 and (now - last) < self._combat_skill_cooldown_sec(key):
+                continue
+            used[key] = now
+            self._cast_one_combat_skill(key, frame=frame)
+            pressed += 1
+            if pressed < per_burst:
+                time.sleep(0.035 if trusted else 0.06)
+        if pressed <= 0:
+            return False
+        self._combat_last_skill_burst_ts = now
+        return True
+
+    def _maybe_run_skill_discovery(
+        self,
+        frame_bgr: Any,
+        player_hp_ratio: float,
+        monster_hp_ratio: float,
+        buff_count: int = 0,
+    ) -> None:
+        if not self.is_combat_authorized("skill"):
+            return
+        disc = self._plain_attr("skill_discovery")
+        if disc is None or not bool(self._get_cfg("skill_discovery_enabled", True)):
+            return
+        if not hasattr(disc, "needs_discovery") or not disc.needs_discovery():
+            return
+        slot = disc.next_slot() if hasattr(disc, "next_slot") else None
+        if not slot:
+            return
+        probe = {
+            "slot": slot,
+            "player_hp": float(player_hp_ratio),
+            "monster_hp": float(monster_hp_ratio),
+            "buffs": int(buff_count),
+            "ts": time.time(),
+        }
+        prev = self._plain_attr("_discovery_probe")
+        # Second tick for same slot → classify delta
+        if isinstance(prev, dict) and str(prev.get("slot")) == str(slot) and (time.time() - float(prev.get("ts", 0))) >= 0.8:
+            try:
+                disc.classify_delta(
+                    slot=slot,
+                    monster_hp_before=float(prev.get("monster_hp", 0)),
+                    monster_hp_after=float(monster_hp_ratio),
+                    player_hp_before=float(prev.get("player_hp", 1)),
+                    player_hp_after=float(player_hp_ratio),
+                    buffs_before=int(prev.get("buffs", 0)),
+                    buffs_after=int(buff_count),
+                )
+                mana_brain = self._plain_attr("mana_phase_combat")
+                if mana_brain is not None and hasattr(mana_brain, "set_lexicon"):
+                    mana_brain.set_lexicon(disc.lexicon())
+            except Exception as exc:
+                logger.debug("skill discovery classify: %s", exc)
+            self._discovery_probe = None
+            return
+        # First tick: optional Alt+hover tooltip (AION2 cursor), then keyboard cast.
+        bus = self._plain_attr("action_bus")
+        try:
+            # Alt-hover disabled while diagnosing dead keys (stuck Alt -> cursor mode).
+            # self._maybe_alt_tooltip_hint(disc, slot, frame_bgr)
+            if bus is not None and hasattr(bus, "cast_skill"):
+                bus.cast_skill(slot, frame=frame_bgr)
+            else:
+                self._press_key(slot, min_hold=0.12, max_hold=0.18, release_mouse=True)
+            self._discovery_probe = probe
+        except Exception as exc:
+            logger.debug("skill discovery cast: %s", exc)
+
+    def _maybe_alt_tooltip_hint(self, disc: Any, slot: str, frame_bgr: Any) -> None:
+        """AION2: Alt hold shows cursor — hover skill to read tooltip (no cast)."""
+        if disc is None or not hasattr(disc, "confirm_tooltip_hint"):
+            return
+        now = time.time()
+        last = float(self._plain_attr("_last_alt_tooltip_ts", 0.0) or 0.0)
+        if now - last < 8.0:
+            return
+        bus = self._plain_attr("action_bus")
+        if bus is None or not hasattr(bus, "hover_skill_with_alt"):
+            return
+        try:
+            def _while_alt(sx: int, sy: int) -> str:
+                return self._ocr_skill_tooltip_near_slot(None, sx, sy)
+
+            hovered = bus.hover_skill_with_alt(
+                slot,
+                frame=frame_bgr,
+                hold_sec=0.45,
+                on_hover=_while_alt,
+            )
+            self._last_alt_tooltip_ts = now
+            tip = str(hovered.get("hover_payload") or "").strip()
+            if hovered.get("ok") and tip:
+                disc.confirm_tooltip_hint(slot, tip)
+                mana_brain = self._plain_attr("mana_phase_combat")
+                if mana_brain is not None and hasattr(mana_brain, "set_lexicon"):
+                    mana_brain.set_lexicon(disc.lexicon())
+        except Exception as exc:
+            logger.debug("alt tooltip hint skipped: %s", exc)
+
+    def _ocr_skill_tooltip_near_slot(
+        self,
+        frame_bgr: Any,
+        slot_x: Any,
+        slot_y: Any,
+    ) -> str:
+        """OCR tooltip above hotbar — call while Alt is still held."""
+        if slot_x is None or slot_y is None:
+            return ""
+        try:
+            import numpy as np
+
+            # Grab while Alt+hover is active (direct vision — avoid learner/disk side effects).
+            frame = None
+            vision = self._plain_attr("vision")
+            if vision is not None and hasattr(vision, "grab_screen"):
+                try:
+                    frame = vision.grab_screen(grayscale=False)
+                except Exception:
+                    frame = None
+            if frame is None:
+                frame = frame_bgr
+            if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+                return ""
+            h, w = frame.shape[:2]
+            sx, sy = int(slot_x), int(slot_y)
+            x1 = max(0, sx - int(w * 0.12))
+            x2 = min(w, sx + int(w * 0.12))
+            y1 = max(0, sy - int(h * 0.28))
+            y2 = min(h, sy - int(h * 0.04))
+            if y2 <= y1 or x2 <= x1:
+                return ""
+            roi = frame[y1:y2, x1:x2]
+            for name in ("ocr_text", "read_text", "ocr_roi"):
+                fn = getattr(vision, name, None) if vision is not None else None
+                if callable(fn):
+                    try:
+                        out = fn(roi)
+                        if isinstance(out, str) and out.strip():
+                            return out.strip()
+                        if isinstance(out, dict):
+                            t = str(out.get("text") or out.get("ocr") or "").strip()
+                            if t:
+                                return t
+                    except Exception:
+                        continue
+            try:
+                from core.ocr_distance import quick_ocr_text  # type: ignore
+
+                t = quick_ocr_text(roi)
+                if t:
+                    return str(t).strip()
+            except Exception:
+                pass
+        except Exception:
+            return ""
+        return ""
+
+    def _zk_post_combat_tick(
+        self,
+        player_mp_ratio: float,
+        monster_hp_ratio: float,
+        phase: str = "B",
+    ) -> None:
+        """Record reward + chat loot into slot economy; refresh UCB hint occasionally."""
+        cog = self._plain_attr("_frame_cognition")
+        chat_events = []
+        if cog is not None:
+            chat_events = list(getattr(cog, "chat_events", None) or [])
+            if hasattr(cog, "as_dict"):
+                chat_events = list(cog.as_dict().get("chat_events") or chat_events)
+
+        eco = self._plain_attr("slot_economy")
+        if eco is not None and chat_events:
+            seen = self._plain_attr("_zk_chat_seen_fps")
+            if not isinstance(seen, dict):
+                seen = {}
+                self._zk_chat_seen_fps = seen
+            now_ts = time.time()
+            # Drop fingerprints older than 60s
+            for old_fp, old_ts in list(seen.items()):
+                if (now_ts - float(old_ts or 0.0)) > 60.0:
+                    seen.pop(old_fp, None)
+            for ev in chat_events:
+                et = str(ev.get("type", ""))
+                raw = str(ev.get("raw", "") or "")[:80]
+                fp = f"{et}:{raw}:{ev.get('amount', '')}:{ev.get('item_name', '')}"
+                if fp in seen:
+                    continue
+                if et == "kina":
+                    try:
+                        eco.record_drop(kina=float(ev.get("amount", 0) or 0), mob_key="combat")
+                        seen[fp] = now_ts
+                    except Exception:
+                        pass
+                elif et == "item":
+                    try:
+                        eco.record_drop(item_name=str(ev.get("item_name", "")), mob_key="combat")
+                        seen[fp] = now_ts
+                    except Exception:
+                        pass
+                elif et == "defeat":
+                    try:
+                        eco.record_kill(mob_key=str(ev.get("raw", "mob"))[:48])
+                        seen[fp] = now_ts
+                    except Exception:
+                        pass
+
+        wasted = max(0.0, 1.0 - float(player_mp_ratio)) if str(phase) == "B" else 0.0
+        dmg = max(0.0, 1.0 - float(monster_hp_ratio)) * 100.0
+        reward_log = self._plain_attr("rl_reward_log")
+        if reward_log is not None and hasattr(reward_log, "log_tick"):
+            try:
+                slot_id = ""
+                if eco is not None:
+                    slot_id = str(getattr(eco, "_current_slot", "") or "")
+                reward_log.log_tick(
+                    damage_dealt=dmg,
+                    wasted_mana=wasted * 0.1,
+                    slot_id=slot_id,
+                    meta={"phase": phase},
+                )
+            except Exception as exc:
+                logger.debug("rl reward tick: %s", exc)
+
+        # Refresh UCB hint every ~20s
+        last = float(self._plain_attr("_ucb_hint_ts", 0.0) or 0.0)
+        if eco is not None and (time.time() - last) >= 20.0:
+            try:
+                self._ucb_slot_hint = eco.suggested_hint()
+                self._ucb_hint_ts = time.time()
+            except Exception:
+                pass
+
+    def _zk_note_stuck_and_avoid(self, cx: float, cy: float, moving: bool = True) -> None:
+        mem = self._plain_attr("obstacle_memory")
+        stuck_for = None
+        if mem is not None and hasattr(mem, "note_position"):
+            try:
+                stuck_for = mem.note_position(cx, cy, moving_cmd=moving)
+            except Exception:
+                stuck_for = None
+        reward_log = self._plain_attr("rl_reward_log")
+        if stuck_for and reward_log is not None:
+            try:
+                reward_log.log_tick(stuck_time=float(stuck_for), meta={"event": "stuck"})
+            except Exception:
+                pass
+        if not stuck_for:
+            return
+        frame = self.__dict__.get("_last_color_frame")
+        depth_avoider = self._plain_attr("depth_avoider")
+        if depth_avoider is not None and frame is not None:
+            try:
+                analysis = None
+                if hasattr(depth_avoider, "analyze_forward_corridor"):
+                    analysis = depth_avoider.analyze_forward_corridor(frame)
+                if analysis and hasattr(depth_avoider, "apply_avoidance_steering"):
+                    depth_avoider.apply_avoidance_steering(
+                        self._plain_attr("input_driver"),
+                        analysis,
+                        test_mode=bool(self._get_cfg("test_mode", False)),
+                    )
+                elif analysis and hasattr(self, "_apply_active_obstacle_evasion"):
+                    steer = float((analysis or {}).get("recommended_steer_deg", 15.0) or 15.0)
+                    self._apply_active_obstacle_evasion("stuck", steer, time.time())
+            except Exception as exc:
+                logger.debug("depth avoid on stuck: %s", exc)
+        glide_pilot = self._plain_attr("glide_pilot")
+        if glide_pilot is not None and hasattr(glide_pilot, "execute_glide_maneuver"):
+            try:
+                glide_pilot.execute_glide_maneuver(
+                    self._plain_attr("active_node"),
+                    input_ctrl=self._plain_attr("input_driver"),
+                )
+            except TypeError:
+                try:
+                    glide_pilot.execute_glide_maneuver(self._plain_attr("active_node"))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        # Enter current area as a slot sample for UCB when stuck resolved path continues
+        eco = self._plain_attr("slot_economy")
+        if eco is not None and hasattr(eco, "enter_slot"):
+            try:
+                sid = eco.slot_id_from_coords(cx, cy, region=str(self._get_cfg("active_region", "map")))
+                eco.enter_slot(sid, cx=cx, cy=cy)
+            except Exception:
+                pass
+
     def _handle_combat_and_death(self) -> bool:
         """Checks for character death or enemy attack and responds accordingly."""
         if self.combat_recovery is None:
+            return False
+        if self.is_paused:
+            self._sync_combat_right_button(False)
             return False
 
         try:
@@ -1292,9 +3265,30 @@ class BotWorker(QThread):
                     self.pause("Paused: character died")
                 return True
 
-            # Under attack check
-            if bool(self._get_cfg("fight_back", True)):
-                under_attack = False
+            # Dedicated combat mode runs its own targeting/skills/tab loop below.
+            if (
+                str(self._plain_attr("_mode", "")).lower() in (BotMode.COMBAT_MODE.value.lower(), "combat")
+                or bool(self._plain_attr("_in_step_combat_mode", False))
+            ):
+                return False
+
+
+            # Active Toplama harvest / player-mapping: never divert into fight-back skills.
+            gathering_now = bool(self._plain_attr("_is_gathering_active", False)) or (
+                str(self._plain_attr("_state", "")) == BotState.GATHERING.value
+            )
+            stop_gather_sec = int(self._get_cfg("fight_stop_gather_sec", 0) or 0)
+            if gathering_now and stop_gather_sec <= 0:
+                self._sync_combat_right_button(False)
+                return False
+            if self._player_driven_mapping_mode() and not bool(self._get_cfg("fight_back", False)):
+                self._sync_combat_right_button(False)
+                return False
+
+            # Under attack check. A missing target bar is not a death and is not a fight.
+            # Default False: Toplama stays gather-only unless user enables fight_back.
+            if bool(self._get_cfg("fight_back", False)):
+                atk_res: Any = False
                 if hasattr(self.combat_recovery, "check_under_attack"):
                     try:
                         if frame_bgr is not None:
@@ -1306,11 +3300,17 @@ class BotWorker(QThread):
                             atk_res = self.combat_recovery.check_under_attack()
                         except TypeError:
                             atk_res = False
-                    under_attack = bool(atk_res[0]) if isinstance(atk_res, tuple) else bool(atk_res)
 
-                if under_attack:
+                _under_ignored, hp_ratio = self._parse_attack_result(atk_res)
+                has_bar = self._enemy_target_bar_visible(frame_bgr)
+                hp_dropped = self._note_player_hp_drop(hp_ratio)
+                if has_bar or hp_dropped:
+                    self._remember_real_combat_signal(has_bar=has_bar, hp_dropped=hp_dropped)
+
+                # Bare "under attack" (vignette / empty bar) does not start a counterattack.
+                if has_bar or hp_dropped:
                     if self._state != BotState.FIGHTING.value:
-                        self._emit_log("Under attack: fighting back")
+                        self._emit_log("Saldırı altında: Karşı saldırı yapılıyor")
                     self._set_state_internal(BotState.FIGHTING.value)
                     self._emit_hud_snapshot(
                         badge=BotState.FIGHTING.value,
@@ -1320,13 +3320,45 @@ class BotWorker(QThread):
 
                     if not bool(self._get_cfg("test_mode", False)):
                         self._last_bot_key_time = time.time()
-                        if hasattr(self.combat_recovery, "fight_back"):
-                            self.combat_recovery.fight_back()
-                        elif hasattr(self.combat_recovery, "fight_back_step"):
-                            self.combat_recovery.fight_back_step()
-                        elif hasattr(self.combat_recovery, "execute_combat_step"):
-                            self.combat_recovery.execute_combat_step()
+                        if has_bar:
+                            self._combat_was_targeting = True
+                            self._combat_no_target_streak = 0
+                        is_route = str(self._plain_attr("_mode", "")).strip().lower() in (
+                            BotMode.ROUTE_MODE.value.lower(),
+                            "route",
+                            "toplama",
+                            "route_mode",
+                        )
+                        route_fb = self._is_route_fight_back_enabled()
+                        allow_fight_back = (not is_route) or route_fb
+                        if allow_fight_back:
+                            try:
+                                if self._real_target_for_skills(has_bar):
+                                    self._send_configured_combat_skill()
+                            except Exception:
+                                logger.debug("Combat skill skipped", exc_info=True)
+                            if hasattr(self.combat_recovery, "fight_back_step"):
+                                self.combat_recovery.fight_back_step(input_ctrl=self.input_driver, frame=frame_bgr)
+                            elif hasattr(self.combat_recovery, "fight_back"):
+                                self.combat_recovery.fight_back(input_ctrl=self.input_driver, frame=frame_bgr)
+                            elif hasattr(self.combat_recovery, "execute_combat_step"):
+                                self.combat_recovery.execute_combat_step(input_ctrl=self.input_driver, frame=frame_bgr)
+                            # Hold after the skill tick so a click inside it cannot release the button.
+                            self._sync_combat_right_button(bool(has_bar))
+                        else:
+                            # In ROUTE_MODE ("TOPLAMA") when route.fight_back=False, strictly suppress combat skills and fight_back (no SKILL KEY leak)
+                            self._sync_combat_right_button(False)
                     return True
+
+                self._sync_combat_right_button(False)
+                if self._confirmed_fight_ended(has_bar, hp_dropped):
+                    self._loot_confirmed_fight()
+                else:
+                    # No target bar and no HP drop. A stuck combat flag must not hold the route.
+                    self._clear_route_combat()
+            else:
+                self._sync_combat_right_button(False)
+                self._clear_route_combat()
         except Exception as exc:
             logger.error("Combat/death check error: %s", exc, exc_info=True)
 
@@ -1336,8 +3368,14 @@ class BotWorker(QThread):
         """
         Checks if a blocking game window/dialog is open (when not intentionally viewing the map).
         If open, presses Esc and logs 'A game window was open: closed with Esc'.
+        Rate-limited with a 4.0-second cooldown to prevent infinite Esc loops.
         """
         if self.vision is None or self._state == BotState.MAP.value:
+            return False
+
+        now = time.time()
+        last_esc = getattr(self, "_last_esc_press_time", 0.0)
+        if now - last_esc < 4.0:
             return False
 
         try:
@@ -1353,137 +3391,366 @@ class BotWorker(QThread):
                 is_blocking = bool(self.vision.check_blocking_window())
 
             if is_blocking:
+                setattr(self, "_last_esc_press_time", now)
                 if not bool(self._get_cfg("test_mode", False)):
                     self._press_key("esc")
                 self._emit_log("A game window was open: closed with Esc")
-                self.msleep(200)
+                self.msleep(250)
                 return True
         except Exception as exc:
             logger.debug("Blocking window check error: %s", exc)
 
         return False
 
-    def _handle_route_gathering(self, conf: int, now: float) -> None:
-        """Handles pressing F and updating HUD while 'F Gather' prompt is visible in ROUTE_MODE."""
-        self._gather_lost_frames = 0
+    def _check_inventory_full(self, frame_bgr: Optional[np.ndarray] = None) -> Tuple[bool, str]:
+        """
+        Detects whether inventory/cube is full and blocking further harvesting.
+        Checks:
+        1. Behavioral guard prompt-stuck monitor (10s stuck with prompt visible)
+        2. Vision inventory panel / cube detection
+        3. Chat feedback for 'inventory full' or 'envanter dolu'
+        """
+        # 1. Behavioral guard check
         node_id = self._extract_node_id(self.active_node)
-
-        # Layer IV: 10s Prompt-Stuck Protection (Inventory full / skill level requirement)
-        if self.behavioral_guard is not None and hasattr(self.behavioral_guard, "check_prompt_stuck"):
+        guard = self._plain_attr("behavioral_guard")
+        if guard is not None and hasattr(guard, "check_prompt_stuck"):
             try:
-                is_stuck, stuck_msg = self.behavioral_guard.check_prompt_stuck(
-                    True, current_node_id=node_id if isinstance(node_id, int) else None, max_stuck_sec=10.0
+                is_stuck, stuck_msg = guard.check_prompt_stuck(
+                    True,
+                    current_node_id=node_id if isinstance(node_id, int) else None,
+                    max_stuck_sec=10.0,
                 )
                 if is_stuck:
-                    if self.panic_system is not None and hasattr(self.panic_system, "trigger_panic"):
-                        try:
-                            self.panic_system.trigger_panic("PROMPT_STUCK_10S", stuck_msg, input_ctrl=self.input_driver)
-                        except Exception:
-                            logger.debug("Panic trigger skipped")
-                    self.pause(stuck_msg)
-                    return
-            except Exception as guard_exc:
-                logger.debug("check_prompt_stuck error: %s", guard_exc)
+                    return True, stuck_msg or "Inventory full / skill level requirement (Prompt stuck 10s)"
+            except Exception as exc:
+                logger.debug("check_prompt_stuck error: %s", exc)
 
+        # 2. Vision check for modal inventory / cube blocking window
+        vision = self._plain_attr("vision")
+        if vision is not None:
+            try:
+                if frame_bgr is None:
+                    frame_bgr = self.__dict__.get("_last_color_frame")
+                if frame_bgr is None:
+                    frame_bgr = self._grab_frame(grayscale=False)
+                if hasattr(vision, "is_inventory_open"):
+                    try:
+                        inv_open = bool(vision.is_inventory_open(frame_bgr)) if frame_bgr is not None else bool(vision.is_inventory_open())
+                    except TypeError:
+                        inv_open = bool(vision.is_inventory_open())
+                    if inv_open:
+                        return True, "Envanter / Cube penceresi açık (Inventory open / full)"
+            except Exception as exc:
+                logger.debug("Vision inventory check error: %s", exc)
+
+        # 3. Chat feedback check
+        hud_reader = self._plain_attr("hud_reader")
+        if hud_reader is not None and hasattr(hud_reader, "parse_chat_feedback_fast"):
+            try:
+                if frame_bgr is None:
+                    frame_bgr = self.__dict__.get("_last_color_frame")
+                if frame_bgr is None:
+                    frame_bgr = self._grab_frame(grayscale=False)
+                if frame_bgr is None:
+                    frame_bgr = np.zeros((100, 100, 3), dtype=np.uint8)
+                if frame_bgr is not None:
+                    fb = hud_reader.parse_chat_feedback_fast(frame_bgr)
+                    if isinstance(fb, dict) and (fb.get("inventory_full") or fb.get("cube_full")):
+                        return True, "Envanter dolu (Chat feedback: Inventory full)"
+            except Exception as exc:
+                logger.debug("Chat feedback inventory error: %s", exc)
+
+        return False, ""
+
+    def _check_gather_cast_progress(self, frame_bgr: Optional[np.ndarray] = None) -> Tuple[bool, float]:
+        """
+        Monitors gathering cast / progress bar via GameHUDReader.
+        Returns:
+            (is_present: bool, progress_pct: float 0.0..100.0)
+        """
+        hud_reader = self._plain_attr("hud_reader")
+        if hud_reader is not None:
+            try:
+                if frame_bgr is None:
+                    frame_bgr = self.__dict__.get("_last_color_frame")
+                if frame_bgr is None:
+                    frame_bgr = self._grab_frame(grayscale=False)
+                if frame_bgr is None:
+                    frame_bgr = np.zeros((100, 100, 3), dtype=np.uint8)
+
+                if frame_bgr is not None and hasattr(hud_reader, "verify_gather_cast_bar"):
+                    is_pres, pct = hud_reader.verify_gather_cast_bar(frame_bgr)
+                    if is_pres:
+                        return True, float(pct)
+
+                if frame_bgr is not None and hasattr(hud_reader, "read_cast_bar_progress"):
+                    ratio = hud_reader.read_cast_bar_progress(frame_bgr)
+                    if ratio > 0.0:
+                        return True, round(float(ratio) * 100.0, 1)
+            except Exception as exc:
+                logger.debug("Cast progress read error: %s", exc)
+
+        return False, 0.0
+
+    def _handle_route_gathering(self, conf: int, now: float) -> None:
+        """
+        Executes the full gathering engine cycle:
+        detect -> approach -> interact (F/E key loop) -> verify cast & progress bar -> 3x harvest cycle -> completion.
+        Guarantees zero false F presses during cast progress or inter-harvest cooldown.
+        """
+        self._gather_lost_frames = 0
+        node_id = self._extract_node_id(self.active_node)
+        if self._node_not_gatherable(self.active_node):
+            self._is_gathering_active = False
+            self.active_node = None
+            self._emit_log(f"Node {node_id} is a scroll, not gatherable: skip harvest")
+            return
+
+        # 1. Check for inventory full or prompt stuck
+        is_full, full_reason = self._check_inventory_full()
+        if is_full:
+            panic = self._plain_attr("panic_system")
+            if panic is not None and hasattr(panic, "trigger_panic"):
+                try:
+                    panic.trigger_panic("INVENTORY_FULL_OR_PROMPT_STUCK", full_reason, input_ctrl=self.input_driver)
+                except Exception:
+                    pass
+            self.pause(full_reason)
+            return
+
+        # 2. Selective gathering check: bypass if unselected
+        if not self._is_gathering_active and self._should_bypass_unselected_gather():
+            self._emit_log(f"Node {node_id or 'unselected'} bypassed: material does not match selective gather")
+            return
+
+        # 3. Halt player movement so character stands still for interaction
+        self._halt_motion()
+        self._release_all_combat_inputs()
+
+        # 4. Initialize node harvest session on first entry
+        test_mode = bool(self._get_cfg("test_mode", False))
         if not self._is_gathering_active:
+            self._release_all_combat_inputs()
             self._is_gathering_active = True
-            self._emit_log(f"Gather prompt found ({conf}%)")
-            # Layer III: Human Visual Reaction Delay (180ms - 380ms Ex-Gaussian) before first F press
-            if not bool(self._get_cfg("test_mode", False)) and self.human_timing is not None:
+            max_h = int(self._get_node_field(self.active_node, "max_harvests", 3) or 3)
+            self._target_harvests_for_active_node = max_h
+            self._current_node_harvest_stage = 0
+            self._current_node_stage_retries = 0
+            self._stage_cast_in_progress = False
+            self._waiting_for_next_stage_prompt = False
+            self._emit_log(f"Gather prompt found ({conf}%) · Stage 1/{max_h}")
+
+            # Human visual reaction delay before initial interaction
+            if not test_mode and self.human_timing is not None:
                 try:
                     react_sec = float(self.human_timing.get_visual_reaction_delay_sec())
                     self.msleep(max(50, min(400, int(react_sec * 1000.0))))
                 except Exception:
-                    logger.debug("Visual reaction delay fallback")
+                    pass
             self._emit_log("Gathering started")
 
         self._set_state_internal(BotState.GATHERING.value)
+        target_h = max(1, self._target_harvests_for_active_node)
+        current_stage_display = min(target_h, self._current_node_harvest_stage + 1)
 
+        # 4. Check if we are waiting between harvest stages (Inter-harvest delay)
+        if self._waiting_for_next_stage_prompt:
+            if now < self._inter_harvest_wait_until:
+                # Inter-harvest cooldown delay: do NOT press F yet! Zero false F presses.
+                self._emit_hud_snapshot(
+                    badge=BotState.GATHERING.value,
+                    title=f"Gathering node {node_id} ({current_stage_display}/{target_h})",
+                    subtitle="Inter-harvest cooldown · preparing next harvest",
+                )
+                return
+            else:
+                # Delay elapsed: ready for next stage interaction
+                self._waiting_for_next_stage_prompt = False
+                self._last_f_press_time = 0.0
+
+        # 5. Check if casting is in progress (Progress bar monitoring)
+        if self._stage_cast_in_progress:
+            is_cast_bar, progress_pct = self._check_gather_cast_progress()
+            cast_dur = float(self._get_cfg("gather_cast_duration_sec", 3.0) or 3.0)
+            elapsed_cast = now - self._stage_cast_start_time
+
+            # Cast completion detection
+            cast_finished = False
+            if is_cast_bar:
+                if progress_pct >= 90.0:
+                    cast_finished = True
+                else:
+                    # Still actively filling progress bar: update HUD and DO NOT press F!
+                    self._emit_hud_snapshot(
+                        badge=BotState.GATHERING.value,
+                        title=f"Gathering node {node_id} ({current_stage_display}/{target_h}) · {int(progress_pct)}%",
+                        subtitle=f"Harvesting... {progress_pct:.0f}%",
+                    )
+                    return
+            else:
+                # Cast bar not present on this frame:
+                if test_mode or elapsed_cast >= cast_dur:
+                    cast_finished = True
+                else:
+                    # Still within expected cast time window
+                    self._emit_hud_snapshot(
+                        badge=BotState.GATHERING.value,
+                        title=f"Gathering node {node_id} ({current_stage_display}/{target_h})",
+                        subtitle=f"Harvesting... ({elapsed_cast:.1f}s)",
+                    )
+                    return
+
+            if cast_finished:
+                self._on_harvest_stage_finished(now)
+                return
+
+        # 6. Interaction Prompt (F / E key loop)
+        # Press gather key when interval has passed and NOT currently casting
         if now - self._last_f_press_time >= self._next_f_interval:
             self._press_gather_key()
+            self._stage_cast_in_progress = True
+            self._stage_cast_start_time = time.time()
             self._last_f_press_time = time.time()
             self._next_f_interval = self._sample_f_interval()
 
         self._emit_hud_snapshot(
             badge=BotState.GATHERING.value,
-            title=f"Gathering node {node_id}",
+            title=f"Gathering node {node_id} ({current_stage_display}/{target_h})",
             subtitle=f"Gather prompt recognized at {conf}%",
         )
 
-    def _complete_route_gathering(self, now: float) -> None:
+    def _on_harvest_stage_finished(self, now: float) -> None:
         """
-        Handles completion of a gather stage (supports 3x harvest `1/3 -> 2/3 -> 3/3`,
-        `Essence Extraction failed` retry without losing stages, partial node depletion,
-        and automatic 2s Pre-Gather Time Machine YOLO dataset labeling).
+        Called when a single harvest cast completes:
+        1. Checks for 'Essence Extraction failed' chat message.
+        2. Records successful stage and triggers Time Machine YOLO training.
+        3. Either advances to next stage of 3x cycle or triggers node completion.
         """
-        if self.behavioral_guard is not None and hasattr(self.behavioral_guard, "check_prompt_stuck"):
-            try:
-                self.behavioral_guard.check_prompt_stuck(False)
-            except Exception:
-                logger.debug("Prompt stuck reset error")
-
         node_id = self._extract_node_id(self.active_node, default=None)
         test_mode = bool(self._get_cfg("test_mode", False))
+        max_h = max(1, self._target_harvests_for_active_node)
 
-        # Check chat for "Essence Extraction failed" (Item 23: do not consume harvest stage)
+        # Check chat for "Essence Extraction failed"
         if not test_mode and self.hud_reader is not None and hasattr(self.hud_reader, "parse_chat_feedback_fast"):
             try:
                 frame_bgr = self._grab_frame(grayscale=False)
+                if frame_bgr is None:
+                    frame_bgr = self.__dict__.get("_last_color_frame")
+                if frame_bgr is None:
+                    frame_bgr = np.zeros((100, 100, 3), dtype=np.uint8)
                 if frame_bgr is not None:
                     fb = self.hud_reader.parse_chat_feedback_fast(frame_bgr)
                     if isinstance(fb, dict) and fb.get("extraction_failed"):
-                        self._is_gathering_active = False
-                        self._gather_lost_frames = 0
-                        self._emit_log(f"Essence Extraction failed on node {node_id}: retrying same stage")
-                        self._press_gather_key()
-                        return
+                        max_retries = int(self._get_cfg("max_retries_per_harvest_stage", 3) or 3)
+                        self._current_node_stage_retries += 1
+                        if self._current_node_stage_retries <= max_retries:
+                            self._emit_log(
+                                f"Essence Extraction failed on node {node_id}: retrying stage "
+                                f"{self._current_node_harvest_stage + 1}/{max_h} "
+                                f"({self._current_node_stage_retries}/{max_retries})"
+                            )
+                            self._stage_cast_in_progress = False
+                            self._last_f_press_time = 0.0
+                            return
+                        else:
+                            self._emit_log(f"Max extraction retries exceeded on node {node_id}")
+                            self._complete_route_gathering(now, depleted=True)
+                            return
             except Exception as fb_exc:
-                logger.debug("Chat feedback check skipped: %s", fb_exc)
+                logger.debug("Chat feedback check error: %s", fb_exc)
 
-        walk_dur = max(0.0, now - self._walk_start_time) if self._walk_start_time > 0 else 0.0
-        self._is_gathering_active = False
-        self._gather_lost_frames = 0
+        # Successful harvest stage!
+        self._current_node_harvest_stage += 1
+        self._current_node_stage_retries = 0
         self.gathered_count += 1
         self.failed_in_row = 0
         self._last_gather_time = now
+        rtype = self._get_node_field(self.active_node, "resource_type", "Orichalcum Ore") or "Orichalcum Ore"
+        rest_min = float(self._get_cfg("rest_minutes", 5) or 5)
+
+        # Trigger Self-Training YOLO Dataset Factory (Time Machine t - 2.0s capture)
+        if self.dataset_factory is not None and hasattr(self.dataset_factory, "on_gather_success"):
+            try:
+                self.dataset_factory.on_gather_success(
+                    material_name=str(rtype),
+                    harvest_stage=self._current_node_harvest_stage,
+                    max_harvests=max_h,
+                )
+            except Exception as df_exc:
+                logger.debug("Dataset factory on_gather_success error: %s", df_exc)
+
+        if self.route_manager is not None and hasattr(self.route_manager, "record_harvest_stage") and node_id is not None:
+            try:
+                self.route_manager.record_harvest_stage(node_id, rest_duration_sec=int(rest_min * 60))
+            except Exception:
+                pass
+
+        # Check if 3x harvest cycle is complete
+        if self._current_node_harvest_stage >= max_h:
+            self._emit_log(f"Node {node_id} cycle complete ({self._current_node_harvest_stage}/{max_h})")
+            self._complete_route_gathering(now, depleted=True)
+        else:
+            # Prepare for next harvest stage in the 3x cycle
+            self._stage_cast_in_progress = False
+            self._waiting_for_next_stage_prompt = True
+            delay_min = float(self._get_cfg("inter_harvest_delay_min", 0.4) or 0.4)
+            delay_max = float(self._get_cfg("inter_harvest_delay_max", 1.2) or 1.2)
+            if delay_max < delay_min:
+                delay_max = delay_min
+            inter_delay = 0.05 if test_mode else random.uniform(delay_min, delay_max)
+            self._inter_harvest_wait_until = now + inter_delay
+
+            prompt_timeout = float(self._get_cfg("post_harvest_prompt_timeout", 4.0) or 4.0)
+            self._post_harvest_prompt_deadline = now + prompt_timeout
+
+            self._emit_log(
+                f"Node {node_id} stage {self._current_node_harvest_stage}/{max_h} gathered · continuing next stage"
+            )
+            self._emit_hud_snapshot(
+                badge=BotState.GATHERING.value,
+                title=f"Gathering node {node_id} ({self._current_node_harvest_stage + 1}/{max_h})",
+                subtitle=f"Stage {self._current_node_harvest_stage}/{max_h} complete · awaiting next prompt",
+            )
+
+    def _complete_route_gathering(self, now: float, depleted: bool = True) -> None:
+        """
+        Handles full completion / depletion of a route node:
+        1. Resets behavioral guard stuck state.
+        2. Clears harvest stage and casting flags.
+        3. Marks node as gathered with route cooldown.
+        4. Dispatches telemetry, economy tracking, respawn prediction.
+        5. Seamlessly clears active_node and transitions to next route waypoint.
+        """
+        guard = self._plain_attr("behavioral_guard")
+        if guard is not None and hasattr(guard, "check_prompt_stuck"):
+            try:
+                guard.check_prompt_stuck(False)
+            except Exception:
+                pass
+
+        node_id = self._extract_node_id(self.active_node, default=None)
+        if self._node_not_gatherable(self.active_node):
+            self._is_gathering_active = False
+            self._stage_cast_in_progress = False
+            self._waiting_for_next_stage_prompt = False
+            self._current_node_harvest_stage = 0
+            self._current_node_stage_retries = 0
+            self._gather_lost_frames = 0
+            self.active_node = None
+            self._emit_log(f"Node {node_id} is a scroll, not gatherable: harvest not counted")
+            return
+
+        walk_dur = max(0.0, now - self._walk_start_time) if self._walk_start_time > 0 else 0.0
+        self._is_gathering_active = False
+        self._stage_cast_in_progress = False
+        self._waiting_for_next_stage_prompt = False
+        self._current_node_harvest_stage = 0
+        self._current_node_stage_retries = 0
+        self._gather_lost_frames = 0
 
         rest_min = float(self._get_cfg("rest_minutes", 5) or 5)
         rtype = self._get_node_field(self.active_node, "resource_type", "Orichalcum Ore") or "Orichalcum Ore"
 
-        # Trigger Self-Training YOLO Dataset Factory (captures frame from t - 2.0s!)
-        if self.dataset_factory is not None and hasattr(self.dataset_factory, "on_gather_success"):
-            try:
-                stage_num = max(1, min(3, self._current_node_harvest_stage + 1))
-                self.dataset_factory.on_gather_success(
-                    material_name=str(rtype),
-                    harvest_stage=stage_num,
-                    max_harvests=3,
-                )
-            except Exception as df_exc:
-                logger.debug("Dataset factory on_gather_success skipped: %s", df_exc)
-
-        # In live gameplay, support 3x harvests per node if the prompt reappears after 400ms
-        depleted = True
-        if not test_mode and self.active_node is not None:
-            self._current_node_harvest_stage += 1
-            max_h = int(self._get_node_field(self.active_node, "max_harvests", 3) or 3)
-            if self._current_node_harvest_stage < max_h:
-                self.msleep(400)
-                re_detected, re_conf = self._detect_gather_prompt()
-                if re_detected:
-                    depleted = False
-                    if self.route_manager is not None and hasattr(self.route_manager, "record_harvest_stage") and node_id is not None:
-                        try:
-                            self.route_manager.record_harvest_stage(node_id, rest_duration_sec=int(rest_min * 60))
-                        except Exception:
-                            logger.debug("record_harvest_stage incremental call skipped")
-                    self._emit_log(
-                        f"Node {node_id} stage {self._current_node_harvest_stage}/{max_h} gathered · continuing next stage"
-                    )
-                    self._handle_route_gathering(re_conf, time.time())
-                    return
-
-        self._current_node_harvest_stage = 0
         if node_id is not None:
             self._mark_node_gathered(node_id, rest_min)
             self._emit_log(f"Node {node_id} gathered (resting {int(rest_min)}m)")
@@ -1506,21 +3773,24 @@ class BotWorker(QThread):
                 logger.debug("Telemetry record_gather error: %s", tel_exc)
 
         # Enterprise Economy Calculator, Respawn Predictor & Multi-Character Quota Tracking
-        if self.economy_calculator is not None and hasattr(self.economy_calculator, "record_gather"):
+        eco = getattr(self, "economy_calculator", None)
+        if eco is not None and hasattr(eco, "record_gather"):
             try:
-                self.economy_calculator.record_gather(str(rtype), count=1)
+                eco.record_gather(str(rtype), count=1)
             except Exception as eco_exc:
                 logger.debug("Economy calculator record_gather skipped: %s", eco_exc)
 
-        if self.respawn_predictor is not None and node_id is not None and hasattr(self.respawn_predictor, "record_gather"):
+        respawn = getattr(self, "respawn_predictor", None)
+        if respawn is not None and node_id is not None and hasattr(respawn, "record_gather"):
             try:
-                self.respawn_predictor.record_gather(int(node_id))
+                respawn.record_gather(int(node_id))
             except Exception as rsp_exc:
                 logger.debug("Respawn predictor record_gather skipped: %s", rsp_exc)
 
-        if self.alt_char_mgr is not None and hasattr(self.alt_char_mgr, "record_gather"):
+        alt_mgr = getattr(self, "alt_char_mgr", None)
+        if alt_mgr is not None and hasattr(alt_mgr, "record_gather"):
             try:
-                self.alt_char_mgr.record_gather(count=1)
+                alt_mgr.record_gather(count=1)
             except Exception as alt_exc:
                 logger.debug("Alt character record_gather skipped: %s", alt_exc)
 
@@ -1532,6 +3802,18 @@ class BotWorker(QThread):
         """Finds the next ready node, opens the map, clicks the node, and transitions to WALKING."""
         rest_min = float(self._get_cfg("rest_minutes", 5) or 5)
         next_node = self._get_next_ready_node(rest_min)
+        if self._node_not_gatherable(next_node):
+            self._emit_log(
+                f"Node {self._extract_node_id(next_node)} is a scroll, not gatherable: skip walk"
+            )
+            next_node = None
+
+        if next_node is not None and getattr(self, "selective_gather_enabled", False):
+            if not self.is_material_selected_for_gather(next_node):
+                self._emit_log(
+                    f"Node {self._extract_node_id(next_node)} bypassed: material does not match selective gather"
+                )
+                next_node = None
 
         if next_node is None:
             self._set_state_internal(BotState.WAITING.value)
@@ -1555,8 +3837,40 @@ class BotWorker(QThread):
             self.active_node = None
             return
 
+        if self.is_paused:
+            self._release_route_motion()
+            return
+
         if not nav_ok:
+            if self._last_nav_block == "map_open":
+                # Map never opened: walk on foot. Do not idle, delete the node, or press F.
+                if (
+                    self.mode == BotMode.ROUTE_MODE.value
+                    and not self.is_paused
+                    and self._command_walk_toward(next_node)
+                ):
+                    self.active_node_distance_m = max(1, int(dist_m or 1))
+                    self._walk_start_time = time.time()
+                    self._last_reclick_time = time.time()
+                    self._set_state_internal(BotState.WALKING.value)
+                    self._emit_hud_snapshot(
+                        badge=BotState.WALKING.value,
+                        title=f"Walking to node {node_id} · {self.active_node_distance_m} m",
+                        subtitle="On arrival: F, or a click on the gathering icon",
+                    )
+                return
             self._emit_log(f"Could not locate node {node_id} on map")
+            if self._command_walk_toward(next_node):
+                self.active_node_distance_m = max(1, int(dist_m or 1))
+                self._walk_start_time = time.time()
+                self._last_reclick_time = time.time()
+                self._set_state_internal(BotState.WALKING.value)
+                self._emit_hud_snapshot(
+                    badge=BotState.WALKING.value,
+                    title=f"Walking to node {node_id} · {self.active_node_distance_m} m",
+                    subtitle="On arrival: F, or a click on the gathering icon",
+                )
+                return
             self._mark_node_failed(node_id)
             self._register_node_failure()
             self.active_node = None
@@ -1565,6 +3879,9 @@ class BotWorker(QThread):
         self.active_node_distance_m = dist_m
         self._walk_start_time = time.time()
         self._last_reclick_time = time.time()
+        if not self._command_walk_toward(next_node):
+            self.active_node = None
+            return
         self._set_state_internal(BotState.WALKING.value)
         self._emit_log(f"Route: going to node {node_id} ({dist_m} m)")
         self._emit_hud_snapshot(
@@ -1573,6 +3890,69 @@ class BotWorker(QThread):
             subtitle="On arrival: F, or a click on the gathering icon",
         )
 
+    def _get_player_movement_coords(self) -> Tuple[float, float]:
+        """Obtain real player world/map coordinates or visual odometry for ObstacleMemory."""
+        carto = self._plain_attr("auto_cartographer")
+        if carto is None and self._plain_attr("explorer_controller") is not None:
+            carto = getattr(self._plain_attr("explorer_controller"), "auto_cartographer", None)
+        if carto is not None:
+            try:
+                if hasattr(carto, "get_current_position"):
+                    pos = carto.get_current_position()
+                    if pos and len(pos) >= 2:
+                        return float(pos[0]), float(pos[1])
+                if hasattr(carto, "map_x") and hasattr(carto, "map_y"):
+                    return float(carto.map_x), float(carto.map_y)
+            except Exception:
+                pass
+        act = self._plain_attr("active_node")
+        if act is not None:
+            try:
+                nx = float(self._get_node_field(act, "map_x", 0.0) or 0.0)
+                ny = float(self._get_node_field(act, "map_y", 0.0) or 0.0)
+                dist = float(self._plain_attr("active_node_distance_m", 0.0) or 0.0)
+                elapsed = max(0.0, time.time() - float(self._plain_attr("_walk_start_time", 0.0) or 0.0))
+                # Dead reckoning position shifts smoothly as walking time progresses
+                return round(nx - dist + elapsed * 1.5, 1), round(ny - dist + elapsed * 1.5, 1)
+            except Exception:
+                pass
+        return 0.0, 0.0
+
+    def _execute_unstick_maneuver(self) -> None:
+        """Physical unstick maneuver when walk distance hasn't decreased over 5s.
+        Releases W, taps S (backup), taps Space (jump), wiggles direction (A/D),
+        and re-commands walk toward node, avoiding false WAITING/BEKLEMEDE lock.
+        """
+        self._emit_log("⚠️ Takılma tespit edildi (5s mesafe azalmadı) -> Fiziksel kurtarma (Unstick) uygulanıyor...")
+        self._emit_hud_snapshot(
+            badge="KURTARMA",
+            title="Takılma Kurtarma (Unstick)",
+            subtitle="Geri çekilme (S) + Zıplama (Space) + Yön düzeltme (A/D)",
+        )
+        try:
+            # 1. Release W / all movement keys
+            self._release_route_motion()
+            self.msleep(60)
+
+            # 2. Tap S (back up slightly)
+            self._press_key("s", min_hold=0.18, max_hold=0.28)
+            self.msleep(80)
+
+            # 3. Tap Space (jump over obstacle/ledge)
+            self._press_key("space", min_hold=0.08, max_hold=0.15)
+            self.msleep(80)
+
+            # 4. Wiggle direction (A or D)
+            wiggle_key = "a" if (int(time.time() * 10) % 2 == 0) else "d"
+            self._press_key(wiggle_key, min_hold=0.12, max_hold=0.22)
+            self.msleep(60)
+
+            # 5. Re-engage walk forward toward active node
+            if self.active_node is not None:
+                self._command_walk_toward(self.active_node)
+        except Exception as exc:
+            logger.debug("Unstick maneuver error: %s", exc)
+
     def _monitor_walking_to_node(self, now: float) -> None:
         """
         Monitors travel towards active_node:
@@ -1580,6 +3960,10 @@ class BotWorker(QThread):
         - Handles time_to_reach_sec timeout and consecutive failure threshold
         """
         if self.active_node is None:
+            return
+
+        if self.is_paused:
+            self._release_route_motion()
             return
 
         node_id = self._extract_node_id(self.active_node)
@@ -1594,15 +3978,43 @@ class BotWorker(QThread):
             self._register_node_failure()
             self.active_node = None
             self._walk_start_time = 0.0
+            self._arrival_at_node_ts = 0.0
             return
 
-        # Periodic map target refresh (reclick_node_sec)
-        if reclick_sec > 0 and (now - self._last_reclick_time) >= reclick_sec:
+        # Hedefe varış ve toplanacak kaynak kontrolü
+        curr_dist = float(getattr(self, "active_node_distance_m", 999.0) or 999.0)
+        if curr_dist <= 3.0:
+            arr_ts = float(getattr(self, "_arrival_at_node_ts", 0.0) or 0.0)
+            if arr_ts <= 0.0:
+                self._arrival_at_node_ts = now
+            elif (now - arr_ts) >= 1.5:
+                # Düğüm noktasına gelindi fakat toplanacak prompt çıkmadı
+                self._emit_log(f"⚠️ Düğüm #{node_id} noktasına gelindi fakat toplanacak kaynak bulunamadı!")
+                self._mark_node_failed(node_id)
+                self._register_node_failure()
+                self.active_node = None
+                self._walk_start_time = 0.0
+                self._arrival_at_node_ts = 0.0
+                return
+        else:
+            self._arrival_at_node_ts = 0.0
+
+        # Periodic map target refresh (reclick_node_sec). A failed open backs off.
+        if (
+            reclick_sec > 0
+            and (now - self._last_reclick_time) >= reclick_sec
+            and self._walking_is_real()
+            and not self._map_open_in_backoff()
+        ):
             nav_ok, dist_m, under_overlay = self._open_map_and_click_node(
                 self.active_node, is_reclick=True
             )
             self._last_reclick_time = time.time()
-            if under_overlay:
+            if self._last_nav_block == "map_open":
+                # Map still closed. Keep the same node and keep holding W.
+                if not self._command_walk_toward(self.active_node):
+                    return
+            elif under_overlay:
                 self._emit_log(f"Node {node_id} is under the overlay panel")
                 self._mark_node_failed(node_id)
                 self._register_node_failure()
@@ -1612,6 +4024,61 @@ class BotWorker(QThread):
                 self.active_node_distance_m = dist_m
                 self._emit_log(f"Route: going to node {node_id} ({dist_m} m)")
         else:
+            if self._map_open_in_backoff() and not self._walking_is_real() and not self._command_walk_toward(self.active_node):
+                self.active_node = None
+                self._walk_start_time = 0.0
+                self._release_route_motion()
+                self._set_state_internal(BotState.WAITING.value)
+                return
+            if not self._walking_is_real() and not self._command_walk_toward(self.active_node):
+                self.active_node = None
+                self._walk_start_time = 0.0
+                return
+            if not self._walking_is_real():
+                self._set_state_internal(BotState.WAITING.value)
+                return
+
+            # Strafe only while a movement key or path step is already active.
+            if self.game_learner is not None:
+                cognition = self.game_learner.get_live_cognition_snapshot()
+                if cognition.get("obstacle_detected"):
+                    obs_type = cognition.get("obstacle_type", "obstacle")
+                    steer_deg = float(cognition.get("recommended_steer_deg", 0.0))
+                    self._apply_active_obstacle_evasion(obs_type, steer_deg, now)
+
+            # Active stuck recovery: if walk distance hasn't decreased over 5s while walking,
+            # execute physical unstick maneuver (release W, tap S, tap Space, wiggle A/D) rather than locking into WAITING.
+            curr_dist = float(self._plain_attr("active_node_distance_m", 0.0) or 0.0)
+            last_check_dist = self._plain_attr("_stuck_last_dist", None)
+            last_decrease_ts = self._plain_attr("_stuck_dist_decrease_ts", None)
+            if (
+                last_decrease_ts is None
+                or last_check_dist is None
+                or self._plain_attr("active_node") != self._plain_attr("_stuck_monitored_node", None)
+            ):
+                self._stuck_monitored_node = self._plain_attr("active_node")
+                self._stuck_last_dist = curr_dist
+                self._stuck_dist_decrease_ts = now
+            elif curr_dist < (last_check_dist - 0.5):
+                self._stuck_last_dist = curr_dist
+                self._stuck_dist_decrease_ts = now
+            elif self._walking_is_real() and (now - last_decrease_ts) >= 5.0:
+                self._execute_unstick_maneuver()
+                self._stuck_dist_decrease_ts = now
+                self._stuck_last_dist = curr_dist
+
+            # ZK: stuck memory with real player movement coordinates / odometry (never constant node_id)
+            coords_x, coords_y = self._get_player_movement_coords()
+            if coords_x != 0.0 or coords_y != 0.0:
+                self._zk_note_stuck_and_avoid(coords_x, coords_y, moving=self._walking_is_real())
+            hint = self._plain_attr("_ucb_slot_hint")
+            if hint and str(self.mode).lower() in ("combat", "farm"):
+                # Hint is informational for combat/farm; route nodes stay primary.
+                pass
+
+            if not self._command_walk_toward(self.active_node):
+                return
+
             # Estimate decreasing distance smoothly while walking
             if self.active_node_distance_m > 1 and time_to_reach > 0:
                 progress = min(0.95, elapsed_walk / time_to_reach)
@@ -1625,6 +4092,134 @@ class BotWorker(QThread):
                 title=f"Walking to node {node_id} · {est_dist} m",
                 subtitle="On arrival: F, or a click on the gathering icon",
             )
+
+    def _note_still_obstacle_angle(self, obs_type: str, steer_deg: float, now: float) -> bool:
+        """A repeating ~20° label on a still character is a stuck classifier, not a rock."""
+        hist = getattr(self, "_still_obstacle_angles", None)
+        if not isinstance(hist, list):
+            hist = []
+        hist.append((float(steer_deg), str(obs_type or "").lower(), float(now)))
+        hist = [item for item in hist if now - item[2] <= 12.0]
+        self._still_obstacle_angles = hist
+        if len(hist) < 2:
+            return False
+        angles = [item[0] for item in hist]
+        return (max(angles) - min(angles)) <= 6.0
+
+    def _obstacle_evasion_allowed(self, obs_type: str, steer_deg: float, now: float) -> bool:
+        """Strafe only for a close obstacle while a movement key or path step is active."""
+        if not self._walking_is_real():
+            self._note_still_obstacle_angle(obs_type, steer_deg, now)
+            return False
+        kind = str(obs_type or "").strip().lower()
+        if kind in ("", "none"):
+            return False
+        close_kind = kind in ("wall", "rock", "tree_trunk", "cliff_drop", "obstacle")
+        if abs(float(steer_deg)) <= 2.5 and not close_kind:
+            return False
+        return True
+
+    def _strafe_key_for_steer(self, steer_deg: float, now: float) -> Optional[str]:
+        """
+        Pick A or D for a sidestep. Alternating left/right labels cancel each
+        other and used to leave the body in place while the camera yawed.
+        After two flips, keep one direction long enough to actually step off.
+        """
+        if abs(float(steer_deg)) <= 2.5:
+            return None
+        preferred = "d" if float(steer_deg) > 0.0 else "a"
+        hist = getattr(self, "_evasion_sign_hist", None)
+        if not isinstance(hist, list):
+            hist = []
+        sign = 1 if float(steer_deg) > 0.0 else -1
+        hist.append((sign, float(now)))
+        hist = [item for item in hist if now - item[1] <= 12.0]
+        self._evasion_sign_hist = hist
+        locked = getattr(self, "_evasion_locked_key", None)
+        lock_until = float(getattr(self, "_evasion_lock_until", 0.0) or 0.0)
+        if locked in ("a", "d") and now <= lock_until:
+            return str(locked)
+        signs = [item[0] for item in hist]
+        flips = sum(1 for prev, cur in zip(signs, signs[1:]) if prev != cur)
+        if flips >= 2 and len(signs) >= 3:
+            positive = sum(1 for item in signs if item > 0)
+            locked = "d" if positive >= (len(signs) - positive) else "a"
+            self._evasion_locked_key = locked
+            self._evasion_lock_until = now + 4.0
+            return locked
+        return preferred
+
+    def _apply_active_obstacle_evasion(
+        self, obs_type: str, steer_deg: float, now: float
+    ) -> bool:
+        """
+        Sidestep and jump while W stays held. The cursor is not moved: an
+        absolute mouse move only changes the camera and the character stands still.
+        """
+        if not self._obstacle_evasion_allowed(obs_type, steer_deg, now):
+            return False
+
+        last_evade = getattr(self, "_last_obstacle_evade_ts", 0.0)
+        if (now - last_evade) < 1.4:
+            return False
+        setattr(self, "_last_obstacle_evade_ts", now)
+
+        driver = self.input_driver
+        if driver is None:
+            return False
+
+        test_mode = bool(self._get_cfg("test_mode", False))
+        if test_mode:
+            return False
+
+        try:
+            hold = getattr(driver, "hold_movement_key", None)
+            if not callable(hold):
+                return False
+            if not hold("w"):
+                return False
+
+            strafe = self._strafe_key_for_steer(steer_deg, now)
+            if strafe and not hold(strafe):
+                strafe = None
+
+            jumped = False
+            if obs_type in ("wall", "rock", "cliff_drop", "obstacle") or abs(steer_deg) > 4.0:
+                pulse = getattr(driver, "pulse_key", None)
+                if callable(pulse):
+                    jumped = bool(pulse("space", 0.16))
+                else:
+                    self._press_key("space")
+                    jumped = True
+                # A keyboard report that only contains Space drops W and the strafe.
+                hold("w")
+                if strafe:
+                    hold(strafe)
+
+            if strafe:
+                if not self._msleep_abortable(480):
+                    release_one = getattr(driver, "release_movement_key", None)
+                    if callable(release_one):
+                        release_one(strafe)
+                    hold("w")
+                    return False
+                release_one = getattr(driver, "release_movement_key", None)
+                if callable(release_one):
+                    release_one(strafe)
+                hold("w")
+
+            jump_note = " ve zıplama" if jumped else ""
+            if strafe:
+                action = f"W+{strafe.upper()} tutuldu{jump_note}"
+            else:
+                action = f"W tutuldu{jump_note}"
+            self._emit_log(
+                f"🧗 [YZ Engel Kaçınma] {obs_type.upper()} engeli: {action} (Açı: {steer_deg:.1f}°)."
+            )
+            return True
+        except Exception as exc:
+            logger.debug("Engel kaçınma manevrası hatası: %s", exc)
+            return False
 
     def _register_node_failure(self) -> None:
         """Increments failed_in_row, captures incident snapshot, and triggers wait_min_after_failed cooldown if limit reached."""
@@ -1672,27 +4267,43 @@ class BotWorker(QThread):
         Returns: (success, distance_meters, is_under_overlay)
         """
         node_id = self._extract_node_id(node)
-        self._set_state_internal(BotState.MAP.value)
-        self._emit_hud_snapshot(
-            badge=BotState.MAP.value,
-            title="Looking at the map",
-            subtitle="Don't touch the mouse or keyboard",
-        )
-
         test_mode = bool(self._get_cfg("test_mode", False))
 
         try:
-            # Open the map if not in test mode
+            if self._motion_should_stop():
+                return False, 0, False
+            # Do not claim "Looking at the map" until the map is actually open.
             if not test_mode:
+                if self._map_open_in_backoff():
+                    if not is_reclick:
+                        self._last_nav_block = "map_open"
+                    return False, 0, False
+                self._last_nav_block = ""
                 opened = self._ensure_map_open()
-                if not opened:
-                    logger.warning("Map did not open when navigating to node %s", node_id)
+                if not opened or self._motion_should_stop():
+                    self._begin_map_open_backoff(node_id)
+                    if is_reclick:
+                        # A later map retry must not cancel the on-foot walk.
+                        self._last_nav_block = ""
+                    return False, 0, False
+                if self.vision is not None and hasattr(self.vision, "is_map_open") and not self._vision_map_is_open():
+                    self._begin_map_open_backoff(node_id)
+                    if is_reclick:
+                        self._last_nav_block = ""
+                    return False, 0, False
+            self._set_state_internal(BotState.MAP.value)
+            self._emit_hud_snapshot(
+                badge=BotState.MAP.value,
+                title="Looking at the map",
+                subtitle="Don't touch the mouse or keyboard",
+            )
 
             # Locate node coordinates & distance on the open map
             loc_result = self._locate_node_on_open_map(node)
-            if loc_result is None:
+            if loc_result is None or self._motion_should_stop():
                 if not test_mode:
                     self._ensure_map_closed()
+                self._deny_walk_hud("Map target missing")
                 return False, 0, False
 
             target_x, target_y, dist_m, under_overlay = loc_result
@@ -1704,8 +4315,14 @@ class BotWorker(QThread):
 
             if not test_mode:
                 self._click_map_point(target_x, target_y)
-                self.msleep(150)
-                self._ensure_map_closed()
+                if self._motion_should_stop() or not self._msleep_abortable(150):
+                    self._ensure_map_closed()
+                    self._deny_walk_hud("Map click aborted")
+                    return False, dist_m, False
+                closed = self._ensure_map_closed()
+                if not closed or self._map_blocks_movement():
+                    self._deny_walk_hud("Map UI blocks movement")
+                    return False, dist_m, False
 
             return True, max(1, dist_m), False
         except Exception as exc:
@@ -1894,33 +4511,72 @@ class BotWorker(QThread):
         rx, ry, rw, rh = rect
         return (rx <= x <= rx + rw) and (ry <= y <= ry + rh)
 
-    def _ensure_map_open(self) -> bool:
+    def _map_open_key(self) -> str:
+        """AION 2 world-map key. F8/F9/F10 chords stay the bot hotkeys."""
+        raw = str(self._get_cfg("map_key", "m") or "m").strip().lower()
+        if not raw or "+" in raw or any(chord in raw for chord in ("f8", "f9", "f10")):
+            return "m"
+        return raw
+
+    def _focus_game_window(self) -> bool:
+        """Focus AION 2 so M is not typed into the Gatherion window."""
+        driver = self.input_driver
+        if driver is None:
+            return False
+        fn = getattr(driver, "focus_game_window", None)
+        if not callable(fn):
+            return False
         try:
-            if self.navigator is not None and hasattr(self.navigator, "open_map"):
-                return bool(self.navigator.open_map())
-            if self.route_manager is not None and hasattr(self.route_manager, "open_map"):
-                return bool(self.route_manager.open_map())
-            if self.vision is not None and hasattr(self.vision, "is_map_open"):
-                if self.vision.is_map_open():
-                    return True
-                self._toggle_map_key()
-                # Wait up to ~560ms (4 x 140ms) for Aion 2 World Map fade-in animation to complete
-                for _ in range(4):
-                    self.msleep(140)
-                    if self.vision.is_map_open():
-                        self.msleep(80)  # Let map canvas settle at 100% opacity before template matching
-                        return True
-                # Retry once if the first M press was swallowed during camera/combat transition
-                self._toggle_map_key()
-                for _ in range(3):
-                    self.msleep(150)
-                    if self.vision.is_map_open():
-                        self.msleep(80)
-                        return True
-                return bool(self.vision.is_map_open())
+            return bool(fn())
+        except Exception as exc:
+            logger.debug("Game focus before map key skipped: %s", exc)
+            return False
+
+    def _vision_map_is_open(self) -> bool:
+        vision = getattr(self, "vision", None)
+        if vision is None or not hasattr(vision, "is_map_open"):
+            return False
+        frame = None
+        grab = getattr(self, "_grab_frame", None)
+        if callable(grab):
+            try:
+                frame = grab(grayscale=False)
+            except TypeError:
+                try:
+                    frame = grab()
+                except Exception:
+                    frame = None
+            except Exception:
+                frame = None
+        try:
+            if frame is not None:
+                try:
+                    return bool(vision.is_map_open(frame))
+                except TypeError:
+                    return bool(vision.is_map_open())
+            return bool(vision.is_map_open())
+        except Exception:
+            return False
+
+    def _ensure_map_open(self) -> bool:
+        """Focus the game, press the map key once, then wait until the map is visible.
+
+        A second press used to close the map when the 720p header template missed
+        a live 2560x1440 frame. One press only; a miss falls back to walking.
+        """
+        try:
+            if self._motion_should_stop():
+                return False
+            if self._vision_map_is_open():
+                return True
+            self._focus_game_window()
             self._toggle_map_key()
-            self.msleep(350)
-            return True
+            for _ in range(6):
+                if not self._msleep_abortable(140):
+                    return False
+                if self._vision_map_is_open():
+                    return self._msleep_abortable(80)
+            return self._vision_map_is_open()
         except Exception as exc:
             logger.debug("Error opening map: %s", exc)
             return False
@@ -1934,11 +4590,11 @@ class BotWorker(QThread):
             if self.vision is not None and hasattr(self.vision, "is_map_open"):
                 if self.vision.is_map_open():
                     self._toggle_map_key()
-                    self.msleep(180)
+                    if not self._msleep_abortable(180):
+                        return False
                 return not bool(self.vision.is_map_open())
             self._toggle_map_key()
-            self.msleep(180)
-            return True
+            return self._msleep_abortable(180)
         except Exception as exc:
             logger.debug("Error closing map: %s", exc)
             return False
@@ -2037,6 +4693,14 @@ class BotWorker(QThread):
     # =========================================================================
 
     @staticmethod
+    def _node_not_gatherable(node: Any) -> bool:
+        if node is None:
+            return False
+        if isinstance(node, dict):
+            return bool(node.get("not_gatherable", False))
+        return bool(getattr(node, "not_gatherable", False))
+
+    @staticmethod
     def _extract_node_id(node: Any, default: Any = "?") -> Any:
         if node is None:
             return default
@@ -2124,7 +4788,56 @@ class BotWorker(QThread):
     def _get_next_ready_node(self, rest_minutes: float) -> Optional[Any]:
         if self.route_manager is None:
             return None
+        is_selective = getattr(self, "selective_gather_enabled", False) and bool(
+            getattr(self, "selected_gather_materials", None)
+        )
         try:
+            # Selective Gathering: filter route nodes strictly by selected materials
+            if is_selective and hasattr(self.route_manager, "get_route_nodes"):
+                try:
+                    all_nodes = self.route_manager.get_route_nodes() or []
+                    matched_nodes = [
+                        n
+                        for n in all_nodes
+                        if self.is_material_selected_for_gather(n)
+                        and not self._node_not_gatherable(n)
+                    ]
+                    if not matched_nodes:
+                        return None
+
+                    now = time.time()
+                    rest_sec = int(round(rest_minutes * 60.0))
+                    ready_nodes = []
+                    for n in matched_nodes:
+                        if hasattr(n, "is_ready"):
+                            if n.is_ready(now=now, rest_duration_sec=rest_sec):
+                                ready_nodes.append(n)
+                        else:
+                            ready_nodes.append(n)
+
+                    if not ready_nodes:
+                        return None
+
+                    if self.sequential_planner is not None and len(ready_nodes) >= 2:
+                        try:
+                            selected_node, next_idx = (
+                                self.sequential_planner.get_next_in_sequence(
+                                    ready_nodes,
+                                    current_seq_pos=self._current_seq_pos,
+                                    forward_window=12,
+                                    allow_wrap=True,
+                                )
+                            )
+                            if selected_node is not None:
+                                self._current_seq_pos = int(next_idx)
+                                return selected_node
+                        except Exception as seq_exc:
+                            logger.debug("Sequential planner selective fallback: %s", seq_exc)
+
+                    return ready_nodes[0]
+                except Exception as sel_exc:
+                    logger.debug("Selective route node retrieval error: %s", sel_exc)
+
             # Layer IV & Agent 18: Anti-Ping-Pong Sequential Corridor Selection
             if self.sequential_planner is not None and hasattr(
                 self.route_manager, "get_route_nodes"
@@ -2138,21 +4851,27 @@ class BotWorker(QThread):
                             forward_window=12,
                             allow_wrap=True,
                         )
-                        if selected_node is not None:
-                            self._current_seq_pos = int(next_idx)
-                            return selected_node
+                        if selected_node is not None and not self._node_not_gatherable(selected_node):
+                            if not is_selective or self.is_material_selected_for_gather(selected_node):
+                                self._current_seq_pos = int(next_idx)
+                                return selected_node
                 except Exception as seq_exc:
                     logger.debug("Sequential planner fallback: %s", seq_exc)
 
             if hasattr(self.route_manager, "get_next_ready_node"):
                 fn = self.route_manager.get_next_ready_node
+                node = None
                 try:
-                    return fn(rest_duration_sec=int(rest_minutes * 60))
+                    node = fn(rest_duration_sec=int(rest_minutes * 60))
                 except TypeError:
                     try:
-                        return fn(rest_minutes=rest_minutes)
+                        node = fn(rest_minutes=rest_minutes)
                     except TypeError:
-                        return fn()
+                        node = fn()
+                if node is not None:
+                    if is_selective and not self.is_material_selected_for_gather(node):
+                        return None
+                    return node
         except Exception as exc:
             logger.error("Error getting next ready node: %s", exc, exc_info=True)
         return None
@@ -2176,22 +4895,56 @@ class BotWorker(QThread):
             return
         try:
             remove_after = int(self._get_cfg("remove_node_after_failures", 0) or 0)
+            active_rte = getattr(self, "active_route", None)
             if hasattr(self.route_manager, "mark_node_failed"):
                 try:
                     self.route_manager.mark_node_failed(
-                        node_id, remove_after_failures=remove_after
+                        node_id,
+                        remove_after_failures=remove_after,
+                        active_route=active_rte,
+                        run_ai_check=True,
                     )
                 except TypeError:
-                    self.route_manager.mark_node_failed(node_id)
+                    try:
+                        self.route_manager.mark_node_failed(
+                            node_id, remove_after_failures=remove_after
+                        )
+                    except TypeError:
+                        self.route_manager.mark_node_failed(node_id)
         except Exception as exc:
             logger.error("Error marking node %s failed: %s", node_id, exc)
 
     def _get_ready_and_resting_counts(self) -> Tuple[int, int]:
-        """Returns (ready_count, resting_count) for the active route."""
+        """Returns (ready_count, resting_count) for the active route (filtered by selected materials if active)."""
         if self.route_manager is None:
             return 0, 0
         try:
             rest_sec = int(float(self._get_cfg("rest_minutes", 5) or 5) * 60)
+            if getattr(self, "selective_gather_enabled", False) and getattr(
+                self, "selected_gather_materials", None
+            ):
+                try:
+                    nodes = []
+                    if hasattr(self.route_manager, "get_route_nodes"):
+                        nodes = self.route_manager.get_route_nodes() or []
+                    elif hasattr(self.route_manager, "nodes"):
+                        nodes = getattr(self.route_manager, "nodes") or []
+                    matched = [
+                        n
+                        for n in nodes
+                        if self.is_material_selected_for_gather(n)
+                        and not self._node_not_gatherable(n)
+                    ]
+                    now = time.time()
+                    ready = sum(
+                        1
+                        for n in matched
+                        if not hasattr(n, "is_ready")
+                        or n.is_ready(now=now, rest_duration_sec=rest_sec)
+                    )
+                    return ready, len(matched) - ready
+                except Exception:
+                    pass
 
             if hasattr(self.route_manager, "get_route_stats"):
                 try:
@@ -2276,56 +5029,167 @@ class BotWorker(QThread):
 
     def _detect_gather_prompt(self) -> Tuple[bool, int]:
         """
-        Detects the 'F Gather' prompt via Vision and returns (detected, confidence_pct: 0..100).
+        Detects the 'F Gather' or 'E' interaction prompt via Vision and AI inference (PerceptionHub/ReflexScanner),
+        returning (detected: bool, confidence_pct: 0..100).
         """
-        if self.vision is None:
-            return False, 0
-
         threshold = float(self._get_cfg("prompt_threshold", 0.75) or 0.75)
-        try:
-            raw = None
-            if hasattr(self.vision, "detect_gather_prompt"):
-                try:
-                    raw = self.vision.detect_gather_prompt(threshold=threshold)
-                except TypeError:
-                    raw = self.vision.detect_gather_prompt()
-            elif hasattr(self.vision, "check_gather_prompt"):
-                try:
-                    raw = self.vision.check_gather_prompt(threshold=threshold, use_roi=True)
-                except TypeError:
-                    raw = self.vision.check_gather_prompt()
-            elif hasattr(self.vision, "find_gather_prompt"):
-                raw = self.vision.find_gather_prompt()
 
-            if raw is None:
-                return False, 0
+        # 1. Classical vision check (template matching)
+        vision = self._plain_attr("vision")
+        if vision is not None:
+            try:
+                raw = None
+                if hasattr(vision, "detect_gather_prompt"):
+                    try:
+                        raw = vision.detect_gather_prompt(threshold=threshold)
+                    except TypeError:
+                        raw = vision.detect_gather_prompt()
+                elif hasattr(vision, "check_gather_prompt"):
+                    try:
+                        raw = vision.check_gather_prompt(threshold=threshold, use_roi=True)
+                    except TypeError:
+                        raw = vision.check_gather_prompt()
+                elif hasattr(vision, "find_gather_prompt"):
+                    raw = vision.find_gather_prompt()
 
-            if isinstance(raw, dict):
-                det = bool(raw.get("detected", raw.get("found", False)))
-                conf_val = float(raw.get("confidence", raw.get("match_pct", 0)))
-                conf_pct = (
-                    int(round(conf_val * 100))
-                    if 0.0 < conf_val <= 1.0
-                    else int(round(conf_val))
-                )
-                return det, max(0, min(100, conf_pct))
+                if raw is not None:
+                    last_k = str(getattr(vision, "last_detected_gather_key", "") or "").lower()
+                    if last_k in ("f", "e"):
+                        self._last_detected_prompt_key = last_k
+                    if isinstance(raw, dict):
+                        det = bool(raw.get("detected", raw.get("found", False)))
+                        conf_val = float(raw.get("confidence", raw.get("match_pct", 0)))
+                        conf_pct = (
+                            int(round(conf_val * 100))
+                            if 0.0 < conf_val <= 1.0
+                            else int(round(conf_val))
+                        )
+                        if det:
+                            k = str(raw.get("key", "")).lower()
+                            if k in ("f", "e"):
+                                self._last_detected_prompt_key = k
+                            return True, max(0, min(100, conf_pct))
 
-            if isinstance(raw, (tuple, list)) and len(raw) >= 2:
-                det = bool(raw[0])
-                conf_val = float(raw[1] or 0)
-                conf_pct = (
-                    int(round(conf_val * 100))
-                    if 0.0 < conf_val <= 1.0
-                    else int(round(conf_val))
-                )
-                return det, max(0, min(100, conf_pct))
+                    elif isinstance(raw, (tuple, list)) and len(raw) >= 2:
+                        det = bool(raw[0])
+                        conf_val = float(raw[1] or 0)
+                        conf_pct = (
+                            int(round(conf_val * 100))
+                            if 0.0 < conf_val <= 1.0
+                            else int(round(conf_val))
+                        )
+                        if det:
+                            return True, max(0, min(100, conf_pct))
 
-            if isinstance(raw, bool):
-                return raw, (100 if raw else 0)
-        except Exception as exc:
-            logger.debug("Gather prompt detection error: %s", exc)
+                    elif isinstance(raw, bool) and raw:
+                        return True, 100
+            except Exception as exc:
+                logger.debug("Gather prompt vision detection error: %s", exc)
+
+        # 2. AI PerceptionHub check (FrameCognition gather_prompt / classes 7 & 8)
+        hub = self._plain_attr("perception_hub")
+        if hub is not None:
+            try:
+                cog = hub.last() if hasattr(hub, "last") else self._plain_attr("_frame_cognition")
+                if cog is not None:
+                    if getattr(cog, "gather_prompt", False):
+                        conf = int(getattr(cog, "gather_conf", 85) or 85)
+                        k = str(getattr(cog, "gather_key", "") or "").lower()
+                        if k in ("f", "e"):
+                            self._last_detected_prompt_key = k
+                        return True, max(1, min(100, conf))
+                    targets = getattr(cog, "targets", None) or []
+                    for t in targets:
+                        if isinstance(t, dict):
+                            cid = t.get("class_id")
+                            cname = str(t.get("class_name", t.get("name", ""))).lower()
+                            if cid in (7, 8) or any(k in cname for k in ("f_gather", "f_prompt", "e_gather", "e_prompt", "gather_prompt")):
+                                conf = float(t.get("confidence", t.get("conf", 0.85)) or 0.85)
+                                conf_pct = int(round(conf * 100)) if conf <= 1.0 else int(round(conf))
+                                if cid == 8 or "e_gather" in cname or "e_prompt" in cname:
+                                    self._last_detected_prompt_key = "e"
+                                else:
+                                    self._last_detected_prompt_key = "f"
+                                return True, max(1, min(100, conf_pct))
+            except Exception as exc:
+                logger.debug("PerceptionHub gather prompt check skipped: %s", exc)
+
+        # 3. AI ReflexScanner check (ReflexLayer YOLO classes 7 [F Gather] & 8 [E Gather])
+        reflex = self._plain_attr("reflex")
+        if reflex is not None and hasattr(reflex, "latest"):
+            try:
+                snap = reflex.latest()
+                if isinstance(snap, dict):
+                    boxes = snap.get("boxes", []) or []
+                    for b in boxes:
+                        if isinstance(b, dict):
+                            cid = b.get("class_id")
+                            if cid is None:
+                                try:
+                                    from core.reflex_layer import _class_id
+                                    cid = _class_id(b)
+                                except Exception:
+                                    cid = -1
+                            cname = str(b.get("class_name", b.get("name", ""))).lower()
+                            if cid in (7, 8) or any(k in cname for k in ("f_gather", "f_prompt", "e_gather", "e_prompt", "gather_prompt")):
+                                conf = float(b.get("confidence", b.get("conf", 0.85)) or 0.85)
+                                conf_pct = int(round(conf * 100)) if conf <= 1.0 else int(round(conf))
+                                if cid == 8 or "e_gather" in cname or "e_prompt" in cname:
+                                    self._last_detected_prompt_key = "e"
+                                else:
+                                    self._last_detected_prompt_key = "f"
+                                return True, max(1, min(100, conf_pct))
+            except Exception as exc:
+                logger.debug("ReflexScanner gather prompt check skipped: %s", exc)
+
+        # 4. MaterialScanner fallback
+        mat_scan = self._plain_attr("material_scanner")
+        if mat_scan is not None and hasattr(mat_scan, "scan_gather_prompt"):
+            try:
+                frame = self.__dict__.get("_last_color_frame")
+                if frame is not None:
+                    prompt_res = mat_scan.scan_gather_prompt(frame)
+                    if isinstance(prompt_res, dict) and prompt_res.get("found"):
+                        conf = float(prompt_res.get("confidence", 0.85) or 0.85)
+                        conf_pct = int(round(conf * 100)) if conf <= 1.0 else int(round(conf))
+                        k = str(prompt_res.get("key", "")).lower()
+                        if k in ("f", "e"):
+                            self._last_detected_prompt_key = k
+                        return True, max(1, min(100, conf_pct))
+            except Exception as exc:
+                logger.debug("MaterialScanner gather prompt check skipped: %s", exc)
 
         return False, 0
+
+    def _learning_mix_sources(self) -> Optional[Dict[str, Any]]:
+        """Non-blocking sources for one multi-mix sample. Empty means keep the old path."""
+        mix: Dict[str, Any] = {}
+        reflex = getattr(self, "reflex", None)
+        if reflex is not None and hasattr(reflex, "latest"):
+            try:
+                snap = reflex.latest()
+                boxes = snap.get("boxes") if isinstance(snap, dict) else None
+                if boxes:
+                    mix["yolo"] = boxes
+            except Exception as exc:
+                logger.debug("reflex latest skipped: %s", exc)
+        factory = getattr(self, "dataset_factory", None)
+        tm = getattr(factory, "time_machine", None) if factory is not None else None
+        if tm is not None and hasattr(tm, "get_frame_before"):
+            try:
+                old = tm.get_frame_before(2.0)
+            except Exception as exc:
+                logger.debug("time machine lookback skipped: %s", exc)
+                old = None
+            if old is not None and getattr(old, "detections", None):
+                mix["time_machine"] = old
+        prompt = getattr(self, "_last_gather_prompt", None)
+        if isinstance(prompt, dict):
+            mix["gather_prompt"] = prompt
+        minimap = getattr(self, "_last_minimap_sprouts", None)
+        if minimap:
+            mix["minimap"] = minimap
+        return mix or None
 
     def _grab_frame(self, grayscale: bool = True) -> Optional[np.ndarray]:
         if self.vision is None:
@@ -2336,18 +5200,58 @@ class BotWorker(QThread):
                 frame = self.vision.grab_screen(grayscale=grayscale)
             elif hasattr(self.vision, "capture_screen"):
                 frame = self.vision.capture_screen(grayscale=grayscale)
+            if frame is not None and not grayscale:
+                self._last_color_frame = frame
             if (
                 not grayscale
                 and frame is not None
                 and isinstance(frame, np.ndarray)
                 and frame.ndim == 3
-                and self.dataset_factory is not None
-                and hasattr(self.dataset_factory, "feed_live_frame")
             ):
-                try:
-                    self.dataset_factory.feed_live_frame(frame)
-                except Exception as df_exc:
-                    logger.debug("dataset_factory.feed_live_frame error: %s", df_exc)
+                # OmniGameLearner: Oyunun tamamını öğrenmek için sürekli algı ve ekran yakalama
+                if self.reflex is not None and hasattr(self.reflex, "submit_frame"):
+                    try:
+                        self.reflex.submit_frame(frame)
+                    except Exception as reflex_exc:
+                        logger.debug("reflex submit skipped: %s", reflex_exc)
+
+                if self.game_learner is not None:
+                    try:
+                        self.game_learner.observe_frame(
+                            frame,
+                            current_state=getattr(self, "state", "WALKING"),
+                            current_mode=getattr(self, "mode", "route"),
+                            mix_sources=self._learning_mix_sources(),
+                        )
+                    except Exception as gl_exc:
+                        logger.debug("game_learner.observe_frame error: %s", gl_exc)
+
+                # PerceptionHub: tek kare snapshot (combat/discovery/economy paylaşır)
+                if self.perception_hub is not None and hasattr(self.perception_hub, "observe"):
+                    try:
+                        self._frame_cognition = self.perception_hub.observe(frame)
+                    except Exception as hub_exc:
+                        logger.debug("perception_hub.observe skipped: %s", hub_exc)
+
+                # Skip heavy dataset ingest while fighting — major hitch source.
+                _mode_now = str(getattr(self, "mode", "") or "")
+                _state_now = str(getattr(self, "state", "") or "").upper()
+                _in_combat = _mode_now == "combat" or _state_now in (
+                    "FIGHTING",
+                    "COMBAT",
+                    "ATTACKING",
+                )
+                if self.dataset_factory is not None and not _in_combat:
+                    if hasattr(self.dataset_factory, "feed_live_frame"):
+                        try:
+                            self.dataset_factory.feed_live_frame(frame)
+                        except Exception as df_exc:
+                            logger.debug("dataset_factory.feed_live_frame error: %s", df_exc)
+                    elif hasattr(self.dataset_factory, "ingest_live_frame"):
+                        try:
+                            self.dataset_factory.ingest_live_frame(frame)
+                        except Exception:
+                            pass
             return frame
         except Exception as exc:
             logger.debug("Screen grab error: %s", exc)
@@ -2367,44 +5271,188 @@ class BotWorker(QThread):
                 logger.debug("Ex-Gaussian F interval fallback: %s", exc)
         return random.uniform(f_min, f_max)
 
+    def _get_active_interaction_key(self) -> str:
+        """Determines the active interaction key ('f' or 'e') based on config, prompt detection, or dynamic reader."""
+        cfg_key = str(self._get_cfg("gather_key", "f") or "f").strip().lower()
+        if cfg_key in ("f", "e"):
+            return cfg_key
+
+        # If cfg is "auto" or anything else:
+        prompt_key = getattr(self, "_last_detected_prompt_key", None)
+        if prompt_key in ("f", "e"):
+            return prompt_key
+
+        vision = self._plain_attr("vision")
+        if vision is not None:
+            v_key = str(getattr(vision, "last_detected_gather_key", "") or "").strip().lower()
+            if v_key in ("f", "e"):
+                return v_key
+
+        frame_bgr = self.__dict__.get("_last_color_frame")
+        if frame_bgr is not None and self.dynamic_key_reader is not None and hasattr(self.dynamic_key_reader, "decide_interaction_key"):
+            try:
+                decided = self.dynamic_key_reader.decide_interaction_key(frame_bgr)
+                if isinstance(decided, dict):
+                    k = str(decided.get("key", "f")).lower()
+                    if k in ("f", "e"):
+                        return k
+                elif isinstance(decided, str) and decided.lower() in ("f", "e"):
+                    return decided.lower()
+            except Exception as exc:
+                logger.debug("dynamic_key_reader error: %s", exc)
+
+        return "f"
+
     def _press_gather_key(self) -> None:
         self.f_pressed_count += 1
-        target_key = str(self._get_cfg("gather_key", "f") or "f").strip().lower()
+        target_key = self._get_active_interaction_key()
+        frame_bgr = self.__dict__.get("_last_color_frame")
         if not bool(self._get_cfg("test_mode", False)) and self.input_driver is not None:
             try:
-                if target_key == "auto" and self.dynamic_key_reader is not None:
+                if frame_bgr is None:
                     frame_bgr = self._grab_frame(grayscale=False)
-                    if frame_bgr is not None and hasattr(self.dynamic_key_reader, "decide_interaction_key"):
-                        decided = self.dynamic_key_reader.decide_interaction_key(frame_bgr)
-                        if isinstance(decided, dict):
-                            target_key = str(decided.get("key", "f")).lower()
-                        elif isinstance(decided, str) and decided.lower() in ("f", "e"):
-                            target_key = decided.lower()
-                if target_key not in ("f", "e"):
-                    target_key = "f"
 
                 self._last_bot_key_time = time.time()
+                bus = self._plain_attr("action_bus")
+                if bus is not None and hasattr(bus, "gather_interact"):
+                    outcome = bus.gather_interact(frame=frame_bgr, preferred_key=target_key)
+                    method = str((outcome or {}).get("method", "") or "")
+                    self._emit_log(
+                        f"Gather {method or 'bus'} '{target_key}'"
+                        if target_key == "e"
+                        else f"Gather {method or 'bus'} F"
+                    )
+                    return
                 if target_key == "e" and hasattr(self.input_driver, "press_key"):
-                    self.input_driver.press_key("e")
+                    self.input_driver.press_key("e", frame=frame_bgr, release_mouse=True, post_to_window=False)
                 elif hasattr(self.input_driver, "send_gather_key"):
-                    self.input_driver.send_gather_key()
-                elif hasattr(self.input_driver, "press_f"):
-                    self.input_driver.press_f()
+                    self.input_driver.send_gather_key(frame=frame_bgr)
                 elif hasattr(self.input_driver, "press_key"):
-                    self.input_driver.press_key("f")
+                    self.input_driver.press_key(target_key, frame=frame_bgr, release_mouse=True, post_to_window=False)
             except Exception as exc:
-                logger.error("Failed to send gather key F: %s", exc)
-        self._emit_log("Pressed F" if target_key != "e" else "Pressed E")
+                logger.error("Failed to send gather interact: %s", exc)
+        self._emit_log(f"Pressed {target_key.upper()}")
 
-    def _press_key(self, key: str) -> None:
-        if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:
+    def _combat_soft_aim_attack(self) -> None:
+        """AION2 mouse-look: nameplate Alt+click / soft-aim when Tab fails. Skills only after lock."""
+        driver = self.input_driver
+        if driver is None:
+            return
+        if not self.is_combat_authorized("target") and not self.is_combat_authorized("skill"):
             return
         try:
+            frame = self._grab_frame(grayscale=False)
+            soft = getattr(driver, "soft_aim_click", None)
+            if callable(soft):
+                try:
+                    soft(frame=frame, restore_lmb=True)
+                except TypeError:
+                    soft(frame=frame)
+                self._emit_log("SOFT AIM (mouse-look) — isimlik Alt+click / kamera + sol tık")
+                # NEVER skill-spam without a real target bar / reticle lock.
+                fresh = self._grab_frame(grayscale=False)
+                if self._combat_has_hostile_lock(fresh):
+                    setattr(self, "_combat_was_targeting", True)
+                    try:
+                        self._sync_combat_left_button(True)
+                    except Exception:
+                        pass
+                    self._send_configured_combat_skill()
+                else:
+                    try:
+                        self._sync_combat_left_button(True)
+                    except Exception:
+                        pass
+                return
+            nudge = getattr(driver, "nudge_camera", None)
+            if callable(nudge) and hasattr(driver, "_hw_mouse_down"):
+                for dx in (40, -80, 60, -30):
+                    nudge(int(dx), 0)
+                    self.msleep(50)
+                    driver._hw_mouse_up("right")
+                    driver._hw_mouse_down("left")
+                    self.msleep(45)
+                    driver._hw_mouse_up("left")
+                    self.msleep(50)
+                driver._hw_mouse_up("right")
+                self._emit_log("SOFT AIM (mouse-look) — kamera süpürme + sol tık")
+        except Exception:
+            logger.debug("combat soft aim failed", exc_info=True)
+
+    def _press_combat_tab(self, soft_aim: bool = False) -> None:
+        """Acquire next target. Prefer action bus so right-click is restored cleanly."""
+        if self.is_paused:
+            return
+        if not self.is_combat_authorized("target"):
+            return
+        # Soft SendInput Tab is untrusted under AION2 Raw Input — force mouse soft-aim.
+        try:
+            driver = self.input_driver
+            trusted = getattr(driver, "keyboard_inject_trusted", None) if driver is not None else None
+            if callable(trusted):
+                trusted = bool(trusted())
+            elif isinstance(trusted, bool):
+                trusted = bool(trusted)
+            else:
+                trusted = False
+            if not trusted:
+                soft_aim = True
+        except Exception:
+            soft_aim = True
+        bus = self._plain_attr("action_bus")
+        frame = None
+        try:
+            frame = self._grab_frame(grayscale=False)
+        except Exception:
+            frame = self.__dict__.get("_last_color_frame")
+        if bus is not None and hasattr(bus, "press_tab_target"):
+            try:
+                bus.press_tab_target(frame=frame, soft_aim=bool(soft_aim))
+                return
+            except TypeError:
+                try:
+                    bus.press_tab_target()
+                    return
+                except Exception:
+                    logger.debug("action_bus.press_tab_target failed", exc_info=True)
+            except Exception:
+                logger.debug("action_bus.press_tab_target failed", exc_info=True)
+        self._press_key("tab", min_hold=0.12, max_hold=0.18, release_mouse=True)
+        if soft_aim:
+            self._combat_soft_aim_attack()
+
+    def _press_key(
+        self,
+        key: str,
+        min_hold: float = None,
+        max_hold: float = None,
+        release_mouse: bool = False,
+    ) -> None:
+        if self.is_paused:
+            return
+        if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:
+            return
+        key_str = str(key).strip().lower()
+        if key_str in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "q", "r"):
+            if not self.is_combat_authorized("skill"):
+                logger.debug("[CombatGate] Combat key '%s' suppressed (mode=%s, state=%s)", key_str, self._mode, self._state)
+                return
+        elif key_str == "tab":
+            if not self.is_combat_authorized("target"):
+                logger.debug("[CombatGate] Tab target key suppressed (mode=%s, state=%s)", self._mode, self._state)
+                return
+        try:
             self._last_bot_key_time = time.time()
+            frame = self.__dict__.get("_last_color_frame")
             if key.lower() == "esc" and hasattr(self.input_driver, "press_esc"):
                 self.input_driver.press_esc()
             elif hasattr(self.input_driver, "press_key"):
-                self.input_driver.press_key(key)
+                kwargs = {"frame": frame, "release_mouse": bool(release_mouse)}
+                if min_hold is not None:
+                    kwargs["min_hold"] = min_hold
+                if max_hold is not None:
+                    kwargs["max_hold"] = max_hold
+                self.input_driver.press_key(key, **kwargs)
             elif hasattr(self.input_driver, "send_key"):
                 self.input_driver.send_key(key)
         except Exception as exc:
@@ -2415,15 +5463,19 @@ class BotWorker(QThread):
             return
         try:
             self._last_bot_key_time = time.time()
+            self._focus_game_window()
+            frame = self.__dict__.get("_last_color_frame")
             if hasattr(self.input_driver, "toggle_map"):
-                self.input_driver.toggle_map()
+                self.input_driver.toggle_map(frame=frame)
             else:
-                self._press_key("m")
+                self._press_key(self._map_open_key())
         except Exception as exc:
             logger.error("Failed to toggle map key: %s", exc)
 
     def _click_map_point(self, x: int, y: int) -> None:
         if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:
+            return
+        if self._motion_should_stop():
             return
         try:
             self._last_bot_key_time = time.time()
@@ -2456,16 +5508,202 @@ class BotWorker(QThread):
     # State Transitions, Logging & HUD Signal Emission
     # =========================================================================
 
+    def _halt_motion(self) -> None:
+        """Stop cursor paths and release WASD. Safe from the GUI thread."""
+        driver = self.input_driver
+        if driver is None:
+            return
+        try:
+            self._release_all_combat_inputs()
+        except Exception as exc:
+            logger.debug("Combat inputs release in halt skipped: %s", exc)
+        abort = getattr(driver, "abort_motion", None)
+        if callable(abort):
+            try:
+                abort()
+                return
+            except Exception as exc:
+                logger.debug("abort_motion failed: %s", exc)
+        releaser = getattr(driver, "release_all_movement_keys", None)
+        if callable(releaser):
+            try:
+                releaser()
+            except Exception as exc:
+                logger.debug("release_all_movement_keys failed: %s", exc)
+
+    def _motion_should_stop(self) -> bool:
+        if self.is_paused:
+            return True
+        driver = self.input_driver
+        if driver is None:
+            return False
+        fn = getattr(driver, "motion_aborted", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
+    def _msleep_abortable(self, ms: int) -> bool:
+        left = max(0, int(ms))
+        while left > 0:
+            if self._motion_should_stop():
+                return False
+            step = min(25, left)
+            self.msleep(step)
+            left -= step
+        return not self._motion_should_stop()
+
+    def _walking_is_real(self) -> bool:
+        driver = self.input_driver
+        if driver is None:
+            return False
+        active = getattr(driver, "movement_active", None)
+        if not callable(active):
+            return False
+        try:
+            return bool(active())
+        except Exception:
+            return False
+
+    def _map_blocks_movement(self) -> bool:
+        vision = self.vision
+        if vision is None or not hasattr(vision, "is_map_open"):
+            return False
+        try:
+            return bool(vision.is_map_open())
+        except Exception:
+            return False
+
+    def _turn_key_for_node(self, node: Any) -> Optional[str]:
+        x_val = self._get_node_field(node, "map_x", self._get_node_field(node, "x"))
+        if x_val is None:
+            return None
+        try:
+            x_px = float(x_val)
+        except (TypeError, ValueError):
+            return None
+        width = 1920
+        driver = self.input_driver
+        if driver is not None and hasattr(driver, "get_screen_resolution"):
+            try:
+                width = int(driver.get_screen_resolution()[0]) or 1920
+            except Exception:
+                width = 1920
+        center = width / 2.0
+        if x_px < center - 30.0:
+            return "a"
+        if x_px > center + 30.0:
+            return "d"
+        return None
+
+    def _map_open_in_backoff(self) -> bool:
+        """After one failed map-open, further map-key attempts wait out the window."""
+        until = float(getattr(self, "_map_open_backoff_until", 0.0) or 0.0)
+        if until <= 0.0:
+            return False
+        if time.time() >= until:
+            self._map_open_backoff_until = 0.0
+            self._map_open_fail_announced = False
+            return False
+        return True
+
+    def _begin_map_open_backoff(self, node_id: Any) -> None:
+        """Record one failed map open and skip map-key spam. Do not idle or release walk."""
+        self._last_nav_block = "map_open"
+        self._map_open_backoff_until = time.time() + 45.0
+        if not self._map_open_fail_announced:
+            self._map_open_fail_announced = True
+            logger.warning("Map did not open when navigating to node %s", node_id)
+            self._emit_log(f"Map did not open for node {node_id}")
+
+    def _release_route_motion(self) -> None:
+        """Drop path-step and movement keys so WALKING cannot stay true while idle."""
+        driver = self.input_driver
+        if driver is None:
+            return
+        end_step = getattr(driver, "end_path_step", None)
+        if callable(end_step):
+            try:
+                end_step()
+            except Exception as exc:
+                logger.debug("end_path_step failed: %s", exc)
+        releaser = getattr(driver, "release_all_movement_keys", None)
+        if callable(releaser):
+            try:
+                releaser()
+            except Exception as exc:
+                logger.debug("release_all_movement_keys failed: %s", exc)
+
+    def _deny_walk_hud(self, reason: str) -> None:
+        self._release_route_motion()
+        if self.is_paused:
+            return
+        self._set_state_internal(BotState.WAITING.value)
+        try:
+            self._emit_hud_snapshot(
+                badge=BotState.WAITING.value,
+                title="Not walking",
+                subtitle=reason,
+            )
+        except Exception as exc:
+            logger.debug("Walk HUD clear skipped: %s", exc)
+
+    def _command_walk_toward(self, node: Any) -> bool:
+        """Hold forward and turn toward the node. False when input is refused."""
+        if self._motion_should_stop():
+            self._deny_walk_hud("Paused")
+            return False
+        driver = self.input_driver
+        if driver is None:
+            self._deny_walk_hud("No input driver")
+            return False
+        if self._map_blocks_movement():
+            closed = self._ensure_map_closed()
+            if not closed or self._map_blocks_movement():
+                self._deny_walk_hud("Map UI blocks movement")
+                return False
+        hold = getattr(driver, "hold_movement_key", None)
+        if not callable(hold):
+            self._deny_walk_hud("Movement input refused")
+            return False
+        forward_ok = bool(hold("w"))
+        turn_key = self._turn_key_for_node(node)
+        turn_ok = bool(hold(turn_key)) if turn_key else False
+        if not forward_ok and not turn_ok:
+            releaser = getattr(driver, "release_all_movement_keys", None)
+            if callable(releaser):
+                releaser()
+            self._deny_walk_hud("Movement input refused")
+            return False
+        begin = getattr(driver, "begin_path_step", None)
+        if callable(begin):
+            begin()
+        return True
+
     def _set_state_internal(self, new_state: str) -> None:
+        # Route mode needs bot-held W for a true WALKING badge. Explorer/Oto-Kayıt
+        # are player-walk modes — never downgrade them to BEKLEMEDE just because W is up.
+        if (
+            str(new_state).upper() in ("WALKING", "YÜRÜYOR")
+            and not self._walking_is_real()
+            and not self._player_driven_mapping_mode()
+        ):
+            new_state = BotState.WAITING.value
         changed = False
+        prev_state = None
         with self._lock:
             if self._state != new_state:
+                prev_state = self._state
                 self._state = new_state
                 self._state_enter_time = time.time()
                 changed = True
             current_mode = self._mode
 
         if changed:
+            if prev_state == BotState.FIGHTING.value or new_state in (BotState.GATHERING.value, BotState.PAUSED.value):
+                self._release_all_combat_inputs()
             self._sync_input_driver_state()
             try:
                 self.state_changed.emit(new_state, current_mode)
@@ -2511,6 +5749,19 @@ class BotWorker(QThread):
         with self._lock:
             curr_state = badge or self._state
             curr_mode = self._mode
+        movement_active = self._walking_is_real()
+        player_mapping = curr_mode in (
+            BotMode.EXPLORER_MODE.value,
+            BotMode.AUTO_RECORD.value,
+        )
+        if (
+            str(curr_state).upper() in ("WALKING", "YÜRÜYOR")
+            and not movement_active
+            and not player_mapping
+        ):
+            curr_state = BotState.WAITING.value
+            if title is None or str(title).lower().startswith("walking"):
+                title = "Not walking"
 
         resolved_mode_badge = mode_badge or MODE_BADGE_MAP.get(curr_mode, "ROUTE")
         ready_cnt, resting_cnt = self._get_ready_and_resting_counts()
@@ -2519,16 +5770,32 @@ class BotWorker(QThread):
 
         if curr_mode == BotMode.MANUAL_RECORD.value:
             default_title = "Manual record"
-            default_sub = "Walk around and press F8 to save nodes"
+            default_sub = "Walk around and press Ctrl+Alt+F8 to save nodes"
             c1_t, c1_v = "SAVED", str(self.saved_nodes_count)
             c2_t, c2_v = "NODES", f"{ready_cnt} ready · {resting_cnt} resting"
             c3_t, c3_v = "LAST SAVED", self.last_saved_str
+        elif curr_mode == BotMode.EXPLORER_MODE.value:
+            default_title = "Auto-mapping gems & materials"
+            default_sub = "Walk around: YZ+CV maps gems/ores in sequential order"
+            c1_t, c1_v = "AUTO MAPPED", str(self.saved_nodes_count)
+            c2_t, c2_v = self._get_route_header_title(), f"{ready_cnt} ready · {resting_cnt} resting"
+            c3_t, c3_v = "LAST MAPPED", self.last_saved_str
         elif curr_mode == BotMode.AUTO_RECORD.value:
             default_title = "Auto record"
             default_sub = "Walk around: bot presses F and saves nodes"
             c1_t, c1_v = "GATHERED", str(self.gathered_count)
             c2_t, c2_v = "F PRESSED", str(self.f_pressed_count)
             c3_t, c3_v = "PROMPT MATCH", f"{self.last_prompt_match}%"
+        elif curr_mode == BotMode.COMBAT_MODE.value:
+            cognition = self.game_learner.get_live_cognition_snapshot() if self.game_learner else {}
+            hp_pct = cognition.get("monster_hp_percent", 0)
+            ready_skills = cognition.get("ready_skills", ["1"])
+            learned_cnt = cognition.get("total_learned_frames", 0)
+            default_title = f"Savaş Modu: {'Canavarla Savaşılıyor' if cognition.get('monster_targeted') else 'Canavar Aranıyor'}"
+            default_sub = f"Canavar Canı: %{hp_pct} · Hazır Skiller: {', '.join(ready_skills)} · Tab ile Seç"
+            c1_t, c1_v = "YZ KARELERİ", str(learned_cnt)
+            c2_t, c2_v = "CANAVAR CANI", f"%{hp_pct}" if hp_pct > 0 else "HEDEF YOK"
+            c3_t, c3_v = "HAZIR SKİL", ",".join(ready_skills[:3])
         else:
             node_id = self._extract_node_id(self.active_node)
             default_title = (
@@ -2540,6 +5807,9 @@ class BotWorker(QThread):
             c1_t, c1_v = "GATHERED", str(self.gathered_count)
             c2_t, c2_v = self._get_route_header_title(), f"{ready_cnt} ready · {resting_cnt} resting"
             c3_t, c3_v = "FAILED IN A ROW", f"{self.failed_in_row} / {max_failed}"
+
+        # Canlı öğrenilen kare sayısını al
+        learned_cnt = self.game_learner.total_learned_frames if self.game_learner else 0
 
         payload: Dict[str, Any] = {
             "badge": curr_state,
@@ -2554,8 +5824,10 @@ class BotWorker(QThread):
             "col3_title": col3_title if col3_title is not None else c3_t,
             "col3_val": col3_val if col3_val is not None else c3_v,
             "version": version_str,
+            "learned_frames": learned_cnt,
             # Legacy compatibility keys for older UI callers
             "state": curr_state,
+            "movement_active": movement_active,
             "sub": subtitle if subtitle is not None else default_sub,
             "gathered": self.gathered_count,
             "f_pressed": self.f_pressed_count,

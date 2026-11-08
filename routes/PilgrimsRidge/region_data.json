@@ -1,0 +1,112 @@
+{
+  "region": "PilgrimsRidge",
+  "routes": [
+    "All"
+  ],
+  "nodes": [
+    {
+      "id": 1,
+      "node_id": 1,
+      "region": "PilgrimsRidge",
+      "routes": [],
+      "resource_type": "Gatherable Material",
+      "map_x": 759,
+      "map_y": 588,
+      "exact_map_x": 759.0,
+      "exact_map_y": 587.916,
+      "norm_x": 0.3953,
+      "norm_y": 0.5444,
+      "in_air": false,
+      "sightings_count": 1,
+      "confidence": 0.95,
+      "kalman_variance": 16.0,
+      "kalman_variance_x": 16.0,
+      "kalman_variance_y": 16.0,
+      "patch_path": "test_minimap_cv_detector_accep0/PilgrimsRidge/patches/node_1.png",
+      "first_seen_timestamp": 1794087524.072483,
+      "last_seen_timestamp": 1794087524.072483,
+      "stack_count": 1,
+      "max_harvests": 3,
+      "current_harvests": 0,
+      "remaining_harvests": 3,
+      "is_depleted": false,
+      "source_type": "minimap_auto",
+      "node_type": "resource",
+      "connected_waypoints": []
+    }
+  ],
+  "route_graph": {
+    "region": "PilgrimsRidge",
+    "waypoints": [
+      {
+        "waypoint_id": 1,
+        "map_x": 800.0,
+        "map_y": 600.0,
+        "norm_x": 0.4167,
+        "norm_y": 0.5556,
+        "timestamp": 1794087923.691646,
+        "connected_node_ids": [
+          1
+        ],
+        "seq_index": 1,
+        "is_breadcrumb": true
+      }
+    ],
+    "edges": [
+      {
+        "from_id": 1,
+        "to_id": 1,
+        "from_type": "waypoint",
+        "to_type": "node",
+        "distance_px": 42.74,
+        "heading_deg": 0.0,
+        "bidirectional": true
+      },
+      {
+        "from_id": 1,
+        "to_id": 1,
+        "from_type": "waypoint",
+        "to_type": "node",
+        "distance_px": 42.74,
+        "heading_deg": 0.0,
+        "bidirectional": true
+      }
+    ],
+    "total_distance_px": 85.49,
+    "waypoint_count": 1,
+    "edge_count": 2
+  },
+  "cartography_stats": {
+    "total_nodes": 1,
+    "auto_mapped": 2,
+    "last_mapped": {
+      "type": "node",
+      "node_id": 1,
+      "resource_type": "Gatherable Material",
+      "map_x": 759,
+      "map_y": 588,
+      "timestamp": 1794087923.9111948,
+      "source_type": "minimap_auto",
+      "confidence": 0.95
+    },
+    "auto_cartography_mode": true,
+    "graph_nodes_count": 1,
+    "graph_waypoints_count": 1,
+    "graph_edges_count": 2,
+    "graph_total_distance_px": 85.49,
+    "total_minimap_recorded": 1,
+    "total_3d_recorded": 0,
+    "total_harvest_recorded": 0,
+    "total_max_harvests": 3,
+    "total_current_harvests": 0,
+    "total_available_harvests": 3,
+    "player_map_x": 800.0,
+    "player_map_y": 600.0,
+    "player_norm_x": 0.4167,
+    "player_norm_y": 0.5556,
+    "walk_trajectory_points": 1,
+    "is_calibrated_on_world_map": false,
+    "cumulative_drift_px": 0.0
+  },
+  "updated_at": 1794087923.9263318
+}

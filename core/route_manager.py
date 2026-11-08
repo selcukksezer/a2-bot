@@ -28,6 +28,27 @@ import numpy as np
 from core.patch_normalizer import MinimapOrientationGuard, SobelClahePatchNormalizer
 
 try:
+    from config.materials_db import (
+        AION2_MATERIALS_CATALOG,
+        MATERIAL_CATEGORIES,
+        classify_3d_material_patch,
+        get_material_spec,
+    )
+except ImportError:
+    try:
+        from materials_db import (  # type: ignore[no-redef]
+            AION2_MATERIALS_CATALOG,
+            MATERIAL_CATEGORIES,
+            classify_3d_material_patch,
+            get_material_spec,
+        )
+    except ImportError:
+        AION2_MATERIALS_CATALOG = None  # type: ignore[assignment]
+        MATERIAL_CATEGORIES = {}  # type: ignore[assignment]
+        classify_3d_material_patch = None  # type: ignore[assignment]
+        get_material_spec = None  # type: ignore[assignment]
+
+try:
     import winsound
 except ImportError:
     winsound = None  # type: ignore[assignment]
@@ -52,6 +73,951 @@ DEFAULT_MAX_HARVESTS: int = 3
 DEFAULT_SOURCE_TYPE: str = "manual"
 VALID_SOURCE_TYPES: Tuple[str, ...] = ("manual", "minimap_auto", "3d_auto", "questlog")
 
+# ==============================================================================
+# SUBREGION CANONICAL MAPPING & BOUNDING SECTOR DEFINITIONS
+# ==============================================================================
+SUBREGION_TO_CANONICAL: Dict[str, str] = {
+    # Altgard subregions
+    "Dredgion Crash Site": "Altgard",
+    "Safe Haven": "Altgard",
+    "Calderon Canyon": "Altgard",
+    "Silent Hill": "Altgard",
+    "Altgard Fortress": "Altgard",
+    "Basfelt Ruins": "Altgard",
+    "Nameless Cemetery": "Altgard",
+    "Fafnite Deposit": "Altgard",
+    "Sanctum Outpost": "Altgard",
+    "Quai Campsite": "Altgard",
+    "Grave of the Red Sky Union": "Altgard",
+    "Moslan Forest": "Altgard",
+    "Idun's Lake": "Altgard",
+    "Black Plains": "Altgard",
+    "Heart of the Dragon": "Altgard",
+    # Verteron subregions
+    "Tolbas Forest": "Verteron",
+    "Dukaki Settlement": "Verteron",
+    "Cantas Coast": "Verteron",
+    "Ardus Shrine": "Verteron",
+    "Pilgrim's Ridge": "Verteron",
+    "Pilgrims Ridge": "Verteron",
+    "Verteron Citadel": "Verteron",
+    "Zulons Island": "Verteron",
+    "Ellun River Mouth": "Verteron",
+    "Geolus Campsite": "Verteron",
+    # Eltnen subregions
+    "Manduri Forest": "Eltnen",
+    "Golden Bough Garrison": "Eltnen",
+    "Eiron Desert": "Eltnen",
+    "Kaidan Headquarters": "Eltnen",
+    "Eltnen Fortress": "Eltnen",
+    # Morheim subregions
+    "Ice Claw Village": "Morheim",
+    "Patamor Ridge": "Morheim",
+    "Salintus Desert": "Morheim",
+    "Mist Mane Village": "Morheim",
+    "Morheim Fortress": "Morheim",
+    # Heiron subregions
+    "Heiron Observatory": "Heiron",
+    "Senea's Campsite": "Heiron",
+    "Kishar Observation Post": "Heiron",
+    "Arbolu's Haven": "Heiron",
+    # Beluslan subregions
+    "Besfer Refugee Camp": "Beluslan",
+    "Red Mane Cavern": "Beluslan",
+    "Hoarfrost Shelter": "Beluslan",
+    "Bakarma Barracks": "Beluslan",
+    # Theobomos subregions
+    "Meniherk Excavation Camp": "Theobomos",
+    "Observatory Village": "Theobomos",
+    "Jamanok Inn": "Theobomos",
+    # Brusthonin subregions
+    "Settlers' Campsite": "Brusthonin",
+    "Baltasar Hill Village": "Brusthonin",
+    "Bubu Village": "Brusthonin",
+    # Reshanta subregions
+    "Teminon Landing": "Reshanta",
+    "Primum Landing": "Reshanta",
+    "Sulfur Tree Nest": "Reshanta",
+    "Siel's Eastern Fortress": "Reshanta",
+}
+
+SUBREGION_CANONICAL_MAP: Dict[str, str] = SUBREGION_TO_CANONICAL
+
+_LOWER_SUBREGION_MAP: Dict[str, str] = {
+    k.strip().lower(): v for k, v in SUBREGION_TO_CANONICAL.items()
+}
+
+_CANONICAL_REGION_LOOKUP: Dict[str, str] = {
+    "altgard": "Altgard",
+    "verteron": "Verteron",
+    "eltnen": "Eltnen",
+    "morheim": "Morheim",
+    "heiron": "Heiron",
+    "beluslan": "Beluslan",
+    "theobomos": "Theobomos",
+    "brusthonin": "Brusthonin",
+    "reshanta": "Reshanta",
+}
+
+SUBREGION_BOUNDING_AREAS: Dict[str, Dict[str, Any]] = {
+    "dredgion crash site": {
+        "canonical": "Altgard",
+        "bbox": (350, 180, 1600, 950),
+        "norm_bbox": (0.18, 0.16, 0.85, 0.88),
+        "center": (655, 455),
+        "radius": 450.0,
+    },
+    "safe haven": {
+        "canonical": "Altgard",
+        "bbox": (250, 150, 620, 440),
+        "norm_bbox": (0.13, 0.13, 0.45, 0.41),
+        "center": (420, 260),
+        "radius": 220.0,
+    },
+    "calderon canyon": {
+        "canonical": "Altgard",
+        "bbox": (650, 360, 1250, 780),
+        "norm_bbox": (0.33, 0.33, 0.65, 0.72),
+        "center": (820, 520),
+        "radius": 260.0,
+    },
+    "silent hill": {
+        "canonical": "Altgard",
+        "bbox": (300, 350, 680, 650),
+        "norm_bbox": (0.15, 0.32, 0.53, 0.60),
+        "center": (480, 480),
+        "radius": 220.0,
+    },
+    "altgard fortress": {
+        "canonical": "Altgard",
+        "bbox": (750, 520, 1300, 900),
+        "norm_bbox": (0.39, 0.48, 0.68, 0.83),
+        "center": (950, 680),
+        "radius": 250.0,
+    },
+    "basfelt ruins": {
+        "canonical": "Altgard",
+        "bbox": (300, 380, 620, 620),
+        "norm_bbox": (0.15, 0.35, 0.48, 0.57),
+        "center": (440, 495),
+        "radius": 200.0,
+    },
+    "nameless cemetery": {
+        "canonical": "Altgard",
+        "bbox": (320, 240, 600, 480),
+        "norm_bbox": (0.16, 0.22, 0.47, 0.44),
+        "center": (455, 360),
+        "radius": 200.0,
+    },
+    "fafnite deposit": {
+        "canonical": "Altgard",
+        "bbox": (440, 180, 720, 420),
+        "norm_bbox": (0.22, 0.16, 0.56, 0.39),
+        "center": (575, 290),
+        "radius": 190.0,
+    },
+    "sanctum outpost": {
+        "canonical": "Altgard",
+        "bbox": (600, 200, 880, 450),
+        "norm_bbox": (0.31, 0.18, 0.69, 0.42),
+        "center": (735, 320),
+        "radius": 180.0,
+    },
+    "quai campsite": {
+        "canonical": "Altgard",
+        "bbox": (880, 260, 1280, 560),
+        "norm_bbox": (0.45, 0.24, 0.67, 0.52),
+        "center": (1050, 400),
+        "radius": 210.0,
+    },
+}
+
+
+def resolve_canonical_region(name: Optional[str]) -> str:
+    """Verilen bölge veya alt bölge adının kanonik ana bölge karşılığını döndürür."""
+    if not name:
+        return DEFAULT_REGION
+    clean = str(name).strip()
+    lower = clean.lower()
+    if lower in _CANONICAL_REGION_LOOKUP:
+        return _CANONICAL_REGION_LOOKUP[lower]
+    if lower in _LOWER_SUBREGION_MAP:
+        return _LOWER_SUBREGION_MAP[lower]
+    return clean
+
+
+def get_canonical_region(name: Optional[str]) -> str:
+    """resolve_canonical_region için eşanlamlı yardımcı fonksiyon."""
+    return resolve_canonical_region(name)
+
+
+def is_subregion(name: Optional[str]) -> bool:
+    """Verilen adın bir alt bölge (subregion) olup olmadığını kontrol eder."""
+    if not name:
+        return False
+    lower = str(name).strip().lower()
+    return lower in _LOWER_SUBREGION_MAP
+
+
+def get_subregion_info(name: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Alt bölge sınırlayıcı alan (bounding box / center) bilgilerini döndürür."""
+    if not name:
+        return None
+    lower = str(name).strip().lower()
+    return SUBREGION_BOUNDING_AREAS.get(lower)
+
+
+def get_subregion_bounding_area(name: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
+    """Alt bölge (min_x, min_y, max_x, max_y) piksel sınırlayıcı kutusunu döndürür."""
+    info = get_subregion_info(name)
+    if info and "bbox" in info:
+        return info["bbox"]
+    return None
+
+
+def filter_nodes_by_subregion(nodes: Sequence[NodeData], subregion: str) -> List[NodeData]:
+    """
+    Kanonik bölge düğümlerini belirtilen alt bölgenin rota etiketine ve/veya
+    sınırlayıcı alanına (bounding box / center radius) göre filtreler.
+    """
+    clean_sub = str(subregion or "").strip()
+    if not clean_sub or not nodes:
+        return list(nodes) if nodes else []
+
+    clean_sub_lower = clean_sub.lower()
+    # 1. Rota listesinde alt bölge adı geçen düğümler
+    by_route = [
+        n for n in nodes
+        if any(str(r).strip().lower() == clean_sub_lower for r in getattr(n, "routes", []))
+    ]
+
+    # 2. Geometrik sınırlayıcı kutu / merkez yarıçapı
+    sub_info = get_subregion_info(clean_sub)
+    by_geom: List[NodeData] = []
+    if sub_info:
+        bbox = sub_info.get("bbox")
+        norm_bbox = sub_info.get("norm_bbox")
+        center = sub_info.get("center")
+        radius = float(sub_info.get("radius", 260.0))
+
+        for n in nodes:
+            mx = float(getattr(n, "map_x", 0) or 0)
+            my = float(getattr(n, "map_y", 0) or 0)
+            nx = float(getattr(n, "norm_x", 0) or 0)
+            ny = float(getattr(n, "norm_y", 0) or 0)
+
+            in_box = False
+            if bbox and (mx > 0 or my > 0):
+                if bbox[0] <= mx <= bbox[2] and bbox[1] <= my <= bbox[3]:
+                    in_box = True
+            elif norm_bbox and (nx > 0 or ny > 0):
+                if norm_bbox[0] <= nx <= norm_bbox[2] and norm_bbox[1] <= ny <= norm_bbox[3]:
+                    in_box = True
+
+            if not in_box and center and (mx > 0 or my > 0):
+                dist = math.hypot(mx - float(center[0]), my - float(center[1]))
+                if dist <= (radius * 1.25):
+                    in_box = True
+
+            if in_box and n not in by_geom:
+                by_geom.append(n)
+
+    if by_route and by_geom:
+        seen = {id(n) for n in by_route}
+        combined = list(by_route)
+        for n in by_geom:
+            if id(n) not in seen:
+                combined.append(n)
+                seen.add(id(n))
+        return combined
+    elif by_route:
+        return by_route
+    elif by_geom:
+        return by_geom
+
+    return list(nodes)
+
+
+# ==============================================================================
+# CANONICAL MATERIAL TAXONOMY & PROXIMITY ROUTE BUILDER (SEÇ-TOPLA ENGINE)
+# ==============================================================================
+
+_TR_CHAR_TRANS = str.maketrans({
+    "ç": "c", "Ç": "c",
+    "ğ": "g", "Ğ": "g",
+    "ı": "i", "I": "i",
+    "i": "i", "İ": "i",
+    "ö": "o", "Ö": "o",
+    "ş": "s", "Ş": "s",
+    "ü": "u", "Ü": "u",
+})
+
+CANONICAL_MATERIAL_GROUPS: Dict[str, Set[str]] = {
+    "ore_orichalcum": {
+        "ore_orichalcum",
+        "orichalcum_ore",
+        "orichalcum",
+        "orikalkum",
+        "orikalkum_cevheri",
+        "orichalcum_cevheri",
+        "fine_orichalcum_ore",
+        "pure_orichalcum_ore",
+        "radiant_orichalcum_ore",
+        "fresh_orichalcum",
+        "ore_vein",
+        "3",
+        "5",
+    },
+    "herb_aria": {
+        "herb_aria",
+        "aria",
+        "fresh_aria",
+        "taze_aria",
+        "aria_mor_kristal_bitki",
+        "herb_flora",
+        "0",
+    },
+    "herb_mela": {
+        "herb_mela",
+        "mela",
+        "fruit_mela",
+        "fresh_mela",
+        "taze_mela",
+        "mela_meyvesi",
+        "1",
+        "4",
+    },
+    "herb_targena": {
+        "herb_targena",
+        "targena",
+        "fresh_targena",
+        "taze_targena",
+        "targena_otu",
+        "2",
+    },
+    "gem_crystal": {
+        "gem_crystal",
+        "gem_crystal_odyle",
+        "gem_or_crystal_or_odyle",
+        "gem_odyle",
+        "crystal",
+        "gem",
+        "gemstone",
+        "gemstones",
+        "degerli_tas",
+        "degerli_taslar",
+        "degerli_taslar_gemler",
+        "kristal",
+        "odyle",
+        "highland_odyle",
+        "pure_odyle",
+        "odyle_orb",
+        "odyle_aether",
+        "odyle_enerji_kuresi",
+        "aether",
+        "aether_crystal",
+        "sapphire",
+        "sapphire_gemstone",
+        "gem_sapphire",
+        "ruby",
+        "ruby_gemstone",
+        "gem_ruby",
+        "diamond",
+        "diamond_gemstone",
+        "gem_diamond",
+        "amethyst",
+        "amethyst_gemstone",
+        "topaz",
+        "topaz_gemstone",
+        "emerald",
+        "emerald_gemstone",
+        "garnet",
+        "garnet_gemstone",
+        "aquamarine",
+        "aquamarine_gemstone",
+        "opal",
+        "opal_gemstone",
+        "4",
+        "10",
+    },
+    "tree_log": {
+        "tree_log",
+        "tree_or_log",
+        "tree",
+        "log",
+        "log_timber",
+        "timber",
+        "agac",
+        "agaclar",
+        "agaclar_keresteler",
+        "agac_kereste",
+        "kereste",
+        "kutuk",
+        "yggdrasil",
+        "yggdrasil_log",
+        "asvata",
+        "asvata_log",
+        "zelkova",
+        "zelkova_log",
+        "teak",
+        "teak_log",
+        "dryas",
+        "dryas_log",
+        "kocan",
+        "kocan_log",
+        "spruce",
+        "spruce_log",
+        "duran",
+        "duran_log",
+        "subara",
+        "subara_log",
+        "5",
+        "11",
+    },
+    "herb_azpha": {
+        "herb_azpha",
+        "azpha",
+        "fresh_azpha",
+        "taze_azpha",
+        "azpha_otu",
+    },
+    "herb_calendula": {
+        "herb_calendula",
+        "calendula",
+        "fresh_calendula",
+    },
+}
+
+ALIAS_TO_CANONICAL_GROUP: Dict[str, str] = {}
+for _grp_key, _aliases in CANONICAL_MATERIAL_GROUPS.items():
+    for _al in _aliases:
+        ALIAS_TO_CANONICAL_GROUP[_al] = _grp_key
+
+CATEGORY_MATERIAL_MAP: Dict[str, Set[str]] = {
+    "herbs": {"herb_aria", "herb_mela", "herb_targena", "herb_azpha", "herb_calendula"},
+    "bitkiler": {"herb_aria", "herb_mela", "herb_targena", "herb_azpha", "herb_calendula"},
+    "bitkiler_otlar": {"herb_aria", "herb_mela", "herb_targena", "herb_azpha", "herb_calendula"},
+    "ores_metals": {"ore_orichalcum"},
+    "madenler": {"ore_orichalcum"},
+    "madenler_cevherler": {"ore_orichalcum"},
+    "gemstones": {"gem_crystal"},
+    "degerli_taslar": {"gem_crystal"},
+    "odyle_aether": {"gem_crystal"},
+    "logs_trees": {"tree_log"},
+    "agaclar_keresteler": {"tree_log"},
+}
+
+
+def _normalize_material_token(text: Any) -> str:
+    """
+    Normalizes a material name, class name, or alias to a clean, canonical token.
+    Strips emojis, replaces Turkish characters, and formats with underscores.
+    """
+    if text is None:
+        return ""
+    if isinstance(text, (int, float)):
+        return str(int(text))
+    s = str(text).strip()
+    if not s:
+        return ""
+    s = s.translate(_TR_CHAR_TRANS).lower()
+    cleaned: List[str] = []
+    for ch in s:
+        if ch.isalnum() or ch == "_":
+            cleaned.append(ch)
+        elif ch in (" ", "-", "/", "\\", "|", "+", "&"):
+            cleaned.append("_")
+    norm = "".join(cleaned).strip("_")
+    while "__" in norm:
+        norm = norm.replace("__", "_")
+    return norm
+
+
+def _extract_node_xy(
+    node: Any,
+    fallback_width: float = 1920.0,
+    fallback_height: float = 1080.0,
+) -> Tuple[float, float]:
+    """Safely extracts 2D map coordinates (x, y) in pixels from NodeData, dict, or tuple/list."""
+    try:
+        if isinstance(node, (tuple, list, np.ndarray)) and len(node) >= 2:
+            return float(node[0]), float(node[1])
+        if isinstance(node, dict):
+            mx = node.get("map_x", node.get("x"))
+            my = node.get("map_y", node.get("y"))
+            if mx is None and my is None:
+                nx = node.get("norm_x")
+                ny = node.get("norm_y")
+                if nx is not None and ny is not None:
+                    return float(nx) * fallback_width, float(ny) * fallback_height
+                return 0.0, 0.0
+            if float(mx or 0.0) == 0.0 and float(my or 0.0) == 0.0:
+                nx = node.get("norm_x")
+                ny = node.get("norm_y")
+                if nx is not None and ny is not None and not (float(nx) == 0.5 and float(ny) == 0.5):
+                    return float(nx) * fallback_width, float(ny) * fallback_height
+            return float(mx or 0.0), float(my or 0.0)
+
+        mx = getattr(node, "map_x", getattr(node, "x", None))
+        my = getattr(node, "map_y", getattr(node, "y", None))
+        if mx is None and my is None:
+            nx = getattr(node, "norm_x", None)
+            ny = getattr(node, "norm_y", None)
+            if nx is not None and ny is not None:
+                return float(nx) * fallback_width, float(ny) * fallback_height
+            return 0.0, 0.0
+        if float(mx or 0.0) == 0.0 and float(my or 0.0) == 0.0:
+            nx = getattr(node, "norm_x", None)
+            ny = getattr(node, "norm_y", None)
+            if nx is not None and ny is not None and not (float(nx) == 0.5 and float(ny) == 0.5):
+                return float(nx) * fallback_width, float(ny) * fallback_height
+        return float(mx or 0.0), float(my or 0.0)
+    except Exception as exc:
+        logger.debug("_extract_node_xy error on %r: %s", node, exc)
+        return 0.0, 0.0
+
+
+
+def _to_material_route_slug(target_materials: Any) -> str:
+    """Produces a clean alphanumeric route name slug from target_materials."""
+    if target_materials is None:
+        return "all"
+    if isinstance(target_materials, str):
+        norm = _normalize_material_token(target_materials)
+        grp = ALIAS_TO_CANONICAL_GROUP.get(norm, norm)
+        return grp or "all"
+    if isinstance(target_materials, (list, tuple, set)):
+        slugs = []
+        for item in target_materials:
+            if item is not None:
+                norm = _normalize_material_token(item)
+                grp = ALIAS_TO_CANONICAL_GROUP.get(norm, norm)
+                if grp and grp not in slugs:
+                    slugs.append(grp)
+        return "_".join(slugs) if slugs else "all"
+    return "all"
+
+
+def _match_node_material(node: Any, targets: List[str]) -> bool:
+    """Evaluates whether a node matches any target material in targets."""
+    candidates: List[Any] = []
+    if isinstance(node, dict):
+        for k in (
+            "resource_type",
+            "material_type",
+            "class_name",
+            "category",
+            "category_tr",
+            "name",
+            "yolo_class_id",
+            "class_id",
+        ):
+            val = node.get(k)
+            if val is not None:
+                if k == "name":
+                    sval = str(val).strip().lower()
+                    if sval.startswith("node ") or sval.startswith("node_") or sval.startswith("node#"):
+                        continue
+                candidates.append(val)
+        patch_info = node.get("patch_classification")
+        if isinstance(patch_info, dict):
+            if patch_info.get("chosen_name"):
+                candidates.append(patch_info["chosen_name"])
+            if patch_info.get("taxonomy", {}).get("category"):
+                candidates.append(patch_info["taxonomy"]["category"])
+    else:
+        for attr in (
+            "resource_type",
+            "material_type",
+            "class_name",
+            "category",
+            "category_tr",
+            "name",
+            "yolo_class_id",
+            "class_id",
+        ):
+            val = getattr(node, attr, None)
+            if val is not None:
+                if attr == "name":
+                    sval = str(val).strip().lower()
+                    if sval.startswith("node ") or sval.startswith("node_") or sval.startswith("node#"):
+                        continue
+                candidates.append(val)
+        patch_info = getattr(node, "patch_classification", None)
+        if isinstance(patch_info, dict):
+            if patch_info.get("chosen_name"):
+                candidates.append(patch_info["chosen_name"])
+            if patch_info.get("taxonomy", {}).get("category"):
+                candidates.append(patch_info["taxonomy"]["category"])
+
+    for tgt in targets:
+        t_norm = _normalize_material_token(tgt)
+        if not t_norm:
+            continue
+        t_group = ALIAS_TO_CANONICAL_GROUP.get(t_norm)
+
+        for cand in candidates:
+            if isinstance(cand, (int, float)):
+                c_str = str(int(cand))
+                if c_str == t_norm:
+                    return True
+                yolo_6_map = {
+                    0: "herb_aria",
+                    1: "herb_mela",
+                    2: "herb_targena",
+                    3: "ore_orichalcum",
+                    4: "gem_crystal",
+                    5: "tree_log",
+                }
+                c_group = yolo_6_map.get(int(cand))
+                if c_group and (c_group == t_norm or c_group == t_group):
+                    return True
+                continue
+
+            c_norm = _normalize_material_token(cand)
+            if not c_norm:
+                continue
+
+            # Exact normalized token match
+            if c_norm == t_norm:
+                return True
+
+            c_group = ALIAS_TO_CANONICAL_GROUP.get(c_norm)
+            # Canonical group match
+            if t_group and c_group and t_group == c_group:
+                return True
+
+            # Direct alias match
+            if t_group and c_norm in CANONICAL_MATERIAL_GROUPS.get(t_group, set()):
+                return True
+            if c_group and t_norm in CANONICAL_MATERIAL_GROUPS.get(c_group, set()):
+                return True
+
+            # Category mapping check
+            if t_norm in CATEGORY_MATERIAL_MAP:
+                allowed_groups = CATEGORY_MATERIAL_MAP[t_norm]
+                if c_group in allowed_groups or c_norm in allowed_groups:
+                    return True
+
+            # Substring containment
+            if len(t_norm) >= 4 and len(c_norm) >= 4:
+                if t_norm in c_norm or c_norm in t_norm:
+                    return True
+
+            # Catalog spec comparison
+            if AION2_MATERIALS_CATALOG is not None:
+                spec = AION2_MATERIALS_CATALOG.get(str(cand))
+                if spec is not None:
+                    base_norm = _normalize_material_token(spec.base_material)
+                    cat_norm = _normalize_material_token(spec.category)
+                    base_grp = ALIAS_TO_CANONICAL_GROUP.get(base_norm)
+                    if (
+                        base_norm == t_norm
+                        or (t_group and base_norm in CANONICAL_MATERIAL_GROUPS.get(t_group, set()))
+                        or (t_group and base_grp and t_group == base_grp)
+                    ):
+                        return True
+                    if cat_norm == t_norm or (
+                        t_norm in CATEGORY_MATERIAL_MAP
+                        and cat_norm in CATEGORY_MATERIAL_MAP[t_norm]
+                    ):
+                        return True
+
+    # Patch classification fallback if patch_path exists
+    patch_path = getattr(node, "patch_path", None) or (
+        node.get("patch_path") if isinstance(node, dict) else None
+    )
+    if patch_path and classify_3d_material_patch is not None:
+        disk_path = str(patch_path)
+        if not os.path.isabs(disk_path) and not os.path.isfile(disk_path):
+            disk_path = os.path.abspath(disk_path)
+        if os.path.isfile(disk_path):
+            try:
+                patch_img = _safe_imread_color(disk_path)
+                if patch_img is not None and patch_img.size > 0:
+                    reg_name = getattr(node, "region", "") or (
+                        node.get("region") if isinstance(node, dict) else ""
+                    )
+                    cls_res = classify_3d_material_patch(patch_img, region_name=str(reg_name))
+                    chosen = cls_res.get("chosen_name")
+                    if chosen:
+                        ch_norm = _normalize_material_token(chosen)
+                        ch_grp = ALIAS_TO_CANONICAL_GROUP.get(ch_norm)
+                        for tgt in targets:
+                            t_norm = _normalize_material_token(tgt)
+                            t_grp = ALIAS_TO_CANONICAL_GROUP.get(t_norm)
+                            if (
+                                ch_norm == t_norm
+                                or (ch_grp and t_grp and ch_grp == t_grp)
+                                or (t_norm and t_norm in ch_norm)
+                            ):
+                                return True
+            except Exception as exc:
+                logger.debug("classify_3d_material_patch fallback error: %s", exc)
+
+    return False
+
+
+def filter_nodes_by_material(
+    nodes: Sequence[Any],
+    target_materials: Any,
+) -> List[Any]:
+    """
+    Filters resource nodes matching the requested target materials.
+    Matches across:
+    - resource_type
+    - material_type
+    - name
+    - category / category_tr
+    - class_name
+    - yolo_class_id / class_id
+    - patch classification (classify_3d_material_patch)
+    - canonical Aion 2 taxonomy and material encyclopedia
+
+    If target_materials is empty, None, 'All', or 'Tümü', returns all gatherable nodes.
+    """
+    if not nodes:
+        return []
+
+    targets_list: List[str] = []
+    if target_materials is None:
+        targets_list = []
+    elif isinstance(target_materials, str):
+        clean_str = target_materials.strip()
+        if clean_str and clean_str.lower() not in ("all", "tumu", "tümü", "*", "none"):
+            targets_list = [clean_str]
+    elif isinstance(target_materials, (list, tuple, set)):
+        for item in target_materials:
+            if item is not None:
+                cs = str(item).strip()
+                if cs and cs.lower() not in ("all", "tumu", "tümü", "*", "none"):
+                    targets_list.append(cs)
+
+    if not targets_list:
+        return [
+            n for n in nodes
+            if not (
+                getattr(n, "not_gatherable", False)
+                if hasattr(n, "not_gatherable")
+                else (isinstance(n, dict) and n.get("not_gatherable", False))
+            )
+        ]
+
+    matched: List[Any] = []
+    for node in nodes:
+        is_not_gatherable = (
+            getattr(node, "not_gatherable", False)
+            if hasattr(node, "not_gatherable")
+            else (isinstance(node, dict) and node.get("not_gatherable", False))
+        )
+        if is_not_gatherable:
+            continue
+        if _match_node_material(node, targets_list):
+            matched.append(node)
+
+    return matched
+
+
+def sort_nodes_by_proximity(
+    nodes: Sequence[Any],
+    start_xy: Optional[Tuple[float, float]] = None,
+) -> List[Any]:
+    """
+    Sorts nodes starting from `start_xy = (x, y)` (player position or first node)
+    using Greedy Nearest-Neighbor + 2-Opt TSP proximity optimization.
+    Minimizes total Euclidean travel distance and untangles crossing segments.
+    """
+    if not nodes:
+        return []
+    node_list = list(nodes)
+    n = len(node_list)
+    if n <= 1:
+        return node_list
+
+    coords: List[Tuple[float, float]] = [_extract_node_xy(item) for item in node_list]
+
+    if n == 2:
+        if start_xy is not None:
+            sx, sy = float(start_xy[0]), float(start_xy[1])
+            d0 = math.hypot(coords[0][0] - sx, coords[0][1] - sy)
+            d1 = math.hypot(coords[1][0] - sx, coords[1][1] - sy)
+            if d1 < d0:
+                return [node_list[1], node_list[0]]
+            return [node_list[0], node_list[1]]
+        return node_list
+
+    # 1. Greedy Nearest-Neighbor Initialization
+    if start_xy is not None:
+        sx, sy = float(start_xy[0]), float(start_xy[1])
+        first_idx = min(
+            range(n),
+            key=lambda i: math.hypot(coords[i][0] - sx, coords[i][1] - sy),
+        )
+    else:
+        first_idx = 0
+
+    visited = [False] * n
+    visited[first_idx] = True
+    tour = [first_idx]
+    curr_idx = first_idx
+
+    for _ in range(n - 1):
+        best_next = -1
+        best_dist = float("inf")
+        curr_x, curr_y = coords[curr_idx]
+        for j in range(n):
+            if not visited[j]:
+                d = math.hypot(coords[j][0] - curr_x, coords[j][1] - curr_y)
+                if d < best_dist:
+                    best_dist = d
+                    best_next = j
+        visited[best_next] = True
+        tour.append(best_next)
+        curr_idx = best_next
+
+    # 2. 2-Opt Local Search Loop Optimization (untangle crossings & minimize perimeter)
+    max_iterations = 60
+    for _ in range(max_iterations):
+        improved = False
+        for i in range(n - 1):
+            for j in range(i + 2, n):
+                if i == 0 and j == n - 1:
+                    continue
+                a = tour[i]
+                b = tour[(i + 1) % n]
+                c = tour[j]
+                d = tour[(j + 1) % n]
+
+                d_ab = math.hypot(coords[a][0] - coords[b][0], coords[a][1] - coords[b][1])
+                d_cd = math.hypot(coords[c][0] - coords[d][0], coords[c][1] - coords[d][1])
+                d_ac = math.hypot(coords[a][0] - coords[c][0], coords[a][1] - coords[c][1])
+                d_bd = math.hypot(coords[b][0] - coords[d][0], coords[b][1] - coords[d][1])
+
+                if (d_ac + d_bd) + 1e-6 < (d_ab + d_cd):
+                    tour[i + 1 : j + 1] = reversed(tour[i + 1 : j + 1])
+                    improved = True
+        if not improved:
+            break
+
+    # 3. Orient tour starting from node closest to start_xy
+    if start_xy is not None:
+        sx, sy = float(start_xy[0]), float(start_xy[1])
+        best_pos = min(
+            range(n),
+            key=lambda k: math.hypot(coords[tour[k]][0] - sx, coords[tour[k]][1] - sy),
+        )
+        tour = tour[best_pos:] + tour[:best_pos]
+        dist_fwd = math.hypot(coords[tour[1]][0] - sx, coords[tour[1]][1] - sy)
+        dist_bwd = math.hypot(coords[tour[-1]][0] - sx, coords[tour[-1]][1] - sy)
+        if dist_bwd < dist_fwd:
+            tour = [tour[0]] + list(reversed(tour[1:]))
+    else:
+        if 0 in tour:
+            zpos = tour.index(0)
+            tour = tour[zpos:] + tour[:zpos]
+
+    # 4. Open-path 2-opt fine-tuning
+    for _ in range(30):
+        improved = False
+        for i in range(n - 2):
+            for j in range(i + 2, n - 1):
+                a = tour[i]
+                b = tour[i + 1]
+                c = tour[j]
+                d = tour[j + 1]
+                d_ab = math.hypot(coords[a][0] - coords[b][0], coords[a][1] - coords[b][1])
+                d_cd = math.hypot(coords[c][0] - coords[d][0], coords[c][1] - coords[d][1])
+                d_ac = math.hypot(coords[a][0] - coords[c][0], coords[a][1] - coords[c][1])
+                d_bd = math.hypot(coords[b][0] - coords[d][0], coords[b][1] - coords[d][1])
+                if (d_ac + d_bd) + 1e-6 < (d_ab + d_cd):
+                    tour[i + 1 : j + 1] = reversed(tour[i + 1 : j + 1])
+                    improved = True
+        if not improved:
+            break
+
+    return [node_list[idx] for idx in tour]
+
+
+def build_proximity_material_route(
+    region_name: Any = None,
+    target_materials: Any = None,
+    start_xy: Optional[Tuple[float, float]] = None,
+    persist_route: bool = True,
+    route_manager: Optional[Any] = None,
+) -> List[Any]:
+    """Module-level helper to build and optionally persist a proximity-sorted material route."""
+    mgr = route_manager or RouteManager()
+    return mgr.build_proximity_material_route(
+        region_name=region_name,
+        target_materials=target_materials,
+        start_xy=start_xy,
+        persist_route=persist_route,
+    )
+
+
+class SelectiveRouteNodeDict(dict):
+    """Dict representation of a route node that also supports attribute access."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self[name] = value
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(self)
+
+
+def get_selective_tsp_route(
+    region: str,
+    selected_materials: list,
+    player_xy: Optional[Tuple[float, float]] = None,
+    route_manager: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Seç-Topla aktifken seçilen materyal(ler) için oyuncu konumundan başlayan
+    en kısa 2-Opt TSP rotayı anında üretir.
+    """
+    mgr = route_manager or RouteManager()
+    return mgr.get_selective_tsp_route(
+        region=region,
+        selected_materials=selected_materials,
+        player_xy=player_xy,
+    )
+
+
+class CanonicalRegionDict(dict):
+
+    """
+    Subregion adlarını canonical üst bölgeye otomatik çözümleyen sözlük.
+    Örn: 'Dredgion Crash Site' istendiğinde 'Altgard' kaydını döndürür.
+    """
+    def __getitem__(self, key: str) -> Any:
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        canon = resolve_canonical_region(key)
+        if super().__contains__(canon):
+            return super().__getitem__(canon)
+        raise KeyError(key)
+
+    def __contains__(self, key: object) -> bool:
+        if super().__contains__(key):
+            return True
+        if isinstance(key, str):
+            canon = resolve_canonical_region(key)
+            return super().__contains__(canon)
+        return False
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
 
 def _safe_imread_gray(path: str) -> Optional[np.ndarray]:
     """Reads a grayscale image safely even when the path contains non-ASCII/Turkish characters."""
@@ -67,6 +1033,23 @@ def _safe_imread_gray(path: str) -> Optional[np.ndarray]:
             return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         except Exception as exc:
             logger.debug("Görsel okunamadı (%s): %s", path, exc)
+            return None
+
+
+def _safe_imread_color(path: str) -> Optional[np.ndarray]:
+    """Reads a color (BGR) image safely even when the path contains non-ASCII/Turkish characters."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        raw = np.fromfile(path, dtype=np.uint8)
+        if raw.size == 0:
+            return None
+        return cv2.imdecode(raw, cv2.IMREAD_COLOR)
+    except Exception:
+        try:
+            return cv2.imread(path, cv2.IMREAD_COLOR)
+        except Exception as exc:
+            logger.debug("Renkli görsel okunamadı (%s): %s", path, exc)
             return None
 
 
@@ -184,6 +1167,78 @@ class NodeLocationResult(tuple):
         }
 
 
+class SnapResult(dict):
+    """
+    Görsel odometri ve rota snap-to-path sonucu.
+    Hem sözlük erişimini:
+        res["coords"], res["snapped"], res["distance"]
+    hem nitelik erişimini:
+        res.coords, res.x, res.y, res.snapped, res.distance, res.segment_index, res.projection_t, res.nearest_node
+    hem de tuple açılımını:
+        (x, y), is_snapped, dist = res
+    destekler.
+    """
+
+    def __init__(
+        self,
+        coords: Tuple[int, int],
+        snapped: bool,
+        distance: float,
+        segment_index: Optional[int] = None,
+        projection_t: float = 0.0,
+        nearest_node: Optional["NodeData"] = None,
+        nearest_node_id: Optional[int] = None,
+        norm_x: Optional[float] = None,
+        norm_y: Optional[float] = None,
+    ) -> None:
+        coords_int = (int(coords[0]), int(coords[1]))
+        dist_f = float(distance)
+        proj_t = float(projection_t)
+        super().__init__(
+            coords=coords_int,
+            x=coords_int[0],
+            y=coords_int[1],
+            snapped=bool(snapped),
+            distance=dist_f,
+            segment_index=segment_index,
+            projection_t=proj_t,
+            nearest_node=nearest_node,
+            nearest_node_id=nearest_node_id,
+            norm_x=float(norm_x) if norm_x is not None else None,
+            norm_y=float(norm_y) if norm_y is not None else None,
+        )
+        self.coords = coords_int
+        self.x = coords_int[0]
+        self.y = coords_int[1]
+        self.snapped = bool(snapped)
+        self.distance = dist_f
+        self.segment_index = segment_index
+        self.projection_t = proj_t
+        self.nearest_node = nearest_node
+        self.nearest_node_id = nearest_node_id
+        self.norm_x = float(norm_x) if norm_x is not None else None
+        self.norm_y = float(norm_y) if norm_y is not None else None
+
+    def __iter__(self):
+        yield self.coords
+        yield self.snapped
+        yield self.distance
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "coords": self.coords,
+            "x": self.x,
+            "y": self.y,
+            "snapped": self.snapped,
+            "distance": self.distance,
+            "segment_index": self.segment_index,
+            "projection_t": self.projection_t,
+            "nearest_node_id": self.nearest_node_id,
+            "norm_x": self.norm_x,
+            "norm_y": self.norm_y,
+        }
+
+
 @dataclass
 class NodeData:
     """
@@ -211,6 +1266,7 @@ class NodeData:
     source_type: str = DEFAULT_SOURCE_TYPE
     state: str = "active"
     seq_index: int = 0
+    not_gatherable: bool = False
 
     def __post_init__(self) -> None:
         self.id = int(self.id)
@@ -248,6 +1304,7 @@ class NodeData:
         )
         self.state = str(self.state or "active").strip().lower() or "active"
         self.seq_index = int(self.seq_index or 0)
+        self.not_gatherable = bool(self.not_gatherable)
 
         if (
             self.last_visited_timestamp > 0.0
@@ -331,6 +1388,8 @@ class NodeData:
         Eğer düğüm şu anda kısmi hasat aşamasındaysa (`1/3` veya `2/3`, `state != 'resting'`),
         henüz tükenmediği için `True` döndürür.
         """
+        if self.not_gatherable:
+            return False
         if self.state in ("active", "gathering") and 0 < self.current_harvests < max(1, self.max_harvests):
             return True
         if self.last_visited_timestamp <= 0.0:
@@ -402,6 +1461,7 @@ class NodeData:
             "source_type": str(self.source_type),
             "state": str(self.state),
             "seq_index": int(self.seq_index),
+            "not_gatherable": bool(self.not_gatherable),
         }
 
     @classmethod
@@ -449,6 +1509,7 @@ class NodeData:
         source_type = str(d.get("source_type", DEFAULT_SOURCE_TYPE) or DEFAULT_SOURCE_TYPE)
         state = str(d.get("state", "active") or "active")
         seq_index = int(d.get("seq_index", 0) or 0)
+        not_gatherable = bool(d.get("not_gatherable", False))
 
         return cls(
             id=node_id,
@@ -470,6 +1531,7 @@ class NodeData:
             source_type=source_type,
             state=state,
             seq_index=seq_index,
+            not_gatherable=not_gatherable,
         )
 
     # Sözlük uyumluluk metodları (eski kodların node["id"] / node.get("map_x") erişimleri için)
@@ -547,30 +1609,197 @@ class RouteManager:
         self.patch_normalizer: SobelClahePatchNormalizer = kwargs.get("patch_normalizer") or SobelClahePatchNormalizer()
         self.orientation_guard: MinimapOrientationGuard = kwargs.get("orientation_guard") or MinimapOrientationGuard()
 
+        # Dynamic viewport ve odometri takipçisi
+        init_vw = kwargs.get("viewport_width")
+        init_vh = kwargs.get("viewport_height")
+        self.viewport_width: Optional[int] = int(init_vw) if init_vw else None
+        self.viewport_height: Optional[int] = int(init_vh) if init_vh else None
+        self.odometry_tracker: Optional[Any] = kwargs.get("odometry_tracker")
+        self._last_odometry_patch: Optional[np.ndarray] = None
+
         # Toplam hasat ve ardışık hata sayaçları
         self.total_gathered: int = 0
         self.consecutive_failures: int = 0
 
+        # Kara Liste (Blacklist) Yöneticisi
+        try:
+            from core.blacklist_manager import get_blacklist_manager
+            self.blacklist_manager = kwargs.get("blacklist_manager") or get_blacklist_manager()
+        except Exception:
+            self.blacklist_manager = None
+
         # Bellek içi veri yapıları:
         # _regions[region_name] = {"routes": ["All", "Ores"], "nodes": [NodeData]}
-        self._regions: Dict[str, Dict[str, Any]] = {}
+        self._regions: Dict[str, Dict[str, Any]] = CanonicalRegionDict()
         self.active_region: str = DEFAULT_REGION
         self.active_route: str = DEFAULT_ROUTE
         self._last_selected_node_id: Dict[Tuple[str, str], int] = {}
+        self.last_save_error: Optional[BaseException] = None
 
         # Geriye dönük uyumluluk için mirror sözlük
         self.data: Dict[str, Any] = {
-            "regions": {},
+            "regions": CanonicalRegionDict(),
             "active_region": self.active_region,
             "active_route": self.active_route,
         }
+        self._legacy_synced_ids: Dict[str, List[int]] = {}
 
-        try:
-            os.makedirs(self.base_dir, exist_ok=True)
-        except Exception as exc:
-            logger.error("Rota ana dizini oluşturulamadı (%s): %s", self.base_dir, exc)
+    def resolve_canonical_region(self, name: Optional[str]) -> str:
+        """Verilen bölge veya alt bölge adının kanonik ana bölge karşılığını döndürür."""
+        return resolve_canonical_region(name)
 
-        self.load_all_regions()
+    def get_canonical_region(self, name: Optional[str]) -> str:
+        """resolve_canonical_region için eşanlamlı yardımcı metot."""
+        return resolve_canonical_region(name)
+
+    def is_subregion(self, name: Optional[str]) -> bool:
+        """Verilen adın bir alt bölge (subregion) olup olmadığını kontrol eder."""
+        return is_subregion(name)
+
+    def get_subregion_bounding_box(self, name: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
+        """Alt bölge (min_x, min_y, max_x, max_y) piksel sınırlayıcı kutusunu döndürür."""
+        return get_subregion_bounding_area(name)
+
+    def get_subregion_focus_area(self, name: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Alt bölge odak ve sınırlayıcı alan bilgilerini döndürür."""
+        return get_subregion_info(name)
+
+    def filter_nodes_by_subregion(self, nodes: Sequence[NodeData], subregion: str) -> List[NodeData]:
+        """Düğümleri alt bölgeye göre filtreler."""
+        return filter_nodes_by_subregion(nodes, subregion)
+
+    def _get_material_route_slug(self, target_materials: Any) -> str:
+        """Returns the route slug for target_materials."""
+        return _to_material_route_slug(target_materials)
+
+    def filter_nodes_by_material(
+        self,
+        nodes: Sequence[Any],
+        target_materials: Any,
+    ) -> List[Any]:
+        """Filters nodes matching target_materials in canonical encyclopedia / taxonomy."""
+        return filter_nodes_by_material(nodes, target_materials)
+
+    def sort_nodes_by_proximity(
+        self,
+        nodes: Sequence[Any],
+        start_xy: Optional[Tuple[float, float]] = None,
+    ) -> List[Any]:
+        """Sorts nodes using Greedy Nearest-Neighbor + 2-Opt TSP proximity optimization."""
+        return sort_nodes_by_proximity(nodes, start_xy=start_xy)
+
+    def build_proximity_material_route(
+        self,
+        region_name: Any = None,
+        target_materials: Any = None,
+        start_xy: Optional[Tuple[float, float]] = None,
+        persist_route: bool = True,
+    ) -> List[NodeData]:
+        """
+        Filters nodes in region_name by target_materials, re-sequences them in Greedy
+        Nearest-Neighbor + 2-Opt TSP proximity order starting from start_xy (or first node),
+        assigns 1-based seq_index, updates named route tagging, and optionally persists
+        to routes/<region>/region_data.json.
+        """
+        # 1. Determine target region & source nodes
+        candidate_nodes: Optional[List[Any]] = None
+        if isinstance(region_name, (list, tuple)):
+            candidate_nodes = list(region_name)
+            target_reg = resolve_canonical_region(
+                getattr(candidate_nodes[0], "region", self.active_region)
+                if candidate_nodes
+                else self.active_region
+            )
+        elif isinstance(region_name, str) and region_name.strip():
+            target_reg = resolve_canonical_region(region_name.strip())
+        else:
+            target_reg = resolve_canonical_region(self.active_region)
+
+        if candidate_nodes is not None:
+            all_nodes = candidate_nodes
+        else:
+            if target_reg not in self._regions:
+                self.load_region(target_reg)
+            if target_reg not in self._regions:
+                logger.warning("build_proximity_material_route: Bölge yüklenemedi: %s", target_reg)
+                return []
+            all_nodes = list(self._regions[target_reg].get("nodes", []))
+
+        # 2. Filter matching nodes
+        matched = self.filter_nodes_by_material(all_nodes, target_materials)
+        if not matched:
+            logger.info(
+                "build_proximity_material_route: '%s' materyali için '%s' bölgesinde düğüm bulunamadı.",
+                target_materials,
+                target_reg,
+            )
+            return []
+
+        # 3. Proximity sort (Greedy Nearest-Neighbor + 2-Opt TSP)
+        ordered: List[Any] = self.sort_nodes_by_proximity(matched, start_xy=start_xy)
+
+        # 4. Assign 1-based seq_index to matched nodes
+        for idx, node in enumerate(ordered, start=1):
+            if hasattr(node, "seq_index"):
+                node.seq_index = idx
+            elif isinstance(node, dict):
+                node["seq_index"] = idx
+
+        # 5. Route naming & persistence
+        slug = self._get_material_route_slug(target_materials)
+        route_name = f"proximity_{slug}"
+
+        if target_reg in self._regions:
+            reg_info = self._regions[target_reg]
+            routes_list = list(reg_info.get("routes", []))
+            if route_name not in routes_list:
+                routes_list.append(route_name)
+            reg_info["routes"] = routes_list
+
+            for n in ordered:
+                if hasattr(n, "routes"):
+                    if route_name not in n.routes:
+                        n.routes.append(route_name)
+                elif isinstance(n, dict):
+                    rts = n.setdefault("routes", [])
+                    if route_name not in rts:
+                        rts.append(route_name)
+
+            # Reorder region nodes: matched ordered nodes first, remaining after
+            matched_ids = {
+                getattr(n, "id", None) or (n.get("id") if isinstance(n, dict) else None)
+                for n in ordered
+            }
+            remaining_nodes = [
+                n for n in all_nodes
+                if (getattr(n, "id", None) or (n.get("id") if isinstance(n, dict) else None))
+                not in matched_ids
+            ]
+            for idx, n in enumerate(remaining_nodes, start=len(ordered) + 1):
+                if hasattr(n, "seq_index"):
+                    n.seq_index = idx
+                elif isinstance(n, dict):
+                    n["seq_index"] = idx
+
+            reg_info["nodes"] = ordered + remaining_nodes
+            self.active_route = route_name
+            self._sync_legacy_data()
+
+            if persist_route:
+                self.save_region(target_reg)
+
+        return ordered
+
+    def update_viewport(self, width: int, height: int) -> None:
+        """Dinamik harita / ekran çözünürlüğünü günceller (1280x720, 1920x1080, 2560x1440 vb.)."""
+        if width > 0 and height > 0:
+            self.viewport_width = int(width)
+            self.viewport_height = int(height)
+            if self.odometry_tracker is not None:
+                if hasattr(self.odometry_tracker, "map_width"):
+                    self.odometry_tracker.map_width = int(width)
+                if hasattr(self.odometry_tracker, "map_height"):
+                    self.odometry_tracker.map_height = int(height)
 
     @property
     def patch_dir(self) -> str:
@@ -637,8 +1866,10 @@ class RouteManager:
         return self.load_all_regions()
 
     def load_region(self, region: str) -> bool:
-        """Belirtilen bölgenin `region_data.json` dosyasını okur."""
-        json_path = self._get_region_json_path(region)
+        """Belirtilen bölgenin `region_data.json` dosyasını okur (alt bölge eşlemelerini otomatik canonical ana bölgeye bağlar)."""
+        clean_reg = str(region or "").strip()
+        canon_reg = resolve_canonical_region(clean_reg)
+        json_path = self._get_region_json_path(canon_reg)
         if not os.path.isfile(json_path):
             logger.warning("Bölge veri dosyası bulunamadı: %s", json_path)
             return False
@@ -647,7 +1878,7 @@ class RouteManager:
             with open(json_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
 
-            reg_name = str(raw.get("region", region))
+            reg_name = str(raw.get("region", canon_reg))
             raw_routes = raw.get("routes", [DEFAULT_ROUTE])
             routes_list: List[str] = [DEFAULT_ROUTE]
             if isinstance(raw_routes, dict):
@@ -660,10 +1891,12 @@ class RouteManager:
                         routes_list.append(str(r_name))
 
             nodes_list: List[NodeData] = []
-            for item in raw.get("nodes", []):
+            for idx, item in enumerate(raw.get("nodes", []), start=1):
                 if isinstance(item, dict):
                     item.setdefault("region", reg_name)
                     node_obj = NodeData.from_dict(item)
+                    if node_obj.seq_index <= 0:
+                        node_obj.seq_index = idx
                     nodes_list.append(node_obj)
                     for r_in_node in node_obj.routes:
                         if r_in_node not in routes_list:
@@ -680,9 +1913,16 @@ class RouteManager:
             logger.error("'%s' bölgesi yüklenirken hata: %s", region, exc)
             return False
 
-    def save_region(self, region: Optional[str] = None) -> bool:
-        """Belirtilen bölgenin verilerini `routes/<region_name>/region_data.json` dosyasına yazar."""
-        target_region = region or self.active_region
+    def save_region(self, region: Optional[str] = None, create_backup: bool = True) -> bool:
+        """
+        Belirtilen bölgenin verilerini `routes/<region_name>/region_data.json` dosyasına yazar.
+        - Atomik yazma (.tmp -> flush -> fsync -> os.replace)
+        - Windows dosya kilitleme ve izin yarışlarına karşı yeniden deneme döngüsü
+        - Otomatik yedekleme (`region_data.backup.json`)
+        - Sıralı, 1-tabanlı ardışık seq_index garantisi
+        """
+        self.last_save_error = None
+        target_region = resolve_canonical_region(region or self.active_region)
         if target_region not in self._regions:
             logger.warning("Kaydedilecek bölge bulunamadı: %s", target_region)
             return False
@@ -698,7 +1938,58 @@ class RouteManager:
             if DEFAULT_ROUTE not in routes_list:
                 routes_list.insert(0, DEFAULT_ROUTE)
 
+            # UI veya map_viewer self.data üzerinde sıralama/düğüm güncellediyse
+            # bunu öncelikli olarak self._regions içine senkronize et
+            if not hasattr(self, "_legacy_synced_ids"):
+                self._legacy_synced_ids = {}
+
+            last_synced = self._legacy_synced_ids.get(target_region)
+            current_nodes = reg_info.get("nodes", [])
+            current_ids = [n.id for n in current_nodes]
+
+            if isinstance(getattr(self, "data", None), dict):
+                legacy_reg = self.data.get("regions", {}).get(target_region)
+                if isinstance(legacy_reg, dict) and "nodes" in legacy_reg:
+                    legacy_nodes = legacy_reg["nodes"]
+                    if isinstance(legacy_nodes, list) and legacy_nodes:
+                        legacy_ids = [
+                            n.id if isinstance(n, NodeData) else int(n.get("id", 0))
+                            for n in legacy_nodes
+                        ]
+                        # self.data son senkronize sıradan farklıysa ve _regions son senkronize sırayla eşleşiyorsa:
+                        should_sync_from_legacy = (
+                            last_synced is not None
+                            and current_ids == last_synced
+                            and legacy_ids != last_synced
+                        )
+                        if should_sync_from_legacy:
+                            node_by_id = {n.id: n for n in current_nodes}
+                            synced_nodes: List[NodeData] = []
+                            for item in legacy_nodes:
+                                if isinstance(item, NodeData):
+                                    synced_nodes.append(item)
+                                elif isinstance(item, dict):
+                                    nid = int(item.get("id", 0))
+                                    if nid in node_by_id:
+                                        n_obj = node_by_id[nid]
+                                        for k, v in item.items():
+                                            if hasattr(n_obj, k) and k != "id":
+                                                setattr(n_obj, k, v)
+                                        synced_nodes.append(n_obj)
+                                    else:
+                                        item_copy = dict(item)
+                                        item_copy.setdefault("region", target_region)
+                                        synced_nodes.append(NodeData.from_dict(item_copy))
+                            synced_ids = {n.id for n in synced_nodes}
+                            for n in current_nodes:
+                                if n.id not in synced_ids:
+                                    synced_nodes.append(n)
+                            reg_info["nodes"] = synced_nodes
+
             nodes_list: List[NodeData] = reg_info.get("nodes", [])
+            for idx, node in enumerate(nodes_list, start=1):
+                node.seq_index = idx
+
             for node in nodes_list:
                 for r_name in node.routes:
                     if r_name and r_name not in routes_list:
@@ -713,15 +2004,68 @@ class RouteManager:
 
             json_path = self._get_region_json_path(target_region)
             tmp_path = json_path + ".tmp"
+            backup_path = os.path.join(reg_dir, "region_data.backup.json")
+
+            # Mevcut geçerli json varsa yedekle
+            if create_backup and os.path.isfile(json_path):
+                try:
+                    if os.path.getsize(json_path) > 0:
+                        shutil.copyfile(json_path, backup_path)
+                except Exception as b_exc:
+                    logger.debug("Otomatik yedek oluşturulamadı (%s): %s", backup_path, b_exc)
+
+            # Atomik geçici dosyaya yazma + flush + fsync
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, json_path)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+
+            # Windows dosya kilitleme ve erişim yarışlarına karşı güvenli atomik değiştirme döngüsü
+            replace_ok = False
+            last_replace_exc: Optional[Exception] = None
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, json_path)
+                    replace_ok = True
+                    break
+                except OSError as r_exc:
+                    last_replace_exc = r_exc
+                    time.sleep(0.04 * (attempt + 1))
+
+            if not replace_ok:
+                if last_replace_exc is not None:
+                    raise last_replace_exc
 
             self._sync_legacy_data()
             return True
+        except OSError as exc:
+            self.last_save_error = exc
+            winerror = getattr(exc, "winerror", None)
+            if winerror == 5:
+                logger.error(
+                    "'%s' bölgesi yazılamadı (WinError 5): %s", target_region, exc
+                )
+            else:
+                logger.error("'%s' bölgesi kaydedilirken hata: %s", target_region, exc)
+            return False
         except Exception as exc:
+            self.last_save_error = exc
             logger.error("'%s' bölgesi kaydedilirken hata: %s", target_region, exc)
             return False
+
+    def backup_region_file(self, region: Optional[str] = None) -> str:
+        """Copy ``region_data.json`` onto the single ``region_data.backup.json``."""
+        target_region = resolve_canonical_region(region or self.active_region)
+        src = self._get_region_json_path(target_region)
+        dst = os.path.join(self._get_region_dir(target_region), "region_data.backup.json")
+        if not os.path.isfile(src):
+            raise FileNotFoundError(src)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+        return dst
 
     def save_data(self) -> bool:
         """Tüm bölgeleri diske kaydeder."""
@@ -731,9 +2075,95 @@ class RouteManager:
                 success = False
         return success
 
+    def reorder_route_nodes(
+        self,
+        region_name: str,
+        ordered_ids: List[int],
+        route_name: Optional[str] = None,
+    ) -> bool:
+        """
+        Düğümleri belirtilen ID sırasına göre kalıcı olarak yeniden sıralar,
+        seq_index değerlerini günceller ve diske kaydeder.
+        """
+        clean_reg = resolve_canonical_region(str(region_name or self.active_region).strip())
+        if clean_reg not in self._regions:
+            return False
+        nodes = self._regions[clean_reg].get("nodes", [])
+        node_map = {n.id: n for n in nodes}
+
+        reordered: List[NodeData] = []
+        seen = set()
+        for nid in ordered_ids:
+            if nid in node_map and nid not in seen:
+                reordered.append(node_map[nid])
+                seen.add(nid)
+        # Sıralama listesinde yer almayan diğer düğümleri koru
+        for n in nodes:
+            if n.id not in seen:
+                reordered.append(n)
+                seen.add(n.id)
+
+        for idx, node in enumerate(reordered, start=1):
+            node.seq_index = idx
+
+        self._regions[clean_reg]["nodes"] = reordered
+        return self.save_region(clean_reg)
+
+    def resequence_nodes(
+        self,
+        region: Optional[str] = None,
+        route: Optional[str] = None,
+    ) -> List[NodeData]:
+        """
+        Bölgedeki tüm düğümlere 1-tabanlı sıralı seq_index (1, 2, ..., N)
+        değerlerini kesin olarak atar, veritabanını atomik olarak kaydeder ve düğüm listesini döndürür.
+        """
+        target_region = resolve_canonical_region(region or self.active_region)
+        if target_region not in self._regions:
+            return []
+        nodes = self._regions[target_region].get("nodes", [])
+        for idx, node in enumerate(nodes, start=1):
+            node.seq_index = idx
+        self.save_region(target_region)
+        if route and route != DEFAULT_ROUTE:
+            return [n for n in nodes if route in n.routes]
+        return list(nodes)
+
+    def move_node_in_sequence(
+        self,
+        node_id: int,
+        new_index: int,
+        region: Optional[str] = None,
+    ) -> bool:
+        """
+        Düğümü rota sıralamasında yeni bir konuma (1-tabanlı indeks) taşır,
+        tüm düğümlerin seq_index değerlerini günceller ve atomik olarak kaydeder.
+        """
+        target_region = resolve_canonical_region(region or self.active_region)
+        if target_region not in self._regions:
+            return False
+        nodes = self._regions[target_region].get("nodes", [])
+        target_node = None
+        curr_idx = -1
+        for i, n in enumerate(nodes):
+            if n.id == int(node_id):
+                target_node = n
+                curr_idx = i
+                break
+        if target_node is None:
+            return False
+        nodes.pop(curr_idx)
+        target_idx = max(0, min(len(nodes), int(new_index) - 1))
+        nodes.insert(target_idx, target_node)
+        for idx, n in enumerate(nodes, start=1):
+            n.seq_index = idx
+        return self.save_region(target_region)
+
     def _sync_legacy_data(self) -> None:
         """UI ve eski modüllerin `self.data` erişimi için uyumluluk sözlüğünü günceller."""
         regions_dict: Dict[str, Any] = {}
+        if not hasattr(self, "_legacy_synced_ids"):
+            self._legacy_synced_ids = {}
         for reg_name, reg_info in self._regions.items():
             nodes_list: List[NodeData] = reg_info.get("nodes", [])
             routes_list: List[str] = reg_info.get("routes", [DEFAULT_ROUTE])
@@ -745,8 +2175,9 @@ class RouteManager:
                 "routes": routes_map,
                 "nodes": nodes_list,
             }
+            self._legacy_synced_ids[reg_name] = [n.id for n in nodes_list]
 
-        self.data["regions"] = regions_dict
+        self.data["regions"] = CanonicalRegionDict(regions_dict)
         self.data["active_region"] = self.active_region
         self.data["active_route"] = self.active_route
 
@@ -955,11 +2386,16 @@ class RouteManager:
     def get_routes(self, region: Optional[str] = None) -> List[str]:
         """Belirtilen bölgedeki tüm rotaların listesini döndürür."""
         target_region = region or self.active_region
-        if target_region not in self._regions:
+        canon_reg = resolve_canonical_region(target_region)
+        if canon_reg not in self._regions:
+            self.load_region(canon_reg)
+        if canon_reg not in self._regions:
             return [DEFAULT_ROUTE]
-        routes_list = list(self._regions[target_region].get("routes", [DEFAULT_ROUTE]))
+        routes_list = list(self._regions[canon_reg].get("routes", [DEFAULT_ROUTE]))
         if DEFAULT_ROUTE not in routes_list:
             routes_list.insert(0, DEFAULT_ROUTE)
+        if is_subregion(target_region) and target_region not in routes_list:
+            routes_list.append(target_region)
         return routes_list
 
     # ------------------------------------------------------------------
@@ -1011,6 +2447,7 @@ class RouteManager:
         source_type: str = DEFAULT_SOURCE_TYPE,
         state: str = "active",
         seq_index: int = 0,
+        **kwargs: Any,
     ) -> NodeData:
         """
         Bölgeye ve rotaya yeni bir düğüm ekler, 80x80 harita kesitini PNG olarak kaydeder
@@ -1020,6 +2457,22 @@ class RouteManager:
         if isinstance(region, NodeData):
             node_obj = region
             target_region = node_obj.region or self.active_region
+            if getattr(self, "blacklist_manager", None) is not None and not kwargs.get("ignore_blacklist", False):
+                is_bl, bl_entry = self.blacklist_manager.is_blacklisted(
+                    region=target_region,
+                    map_x=node_obj.map_x,
+                    map_y=node_obj.map_y,
+                    norm_x=node_obj.norm_x,
+                    norm_y=node_obj.norm_y,
+                )
+                if is_bl:
+                    logger.warning(
+                        "⛔ [KARA LİSTE ENGELİ] '%s' bölgesinde (%d, %d) koordinatı kara listede! Düğüm eklenmesi engellendi.",
+                        target_region,
+                        node_obj.map_x,
+                        node_obj.map_y,
+                    )
+                    return None
             if target_region not in self._regions:
                 self.create_region(target_region)
             if not node_obj.id or any(n.id == node_obj.id for n in self._regions[target_region]["nodes"]):
@@ -1032,6 +2485,9 @@ class RouteManager:
                 _safe_imwrite(disk_patch_path, self._prepare_patch_image(patch_img))
             elif not os.path.exists(disk_patch_path):
                 _safe_imwrite(disk_patch_path, self._prepare_patch_image(None))
+
+            if node_obj.seq_index <= 0:
+                node_obj.seq_index = len(self._regions[target_region]["nodes"]) + 1
 
             for r_item in node_obj.routes:
                 if r_item and r_item not in self._regions[target_region]["routes"]:
@@ -1052,6 +2508,24 @@ class RouteManager:
 
         if not target_region:
             target_region = DEFAULT_REGION
+
+        if getattr(self, "blacklist_manager", None) is not None and not kwargs.get("ignore_blacklist", False):
+            is_bl, bl_entry = self.blacklist_manager.is_blacklisted(
+                region=target_region,
+                map_x=map_x,
+                map_y=map_y,
+                norm_x=norm_x,
+                norm_y=norm_y,
+            )
+            if is_bl:
+                logger.warning(
+                    "⛔ [KARA LİSTE ENGELİ] '%s' bölgesinde (%d, %d) koordinatı kara listede! Düğüm eklenmesi engellendi (Neden: %s).",
+                    target_region,
+                    map_x,
+                    map_y,
+                    bl_entry.reason if bl_entry else "Blacklisted",
+                )
+                return None
 
         if target_region not in self._regions:
             self.create_region(target_region)
@@ -1086,8 +2560,19 @@ class RouteManager:
         elif not os.path.exists(disk_patch_path):
             _safe_imwrite(disk_patch_path, self._prepare_patch_image(None))
 
-        calc_norm_x = float(norm_x) if norm_x is not None else (round(map_x / 1920.0, 4) if map_x > 0 else 0.5)
-        calc_norm_y = float(norm_y) if norm_y is not None else (round(map_y / 1080.0, 4) if map_y > 0 else 0.5)
+        # Viewport normalizasyonu: dinamik çözünürlük desteği (1280x720, 1920x1080 vb.)
+        vw = float(kwargs.get("viewport_width") or getattr(self, "viewport_width", 0) or 0)
+        vh = float(kwargs.get("viewport_height") or getattr(self, "viewport_height", 0) or 0)
+        if vw <= 0:
+            vw = 1280.0 if (0 < map_x <= 1280 and map_y <= 720) else 1920.0
+        if vh <= 0:
+            vh = 720.0 if (0 < map_y <= 720 and map_x <= 1280) else 1080.0
+
+        calc_norm_x = float(norm_x) if norm_x is not None else (round(float(map_x) / vw, 4) if map_x > 0 else 0.5)
+        calc_norm_y = float(norm_y) if norm_y is not None else (round(float(map_y) / vh, 4) if map_y > 0 else 0.5)
+
+        existing_node_count = len(self._regions[target_region]["nodes"])
+        assigned_seq = int(seq_index) if seq_index > 0 else (existing_node_count + 1)
 
         node = NodeData(
             id=assigned_id,
@@ -1108,7 +2593,7 @@ class RouteManager:
             current_harvests=max(0, int(current_harvests if current_harvests is not None else 0)),
             source_type=str(source_type or DEFAULT_SOURCE_TYPE),
             state=str(state or "active"),
-            seq_index=int(seq_index or 0),
+            seq_index=assigned_seq,
         )
 
         self._regions[target_region]["nodes"].append(node)
@@ -1119,14 +2604,17 @@ class RouteManager:
     def get_node(self, node_id: int, region: Optional[str] = None) -> Optional[NodeData]:
         """ID ve bölgeye göre NodeData nesnesini bulur."""
         target_id = int(node_id)
-        if region and region in self._regions:
-            for node in self._regions[region]["nodes"]:
-                if node.id == target_id:
-                    return node
-            return None
+        if region:
+            canon_reg = resolve_canonical_region(region)
+            if canon_reg in self._regions:
+                for node in self._regions[canon_reg]["nodes"]:
+                    if node.id == target_id:
+                        return node
+                return None
 
         # Önce aktif bölgede ara, sonra diğer bölgelerde
-        search_order = [self.active_region] + [r for r in self._regions.keys() if r != self.active_region]
+        active_canon = resolve_canonical_region(self.active_region)
+        search_order = [active_canon] + [r for r in self._regions.keys() if r != active_canon]
         for reg_name in search_order:
             if reg_name in self._regions:
                 for node in self._regions[reg_name]["nodes"]:
@@ -1139,13 +2627,38 @@ class RouteManager:
         region_name: Optional[str] = None,
         route_name: Optional[str] = None,
     ) -> List[NodeData]:
-        """Belirtilen bölge ve rotadaki düğümlerin listesini döndürür."""
-        target_region = region_name or self.active_region
+        """
+        Belirtilen bölge ve rotadaki düğümlerin listesini döndürür.
+        Eğer 'Dredgion Crash Site', 'Safe Haven', 'Calderon Canyon' gibi bir alt bölge
+        istendiyse, kanonik üst bölgeyi ('Altgard') şeffafça yükler ve alt bölgenin
+        sınırlayıcı alanına (bounding box / center radius) veya rota etiketine göre filtreler.
+        """
+        raw_reg = region_name or self.active_region
+        canon_reg = resolve_canonical_region(raw_reg)
         target_route = route_name or self.active_route
-        if target_region not in self._regions:
+
+        if canon_reg not in self._regions:
+            self.load_region(canon_reg)
+
+        if canon_reg not in self._regions:
             return []
 
-        all_nodes: List[NodeData] = self._regions[target_region].get("nodes", [])
+        all_nodes: List[NodeData] = self._regions[canon_reg].get("nodes", [])
+
+        # Durum 1: İstenen bölge adı doğrudan bir alt bölge ise (örn: region_name="Dredgion Crash Site")
+        if is_subregion(raw_reg):
+            filtered = filter_nodes_by_subregion(all_nodes, raw_reg)
+            if target_route and target_route not in (DEFAULT_ROUTE, raw_reg):
+                route_filtered = [n for n in filtered if target_route in n.routes]
+                if route_filtered:
+                    return route_filtered
+            return filtered
+
+        # Durum 2: İstenen rota adı bir alt bölge ise (örn: region_name="Altgard", route_name="Dredgion Crash Site")
+        if target_route and is_subregion(target_route):
+            return filter_nodes_by_subregion(all_nodes, target_route)
+
+        # Durum 3: Standart rota filtreleme
         if not target_route or target_route == DEFAULT_ROUTE:
             return list(all_nodes)
         return [n for n in all_nodes if target_route in n.routes]
@@ -1161,7 +2674,7 @@ class RouteManager:
     def delete_node(self, node_id: int, region: Optional[str] = None) -> bool:
         """Düğümü bölgeden ve diskteki `patches/node_<id>.png` dosyasından siler."""
         target_id = int(node_id)
-        target_region = region or self.active_region
+        target_region = resolve_canonical_region(region or self.active_region)
         if target_region not in self._regions:
             node_found = self.get_node(target_id)
             if node_found is None:
@@ -1180,6 +2693,16 @@ class RouteManager:
             logger.warning("'%s' bölgesinde silinecek düğüm bulunamadı: #%d", target_region, target_id)
             return False
 
+        nodes_list.remove(target_node)
+        for idx, n in enumerate(nodes_list, start=1):
+            n.seq_index = idx
+        if not self.save_region(target_region):
+            nodes_list.append(target_node)
+            for idx, n in enumerate(nodes_list, start=1):
+                n.seq_index = idx
+            logger.error("Düğüm silinemedi, kayıt başarısız: %s #%d", target_region, target_id)
+            return False
+
         try:
             disk_patch = self._resolve_patch_disk_path(target_node)
             if os.path.isfile(disk_patch):
@@ -1187,9 +2710,62 @@ class RouteManager:
         except Exception as exc:
             logger.warning("Düğüm yama görseli silinemedi (#%d): %s", target_id, exc)
 
-        nodes_list.remove(target_node)
-        self.save_region(target_region)
         logger.info("Düğüm silindi: %s #%d", target_region, target_id)
+        return True
+
+    def delete_nodes(self, node_ids: List[int], region: Optional[str] = None) -> bool:
+        """Delete the given nodes and write ``region_data.json`` once.
+
+        Uses the same ``save_region`` replace as ``delete_node``. An empty id
+        list writes nothing and returns True. If ``os.replace`` fails, including
+        WinError 5, the in-memory list is restored and this returns False.
+        """
+        target_region = resolve_canonical_region(region or self.active_region)
+        wanted = []
+        seen = set()
+        for raw_id in node_ids or []:
+            try:
+                node_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if node_id not in seen:
+                seen.add(node_id)
+                wanted.append(node_id)
+        if not wanted:
+            return True
+        if target_region not in self._regions:
+            logger.warning("Silinecek bölge bulunamadı: %s", target_region)
+            return False
+
+        nodes_list: List[NodeData] = self._regions[target_region]["nodes"]
+        previous = list(nodes_list)
+        removed = [node for node in previous if node.id in seen]
+        if not removed:
+            logger.warning("'%s' bölgesinde silinecek düğüm bulunamadı.", target_region)
+            return False
+
+        nodes_list[:] = [node for node in previous if node.id not in seen]
+        for idx, n in enumerate(nodes_list, start=1):
+            n.seq_index = idx
+        if not self.save_region(target_region):
+            nodes_list[:] = previous
+            for idx, n in enumerate(nodes_list, start=1):
+                n.seq_index = idx
+            logger.error(
+                "Toplu silme kaydı başarısız (%s): %s",
+                target_region,
+                self.last_save_error,
+            )
+            return False
+
+        for node in removed:
+            try:
+                disk_patch = self._resolve_patch_disk_path(node)
+                if os.path.isfile(disk_patch):
+                    os.remove(disk_patch)
+            except Exception as exc:
+                logger.warning("Düğüm yama görseli silinemedi (#%d): %s", node.id, exc)
+        logger.info("Düğümler silindi: %s %s", target_region, [node.id for node in removed])
         return True
 
     def add_node_to_route(
@@ -1356,12 +2932,15 @@ class RouteManager:
         route: Optional[str] = None,
         rest_duration_sec: Optional[int] = None,
         rest_minutes: Optional[float] = None,
+        fallback_to_next: bool = False,
     ) -> Optional[NodeData]:
         """
         Seçili bölge ve rotadaki dinlenme süresi dolmuş (`is_ready() == True`)
         sıradaki düğümü döndürür.
         Eğer bir düğüm şu anda kısmi hasat aşamasındaysa (`1/3` veya `2/3`),
         tüm 3 hasat tamamlanana kadar o düğümde kalmaya öncelik verir.
+        `fallback_to_next=True` olduğunda tüm düğümler dinlenmede olsa bile
+        stall olmadan 1 -> 2 -> 3 -> 1... döngüsünü sürdürür.
         """
         # Geriye dönük uyumluluk: get_next_ready_node(300) şeklinde çağrıldıysa
         if isinstance(region, (int, float)) and rest_duration_sec is None:
@@ -1373,6 +2952,7 @@ class RouteManager:
         if rest_duration_sec is None and rest_minutes is not None and float(rest_minutes) > 0:
             rest_duration_sec = int(round(float(rest_minutes) * 60.0))
 
+        canon_reg = resolve_canonical_region(target_region)
         target_route = route or self.active_route
         nodes = self.get_route_nodes(region_name=target_region, route_name=target_route)
         if not nodes:
@@ -1381,33 +2961,65 @@ class RouteManager:
         now = time.time()
         ready_nodes: List[NodeData] = []
         for n in nodes:
+            if n.not_gatherable:
+                continue
             if n.is_ready(now=now, rest_duration_sec=rest_duration_sec):
                 if n.state == "resting":
                     n.state = "active"
                     n.current_harvests = 0
                 ready_nodes.append(n)
-        if not ready_nodes:
-            return None
 
         # Kısmi hasat devam eden düğüm varsa (1/3 veya 2/3), 3/3 tamamlanana kadar aynı düğümde kal
         for candidate in ready_nodes:
             if 0 < candidate.current_harvests < max(1, candidate.max_harvests):
-                key = (target_region, target_route)
+                key = (canon_reg, target_route)
                 self._last_selected_node_id[key] = candidate.id
                 return candidate
 
-        # Döngüsel sıra: son seçilen node'dan sonraki ilk hazır node'u seç
-        key = (target_region, target_route)
+        # Döngüsel sıra: rota diziliminde son seçilen node'dan bir sonraki hazır node'u seç
+        key = (canon_reg, target_route)
         last_id = self._last_selected_node_id.get(key)
-        selected = ready_nodes[0]
-        if last_id is not None:
+        node_order = [n.id for n in nodes]
+        last_pos = node_order.index(last_id) if (last_id is not None and last_id in node_order) else -1
+        selected = None
+
+        if ready_nodes:
             for candidate in ready_nodes:
-                if candidate.id > last_id:
+                cand_pos = node_order.index(candidate.id) if candidate.id in node_order else 9999
+                if cand_pos > last_pos:
                     selected = candidate
                     break
+            if selected is None:
+                selected = ready_nodes[0]
+        elif fallback_to_next and nodes:
+            # Tüm düğümler dinlenmede olsa bile stall olmadan döngüye devam et (1 -> 2 -> 3 -> 1...)
+            next_idx = (last_pos + 1) % len(nodes)
+            selected = nodes[next_idx]
 
-        self._last_selected_node_id[key] = selected.id
+        if selected is not None:
+            self._last_selected_node_id[key] = selected.id
         return selected
+
+    def get_next_node(
+        self,
+        region: Optional[Union[str, int]] = None,
+        route: Optional[str] = None,
+        rest_duration_sec: Optional[int] = None,
+        rest_minutes: Optional[float] = None,
+        fallback_to_next: bool = True,
+    ) -> Optional[NodeData]:
+        """
+        Döngüsel rota sırasındaki bir sonraki düğümü seçer.
+        Tüm düğümler dinlenmede olsa bile stall olmadan (duraklamadan)
+        1 -> 2 -> 3 -> 1... döngüsüne süresiz devam eder.
+        """
+        return self.get_next_ready_node(
+            region=region,
+            route=route,
+            rest_duration_sec=rest_duration_sec,
+            rest_minutes=rest_minutes,
+            fallback_to_next=fallback_to_next,
+        )
 
     def get_route_stats(
         self,
@@ -1460,6 +3072,9 @@ class RouteManager:
             return (0, target_default, False)
 
         target = max(1, int(node.max_harvests or target_default))
+        if node.not_gatherable:
+            logger.info("Düğüm #%d parşömen, hasat sayılmadı", int(node.id))
+            return (int(node.current_harvests), int(target), False)
         if extraction_failed:
             if node.state not in ("active", "gathering"):
                 node.state = "active"
@@ -1587,6 +3202,9 @@ class RouteManager:
         if node is None:
             logger.warning("Toplandı olarak işaretlenecek düğüm bulunamadı: #%d", int(node_id))
             return None
+        if node.not_gatherable:
+            logger.info("Düğüm #%d parşömen, toplanmış sayılmadı", int(node.id))
+            return node
 
         if not force_deplete:
             stage_rest = effective_rest_min if effective_rest_min is not None else (node.rest_duration_sec / 60.0)
@@ -1636,12 +3254,25 @@ class RouteManager:
         self,
         node_id: int,
         region: Optional[str] = None,
-        remove_after_failures: int = 0,
+        remove_after_failures: int = 3,
+        active_route: Optional[str] = None,
+        run_ai_check: bool = True,
+        **kwargs: Any,
     ) -> Optional[NodeData]:
         """
-        Düğüme ulaşılamadığında veya toplama başarısız olduğunda çağrılır.
-        `remove_after_failures > 0` ise ve ardışık hata sayısı bu eşiğe ulaşırsa
-        düğüm silinir.
+        Düğüme ulaşılamadığında veya toplama başarısız olduğunda çağrılır:
+        1. Eğer ardışık hata < 3 ise:
+           Kullanıcı İsteği: "örnek rotaya geldi ve toplanacak bişey bulamadıysa orayı rotadan çıkarsın"
+           Aktif rota (`active_route`) belirtilmişse düğümü o rotadan çıkarır (bölgeden silmez).
+           Düğümü dinlenme/başarısız moduna alır böylece bu tur atlanır.
+        2. Eğer ardışık hata >= 3 (veya >= remove_after_failures) ise:
+           Kullanıcı İsteği: "3 kere üst üste geldi ve üçündede bulamadıysa rotayı otomatik silsin
+           demekki yanlış işaretleme olduğunu anlasın yapay zekayla kontrol etsin ama bunu mutlaka
+           orayıda birdaha kesinlikle kaydetmesin blacklist kısmı olsun ayarlarda oraya blacklistleri kaydetsin"
+           - Yapay zeka ile analiz eder (verify_and_blacklist_node).
+           - Aktif öğrenme ile ExemplarMemory'ye negatif örnek olarak ekler.
+           - Koordinatları Kara Listeye (Blacklist) ekler (bir daha asla kaydedilmez).
+           - Düğümü bölgeden ve diskten kalıcı olarak siler (delete_node).
         """
         node = self.get_node(node_id, region=region)
         if node is None:
@@ -1651,17 +3282,480 @@ class RouteManager:
         node.current_harvests = 0
         node.consecutive_failures += 1
         self.consecutive_failures += 1
-        if remove_after_failures > 0 and node.consecutive_failures >= int(remove_after_failures):
+
+        effective_limit = int(remove_after_failures) if int(remove_after_failures or 0) > 0 else 3
+        curr_route = str(active_route or self.active_route or "").strip()
+
+        # Durum 1: 3 kez üst üste başarısız -> YZ İnceleme + Kara Liste + Kalıcı Silme
+        if node.consecutive_failures >= effective_limit:
             logger.warning(
-                "Düğüm #%d ardışık %d kez başarısız oldu, bölgeden siliniyor.",
+                "🚨 [3x Başarısızlık] Düğüm #%d ardışık %d kez bulunamadı! YZ kontrolü başlatılıyor ve kara listeye ekleniyor...",
                 node.id,
                 node.consecutive_failures,
             )
+            ai_diag = "empty_terrain"
+            if run_ai_check:
+                try:
+                    from core.wrong_node_scan import verify_and_blacklist_node
+                    ok, verdict, bl_entry = verify_and_blacklist_node(
+                        node=node,
+                        region=node.region,
+                        reason="3x ardışık toplama başarısızlığı (YZ yanlış işaretleme doğrulaması)",
+                        blacklist_mgr=getattr(self, "blacklist_manager", None),
+                    )
+                    ai_diag = verdict
+                    logger.warning(
+                        "🧠 [YZ Teşhisi] Düğüm #%d incelendi: %s -> Kara listeye kaydedildi.",
+                        node.id,
+                        verdict,
+                    )
+                except Exception as ai_exc:
+                    logger.error("YZ kontrolü ve kara liste ekleme hatası: %s", ai_exc)
+                    if getattr(self, "blacklist_manager", None) is not None:
+                        self.blacklist_manager.add_entry(
+                            region=node.region,
+                            map_x=node.map_x,
+                            map_y=node.map_y,
+                            norm_x=node.norm_x,
+                            norm_y=node.norm_y,
+                            reason="3x ardışık toplama hatası",
+                            source_node_id=node.id,
+                        )
+
+            # Düğümü haritadan ve diskten tamamen sil
             self.delete_node(node.id, region=node.region)
             return None
 
+        # Durum 2: 1 veya 2 kez başarısız -> "orayı rotadan çıkarsın"
+        if curr_route and curr_route != DEFAULT_ROUTE and curr_route in node.routes:
+            logger.warning(
+                "⚠️ [Rotadan Çıkarma] Düğüm #%d üzerinde kaynak bulunamadı -> '%s' rotasından çıkarıldı (Deneme: %d/%d).",
+                node.id,
+                curr_route,
+                node.consecutive_failures,
+                effective_limit,
+            )
+            self.remove_node_from_route(node.id, curr_route, region=node.region)
+        else:
+            logger.warning(
+                "⚠️ [Tur Atlandı] Düğüm #%d üzerinde kaynak bulunamadı -> Geçici dinlenmeye alındı (Deneme: %d/%d).",
+                node.id,
+                node.consecutive_failures,
+                effective_limit,
+            )
+            node.state = "resting"
+            node.last_visited_timestamp = time.time()
+
         self.save_region(node.region)
         return node
+
+    # ------------------------------------------------------------------
+    # Görsel Odometri Snap-to-Path & Rota Geometrisi
+    # ------------------------------------------------------------------
+    def snap_to_path(
+        self,
+        point: Tuple[Union[int, float], Union[int, float]],
+        region: Optional[str] = None,
+        route: Optional[str] = None,
+        max_snap_distance: float = 35.0,
+        nodes: Optional[List[NodeData]] = None,
+        closed_loop: bool = False,
+    ) -> SnapResult:
+        """
+        Görsel odometri veya anlık koordinatı en yakın rota segmentine veya düğüme hizalar (Snap-to-Path).
+
+        2D segment izdüşüm formülü:
+            P: sorgu noktası, A, B: segment uçları
+            V = B - A
+            t = clamp(((P - A) . V) / |V|^2, 0.0, 1.0)
+            Q = A + t * V
+            d = |P - Q|
+
+        Eğer d <= max_snap_distance ise:
+            snapped=True, coords=(Q.x, Q.y) döner.
+        Aksi takdirde:
+            snapped=False, orijinal coords=(P.x, P.y) döner.
+        """
+        px, py = float(point[0]), float(point[1])
+        target_region = resolve_canonical_region(region or self.active_region)
+        target_route = route or self.active_route
+
+        route_nodes = nodes
+        if route_nodes is None:
+            route_nodes = self.get_route_nodes(region_name=target_region, route_name=target_route)
+
+        if not route_nodes:
+            return SnapResult(
+                coords=(int(round(px)), int(round(py))),
+                snapped=False,
+                distance=float("inf"),
+                segment_index=None,
+                projection_t=0.0,
+                nearest_node=None,
+                nearest_node_id=None,
+            )
+
+        best_dist = float("inf")
+        best_proj = (int(round(px)), int(round(py)))
+        best_seg_idx: Optional[int] = None
+        best_t: float = 0.0
+        best_node: Optional[NodeData] = None
+
+        # 1. Tek düğüm varsa doğrudan o düğüme olan mesafeye bak
+        if len(route_nodes) == 1:
+            n = route_nodes[0]
+            d = math.hypot(px - float(n.map_x), py - float(n.map_y))
+            if d <= float(max_snap_distance):
+                return SnapResult(
+                    coords=(int(n.map_x), int(n.map_y)),
+                    snapped=True,
+                    distance=d,
+                    segment_index=0,
+                    projection_t=0.0,
+                    nearest_node=n,
+                    nearest_node_id=n.id,
+                    norm_x=n.norm_x,
+                    norm_y=n.norm_y,
+                )
+            return SnapResult(
+                coords=(int(round(px)), int(round(py))),
+                snapped=False,
+                distance=d,
+                segment_index=0,
+                projection_t=0.0,
+                nearest_node=n,
+                nearest_node_id=n.id,
+            )
+
+        # 2. Çoklu düğümlerde segment izdüşümlerini tara
+        seg_count = len(route_nodes) if closed_loop else (len(route_nodes) - 1)
+        for i in range(seg_count):
+            nA = route_nodes[i]
+            nB = route_nodes[(i + 1) % len(route_nodes)]
+            ax, ay = float(nA.map_x), float(nA.map_y)
+            bx, by = float(nB.map_x), float(nB.map_y)
+
+            dx = bx - ax
+            dy = by - ay
+            l2 = dx * dx + dy * dy
+            if l2 < 1e-6:
+                t = 0.0
+                qx = ax
+                qy = ay
+            else:
+                t = ((px - ax) * dx + (py - ay) * dy) / l2
+                t = max(0.0, min(1.0, float(t)))
+                qx = ax + t * dx
+                qy = ay + t * dy
+
+            d = math.hypot(px - qx, py - qy)
+            if d < best_dist:
+                best_dist = d
+                best_proj = (int(round(qx)), int(round(qy)))
+                best_seg_idx = i
+                best_t = t
+                best_node = nA if t < 0.5 else nB
+
+        # 3. Düğüm köşelerine olan doğrudan mesafeleri de kontrol et
+        for idx, n in enumerate(route_nodes):
+            d_v = math.hypot(px - float(n.map_x), py - float(n.map_y))
+            if d_v < best_dist:
+                best_dist = d_v
+                best_proj = (int(n.map_x), int(n.map_y))
+                best_seg_idx = idx
+                best_t = 0.0
+                best_node = n
+
+        vw = getattr(self, "viewport_width", 1920) or 1920
+        vh = getattr(self, "viewport_height", 1080) or 1080
+        calc_norm_x = round(float(best_proj[0]) / float(max(1, vw)), 4)
+        calc_norm_y = round(float(best_proj[1]) / float(max(1, vh)), 4)
+
+        if best_dist <= float(max_snap_distance):
+            return SnapResult(
+                coords=best_proj,
+                snapped=True,
+                distance=best_dist,
+                segment_index=best_seg_idx,
+                projection_t=best_t,
+                nearest_node=best_node,
+                nearest_node_id=best_node.id if best_node else None,
+                norm_x=calc_norm_x,
+                norm_y=calc_norm_y,
+            )
+
+        return SnapResult(
+            coords=(int(round(px)), int(round(py))),
+            snapped=False,
+            distance=best_dist,
+            segment_index=best_seg_idx,
+            projection_t=best_t,
+            nearest_node=best_node,
+            nearest_node_id=best_node.id if best_node else None,
+            norm_x=round(float(px) / float(max(1, vw)), 4),
+            norm_y=round(float(py) / float(max(1, vh)), 4),
+        )
+
+    def snap_odometry_position(
+        self,
+        odometry_tracker: Any = None,
+        region: Optional[str] = None,
+        route: Optional[str] = None,
+        max_snap_distance: float = 35.0,
+    ) -> Optional[SnapResult]:
+        """
+        Görsel odometri takipçisinden (Visual Odometry / Optical Flow / Minimap Tracker)
+        mevcut pozisyonu alır, aktif rotaya olan en yakın izdüşüm noktasına (snap-to-path)
+        hizalar ve eğer takipçi güncellenebilir ise sürüklenmeyi (drift) sıfırlamak için
+        takipçi koordinatlarını günceller.
+        """
+        tracker = odometry_tracker or getattr(self, "odometry_tracker", None)
+        if tracker is None:
+            return None
+
+        pos: Optional[Tuple[float, float]] = None
+        if hasattr(tracker, "get_position") and callable(tracker.get_position):
+            try:
+                opos = tracker.get_position()
+                if opos and len(opos) >= 2:
+                    pos = (float(opos[0]), float(opos[1]))
+            except Exception as exc:
+                logger.debug("tracker.get_position hatası: %s", exc)
+        elif hasattr(tracker, "get_coordinates") and callable(tracker.get_coordinates):
+            try:
+                opos = tracker.get_coordinates()
+                if opos and len(opos) >= 2:
+                    pos = (float(opos[0]), float(opos[1]))
+            except Exception as exc:
+                logger.debug("tracker.get_coordinates hatası: %s", exc)
+        elif hasattr(tracker, "map_x") and hasattr(tracker, "map_y"):
+            pos = (float(tracker.map_x), float(tracker.map_y))
+
+        if pos is None:
+            return None
+
+        snap_res = self.snap_to_path(
+            point=pos,
+            region=region,
+            route=route,
+            max_snap_distance=max_snap_distance,
+        )
+
+        if snap_res.snapped:
+            if hasattr(tracker, "set_position") and callable(tracker.set_position):
+                try:
+                    tracker.set_position(snap_res.x, snap_res.y)
+                except Exception:
+                    pass
+            elif hasattr(tracker, "update_position") and callable(tracker.update_position):
+                try:
+                    tracker.update_position(snap_res.x, snap_res.y)
+                except Exception:
+                    pass
+            else:
+                if hasattr(tracker, "map_x"):
+                    tracker.map_x = snap_res.x
+                if hasattr(tracker, "map_y"):
+                    tracker.map_y = snap_res.y
+
+        return snap_res
+
+    def interpolate_intermediate_waypoints(
+        self,
+        region: Optional[str] = None,
+        route: Optional[str] = None,
+        max_segment_distance: float = 150.0,
+        resource_type: str = "Waypoint",
+        not_gatherable: bool = True,
+        map_frame: Optional[np.ndarray] = None,
+    ) -> List[NodeData]:
+        """
+        Uzun segmentlerde (ardışık düğümler arası mesafe > max_segment_distance)
+        gezinme kaybını ve sapmaları önlemek amacıyla araya otomatik ara noktalar
+        (intermediate waypoints) ekler. seq_index değerlerini günceller ve atomik kaydeder.
+        """
+        target_region = resolve_canonical_region(region or self.active_region)
+        target_route = route or self.active_route
+        if target_region not in self._regions:
+            return []
+
+        all_region_nodes: List[NodeData] = self._regions[target_region].get("nodes", [])
+        if len(all_region_nodes) < 2:
+            return []
+
+        # İlgili rotadaki düğümleri belirle
+        if target_route and target_route != DEFAULT_ROUTE:
+            route_subnodes = [n for n in all_region_nodes if target_route in n.routes]
+        else:
+            route_subnodes = list(all_region_nodes)
+
+        if len(route_subnodes) < 2:
+            return []
+
+        max_dist = max(10.0, float(max_segment_distance))
+        vw = float(getattr(self, "viewport_width", 1920) or 1920)
+        vh = float(getattr(self, "viewport_height", 1080) or 1080)
+        created_nodes: List[NodeData] = []
+
+        # Ardışık düğümler arasında mesafe kontrolü
+        i = 0
+        while i < len(route_subnodes) - 1:
+            node_a = route_subnodes[i]
+            node_b = route_subnodes[i + 1]
+
+            d = math.hypot(node_b.map_x - node_a.map_x, node_b.map_y - node_a.map_y)
+            if d > max_dist:
+                subdivisions = int(math.ceil(d / max_dist))
+                # Ara noktaları sırayla ekle
+                insert_pos_in_region = all_region_nodes.index(node_a) + 1
+                insert_pos_in_route = i + 1
+
+                for step in range(1, subdivisions):
+                    frac = float(step) / float(subdivisions)
+                    ix = int(round(node_a.map_x + frac * (node_b.map_x - node_a.map_x)))
+                    iy = int(round(node_a.map_y + frac * (node_b.map_y - node_a.map_y)))
+                    inx = round(float(node_a.norm_x + frac * (node_b.norm_x - node_a.norm_x)), 4)
+                    iny = round(float(node_a.norm_y + frac * (node_b.norm_y - node_a.norm_y)), 4)
+
+                    new_id = self._next_node_id(target_region)
+                    patch_path = self._get_patch_rel_path(target_region, new_id)
+                    disk_patch_path = os.path.join(self._get_region_patches_dir(target_region), f"node_{new_id}.png")
+                    os.makedirs(os.path.dirname(disk_patch_path), exist_ok=True)
+
+                    if map_frame is not None and isinstance(map_frame, np.ndarray) and map_frame.size > 0:
+                        patch_img = self._extract_clean_80x80_patch(map_frame, ix, iy)
+                    else:
+                        patch_img = self._prepare_patch_image(None)
+                    _safe_imwrite(disk_patch_path, patch_img)
+
+                    routes_for_node = [target_route] if target_route and target_route != DEFAULT_ROUTE else []
+                    new_node = NodeData(
+                        id=new_id,
+                        region=target_region,
+                        routes=routes_for_node,
+                        patch_path=_normalize_path(patch_path),
+                        in_air=bool(node_a.in_air and node_b.in_air),
+                        gathered_count=0,
+                        last_visited_timestamp=0.0,
+                        rest_duration_sec=self.default_rest_sec,
+                        consecutive_failures=0,
+                        map_x=ix,
+                        map_y=iy,
+                        norm_x=inx,
+                        norm_y=iny,
+                        resource_type=str(resource_type or "Waypoint"),
+                        max_harvests=1,
+                        current_harvests=0,
+                        source_type="interpolated",
+                        state="active",
+                        not_gatherable=bool(not_gatherable),
+                    )
+
+                    all_region_nodes.insert(insert_pos_in_region, new_node)
+                    route_subnodes.insert(insert_pos_in_route, new_node)
+                    created_nodes.append(new_node)
+                    insert_pos_in_region += 1
+                    insert_pos_in_route += 1
+
+                i += (subdivisions - 1)
+            i += 1
+
+        if created_nodes:
+            for idx, n in enumerate(all_region_nodes, start=1):
+                n.seq_index = idx
+            self.save_region(target_region)
+            logger.info(
+                "Uzun segmentlerde %d ara nokta (intermediate waypoints) oluşturuldu: Bölge=%s, Rota=%s",
+                len(created_nodes),
+                target_region,
+                target_route,
+            )
+
+        return created_nodes
+
+    def deduplicate_nodes(
+        self,
+        region: Optional[str] = None,
+        route: Optional[str] = None,
+        min_distance: float = 12.0,
+    ) -> List[int]:
+        """
+        Rotadaki birbirine çok yakın (mesafe < min_distance) mükerrer düğümleri tespit eder,
+        rota üyeliklerini birleştirerek tekilleştirir, fazlalıkları diskten ve veritabanından temizler.
+        Silinen düğüm ID'lerinin listesini döndürür.
+        """
+        target_region = resolve_canonical_region(region or self.active_region)
+        target_route = route or self.active_route
+        if target_region not in self._regions:
+            return []
+
+        all_nodes: List[NodeData] = self._regions[target_region].get("nodes", [])
+        if len(all_nodes) < 2:
+            return []
+
+        min_d = max(1.0, float(min_distance))
+        kept_nodes: List[NodeData] = []
+        removed_nodes: List[NodeData] = []
+        removed_ids: List[int] = []
+
+        for candidate in all_nodes:
+            # Eğer belirli bir rota filtrelendiyse ve aday bu rotada değilse dokunma
+            if target_route and target_route != DEFAULT_ROUTE and target_route not in candidate.routes:
+                kept_nodes.append(candidate)
+                continue
+
+            # Daha önce saklanan düğümlerle yakınlık kontrolü
+            duplicate_of: Optional[NodeData] = None
+            for existing in kept_nodes:
+                if target_route and target_route != DEFAULT_ROUTE and target_route not in existing.routes:
+                    continue
+                dist = math.hypot(candidate.map_x - existing.map_x, candidate.map_y - existing.map_y)
+                if dist < min_d:
+                    duplicate_of = existing
+                    break
+
+            if duplicate_of is not None:
+                # Mükerrer düğüm tespit edildi -> Bilgileri birleştir
+                # Eğer aday toplanabilir bir kaynaksa ama existing parşömen/waypoint ise existing'i kaynağa yükselt
+                if not candidate.not_gatherable and duplicate_of.not_gatherable:
+                    duplicate_of.not_gatherable = False
+                    duplicate_of.resource_type = candidate.resource_type
+                    duplicate_of.max_harvests = candidate.max_harvests
+                # Rota etiketlerini birleştir
+                for r in candidate.routes:
+                    if r not in duplicate_of.routes:
+                        duplicate_of.routes.append(r)
+                # İstatistikleri birleştir
+                duplicate_of.gathered_count = max(duplicate_of.gathered_count, candidate.gathered_count)
+
+                removed_nodes.append(candidate)
+                removed_ids.append(candidate.id)
+            else:
+                kept_nodes.append(candidate)
+
+        if removed_ids:
+            self._regions[target_region]["nodes"] = kept_nodes
+            for idx, n in enumerate(kept_nodes, start=1):
+                n.seq_index = idx
+            self.save_region(target_region)
+
+            for rem_node in removed_nodes:
+                try:
+                    patch_file = self._resolve_patch_disk_path(rem_node)
+                    if os.path.isfile(patch_file):
+                        os.remove(patch_file)
+                except Exception as exc:
+                    logger.debug("Mükerrer düğüm görseli silinemedi (#%d): %s", rem_node.id, exc)
+
+            logger.info(
+                "Mükerrer düğüm tekilleştirme tamamlandı: %d düğüm silindi (%s), Bölge=%s, Rota=%s",
+                len(removed_ids),
+                removed_ids,
+                target_region,
+                target_route,
+            )
+
+        return removed_ids
 
     # ------------------------------------------------------------------
     # F8 Anlık Düğüm Kayıt Akışı (Minimap + Açık Harita Hibrit Destekli)
@@ -1875,6 +3969,12 @@ class RouteManager:
         use_minimap_for_f8: bool = True,
         max_harvests: int = DEFAULT_MAX_HARVESTS,
         source_type: str = DEFAULT_SOURCE_TYPE,
+        odometry_tracker: Any = None,
+        snap_to_path: bool = False,
+        snap_to_existing_path: bool = False,
+        max_snap_distance: float = 35.0,
+        min_record_distance: float = 5.0,
+        **kwargs: Any,
     ) -> NodeData:
         """
         F8 Anlık Düğüm Kayıt Akışı (Hibrit Minimap + Açık Harita):
@@ -1913,11 +4013,14 @@ class RouteManager:
                         if new_frame is not None and new_frame.size > 0:
                             frame = new_frame
 
-            # Ekran görüntüsü hala None ise sentetik güvenli 1080p kare oluştur (asla None dönme)
+            # Ekran görüntüsü hala None ise sentetik güvenli kare oluştur (asla None dönme)
             if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
-                frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+                vw = getattr(self, "viewport_width", 1920) or 1920
+                vh = getattr(self, "viewport_height", 1080) or 1080
+                frame = np.zeros((vh, vw, 3), dtype=np.uint8)
 
             h, w = frame.shape[:2]
+            self.update_viewport(w, h)
             is_full_map = self._verify_map_open(vision_engine, frame)
 
             # Özel test/vision_engine find_player_on_map sağlıyorsa öncelik ver
@@ -1933,26 +4036,120 @@ class RouteManager:
             if custom_player_pos is not None:
                 crop_x, crop_y = custom_player_pos
                 map_x, map_y = custom_player_pos
+                norm_x = round(float(map_x) / float(max(1, w)), 4)
+                norm_y = round(float(map_y) / float(max(1, h)), 4)
             elif is_full_map and not use_minimap_for_f8:
                 crop_x, crop_y = w // 2, h // 2
                 map_x, map_y = crop_x, crop_y
+                norm_x = round(float(map_x) / float(max(1, w)), 4)
+                norm_y = round(float(map_y) / float(max(1, h)), 4)
             elif is_full_map and vision_engine is not None and hasattr(vision_engine, "is_map_open"):
                 # Tam ekran harita gerçekten açıksa merkezden kırp
                 crop_x, crop_y = w // 2, h // 2
                 map_x, map_y = crop_x, crop_y
+                norm_x = round(float(map_x) / float(max(1, w)), 4)
+                norm_y = round(float(map_y) / float(max(1, h)), 4)
             else:
                 # Normal oyun ekranı (Pilgrim's Ridge / Western Altamia Highland vb.):
                 # Sağ üst Minimap (x: 0.855..0.992, y: 0.065..0.255) oyuncu oku etrafından kırp
                 crop_x, crop_y = self._locate_minimap_player_center(frame)
-                existing_count = len(self._regions.get(target_region, {}).get("nodes", []))
-                # Harita görünümü için anlamlı koordinat ata
-                if existing_count == 0:
+                existing_nodes = self._regions.get(target_region, {}).get("nodes", [])
+
+                # Gerçek odometri / dünya koordinat dönüşümü:
+                odometry_pos: Optional[Tuple[float, float, float, float]] = None
+
+                # 1. Tracker sorgusu (odometry_tracker argümanı, vision_engine veya self)
+                tracker = odometry_tracker
+                if tracker is None and vision_engine is not None:
+                    if hasattr(vision_engine, "odometry_tracker") and vision_engine.odometry_tracker is not None:
+                        tracker = vision_engine.odometry_tracker
+                    elif (
+                        hasattr(vision_engine, "auto_cartographer")
+                        and getattr(vision_engine.auto_cartographer, "odometry_tracker", None) is not None
+                    ):
+                        tracker = vision_engine.auto_cartographer.odometry_tracker
+                    elif hasattr(vision_engine, "get_odometry_position") and callable(vision_engine.get_odometry_position):
+                        try:
+                            opos = vision_engine.get_odometry_position()
+                            if opos and len(opos) >= 4:
+                                odometry_pos = (float(opos[0]), float(opos[1]), float(opos[2]), float(opos[3]))
+                            elif opos and len(opos) >= 2:
+                                odometry_pos = (
+                                    float(opos[0]),
+                                    float(opos[1]),
+                                    round(float(opos[0]) / float(w), 4),
+                                    round(float(opos[1]) / float(h), 4),
+                                )
+                        except Exception as o_exc:
+                            logger.debug("vision_engine.get_odometry_position hatası: %s", o_exc)
+
+                if tracker is None and getattr(self, "odometry_tracker", None) is not None:
+                    tracker = self.odometry_tracker
+
+                if odometry_pos is None and tracker is not None:
+                    try:
+                        if hasattr(tracker, "get_position") and callable(tracker.get_position):
+                            opos = tracker.get_position()
+                            if opos and len(opos) >= 4:
+                                odometry_pos = (float(opos[0]), float(opos[1]), float(opos[2]), float(opos[3]))
+                        elif hasattr(tracker, "map_x") and hasattr(tracker, "map_y"):
+                            ox, oy = float(tracker.map_x), float(tracker.map_y)
+                            odometry_pos = (
+                                ox,
+                                oy,
+                                round(ox / float(max(1, w)), 4),
+                                round(oy / float(max(1, h)), 4),
+                            )
+                    except Exception as o_exc:
+                        logger.debug("Odometry tracker get_position hatası: %s", o_exc)
+
+                # 2. Koordinat belirleme
+                if odometry_pos is not None:
+                    map_x = int(round(odometry_pos[0]))
+                    map_y = int(round(odometry_pos[1]))
+                    norm_x = float(odometry_pos[2])
+                    norm_y = float(odometry_pos[3])
+                elif not existing_nodes:
+                    # İlk düğüm: ekran/harita merkezini referans al
                     map_x, map_y = w // 2, h // 2
+                    norm_x = round(float(map_x) / float(max(1, w)), 4)
+                    norm_y = round(float(map_y) / float(max(1, h)), 4)
                 else:
-                    angle = float(existing_count) * 0.65
-                    radius = min(320.0, 45.0 + existing_count * 12.0)
-                    map_x = int(np.clip(round((w * 0.5) + math.cos(angle) * radius), 80, max(81, w - 80)))
-                    map_y = int(np.clip(round((h * 0.5) + math.sin(angle) * radius), 80, max(81, h - 80)))
+                    # Mevcut düğümler varsa: son düğümün konumu ve minimap optik kayması (phase correlate)
+                    last_node = existing_nodes[-1]
+                    prev_patch_path = self._resolve_patch_disk_path(last_node)
+                    prev_patch = _safe_imread_gray(prev_patch_path) if os.path.isfile(prev_patch_path) else None
+
+                    curr_patch = self._extract_clean_80x80_patch(frame, crop_x, crop_y)
+                    shift_dx, shift_dy = 0.0, 0.0
+                    if prev_patch is not None and prev_patch.size > 0 and curr_patch.size > 0:
+                        try:
+                            (pc_dx, pc_dy), resp = cv2.phaseCorrelate(
+                                np.float32(prev_patch), np.float32(curr_patch)
+                            )
+                            if float(resp) >= 0.15:
+                                scale = max(1.0, float(self.meters_per_pixel) * 4.0)
+                                shift_dx = -float(pc_dx) * scale
+                                shift_dy = -float(pc_dy) * scale
+                        except Exception as pc_exc:
+                            logger.debug("Minimap faz korelasyonu hatası: %s", pc_exc)
+
+                    if abs(shift_dx) > 0.01 or abs(shift_dy) > 0.01:
+                        calc_x = float(last_node.map_x) + shift_dx
+                        calc_y = float(last_node.map_y) + shift_dy
+                    else:
+                        # Faz korelasyonu sıfırsa minimap içi oyuncu oku ofsetini kullan
+                        default_cx = float(round(w * 0.923))
+                        default_cy = float(round(h * 0.165))
+                        off_dx = (float(crop_x) - default_cx) * 2.0
+                        off_dy = (float(crop_y) - default_cy) * 2.0
+                        calc_x = float(last_node.map_x) + off_dx
+                        calc_y = float(last_node.map_y) + off_dy
+
+                    map_x = int(np.clip(round(calc_x), 40, max(41, w - 40)))
+                    map_y = int(np.clip(round(calc_y), 40, max(41, h - 40)))
+                    norm_x = round(float(map_x) / float(max(1, w)), 4)
+                    norm_y = round(float(map_y) / float(max(1, h)), 4)
 
             patch_80 = self._extract_clean_80x80_patch(frame, crop_x, crop_y)
 
@@ -1960,8 +4157,70 @@ class RouteManager:
                 self._send_map_key(input_ctrl)
                 map_opened_by_us = False
 
-            norm_x = round(float(map_x) / float(max(1, w)), 4)
-            norm_y = round(float(map_y) / float(max(1, h)), 4)
+            # Snap-to-path kontrolü
+            do_snap = bool(
+                snap_to_path
+                or snap_to_existing_path
+                or kwargs.get("snap_to_path", False)
+                or kwargs.get("snap_to_existing_path", False)
+            )
+            if do_snap:
+                snap_dist = float(kwargs.get("max_snap_distance", max_snap_distance))
+                snap_res = self.snap_to_path(
+                    point=(map_x, map_y),
+                    region=target_region,
+                    route=target_route,
+                    max_snap_distance=snap_dist,
+                )
+                if snap_res.snapped:
+                    logger.info(
+                        "[F8] Konum rotaya hizalandı (Snap-to-path): (%d, %d) -> (%d, %d) [Mesafe: %.1fpx]",
+                        map_x,
+                        map_y,
+                        snap_res.x,
+                        snap_res.y,
+                        snap_res.distance,
+                    )
+                    map_x, map_y = snap_res.x, snap_res.y
+                    norm_x = round(float(map_x) / float(max(1, w)), 4)
+                    norm_y = round(float(map_y) / float(max(1, h)), 4)
+
+            # Kara liste (Blacklist) kontrolü: Engellenmiş koordinat (her zaman mükerrer kontrolünden önce yapılmalı)
+            if getattr(self, "blacklist_manager", None) is not None:
+                is_bl, bl_entry = self.blacklist_manager.is_blacklisted(
+                    region=target_region,
+                    map_x=map_x,
+                    map_y=map_y,
+                    norm_x=norm_x,
+                    norm_y=norm_y,
+                )
+                if is_bl:
+                    logger.warning(
+                        "⛔ [F8 KAYIT ENGELİ] Bu konum (%d, %d) kara listede (Blacklist)! Kayıt yapılmadı (Neden: %s).",
+                        map_x,
+                        map_y,
+                        bl_entry.reason if bl_entry else "Blacklisted",
+                    )
+                    _play_beep(600, 200)
+                    return None
+
+            # Mükerrer / çok yakın F8 basma engeli
+            effective_min_dist = float(kwargs.get("min_record_distance", min_record_distance))
+            allow_dup = bool(kwargs.get("allow_duplicate", False))
+            if effective_min_dist > 0.0 and not allow_dup:
+                existing_for_dup = self.get_route_nodes(region_name=target_region, route_name=target_route)
+                if existing_for_dup:
+                    last_n = existing_for_dup[-1]
+                    d_dup = math.hypot(map_x - last_n.map_x, map_y - last_n.map_y)
+                    if d_dup < effective_min_dist:
+                        logger.info(
+                            "[F8] Düğüm #%d ile çok yakın mesafe (%.1fpx < %.1fpx), mükerrer F8 kaydı atlandı.",
+                            last_n.id,
+                            d_dup,
+                            effective_min_dist,
+                        )
+                        _play_beep(900, 100)
+                        return last_n
 
             node = self.add_node(
                 region=target_region,
@@ -1976,7 +4235,14 @@ class RouteManager:
                 max_harvests=max(1, int(max_harvests or DEFAULT_MAX_HARVESTS)),
                 current_harvests=0,
                 source_type=str(source_type or DEFAULT_SOURCE_TYPE),
+                viewport_width=w,
+                viewport_height=h,
             )
+
+            if node is None:
+                logger.warning("[F8] Düğüm oluşturulamadı veya kara liste engeline takıldı.")
+                _play_beep(600, 200)
+                return None
 
             _play_beep(1200, 150)
             logger.info(
@@ -1995,19 +4261,23 @@ class RouteManager:
             logger.warning("F8 Düğüm kaydı yedek mod ile tamamlanıyor: %s", exc)
             if map_opened_by_us and input_ctrl is not None:
                 self._send_map_key(input_ctrl)
+            vw = getattr(self, "viewport_width", 1920) or 1920
+            vh = getattr(self, "viewport_height", 1080) or 1080
             fallback_node = self.add_node(
                 region=target_region,
                 route=target_route,
                 patch_img=None,
                 in_air=bool(in_air),
-                map_x=960,
-                map_y=540,
+                map_x=vw // 2,
+                map_y=vh // 2,
                 norm_x=0.5,
                 norm_y=0.5,
                 resource_type=resource_type,
                 max_harvests=max(1, int(max_harvests or DEFAULT_MAX_HARVESTS)),
                 current_harvests=0,
                 source_type=str(source_type or DEFAULT_SOURCE_TYPE),
+                viewport_width=vw,
+                viewport_height=vh,
             )
             logger.info(
                 "[F8] Konum başarıyla kaydedildi (Node #%d, %dx Toplama)",
@@ -2097,8 +4367,10 @@ class RouteManager:
             open_map_frame = self._grab_frame_from_vision(vision_engine)
 
         if open_map_frame is None or not isinstance(open_map_frame, np.ndarray) or open_map_frame.size == 0:
-            fallback_x = int(resolved_node.map_x if resolved_node.map_x > 0 else round(resolved_node.norm_x * 1920))
-            fallback_y = int(resolved_node.map_y if resolved_node.map_y > 0 else round(resolved_node.norm_y * 1080))
+            vw = getattr(self, "viewport_width", 1920) or 1920
+            vh = getattr(self, "viewport_height", 1080) or 1080
+            fallback_x = int(resolved_node.map_x if resolved_node.map_x > 0 else round(resolved_node.norm_x * vw))
+            fallback_y = int(resolved_node.map_y if resolved_node.map_y > 0 else round(resolved_node.norm_y * vh))
             under_ov = self._is_point_in_overlay(fallback_x, fallback_y, overlay_rect)
             if under_ov:
                 logger.warning("Node %d is under the overlay panel", resolved_node.id)
@@ -2120,6 +4392,7 @@ class RouteManager:
             map_gray = open_map_frame
 
         map_h, map_w = map_gray.shape[:2]
+        self.update_viewport(map_w, map_h)
         target_x: int = 0
         target_y: int = 0
         confidence: float = 0.0
@@ -2233,6 +4506,9 @@ class RouteManager:
             under_overlay=under_overlay,
             used_fallback=used_fallback,
         )
+
+    # Geriye dönük uyumluluk ve alternatif arayüzler için alias
+    find_node_on_map = locate_node_on_open_map
 
     # ------------------------------------------------------------------
     # Rota Paylaşımı (ZIP Export / Import)
@@ -2428,7 +4704,17 @@ from core.navigation_intel import PartialNodeDetector, handle_extraction_failure
 
 
 def get_route_manager_capabilities() -> list:
-    return ["route_manager", "node_persistence", "diagnostic_snapshot"]
+    return [
+        "route_manager",
+        "node_persistence",
+        "diagnostic_snapshot",
+        "snap_to_path",
+        "odometry_snap",
+        "intermediate_waypoints",
+        "deduplicate_nodes",
+        "sequence_indexing",
+        "atomic_persistence",
+    ]
 
 
 def validate_route_manager_contract() -> bool:

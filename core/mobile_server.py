@@ -28,6 +28,7 @@ import select
 import socket
 import string
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -71,9 +72,11 @@ ALLOWED_REMOTE_KEYS = {
     "2",
     "3",
     "4",
+    "5",
     "q",
     "r",
     "v",
+    "alt",
     "f8",
     "f9",
 }
@@ -1181,7 +1184,23 @@ class MobileRemoteServer:
             return "gather"
         if m in ("explore", "explorer", "explorer_mode", "auto_cartography"):
             return "explore"
+        if m in ("combat", "combat_mode", "fight", "savas", "savaş"):
+            return "combat"
         return "route"
+
+    @staticmethod
+    def _bot_is_elevated() -> bool:
+        try:
+            from core.uac_elevator import is_admin
+
+            return bool(is_admin())
+        except Exception:
+            try:
+                import ctypes as _ct
+
+                return bool(_ct.windll.shell32.IsUserAnAdmin() != 0)
+            except Exception:
+                return False
 
     @staticmethod
     def _is_node_quarantined_or_failed(node: Any) -> bool:
@@ -1539,6 +1558,8 @@ class MobileRemoteServer:
                 "system_ram_pct": round(float(system_ram_pct), 1),
                 "watchdog_healthy": bool(watchdog_healthy),
                 "input_backend": input_backend,
+                "bot_elevated": bool(self._bot_is_elevated()),
+                "uipi_risk": (not bool(self._bot_is_elevated())),
             },
             "telemetry": {
                 "minimap_auto_recorded": int(minimap_mapped_count),
@@ -2243,6 +2264,8 @@ class MobileRemoteServer:
                     internal_mode = "auto_record" if req_mode != "manual_record" else "manual_record"
                 elif req_mode in ("explore", "explorer", "explorer_mode", "auto_cartography"):
                     internal_mode = "explorer"
+                elif req_mode in ("combat", "combat_mode", "savas", "savaş", "fight"):
+                    internal_mode = "combat"
                 else:
                     internal_mode = "route"
 
@@ -2533,9 +2556,21 @@ class MobileRemoteServer:
                         "error": f"Geçersiz veya izin verilmeyen tuş: '{raw_key}'",
                     }
 
-                hold_sec = 0.06
+                hold_sec = 0.12
                 if ic is not None and hasattr(ic, "press_key"):
-                    hold_sec = float(ic.press_key(clean_key) or 0.06)
+                    try:
+                        hold_sec = float(
+                            ic.press_key(
+                                clean_key,
+                                min_hold=0.12,
+                                max_hold=0.20,
+                                release_mouse=True,
+                                post_to_window=False,
+                            )
+                            or 0.12
+                        )
+                    except TypeError:
+                        hold_sec = float(ic.press_key(clean_key) or 0.12)
                 logger.info("[Mobil Müdahale] Uzaktan tuş gönderildi: '%s' (%.1fms)", clean_key, hold_sec * 1000.0)
                 self.notify_stream_listeners()
                 return {
@@ -2812,6 +2847,291 @@ class MobileRemoteServer:
                     "ok": True,
                     "action": action,
                     "message": msg,
+                }
+
+            # 15. SOFT_AIM — mouse-only target acquire (Tab inject often filtered)
+            if action in ("soft_aim", "soft_aim_click", "mouse_aim"):
+                if ic is None or not hasattr(ic, "soft_aim_click"):
+                    return {"ok": False, "error": "soft_aim_click yok (input driver)"}
+                frame = None
+                try:
+                    if orch is not None and hasattr(orch, "state_machine"):
+                        sm = orch.state_machine
+                        grab = getattr(sm, "_grab_frame", None)
+                        if callable(grab):
+                            frame = grab(grayscale=False)
+                except Exception as exc:
+                    logger.debug("soft_aim frame grab: %s", exc)
+                ok = bool(ic.soft_aim_click(frame=frame))
+                logger.info("[Mobil Müdahale] soft_aim ok=%s", ok)
+                self.notify_stream_listeners()
+                return {
+                    "ok": ok,
+                    "action": "soft_aim",
+                    "message": "Mouse-only soft-aim gönderildi." if ok else "soft_aim başarısız",
+                }
+
+            # 15b. CAST_SKILL — prefer Alt+skillbar when soft keyboard untrusted
+            if action in ("cast_skill", "skill_cast", "alt_skill"):
+                slot = str(payload.get("slot", payload.get("key", payload.get("skill", "1"))) or "1").strip()
+                force_alt = bool(payload.get("force_alt", action == "alt_skill"))
+                wkr = w if w is not None else self.worker
+                frame = None
+                try:
+                    grab = getattr(wkr, "_grab_frame", None) if wkr is not None else None
+                    if callable(grab):
+                        frame = grab(grayscale=False)
+                except Exception as exc:
+                    logger.debug("cast_skill frame grab: %s", exc)
+                bus = getattr(wkr, "action_bus", None) if wkr is not None else None
+                reader = (
+                    getattr(wkr, "skill_bar_monitor", None)
+                    if wkr is not None
+                    else None
+                )
+                if reader is None and orch is not None:
+                    reader = getattr(orch, "skill_bar_monitor", None)
+                if bus is None or not hasattr(bus, "cast_skill"):
+                    # Direct Alt+click via skill bar reader + input driver
+                    if ic is None or reader is None or not hasattr(reader, "slot_center_px"):
+                        return {
+                            "ok": False,
+                            "error": "cast_skill yolu yok (bus/reader)",
+                            "has_bus": bus is not None,
+                            "has_reader": reader is not None,
+                            "has_ic": ic is not None,
+                        }
+                    if frame is None:
+                        return {"ok": False, "error": "frame yok — skillbar koordinatı hesaplanamadı"}
+                    point = reader.slot_center_px(frame, slot)
+                    if point is None:
+                        return {"ok": False, "error": f"slot_center_px yok: {slot}"}
+                    x, y = int(point[0]), int(point[1])
+                    alt = getattr(ic, "cast_skill_alt_click", None)
+                    if not callable(alt):
+                        return {"ok": False, "error": "cast_skill_alt_click yok"}
+                    ok = bool(alt(x, y))
+                    logger.info("[Mobil Müdahale] cast_skill direct alt '%s' @(%d,%d) ok=%s", slot, x, y, ok)
+                    self.notify_stream_listeners()
+                    return {
+                        "ok": ok,
+                        "action": "cast_skill",
+                        "slot": slot,
+                        "method": "alt_ui_click",
+                        "x": x,
+                        "y": y,
+                        "message": f"Alt+skillbar '{slot}' @({x},{y})" if ok else "Alt+skillbar başarısız",
+                    }
+                if force_alt:
+                    # Temporarily treat keyboard as untrusted for this cast.
+                    prev = getattr(bus, "_keyboard_trusted", None)
+                    try:
+                        bus._keyboard_trusted = lambda: False  # type: ignore[method-assign]
+                    except Exception:
+                        pass
+                    try:
+                        cast_res = bus.cast_skill(slot, frame=frame)
+                    finally:
+                        if prev is not None:
+                            try:
+                                bus._keyboard_trusted = prev  # type: ignore[method-assign]
+                            except Exception:
+                                pass
+                else:
+                    cast_res = bus.cast_skill(slot, frame=frame)
+                logger.info("[Mobil Müdahale] cast_skill %s => %s", slot, cast_res)
+                self.notify_stream_listeners()
+                return {
+                    "ok": bool((cast_res or {}).get("ok")),
+                    "action": "cast_skill",
+                    "slot": slot,
+                    "method": (cast_res or {}).get("method"),
+                    "x": (cast_res or {}).get("x"),
+                    "y": (cast_res or {}).get("y"),
+                    "result": cast_res,
+                    "message": f"Skill '{slot}' method={(cast_res or {}).get('method')}",
+                }
+
+            # 15c. TAB_TARGET — optional soft_aim; distinguishes key vs mouse lock
+            if action in ("tab_target", "press_tab_target"):
+                soft = bool(payload.get("soft_aim", payload.get("soft", True)))
+                wkr = w if w is not None else self.worker
+                frame = None
+                try:
+                    grab = getattr(wkr, "_grab_frame", None) if wkr is not None else None
+                    if callable(grab):
+                        frame = grab(grayscale=False)
+                except Exception as exc:
+                    logger.debug("tab_target frame grab: %s", exc)
+                bus = getattr(wkr, "action_bus", None) if wkr is not None else None
+                if bus is None or not hasattr(bus, "press_tab_target"):
+                    return {
+                        "ok": False,
+                        "error": "press_tab_target yok",
+                        "has_worker": wkr is not None,
+                        "has_bus": bus is not None,
+                    }
+                tab_res = bus.press_tab_target(frame=frame, soft_aim=soft)
+                logger.info("[Mobil Müdahale] tab_target soft_aim=%s => %s", soft, tab_res)
+                self.notify_stream_listeners()
+                return {
+                    "ok": bool((tab_res or {}).get("ok")),
+                    "action": "tab_target",
+                    "soft_aim": soft,
+                    "method": (tab_res or {}).get("method"),
+                    "result": tab_res,
+                    "message": f"Tab target method={(tab_res or {}).get('method')}",
+                }
+
+            # 16. NUDGE_CAMERA — relative mouse-look (no absolute teleport)
+            if action in ("nudge_camera", "nudge", "look"):
+                if ic is None or not hasattr(ic, "nudge_camera"):
+                    return {"ok": False, "error": "nudge_camera yok"}
+                dx = int(payload.get("dx", payload.get("x", 0)) or 0)
+                dy = int(payload.get("dy", payload.get("y", 0)) or 0)
+                dx = max(-200, min(200, dx))
+                dy = max(-200, min(200, dy))
+                ok = bool(ic.nudge_camera(dx, dy))
+                logger.info("[Mobil Müdahale] nudge_camera dx=%d dy=%d ok=%s", dx, dy, ok)
+                return {
+                    "ok": ok,
+                    "action": "nudge_camera",
+                    "dx": dx,
+                    "dy": dy,
+                    "message": f"Kamera nudge ({dx},{dy})",
+                }
+
+            # 17a. ELEVATE — ShellExecute runas (shows UAC). Required when Steam/AION2 is High.
+            if action in ("elevate", "runas", "admin"):
+                if self._bot_is_elevated():
+                    return {
+                        "ok": True,
+                        "action": "elevate",
+                        "elevated": True,
+                        "message": "Bot zaten yönetici (elevated).",
+                    }
+                logger.warning("[Mobil Müdahale] elevate: UAC runas isteniyor.")
+
+                def _do_elevate() -> None:
+                    try:
+                        from core.uac_elevator import ensure_admin_elevation
+
+                        ensure_admin_elevation(
+                            argv=[os.path.join(PROJECT_ROOT, "main.py")],
+                            working_dir=PROJECT_ROOT,
+                            dry_run=False,
+                            exit_on_elevate=True,
+                        )
+                    except Exception as exc:
+                        logger.error("elevate hatası: %s", exc)
+                    try:
+                        time.sleep(1.0)
+                        os._exit(0)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_do_elevate, name="MobileElevate", daemon=True).start()
+                return {
+                    "ok": True,
+                    "action": "elevate",
+                    "elevated": False,
+                    "message": "UAC açılmalı — Evet deyin. Medium bot High AION2'ye UIPI yüzünden tuş/fare gönderemez.",
+                }
+
+            # 17. RESTART — elevated self-relaunch (no second UAC if already admin)
+            if action in ("restart", "reload", "relauch", "relaunch"):
+                logger.warning("[Mobil Müdahale] Uzaktan yeniden başlatma isteği alındı.")
+                orch = self.orchestrator
+                project_dir = os.environ.get("GATHERION_HOME") or os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))
+                )
+                main_py = os.path.join(project_dir, "main.py")
+                py_exe = sys.executable
+                # Prefer pythonw twin of current interpreter.
+                if py_exe.lower().endswith("python.exe"):
+                    twin = py_exe[:-10] + "pythonw.exe"
+                    if os.path.isfile(twin):
+                        py_exe = twin
+
+                def _do_restart() -> None:
+                    try:
+                        from PyQt6.QtWidgets import QApplication
+
+                        app = QApplication.instance()
+                        if app is not None:
+                            app.quit()
+                    except Exception as exc:
+                        logger.debug("QApplication.quit atlandı: %s", exc)
+                    try:
+                        if orch is not None and hasattr(orch, "shutdown"):
+                            orch.shutdown()
+                    except Exception as exc:
+                        logger.error("Uzaktan shutdown hatası: %s", exc)
+                    time.sleep(1.0)
+                    try:
+                        creationflags = 0
+                        if sys.platform.startswith("win"):
+                            creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+                                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+                            )
+                        env = os.environ.copy()
+                        env["PYTHONPATH"] = project_dir + os.pathsep + env.get("PYTHONPATH", "")
+                        subprocess.Popen(
+                            [py_exe, main_py],
+                            cwd=project_dir,
+                            env=env,
+                            close_fds=True,
+                            creationflags=creationflags,
+                        )
+                        logger.warning(
+                            "[Mobil Müdahale] Yeni süreç başlatıldı: %s %s", py_exe, main_py
+                        )
+                    except Exception as exc:
+                        logger.error("Yeniden başlatma spawn hatası: %s", exc)
+                    time.sleep(0.8)
+                    try:
+                        os._exit(0)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_do_restart, name="MobileRestart", daemon=True).start()
+                return {
+                    "ok": True,
+                    "action": "restart",
+                    "message": "Gatherion yeniden başlatılıyor (elevated self-spawn)...",
+                }
+
+            # 18. QUIT / EXIT / SHUTDOWN — remote process exit (for elevated restart)
+            if action in ("quit", "exit", "shutdown"):
+                logger.warning("[Mobil Müdahale] Uzaktan kapatma isteği alındı.")
+                orch = self.orchestrator
+
+                def _do_quit() -> None:
+                    try:
+                        from PyQt6.QtWidgets import QApplication
+
+                        app = QApplication.instance()
+                        if app is not None:
+                            # Thread-safe; drains main loop so overlay/shutdown can run.
+                            app.quit()
+                    except Exception as exc:
+                        logger.debug("QApplication.quit atlandı: %s", exc)
+                    try:
+                        if orch is not None and hasattr(orch, "shutdown"):
+                            orch.shutdown()
+                    except Exception as exc:
+                        logger.error("Uzaktan shutdown hatası: %s", exc)
+                    time.sleep(1.5)
+                    try:
+                        os._exit(0)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_do_quit, name="MobileQuit", daemon=True).start()
+                return {
+                    "ok": True,
+                    "action": "quit",
+                    "message": "Gatherion kapatılıyor...",
                 }
 
             return {"ok": False, "error": f"Bilinmeyen aksiyon: '{action}'"}
