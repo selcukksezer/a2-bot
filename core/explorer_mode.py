@@ -205,6 +205,8 @@ class ExplorerModeController:
         reflex: Optional[Any] = None,
         yolo_detector: Optional[Any] = None,
         perception_hub: Optional[Any] = None,
+        dataset_factory: Optional[Any] = None,
+        heartbeat_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         self.route_manager: RouteManager = route_manager or RouteManager()
         if region:
@@ -247,6 +249,8 @@ class ExplorerModeController:
         self.reflex: Optional[Any] = reflex
         self.yolo_detector: Optional[Any] = yolo_detector
         self.perception_hub: Optional[Any] = perception_hub
+        self.dataset_factory: Optional[Any] = dataset_factory
+        self.heartbeat_callback: Optional[Callable[[], None]] = heartbeat_callback
 
         # Sıralı rota düğüm listesi ve iç durum sayaçları
         self._ordered_nodes: List[NodeData] = []
@@ -2012,6 +2016,11 @@ class ExplorerModeController:
         wait_budget = max(0.15, float(self.cast_wait_sec))
         deadline = time.time() + wait_budget
         while time.time() < deadline:
+            if self.heartbeat_callback is not None and callable(self.heartbeat_callback):
+                try:
+                    self.heartbeat_callback()
+                except Exception:
+                    pass
             time.sleep(min(0.12, max(0.02, deadline - time.time())))
             if frame_provider is not None and callable(frame_provider):
                 try:
@@ -2111,6 +2120,23 @@ class ExplorerModeController:
                 self._total_gathered_in_explorer += 1
                 stage_label = f"{completed_stages}/{target_harvests}"
                 stages_log.append(stage_label)
+
+                # Trigger Self-Training YOLO Dataset Factory (Time Machine t - 2.0s capture)
+                df = getattr(self, "dataset_factory", None)
+                if df is not None and hasattr(df, "on_gather_success"):
+                    try:
+                        resolved_mat = ""
+                        if nearest_node is not None and getattr(nearest_node, "resource_type", None):
+                            resolved_mat = str(nearest_node.resource_type)
+                        elif getattr(self, "_last_steer_target", None):
+                            resolved_mat = str(self._last_steer_target.get("material_type", ""))
+                        df.on_gather_success(
+                            material_name=resolved_mat,
+                            harvest_stage=completed_stages,
+                            max_harvests=target_harvests,
+                        )
+                    except Exception as df_exc:
+                        logger.debug("[ExplorerMode] Dataset factory on_gather_success skipped: %s", df_exc)
 
                 if nearest_node is not None:
                     if hasattr(self.route_manager, "record_harvest_stage"):

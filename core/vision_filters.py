@@ -444,7 +444,7 @@ class FeatherNegativeFilter:
             and rot_aspect >= self.min_elongated_aspect
         ):
             is_feather = True
-        elif rot_aspect >= 2.45 and area >= 85.0 and solidity >= 0.70:
+        elif rot_aspect >= 2.45 and area >= 85.0 and solidity >= 0.70 and f_ncc >= 0.40:
             is_feather = True
         else:
             is_feather = False

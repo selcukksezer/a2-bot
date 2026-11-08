@@ -1,8 +1,8 @@
 {
   "step": 1,
-  "trained": true,
-  "validated": true,
-  "published": true,
+  "trained": false,
+  "validated": false,
+  "published": false,
   "scanned": true,
   "imbalance_fixed": false,
   "frozen": true,
@@ -26,5 +26,8 @@
       "results_csv": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16\\results.csv"
     }
   },
-  "train_completed_at": "2026-11-08T11:33:17"
+  "train_completed_at": "2026-11-08T11:33:17",
+  "model_stale": true,
+  "stale_reason": "Etiketler güncellendi: gather_t2s_aria_s1_9743714_0001_aug06_night_fog_hflip (train)",
+  "stale_at": "2026-11-08T12:22:24.850215"
 }

@@ -12,15 +12,18 @@ import ctypes
 from ctypes import wintypes
 import datetime
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger("Gatherion.DPIFocusGuard")
 
 
 # ============================================================================
@@ -460,12 +463,14 @@ class ForegroundFocusGuard:
 
     DEFAULT_ALLOWED_TITLE_KEYWORDS = (
         "aion",
+        "aion2",
         "ncsoft",
         "purple",
         "unrealwindow",
         "game",
         "rise",
         "client",
+        "아이온",
     )
 
     DEFAULT_BLOCKED_APPS = (
@@ -491,6 +496,9 @@ class ForegroundFocusGuard:
         "program manager",
         "desktop",
         "masaüstü",
+        "steam",
+        "taskview",
+        "cortana",
     )
 
     def __init__(
@@ -511,6 +519,16 @@ class ForegroundFocusGuard:
         self._suppressed_keystroke_count: int = 0
         self._last_focus_loss_reason: str = ""
         self._last_check_latency_ms: float = 0.0
+        self._verified_game_pids: set[int] = set()
+        self._own_pid: int = os.getpid()
+
+        # Monitoring thread state
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_stop_event = threading.Event()
+        self._on_focus_lost_cb: Optional[Callable[[str], None]] = None
+        self._on_focus_gained_cb: Optional[Callable[[str], None]] = None
+        self._monitor_interval_sec: float = 0.05
+        self._monitor_allow_gatherion: bool = True
 
         # Pre-bind Win32 ctypes signatures for < 0.05ms execution
         self._has_win32 = os.name == "nt" and hasattr(ctypes, "windll")
@@ -530,6 +548,17 @@ class ForegroundFocusGuard:
             self._GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
             self._GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
             self._GetWindowThreadProcessId.restype = wintypes.DWORD
+
+    def register_game_pids(self, pids: Sequence[int]) -> None:
+        """Dynamically registers active game PIDs (e.g. from find_aion_game_processes)."""
+        for p in pids:
+            try:
+                val = int(p)
+                if val > 0:
+                    self.allowed_pids.add(val)
+                    self._verified_game_pids.add(val)
+            except (ValueError, TypeError):
+                pass
 
     def set_simulated_foreground_window(self, title: Optional[str], pid: Optional[int] = None) -> None:
         """Used by unit tests and dry-run simulator to emulate Alt-Tab focus transitions."""
@@ -551,6 +580,16 @@ class ForegroundFocusGuard:
             return 0, 0, ""
 
         hwnd = int(self._GetForegroundWindow() or 0)
+        if not hwnd and self._has_win32:
+            try:
+                desk = ctypes.windll.user32.OpenInputDesktop(0, False, 0x0100)
+                if desk:
+                    ctypes.windll.user32.SetThreadDesktop(desk)
+                    hwnd = int(self._GetForegroundWindow() or 0)
+                    ctypes.windll.user32.CloseDesktop(desk)
+            except Exception:
+                pass
+
         if not hwnd:
             self._last_check_latency_ms = (time.perf_counter() - t0) * 1000.0
             return 0, 0, ""
@@ -570,11 +609,13 @@ class ForegroundFocusGuard:
         self._last_check_latency_ms = (time.perf_counter() - t0) * 1000.0
         return hwnd, pid, title
 
-    def is_game_window_focused(self) -> Tuple[bool, str]:
+    def is_game_window_focused(self, allow_gatherion_ui: bool = True) -> Tuple[bool, str]:
         """
         Returns `(is_focused, active_window_description)` in `< 0.1ms`.
         Immediately returns `False` if the foreground window is empty, matches a blocked non-game app
         (Discord, Chrome, Explorer, etc.), or does not match the allowed game title/PID criteria.
+        If `allow_gatherion_ui=True`, Gatherion's own window is treated as allowed so clicking HUD
+        buttons does not falsely trigger an Alt-Tab pause.
         """
         hwnd, pid, title = self.query_foreground_window_info()
         if (hwnd == 0 or not title.strip()) and self._simulated_foreground_title is None:
@@ -586,8 +627,13 @@ class ForegroundFocusGuard:
             self._last_focus_loss_reason = f"Masaüstü odakta: '{title or '<Desktop>'}' (PID={pid})"
             return False, self._last_focus_loss_reason
 
-        # 1. Explicit PID match (if registered)
-        if self.allowed_pids and pid in self.allowed_pids:
+        # 0. Gatherion internal UI exemption (Overlay HUD, F9 Menu, Settings)
+        if allow_gatherion_ui:
+            if pid == self._own_pid or "gatherion" in title_lower:
+                return True, f"Gatherion UI: '{title}' (PID={pid})"
+
+        # 1. Explicit PID match (if registered or verified)
+        if (self.allowed_pids and pid in self.allowed_pids) or (pid in self._verified_game_pids):
             return True, f"{title} (PID={pid})"
 
         # 2. Immediate blocklist check (Discord, Chrome, Explorer, IDE, etc.)
@@ -599,13 +645,81 @@ class ForegroundFocusGuard:
         # 3. Allowed game title keyword match
         for kw in self.allowed_title_keywords:
             if kw in title_lower:
+                if pid > 0:
+                    self._verified_game_pids.add(pid)
                 return True, f"{title} (PID={pid})"
+
+        # 4. Check process executable name if available (e.g. AION2.exe)
+        if pid > 0 and pid != self._own_pid and self._simulated_foreground_title is None:
+            try:
+                import psutil
+                pname = psutil.Process(pid).name().lower()
+                if "aion" in pname or "ncsoft" in pname:
+                    self._verified_game_pids.add(pid)
+                    return True, f"{title} (PID={pid})"
+            except Exception:
+                pass
 
         if not self.strict_mode and title:
             return True, f"{title} (PID={pid})"
 
         self._last_focus_loss_reason = f"Unrecognized foreground window: '{title or '<Untitled>'}' (PID={pid})"
         return False, self._last_focus_loss_reason
+
+    def start_monitoring(
+        self,
+        on_focus_lost: Optional[Callable[[str], None]] = None,
+        on_focus_gained: Optional[Callable[[str], None]] = None,
+        check_interval_sec: float = 0.05,
+        allow_gatherion_ui: bool = True,
+    ) -> None:
+        """
+        Starts a background daemon thread that checks GetForegroundWindow every 50ms.
+        Immediately fires on_focus_lost(reason) when user Alt-Tabs away from the game.
+        """
+        self.stop_monitoring()
+        self._on_focus_lost_cb = on_focus_lost
+        self._on_focus_gained_cb = on_focus_gained
+        self._monitor_interval_sec = max(0.01, float(check_interval_sec))
+        self._monitor_allow_gatherion = bool(allow_gatherion_ui)
+        self._monitor_stop_event.clear()
+
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop,
+            name="FocusGuardMonitorThread",
+            daemon=True,
+        )
+        self._monitor_thread.start()
+
+    def stop_monitoring(self) -> None:
+        """Stops the focus monitoring thread."""
+        self._monitor_stop_event.set()
+        if self._monitor_thread is not None and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=0.2)
+        self._monitor_thread = None
+
+    def _monitor_loop(self) -> None:
+        last_focused = True
+        while not self._monitor_stop_event.is_set():
+            try:
+                focused, info = self.is_game_window_focused(allow_gatherion_ui=self._monitor_allow_gatherion)
+                if last_focused and not focused:
+                    last_focused = False
+                    if self._on_focus_lost_cb:
+                        try:
+                            self._on_focus_lost_cb(info)
+                        except Exception as cb_exc:
+                            logger.error("Error in on_focus_lost callback: %s", cb_exc)
+                elif not last_focused and focused:
+                    last_focused = True
+                    if self._on_focus_gained_cb:
+                        try:
+                            self._on_focus_gained_cb(info)
+                        except Exception as cb_exc:
+                            logger.error("Error in on_focus_gained callback: %s", cb_exc)
+            except Exception:
+                pass
+            self._monitor_stop_event.wait(self._monitor_interval_sec)
 
     def guard_keystroke(
         self,

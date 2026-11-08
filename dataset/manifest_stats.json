@@ -1,13 +1,13 @@
 {
-  "total_images": 456,
+  "total_images": 463,
   "target_goal": 100000,
   "progress_pct": 0.46,
-  "train_count": 440,
-  "val_count": 16,
-  "preview_count": 13,
-  "total_boxes": 773,
-  "train_boxes": 748,
-  "val_boxes": 25,
+  "train_count": 446,
+  "val_count": 17,
+  "preview_count": 14,
+  "total_boxes": 780,
+  "train_boxes": 754,
+  "val_boxes": 26,
   "nc": 27,
   "class_counts": {
     "herb_aria": 0,
@@ -18,7 +18,7 @@
     "wood_tree": 0,
     "world_gather_crest": 16,
     "f_gather_prompt": 26,
-    "combo_skill_prompt": 10,
+    "combo_skill_prompt": 17,
     "minimap_sprout": 40,
     "monster_3d": 225,
     "minimap_monster_dot": 118,
@@ -47,7 +47,7 @@
     "5": 0,
     "6": 16,
     "7": 26,
-    "8": 10,
+    "8": 17,
     "9": 40,
     "10": 225,
     "11": 118,
@@ -69,6 +69,6 @@
   },
   "data_yaml_path": "F:\\a2\\dataset\\data.yaml",
   "dataset_dir": "F:\\a2\\dataset",
-  "updated_at_epoch": 1794127809.39,
-  "updated_at_iso": "2026-11-08T08:50:09.389748+00:00"
+  "updated_at_epoch": 1794130842.804,
+  "updated_at_iso": "2026-11-08T09:40:42.803627+00:00"
 }

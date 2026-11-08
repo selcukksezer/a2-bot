@@ -50,6 +50,7 @@ class GatheringSettings:
     selective_gather_enabled: bool = False
     selected_materials: List[str] = field(default_factory=list)
     proximity_route_auto: bool = True
+    pause_on_alt_tab: bool = True
 
     def validate(self) -> "GatheringSettings":
         try:
@@ -98,6 +99,7 @@ class GatheringSettings:
             self.selected_materials = list(self.selected_materials) if self.selected_materials else []
         self.selected_materials = [str(m).strip() for m in self.selected_materials if str(m).strip()]
         self.proximity_route_auto = bool(self.proximity_route_auto)
+        self.pause_on_alt_tab = bool(getattr(self, "pause_on_alt_tab", True))
         return self
 
     @classmethod
@@ -121,6 +123,7 @@ class GatheringSettings:
             selective_gather_enabled=bool(data.get("selective_gather_enabled", False)),
             selected_materials=[str(m).strip() for m in raw_mats if str(m).strip()],
             proximity_route_auto=bool(data.get("proximity_route_auto", True)),
+            pause_on_alt_tab=bool(data.get("pause_on_alt_tab", True)),
         )
         return instance.validate()
 
@@ -154,6 +157,7 @@ class RouteSettings:
     mp_full_threshold: float = 0.95
     ucb_explore_ratio: float = 0.20
     skill_discovery_enabled: bool = True
+    pause_on_alt_tab: bool = True
 
     def validate(self) -> "RouteSettings":
         try:
@@ -232,6 +236,7 @@ class RouteSettings:
             self.ucb_explore_ratio = 0.20
 
         self.skill_discovery_enabled = bool(self.skill_discovery_enabled)
+        self.pause_on_alt_tab = bool(getattr(self, "pause_on_alt_tab", True))
         return self
 
     @classmethod
@@ -263,6 +268,7 @@ class RouteSettings:
             mp_full_threshold=_coerce(data.get("mp_full_threshold", 0.95), float, 0.95),
             ucb_explore_ratio=_coerce(data.get("ucb_explore_ratio", 0.20), float, 0.20),
             skill_discovery_enabled=bool(data.get("skill_discovery_enabled", True)),
+            pause_on_alt_tab=bool(data.get("pause_on_alt_tab", True)),
         )
         return instance.validate()
 

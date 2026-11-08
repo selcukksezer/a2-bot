@@ -44,7 +44,7 @@
         "map_y": 300.0,
         "norm_x": 0.1562,
         "norm_y": 0.2778,
-        "timestamp": 1794087923.984755,
+        "timestamp": 1794130093.1143181,
         "connected_node_ids": [
           1
         ],
@@ -57,7 +57,7 @@
         "map_y": 300.0,
         "norm_x": 0.1745,
         "norm_y": 0.2778,
-        "timestamp": 1794087924.2358794,
+        "timestamp": 1794130093.8848066,
         "connected_node_ids": [],
         "seq_index": 2,
         "is_breadcrumb": true
@@ -68,7 +68,7 @@
         "map_y": 300.0,
         "norm_x": 0.1953,
         "norm_y": 0.2778,
-        "timestamp": 1794087924.3056893,
+        "timestamp": 1794130094.0648634,
         "connected_node_ids": [
           2
         ],
@@ -163,7 +163,7 @@
       "resource_type": "Gatherable Material",
       "map_x": 420,
       "map_y": 260,
-      "timestamp": 1794087924.339805,
+      "timestamp": 1794130094.1135018,
       "source_type": "minimap_auto",
       "confidence": 0.94
     },
@@ -186,5 +186,5 @@
     "is_calibrated_on_world_map": false,
     "cumulative_drift_px": 0.0
   },
-  "updated_at": 1794087924.354931
+  "updated_at": 1794130094.1381462
 }

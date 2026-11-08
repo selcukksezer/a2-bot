@@ -25,6 +25,7 @@ AION 2 Gatherion Pixel Bot - Ajan 6 Modülü
 from collections import deque
 from datetime import datetime, timedelta, timezone
 import logging
+import os
 import random
 import time
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
@@ -149,11 +150,11 @@ class CombatRecovery:
         )
         self.last_status_message: str = "IDLE"
 
-        # Fast TAB cycling and 1-frame targeting flicker grace
+        # Fast TAB cycling and targeting flicker grace (sustains lock during combat VFX / damage numbers)
         self.fast_tab_interval_sec: float = float(self.FAST_TAB_INTERVAL_SEC)
         self.last_tab_time: float = 0.0
         self.tab_cycle_count: int = 0
-        self.max_flicker_grace_ticks: int = 1
+        self.max_flicker_grace_ticks: int = int(os.environ.get("GATHERION_FLICKER_GRACE_TICKS", 15))
         self._flicker_grace_counter: int = 0
         self.is_flicker_grace_active: bool = False
         self._last_raw_target_detected: bool = False
@@ -521,7 +522,7 @@ class CombatRecovery:
             self._flicker_grace_counter = self._consecutive_no_target_frames
             self.is_flicker_grace_active = True
             logger.debug(
-                "Targeting 1-frame flicker grace active (frame %d/%d) - combat sustained",
+                "Targeting flicker grace active (frame %d/%d) - combat sustained",
                 self._consecutive_no_target_frames,
                 self.max_flicker_grace_ticks,
             )
@@ -1098,6 +1099,8 @@ class CombatRecovery:
 
             # Hızlı birim testlerinde döngü adım süresini uyarla
             fast_mode = float(max_fight_sec) < 5.0
+            if fast_mode:
+                self.max_flicker_grace_ticks = 1
             min_step_delay = 0.03 if fast_mode else 0.18
             max_step_delay = 0.07 if fast_mode else 0.36
 

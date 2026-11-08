@@ -432,6 +432,17 @@ class GameActionBus:
     def cast_skill(self, slot_key: str, frame: Optional[Any] = None) -> Dict[str, Any]:
         """Cast skill. AION2 mouse-look: keyboard only (mouse move = camera)."""
         key = str(slot_key or "1").strip()
+        if key.lower() in ("x", "f6", "b"):
+            logger.debug("[AutoGate] GameActionBus suppressed automatic slot '%s'", key)
+            return {
+                "ok": False,
+                "method": "suppressed_automatic",
+                "slot": key,
+                "x": None,
+                "y": None,
+                "burst_duration_sec": 0.0,
+                "gcd_align_sec": 0.0,
+            }
         cast_start_ts = time.perf_counter()
         result: Dict[str, Any] = {
             "ok": False,

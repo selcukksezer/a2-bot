@@ -479,6 +479,8 @@ class GatherionOrchestrator(QObject):
         self.worker.panic_system = self.panic_system
         self.worker.dpi_guard = self.dpi_guard
         self.worker.focus_monitor = self.focus_monitor
+        if hasattr(self.input_ctrl, "focus_monitor"):
+            self.input_ctrl.focus_monitor = self.focus_monitor
         self.worker.route_backup_mgr = self.route_backup_mgr
         self.worker.template_tuner = self.template_tuner
         self.worker.feather_filter = self.feather_filter
@@ -1969,6 +1971,13 @@ class GatherionOrchestrator(QObject):
             else:
                 self.overlay.hide()
             self.overlay.add_log("Ayarlar kaydedildi ve uygulandı")
+            if hasattr(self.worker, "set_pause_on_alt_tab"):
+                self.worker.set_pause_on_alt_tab(
+                    bool(
+                        getattr(self.settings.route, "pause_on_alt_tab", True)
+                        or getattr(self.settings.gathering, "pause_on_alt_tab", True)
+                    )
+                )
             self._apply_hotkey_labels()
             self._register_native_chords()
             self.worker._emit_hud_snapshot()

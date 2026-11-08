@@ -1113,7 +1113,8 @@ class SmartConsumableManager:
     DEFAULT_CONSUMABLE_ROW_ROI: Tuple[float, float, float, float] = (0.345, 0.870, 0.655, 0.938)
     CONSUMABLE_ROW_ROI: Any = _ConsumableBarRoiDescriptor(DEFAULT_CONSUMABLE_ROW_ROI)
     CONSUMABLE_SLOTS: Tuple[str, ...] = ("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "X", "B")
-    SCROLL_SLOTS: Tuple[str, ...] = ("F5", "F6", "F7")
+    SCROLL_SLOTS: Tuple[str, ...] = ("F5", "F7")
+    FORBIDDEN_MANUAL_SLOTS: Tuple[str, ...] = ("X", "F6", "B")
 
     CLASS_ID_HP_POTION: int = 22
     CLASS_NAME_HP_POTION: str = "hp_potion"
@@ -1123,6 +1124,8 @@ class SmartConsumableManager:
     CLASS_NAME_BUFF_SCROLL: str = "buff_scroll"
     CLASS_ID_EMPTY: int = 25
     CLASS_NAME_EMPTY: str = "empty"
+    CLASS_ID_AUTOMATIC: int = 26
+    CLASS_NAME_AUTOMATIC: str = "automatic"
 
     DEFAULT_SLOT_ASSIGNMENTS: Dict[str, str] = {
         "F1": "hp_potion",
@@ -1130,11 +1133,11 @@ class SmartConsumableManager:
         "F3": "hp_potion",
         "F4": "mp_potion",
         "F5": "buff_scroll",
-        "F6": "buff_scroll",
+        "F6": "automatic",
         "F7": "buff_scroll",
         "F8": "empty",
-        "X": "hp_potion",
-        "B": "empty",
+        "X": "automatic",
+        "B": "automatic",
     }
 
     @classmethod
@@ -1206,12 +1209,19 @@ class SmartConsumableManager:
         hp_threshold: float = 0.65,
         mp_threshold: float = 0.45,
         seed_defaults: bool = True,
+        forbidden_slots: Optional[Sequence[str]] = None,
     ) -> None:
         self._lock: threading.RLock = threading.RLock()
         self.calibrated_rois_path: Path = (
             Path(calibrated_rois_path) if calibrated_rois_path is not None else DEFAULT_CALIBRATED_ROIS_PATH
         )
         self.exemplar_memory: Optional[Any] = exemplar_memory
+        if forbidden_slots is not None:
+            self.forbidden_slots: Set[str] = {str(s).strip().upper() for s in forbidden_slots}
+        elif seed_defaults:
+            self.forbidden_slots = {"X", "F6", "B"}
+        else:
+            self.forbidden_slots = set()
         self.default_hp_cooldown_sec: float = max(0.5, float(default_hp_cooldown_sec))
         self.default_mp_cooldown_sec: float = max(0.5, float(default_mp_cooldown_sec))
         self.default_scroll_cooldown_sec: float = max(0.2, float(default_scroll_cooldown_sec))
@@ -1604,7 +1614,7 @@ class SmartConsumableManager:
         """
         diag = self.classify_slot_crop(crop_bgr, slot_key=slot_key)
         itype = str(diag.get("item_type", "empty"))
-        if itype not in ("hp_potion", "mp_potion", "buff_scroll", "empty"):
+        if itype not in ("hp_potion", "mp_potion", "buff_scroll", "empty", "automatic"):
             return "empty"
         return itype
 
@@ -1938,9 +1948,12 @@ class SmartConsumableManager:
 
     def get_best_hp_potion(self, now: Optional[float] = None) -> Optional[str]:
         t = time.monotonic() if now is None else float(now)
+        forbidden = getattr(self, "forbidden_slots", set())
         with self._lock:
             ready_slots = []
             for slot_key, itype in self._slot_assignments.items():
+                if slot_key.upper() in forbidden:
+                    continue
                 if itype == "hp_potion" and self.is_slot_ready(slot_key, now=t):
                     ready_slots.append(slot_key)
             if not ready_slots:
@@ -1955,9 +1968,12 @@ class SmartConsumableManager:
 
     def get_best_mp_potion(self, now: Optional[float] = None) -> Optional[str]:
         t = time.monotonic() if now is None else float(now)
+        forbidden = getattr(self, "forbidden_slots", set())
         with self._lock:
             ready_slots = []
             for slot_key, itype in self._slot_assignments.items():
+                if slot_key.upper() in forbidden:
+                    continue
                 if itype == "mp_potion" and self.is_slot_ready(slot_key, now=t):
                     ready_slots.append(slot_key)
             if not ready_slots:
@@ -1972,9 +1988,12 @@ class SmartConsumableManager:
 
     def get_expired_buff_scrolls(self, now: Optional[float] = None) -> List[str]:
         t = time.monotonic() if now is None else float(now)
+        forbidden = getattr(self, "forbidden_slots", set())
         with self._lock:
             expired = []
             for slot_key, itype in self._slot_assignments.items():
+                if slot_key.upper() in forbidden:
+                    continue
                 if itype == "buff_scroll":
                     if self.is_buff_expired(slot_key, now=t) and self.is_slot_ready(slot_key, now=t):
                         expired.append(slot_key)
@@ -2001,10 +2020,11 @@ class SmartConsumableManager:
         active_buffs: Optional[Any] = None,
     ) -> List[str]:
         """
-        Checks `buff_scroll` slots (`F5, F6, F7`) and returns the list of keys to press
+        Checks `buff_scroll` slots and returns the list of keys to press
         automatically when their duration (`scroll_duration_sec=300.0`) has expired.
         Supports both `check_and_refresh_scroll_buffs(frame, now=None)` and
         `check_and_refresh_scroll_buffs(active_buffs=..., now=None)`.
+        Excludes automatic client slots (`F6, X, B` when enabled).
         """
         actual_frame: Optional[np.ndarray] = None
         if frame is not None:
@@ -2028,14 +2048,19 @@ class SmartConsumableManager:
             else:
                 active_keys_set = {str(k).upper() for k in active_buffs}
 
+        forbidden = getattr(self, "forbidden_slots", set())
         with self._lock:
             scroll_candidates = [
                 slot_key
                 for slot_key, itype in self._slot_assignments.items()
                 if itype == "buff_scroll"
+                and slot_key.upper() not in forbidden
             ]
             if not scroll_candidates:
-                scroll_candidates = list(self.SCROLL_SLOTS)
+                scroll_candidates = [
+                    s for s in self.SCROLL_SLOTS
+                    if s.upper() not in forbidden
+                ]
 
             for slot_key in scroll_candidates:
                 if not self.is_slot_ready(slot_key, now=t):
@@ -2142,15 +2167,19 @@ class SmartConsumableManager:
 
         chosen_scroll: Optional[str] = scroll_keys[0] if scroll_keys else None
 
+        forbidden = getattr(self, "forbidden_slots", set())
         keys_to_press: List[str] = []
-        if chosen_hp:
+        if chosen_hp and str(chosen_hp).upper() not in forbidden:
             keys_to_press.append(chosen_hp)
-        if chosen_mp:
+        if chosen_mp and str(chosen_mp).upper() not in forbidden:
             keys_to_press.append(chosen_mp)
         if scroll_keys:
-            keys_to_press.extend(scroll_keys)
+            keys_to_press.extend([
+                s for s in scroll_keys
+                if str(s).upper() not in forbidden
+            ])
 
-        primary_key: Optional[str] = chosen_hp or chosen_mp or chosen_scroll
+        primary_key: Optional[str] = keys_to_press[0] if keys_to_press else None
         action_name = "emergency" if is_emergency else ("consumable_buff" if keys_to_press else "none")
 
         return ConsumableActionResult(

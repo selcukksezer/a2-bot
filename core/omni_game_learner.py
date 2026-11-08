@@ -149,6 +149,7 @@ class OmniGameLearner:
         self.current_monster_hp_ratio: float = 0.0
         self.prev_monster_hp_ratio: float = 0.0
         self.last_monster_death_ts: float = 0.0
+        self._learner_no_target_frames: int = 0
 
         self.player_hp_ratio: float = 1.0
         self.player_mp_ratio: float = 1.0
@@ -970,25 +971,41 @@ class OmniGameLearner:
         else:
             hp_ratio = 0.0
 
-        # Canavar öldü mü tespiti. Kısa titreme / soft-lock kaybı ölüm değildir.
+        # Canavar öldü mü tespiti. Kısa titreme / hasar yazıları / soft-lock kaybı ölüm değildir.
+        if has_target:
+            self._learner_no_target_frames = 0
+            effective_targeted = True
+        else:
+            self._learner_no_target_frames = getattr(self, "_learner_no_target_frames", 0) + 1
+            # Savaş esnasında devamlılık toleransı: 15 kare (~1.5sn) boyunca hedef düşürülmez
+            effective_targeted = bool(self.current_monster_targeted and (self._learner_no_target_frames <= 15))
+
+        # Canavar öldü mü tespiti: sadece hedef kalıcı olarak kaybolduğunda (>= 15 kare) tetiklenir
         monster_died = (
             self.current_monster_targeted
-            and not has_target
+            and not effective_targeted
+            and self._learner_no_target_frames > 15
             and self._combat_context_for_death()
             and (time.time() - self.last_monster_death_ts > 2.5)
         )
         if monster_died:
             self.last_monster_death_ts = time.time()
-            logger.info("OmniGameLearner: Canavar öldü algılandı (Hedef barı kayboldu).")
+            logger.info("OmniGameLearner: Canavar öldü algılandı (Hedef barı kalıcı olarak kayboldu).")
 
         self.prev_monster_hp_ratio = self.current_monster_hp_ratio
-        self.current_monster_targeted = has_target
-        self.current_monster_hp_ratio = hp_ratio
+        self.current_monster_targeted = effective_targeted
+        if not effective_targeted:
+            self.current_monster_hp_ratio = 0.0
+        elif not has_target:
+            # Görsel titreme esnasında can barının son bilinen değerini koru (0'a düşürüp sahte ölüm yaratma)
+            pass
+        else:
+            self.current_monster_hp_ratio = hp_ratio
 
         return {
-            "has_target": has_target,
-            "hp_ratio": round(hp_ratio, 3),
-            "hp_percent": int(round(hp_ratio * 100)),
+            "has_target": effective_targeted,
+            "hp_ratio": round(self.current_monster_hp_ratio, 3),
+            "hp_percent": int(round(self.current_monster_hp_ratio * 100)),
             "monster_died": monster_died,
             "red_pixels": red_pixel_count,
         }
@@ -1148,38 +1165,45 @@ class OmniGameLearner:
         self.player_hp_ratio = hp_ratio
         self.player_mp_ratio = mp_ratio
 
-        # 3. Otomatik İksir Mantığı
-        driver = getattr(self.bot_worker, "input_driver", None) if self.bot_worker else None
+        # 3. Otomatik İksir Mantığı (X, F6, B otomatik oyun mekanikleri kesinlikle dışlanır)
+        worker = self.bot_worker
+        driver = getattr(worker, "input_driver", None) if worker else None
         hp_pot_used = False
         mp_pot_used = False
 
-        if hp_ratio < self.hp_pot_threshold and (now - self._last_hp_pot_ts) >= self.pot_cooldown_sec:
-            self._last_hp_pot_ts = now
-            hp_pot_used = True
-            if driver and hasattr(driver, "press_key"):
-                try:
-                    driver.press_key("7", hold_sec=0.065)
-                    logger.info(
-                        "🧪 [YZ Can/İksir Koruyucu] Oyuncu Canı: %%%d (< %%%d) -> HP İksiri (7) basıldı!",
-                        int(round(hp_ratio * 100)),
-                        int(round(self.hp_pot_threshold * 100)),
-                    )
-                except Exception as exc:
-                    logger.debug("HP iksiri basma hatası: %s", exc)
+        if worker is not None and hasattr(worker, "_check_and_trigger_auto_potions"):
+            try:
+                hp_pot_used = bool(worker._check_and_trigger_auto_potions(hp_ratio, mp_ratio, frame_bgr))
+            except Exception as w_exc:
+                logger.debug("worker._check_and_trigger_auto_potions hatası: %s", w_exc)
+        else:
+            if hp_ratio < self.hp_pot_threshold and (now - self._last_hp_pot_ts) >= self.pot_cooldown_sec:
+                self._last_hp_pot_ts = now
+                hp_pot_used = True
+                if driver and hasattr(driver, "press_key"):
+                    try:
+                        driver.press_key("7", hold_sec=0.065)
+                        logger.info(
+                            "🧪 [YZ Can/İksir Koruyucu] Oyuncu Canı: %%%d (< %%%d) -> HP İksiri (7) basıldı!",
+                            int(round(hp_ratio * 100)),
+                            int(round(self.hp_pot_threshold * 100)),
+                        )
+                    except Exception as exc:
+                        logger.debug("HP iksiri basma hatası: %s", exc)
 
-        if mp_ratio < self.mp_pot_threshold and (now - self._last_mp_pot_ts) >= self.pot_cooldown_sec:
-            self._last_mp_pot_ts = now
-            mp_pot_used = True
-            if driver and hasattr(driver, "press_key"):
-                try:
-                    driver.press_key("8", hold_sec=0.065)
-                    logger.info(
-                        "💧 [YZ Mana/İksir Koruyucu] Oyuncu Manası: %%%d (< %%%d) -> Mana İksiri (8) basıldı!",
-                        int(round(mp_ratio * 100)),
-                        int(round(self.mp_pot_threshold * 100)),
-                    )
-                except Exception as exc:
-                    logger.debug("Mana iksiri basma hatası: %s", exc)
+            if mp_ratio < self.mp_pot_threshold and (now - self._last_mp_pot_ts) >= self.pot_cooldown_sec:
+                self._last_mp_pot_ts = now
+                mp_pot_used = True
+                if driver and hasattr(driver, "press_key"):
+                    try:
+                        driver.press_key("8", hold_sec=0.065)
+                        logger.info(
+                            "💧 [YZ Mana/İksir Koruyucu] Oyuncu Manası: %%%d (< %%%d) -> Mana İksiri (8) basıldı!",
+                            int(round(mp_ratio * 100)),
+                            int(round(self.mp_pot_threshold * 100)),
+                        )
+                    except Exception as exc:
+                        logger.debug("Mana iksiri basma hatası: %s", exc)
 
         return {
             "player_hp_ratio": round(hp_ratio, 3),

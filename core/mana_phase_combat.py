@@ -460,33 +460,37 @@ class ManaPhaseCombat:
         keys: List[str] = []
         reasons: List[str] = []
 
+        FORBIDDEN = {"x", "f6", "b"}
+
         if hp < self.hp_potion_threshold:
             if (t - self._last_hp_potion_ts) >= self.hp_potion_cd_sec:
-                hp_trigger = True
-                self._last_hp_potion_ts = t
-                keys.append(self.hp_potion_key)
-                reasons.append(f"HP {hp*100:.1f}% < {self.hp_potion_threshold*100:.0f}%")
-                msg = f"AUTO_POTION: HP triggered [{self.hp_potion_key}] (hp={hp:.2f})"
-                logger.info(msg)
-                if callable(self._on_log):
-                    try:
-                        self._on_log(msg)
-                    except Exception:
-                        pass
+                if str(self.hp_potion_key).lower() not in FORBIDDEN:
+                    hp_trigger = True
+                    self._last_hp_potion_ts = t
+                    keys.append(self.hp_potion_key)
+                    reasons.append(f"HP {hp*100:.1f}% < {self.hp_potion_threshold*100:.0f}%")
+                    msg = f"AUTO_POTION: HP triggered [{self.hp_potion_key}] (hp={hp:.2f})"
+                    logger.info(msg)
+                    if callable(self._on_log):
+                        try:
+                            self._on_log(msg)
+                        except Exception:
+                            pass
 
         if mp < self.mp_potion_threshold:
             if (t - self._last_mp_potion_ts) >= self.mp_potion_cd_sec:
-                mp_trigger = True
-                self._last_mp_potion_ts = t
-                keys.append(self.mp_potion_key)
-                reasons.append(f"MP {mp*100:.1f}% < {self.mp_potion_threshold*100:.0f}%")
-                msg = f"AUTO_POTION: MP triggered [{self.mp_potion_key}] (mp={mp:.2f})"
-                logger.info(msg)
-                if callable(self._on_log):
-                    try:
-                        self._on_log(msg)
-                    except Exception:
-                        pass
+                if str(self.mp_potion_key).lower() not in FORBIDDEN:
+                    mp_trigger = True
+                    self._last_mp_potion_ts = t
+                    keys.append(self.mp_potion_key)
+                    reasons.append(f"MP {mp*100:.1f}% < {self.mp_potion_threshold*100:.0f}%")
+                    msg = f"AUTO_POTION: MP triggered [{self.mp_potion_key}] (mp={mp:.2f})"
+                    logger.info(msg)
+                    if callable(self._on_log):
+                        try:
+                            self._on_log(msg)
+                        except Exception:
+                            pass
 
         return AutoPotionResult(
             hp_potion_triggered=hp_trigger,
@@ -594,12 +598,15 @@ class ManaPhaseCombat:
         reasons: List[str] = []
 
         # 2. HP Potion Check (< 65% or emergency < 40%)
+        FORBIDDEN = {"x", "f6", "b"}
         if hp_potion_needed:
             learned_hp = self.consumable_manager.get_best_hp_potion(now=t) if self.consumable_manager is not None else None
             candidate_key = learned_hp or self.hp_potion_key
+            if candidate_key and str(candidate_key).lower() in FORBIDDEN:
+                candidate_key = None
 
             cd_ready = (t - self._last_hp_potion_ts) >= self.hp_potion_cd_sec
-            if self.consumable_manager is not None and candidate_key in self.consumable_manager.CONSUMABLE_SLOTS:
+            if self.consumable_manager is not None and candidate_key and candidate_key in self.consumable_manager.CONSUMABLE_SLOTS:
                 cd_ready = cd_ready and self.consumable_manager.is_slot_ready(candidate_key, now=t)
 
             if cd_ready and candidate_key:
@@ -622,9 +629,11 @@ class ManaPhaseCombat:
         if mp_potion_needed:
             learned_mp = self.consumable_manager.get_best_mp_potion(now=t) if self.consumable_manager is not None else None
             candidate_key = learned_mp or self.mp_potion_key
+            if candidate_key and str(candidate_key).lower() in FORBIDDEN:
+                candidate_key = None
 
             cd_ready = (t - self._last_mp_potion_ts) >= self.mp_potion_cd_sec
-            if self.consumable_manager is not None and candidate_key in self.consumable_manager.CONSUMABLE_SLOTS:
+            if self.consumable_manager is not None and candidate_key and candidate_key in self.consumable_manager.CONSUMABLE_SLOTS:
                 cd_ready = cd_ready and self.consumable_manager.is_slot_ready(candidate_key, now=t)
 
             if cd_ready and candidate_key:
@@ -645,6 +654,7 @@ class ManaPhaseCombat:
         # 4. Expired Buff Scroll Check (buff_expired -> re-apply automatically)
         if self.consumable_manager is not None:
             expired_scrolls = self.consumable_manager.check_and_refresh_scroll_buffs(active_buffs=active_buffs, now=t)
+            expired_scrolls = [s for s in (expired_scrolls or []) if str(s).lower() not in FORBIDDEN]
             if expired_scrolls:
                 buff_expired = True
                 for skey in expired_scrolls:

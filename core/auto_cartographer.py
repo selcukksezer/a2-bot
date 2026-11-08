@@ -1994,7 +1994,7 @@ class AutoCartographer:
             target_my = int(round(arrow_cy + float(rel_map_dy) * inv_scale))
 
             half = PATCH_SIZE // 2
-            pad = half + 8
+            pad = PATCH_SIZE
             padded = cv2.copyMakeBorder(
                 inpainted_minimap,
                 pad,
@@ -2004,8 +2004,8 @@ class AutoCartographer:
                 borderType=cv2.BORDER_REPLICATE,
             )
 
-            px = int(np.clip(target_mx, -half // 2, mw + half // 2)) + pad
-            py = int(np.clip(target_my, -half // 2, mh + half // 2)) + pad
+            px = int(np.clip(target_mx, 0, mw)) + pad
+            py = int(np.clip(target_my, 0, mh)) + pad
 
             patch_80 = padded[py - half : py + half, px - half : px + half].copy()
             if patch_80.shape[0] != PATCH_SIZE or patch_80.shape[1] != PATCH_SIZE:
@@ -3157,8 +3157,9 @@ class AutoCartographer:
                 resource_type=resource_type,
                 detector=self._get_quality_detector(),
                 conf_min=MODEL_CONF_MIN,
-                check_feather=True,
+                check_feather=source_type.startswith("minimap"),
                 check_monster=source_type.startswith("minimap"),
+                check_terrain=False,
                 exemplar_memory=self._get_exemplar_memory(),
             )
             if gate.reject:
@@ -3691,10 +3692,10 @@ class AutoCartographer:
                 detector=self._get_quality_detector(),
                 conf_min=MODEL_CONF_MIN,
                 exemplar_memory=mem,
-                check_feather=kwargs.get("check_feather", True),
+                check_feather=kwargs.get("check_feather", source_type.startswith("minimap")),
                 check_monster=kwargs.get("check_monster", source_type.startswith("minimap")),
                 check_exemplars=kwargs.get("check_exemplars", True),
-                check_terrain=kwargs.get("check_terrain", True),
+                check_terrain=kwargs.get("check_terrain", False),
             )
             if gate.reject:
                 self.total_gate_rejected += 1

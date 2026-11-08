@@ -3135,14 +3135,36 @@ class InputController:
         self._game_hwnd_cache_ts = now
         return hwnd
 
+    def _is_gatherion_hwnd(self, hwnd: int) -> bool:
+        """True if hwnd belongs to Gatherion itself (Overlay HUD, F9 Menu, Settings, Console)."""
+        if not hwnd or not sys.platform.startswith("win"):
+            return False
+        try:
+            pid = wintypes.DWORD(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+            if int(pid.value) == os.getpid():
+                return True
+            length = int(ctypes.windll.user32.GetWindowTextLengthW(wintypes.HWND(hwnd)) or 0)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(wintypes.HWND(hwnd), buf, length + 1)
+                if "gatherion" in buf.value.lower():
+                    return True
+        except Exception:
+            pass
+        return False
+
     def focus_game_window(self) -> bool:
         """
         Bring the AION 2 client to the foreground before M.
 
         SendInput reaches whichever window is focused. Gatherion's own window
         (settings, console, menu) must not receive the world-map key.
+        Never steals focus if user Alt-Tabbed to a third-party app (Chrome, Discord, etc.).
         """
         if self.test_mode or not sys.platform.startswith("win"):
+            return False
+        if self.motion_aborted():
             return False
         try:
             user32 = ctypes.windll.user32
@@ -3152,6 +3174,9 @@ class InputController:
             fg = int(user32.GetForegroundWindow() or 0)
             if fg == game:
                 return True
+            # Never steal focus from external applications (Discord, Chrome, Explorer, etc.)
+            if fg and not self._is_gatherion_hwnd(fg):
+                return False
             fg_thread = int(user32.GetWindowThreadProcessId(wintypes.HWND(fg), None) or 0) if fg else 0
             game_thread = int(user32.GetWindowThreadProcessId(wintypes.HWND(game), None) or 0)
             attached = False

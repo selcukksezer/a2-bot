@@ -288,7 +288,8 @@ def is_fake_gray_rock_or_ground(
             if neg_sim >= thresh and neg_ex is not None:
                 cname = str(neg_ex.get("class_name", "negative_exemplar"))
                 cid = neg_ex.get("class_id")
-                return True, float(neg_sim), f"learned_negative:{cname}:{cid}"
+                if cid is None or not is_keep_class(cid):
+                    return True, float(neg_sim), f"learned_negative:{cname}:{cid}"
         except Exception as exc:
             logger.debug("Negative exemplar match error: %s", exc)
 
@@ -399,6 +400,23 @@ def evaluate_node_candidate(
     hard_wrong: Optional[int] = None
     source = str(source_type or "").strip().lower()
     resource = str(resource_type or "")
+    is_harvest_prompt = source in ("harvest_auto", "gather_prompt", "harvest", "f_gather")
+    is_minimap_source = source.startswith("minimap")
+
+    # For confirmed harvest actions (gather_prompt, harvest_auto, f_gather),
+    # the candidate is an active interaction at player's location, never false terrain/feather.
+    if is_harvest_prompt:
+        check_feather = False
+        check_terrain = False
+        check_monster = False
+
+    # Minimap is a 2D top-down map tile; 3D terrain/rock checks must never run on 2D minimap tiles.
+    if is_minimap_source:
+        check_terrain = False
+
+    # Feather icons only exist on the minimap HUD, never in 3D world or radar.
+    if not is_minimap_source:
+        check_feather = False
 
     if image is not None and is_parchment_scroll_patch(image):
         reasons.append("scroll")
@@ -477,7 +495,7 @@ def evaluate_node_candidate(
             pass
 
     # Exemplar memory & terrain check: learned negative exemplars and empty terrain prototypes
-    if image is not None and check_exemplars:
+    if image is not None and check_exemplars and not is_harvest_prompt and not is_minimap_source:
         mem = exemplar_memory if exemplar_memory is not None else get_default_exemplar_memory()
         is_high_keep = (
             raw_id is not None
@@ -502,7 +520,7 @@ def evaluate_node_candidate(
                 logger.debug("is_negative_patch check error: %s", exc_neg)
 
         if check_terrain and not is_high_keep:
-            is_fake, fake_conf, fake_reason = is_fake_gray_rock_or_ground(image, exemplar_memory=mem)
+            is_fake, fake_conf, fake_reason = is_fake_gray_rock_or_ground(image, exemplar_memory=mem, candidate_class_id=raw_id)
             if is_fake:
                 if "terrain" not in reasons:
                     reasons.append("terrain")
@@ -556,7 +574,7 @@ def evaluate_node_candidate(
                         elif "sprout" in cn:
                             verified_resource_type = "Sprout"
                         else:
-                            verified_resource_type = str(pos_cname)
+                            verified_resource_type = None
                     else:
                         verified_resource_type = "Resource"
 

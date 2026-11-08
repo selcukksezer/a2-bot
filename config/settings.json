@@ -12,7 +12,8 @@
         "gather_key": "f",
         "selective_gather_enabled": false,
         "selected_materials": [],
-        "proximity_route_auto": true
+        "proximity_route_auto": true,
+        "pause_on_alt_tab": true
     },
     "route": {
         "rest_minutes": 5,
@@ -23,11 +24,11 @@
         "reclick_node_sec": 10,
         "time_to_reach_sec": 58,
         "gather_on_the_way": false,
-        "wait_min_after_failed": 5,
+        "wait_min_after_failed": 2,
         "max_failed_in_row": 10,
         "remove_node_after_failures": 0,
         "pause_after_no_gather_min": 15,
-        "fight_back": false,
+        "fight_back": true,
         "fight_stop_gather_sec": 0,
         "harvests_per_node": 3,
         "minimap_auto_record": true,
@@ -38,7 +39,8 @@
         "auto_record_3d_crests": true,
         "mp_full_threshold": 0.95,
         "ucb_explore_ratio": 0.2,
-        "skill_discovery_enabled": true
+        "skill_discovery_enabled": true,
+        "pause_on_alt_tab": true
     },
     "breaks": {
         "break_every_min": 0,
@@ -55,7 +57,7 @@
     "display": {
         "ui_proportion": "Medium",
         "monitor_idx": 1,
-        "last_tab": "yolo"
+        "last_tab": "home"
     },
     "active_region": "Altgard",
     "active_route": "Dredgion Crash Site",

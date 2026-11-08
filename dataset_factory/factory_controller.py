@@ -400,7 +400,7 @@ class AutoLabelingDatasetFactory:
             return
 
         # Central Game Frame Gate: unconditionally drop non-game captures before saving to disk
-        valid_game, gate_reason = is_valid_game_frame(frame, require_foreground=False)
+        valid_game, gate_reason = is_valid_game_frame(frame, require_foreground=False, require_novelty=False)
         if not valid_game:
             logger.debug("Shadow sample dropped by GameFrameGate: %s", gate_reason)
             return
@@ -476,7 +476,7 @@ class AutoLabelingDatasetFactory:
             }
 
         # Central Game Frame Gate: unconditionally drop non-game captures before saving or buffering
-        is_valid, gate_reason = is_valid_game_frame(frame, require_foreground=True)
+        is_valid, gate_reason = is_valid_game_frame(frame, require_foreground=False, require_novelty=False)
         if not is_valid:
             logger.debug("Live frame dropped by GameFrameGate: %s", gate_reason)
             return {
@@ -591,9 +591,11 @@ class AutoLabelingDatasetFactory:
         material_name: str = "",
         harvest_stage: int = 1,
         *,
+        max_harvests: int = 3,
         lookback_sec: Optional[float] = None,
         reference_ts: Optional[float] = None,
         force_save: bool = False,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         THE KEY FEATURE: Called automatically every time the bot (or player) completes a gather!
@@ -670,7 +672,7 @@ class AutoLabelingDatasetFactory:
             }
 
         # Central Game Frame Gate: unconditionally drop non-game captures before saving to disk
-        valid_gate, gate_reason = is_valid_game_frame(target_frame, require_foreground=False)
+        valid_gate, gate_reason = is_valid_game_frame(target_frame, require_foreground=False, require_novelty=False)
         if not valid_gate and not force_save:
             logger.warning("Gather sample dropped by GameFrameGate: %s", gate_reason)
             with self._lock:

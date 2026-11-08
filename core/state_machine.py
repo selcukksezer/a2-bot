@@ -297,6 +297,8 @@ class BotWorker(QThread):
         self.focus_monitor: Any = self._init_optional_subsystem(
             "core.dpi_focus_guard", "ForegroundFocusGuard"
         )
+        self.pause_on_alt_tab: bool = bool(self._get_cfg("pause_on_alt_tab", True))
+        self._last_focus_lost_ts: float = 0.0
         self.route_backup_mgr: Any = self._init_optional_subsystem(
             "core.dpi_focus_guard", "RouteBackupManager"
         )
@@ -777,6 +779,8 @@ class BotWorker(QThread):
                 route_manager=self.route_manager,
                 vision_engine=self.vision,
                 input_driver=self.input_driver,
+                dataset_factory=getattr(self, "dataset_factory", None),
+                heartbeat_callback=getattr(self, "heartbeat", None),
                 test_mode=False,
             )
         except Exception as exc:
@@ -933,6 +937,11 @@ class BotWorker(QThread):
             "pause_on_keyboard_input": (
                 (None, "pause_on_keyboard_input"),
                 ("gathering", "pause_on_keyboard_input"),
+            ),
+            "pause_on_alt_tab": (
+                (None, "pause_on_alt_tab"),
+                ("route", "pause_on_alt_tab"),
+                ("gathering", "pause_on_alt_tab"),
             ),
             "rest_minutes": (
                 (None, "rest_minutes"),
@@ -1215,6 +1224,11 @@ class BotWorker(QThread):
         with self._lock:
             return self._paused
 
+    @property
+    def pause_reason(self) -> str:
+        with self._lock:
+            return self._pause_reason
+
     def set_mode(self, mode: str) -> None:
         """
         Switches the active bot mode ('route', 'combat', 'manual_record', 'auto_record', 'explorer')
@@ -1485,6 +1499,58 @@ class BotWorker(QThread):
         except Exception as exc:
             logger.error("Error in on_user_key_pressed('%s'): %s", key_name, exc, exc_info=True)
 
+    def set_pause_on_alt_tab(self, enabled: bool) -> None:
+        """Enables or disables automatic pausing when the player Alt-Tabs away from the game."""
+        self.pause_on_alt_tab = bool(enabled)
+        logger.info("[Alt-Tab Guard] pause_on_alt_tab set to %s", self.pause_on_alt_tab)
+
+    def _on_game_focus_lost(self, reason: str = "") -> None:
+        """
+        Called when the Aion 2 game window loses foreground focus (e.g. user Alt-Tabs to Discord/Chrome).
+        Immediately halts all movement keys, pauses the bot, and alerts via HUD and log.
+        """
+        if not getattr(self, "pause_on_alt_tab", True):
+            return
+        if self.is_paused:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_focus_lost_ts", 0.0) < 0.5:
+            return
+        self._last_focus_lost_ts = now
+        logger.info("[Alt-Tab] Oyun penceresi odağı kaybetti (%s) -> Bot otomatik duraklatılıyor.", reason)
+        self._release_route_motion()
+        if self.input_driver is not None and hasattr(self.input_driver, "abort_motion"):
+            try:
+                self.input_driver.abort_motion()
+            except Exception:
+                pass
+        self.pause("Alt-Tab (Oyun odağı kayboldu)")
+        self._emit_log("🛑 [Alt-Tab] Oyun arka plana geçti, bot otomatik duraklatıldı.")
+        try:
+            import winsound
+            winsound.Beep(700, 180)
+        except Exception:
+            pass
+
+    def _check_game_focus(self) -> bool:
+        """
+        Tick-level focus check. Returns True if game is focused or pause_on_alt_tab is disabled.
+        If Alt-Tab is detected, pauses immediately and returns False.
+        """
+        if not getattr(self, "pause_on_alt_tab", True) or self.is_paused:
+            return True
+        focus_mon = getattr(self, "focus_monitor", None)
+        if focus_mon is None or not hasattr(focus_mon, "is_game_window_focused"):
+            return True
+        try:
+            focused, reason = focus_mon.is_game_window_focused(allow_gatherion_ui=True)
+            if not focused:
+                self._on_game_focus_lost(reason)
+                return False
+        except Exception as exc:
+            logger.debug("Error checking game focus: %s", exc)
+        return True
+
     # =========================================================================
     # Main QThread Loop
     # =========================================================================
@@ -1513,6 +1579,24 @@ class BotWorker(QThread):
         if self.reflex is not None and hasattr(self.reflex, "start"):
             self.reflex.start()
         self._log_combat_skill_knobs_once()
+
+        # Wire and start FocusGuard for automatic pause on Alt-Tab
+        if self.focus_monitor is not None and hasattr(self.focus_monitor, "start_monitoring"):
+            try:
+                from core.game_gpu_throttle import find_aion_game_processes
+                aion_pids = find_aion_game_processes()
+                if aion_pids and hasattr(self.focus_monitor, "register_game_pids"):
+                    self.focus_monitor.register_game_pids(aion_pids)
+            except Exception as proc_exc:
+                logger.debug("Aion process registration into focus_monitor skipped: %s", proc_exc)
+            try:
+                self.focus_monitor.start_monitoring(
+                    on_focus_lost=self._on_game_focus_lost,
+                    check_interval_sec=0.05,
+                    allow_gatherion_ui=True,
+                )
+            except Exception as mon_exc:
+                logger.debug("Focus monitor start failed: %s", mon_exc)
 
         try:
             while self._is_running() and not self.isInterruptionRequested():
@@ -1547,6 +1631,10 @@ class BotWorker(QThread):
                         self._sleep_adaptive(BotState.PAUSED.value, fallback_ms=150)
                         continue
 
+                    # 3.5 Check game focus (Alt-Tab auto-pause)
+                    if not self._check_game_focus():
+                        continue
+
                     # 4. Dispatch by active mode
                     current_mode = self.mode
                     if current_mode == BotMode.MANUAL_RECORD.value:
@@ -1570,6 +1658,11 @@ class BotWorker(QThread):
                     logger.error("Error inside BotWorker iteration: %s", loop_exc, exc_info=True)
                     self.msleep(250)
         finally:
+            if self.focus_monitor is not None and hasattr(self.focus_monitor, "stop_monitoring"):
+                try:
+                    self.focus_monitor.stop_monitoring()
+                except Exception:
+                    pass
             if self.reflex is not None and hasattr(self.reflex, "stop"):
                 try:
                     self.reflex.stop()
@@ -1580,7 +1673,7 @@ class BotWorker(QThread):
 
     def _is_running(self) -> bool:
         with self._lock:
-            return self._running
+            return bool(getattr(self, "_running", True))
 
     def _consume_f8_request(self) -> bool:
         with self._lock:
@@ -1615,6 +1708,10 @@ class BotWorker(QThread):
         frame_bgr = self._grab_frame(grayscale=False)
         if not self.auto_cartography_enabled or self.explorer_controller is None:
             return
+        if getattr(self.explorer_controller, "dataset_factory", None) is None and getattr(self, "dataset_factory", None) is not None:
+            self.explorer_controller.dataset_factory = self.dataset_factory
+        if getattr(self.explorer_controller, "heartbeat_callback", None) is None:
+            self.explorer_controller.heartbeat_callback = getattr(self, "heartbeat", None)
         try:
             if frame_bgr is None or not isinstance(frame_bgr, np.ndarray) or frame_bgr.size == 0:
                 return
@@ -1685,6 +1782,9 @@ class BotWorker(QThread):
             "right",
             "left_click",
             "right_click",
+            "x",
+            "f6",
+            "b",
         }
         keys = []
         for part in parts:
@@ -1984,9 +2084,14 @@ class BotWorker(QThread):
 
         self._combat_was_targeting = False
         self._combat_no_target_streak = 0
+        self._combat_last_target_ts = 0.0
         self._mark_right_button(False)
 
     def _cast_one_combat_skill(self, key: str, frame: Any = None) -> None:
+        key_str = str(key).strip().lower()
+        if key_str in ("x", "f6", "b"):
+            logger.debug("[AutoGate] _cast_one_combat_skill('%s') suppressed (automatic client function)", key)
+            return
         if not self.is_combat_authorized("skill"):
             logger.debug("[CombatGate] _cast_one_combat_skill('%s') suppressed", key)
             return
@@ -2018,7 +2123,7 @@ class BotWorker(QThread):
         now = time.time()
         burst_gap = self._combat_skill_burst_sec()
         last_burst = float(self._plain_attr("_combat_last_skill_burst_ts", 0.0) or 0.0)
-        if last_burst > 0.0 and (now - last_burst) < burst_gap:
+        if last_burst > 0.0 and (now - last_burst) < (burst_gap - 1e-4):
             return False
         used = self._plain_attr("_combat_skill_used_at")
         if not isinstance(used, dict):
@@ -2078,6 +2183,9 @@ class BotWorker(QThread):
             self._release_combat_left_button()
             return
 
+        if not self._check_game_focus():
+            return
+
         now = time.time()
         test_mode = bool(self._get_cfg("test_mode", False))
 
@@ -2110,96 +2218,123 @@ class BotWorker(QThread):
 
         # 3. Handle monster death & targeting
         if not has_enemy:
-            self._sync_combat_right_button(False)
-            self._release_combat_left_button()
             no_target_streak += 1
             setattr(self, "_combat_no_target_streak", no_target_streak)
 
-            # AION2 hedef UI titrer; hasar sürüyorsa ölüm ilan etme. Streak 2→5.
-            death_ready = was_fighting and no_target_streak >= 5 and not still_taking_damage
-            if death_ready:
-                # Target just died. Skills stop; loot is not an attack.
-                setattr(self, "_combat_was_targeting", False)
-                setattr(self, "_combat_no_target_streak", 0)
-                try:
-                    from core.lifetime_stats import get_lifetime_stats
+            last_target_ts = float(self._plain_attr("_combat_last_target_ts", 0.0) or 0.0)
+            time_since_target = (now - last_target_ts) if last_target_ts > 0.0 else 999.0
 
-                    get_lifetime_stats().record_monster_kill(mob_key="combat_death")
-                except Exception:
-                    logger.debug("lifetime combat death kill skipped", exc_info=True)
-                self._emit_log("⚔️ Canavar öldü -> Ganimet toplanıyor (F)...")
-                self._emit_hud_snapshot(
-                    badge=BotState.FIGHTING.value,
-                    mode_badge="SAVAŞ (COMBAT)",
-                    title="Canavar Öldü: Ganimet Toplanıyor",
-                    subtitle="F ile ganimet toplanıyor, ardından sıradaki canavar seçilecek...",
-                )
-                if not test_mode:
-                    self._press_key("f")
-                    self.msleep(220)
-                    self._emit_log("Sıradaki canavarı seçmek için Tab tuşuna basılıyor...")
-                    self._press_combat_tab()
-                    self.msleep(200)
-                fresh = self._grab_frame(grayscale=False)
-                if self._combat_has_hostile_lock(fresh):
-                    frame_bgr = fresh
-                    has_enemy = True
-                else:
-                    return
+            # Target Persistence Grace:
+            # Savaş esnasında hasar yazıları ("CRITICAL", uçuşan rakamlar) ve büyü partikülleri
+            # hedef can barını veya isimliğini 1-2 saniye boyunca görsel olarak örtebilir.
+            # Normal bir oyuncu bu örtülmeler esnasında skillerini kesintisiz spamlamaya devam eder.
+            # 2.5 saniyeye (veya 25 kareye) kadar tanınan hedef devamlılığı toleransı sayesinde
+            # hedef erken düşürülmez, kamera sağa sola savrulmaz ve 5 saniyelik duraksama tamamen kalkar.
+            is_combat_grace = was_fighting and (time_since_target < 2.5 and no_target_streak < 25)
 
-            # When targeting flickers for 1 frame, do not immediately choke into TAB / HEDEF YOK loop;
-            # allow skill grace ticks if combat was actively targeting.
-            is_flicker_grace = False
-            if was_fighting and no_target_streak < 2:
+            if is_combat_grace:
                 has_enemy = True
                 is_flicker_grace = True
             else:
-                if was_fighting and no_target_streak >= 2:
+                # Savaş gerçekten bitti veya hedef tamamen kayboldu.
+                death_ready = was_fighting and (not still_taking_damage or time_since_target >= 4.0)
+                if death_ready:
+                    # Canavar öldü. Saldırı tuşlarını bırak; F ile ganimet topla ve sıradaki hedefe geç.
+                    self._sync_combat_right_button(False)
+                    self._release_combat_left_button()
                     setattr(self, "_combat_was_targeting", False)
+                    setattr(self, "_combat_no_target_streak", 0)
+                    try:
+                        from core.lifetime_stats import get_lifetime_stats
 
-                # No target -> Tab / soft-aim only (never cast until lock is real).
-                last_tab_ts = getattr(self, "_combat_last_tab_ts", 0.0)
-                # Faster Tab acquire (~0.55s) so lock loss does not idle 7–12s between skills.
-                if now - last_tab_ts >= 0.55:
-                    setattr(self, "_combat_last_tab_ts", now)
-                    tab_misses = int(self._plain_attr("_combat_tab_miss_count", 0) or 0) + 1
-                    self._combat_tab_miss_count = tab_misses
-                    if tab_misses in (5, 15, 40):
-                        self._warn_combat_input_blocked(tab_misses)
+                        get_lifetime_stats().record_monster_kill(mob_key="combat_death")
+                    except Exception:
+                        logger.debug("lifetime combat death kill skipped", exc_info=True)
+                    self._emit_log("⚔️ Canavar öldü -> Ganimet toplanıyor (F)...")
                     self._emit_hud_snapshot(
                         badge=BotState.FIGHTING.value,
                         mode_badge="SAVAŞ (COMBAT)",
-                        title="Canavar Aranıyor (Tab)",
-                        subtitle="HEDEF YOK — Tab/soft-aim; skill yok (sahte savaş yok)",
+                        title="Canavar Öldü: Ganimet Toplanıyor",
+                        subtitle="F ile ganimet toplanıyor, ardından sıradaki canavar seçilecek...",
                     )
                     if not test_mode:
-                        # Soft-aim cadence: first miss + every ~1.4s.
-                        last_soft = float(self._plain_attr("_combat_last_soft_aim_ts", 0.0) or 0.0)
-                        use_soft = tab_misses == 1 or (now - last_soft) >= 1.4
-                        if use_soft:
-                            self._combat_last_soft_aim_ts = now
-                        self._press_combat_tab(soft_aim=use_soft)
-                        self.msleep(80)
+                        self._press_key("f")
+                        self.msleep(150)
+                        self._emit_log("Sıradaki canavarı seçmek için Tab tuşuna basılıyor...")
+                        self._press_combat_tab(soft_aim=False)
+                        self.msleep(120)
                     fresh = self._grab_frame(grayscale=False)
                     if self._combat_has_hostile_lock(fresh):
                         frame_bgr = fresh
                         has_enemy = True
+                        self._combat_last_target_ts = now
+                        setattr(self, "_combat_was_targeting", True)
+                    else:
+                        return
+                elif was_fighting:
+                    # Hedef barı kayboldu fakat hasar alınıyor -> hızlıca Tab ile hedefi yeniden kilitle (kamera süpürme yok)
+                    self._sync_combat_right_button(False)
+                    last_tab_ts = getattr(self, "_combat_last_tab_ts", 0.0)
+                    if now - last_tab_ts >= 0.5:
+                        setattr(self, "_combat_last_tab_ts", now)
+                        if not test_mode:
+                            self._press_combat_tab(soft_aim=False)
+                            self.msleep(80)
+                        fresh = self._grab_frame(grayscale=False)
+                        if self._combat_has_hostile_lock(fresh):
+                            frame_bgr = fresh
+                            has_enemy = True
+                            self._combat_last_target_ts = now
+                            setattr(self, "_combat_was_targeting", True)
+                        else:
+                            return
                     else:
                         return
                 else:
-                    self._emit_hud_snapshot(
-                        badge=BotState.FIGHTING.value,
-                        mode_badge="SAVAŞ (COMBAT)",
-                        title="Savaş Modu: Bekleniyor",
-                        subtitle="Canavar aranıyor (Tab)...",
-                    )
-                    return
+                    # Savaş dışı / Canavar aranıyor:
+                    self._sync_combat_right_button(False)
+                    self._release_combat_left_button()
+                    last_tab_ts = getattr(self, "_combat_last_tab_ts", 0.0)
+                    if now - last_tab_ts >= 0.7:
+                        setattr(self, "_combat_last_tab_ts", now)
+                        tab_misses = int(self._plain_attr("_combat_tab_miss_count", 0) or 0) + 1
+                        self._combat_tab_miss_count = tab_misses
+                        if tab_misses in (5, 15, 40):
+                            self._warn_combat_input_blocked(tab_misses)
+                        self._emit_hud_snapshot(
+                            badge=BotState.FIGHTING.value,
+                            mode_badge="SAVAŞ (COMBAT)",
+                            title="Canavar Aranıyor (Tab)",
+                            subtitle="HEDEF YOK — Tab ile canavar aranıyor...",
+                        )
+                        if not test_mode:
+                            # Sadece üst üste 3 başarısız Tab sonrasında yumuşak hedefleme yap
+                            use_soft = tab_misses >= 3
+                            self._press_combat_tab(soft_aim=use_soft)
+                            self.msleep(80)
+                        fresh = self._grab_frame(grayscale=False)
+                        if self._combat_has_hostile_lock(fresh):
+                            frame_bgr = fresh
+                            has_enemy = True
+                            self._combat_last_target_ts = now
+                            setattr(self, "_combat_was_targeting", True)
+                        else:
+                            return
+                    else:
+                        self._emit_hud_snapshot(
+                            badge=BotState.FIGHTING.value,
+                            mode_badge="SAVAŞ (COMBAT)",
+                            title="Savaş Modu: Bekleniyor",
+                            subtitle="Canavar aranıyor (Tab)...",
+                        )
+                        return
 
         if not has_enemy:
             return
 
         # 4. Active enemy targeted!
         setattr(self, "_combat_was_targeting", True)
+        self._combat_last_target_ts = now
         if not locals().get("is_flicker_grace", False) and self._combat_has_hostile_lock(frame_bgr):
             setattr(self, "_combat_no_target_streak", 0)
             setattr(self, "_combat_tab_miss_count", 0)
@@ -2280,8 +2415,9 @@ class BotWorker(QThread):
         )
 
         if not test_mode:
-            # Sticky RMB off in mouse-look combat; LMB AA only. Skills need real lock.
-            self._sync_combat_right_button(False)
+            # 1. Vitality check: drink HP/MP potions if vitals dropped (< 65%, emergency < 40%)
+            self._check_and_trigger_auto_potions(player_hp_ratio, player_mp_ratio, frame_bgr)
+
             allow_skills = self._real_target_for_skills(bool(has_enemy))
             decision = None
             self._log_combat_skill_knobs_once()
@@ -2300,27 +2436,40 @@ class BotWorker(QThread):
                     logger.debug("ManaPhase decide skipped", exc_info=True)
                     decision = None
 
-            try:
-                self._sync_combat_left_button(True)
-            except Exception:
-                if action_bus is not None and hasattr(action_bus, "hold_left_attack"):
-                    try:
-                        action_bus.hold_left_attack(True)
-                    except Exception:
-                        pass
+            # 2. Combat Mouse Attack Mode:
+            # Low mana (Regen phase "A"): spam left click (sol tık) to recover mana
+            # High mana (Burst phase "B"): spam right click (sağ tık) for burst damage
+            mp_thresh = float(self._get_cfg("mp_full_threshold", 0.90) or 0.90)
+            if decision is not None:
+                from core.mana_phase_combat import ManaPhase
+                is_regen = (getattr(decision, "phase", None) == ManaPhase.REGEN)
+            else:
+                is_regen = (player_mp_ratio < mp_thresh)
 
+            combat_mouse_btn = "left" if is_regen else "right"
+            self._spam_combat_mouse(combat_mouse_btn)
+
+            if combat_mouse_btn == "left":
+                self._sync_combat_left_button(True)
+                self._sync_combat_right_button(False)
+            else:
+                self._sync_combat_right_button(True)
+                self._release_combat_left_button()
+
+            # 3. Combat Skill Rotation (1, 2, 3, 4, Q, E, R)
             if not allow_skills:
                 self._emit_log("Skill bekleniyor — gerçek hedef kilidi yok (HUD-only değil)")
             else:
-                # Always round-robin full hotbar. ManaPhase skill_keys / ready_skills
-                # previously stuck on a single bright slot ('2') and ignored burst knobs.
                 try:
                     burst_gap = self._combat_skill_burst_sec()
-                    gate_ok = True
+                    last_burst = float(self._plain_attr("_combat_last_skill_burst_ts", 0.0) or 0.0)
+                    gate_ok = (last_burst <= 0.0) or ((now - last_burst) >= (burst_gap - 1e-4))
                     if mana_brain is not None and hasattr(mana_brain, "should_cast_skill"):
-                        gate_ok = bool(mana_brain.should_cast_skill(min_gap=burst_gap))
+                        gate_ok = gate_ok or bool(mana_brain.should_cast_skill(min_gap=burst_gap, now=now))
                     if gate_ok:
-                        self._send_configured_combat_skill()
+                        cast_done = self._send_configured_combat_skill()
+                        if cast_done and mana_brain is not None:
+                            mana_brain._last_skill_ts = now
                 except Exception:
                     logger.debug("Combat skill skipped", exc_info=True)
 
@@ -2340,6 +2489,8 @@ class BotWorker(QThread):
         Player walks/flies freely around the map; bot automatically detects and maps
         every gem/material seen on 3D screen or minimap and orders them sequentially.
         """
+        if not self._check_game_focus():
+            return
         self._run_passive_auto_cartography(gather_while_exploring=True)
         self._set_state_internal(BotState.WALKING.value)
         ready_cnt, resting_cnt = self._get_ready_and_resting_counts()
@@ -2366,6 +2517,8 @@ class BotWorker(QThread):
         and passive auto-cartography also maps seen gems/materials automatically.
         HUD shows WAITING badge, MANUAL RECORD mode badge, and SAVED / NODES / LAST SAVED columns.
         """
+        if not self._check_game_focus():
+            return
         self._run_passive_auto_cartography(gather_while_exploring=False)
         self._set_state_internal(BotState.WAITING.value)
         ready_cnt, resting_cnt = self._get_ready_and_resting_counts()
@@ -2392,6 +2545,8 @@ class BotWorker(QThread):
         randomized intervals (f_interval_min..f_interval_max), and automatically
         records a new node when gathering finishes (plus passive auto-cartography).
         """
+        if not self._check_game_focus():
+            return
         self._run_passive_auto_cartography(gather_while_exploring=False)
         detected, conf = self._detect_gather_prompt()
         self.last_prompt_match = conf
@@ -2435,6 +2590,7 @@ class BotWorker(QThread):
             )
         else:
             if self._is_gathering_active:
+                gather_finished = False
                 if self._stage_cast_in_progress:
                     is_cast, pct = self._check_gather_cast_progress()
                     cast_dur = float(self._get_cfg("gather_cast_duration_sec", 3.0) or 3.0)
@@ -2445,6 +2601,7 @@ class BotWorker(QThread):
                         self.gathered_count += 1
                         self._last_gather_time = now
                         self._emit_log(f"Resource gathered (#{self.gathered_count})")
+                        gather_finished = True
                 else:
                     self._gather_lost_frames += 1
                     if self._gather_lost_frames >= 3:
@@ -2453,14 +2610,19 @@ class BotWorker(QThread):
                         self.gathered_count += 1
                         self._last_gather_time = now
                         self._emit_log(f"Resource gathered (#{self.gathered_count})")
+                        gather_finished = True
 
+                if gather_finished:
                     # Same as route mode: YOLO / dataset factory captures t-2.0s frame on gather end
                     if self.dataset_factory is not None and hasattr(
                         self.dataset_factory, "on_gather_success"
                     ):
                         try:
+                            prompt_name = ""
+                            if isinstance(self._last_gather_prompt, dict):
+                                prompt_name = str(self._last_gather_prompt.get("name", "") or "")
                             self.dataset_factory.on_gather_success(
-                                material_name="",
+                                material_name=prompt_name,
                                 harvest_stage=1,
                                 max_harvests=3,
                             )
@@ -2505,6 +2667,9 @@ class BotWorker(QThread):
         # A pause tick must drop W/A/D. Walking only continues while TOPLAMA is running.
         if self.is_paused:
             self._release_route_motion()
+            return
+
+        if not self._check_game_focus():
             return
 
         # 1. Active break or scheduled break trigger
@@ -2900,6 +3065,170 @@ class BotWorker(QThread):
     def _release_combat_left_button(self) -> None:
         self._sync_combat_left_button(False)
 
+    def _spam_combat_mouse(self, button: str) -> None:
+        """
+        Combat mouse spam: continuously clicks the designated attack button
+        ('left' for low-mana regen, 'right' for high-mana burst) alongside skills.
+        Ensures opposite button is released, applies human timing (~75-110ms),
+        and avoids moving cursor/camera in mouse-look mode.
+        """
+        btn = str(button or "left").strip().lower()
+        if btn not in ("left", "right"):
+            btn = "left"
+        if self.is_paused or bool(self._get_cfg("test_mode", False)):
+            return
+        if not self.is_combat_authorized("attack"):
+            return
+
+        now = time.time()
+        last_spam = float(self._plain_attr("_last_combat_mouse_spam_ts", 0.0) or 0.0)
+        spam_gap = float(self._plain_attr("_combat_mouse_spam_gap", 0.09) or 0.09)
+        if (now - last_spam) < spam_gap:
+            return
+
+        # Ensure opposite button is released
+        other = "right" if btn == "left" else "left"
+        if other == "right":
+            self._sync_combat_right_button(False)
+        else:
+            self._release_combat_left_button()
+
+        driver = getattr(self, "input_driver", None)
+        port = self._plain_attr("input_port")
+        try:
+            if driver is not None and hasattr(driver, "human_click"):
+                # Click in-place without x,y args so mouse-look camera doesn't drift
+                driver.human_click(button=btn, min_hold=0.025, max_hold=0.045)
+            elif port is not None and hasattr(port, "mouse_button"):
+                port.mouse_button(btn, True)
+                time.sleep(0.025)
+                port.mouse_button(btn, False)
+            elif driver is not None and hasattr(driver, "_hw_mouse_down"):
+                driver._hw_mouse_down(btn)
+                time.sleep(0.025)
+                driver._hw_mouse_up(btn)
+        except Exception as exc:
+            logger.debug("combat mouse click spam failed for %s: %s", btn, exc)
+
+        self._last_combat_mouse_spam_ts = time.time()
+        self._combat_mouse_spam_gap = random.uniform(0.075, 0.110)
+
+    def _check_and_trigger_auto_potions(
+        self,
+        player_hp_ratio: float,
+        player_mp_ratio: float,
+        frame_bgr: Optional[np.ndarray] = None,
+    ) -> bool:
+        """
+        Monitors player HP and MP during combat and route travel:
+        - HP < hp_potion_threshold (default 0.65 / 65%): triggers HP potion (e.g. F1, F3, 7).
+        - Emergency HP < emergency_hp_threshold (0.40): immediate priority HP recovery.
+        - MP < mp_potion_threshold (default 0.35 / 35%): triggers MP potion (e.g. F2, F4, 8).
+        - Strictly forbids and suppresses keys X, F6, and B (managed automatically by client).
+        Respects per-potion cooldowns (default 8.0s).
+        """
+        if self.is_paused or bool(self._get_cfg("test_mode", False)):
+            return False
+
+        now = time.time()
+        try:
+            hp = max(0.0, min(1.0, float(player_hp_ratio)))
+            mp = max(0.0, min(1.0, float(player_mp_ratio)))
+        except (TypeError, ValueError):
+            return False
+
+        # If HP is near zero (e.g. death or invalid frame), death handler manages it
+        if hp <= 0.01:
+            return False
+
+        mana_brain = self._plain_attr("mana_phase_combat")
+        hp_thresh = float(getattr(mana_brain, "smart_hp_potion_threshold", 0.65) if mana_brain else 0.65)
+        mp_thresh = float(getattr(mana_brain, "smart_mp_potion_threshold", 0.35) if mana_brain else 0.35)
+        emerg_thresh = float(getattr(mana_brain, "emergency_hp_threshold", 0.40) if mana_brain else 0.40)
+
+        hp_cd = float(getattr(mana_brain, "hp_potion_cd_sec", 8.0) if mana_brain else 8.0)
+        mp_cd = float(getattr(mana_brain, "mp_potion_cd_sec", 8.0) if mana_brain else 8.0)
+
+        last_hp = float(self._plain_attr("_last_hp_potion_ts", 0.0) or 0.0)
+        last_mp = float(self._plain_attr("_last_mp_potion_ts", 0.0) or 0.0)
+        if mana_brain and hasattr(mana_brain, "_last_hp_potion_ts"):
+            last_hp = max(last_hp, float(mana_brain._last_hp_potion_ts or 0.0))
+        if mana_brain and hasattr(mana_brain, "_last_mp_potion_ts"):
+            last_mp = max(last_mp, float(mana_brain._last_mp_potion_ts or 0.0))
+
+        FORBIDDEN = {"x", "f6", "b"}
+        pot_triggered = False
+
+        # 1. HP Potion Check
+        if hp < hp_thresh:
+            if (now - last_hp) >= hp_cd:
+                chosen_key = None
+                consumable_mgr = getattr(mana_brain, "consumable_manager", None) if mana_brain else None
+                if consumable_mgr is not None and hasattr(consumable_mgr, "get_best_hp_potion"):
+                    try:
+                        best = consumable_mgr.get_best_hp_potion(now=now)
+                        if best and str(best).strip().lower() not in FORBIDDEN:
+                            chosen_key = str(best).strip()
+                    except Exception:
+                        chosen_key = None
+
+                if not chosen_key:
+                    fallback_key = getattr(mana_brain, "hp_potion_key", "F1") if mana_brain else "F1"
+                    if str(fallback_key).strip().lower() not in FORBIDDEN:
+                        chosen_key = str(fallback_key).strip()
+                    else:
+                        chosen_key = "F1"
+
+                if chosen_key and str(chosen_key).strip().lower() not in FORBIDDEN:
+                    is_emerg = hp < emerg_thresh
+                    tag = "🚨 ACİL CAN POTU" if is_emerg else "🧪 CAN POTU"
+                    self._emit_log(f"{tag}: Can %{int(round(hp * 100))} < %{int(round(hp_thresh * 100))} -> [{chosen_key}] basılıyor...")
+                    self._press_key(chosen_key, min_hold=0.06, max_hold=0.12, release_mouse=False)
+                    self._last_hp_potion_ts = now
+                    if mana_brain and hasattr(mana_brain, "_last_hp_potion_ts"):
+                        mana_brain._last_hp_potion_ts = now
+                    if consumable_mgr and hasattr(consumable_mgr, "mark_used"):
+                        try:
+                            consumable_mgr.mark_used(chosen_key, now=now)
+                        except Exception:
+                            pass
+                    pot_triggered = True
+
+        # 2. MP Potion Check
+        if mp < mp_thresh:
+            if (now - last_mp) >= mp_cd:
+                chosen_mp = None
+                consumable_mgr = getattr(mana_brain, "consumable_manager", None) if mana_brain else None
+                if consumable_mgr is not None and hasattr(consumable_mgr, "get_best_mp_potion"):
+                    try:
+                        best_mp = consumable_mgr.get_best_mp_potion(now=now)
+                        if best_mp and str(best_mp).strip().lower() not in FORBIDDEN:
+                            chosen_mp = str(best_mp).strip()
+                    except Exception:
+                        chosen_mp = None
+
+                if not chosen_mp:
+                    fallback_mp = getattr(mana_brain, "mp_potion_key", "F2") if mana_brain else "F2"
+                    if str(fallback_mp).strip().lower() not in FORBIDDEN:
+                        chosen_mp = str(fallback_mp).strip()
+                    else:
+                        chosen_mp = "F2"
+
+                if chosen_mp and str(chosen_mp).strip().lower() not in FORBIDDEN:
+                    self._emit_log(f"💧 MANA POTU: Mana %{int(round(mp * 100))} < %{int(round(mp_thresh * 100))} -> [{chosen_mp}] basılıyor...")
+                    self._press_key(chosen_mp, min_hold=0.06, max_hold=0.12, release_mouse=False)
+                    self._last_mp_potion_ts = now
+                    if mana_brain and hasattr(mana_brain, "_last_mp_potion_ts"):
+                        mana_brain._last_mp_potion_ts = now
+                    if consumable_mgr and hasattr(consumable_mgr, "mark_used"):
+                        try:
+                            consumable_mgr.mark_used(chosen_mp, now=now)
+                        except Exception:
+                            pass
+                    pot_triggered = True
+
+        return pot_triggered
+
     def _send_configured_combat_skill_from_keys(self, keys: list) -> bool:
         """Cast ready keys from ManaPhase decision list (same bus path, fast when trusted)."""
         if self.is_paused or bool(self._get_cfg("test_mode", False)):
@@ -2912,7 +3241,7 @@ class BotWorker(QThread):
         now = time.time()
         burst_gap = self._combat_skill_burst_sec()
         last_burst = float(self._plain_attr("_combat_last_skill_burst_ts", 0.0) or 0.0)
-        if last_burst > 0.0 and (now - last_burst) < burst_gap:
+        if last_burst > 0.0 and (now - last_burst) < (burst_gap - 1e-4):
             return False
         used = self._plain_attr("_combat_skill_used_at")
         if not isinstance(used, dict):
@@ -3306,6 +3635,10 @@ class BotWorker(QThread):
                 hp_dropped = self._note_player_hp_drop(hp_ratio)
                 if has_bar or hp_dropped:
                     self._remember_real_combat_signal(has_bar=has_bar, hp_dropped=hp_dropped)
+
+                # Auto-potion check when taking damage or under attack
+                if hp_ratio > 0.01:
+                    self._check_and_trigger_auto_potions(hp_ratio, 1.0, frame_bgr)
 
                 # Bare "under attack" (vignette / empty bar) does not start a counterattack.
                 if has_bar or hp_dropped:
@@ -5433,6 +5766,9 @@ class BotWorker(QThread):
         if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:
             return
         key_str = str(key).strip().lower()
+        if key_str in ("x", "f6", "b"):
+            logger.debug("[AutoGate] Key '%s' suppressed (automatic client function)", key_str)
+            return
         if key_str in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "q", "r"):
             if not self.is_combat_authorized("skill"):
                 logger.debug("[CombatGate] Combat key '%s' suppressed (mode=%s, state=%s)", key_str, self._mode, self._state)
@@ -5534,6 +5870,13 @@ class BotWorker(QThread):
     def _motion_should_stop(self) -> bool:
         if self.is_paused:
             return True
+        if getattr(self, "pause_on_alt_tab", True) and self.focus_monitor is not None and hasattr(self.focus_monitor, "is_game_window_focused"):
+            try:
+                focused, _ = self.focus_monitor.is_game_window_focused(allow_gatherion_ui=True)
+                if not focused:
+                    return True
+            except Exception:
+                pass
         driver = self.input_driver
         if driver is None:
             return False

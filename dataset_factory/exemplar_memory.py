@@ -523,6 +523,15 @@ class ExemplarMemory:
                     purged_neg += 1
                     continue
 
+                # Never keep gatherable material classes in negative exemplars!
+                if (
+                    cid in SUPER_CATEGORY_3D_MATERIALS
+                    or cid in {0, 1, 2, 3, 4, 5, 6, 12}
+                    or any(k in cname for k in ("aria", "mela", "targena", "orichalcum", "gem", "tree", "ore_", "herb_"))
+                ):
+                    purged_neg += 1
+                    continue
+
                 if cid >= 16:
                     if cid not in SUPER_CATEGORY_HUD:
                         purged_neg += 1
@@ -789,6 +798,12 @@ class ExemplarMemory:
 
         cid = int(class_id)
         cname = str(class_name or f"class_{cid}")
+
+        # Protect keep/material classes: if a box was rejected as a false positive,
+        # it is ground/terrain, NOT an exemplar of the resource class itself.
+        if cid in SUPER_CATEGORY_3D_MATERIALS or cid in {0, 1, 2, 3, 4, 5, 6, 12}:
+            cid = 15
+            cname = "path_ground"
 
         if cid not in CANONICAL_CLASSES or cid >= 22 or cname.lower().startswith("essence_") or "essence" in cname.lower():
             logger.warning(

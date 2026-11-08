@@ -7114,7 +7114,9 @@ class YOLOFactoryDialog(QDialog):
         stem = it.get("stem")
         if kind == "no":
             for b in it.get("weak", []):
-                self._learn_box_exemplar(it, b, positive=False, source="user_frame_reject")
+                cid = int(b.get("class_id", 0))
+                if cid not in (0, 1, 2, 3, 4, 5, 6, 12):
+                    self._learn_box_exemplar(it, b, positive=False, source="user_frame_reject")
             removed = self._delete_review_sample(it)
             self._remove_review_item_at(index)
             rej_stems = set(self._rejected_stems)

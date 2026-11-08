@@ -121,6 +121,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "f_interval_max": 3.0,
     "test_mode": False,
     "show_overlay": True,
+    "pause_on_alt_tab": True,
     "harvests_per_node": 3,
     "gather_key": "f",
     "retry_on_extraction_fail": True,
@@ -164,6 +165,7 @@ LEGACY_KEY_MAP: Dict[str, Tuple[str, str]] = {
     "f_interval_max": ("gathering", "max_f_interval"),
     "test_mode": ("gathering", "test_mode"),
     "show_overlay": ("gathering", "show_overlay"),
+    "pause_on_alt_tab": ("gathering", "pause_on_alt_tab"),
     "harvests_per_node": ("gathering", "harvests_per_node"),
     "gather_key": ("gathering", "gather_key"),
     "retry_on_extraction_fail": ("gathering", "retry_on_extraction_fail"),
@@ -1735,6 +1737,10 @@ class SettingsWindow(QDialog):
         self.chk_overlay = self.show_overlay
         lay.addWidget(self.show_overlay)
 
+        self.pause_on_alt_tab = ToggleSwitch("Alt-Tab yapıldığında botu otomatik duraklat", self, checked=True)
+        self.pause_on_alt_tab.setToolTip("Oyun penceresi odağı kaybettiğinde veya Alt-Tab yapıldığında botu güvenle duraklatır")
+        lay.addWidget(self.pause_on_alt_tab)
+
         # ------------------------------------------------------------------
         # Seç-Topla (Materyal Seç & Yakınlık Rotası) Bölümü
         # ------------------------------------------------------------------
@@ -2713,6 +2719,9 @@ class SettingsWindow(QDialog):
             self.show_overlay.setChecked(
                 bool(self._cfg_get("show_overlay", True, target=settings))
             )
+            self.pause_on_alt_tab.setChecked(
+                bool(self._cfg_get("pause_on_alt_tab", True, target=settings))
+            )
 
             # New Gathering settings: harvests_per_node, gather_key, retry_on_extraction_fail
             raw_harvests = self._cfg_get("harvests_per_node", 3, target=settings)
@@ -2908,6 +2917,7 @@ class SettingsWindow(QDialog):
             "f_interval_max": max_f,
             "test_mode": bool(self.test_mode.isChecked()),
             "show_overlay": bool(self.show_overlay.isChecked()),
+            "pause_on_alt_tab": bool(self.pause_on_alt_tab.isChecked()),
             "harvests_per_node": max(1, min(10, int(self.harvests_per_node.value()))),
             "gather_key": raw_gkey,
             "retry_on_extraction_fail": bool(

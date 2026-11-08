@@ -44,7 +44,7 @@
         "map_y": 600.0,
         "norm_x": 0.4167,
         "norm_y": 0.5556,
-        "timestamp": 1794087923.691646,
+        "timestamp": 1794130092.3855925,
         "connected_node_ids": [
           1
         ],
@@ -85,7 +85,7 @@
       "resource_type": "Gatherable Material",
       "map_x": 759,
       "map_y": 588,
-      "timestamp": 1794087923.9111948,
+      "timestamp": 1794130093.0310283,
       "source_type": "minimap_auto",
       "confidence": 0.95
     },
@@ -108,5 +108,5 @@
     "is_calibrated_on_world_map": false,
     "cumulative_drift_px": 0.0
   },
-  "updated_at": 1794087923.9263318
+  "updated_at": 1794130093.0527132
 }
