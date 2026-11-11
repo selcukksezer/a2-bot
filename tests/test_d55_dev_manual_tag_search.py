@@ -26,6 +26,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from dataset_factory.class_taxonomy import CANONICAL_NAMES
 from dataset_factory.manual_tag_search import (
     SearchableTagRegistry,
     _has_prefix,
@@ -37,7 +38,7 @@ from dataset_factory.manual_tag_search import (
 def test_d55_score_fields_precomputed_for_all_classes() -> None:
     """Every class has cached scoring fields, so _score_entry never re-folds."""
     registry = SearchableTagRegistry()
-    assert len(registry._score_fields) == 27
+    assert len(registry._score_fields) == len(CANONICAL_NAMES) == 29
     fields = registry._score_fields[0]
     assert fields["cname_ascii"] == "herb_aria"
     assert fields["short_ascii"] == "aria"
@@ -94,9 +95,11 @@ def test_d55_canonical_rankings_unchanged() -> None:
     assert search_label_classes("kırmızı kristal")[0]["class_id"] == 12
     assert search_label_classes("canavar noktası")[0]["class_id"] == 11
     assert search_label_classes("yol zemin")[0]["class_id"] == 15
-    # No-match and out-of-range queries still return nothing.
+    # Numeric id 27 is now canonical (other_ore); out-of-range still empty.
     assert search_label_classes("zzzqqq") == []
-    assert search_label_classes("27") == []
+    ore27 = search_label_classes("27")
+    assert ore27 and ore27[0]["class_id"] == 27
+    assert search_label_classes("29") == []
     assert search_label_classes("999") == []
 
 

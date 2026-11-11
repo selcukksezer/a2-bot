@@ -123,12 +123,13 @@ def cuda_training_blocked_by_game() -> str:
 
 
 # ==============================================================================
-# Canonical class-name map (dataset_factory.class_taxonomy.CANONICAL_NAMES,
-# 0..26). The name FACTORY_12_CLASS_NAMES is kept for compatibility, but the
-# contents are the canonical 27-class taxonomy -- NOT the legacy 12/23-class
-# YOLO scheme, where ids 6/7/8 were UI icons (crest / F-prompt / E-icon),
-# 12 was a generic "world material" and 18..22 were shifted consumables/bars,
-# so the same class_id meant different things in different files (F-0802).
+# Canonical class-name map (dataset_factory.class_taxonomy.CANONICAL_NAMES /
+# ALL_CANONICAL_CLASSES, today 0..28 / nc=29). The name FACTORY_12_CLASS_NAMES
+# is kept for compatibility, but the contents are the full canonical taxonomy
+# -- NOT the legacy 12/23-class YOLO scheme, where ids 6/7/8 were UI icons
+# (crest / F-prompt / E-icon), 12 was a generic "world material" and 18..22
+# were shifted consumables/bars, so the same class_id meant different things
+# in different files (F-0802).
 # P1-14 (K-36): NO legacy translation happens here any more. Both live
 # producers emit canonical ids (see _canonicalize_annotations): a bare id is
 # canonical by definition, and a named legacy box resolves by its name.
@@ -174,13 +175,20 @@ FACTORY_12_CLASS_LABELS_TR: Dict[int, str] = {
 }
 
 try:
+    from dataset_factory.class_taxonomy import ALL_CANONICAL_CLASSES as _ALL_CANONICAL_CLASSES
+    from dataset_factory.class_taxonomy import CANONICAL_NAMES as _CANONICAL_NAMES
     from dataset_factory.class_taxonomy import dataset_class_names as _taxonomy_class_names
     from dataset_factory.class_taxonomy import dataset_labels_tr as _taxonomy_labels_tr
 
     # A27: _taxonomy_labels_tr() was rebuilt on every loop iteration
     # (once per class id >= 16); call it once.
     _taxonomy_labels = _taxonomy_labels_tr()
+    # Prefer authority names (data.yaml via dataset_class_names), then fill
+    # any in-code canonical ids the authority may still be catching up on
+    # (e.g. F4 generics 27/28) so FACTORY always matches CANONICAL_NAMES.
     for _cid, _name in _taxonomy_class_names().items():
+        FACTORY_12_CLASS_NAMES.setdefault(int(_cid), _name)
+    for _cid, _name in _CANONICAL_NAMES.items():
         FACTORY_12_CLASS_NAMES.setdefault(int(_cid), _name)
         if int(_cid) >= 16:
             FACTORY_12_CLASS_LABELS_TR.setdefault(
@@ -190,21 +198,23 @@ try:
     # P1-14 (K-38): taxonomy load failure is a HARD error — a silent
     # fallback to the local 16-class table would mislabel every class
     # >= 16 and write a wrong nc into data.yaml. The merged map must
-    # cover the full canonical taxonomy (27 classes, 0..26).
-    if set(FACTORY_12_CLASS_NAMES) != set(range(27)):
+    # cover the full canonical taxonomy (ALL_CANONICAL_CLASSES / CANONICAL_NAMES).
+    _canonical_ids = set(_ALL_CANONICAL_CLASSES) or set(_CANONICAL_NAMES)
+    if set(FACTORY_12_CLASS_NAMES) != _canonical_ids:
         raise RuntimeError(
-            "Taksonomi eksik: FACTORY_12_CLASS_NAMES 27 sınıfı kapsamıyor "
+            "Taksonomi eksik: FACTORY_12_CLASS_NAMES "
+            f"{len(_canonical_ids)} sınıfı kapsamıyor "
             f"(kapsanan: {sorted(FACTORY_12_CLASS_NAMES)})"
         )
 except Exception as exc:
     raise RuntimeError(
         "Taksonomi yüklenemedi (dataset_factory.class_taxonomy): "
-        "factory_controller kanonik 27 sınıf olmadan çalışamaz"
+        "factory_controller kanonik sınıf kümesi olmadan çalışamaz"
     ) from exc
 
 
 def _canonicalize_annotations(annotations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Validate live annotations against the canonical (0..26) taxonomy.
+    """Validate live annotations against the canonical taxonomy (ALL_CANONICAL).
 
     P1-14 (K-36, K-37) — SEÇİLEN YÖN: kör legacy çeviri KALDIRILDI.
     Gerekçe: iki canlı üretici de (``YOLOAutoLabeler`` ve
@@ -1823,16 +1833,19 @@ def validate_factory_controller_contract() -> bool:
     non-empty (a tautology), and the readiness/audit/seal/certificate chain
     built on it was fake assurance. Now it verifies the actual invariants:
     the factory class exists, the class-name map is exactly the canonical
-    0..26 taxonomy, and the game-block check returns a string.
+    taxonomy (CANONICAL_NAMES / ALL_CANONICAL_CLASSES), and the game-block
+    check returns a string.
     """
     try:
         if not get_factory_controller_capabilities():
             return False
         if not isinstance(AutoLabelingDatasetFactory, type):
             return False
-        from dataset_factory.class_taxonomy import CANONICAL_NAMES
+        from dataset_factory.class_taxonomy import ALL_CANONICAL_CLASSES, CANONICAL_NAMES
 
         if dict(FACTORY_12_CLASS_NAMES) != dict(CANONICAL_NAMES):
+            return False
+        if set(FACTORY_12_CLASS_NAMES) != set(ALL_CANONICAL_CLASSES):
             return False
         if not isinstance(cuda_training_blocked_by_game(), str):
             return False
@@ -1844,7 +1857,7 @@ def validate_factory_controller_contract() -> bool:
 # The readiness/audit/seal/certificate wrappers below used to call
 # validate_factory_controller_contract() once PER NESTING LEVEL (8 calls for
 # get_factory_controller_audit_summary), each re-importing the taxonomy and
-# re-comparing the 27-entry map. The nesting also meant the levels could
+# re-comparing the canonical map. The nesting also meant the levels could
 # theoretically disagree with each other. Each public wrapper now validates
 # exactly once and threads the single result through private builders, so
 # the nested payload is built from one consistent verdict. Public names,

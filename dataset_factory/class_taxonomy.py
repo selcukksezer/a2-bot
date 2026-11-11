@@ -763,10 +763,17 @@ def _build_taxonomy_locked() -> None:
     # _ALIASES/_NAMES/_LABELS_TR dict-update ile zaten idempotent.
     del UNMAPPED_CATALOG_MATERIALS[:]
     _NAMES.update(authority_names)
+    # Fill any in-code canonical ids the authority may still be catching
+    # up on (e.g. F4 generics 27/28) so ui_class_specs / factory always
+    # cover CANONICAL_NAMES even when data.yaml lags briefly.
+    for _cid, _name in CANONICAL_NAMES.items():
+        _NAMES.setdefault(int(_cid), _name)
     _LABELS_TR.update(CANONICAL_LABELS_TR)
 
     # 1. Register canonical names and labels
-    for cid, name in authority_names.items():
+    for cid, name in list(_NAMES.items()):
+        if cid not in ALL_CANONICAL_CLASSES:
+            continue
         _add_alias(name, cid)
         _add_alias(_LABELS_TR.get(cid, ""), cid)
         _add_alias(CANONICAL_SHORT_LABELS_TR.get(cid, ""), cid)

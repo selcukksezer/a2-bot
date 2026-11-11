@@ -233,11 +233,11 @@ def test_generates_valid_data_approved_yaml_schema_and_paths(tmp_path: Path) -> 
     assert "\\" not in parsed["path"]
     assert parsed["train"] == "images/train"
     assert parsed["val"] == "images/val"
-    assert parsed["nc"] == len(CANONICAL_NAMES) == 27
+    assert parsed["nc"] == len(CANONICAL_NAMES) == 29
 
     names = parsed["names"]
     assert isinstance(names, dict)
-    assert len(names) == 27
+    assert len(names) == 29
     for cid, cname in CANONICAL_NAMES.items():
         assert names[cid] == cname
 
@@ -438,6 +438,6 @@ def test_top_level_prepare_approved_training_dataset_function(
     yaml_file = Path(result["data_yaml_path"])
     assert yaml_file.is_file()
     yaml_data = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
-    assert yaml_data["nc"] == 27
+    assert yaml_data["nc"] == len(CANONICAL_NAMES) == 29
     assert yaml_data["train"] == "images/train"
     assert yaml_data["val"] == "images/val"

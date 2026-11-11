@@ -57,15 +57,19 @@ def test_canonical_classes_0_to_26_exact_mapping() -> None:
         24: "buff_scroll",
         25: "kinah",
         26: "player_character",
+        27: "other_ore",
+        28: "other_odyle",
     }
     assert CANONICAL_NAMES == expected_names
     assert dataset_class_names() == expected_names
-    assert set(CANONICAL_NAMES.keys()) == set(range(27))
-    assert ALL_CANONICAL_CLASSES == frozenset(range(27))
+    assert set(CANONICAL_NAMES.keys()) == set(range(29))
+    assert ALL_CANONICAL_CLASSES == frozenset(range(29))
     assert set(CORE_22_CANONICAL_NAMES.keys()) == set(range(22))
     assert set(CONSUMABLE_CANONICAL_NAMES.keys()) == {22, 23, 24}
     assert CANONICAL_NAMES[0] == "herb_aria"
     assert CANONICAL_NAMES[24] == "buff_scroll"
+    assert CANONICAL_NAMES[27] == "other_ore"
+    assert CANONICAL_NAMES[28] == "other_odyle"
 
     # Bidirectional mapping check
     for cid, name in expected_names.items():
@@ -74,7 +78,9 @@ def test_canonical_classes_0_to_26_exact_mapping() -> None:
     assert is_valid_canonical_class_id(-1) is False
     assert is_valid_canonical_class_id(25) is True
     assert is_valid_canonical_class_id(26) is True
-    assert is_valid_canonical_class_id(27) is False
+    assert is_valid_canonical_class_id(27) is True
+    assert is_valid_canonical_class_id(28) is True
+    assert is_valid_canonical_class_id(29) is False
     assert is_valid_canonical_class_id(98) is False
 
 
@@ -82,15 +88,17 @@ def test_turkish_labels_completeness_and_consistency() -> None:
     """Verify Turkish full and short labels exist for all classes and resolve back."""
     labels_tr = dataset_labels_tr()
     assert labels_tr == CANONICAL_LABELS_TR
-    assert set(CANONICAL_LABELS_TR.keys()) == set(range(27))
-    assert set(CANONICAL_SHORT_LABELS_TR.keys()) == set(range(27))
+    assert set(CANONICAL_LABELS_TR.keys()) == set(range(29))
+    assert set(CANONICAL_SHORT_LABELS_TR.keys()) == set(range(29))
 
     assert CANONICAL_LABELS_TR[0] == "Aria (Mor Kristal Bitki)"
     assert CANONICAL_LABELS_TR[22] == "Can İksiri"
     assert CANONICAL_LABELS_TR[23] == "Mana İksiri"
     assert CANONICAL_LABELS_TR[24] == "Parşömen"
+    assert CANONICAL_LABELS_TR[27] == "Diğer Cevher (Jenerik)"
+    assert CANONICAL_LABELS_TR[28] == "Odyle (Jenerik)"
 
-    for cid in range(27):
+    for cid in range(29):
         full_tr = CANONICAL_LABELS_TR[cid]
         short_tr = CANONICAL_SHORT_LABELS_TR[cid]
         assert isinstance(full_tr, str) and len(full_tr.strip()) > 0
@@ -102,7 +110,7 @@ def test_turkish_labels_completeness_and_consistency() -> None:
 
 
 def test_sanitize_class_id_and_name_canonical_roundtrip() -> None:
-    """Verify sanitize_class_id_and_name resolves all 0..26 IDs, names, and formatting variants."""
+    """Verify sanitize_class_id_and_name resolves all canonical IDs, names, and formatting variants."""
     for cid, cname in CANONICAL_NAMES.items():
         # By ID only
         assert sanitize_class_id_and_name(cid, "") == (cid, cname)

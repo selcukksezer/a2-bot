@@ -947,14 +947,14 @@ def confidence_to_hex_color(conf: float) -> str:
 
 
 def _canonical_classes() -> dict[int, str]:
-    """The 27 canonical classes (0..26), single-sourced from ui.yolo_panel.
+    """Canonical taxonomy map, single-sourced from ui.yolo_panel.
 
     Previously this module carried its own invented map (player_self,
     monster_hostile, npc_vendor, ...) that conflicted with the panel /
     calibration map on every id except the consumables (F-0545). The import
     is function-level to avoid a top-level cycle (yolo_panel re-exports
-    create_yolo_factory_page from this module). S-1801: the panel map is
-    now the canonical 27 (0..26, incl. kinah=25, player_character=26).
+    create_yolo_factory_page from this module). S-1801 / F4: panel map
+    follows CANONICAL_NAMES (today 0..28 / nc=29).
     """
     from ui.yolo_panel import CLASS_ID_TO_NAME
 
@@ -962,14 +962,13 @@ def _canonical_classes() -> dict[int, str]:
 
 
 def _canonical_25_classes() -> dict[int, str]:
-    """Deprecated alias of _canonical_classes (legacy name, now 27 classes)."""
+    """Deprecated alias of _canonical_classes (legacy name)."""
     return _canonical_classes()
 
 
 def __getattr__(name: str) -> Any:
     # Back-compat: CANONICAL_25_CLASSES as a module attribute, resolved lazily.
-    # The name is legacy (the map now holds the canonical 27 classes, 0..26);
-    # prefer CANONICAL_27_CLASSES / CANONICAL_CLASSES.
+    # Prefer CANONICAL_CLASSES (length tracks CANONICAL_NAMES).
     if name in ("CANONICAL_25_CLASSES", "CANONICAL_27_CLASSES", "CANONICAL_CLASSES"):
         return _canonical_classes()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -1048,13 +1047,15 @@ def _get_web_pool(dataset_dir: Optional[str] = None) -> ApprovedDatasetPool:
 
 def get_web_pipeline_extended_state(dataset_dir: Optional[str] = None) -> dict:
     """Return extended web pipeline state for ApprovedDatasetPool, 3-tier confidence colors,
-    only_approved training mode, and the 27 canonical classes (0..26) from
-    ui.yolo_panel.CLASS_ID_TO_NAME (F-0545, S-1801).
+    only_approved training mode, and the canonical class map from
+    ui.yolo_panel.CLASS_ID_TO_NAME (F-0545, S-1801 / F4 nc=29).
     """
     pool = _get_web_pool(dataset_dir)
     pool_summary = pool.summary()
     canonical_classes = _canonical_classes()
-    class_list = [canonical_classes[i] for i in range(27)]
+    class_ids = sorted(int(cid) for cid in canonical_classes)
+    class_list = [canonical_classes[i] for i in class_ids]
+    class_count = len(class_ids)
     return {
         "pool_name": "ApprovedDatasetPool",
         "approved_dataset_pool": pool_summary,
@@ -1066,9 +1067,9 @@ def get_web_pipeline_extended_state(dataset_dir: Optional[str] = None) -> dict:
             CONFIDENCE_TIER_COLORS["low"],
         ],
         "confidence_tiers": CONFIDENCE_COLOR_TIERS,
-        "num_classes": 27,
-        "canonical_class_count": 27,
-        "class_ids": list(range(27)),
+        "num_classes": class_count,
+        "canonical_class_count": class_count,
+        "class_ids": class_ids,
         "canonical_classes": dict(canonical_classes),
         "class_names": class_list,
     }

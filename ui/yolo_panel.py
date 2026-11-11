@@ -69,40 +69,46 @@ def style_combobox_dark_view(combo: Optional[QComboBox]) -> None:
 
 logger = logging.getLogger("Gatherion.YOLOPanel")
 
-# Class ID to Name mapping — canonical 27 classes (0..26), single authority
-# dataset_factory/class_taxonomy.py CANONICAL_NAMES (Decision 1 / S-1801).
-# Previously this was a stale 25-class map (0..24): 6/7/8/12 carried legacy
-# names (world_gather_crest, f_gather_prompt, f_press_key,
-# feather_particle_negative) and 25 kinah / 26 player_character were missing.
-CLASS_ID_TO_NAME: Dict[int, str] = {
-    0: "herb_aria",
-    1: "herb_mela",
-    2: "herb_targena",
-    3: "ore_orichalcum",
-    4: "gem_crystal",
-    5: "tree_log",
-    6: "herb_edana",
-    7: "herb_lumina",
-    8: "ore_obsidian",
-    9: "minimap_sprout",
-    10: "monster_3d",
-    11: "minimap_monster_dot",
-    12: "crystal_blood",
-    13: "skill_ui_prompt",
-    14: "obstacle",
-    15: "path_ground",
-    16: "player_hp_bar",
-    17: "player_mp_bar",
-    18: "target_hp_bar",
-    19: "skill_bar",
-    20: "skill_slot_ready",
-    21: "skill_slot_cooldown",
-    22: "hp_potion",
-    23: "mp_potion",
-    24: "buff_scroll",
-    25: "kinah",
-    26: "player_character",
-}
+# Class ID to Name mapping — canonical taxonomy (today 0..28 / nc=29),
+# single authority dataset_factory/class_taxonomy.py CANONICAL_NAMES
+# (Decision 1 / S-1801). Previously this was a stale 25-class map (0..24):
+# 6/7/8/12 carried legacy names and 25..28 were missing.
+try:
+    from dataset_factory.class_taxonomy import CANONICAL_NAMES as _PANEL_CANONICAL_NAMES
+
+    CLASS_ID_TO_NAME: Dict[int, str] = dict(_PANEL_CANONICAL_NAMES)
+except Exception:
+    CLASS_ID_TO_NAME = {
+        0: "herb_aria",
+        1: "herb_mela",
+        2: "herb_targena",
+        3: "ore_orichalcum",
+        4: "gem_crystal",
+        5: "tree_log",
+        6: "herb_edana",
+        7: "herb_lumina",
+        8: "ore_obsidian",
+        9: "minimap_sprout",
+        10: "monster_3d",
+        11: "minimap_monster_dot",
+        12: "crystal_blood",
+        13: "skill_ui_prompt",
+        14: "obstacle",
+        15: "path_ground",
+        16: "player_hp_bar",
+        17: "player_mp_bar",
+        18: "target_hp_bar",
+        19: "skill_bar",
+        20: "skill_slot_ready",
+        21: "skill_slot_cooldown",
+        22: "hp_potion",
+        23: "mp_potion",
+        24: "buff_scroll",
+        25: "kinah",
+        26: "player_character",
+        27: "other_ore",
+        28: "other_odyle",
+    }
 
 # Confidence tiers — P3-7 (v18): tek kaynak ui.shell_theme (o da
 # dataset_factory/confidence_tier_coloring'dan okur; test-pinned:
@@ -123,6 +129,8 @@ CLASS_COLORS: Dict[str, str] = {
     # Ores, Gems, Trees (Amber / Magenta / Lime)
     "ore_orichalcum": "#f59e0b",     # Amber Gold
     "ore_obsidian": "#334155",       # Dark Slate (obsidian, S-1801)
+    "other_ore": "#78716c",          # Neutral stone (F4 generic ore)
+    "other_odyle": "#a78bfa",        # Soft violet (F4 generic odyle)
     "gem_crystal": "#ec4899",        # Crystal Pink
     "crystal_blood": "#dc2626",      # Blood Red crystal (S-1801)
     "tree_log": "#84cc16",           # Lime Wood

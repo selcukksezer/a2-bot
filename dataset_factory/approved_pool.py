@@ -56,7 +56,7 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 # =============================================================================
-# Canonical Class Definitions Fallback (0..26: Core 22 + consumables + kinah + player)
+# Canonical Class Definitions Fallback (0..28: Core 22 + consumables + kinah + player + F4 generics)
 # =============================================================================
 
 DEFAULT_CANONICAL_NAMES: Dict[int, str] = {
@@ -87,6 +87,8 @@ DEFAULT_CANONICAL_NAMES: Dict[int, str] = {
     24: "buff_scroll",
     25: "kinah",
     26: "player_character",
+    27: "other_ore",
+    28: "other_odyle",
 }
 
 try:

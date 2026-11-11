@@ -182,7 +182,7 @@ def test_generate_approved_data_yaml(temp_pool_dir):
     assert data["path"] == temp_pool_dir.resolve().as_posix()
     assert data["train"] == "images/train"
     assert data["val"] == "images/val"
-    assert data["nc"] == 27
+    assert data["nc"] == len(CANONICAL_NAMES) == 29
     assert data["names"] == CANONICAL_NAMES
 
 

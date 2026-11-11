@@ -120,7 +120,7 @@ _SUPER_CATEGORY_CODES: Dict[str, int] = {
     "currency": 6,
     "player": 7,
 }
-_SUPER_CATEGORY_CODE_BY_CLASS = np.full(29, -1, dtype=np.int8)
+_SUPER_CATEGORY_CODE_BY_CLASS = np.full(max(ALL_CANONICAL_CLASSES) + 1, -1, dtype=np.int8)
 for _code_name, _code, _members in (
     ("3d_materials", 0, SUPER_CATEGORY_3D_MATERIALS),
     ("minimap", 1, SUPER_CATEGORY_MINIMAP),
@@ -952,7 +952,9 @@ class ExemplarMemory:
                 self._pos_cids = np.array([int(ex.get("class_id", -1)) for ex in self._positive], dtype=np.int32)
                 # O-2: 22..26 are canonical classes too — the old clip to
                 # 21 silently re-coded consumables/currency/player as HUD.
-                self._pos_super_cats = _SUPER_CATEGORY_CODE_BY_CLASS[np.clip(self._pos_cids, 0, 26)]
+                self._pos_super_cats = _SUPER_CATEGORY_CODE_BY_CLASS[
+                    np.clip(self._pos_cids, 0, len(_SUPER_CATEGORY_CODE_BY_CLASS) - 1)
+                ]
             else:
                 self._pos_matrix = np.zeros((0, FEATURE_VECTOR_DIM), dtype=np.float32)
                 self._pos_cids = np.zeros((0,), dtype=np.int32)

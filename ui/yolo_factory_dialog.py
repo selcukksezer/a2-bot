@@ -203,10 +203,10 @@ if not logger.handlers:
 
 
 # ============================================================================
-# 27 YOLO Sınıfı Tanımları, Türkçe Etiketleri ve Renk Paleti
+# Kanonik YOLO Sınıfı Tanımları, Türkçe Etiketleri ve Renk Paleti
 # (P1-14: eski "12 YOLO Sınıfı" başlığı yanlıştı — tek otorite
-# dataset_factory.class_taxonomy.CANONICAL_NAMES, 27 sınıf 0..26.
-# YOLO_12_CLASS_SPECS adı uyumluluk için korunuyor ama içeriği 27 sınıftır.)
+# dataset_factory.class_taxonomy.CANONICAL_NAMES, bugün 29 sınıf 0..28.
+# YOLO_12_CLASS_SPECS adı uyumluluk için korunuyor ama içeriği kanonik kümedir.)
 # ============================================================================
 TARGET_DATASET_PHOTO_GOAL: int = 100000
 
@@ -214,7 +214,7 @@ TARGET_DATASET_PHOTO_GOAL: int = 100000
 # (F-1946 remap: tek otorite dataset_factory/class_taxonomy.py CANONICAL_NAMES;
 # 8 = ore_obsidian, 5 = tree_log, 6 = herb_edana, 7 = herb_lumina, 12 = crystal_blood).
 # P1-14 (K-38): bu birebirlik _build_yolo_class_specs'te import anında
-# doğrulanır; taksonomi yüklenemezse veya 27 sınıf tamamlanamazsa sert hata
+# doğrulanır; taksonomi yüklenemezse veya kanonik küme tamamlanamazsa sert hata
 # verilir — sessiz 16 sınıfa düşüş yok.
 # Eski yerel adlar (combo_skill_prompt vb.) yalnızca CLASS_KEY_ALIASES'te
 # kanonik 13 (skill_ui_prompt) için legacy alias olarak durur.
@@ -357,18 +357,18 @@ except Exception as exc:
     # 16 sınıfa düşüş ve eksik alias tablosuyla çalışma yok.
     raise RuntimeError(
         "Taksonomi yüklenemedi (dataset_factory.class_taxonomy): "
-        "YOLO Factory dialog kanonik 27 sınıf olmadan açılamaz"
+        "YOLO Factory dialog kanonik sınıf kümesi olmadan açılamaz"
     ) from exc
 
 
 def _build_yolo_class_specs() -> List[Dict[str, Any]]:
-    """Tek kaynaktan 27 sınıf spec'i: yerel 16 (0..15, kanonikle birebir — F-1946)
-    + canonical taksonomiden 16..26.
+    """Tek kaynaktan kanonik sınıf spec'leri: yerel 16 (0..15, kanonikle
+    birebir — F-1946) + canonical taksonomiden 16..N (ui_class_specs).
 
     P1-14 (K-38): sınıf sayısı tek kaynaktır (CANONICAL_NAMES). Yerel tablo
-    taksonomiyle çelişirse, taksonomi genişletilemezse veya sonuç 27 sınıfı
-    tam kapsamazsa SERT hata verilir; eskiden olduğu gibi warning loglayıp
-    sessizce 16 sınıfla devam edilmez.
+    taksonomiyle çelişirse, taksonomi genişletilemezse veya sonuç kanonik
+    kümeyi tam kapsamazsa SERT hata verilir; eskiden olduğu gibi warning
+    loglayıp sessizce 16 sınıfla devam edilmez.
     """
     for item in _BASE_CLASS_SPECS:
         cid = int(item["id"])
@@ -392,9 +392,11 @@ def _build_yolo_class_specs() -> List[Dict[str, Any]]:
         specs.append(dict(extra))
     specs.sort(key=lambda item: int(item["id"]))
     if {int(item["id"]) for item in specs} != set(_TAXONOMY_CANONICAL_NAMES):
+        _max_id = max(_TAXONOMY_CANONICAL_NAMES) if _TAXONOMY_CANONICAL_NAMES else -1
         raise RuntimeError(
             "Sınıf taksonomisi eksik: %d spec üretildi, kanonik %d sınıf "
-            "bekleniyor (0..26)" % (len(specs), len(_TAXONOMY_CANONICAL_NAMES))
+            "bekleniyor (0..%d)"
+            % (len(specs), len(_TAXONOMY_CANONICAL_NAMES), _max_id)
         )
     return specs
 

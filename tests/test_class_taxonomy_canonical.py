@@ -99,19 +99,21 @@ def test_consumable_classes_defined():
     assert CANONICAL_NAMES[24] == "buff_scroll"
     assert CANONICAL_NAMES[25] == "kinah"
     assert CANONICAL_NAMES[26] == "player_character"
-    assert len(CANONICAL_NAMES) == 27
-    assert len(ALL_CANONICAL_CLASSES) == 27
+    assert CANONICAL_NAMES[27] == "other_ore"
+    assert CANONICAL_NAMES[28] == "other_odyle"
+    assert len(CANONICAL_NAMES) == 29
+    assert len(ALL_CANONICAL_CLASSES) == 29
 
 
 def test_is_valid_canonical_class_id():
-    """Verify that canonical validation accepts 0..26 and rejects alien IDs."""
-    for cid in range(27):
+    """Verify that canonical validation accepts 0..28 and rejects alien IDs."""
+    for cid in range(29):
         assert is_valid_canonical_class_id(cid) is True
         assert is_valid_canonical_class_id(str(cid)) is True
 
     # Alien / non-canonical IDs
     assert is_valid_canonical_class_id(-1) is False
-    assert is_valid_canonical_class_id(27) is False
+    assert is_valid_canonical_class_id(29) is False
     assert is_valid_canonical_class_id(98) is False  # Legacy essence_yggdrasil_log ID
     assert is_valid_canonical_class_id(135) is False
     assert is_valid_canonical_class_id("invalid") is False
@@ -120,8 +122,8 @@ def test_is_valid_canonical_class_id():
 
 def test_super_categories():
     """Verify super-category memberships and predicates."""
-    # 3D Materials
-    expected_3d = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12}
+    # 3D Materials (includes F4 generics other_ore / other_odyle)
+    expected_3d = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 27, 28}
     assert MATERIAL_3D_CLASSES == expected_3d
     for cid in expected_3d:
         assert is_3d_world_material(cid) is True
@@ -326,17 +328,19 @@ def test_ui_class_specs_and_backwards_compatibility():
     assert 24 in spec_ids
     assert 25 in spec_ids
     assert 26 in spec_ids
-    assert max(spec_ids) == 26
+    assert 27 in spec_ids
+    assert 28 in spec_ids
+    assert max(spec_ids) == 28
 
     all_specs = all_ui_class_specs()
-    assert len(all_specs) == 27
+    assert len(all_specs) == 29
 
 
 def test_dataset_class_names_and_alias_map():
-    """Verify that dataset_class_names and alias_map are correctly built with 27 canonical classes."""
+    """Verify that dataset_class_names and alias_map are correctly built with 29 canonical classes."""
     names = dataset_class_names()
-    assert len(names) == 27
-    assert max(names.keys()) == 26
+    assert len(names) == 29
+    assert max(names.keys()) == 28
 
     aliases = alias_map()
     assert "essence_yggdrasil_log" in aliases
@@ -349,7 +353,9 @@ def test_dataset_class_names_and_alias_map():
     assert aliases["karakterim"] == 26
     assert aliases["oyuncu"] == 26
     assert aliases["player"] == 26
-    assert max(aliases.values()) <= 26
+    assert aliases["other_ore"] == 27
+    assert aliases["other_odyle"] == 28
+    assert max(aliases.values()) <= 28
 
 
 def test_player_character_class():

@@ -27,27 +27,27 @@ from dataset_factory.manual_tag_search import (
 
 
 def test_tag_list_full_canonical_catalog_and_combobox_items() -> None:
-    """Verify aggregate sizes: 27 canonical classes, 24 core-only, 27 combobox items."""
+    """Verify aggregate sizes: 29 canonical classes, 26 non-consumable, 29 combobox items."""
     registry = SearchableTagRegistry()
     all_classes = registry.get_all_classes(include_consumables=True)
-    assert len(all_classes) == 27
-    assert len(CANONICAL_NAMES) == 27
+    assert len(all_classes) == 29
+    assert len(CANONICAL_NAMES) == 29
 
     core_only = registry.get_all_classes(include_consumables=False)
-    assert len(core_only) == 24
-    assert [c["class_id"] for c in core_only] == list(range(22)) + [25, 26]
+    assert len(core_only) == 26
+    assert [c["class_id"] for c in core_only] == list(range(22)) + [25, 26, 27, 28]
 
     combo_items = registry.get_combobox_items()
-    assert len(combo_items) == 27
+    assert len(combo_items) == 29
 
 
-@pytest.mark.parametrize("class_id", range(27))
+@pytest.mark.parametrize("class_id", range(29))
 def test_tag_list_entry_matches_canonical_catalog(class_id: int) -> None:
     """Verify each single catalog entry (id, name, key, display label, combobox item).
 
-    Eskiden 27 girdilik tek döngüydü: ilk hatalı girdide döngü kırılır,
+    Eskiden sabit girdilik tek döngüydü: ilk hatalı girdide döngü kırılır,
     kalan girdiler hiç denetlenmezdi. Parametreli hali her girdiyi ayrı
-    test vakası yapar; bir girdideki hata diğer 26'sını gizlemez.
+    test vakası yapar; bir girdideki hata diğerlerini gizlemez.
     """
     registry = SearchableTagRegistry()
     all_classes = registry.get_all_classes(include_consumables=True)
