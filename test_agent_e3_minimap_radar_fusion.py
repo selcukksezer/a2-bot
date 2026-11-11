@@ -144,6 +144,11 @@ class TestPlayerClearanceNorm:
         cy = int(round(h * 0.545))
         clearance_px = min(w, h) * 0.075  # ~19.275 px
 
+        # Player chevron at the assumed center: without it the scanner's
+        # detected player center drifts and the "inside" dots are no longer
+        # inside clearance (see F-1313).
+        cv2.circle(crop, (cx, cy), 4, (255, 255, 255), -1)
+
         # 1. Hostile red dot INSIDE clearance (dist = 10px <= 19.275px)
         cv2.circle(crop, (cx + 8, cy + 6), 4, (20, 20, 240), -1)
 
@@ -159,6 +164,14 @@ class TestPlayerClearanceNorm:
         results = scanner.scan_minimap_crop(crop)
         hostiles = results["hostile_dots"]
         monsters = results["monster_dots"]
+
+        # The inside dots must be dropped AND the outside dots must survive:
+        # exactly one hostile and one monster remain, at the outside positions.
+        # A bare `all(...)` over an empty list would pass vacuously (F-1313).
+        assert len(hostiles) == 1, hostiles
+        assert len(monsters) == 1, monsters
+        assert hostiles[0]["pos"] == (cx + 35, cy + 20), hostiles
+        assert monsters[0]["pos"] == (cx - 35, cy - 30), monsters
 
         # Only the outside hostile dot should survive
         assert all(h["dist_px"] > clearance_px for h in hostiles)
@@ -183,6 +196,15 @@ class TestPlayerClearanceNorm:
         cv2.circle(crop, (cx + 50, cy + 20), 4, (20, 20, 240), -1)
 
         materials, monsters = classify_minimap_crop_bgr(crop)
+        # The inside red dot must be filtered AND the outside one must survive:
+        # exactly one monster remains, the outside hostile dot. A bare loop over
+        # an empty list would pass vacuously (F-1314).
+        assert len(monsters) == 1, monsters
+        assert monsters[0]["kind"] == "hostile_dot", monsters
+        assert monsters[0]["is_hostile"] is True
+        outside = (cx + 50, cy + 20)
+        assert abs(monsters[0]["norm_x"] * w - outside[0]) < 6, monsters
+        assert abs(monsters[0]["norm_y"] * h - outside[1]) < 6, monsters
         # Ensure inside red dot was filtered by clearance
         gather_clearance_px = 0.075 * min(w, h)
         for mob in monsters:
@@ -205,43 +227,76 @@ class TestSubregionRecognition:
         assert resolve_canonical_region("Moslan Forest") == "Altgard"
         assert resolve_canonical_region("Altgard") == "Altgard"
 
-    def test_identify_subregion_from_minimap_title(self) -> None:
-        """identify_subregion correctly recognizes 'Dredgion Crash Site' and 'Safe Haven' from title text."""
+    def test_identify_subregion_from_real_game_pixels(self) -> None:
+        """identify_subregion recognizes the subregion on real game pixels.
+
+        The old test rendered the title with cv2.putText(FONT_HERSHEY_SIMPLEX)
+        — the exact font/scale production uses to build its own match
+        templates — so it could only prove the matcher matches itself (F-1315).
+        This test uses a real screenshot instead.
+        """
+        scanner = MinimapScanner()
+        frame_path = os.path.join(
+            os.path.dirname(__file__),
+            "reference_screenshots",
+            "pilgrims_ridge_1.jpg",
+        )
+        data = np.fromfile(frame_path, dtype=np.uint8)
+        frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        assert frame is not None
+        res = scanner.identify_subregion(frame)
+        assert res["subregion"] == "Pilgrim's Ridge", res
+        # H-sweep dilim 13 K1: kanonik bölge tek kaynaktan çözülür —
+        # 'pilgrim's ridge' -> 'Verteron' (core/minimap_scanner.py:117),
+        # eski 'Altgard' varsayımı kalktı.
+        assert res["canonical_region"] == "Verteron"
+        assert res["source"] == "header_template_ncc", res
+
+    def test_identify_subregion_generalizes_beyond_own_templates(self) -> None:
+        """Matcher recognizes titles rendered in fonts it never templated.
+
+        Production builds its templates only with FONT_HERSHEY_SIMPLEX, so
+        rendering the same titles in DUPLEX / TRIPLEX proves the matcher
+        generalizes instead of matching its own rendering (F-1315).
+        """
         scanner = MinimapScanner()
         h, w = 257, 332
 
-        # 1. Test Dredgion Crash Site
+        # DUPLEX rendering of "Dredgion Crash Site" (never a production template)
         img_dredgion = np.full((h, w, 3), (40, 50, 60), dtype=np.uint8)
         cv2.putText(
             img_dredgion,
             "Dredgion Crash Site",
             (8, 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.FONT_HERSHEY_DUPLEX,
             0.55,
             (240, 240, 240),
             1,
             cv2.LINE_AA,
         )
         res_d = scanner.identify_subregion(img_dredgion)
-        assert res_d["subregion"] == "Dredgion Crash Site"
+        assert res_d["subregion"] == "Dredgion Crash Site", res_d
         assert res_d["canonical_region"] == "Altgard"
-        assert res_d["confidence"] > 0.70
+        # Matching genuinely fired, not the default fallback.
+        assert res_d["source"] == "header_template_ncc", res_d
 
-        # 2. Test Safe Haven
+        # TRIPLEX rendering of "Safe Haven" — a different font AND title.
         img_haven = np.full((h, w, 3), (40, 50, 60), dtype=np.uint8)
         cv2.putText(
             img_haven,
             "Safe Haven",
             (8, 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.FONT_HERSHEY_TRIPLEX,
             0.55,
             (240, 240, 240),
             1,
             cv2.LINE_AA,
         )
         res_h = scanner.identify_subregion(img_haven)
-        assert res_h["subregion"] == "Safe Haven"
+        assert res_h["subregion"] == "Safe Haven", res_h
         assert res_h["canonical_region"] == "Altgard"
+        assert res_h["source"] == "header_template_ncc", res_h
+        assert res_h["subregion"] != res_d["subregion"]
 
     def test_identify_subregion_spatial_lookup(self) -> None:
         """Player map coordinates within Dredgion Crash Site bounding box identify the subregion."""

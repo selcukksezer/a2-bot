@@ -11,21 +11,29 @@ ZIP içe/dışa aktarma işlevlerini barındırır.
 
 from __future__ import annotations
 
+import copy
 import datetime
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import shutil
 import time
 import zipfile
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import cv2
 import numpy as np
 
 from core.patch_normalizer import MinimapOrientationGuard, SobelClahePatchNormalizer
+# P1-7 (K-20): dünya-harita metre/piksel ölçeğinin tek kaynağı.
+# 0.25 (vision.py eski değeri) ile çelişir; kalibre edilmedi — karar
+# gerekçesi core/corridor_navigator.py başlığındadır.
+from core.corridor_navigator import WORLD_MAP_METERS_PER_PX
+from version import __version__
 
 try:
     from config.materials_db import (
@@ -68,10 +76,34 @@ PATCH_SIZE: int = 80
 DEFAULT_REST_SEC: int = 300
 DEFAULT_REGION: str = "Verteron"
 DEFAULT_ROUTE: str = "All"
-DEFAULT_RESOURCE_TYPE: str = "Orichalcum Ore"
+# v19 ZIP içe aktarma korumaları (final rapor §10): `import_route_zip`
+# arşiv girdisini kontrolsüz okuyordu — `zf.read` sınırsız şişirme
+# (zip bomb), `create_region` dönüşü denetlenmiyordu, JSON şekli
+# doğrulanmıyordu. Gerçek dışa aktarma `region_data.json` için KB
+# mertebesinde, yama PNG'leri küçük kesitlerdir; sınırlar cömerttir.
+ZIP_IMPORT_MAX_JSON_BYTES: int = 10 * 1024 * 1024
+ZIP_IMPORT_MAX_PATCH_BYTES: int = 5 * 1024 * 1024
+ZIP_IMPORT_MAX_TOTAL_PATCH_BYTES: int = 64 * 1024 * 1024
+ZIP_IMPORT_COPY_CHUNK_BYTES: int = 256 * 1024
+# K3 (dilim 13) + v11 entegrasyon (2): adı bilinmeyen tespit jenerik
+# türe düşer — "Orichalcum Ore" spesifik bir maden adıydı; adı
+# bilinmeyen her tespit %100 güvenli Orichalcum düğümü olarak rotaya
+# yazılıyordu. "Gatherable Material" rota verisindeki yerleşik
+# jenerik etikettir (93 düğümde aynen böyle kayıtlı).
+DEFAULT_RESOURCE_TYPE: str = "Gatherable Material"
 DEFAULT_MAX_HARVESTS: int = 3
 DEFAULT_SOURCE_TYPE: str = "manual"
-VALID_SOURCE_TYPES: Tuple[str, ...] = ("manual", "minimap_auto", "3d_auto", "questlog")
+VALID_SOURCE_TYPES: Tuple[str, ...] = (
+    "manual",
+    "minimap_auto",
+    "3d_auto",
+    "questlog",
+    "interpolated",
+    "minimap_material",
+    "3d_world_crest",
+    "gather_prompt",
+    "harvest_auto",
+)
 
 # ==============================================================================
 # SUBREGION CANONICAL MAPPING & BOUNDING SECTOR DEFINITIONS
@@ -93,6 +125,15 @@ SUBREGION_TO_CANONICAL: Dict[str, str] = {
     "Idun's Lake": "Altgard",
     "Black Plains": "Altgard",
     "Heart of the Dragon": "Altgard",
+    # J (sweep): ui/map_viewer.py kendi kopyasında bu 5 adı Altgard'a
+    # bağlıyordu; tek kaynak burası olsun diye eklendi (kısa adlar:
+    # "Dredgion"/"Calderon" tam adların kısaltması, "Mumu Farmland"/
+    # "Gribbler Sanctuary"/"Basfelt Village" map_viewer'daki adlar).
+    "Mumu Farmland": "Altgard",
+    "Dredgion": "Altgard",
+    "Calderon": "Altgard",
+    "Gribbler Sanctuary": "Altgard",
+    "Basfelt Village": "Altgard",
     # Verteron subregions
     "Tolbas Forest": "Verteron",
     "Dukaki Settlement": "Verteron",
@@ -158,6 +199,18 @@ _CANONICAL_REGION_LOOKUP: Dict[str, str] = {
     "brusthonin": "Brusthonin",
     "reshanta": "Reshanta",
 }
+
+KNOWN_CANONICAL_REGIONS: frozenset = frozenset(_CANONICAL_REGION_LOOKUP.values())
+
+# Canlı bölge tespiti için asgari güven (Görev 4 / harita-istatistik).
+# Minimap başlık-eşleşmesinin "eşleşme sayılır" sınırı (0.45) ile aynıdır:
+# altındaki tespit "bilinmiyor" sayılır, asla varsayılan bölgeye düşülmez.
+REGION_DETECTION_MIN_CONFIDENCE: float = 0.45
+# H-sweep (dilim 13 Y2): canlı bölge tespitinin son kullanma süresi.
+# note_detected_region zaman damgası yazar ama okuyucular yaşı hiç
+# kontrol etmiyordu — 30 dk önceki tespit sonsuza dek 'canlı' sayılır,
+# bölge değişince uyumsuzluk bayrağı bayat tespitle kilitlenirdi.
+REGION_DETECTION_TTL_SEC: float = 1800.0
 
 SUBREGION_BOUNDING_AREAS: Dict[str, Dict[str, Any]] = {
     "dredgion crash site": {
@@ -230,6 +283,394 @@ SUBREGION_BOUNDING_AREAS: Dict[str, Dict[str, Any]] = {
         "center": (1050, 400),
         "radius": 210.0,
     },
+
+    "arbolu's haven": {
+        "canonical": "Heiron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "ardus shrine": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "bakarma barracks": {
+        "canonical": "Beluslan",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "baltasar hill village": {
+        "canonical": "Brusthonin",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "besfer refugee camp": {
+        "canonical": "Beluslan",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "black plains": {
+        "canonical": "Altgard",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "bubu village": {
+        "canonical": "Brusthonin",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "cantas coast": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "dukaki settlement": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "eiron desert": {
+        "canonical": "Eltnen",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "ellun river mouth": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "eltnen fortress": {
+        "canonical": "Eltnen",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "geolus campsite": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "golden bough garrison": {
+        "canonical": "Eltnen",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "grave of the red sky union": {
+        "canonical": "Altgard",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "heart of the dragon": {
+        "canonical": "Altgard",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "heiron observatory": {
+        "canonical": "Heiron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "hoarfrost shelter": {
+        "canonical": "Beluslan",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "ice claw village": {
+        "canonical": "Morheim",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "idun's lake": {
+        "canonical": "Altgard",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "jamanok inn": {
+        "canonical": "Theobomos",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "kaidan headquarters": {
+        "canonical": "Eltnen",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "kishar observation post": {
+        "canonical": "Heiron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "manduri forest": {
+        "canonical": "Eltnen",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "meniherk excavation camp": {
+        "canonical": "Theobomos",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "mist mane village": {
+        "canonical": "Morheim",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "morheim fortress": {
+        "canonical": "Morheim",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "moslan forest": {
+        "canonical": "Altgard",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "observatory village": {
+        "canonical": "Theobomos",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "patamor ridge": {
+        "canonical": "Morheim",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "pilgrim's ridge": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "pilgrims ridge": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "primum landing": {
+        "canonical": "Reshanta",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "red mane cavern": {
+        "canonical": "Beluslan",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "salintus desert": {
+        "canonical": "Morheim",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "senea's campsite": {
+        "canonical": "Heiron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "settlers' campsite": {
+        "canonical": "Brusthonin",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "siel's eastern fortress": {
+        "canonical": "Reshanta",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "sulfur tree nest": {
+        "canonical": "Reshanta",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "teminon landing": {
+        "canonical": "Reshanta",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "tolbas forest": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "verteron citadel": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
+    "zulons island": {
+        "canonical": "Verteron",
+        # Geometri henuz haritalanmadi: uydurma bbox yazilmadi; yalnizca
+        # rota etiketiyle eslesir (filter_nodes_by_subregion by_route dali).
+        "bbox": None,
+        "norm_bbox": None,
+        "center": None,
+        "radius": 260.0,
+    },
 }
 
 
@@ -294,6 +735,11 @@ def filter_nodes_by_subregion(nodes: Sequence[NodeData], subregion: str) -> List
     # 2. Geometrik sınırlayıcı kutu / merkez yarıçapı
     sub_info = get_subregion_info(clean_sub)
     by_geom: List[NodeData] = []
+    # Eski kod `n not in by_geom` ile dataclass __eq__ (tum alanlar)
+    # karsilastirmasi yapiyordu: her aday icin O(len(by_geom)) tarama ->
+    # O(n^2) ve buyuk rotalarda saniyeler. Kimlik (id()) bazli kume ayni
+    # tekillestirmeyi O(1) ile yapar; birlestirme adimi zaten id() kullaniyordu.
+    seen_geom_ids: Set[int] = set()
     if sub_info:
         bbox = sub_info.get("bbox")
         norm_bbox = sub_info.get("norm_bbox")
@@ -319,7 +765,8 @@ def filter_nodes_by_subregion(nodes: Sequence[NodeData], subregion: str) -> List
                 if dist <= (radius * 1.25):
                     in_box = True
 
-            if in_box and n not in by_geom:
+            if in_box and id(n) not in seen_geom_ids:
+                seen_geom_ids.add(id(n))
                 by_geom.append(n)
 
     if by_route and by_geom:
@@ -335,7 +782,9 @@ def filter_nodes_by_subregion(nodes: Sequence[NodeData], subregion: str) -> List
     elif by_geom:
         return by_geom
 
-    return list(nodes)
+    # Eslesme yoksa bos don: cagiran alt bolge istedigini biliyor; tum
+    # dugumleri dondurmek yanlis bolgenin rotasini calistirir.
+    return []
 
 
 # ==============================================================================
@@ -365,8 +814,6 @@ CANONICAL_MATERIAL_GROUPS: Dict[str, Set[str]] = {
         "radiant_orichalcum_ore",
         "fresh_orichalcum",
         "ore_vein",
-        "3",
-        "5",
     },
     "herb_aria": {
         "herb_aria",
@@ -375,7 +822,6 @@ CANONICAL_MATERIAL_GROUPS: Dict[str, Set[str]] = {
         "taze_aria",
         "aria_mor_kristal_bitki",
         "herb_flora",
-        "0",
     },
     "herb_mela": {
         "herb_mela",
@@ -384,8 +830,6 @@ CANONICAL_MATERIAL_GROUPS: Dict[str, Set[str]] = {
         "fresh_mela",
         "taze_mela",
         "mela_meyvesi",
-        "1",
-        "4",
     },
     "herb_targena": {
         "herb_targena",
@@ -393,7 +837,6 @@ CANONICAL_MATERIAL_GROUPS: Dict[str, Set[str]] = {
         "fresh_targena",
         "taze_targena",
         "targena_otu",
-        "2",
     },
     "gem_crystal": {
         "gem_crystal",
@@ -437,8 +880,6 @@ CANONICAL_MATERIAL_GROUPS: Dict[str, Set[str]] = {
         "aquamarine_gemstone",
         "opal",
         "opal_gemstone",
-        "4",
-        "10",
     },
     "tree_log": {
         "tree_log",
@@ -471,8 +912,6 @@ CANONICAL_MATERIAL_GROUPS: Dict[str, Set[str]] = {
         "duran_log",
         "subara",
         "subara_log",
-        "5",
-        "11",
     },
     "herb_azpha": {
         "herb_azpha",
@@ -533,12 +972,148 @@ def _normalize_material_token(text: Any) -> str:
     return norm
 
 
+def _token_boundary_contains(haystack_norm: str, needle_norm: str) -> bool:
+    """S011 (v19/P3-8): normalize edilmiş adlarda alt-dize eşleşmesi
+    yalnızca belirteç (token) sınırında geçerlidir. ``_normalize_``
+    boşluğu ``_`` yapar, o yüzden belirteçler ``_`` ile ayrılır:
+    ``iron_ore`` ⊂ ``iron_ore_vein`` evet (bitişik alt dizi),
+    ``iron`` ⊂ ``ironwood`` hayır.
+    """
+    if not haystack_norm or not needle_norm:
+        return False
+    hay = [t for t in haystack_norm.split("_") if t]
+    nee = [t for t in needle_norm.split("_") if t]
+    if not hay or not nee or len(nee) > len(hay):
+        return False
+    return any(hay[i:i + len(nee)] == nee for i in range(len(hay) - len(nee) + 1))
+
+
+# B-01 (sweep-slice30): norm_x/norm_y HARİTA KANVASI (1280x720) uzayında
+# tanımlıdır — routes/*/region_data.json düğüm 245: norm (0.3328, 0.3972)
+# x 1280x720 = (426, 286) = map_x/map_y (core/questlog_importer.py
+# MAP_WIDTH/MAP_HEIGHT ile aynı). Eski 1920x1080 varsayılanı her iki
+# gerçek ölçekte de yanlıştı (norm dalında %50 konum sapması).
+MAP_CANVAS_WIDTH = 1280.0
+MAP_CANVAS_HEIGHT = 720.0
+_NORM_CANVAS_FALLBACK_WARNED = False
+
+
+def _warn_norm_canvas_fallback_once() -> None:
+    """Norm dalı boyutsuz çağrıldı: kanvas varsayıldı — süreçte bir kez uyar."""
+    global _NORM_CANVAS_FALLBACK_WARNED
+    if not _NORM_CANVAS_FALLBACK_WARNED:
+        _NORM_CANVAS_FALLBACK_WARNED = True
+        logger.warning(
+            "Norm-koordinat dönüşümünde boyut verilmedi; harita kanvası "
+            "1280x720 varsayıldı (eski sessiz 1920x1080 yanlış ölçekti). "
+            "Çağıran gerçek boyutu geçirmeli."
+        )
+
+
+def _norm_xy_to_px(
+    nx: Any,
+    ny: Any,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
+) -> Optional[Tuple[float, float]]:
+    """norm_x/norm_y -> piksel. Boyut yoksa kanvas varsayılır (bir kez uyarılır).
+
+    (0.5, 0.5) yer tutucu merkezdir, gerçek koordinat değil — reddedilir
+    (None döner, çağıran map==0 dalına düşer). Ölçülemeyen norm da None döner.
+    """
+    if nx is None or ny is None:
+        return None
+    try:
+        fx = float(nx)
+        fy = float(ny)
+    except (TypeError, ValueError):
+        return None
+    if fx == 0.5 and fy == 0.5:
+        return None
+    if fallback_width is None or fallback_height is None:
+        _warn_norm_canvas_fallback_once()
+    width = MAP_CANVAS_WIDTH if fallback_width is None else float(fallback_width)
+    height = MAP_CANVAS_HEIGHT if fallback_height is None else float(fallback_height)
+    return fx * width, fy * height
+
+
+def _extract_node_xy_or_none(
+    node: Any,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
+) -> Optional[Tuple[float, float]]:
+    """`_extract_node_xy`'nin hayaletsiz varyantı: koordinat çıkarılamazsa
+    `(0.0, 0.0)` döndürmez, `None` döner.
+
+    (0.5, 0.5) norm yer tutucusu tek başına koordinat sayılmaz;
+    map anahtarı hiç olmayan ve kullanılabilir normu da olmayan düğüm
+    koordinatsızdır (`None`). Açıkça verilmiş piksel `(0, 0)` (tuple,
+    dict veya nesne) gerçek köşe koordinatıdır, reddedilmez.
+
+    F4 (F3'ün `core/sequential_router.py` düzeltmesinin bu dosyadaki
+    karşılığı): `(0, 0)` dalında norm geçerliyse norm kullanılır, yoksa
+    açık `(0, 0)` gerçek koordinat olarak döner (v17 davranışı) — P1-7
+    bu dalda koşulsuz `None` döndürüp gerçek orijin köşesini (örn.
+    `NodeData(map_x=0, map_y=0)` + varsayılan `(0.5, 0.5)` norm)
+    koordinatsız sayıp turdan çıkarıyordu. `None` yalnızca hiçbir
+    koordinat kaynağı yoksa döner (map anahtarları hiç yok ve
+    kullanılabilir norm da yok — yukarıdaki `mx/my is None` dalı).
+    """
+    try:
+        if isinstance(node, (tuple, list, np.ndarray)) and len(node) >= 2:
+            return float(node[0]), float(node[1])
+        if isinstance(node, dict):
+            mx = node.get("map_x", node.get("x"))
+            my = node.get("map_y", node.get("y"))
+        else:
+            mx = getattr(node, "map_x", getattr(node, "x", None))
+            my = getattr(node, "map_y", getattr(node, "y", None))
+        if mx is None and my is None:
+            if isinstance(node, dict):
+                return _norm_xy_to_px(
+                    node.get("norm_x"), node.get("norm_y"),
+                    fallback_width, fallback_height,
+                )
+            return _norm_xy_to_px(
+                getattr(node, "norm_x", None), getattr(node, "norm_y", None),
+                fallback_width, fallback_height,
+            )
+        if float(mx or 0.0) == 0.0 and float(my or 0.0) == 0.0:
+            if isinstance(node, dict):
+                px = _norm_xy_to_px(
+                    node.get("norm_x"), node.get("norm_y"),
+                    fallback_width, fallback_height,
+                )
+            else:
+                px = _norm_xy_to_px(
+                    getattr(node, "norm_x", None), getattr(node, "norm_y", None),
+                    fallback_width, fallback_height,
+                )
+            if px is not None:
+                return px
+            # F4: norm yer tutucu/eksikse açık (0, 0) harita koordinatı
+            # gerçektir — koşulsuz `return None` yok (F3 ile aynı kural).
+            return float(mx or 0.0), float(my or 0.0)
+        return float(mx or 0.0), float(my or 0.0)
+    except Exception as exc:
+        logger.debug("_extract_node_xy_or_none error on %r: %s", node, exc)
+        return None
+
+
 def _extract_node_xy(
     node: Any,
-    fallback_width: float = 1920.0,
-    fallback_height: float = 1080.0,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
 ) -> Tuple[float, float]:
-    """Safely extracts 2D map coordinates (x, y) in pixels from NodeData, dict, or tuple/list."""
+    """Safely extracts 2D map coordinates (x, y) in pixels from NodeData, dict, or tuple/list.
+
+    GERIYE DONUK UYUMLULUK icin korunur: koordinat cikarilamazsa
+    `(0.0, 0.0)` doner (hayalet). Yeni kod `_extract_node_xy_or_none`
+    kullanmalidir. Boyut verilmezse norm dönüşümü harita kanvası
+    1280x720 ile yapılır (B-01: eski sessiz 1920x1080 varsayılanı
+    kaldırıldı) ve bir kez uyarı loglanır. (0.5, 0.5) norm yer
+    tutucusu her dalda reddedilir.
+    """
     try:
         if isinstance(node, (tuple, list, np.ndarray)) and len(node) >= 2:
             return float(node[0]), float(node[1])
@@ -546,31 +1121,39 @@ def _extract_node_xy(
             mx = node.get("map_x", node.get("x"))
             my = node.get("map_y", node.get("y"))
             if mx is None and my is None:
-                nx = node.get("norm_x")
-                ny = node.get("norm_y")
-                if nx is not None and ny is not None:
-                    return float(nx) * fallback_width, float(ny) * fallback_height
+                px = _norm_xy_to_px(
+                    node.get("norm_x"), node.get("norm_y"),
+                    fallback_width, fallback_height,
+                )
+                if px is not None:
+                    return px
                 return 0.0, 0.0
             if float(mx or 0.0) == 0.0 and float(my or 0.0) == 0.0:
-                nx = node.get("norm_x")
-                ny = node.get("norm_y")
-                if nx is not None and ny is not None and not (float(nx) == 0.5 and float(ny) == 0.5):
-                    return float(nx) * fallback_width, float(ny) * fallback_height
+                px = _norm_xy_to_px(
+                    node.get("norm_x"), node.get("norm_y"),
+                    fallback_width, fallback_height,
+                )
+                if px is not None:
+                    return px
             return float(mx or 0.0), float(my or 0.0)
 
         mx = getattr(node, "map_x", getattr(node, "x", None))
         my = getattr(node, "map_y", getattr(node, "y", None))
         if mx is None and my is None:
-            nx = getattr(node, "norm_x", None)
-            ny = getattr(node, "norm_y", None)
-            if nx is not None and ny is not None:
-                return float(nx) * fallback_width, float(ny) * fallback_height
+            px = _norm_xy_to_px(
+                getattr(node, "norm_x", None), getattr(node, "norm_y", None),
+                fallback_width, fallback_height,
+            )
+            if px is not None:
+                return px
             return 0.0, 0.0
         if float(mx or 0.0) == 0.0 and float(my or 0.0) == 0.0:
-            nx = getattr(node, "norm_x", None)
-            ny = getattr(node, "norm_y", None)
-            if nx is not None and ny is not None and not (float(nx) == 0.5 and float(ny) == 0.5):
-                return float(nx) * fallback_width, float(ny) * fallback_height
+            px = _norm_xy_to_px(
+                getattr(node, "norm_x", None), getattr(node, "norm_y", None),
+                fallback_width, fallback_height,
+            )
+            if px is not None:
+                return px
         return float(mx or 0.0), float(my or 0.0)
     except Exception as exc:
         logger.debug("_extract_node_xy error on %r: %s", node, exc)
@@ -598,8 +1181,25 @@ def _to_material_route_slug(target_materials: Any) -> str:
     return "all"
 
 
+_YOLO_6_GROUP_MAP: Dict[int, str] = {
+    0: "herb_aria",
+    1: "herb_mela",
+    2: "herb_targena",
+    3: "ore_orichalcum",
+    4: "gem_crystal",
+    5: "tree_log",
+}
+
+
 def _match_node_material(node: Any, targets: List[str]) -> bool:
     """Evaluates whether a node matches any target material in targets."""
+    # Aday normalizasyonu bu cagri icinde onbelleklenir: ayni aday dizesi
+    # her hedef icin yeniden normalize edilmez. Onbellek yalnizca gercekten
+    # ziyaret edilen adaylari doldurur; erken donus (return True) davranisi
+    # ve hedef dongusu aynen korunur, fazladan is yapilmaz.
+    norm_cache: Dict[str, str] = {}
+    spec_norm_cache: Dict[str, Tuple[str, str, Optional[str]]] = {}
+
     candidates: List[Any] = []
     if isinstance(node, dict):
         for k in (
@@ -661,20 +1261,17 @@ def _match_node_material(node: Any, targets: List[str]) -> bool:
                 c_str = str(int(cand))
                 if c_str == t_norm:
                     return True
-                yolo_6_map = {
-                    0: "herb_aria",
-                    1: "herb_mela",
-                    2: "herb_targena",
-                    3: "ore_orichalcum",
-                    4: "gem_crystal",
-                    5: "tree_log",
-                }
-                c_group = yolo_6_map.get(int(cand))
+                c_group = _YOLO_6_GROUP_MAP.get(int(cand))
                 if c_group and (c_group == t_norm or c_group == t_group):
                     return True
                 continue
 
-            c_norm = _normalize_material_token(cand)
+            if isinstance(cand, str) and cand in norm_cache:
+                c_norm = norm_cache[cand]
+            else:
+                c_norm = _normalize_material_token(cand)
+                if isinstance(cand, str):
+                    norm_cache[cand] = c_norm
             if not c_norm:
                 continue
 
@@ -699,18 +1296,34 @@ def _match_node_material(node: Any, targets: List[str]) -> bool:
                 if c_group in allowed_groups or c_norm in allowed_groups:
                     return True
 
-            # Substring containment
+            # Substring containment — token sınırında: ham alt-dize
+            # "iron"u "ironwood" içinde de eşleştiriyordu (S011, P1-8
+            # ailesi). Yalnızca belirteç (token) sınırında başlayan/
+            # biten alt-dize kabul edilir: "iron ore" ⊂ "iron ore vein"
+            # evet, "iron" ⊂ "ironwood" hayır.
             if len(t_norm) >= 4 and len(c_norm) >= 4:
-                if t_norm in c_norm or c_norm in t_norm:
+                if _token_boundary_contains(c_norm, t_norm) or _token_boundary_contains(t_norm, c_norm):
                     return True
 
-            # Catalog spec comparison
+            # Catalog spec comparison (spec normalizasyonu da aday bazinda onbelleklenir)
             if AION2_MATERIALS_CATALOG is not None:
-                spec = AION2_MATERIALS_CATALOG.get(str(cand))
-                if spec is not None:
-                    base_norm = _normalize_material_token(spec.base_material)
-                    cat_norm = _normalize_material_token(spec.category)
-                    base_grp = ALIAS_TO_CANONICAL_GROUP.get(base_norm)
+                cand_key = str(cand)
+                spec_norm = spec_norm_cache.get(cand_key)
+                if spec_norm is None:
+                    spec = AION2_MATERIALS_CATALOG.get(cand_key)
+                    if spec is None:
+                        spec_norm_cache[cand_key] = ("", "", None)
+                        spec_norm = ("", "", None)
+                    else:
+                        _base = _normalize_material_token(spec.base_material)
+                        spec_norm = (
+                            _base,
+                            _normalize_material_token(spec.category),
+                            ALIAS_TO_CANONICAL_GROUP.get(_base),
+                        )
+                        spec_norm_cache[cand_key] = spec_norm
+                base_norm, cat_norm, base_grp = spec_norm
+                if base_norm or cat_norm:
                     if (
                         base_norm == t_norm
                         or (t_group and base_norm in CANONICAL_MATERIAL_GROUPS.get(t_group, set()))
@@ -821,20 +1434,58 @@ def filter_nodes_by_material(
 def sort_nodes_by_proximity(
     nodes: Sequence[Any],
     start_xy: Optional[Tuple[float, float]] = None,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
 ) -> List[Any]:
     """
     Sorts nodes starting from `start_xy = (x, y)` (player position or first node)
     using Greedy Nearest-Neighbor + 2-Opt TSP proximity optimization.
     Minimizes total Euclidean travel distance and untangles crossing segments.
+
+    Boyut verilmezse norm dönüşümü harita kanvası 1280x720 ile yapılır
+    (B-01: eski sessiz 1920x1080 varsayılanı kaldırıldı).
+
+    P1-7 (K-20): koordinatsız düğüm (0,0) hayaleti olarak tura girmez —
+    turdan çıkarılır ve sayısı loglanır.
     """
     if not nodes:
         return []
     node_list = list(nodes)
+    kept: List[Any] = []
+    dropped = 0
+    for item in node_list:
+        if _extract_node_xy_or_none(
+            item, fallback_width=fallback_width, fallback_height=fallback_height
+        ) is None:
+            dropped += 1
+            logger.warning(
+                "sort_nodes_by_proximity: koordinatsız düğüm turdan "
+                "çıkarıldı (id=%r).",
+                item.get("id") if isinstance(item, dict) else getattr(item, "id", None),
+            )
+        else:
+            kept.append(item)
+    if dropped:
+        logger.warning(
+            "sort_nodes_by_proximity: %d koordinatsız düğüm çıkarıldı, "
+            "%d düğüm kaldı.",
+            dropped,
+            len(kept),
+        )
+    node_list = kept
     n = len(node_list)
+    if n == 0:
+        return []
     if n <= 1:
         return node_list
 
-    coords: List[Tuple[float, float]] = [_extract_node_xy(item) for item in node_list]
+    coords: List[Tuple[float, float]] = [
+        xy for xy in (
+            _extract_node_xy_or_none(item, fallback_width=fallback_width, fallback_height=fallback_height)
+            for item in node_list
+        )
+        if xy is not None
+    ]
 
     if n == 2:
         if start_xy is not None:
@@ -846,14 +1497,29 @@ def sort_nodes_by_proximity(
             return [node_list[0], node_list[1]]
         return node_list
 
+    # Mesafe matrisi: 2-Opt donguleri ayni ciftleri tekrar tekrar
+    # math.hypot ile hesapliyordu (60 + 30 iterasyon x O(n^2) cift x 4
+    # hypot). Tum cift mesafeler bir kez hesaplanir, dongulerde yalnizca
+    # matris okunur. Degerler ayni hypot cagrilarindan geldigi icin tur
+    # sonucu bit-birebir aynidir; yalnizca tekrarli hesap ortadan kalkar.
+    dist: List[List[float]] = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        xi, yi = coords[i]
+        row = dist[i]
+        for j in range(i + 1, n):
+            d = math.hypot(coords[j][0] - xi, coords[j][1] - yi)
+            row[j] = d
+            dist[j][i] = d
+
     # 1. Greedy Nearest-Neighbor Initialization
     if start_xy is not None:
         sx, sy = float(start_xy[0]), float(start_xy[1])
-        first_idx = min(
-            range(n),
-            key=lambda i: math.hypot(coords[i][0] - sx, coords[i][1] - sy),
-        )
+        start_dist = [
+            math.hypot(coords[i][0] - sx, coords[i][1] - sy) for i in range(n)
+        ]
+        first_idx = min(range(n), key=lambda i: start_dist[i])
     else:
+        start_dist = []
         first_idx = 0
 
     visited = [False] * n
@@ -864,10 +1530,10 @@ def sort_nodes_by_proximity(
     for _ in range(n - 1):
         best_next = -1
         best_dist = float("inf")
-        curr_x, curr_y = coords[curr_idx]
+        curr_row = dist[curr_idx]
         for j in range(n):
             if not visited[j]:
-                d = math.hypot(coords[j][0] - curr_x, coords[j][1] - curr_y)
+                d = curr_row[j]
                 if d < best_dist:
                     best_dist = d
                     best_next = j
@@ -888,10 +1554,10 @@ def sort_nodes_by_proximity(
                 c = tour[j]
                 d = tour[(j + 1) % n]
 
-                d_ab = math.hypot(coords[a][0] - coords[b][0], coords[a][1] - coords[b][1])
-                d_cd = math.hypot(coords[c][0] - coords[d][0], coords[c][1] - coords[d][1])
-                d_ac = math.hypot(coords[a][0] - coords[c][0], coords[a][1] - coords[c][1])
-                d_bd = math.hypot(coords[b][0] - coords[d][0], coords[b][1] - coords[d][1])
+                d_ab = dist[a][b]
+                d_cd = dist[c][d]
+                d_ac = dist[a][c]
+                d_bd = dist[b][d]
 
                 if (d_ac + d_bd) + 1e-6 < (d_ab + d_cd):
                     tour[i + 1 : j + 1] = reversed(tour[i + 1 : j + 1])
@@ -902,10 +1568,7 @@ def sort_nodes_by_proximity(
     # 3. Orient tour starting from node closest to start_xy
     if start_xy is not None:
         sx, sy = float(start_xy[0]), float(start_xy[1])
-        best_pos = min(
-            range(n),
-            key=lambda k: math.hypot(coords[tour[k]][0] - sx, coords[tour[k]][1] - sy),
-        )
+        best_pos = min(range(n), key=lambda k: start_dist[tour[k]])
         tour = tour[best_pos:] + tour[:best_pos]
         dist_fwd = math.hypot(coords[tour[1]][0] - sx, coords[tour[1]][1] - sy)
         dist_bwd = math.hypot(coords[tour[-1]][0] - sx, coords[tour[-1]][1] - sy)
@@ -925,10 +1588,10 @@ def sort_nodes_by_proximity(
                 b = tour[i + 1]
                 c = tour[j]
                 d = tour[j + 1]
-                d_ab = math.hypot(coords[a][0] - coords[b][0], coords[a][1] - coords[b][1])
-                d_cd = math.hypot(coords[c][0] - coords[d][0], coords[c][1] - coords[d][1])
-                d_ac = math.hypot(coords[a][0] - coords[c][0], coords[a][1] - coords[c][1])
-                d_bd = math.hypot(coords[b][0] - coords[d][0], coords[b][1] - coords[d][1])
+                d_ab = dist[a][b]
+                d_cd = dist[c][d]
+                d_ac = dist[a][c]
+                d_bd = dist[b][d]
                 if (d_ac + d_bd) + 1e-6 < (d_ab + d_cd):
                     tour[i + 1 : j + 1] = reversed(tour[i + 1 : j + 1])
                     improved = True
@@ -1091,6 +1754,161 @@ def _normalize_path(path_str: str) -> str:
     if not path_str:
         return ""
     return path_str.replace("\\", "/")
+
+
+def _validate_region_name(name: Any) -> str:
+    """Bölge adını dosya sistemi yolu olarak güvenli hale getirir.
+
+    Ayraç, mutlak yol, ``..`` / ``.`` bileseni veya NUL içeren adlar
+    ``routes/`` dışına yazmaya/silmeye yol açacağı için ValueError verir.
+    Kanonik bölge adları (örn. "Verteron") aynen geçer.
+    """
+    clean = str(name or "").strip()
+    if not clean:
+        raise ValueError("Bölge adı boş olamaz.")
+    if (
+        clean in (".", "..")
+        or "/" in clean
+        or "\\" in clean
+        or "\x00" in clean
+        or os.path.isabs(clean)
+        or clean != os.path.basename(clean)
+    ):
+        raise ValueError(f"Geçersiz bölge adı (path traversal): {clean!r}")
+    return clean
+
+
+def _is_safe_zip_entry_name(name: str) -> bool:
+    """ZIP-slip koruması: arşiv girdisi mutlak yol, ``..`` bileşeni veya
+    NUL içeremez. Okuma/yazma yalnızca bu kontrolden geçen girdilerle
+    yapılır; ihlalde içe aktarma açıklayıcı hatayla reddedilir."""
+    if not name or "\x00" in name:
+        return False
+    if os.path.isabs(name) or name.startswith(("/", "\\")):
+        return False
+    parts = name.replace("\\", "/").split("/")
+    return all(part not in ("", ".", "..") for part in parts)
+
+
+def _bounded_zip_copy(zf: "zipfile.ZipFile", entry_name: str, dst_f: Any, max_bytes: int, what: str) -> int:
+    """Arşiv girdisini sınır kontrollü kopyalar; sınır aşılırsa ValueError.
+
+    ``ZipInfo.file_size`` merkezi dizinden gelir ve sahte olabilir —
+    tek güvenilir sınır kopya anında sayılan bayttır. Sınır aşımında
+    hedef dosya çağrıcı tarafından (rollback ile) temizlenir.
+    """
+    copied = 0
+    with zf.open(entry_name, "r") as src_f:
+        while True:
+            chunk = src_f.read(ZIP_IMPORT_COPY_CHUNK_BYTES)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > max_bytes:
+                raise ValueError(
+                    f"ZIP içe aktarma reddedildi: {what} boyutu sınırı aşıyor "
+                    f"({copied} bayt > {max_bytes} bayt, girdi: {entry_name!r})"
+                )
+            dst_f.write(chunk)
+    return copied
+
+
+def _file_sha256(path: str) -> str:
+    """Dosyanın SHA-256 özeti; okunamazsa boş döner."""
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def _atomic_copy_file(src: str, dst: str) -> bool:
+    """P2-6 (K-05/K-19): dosyayı tmp + flush + fsync + os.replace ile atomik kopyalar.
+
+    Düz ``shutil.copyfile`` çökme anında yarım hedef bırakır ve — tek
+    yedek dosyası üstüne yazılıyorsa — önceki SAĞLAM yedeği de yok eder.
+    Bu yardımcı aynı dizinde tmp yazar (aynı dosya sistemi -> replace
+    atomiktir), kopyayı boyut + SHA-256 ile doğrular; başarısızlıkta
+    hedefe dokunulmaz (eski dosya yerinde kalır) ve tmp temizlenir.
+    """
+    tmp_path = f"{dst}.tmp-{os.getpid()}-{time.time_ns()}"
+    try:
+        with open(src, "rb") as f_src, open(tmp_path, "wb") as f_dst:
+            shutil.copyfileobj(f_src, f_dst)
+            f_dst.flush()
+            try:
+                os.fsync(f_dst.fileno())
+            except OSError:
+                pass
+        replace_ok = False
+        last_exc: Optional[Exception] = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, dst)
+                replace_ok = True
+                break
+            except OSError as exc:
+                last_exc = exc
+                time.sleep(0.04 * (attempt + 1))
+        if not replace_ok:
+            raise last_exc if last_exc is not None else OSError("os.replace başarısız")
+        try:
+            if os.path.getsize(src) != os.path.getsize(dst):
+                return False
+        except OSError:
+            return False
+        src_sig = _file_sha256(src)
+        return bool(src_sig) and src_sig == _file_sha256(dst)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def _dir_manifest(root: str) -> Dict[str, int]:
+    """S-2401: klasördeki dosyaların göreli yol -> boyut manifestosu.
+
+    Silme geri almasında staging klasörünün bütünlüğünü doğrulamak için
+    kullanılır; boyut -1 ise dosya okunamadı demektir.
+    """
+    manifest: Dict[str, int] = {}
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fname in filenames:
+            full = os.path.join(dirpath, fname)
+            rel = os.path.relpath(full, root)
+            try:
+                manifest[rel] = os.path.getsize(full)
+            except OSError:
+                manifest[rel] = -1
+    return manifest
+
+
+def _manifest_missing(manifest: Dict[str, int], root: str) -> List[str]:
+    """S-2401: manifestoya göre `root` altında eksik/boyutu değişmiş dosyalar."""
+    current = _dir_manifest(root)
+    return sorted(rel for rel, size in manifest.items() if current.get(rel) != size)
+
+
+def _remove_tree_retry(path: str, attempts: int = 2) -> None:
+    """S-2401: rmtree'yi (Windows dosya kilidi gibi geçici hatalara karşı)
+    bir kez daha dener; klasör kalmadıysa sessizce döner."""
+    last_exc: Optional[BaseException] = None
+    for _ in range(max(1, attempts)):
+        if not os.path.exists(path):
+            return
+        try:
+            shutil.rmtree(path)
+            return
+        except Exception as exc:  # noqa: BLE001 - yeniden deneme için yakalanır
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
 
 
 class NodeLocationResult(tuple):
@@ -1302,6 +2120,11 @@ class NodeData:
         self.source_type = (
             str(self.source_type or DEFAULT_SOURCE_TYPE).strip() or DEFAULT_SOURCE_TYPE
         )
+        # VALID_SOURCE_TYPES bilinen kaynak turlerini listeler; bilinmeyen bir
+        # deger veriyi bozmadan yalnizca loglanir (eski kayitlarda baska
+        # source_type degerleri de vardir, zorla DEFAULT'a cevrilmez).
+        if self.source_type not in VALID_SOURCE_TYPES:
+            logger.debug("Bilinmeyen source_type: %r (id=#%d)", self.source_type, self.id)
         self.state = str(self.state or "active").strip().lower() or "active"
         self.seq_index = int(self.seq_index or 0)
         self.not_gatherable = bool(self.not_gatherable)
@@ -1393,7 +2216,9 @@ class NodeData:
         if self.state in ("active", "gathering") and 0 < self.current_harvests < max(1, self.max_harvests):
             return True
         if self.last_visited_timestamp <= 0.0:
-            return self.state != "resting"
+            # Hic ziyaret edilmemis dugumun dinlenme sayaci hic baslamamistir;
+            # "resting" etiketi tek basina sonsuza dek hazirsiz birakmamali.
+            return True
         current_time = time.time() if now is None else float(now)
         duration = self.rest_duration_sec if rest_duration_sec is None else int(rest_duration_sec)
         if duration <= 0:
@@ -1581,6 +2406,62 @@ class NodeData:
         }
 
 
+def effective_node_state(
+    node: Any,
+    now: Optional[float] = None,
+    rest_duration_sec: Optional[int] = None,
+) -> str:
+    """P1-6 (K-06): bir düğümün sayım/durum değeri — TEK KAYNAK.
+
+    `get_route_stats`, mobil `/api/status` özeti ve mobil düğüm listesi
+    (`build_nodes_payload`) bu değeri kullanır; her düğüm tam bir
+    kovaya girer, çift sayım ve payload çelişkisi olmaz. Öncelik
+    (en ağır durum kazanır):
+
+    1. `"quarantined"` — `state == "quarantined"`
+    2. `"failed"` — `state in ("failed", "disabled")` ya da
+       `consecutive_failures > 0` (ardışık hata; başarıda sıfırlanır)
+    3. `"resting"` — kalan dinlenme süresi > 0. Salt-okunur eşdeğeri
+       `update_resting_nodes()`'un uyandırma kuralının: dinlenmesi
+       bitmiş düğüm hazırdır, bayat `"resting"` etiketi sayılmaz.
+    4. `"active"` — diğer her şey (`"gathering"` dahil: düğüm
+       toplanabilir durumdadır).
+
+    `rest_duration_sec` verilirse kalan süre hesabına aktarılır
+    (`NodeData.remaining_rest_sec` imzası); uymayan sahte/legacy
+    nesnelerde sessizce `now` ile denenir.
+    """
+    raw_state = str(getattr(node, "state", "active") or "active").lower()
+    if raw_state == "quarantined":
+        return "quarantined"
+    if raw_state in ("failed", "disabled"):
+        return "failed"
+    try:
+        fails = int(getattr(node, "consecutive_failures", 0) or 0)
+    except (TypeError, ValueError):
+        fails = 0
+    if fails > 0:
+        return "failed"
+    rest_rem = 0
+    remaining = getattr(node, "remaining_rest_sec", None)
+    if callable(remaining):
+        try:
+            if rest_duration_sec is not None:
+                rest_rem = int(remaining(now=now, rest_duration_sec=rest_duration_sec))
+            else:
+                rest_rem = int(remaining(now=now))
+        except TypeError:
+            try:
+                rest_rem = int(remaining(now=now))
+            except Exception:
+                rest_rem = 0
+        except Exception:
+            rest_rem = 0
+    if rest_rem > 0:
+        return "resting"
+    return "active"
+
+
 class RouteManager:
     """
     Bölge, rota ve düğüm (node) veritabanı yöneticisi.
@@ -1588,13 +2469,19 @@ class RouteManager:
     Her bölgeyi `routes/<region_name>/region_data.json` altında,
     80x80 gri harita kesitlerini ise `routes/<region_name>/patches/node_<id>.png`
     altında saklar.
+
+    P1-6 (K-06): `get_route_stats`, mobil `/api/status` özeti ve mobil
+    düğüm listesi (`build_nodes_payload`) bir düğümün durumunu tek
+    `effective_node_state()` değerinden sayar — eskiden her yüzey kendi
+    dallanmasıyla sayıyor, dinlenen + hatalı düğüm iki kovaya birden
+    giriyor ve payload'lar çelişiyordu.
     """
 
     def __init__(
         self,
         base_dir: str = "routes",
         default_rest_sec: int = DEFAULT_REST_SEC,
-        meters_per_pixel: float = 0.28,
+        meters_per_pixel: float = WORLD_MAP_METERS_PER_PX,
         **kwargs: Any,
     ) -> None:
         # Geriye dönük uyumluluk: eğer ilk argüman bir .json dosya yoluysa dizinini al
@@ -1614,6 +2501,15 @@ class RouteManager:
         init_vh = kwargs.get("viewport_height")
         self.viewport_width: Optional[int] = int(init_vw) if init_vw else None
         self.viewport_height: Optional[int] = int(init_vh) if init_vh else None
+        # P1-7 (K-20): harita kanvası (açık dünya haritası görüntüsü)
+        # ekran viewport'undan AYRI tutulur — update_viewport çift
+        # uzaylıydı: canlı kare boyutu ile harita görüntüsü boyutu aynı
+        # alanlara yazılıyordu. Norm dönüşümü harita kanvası boyutuyla
+        # yapılır; ekran boyutu yalnızca ekran uzayındaki işlerde okunur.
+        init_mw = kwargs.get("map_canvas_width")
+        init_mh = kwargs.get("map_canvas_height")
+        self.map_canvas_width: Optional[int] = int(init_mw) if init_mw else None
+        self.map_canvas_height: Optional[int] = int(init_mh) if init_mh else None
         self.odometry_tracker: Optional[Any] = kwargs.get("odometry_tracker")
         self._last_odometry_patch: Optional[np.ndarray] = None
 
@@ -1635,6 +2531,18 @@ class RouteManager:
         self.active_route: str = DEFAULT_ROUTE
         self._last_selected_node_id: Dict[Tuple[str, str], int] = {}
         self.last_save_error: Optional[BaseException] = None
+        # Canlı bölge tespiti (Görev 4): AutoCartographer / radar besler.
+        # _detected_region yalnızca güvenilir tespitle dolar; boşken "bilinmiyor"
+        # demektir ve asla varsayılan bölge sayılmaz.
+        self._detected_region: Optional[str] = None
+        self._detected_region_confidence: float = 0.0
+        self._detected_region_source: str = ""
+        self._detected_region_ts: float = 0.0
+        self._last_mismatch_log_key: Optional[Tuple[str, str]] = None
+        self._last_mismatch_block_log_ts: float = 0.0
+        # S-2401: son bölge silme geri alması eksik kaldıysa açıklaması
+        # (None = son silme/geri alma bütünlüklü).
+        self.last_delete_error: Optional[str] = None
 
         # Geriye dönük uyumluluk için mirror sözlük
         self.data: Dict[str, Any] = {
@@ -1668,6 +2576,130 @@ class RouteManager:
         """Düğümleri alt bölgeye göre filtreler."""
         return filter_nodes_by_subregion(nodes, subregion)
 
+    # ------------------------------------------------------------------
+    # Canlı bölge tespiti & bölge uyumsuzluğu koruması (Görev 4)
+    #
+    # Sorun: aktif bölge/rota ayarlardan (varsayılan Altgard) gelir; bot
+    # karakterin gerçekte bulunduğu bölgeyi hiç kontrol etmezdi. Verteron'da
+    # duran karakter Altgard rotasını koşuyordu.
+    #
+    # Kural: canlı tespit (AutoCartographer / radar) güvenilirse ve aktif
+    # bölgeden farklıysa, aktif rotanın düğümleri çalıştırılmaz ve yanlış
+    # bölgeye düğüm yazılmaz. Otomatik bölge geçişi YOKTUR (kör geçiş
+    # riskli): kullanıcı F9 menüden bölgeyi düzeltince uyumsuzluk kendiliğinden
+    # kalkar. Tespit yoksa/belirsizse engel de yoktur — bilinmeyen bölge,
+    # varsayılan bölge sayılmaz.
+    # ------------------------------------------------------------------
+    def note_detected_region(
+        self,
+        region: Optional[str],
+        confidence: float = 1.0,
+        source: str = "",
+    ) -> Optional[str]:
+        """Canlı tespit edilen bölgeyi kaydeder; kanonik adı döndürür.
+
+        Güven eşiğin altındaki veya bilinmeyen bölgedeki tespitler yoksayılır
+        (None döner, kayıt değişmez). Uyumsuzluk ilk kez ortaya çıktığında
+        uyarı loglanır; aynı uyumsuzluk tekrar tekrar loglanmaz.
+        """
+        try:
+            conf = float(confidence or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if conf < REGION_DETECTION_MIN_CONFIDENCE:
+            return None
+        canon = resolve_canonical_region(region)
+        if canon not in KNOWN_CANONICAL_REGIONS:
+            return None
+        prev = self._detected_region
+        self._detected_region = canon
+        self._detected_region_confidence = conf
+        self._detected_region_source = str(source or "")
+        self._detected_region_ts = time.time()
+        mismatch = self.get_region_mismatch()
+        if mismatch is not None:
+            key = (str(mismatch["active_region"]), str(mismatch["detected_region"]))
+            if key != self._last_mismatch_log_key:
+                self._last_mismatch_log_key = key
+                logger.warning(
+                    "⚠️ BÖLGE UYUMSUZLUĞU: karakter %s bölgesinde (güven %.2f, kaynak: %s) "
+                    "ama aktif rota %s · %s. Yanlış bölge rotası çalıştırılmıyor; "
+                    "bölgeyi F9 menüden düzeltin (otomatik geçiş yapılmaz).",
+                    canon,
+                    conf,
+                    self._detected_region_source or "?",
+                    mismatch["active_region"],
+                    self.active_route,
+                )
+        else:
+            self._last_mismatch_log_key = None
+            if prev != canon:
+                logger.info(
+                    "Tespit edilen bölge: %s (güven %.2f, kaynak: %s)",
+                    canon,
+                    conf,
+                    self._detected_region_source or "?",
+                )
+        return canon
+
+    def get_detected_region(self) -> Optional[Dict[str, Any]]:
+        """Son güvenilir canlı bölge tespitini döndürür; yoksa None.
+
+        H-sweep (dilim 13 Y2): bayat tespit (REGION_DETECTION_TTL_SEC,
+        30 dk) yok sayılır — tespit zaman aşımına uğradıysa None döner.
+        """
+        if not self._detected_region:
+            return None
+        if (time.time() - float(self._detected_region_ts or 0.0)) > REGION_DETECTION_TTL_SEC:
+            return None
+        return {
+            "region": str(self._detected_region),
+            "confidence": float(self._detected_region_confidence),
+            "source": str(self._detected_region_source or ""),
+            "detected_at": float(self._detected_region_ts),
+        }
+
+    def get_region_mismatch(self) -> Optional[Dict[str, Any]]:
+        """Aktif bölge ile canlı tespit uyuşmuyorsa uyumsuzluk sözlüğü, yoksa None.
+
+        Dinamik hesaplanır: kullanıcı aktif bölgeyi tespit edilen bölgeye
+        çevirince uyumsuzluk kendiliğinden kalkar; ayrı temizleme gerekmez.
+        H-sweep (dilim 13 Y2): bayat tespit uyumsuzluk üretmez.
+        """
+        if not self._detected_region:
+            return None
+        if (time.time() - float(self._detected_region_ts or 0.0)) > REGION_DETECTION_TTL_SEC:
+            return None
+        active = resolve_canonical_region(self.active_region)
+        detected = resolve_canonical_region(self._detected_region)
+        if active.lower() == detected.lower():
+            return None
+        return {
+            "active_region": active,
+            "detected_region": detected,
+            "active_route": str(self.active_route or ""),
+            "confidence": float(self._detected_region_confidence),
+            "source": str(self._detected_region_source or ""),
+            "detected_at": float(self._detected_region_ts),
+        }
+
+    def is_route_blocked_by_region_mismatch(self) -> bool:
+        """Aktif rotanın bölge uyumsuzluğu yüzünden durdurulup durdurulmadığı."""
+        return self.get_region_mismatch() is not None
+
+    def _region_mismatch_blocks(self, target_region: str) -> bool:
+        """Hedef bölgeye yazmak/okumak engelli mi?
+
+        Yalnızca hedef bölge canlı tespit edilen bölgeden farklıysa engellenir;
+        tespit edilen bölgenin kendisine yazmak/okumak serbesttir.
+        """
+        mismatch = self.get_region_mismatch()
+        if mismatch is None:
+            return False
+        return resolve_canonical_region(target_region).lower() != str(
+            mismatch["detected_region"]
+        ).lower()
+
     def _get_material_route_slug(self, target_materials: Any) -> str:
         """Returns the route slug for target_materials."""
         return _to_material_route_slug(target_materials)
@@ -1685,8 +2717,18 @@ class RouteManager:
         nodes: Sequence[Any],
         start_xy: Optional[Tuple[float, float]] = None,
     ) -> List[Any]:
-        """Sorts nodes using Greedy Nearest-Neighbor + 2-Opt TSP proximity optimization."""
-        return sort_nodes_by_proximity(nodes, start_xy=start_xy)
+        """Sorts nodes using Greedy Nearest-Neighbor + 2-Opt TSP proximity optimization.
+
+        Norm dönüşümünde HARİTA KANVASI boyutu kullanılır (P1-7: ekran
+        viewport'u ile harita kanvası ayrıldı — `update_viewport`
+        artık iki uzayı ayrı alanlarda tutar; burada ekran boyutu
+        okunmaz). Boyut bilinmiyorsa kanonik kanvas 1280x720 varsayılır
+        (bir kez uyarılır — B-01: eski sessiz 1920x1080 kaldırıldı).
+        """
+        mw, mh = self._map_canvas_size()
+        return sort_nodes_by_proximity(
+            nodes, start_xy=start_xy, fallback_width=mw, fallback_height=mh
+        )
 
     def build_proximity_material_route(
         self,
@@ -1765,23 +2807,22 @@ class RouteManager:
                     if route_name not in rts:
                         rts.append(route_name)
 
-            # Reorder region nodes: matched ordered nodes first, remaining after
+            # Yalnızca eşleşen düğümler proximity sırasına girer; eşleşmeyen
+            # düğümler kendi yerinde/sırasında bırakılır (eski kod hepsini
+            # yeniden sıralayıp seq_index'lerini değiştiriyordu).
             matched_ids = {
                 getattr(n, "id", None) or (n.get("id") if isinstance(n, dict) else None)
                 for n in ordered
             }
-            remaining_nodes = [
-                n for n in all_nodes
+            matched_positions = [
+                i for i, n in enumerate(all_nodes)
                 if (getattr(n, "id", None) or (n.get("id") if isinstance(n, dict) else None))
-                not in matched_ids
+                in matched_ids
             ]
-            for idx, n in enumerate(remaining_nodes, start=len(ordered) + 1):
-                if hasattr(n, "seq_index"):
-                    n.seq_index = idx
-                elif isinstance(n, dict):
-                    n["seq_index"] = idx
-
-            reg_info["nodes"] = ordered + remaining_nodes
+            reordered_nodes = list(all_nodes)
+            for pos, node in zip(matched_positions, ordered):
+                reordered_nodes[pos] = node
+            reg_info["nodes"] = reordered_nodes
             self.active_route = route_name
             self._sync_legacy_data()
 
@@ -1790,16 +2831,46 @@ class RouteManager:
 
         return ordered
 
-    def update_viewport(self, width: int, height: int) -> None:
-        """Dinamik harita / ekran çözünürlüğünü günceller (1280x720, 1920x1080, 2560x1440 vb.)."""
+    def update_viewport(self, width: int, height: int, space: str = "screen") -> None:
+        """Dinamik harita / ekran çözünürlüğünü günceller (1280x720, 1920x1080, 2560x1440 vb.).
+
+        P1-7 (K-20): `space` iki uzayı ayırır — `"screen"` canlı ekran
+        karesi boyutudur (`viewport_width/height`), `"map"` açık dünya
+        haritası görüntüsü boyutudur (`map_canvas_width/height`). Eski
+        tek-alanlı davranışta harita görüntüsü boyutu ekran viewport'unu
+        ezip norm ölçeğini bozuyordu. Varsayılan `"screen"` geriye dönük
+        uyumluluk içindir.
+        """
         if width > 0 and height > 0:
-            self.viewport_width = int(width)
-            self.viewport_height = int(height)
+            if str(space or "screen").strip().lower() == "map":
+                self.map_canvas_width = int(width)
+                self.map_canvas_height = int(height)
+            else:
+                self.viewport_width = int(width)
+                self.viewport_height = int(height)
             if self.odometry_tracker is not None:
                 if hasattr(self.odometry_tracker, "map_width"):
                     self.odometry_tracker.map_width = int(width)
                 if hasattr(self.odometry_tracker, "map_height"):
                     self.odometry_tracker.map_height = int(height)
+
+    def _map_canvas_size(self) -> Tuple[float, float]:
+        """Norm -> piksel dönüşümünde kullanılacak harita kanvası boyutu.
+
+        Öncelik: açık harita görüntüsünden okunan kanvas > ekran viewport'u
+        > kanonik harita kanvası 1280x720. Hiçbir boyut bilinmiyorsa kanvas
+        varsayılır (bir kez uyarılır; eski sessiz 1920x1080 kaldırıldı).
+        """
+        mw = getattr(self, "map_canvas_width", None) or 0
+        mh = getattr(self, "map_canvas_height", None) or 0
+        if mw and mh:
+            return float(mw), float(mh)
+        vw = getattr(self, "viewport_width", None) or 0
+        vh = getattr(self, "viewport_height", None) or 0
+        if vw and vh:
+            return float(vw), float(vh)
+        _warn_norm_canvas_fallback_once()
+        return MAP_CANVAS_WIDTH, MAP_CANVAS_HEIGHT
 
     @property
     def patch_dir(self) -> str:
@@ -1810,7 +2881,7 @@ class RouteManager:
     # Dosya Yolu Yardımcıları
     # ------------------------------------------------------------------
     def _get_region_dir(self, region: str) -> str:
-        return os.path.join(self.base_dir, str(region))
+        return os.path.join(self.base_dir, _validate_region_name(region))
 
     def _get_region_json_path(self, region: str) -> str:
         return os.path.join(self._get_region_dir(region), "region_data.json")
@@ -1820,16 +2891,27 @@ class RouteManager:
 
     def _get_patch_rel_path(self, region: str, node_id: int) -> str:
         base_name = os.path.basename(os.path.normpath(self.base_dir)) or "routes"
-        return _normalize_path(f"{base_name}/{region}/patches/node_{int(node_id)}.png")
+        return _normalize_path(
+            f"{base_name}/{_validate_region_name(region)}/patches/node_{int(node_id)}.png"
+        )
 
     def _resolve_patch_disk_path(self, node: NodeData) -> str:
-        """NodeData içindeki patch_path değerini gerçek disk yoluna çözümler."""
+        """NodeData içindeki patch_path değerini gerçek disk yoluna çözümler.
+
+        patch_path mutlak da olsa görece de olsa yalnızca ``base_dir`` içinde
+        kalan bir yol kabul edilir; dışarı taşan yol yok sayılır ve kanonik
+        ``<base>/<region>/patches/node_<id>.png`` yoluna düşülür.
+        """
         raw_path = node.patch_path
         if raw_path:
-            if os.path.isabs(raw_path) and os.path.exists(raw_path):
-                return raw_path
-            if os.path.exists(raw_path):
-                return raw_path
+            base_real = os.path.realpath(self.base_dir)
+            cand_real = os.path.realpath(raw_path)
+            try:
+                inside_base = os.path.commonpath([cand_real, base_real]) == base_real
+            except ValueError:
+                inside_base = False
+            if inside_base and os.path.exists(cand_real):
+                return cand_real
             # Eğer base_dir özel bir test diziniyse (örn. tmp_dir/routes)
             norm = _normalize_path(raw_path)
             parts = norm.split("/")
@@ -1845,13 +2927,21 @@ class RouteManager:
     def load_all_regions(self) -> Dict[str, Any]:
         """`routes/<region_name>/region_data.json` dosyalarının tamamını yükler."""
         self._regions.clear()
+        seen_dirs = set()
         try:
             if os.path.exists(self.base_dir):
                 for entry in sorted(os.listdir(self.base_dir)):
                     reg_dir = os.path.join(self.base_dir, entry)
                     json_path = os.path.join(reg_dir, "region_data.json")
                     if os.path.isdir(reg_dir) and os.path.isfile(json_path):
-                        self.load_region(entry)
+                        # P3-8 (S-010): yalnızca büyük/küçük harf farkı olan
+                        # iki dizin aynı kanonik bölgeye yazıp sessizce
+                        # üzerine yazardı — ikincisi uyarıyla atlanır.
+                        if entry.lower() in seen_dirs:
+                            logger.warning("Bölge dizini atlandı (büyük/küçük harf çakışması): %s", entry)
+                            continue
+                        if self.load_region(entry):
+                            seen_dirs.add(entry.lower())
         except Exception as exc:
             logger.error("Bölgeler taranırken hata oluştu: %s", exc)
 
@@ -1869,7 +2959,11 @@ class RouteManager:
         """Belirtilen bölgenin `region_data.json` dosyasını okur (alt bölge eşlemelerini otomatik canonical ana bölgeye bağlar)."""
         clean_reg = str(region or "").strip()
         canon_reg = resolve_canonical_region(clean_reg)
-        json_path = self._get_region_json_path(canon_reg)
+        try:
+            json_path = self._get_region_json_path(canon_reg)
+        except ValueError as exc:
+            logger.warning("Geçersiz bölge adı, yüklenemedi: %s", exc)
+            return False
         if not os.path.isfile(json_path):
             logger.warning("Bölge veri dosyası bulunamadı: %s", json_path)
             return False
@@ -1878,7 +2972,20 @@ class RouteManager:
             with open(json_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
 
-            reg_name = str(raw.get("region", canon_reg))
+            # S-2402: JSON'daki 'region' alanı doğrulanmamış gelirse
+            # (elle düzenlenmiş/bozuk JSON) makedirs ValueError verip yarım
+            # kayıt bırakıyordu — geçersiz ad reddedilir, dizinden türeyen
+            # kanonik ad kullanılır.
+            raw_reg = raw.get("region", canon_reg)
+            try:
+                reg_name = _validate_region_name(raw_reg)
+            except ValueError:
+                logger.warning(
+                    "'%s' bölgesi: JSON'daki 'region' alanı geçersiz (%r), "
+                    "dizin adı '%s' kullanılıyor.",
+                    canon_reg, raw_reg, canon_reg,
+                )
+                reg_name = canon_reg
             raw_routes = raw.get("routes", [DEFAULT_ROUTE])
             routes_list: List[str] = [DEFAULT_ROUTE]
             if isinstance(raw_routes, dict):
@@ -1892,22 +2999,46 @@ class RouteManager:
 
             nodes_list: List[NodeData] = []
             for idx, item in enumerate(raw.get("nodes", []), start=1):
-                if isinstance(item, dict):
+                if not isinstance(item, dict):
+                    logger.warning(
+                        "'%s' bölgesi: #%d. düğüm dict değil (%s), atlandı.",
+                        reg_name, idx, type(item).__name__,
+                    )
+                    continue
+                try:
                     item.setdefault("region", reg_name)
                     node_obj = NodeData.from_dict(item)
-                    if node_obj.seq_index <= 0:
-                        node_obj.seq_index = idx
-                    nodes_list.append(node_obj)
-                    for r_in_node in node_obj.routes:
-                        if r_in_node not in routes_list:
-                            routes_list.append(r_in_node)
+                except Exception as exc:
+                    # Tek bozuk düğüm tüm bölgeyi yüklenemez yapmasın.
+                    logger.warning(
+                        "'%s' bölgesi: #%d. düğüm bozuk, atlandı: %s",
+                        reg_name, idx, exc,
+                    )
+                    continue
+                if node_obj.seq_index <= 0:
+                    node_obj.seq_index = idx
+                nodes_list.append(node_obj)
+                for r_in_node in node_obj.routes:
+                    if r_in_node not in routes_list:
+                        routes_list.append(r_in_node)
 
             self._regions[reg_name] = {
                 "routes": routes_list,
                 "nodes": nodes_list,
             }
-            os.makedirs(self._get_region_patches_dir(reg_name), exist_ok=True)
-            self._sync_legacy_data()
+            try:
+                os.makedirs(self._get_region_patches_dir(reg_name), exist_ok=True)
+                self._sync_legacy_data()
+            except Exception:
+                # S-2402: makedirs/_sync_legacy_data hata verirse başarısız
+                # yükleme bellekte kalmasın — yarım kayıt silinir, legacy
+                # sözlük kayıtsız haliyle yeniden kurulur.
+                self._regions.pop(reg_name, None)
+                try:
+                    self._sync_legacy_data()
+                except Exception:
+                    pass
+                raise
             return True
         except Exception as exc:
             logger.error("'%s' bölgesi yüklenirken hata: %s", region, exc)
@@ -2006,11 +3137,17 @@ class RouteManager:
             tmp_path = json_path + ".tmp"
             backup_path = os.path.join(reg_dir, "region_data.backup.json")
 
-            # Mevcut geçerli json varsa yedekle
+            # Mevcut geçerli json varsa yedekle (P2-6: atomik kopya —
+            # düz copyfile yarım yedek bırakıp önceki sağlam yedeği
+            # ezerdi; kopya doğrulanamazsa eski yedek yerinde kalır).
             if create_backup and os.path.isfile(json_path):
                 try:
                     if os.path.getsize(json_path) > 0:
-                        shutil.copyfile(json_path, backup_path)
+                        if not _atomic_copy_file(json_path, backup_path):
+                            logger.debug(
+                                "Otomatik yedek doğrulanamadı (%s): kopya bütünlüğü tutmadı",
+                                backup_path,
+                            )
                 except Exception as b_exc:
                     logger.debug("Otomatik yedek oluşturulamadı (%s): %s", backup_path, b_exc)
 
@@ -2056,15 +3193,47 @@ class RouteManager:
             logger.error("'%s' bölgesi kaydedilirken hata: %s", target_region, exc)
             return False
 
+    def _snapshot_region_json(self, region: str, tag: str) -> Optional[str]:
+        """P2-6 (K-05): yıkıcı işlem ÖNCESİ ``region_data.json``'un zaman
+        damgalı, atomik kopyasını ``<base_dir>/backups/`` altına alır.
+
+        Döner: snapshot yolu; kaynak json yoksa None (hata değil).
+        Kopya doğrulanamazsa OSError fırlatır — çağıran fail-closed
+        davranır (yedeksiz yıkıcı işleme girilmez). Adındaki ``_<tag>_``
+        eki, dpi_focus_guard'ın ``list_backups_for_region`` desenine
+        uymaz; bu snapshot'lar o listeye karışmaz.
+        """
+        target_region = resolve_canonical_region(region)
+        src = self._get_region_json_path(target_region)
+        if not os.path.isfile(src):
+            return None
+        backups_dir = os.path.join(self.base_dir, "backups")
+        os.makedirs(backups_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        dst = os.path.join(
+            backups_dir, f"region_data_{target_region}_{tag}_{ts}.json"
+        )
+        if not _atomic_copy_file(src, dst):
+            raise OSError(f"Bölge snapshot'ı yazılamadı/doğrulanamadı: {dst}")
+        logger.info("Bölge snapshot'ı alındı (%s): %s", target_region, dst)
+        return dst
+
     def backup_region_file(self, region: Optional[str] = None) -> str:
-        """Copy ``region_data.json`` onto the single ``region_data.backup.json``."""
+        """Copy ``region_data.json`` onto the single ``region_data.backup.json``.
+
+        P2-6: atomik kopya (tmp + fsync + os.replace) + bütünlük
+        doğrulaması — düz copyfile çökmede yarım yedek bırakıp önceki
+        sağlam yedeği eziyordu. Kopya doğrulanamazsa OSError fırlatır;
+        hedefte yarım dosya bırakılmaz.
+        """
         target_region = resolve_canonical_region(region or self.active_region)
         src = self._get_region_json_path(target_region)
         dst = os.path.join(self._get_region_dir(target_region), "region_data.backup.json")
         if not os.path.isfile(src):
             raise FileNotFoundError(src)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copyfile(src, dst)
+        if not _atomic_copy_file(src, dst):
+            raise OSError(f"Yedek kopyası yazılamadı/doğrulanamadı: {dst}")
         return dst
 
     def save_data(self) -> bool:
@@ -2185,33 +3354,52 @@ class RouteManager:
     # Bölge (Region) Yönetim Metodları
     # ------------------------------------------------------------------
     def create_region(self, region_name: str) -> bool:
-        """Yeni bir bölge klasörü ve `region_data.json` oluşturur."""
-        clean_name = str(region_name).strip()
-        if not clean_name:
-            logger.warning("Boş bölge adı ile bölge oluşturulamaz.")
+        """Yeni bir bölge klasörü ve `region_data.json` oluşturur.
+
+        Alt bölge adı verilirse (örn. "Pilgrim's Ridge") kanonik ana bölge
+        ("Verteron") altında kayıt yapılır: `_regions` anahtarları ve disk
+        dizinleri kanoniktir (`load_region`/`save_region` de kanonik adla
+        çalışır); literal adla kayıt `save_region`'da bulunamayıp geri
+        almaya (rollback) yol açardı.
+        """
+        try:
+            clean_name = resolve_canonical_region(_validate_region_name(region_name))
+        except ValueError as exc:
+            logger.warning("Bölge oluşturulamaz: %s", exc)
             return False
 
         if clean_name in self._regions:
             logger.info("Bölge zaten mevcut: %s", clean_name)
             return True
 
+        prev_active = self.active_region
         try:
             self._regions[clean_name] = {
                 "routes": [DEFAULT_ROUTE],
                 "nodes": [],
             }
             self.active_region = clean_name
-            return self.save_region(clean_name)
+            if self.save_region(clean_name):
+                return True
+            # Kayıt başarısız: yarım kalan bölgeyi geri al.
+            self._regions.pop(clean_name, None)
+            self.active_region = prev_active
+            self._sync_legacy_data()
+            return False
         except Exception as exc:
+            self._regions.pop(clean_name, None)
+            self.active_region = prev_active
+            self._sync_legacy_data()
             logger.error("Bölge oluşturma hatası (%s): %s", clean_name, exc)
             return False
 
     def rename_region(self, old_name: str, new_name: str) -> bool:
         """Mevcut bir bölgeyi, klasörünü ve tüm node patch_path referanslarını yeniden adlandırır."""
-        old_clean = str(old_name).strip()
-        new_clean = str(new_name).strip()
-        if not old_clean or not new_clean:
-            logger.warning("Geçersiz bölge adı: '%s' -> '%s'", old_clean, new_clean)
+        try:
+            old_clean = _validate_region_name(old_name)
+            new_clean = _validate_region_name(new_name)
+        except ValueError as exc:
+            logger.warning("Geçersiz bölge adı: %s", exc)
             return False
         if old_clean not in self._regions:
             logger.warning("Yeniden adlandırılacak bölge bulunamadı: %s", old_clean)
@@ -2222,15 +3410,39 @@ class RouteManager:
             logger.warning("Hedef bölge adı zaten kullanımda: %s", new_clean)
             return False
 
+        reg_info = self._regions[old_clean]
+        node_snapshot = [
+            (n, n.region, n.patch_path) for n in reg_info.get("nodes", [])
+        ]
+        prev_active = self.active_region
+        dir_moved = False
+        new_dir_created = False
+        old_dir = None
+        new_dir = None
+        # P2-6 (K-05/K-19): klasör taşınmadan ÖNCE disk snapshot'ı.
+        # Eskiden yalnızca bellek snapshot'ı vardı: save_region(new)
+        # başarısız olup geri alma klasörü geri taşısa bile, save'in
+        # yazdığı yeni-isimli region_data.json eski klasörde kalıyor,
+        # bellek/disk ayrışıyordu. Snapshot yoksa (kaynak json yok)
+        # None döner, hata değildir; kopya doğrulanamazsa OSError
+        # fırlatır ve hiçbir şey taşınmadan False dönülür.
+        disk_snapshot: Optional[str] = None
+        try:
+            disk_snapshot = self._snapshot_region_json(old_clean, "rename")
+        except OSError as exc:
+            logger.error("Bölge yeniden adlandırma öncesi snapshot alınamadı (%s -> %s): %s", old_clean, new_clean, exc)
+            return False
         try:
             old_dir = self._get_region_dir(old_clean)
             new_dir = self._get_region_dir(new_clean)
             if os.path.exists(old_dir):
                 shutil.move(old_dir, new_dir)
+                dir_moved = True
             else:
                 os.makedirs(self._get_region_patches_dir(new_clean), exist_ok=True)
+                new_dir_created = True
 
-            reg_info = self._regions.pop(old_clean)
+            del self._regions[old_clean]
             for node in reg_info.get("nodes", []):
                 node.region = new_clean
                 node.patch_path = self._get_patch_rel_path(new_clean, node.id)
@@ -2239,9 +3451,42 @@ class RouteManager:
             if self.active_region == old_clean:
                 self.active_region = new_clean
 
-            return self.save_region(new_clean)
+            if self.save_region(new_clean):
+                return True
+            raise OSError("save_region başarısız, yeniden adlandırma geri alınıyor")
         except Exception as exc:
             logger.error("Bölge yeniden adlandırma hatası (%s -> %s): %s", old_clean, new_clean, exc)
+            # Geri alma: klasörü geri taşı, bellek durumunu geri yükle.
+            try:
+                if dir_moved and old_dir and new_dir and os.path.exists(new_dir) and not os.path.exists(old_dir):
+                    shutil.move(new_dir, old_dir)
+            except Exception as rb_exc:
+                logger.error("Yeniden adlandırma geri alma (klasör) başarısız: %s", rb_exc)
+            if not dir_moved and new_dir_created and new_dir and old_dir and not os.path.exists(old_dir):
+                # Eski klasör hiç yoktu, yeni klasör biz oluşturduk:
+                # yarım kalmış boş klasörü kaldır.
+                try:
+                    shutil.rmtree(new_dir)
+                except Exception as rb_exc:
+                    logger.error("Yeniden adlandırma geri alma (yeni klasör temizliği) başarısız: %s", rb_exc)
+            # P2-6: başarısız save_region yeni-isimli dosyayı eski
+            # klasöre yazmış olabilir — disk snapshot'ını atomik
+            # kopyayla geri yükle, bellek/disk ayrışmasın.
+            if disk_snapshot and old_dir and os.path.isdir(old_dir):
+                old_json = os.path.join(old_dir, "region_data.json")
+                if not _atomic_copy_file(disk_snapshot, old_json):
+                    logger.error(
+                        "Yeniden adlandırma geri alma (disk snapshot) BAŞARISIZ: %s -> %s; "
+                        "diskteki region_data.json yeni-isimli içerik taşıyor olabilir",
+                        disk_snapshot, old_json,
+                    )
+            self._regions.pop(new_clean, None)
+            self._regions[old_clean] = reg_info
+            for node, prev_region, prev_patch in node_snapshot:
+                node.region = prev_region
+                node.patch_path = prev_patch
+            self.active_region = prev_active
+            self._sync_legacy_data()
             return False
 
     def delete_region(self, region_name: str) -> bool:
@@ -2251,10 +3496,42 @@ class RouteManager:
             logger.warning("Silinecek bölge bulunamadı: %s", clean_name)
             return False
 
+        # S-1301: create/rename/delete_route'taki snapshot geri alma burada
+        # yoktu — rmtree yarıda hata verirse yarım silinmiş klasör +
+        # bellekte duran bölge kalıyordu. Klasör önce aynı dosya
+        # sisteminde staging konumuna taşınır (ucuz rename), bellek
+        # snapshot'ı alınır; hata olursa ikisi de geri yüklenir.
+        reg_info = self._regions[clean_name]
+        prev_active_region = self.active_region
+        prev_active_route = self.active_route
+        reg_dir = self._get_region_dir(clean_name)
+        # P2-6 (K-05): purge öncesi kalıcı snapshot. Staging + manifesto
+        # (S-1301/S-2401) yalnızca yarıda-kalan silmenin geri alınmasını
+        # korur; başarılı silmede bölge verisi tamamen yok oluyordu.
+        # Snapshot `<base>/backups/region_data_<bölge>_deleted_<ts>.json`
+        # altında kalır (silme sonrası da kurtarılabilir). Snapshot
+        # alınamazsa (kaynak json varken kopya doğrulanamazsa) yedeksiz
+        # silmeye girilmez — fail-closed, bölge yerinde kalır.
         try:
-            reg_dir = self._get_region_dir(clean_name)
+            region_snapshot = self._snapshot_region_json(clean_name, "deleted")
+        except OSError as exc:
+            logger.error("Bölge silme öncesi snapshot alınamadı (%s): %s", clean_name, exc)
+            return False
+        if region_snapshot is not None:
+            logger.info("Bölge silme snapshot'ı: %s", region_snapshot)
+        staging_dir = None
+        dir_staged = False
+        # S-2401: silme öncesi bütünlük manifestosu — rmtree yarıda kalırsa
+        # geri alma yalnızca klasörün varlığını değil içeriğini de doğrular.
+        dir_manifest: Dict[str, int] = {}
+        try:
             if os.path.exists(reg_dir):
-                shutil.rmtree(reg_dir)
+                dir_manifest = _dir_manifest(reg_dir)
+                staging_dir = reg_dir + f".siliniyor-{os.getpid()}"
+                if os.path.exists(staging_dir):
+                    shutil.rmtree(staging_dir)
+                shutil.move(reg_dir, staging_dir)
+                dir_staged = True
 
             del self._regions[clean_name]
             if self.active_region == clean_name:
@@ -2262,9 +3539,49 @@ class RouteManager:
                 self.active_route = DEFAULT_ROUTE
 
             self._sync_legacy_data()
+            if dir_staged:
+                # Windows dosya kilidine karşı bir kez daha dene.
+                _remove_tree_retry(staging_dir)
+            self.last_delete_error = None
             return True
         except Exception as exc:
             logger.error("Bölge silme hatası (%s): %s", clean_name, exc)
+            # Geri alma: klasörü geri taşı, bellek durumunu geri yükle.
+            # S-2401: rmtree yarıda kaldıysa staging kısmi olabilir — geri
+            # taşınan klasör manifestoyla karşılaştırılır; eksik varsa
+            # bölge "kurtarıldı" gibi gösterilmez, eksiklik açıkça
+            # last_delete_error + error log ile işaretlenir.
+            incomplete: List[str] = []
+            rollback_ok = True
+            try:
+                if dir_staged and staging_dir is not None and os.path.exists(staging_dir) and not os.path.exists(reg_dir):
+                    incomplete = _manifest_missing(dir_manifest, staging_dir)
+                    shutil.move(staging_dir, reg_dir)
+            except Exception as rb_exc:
+                logger.error("Bölge silme geri alma (klasör) başarısız: %s", rb_exc)
+                rollback_ok = False
+            if dir_staged and not os.path.exists(reg_dir):
+                rollback_ok = False
+            if not rollback_ok:
+                self.last_delete_error = (
+                    f"Bölge silme geri alma BAŞARISIZ ({clean_name}): klasör "
+                    f"geri taşınamadı, kısmi veri staging konumunda kaldı: "
+                    f"{staging_dir}"
+                )
+                logger.error("%s", self.last_delete_error)
+            elif incomplete:
+                self.last_delete_error = (
+                    f"Bölge silme geri alma EKSİK ({clean_name}): rmtree yarıda "
+                    f"kaldı, geri taşınan klasörde {len(incomplete)} dosya "
+                    f"eksik/bozuk: {incomplete[:10]}"
+                )
+                logger.error("%s", self.last_delete_error)
+            else:
+                self.last_delete_error = None
+            self._regions[clean_name] = reg_info
+            self.active_region = prev_active_region
+            self.active_route = prev_active_route
+            self._sync_legacy_data()
             return False
 
     def get_regions(self) -> List[str]:
@@ -2329,6 +3646,13 @@ class RouteManager:
             logger.warning("Yeniden adlandırılacak rota bulunamadı: %s/%s", target_region, old_r)
             return False
 
+        # K-19: bellek/disk ayrışmasını engelle — yazım başarısız olursa
+        # aşağıdaki tüm bellek değişimleri geri alınır (delete_route ile
+        # aynı desen).
+        routes_snapshot = list(routes_list)
+        node_routes_snapshot = {id(n): list(n.routes) for n in reg_info["nodes"]}
+        prev_active_route = self.active_route
+
         idx = routes_list.index(old_r)
         if new_r in routes_list:
             routes_list.pop(idx)
@@ -2348,7 +3672,26 @@ class RouteManager:
         if self.active_region == target_region and self.active_route == old_r:
             self.active_route = new_r
 
-        return self.save_region(target_region)
+        try:
+            saved = self.save_region(target_region)
+        except Exception as exc:
+            logger.error(
+                "Rota yeniden adlandırma kaydı hata verdi (%s/%s -> %s): %s",
+                target_region, old_r, new_r, exc,
+            )
+            saved = False
+        if not saved:
+            reg_info["routes"] = routes_snapshot
+            for node in reg_info["nodes"]:
+                node.routes = node_routes_snapshot.get(id(node), node.routes)
+            self.active_route = prev_active_route
+            self._sync_legacy_data()
+            logger.error(
+                "Rota yeniden adlandırma kaydı başarısız, geri alındı: %s/%s -> %s",
+                target_region, old_r, new_r,
+            )
+            return False
+        return True
 
     def delete_route(self, region_name: str, route_name: Optional[str] = None) -> bool:
         """Belirtilen rotayı bölgeden ve düğümlerin rota listesinden kaldırır (düğümleri silmez)."""
@@ -2373,6 +3716,23 @@ class RouteManager:
             logger.warning("Silinecek rota bulunamadı: %s/%s", target_region, target_route)
             return False
 
+        # P2-6 (K-05): rota purge'u öncesi zaman damgalı snapshot.
+        # save_region'un region_data.backup.json'u (artık atomik) silme
+        # anındaki hâli korur ama her kayıtta üstüne yazılır; bu
+        # snapshot kalıcıdır. Snapshot alınamazsa uyarıyla devam edilir
+        # (tek-yedek koruması hâlâ devrededir); bölge silmenin aksine
+        # burada düğümler durur, yalnızca rota üyeliği değişir.
+        try:
+            route_snapshot = self._snapshot_region_json(target_region, "route-deleted")
+        except OSError as exc:
+            route_snapshot = None
+            logger.warning("Rota silme öncesi snapshot alınamadı (%s/%s): %s", target_region, target_route, exc)
+        if route_snapshot is not None:
+            logger.info("Rota silme snapshot'ı: %s", route_snapshot)
+
+        routes_snapshot = list(routes_list)
+        node_routes_snapshot = {id(n): list(n.routes) for n in reg_info["nodes"]}
+        prev_active_route = self.active_route
         routes_list.remove(target_route)
         for node in reg_info["nodes"]:
             if target_route in node.routes:
@@ -2381,7 +3741,16 @@ class RouteManager:
         if self.active_region == target_region and self.active_route == target_route:
             self.active_route = DEFAULT_ROUTE
 
-        return self.save_region(target_region)
+        if self.save_region(target_region):
+            return True
+        # Kayıt başarısız: rota silme işlemini geri al.
+        reg_info["routes"] = routes_snapshot
+        for node in reg_info["nodes"]:
+            node.routes = node_routes_snapshot.get(id(node), node.routes)
+        self.active_route = prev_active_route
+        self._sync_legacy_data()
+        logger.error("Rota silme kaydı başarısız, geri alındı: %s/%s", target_region, target_route)
+        return False
 
     def get_routes(self, region: Optional[str] = None) -> List[str]:
         """Belirtilen bölgedeki tüm rotaların listesini döndürür."""
@@ -2390,7 +3759,8 @@ class RouteManager:
         if canon_reg not in self._regions:
             self.load_region(canon_reg)
         if canon_reg not in self._regions:
-            return [DEFAULT_ROUTE]
+            # Bilinmeyen bölge için sahte ["All"] dönülmez; rota yok.
+            return []
         routes_list = list(self._regions[canon_reg].get("routes", [DEFAULT_ROUTE]))
         if DEFAULT_ROUTE not in routes_list:
             routes_list.insert(0, DEFAULT_ROUTE)
@@ -2407,10 +3777,14 @@ class RouteManager:
         existing_ids = [n.id for n in self._regions[region]["nodes"]]
         return max(existing_ids) + 1
 
-    def _prepare_patch_image(self, patch_img: Optional[np.ndarray]) -> np.ndarray:
-        """Gelen görüntüyü 80x80 gri tonlamalı (uint8) kesite dönüştürür."""
+    def _prepare_patch_image(self, patch_img: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Gelen görüntüyü 80x80 gri tonlamalı (uint8) kesite dönüştürür.
+
+        Görüntü yoksa/boşsa None döner: kayıp yama yerine siyah sahte kesit
+        yazılmaz; çağıran yama dosyasını yazmayı atlar.
+        """
         if patch_img is None or not isinstance(patch_img, np.ndarray) or patch_img.size == 0:
-            return np.zeros((PATCH_SIZE, PATCH_SIZE), dtype=np.uint8)
+            return None
 
         if len(patch_img.shape) == 3:
             if patch_img.shape[2] == 4:
@@ -2457,6 +3831,17 @@ class RouteManager:
         if isinstance(region, NodeData):
             node_obj = region
             target_region = node_obj.region or self.active_region
+            # Görev 4: canlı tespit edilen bölgeden farklı bölgeye düğüm
+            # yazılmaz (örn. Verteron'dayken Altgard verisine yazmak).
+            if self._region_mismatch_blocks(target_region):
+                mismatch = self.get_region_mismatch() or {}
+                logger.warning(
+                    "⛔ [BÖLGE UYUMSUZLUĞU] Düğüm '%s' bölgesine yazılmadı: karakter %s "
+                    "bölgesinde. Bölgeyi düzeltip yeniden deneyin.",
+                    target_region,
+                    mismatch.get("detected_region"),
+                )
+                return None
             if getattr(self, "blacklist_manager", None) is not None and not kwargs.get("ignore_blacklist", False):
                 is_bl, bl_entry = self.blacklist_manager.is_blacklisted(
                     region=target_region,
@@ -2473,8 +3858,19 @@ class RouteManager:
                         node_obj.map_y,
                     )
                     return None
+            # Kanonik ad: alt bölge ("Pilgrim's Ridge") kanonik ana bölgeye
+            # ("Verteron") çözülür — `_regions` anahtarları kanoniktir.
+            # Kontrolsüz create_region başarısız olursa (False) aşağıda
+            # `self._regions[target_region]` KeyError ile patlardı; bölge
+            # yoksa ekleme açıkça reddedilir (None döner).
+            target_region = resolve_canonical_region(target_region)
             if target_region not in self._regions:
-                self.create_region(target_region)
+                if not self.create_region(target_region):
+                    logger.error(
+                        "Düğüm eklenemedi: '%s' bölgesi oluşturulamadı.",
+                        target_region,
+                    )
+                    return None
             if not node_obj.id or any(n.id == node_obj.id for n in self._regions[target_region]["nodes"]):
                 node_obj.id = self._next_node_id(target_region)
             node_obj.region = target_region
@@ -2482,9 +3878,9 @@ class RouteManager:
             disk_patch_path = os.path.join(self._get_region_patches_dir(target_region), f"node_{node_obj.id}.png")
             os.makedirs(os.path.dirname(disk_patch_path), exist_ok=True)
             if patch_img is not None:
-                _safe_imwrite(disk_patch_path, self._prepare_patch_image(patch_img))
-            elif not os.path.exists(disk_patch_path):
-                _safe_imwrite(disk_patch_path, self._prepare_patch_image(None))
+                prepared = self._prepare_patch_image(patch_img)
+                if prepared is not None:
+                    _safe_imwrite(disk_patch_path, prepared)
 
             if node_obj.seq_index <= 0:
                 node_obj.seq_index = len(self._regions[target_region]["nodes"]) + 1
@@ -2509,6 +3905,17 @@ class RouteManager:
         if not target_region:
             target_region = DEFAULT_REGION
 
+        # Görev 4: canlı tespit edilen bölgeden farklı bölgeye düğüm yazılmaz.
+        if self._region_mismatch_blocks(target_region):
+            mismatch = self.get_region_mismatch() or {}
+            logger.warning(
+                "⛔ [BÖLGE UYUMSUZLUĞU] Düğüm '%s' bölgesine yazılmadı: karakter %s "
+                "bölgesinde. Bölgeyi düzeltip yeniden deneyin.",
+                target_region,
+                mismatch.get("detected_region"),
+            )
+            return None
+
         if getattr(self, "blacklist_manager", None) is not None and not kwargs.get("ignore_blacklist", False):
             is_bl, bl_entry = self.blacklist_manager.is_blacklisted(
                 region=target_region,
@@ -2527,8 +3934,19 @@ class RouteManager:
                 )
                 return None
 
+        # Kanonik ad: alt bölge ("Pilgrim's Ridge") kanonik ana bölgeye
+        # ("Verteron") çözülür — `_regions` anahtarları kanoniktir.
+        # Kontrolsüz create_region başarısız olursa (False) aşağıda
+        # `self._regions[target_region]` KeyError ile patlardı; bölge
+        # yoksa ekleme açıkça reddedilir (None döner).
+        target_region = resolve_canonical_region(target_region)
         if target_region not in self._regions:
-            self.create_region(target_region)
+            if not self.create_region(target_region):
+                logger.error(
+                    "Düğüm eklenemedi: '%s' bölgesi oluşturulamadı.",
+                    target_region,
+                )
+                return None
 
         assigned_id = int(node_id) if node_id is not None else self._next_node_id(target_region)
         if any(n.id == assigned_id for n in self._regions[target_region]["nodes"]):
@@ -2553,20 +3971,21 @@ class RouteManager:
 
         if patch_img is not None:
             prepared = self._prepare_patch_image(patch_img)
-            _safe_imwrite(disk_patch_path, prepared)
+            if prepared is not None:
+                _safe_imwrite(disk_patch_path, prepared)
         elif patch_path and os.path.exists(patch_path) and os.path.abspath(patch_path) != os.path.abspath(disk_patch_path):
             src_img = _safe_imread_gray(patch_path)
-            _safe_imwrite(disk_patch_path, self._prepare_patch_image(src_img))
-        elif not os.path.exists(disk_patch_path):
-            _safe_imwrite(disk_patch_path, self._prepare_patch_image(None))
+            prepared_src = self._prepare_patch_image(src_img)
+            if prepared_src is not None:
+                _safe_imwrite(disk_patch_path, prepared_src)
 
         # Viewport normalizasyonu: dinamik çözünürlük desteği (1280x720, 1920x1080 vb.)
-        vw = float(kwargs.get("viewport_width") or getattr(self, "viewport_width", 0) or 0)
-        vh = float(kwargs.get("viewport_height") or getattr(self, "viewport_height", 0) or 0)
-        if vw <= 0:
-            vw = 1280.0 if (0 < map_x <= 1280 and map_y <= 720) else 1920.0
-        if vh <= 0:
-            vh = 720.0 if (0 < map_y <= 720 and map_x <= 1280) else 1080.0
+        # P1-7 (K-20): norm harita kanvası uzayındadır — açıkça verilen
+        # kwarg korunur, yoksa harita kanvası boyutu okunur (eski sessiz
+        # 1920x1080 / koordinata bakarak tahmin kaldırıldı).
+        _mw, _mh = self._map_canvas_size()
+        vw = float(kwargs.get("viewport_width") or _mw)
+        vh = float(kwargs.get("viewport_height") or _mh)
 
         calc_norm_x = float(norm_x) if norm_x is not None else (round(float(map_x) / vw, 4) if map_x > 0 else 0.5)
         calc_norm_y = float(norm_y) if norm_y is not None else (round(float(map_y) / vh, 4) if map_y > 0 else 0.5)
@@ -2636,6 +4055,23 @@ class RouteManager:
         raw_reg = region_name or self.active_region
         canon_reg = resolve_canonical_region(raw_reg)
         target_route = route_name or self.active_route
+
+        # Görev 4 — bölge uyumsuzluğu engeli: yalnızca aktif-rotayı çalıştıran
+        # çağrılar (bölge/rota argümansız) engellenir; açıkça başka bölge
+        # isteyen okumalar (arayüz, rehidrasyon, test) etkilenmez.
+        if region_name is None and route_name is None and self.is_route_blocked_by_region_mismatch():
+            mismatch = self.get_region_mismatch() or {}
+            now_ts = time.time()
+            if now_ts - float(self._last_mismatch_block_log_ts or 0.0) >= 60.0:
+                self._last_mismatch_block_log_ts = now_ts
+                logger.warning(
+                    "⛔ [BÖLGE UYUMSUZLUĞU] Aktif rota düğümleri verilmiyor: karakter %s "
+                    "bölgesinde, aktif rota %s · %s.",
+                    mismatch.get("detected_region"),
+                    mismatch.get("active_region"),
+                    mismatch.get("active_route"),
+                )
+            return []
 
         if canon_reg not in self._regions:
             self.load_region(canon_reg)
@@ -2806,10 +4242,30 @@ class RouteManager:
             logger.warning("Rotadan çıkarılacak düğüm bulunamadı: #%d", int(node_id))
             return False
 
-        if clean_route in node.routes:
-            node.routes.remove(clean_route)
-            return self.save_region(node.region)
-        return False
+        if clean_route not in node.routes:
+            return False
+
+        # K-19: yazım başarısız olursa bellek içi rota üyeliği geri alınır,
+        # yoksa bellek "çıkarıldı" derken disk düğümü rotada tutar.
+        prev_routes = list(node.routes)
+        node.routes.remove(clean_route)
+        try:
+            saved = self.save_region(node.region)
+        except Exception as exc:
+            logger.error(
+                "Rotadan çıkarma kaydı hata verdi (#%d, %s): %s",
+                int(node_id), clean_route, exc,
+            )
+            saved = False
+        if not saved:
+            node.routes = prev_routes
+            self._sync_legacy_data()
+            logger.error(
+                "Rotadan çıkarma kaydı başarısız, geri alındı: #%d (%s)",
+                int(node_id), clean_route,
+            )
+            return False
+        return True
 
     def move_node_to_region(
         self,
@@ -2821,9 +4277,10 @@ class RouteManager:
         """
         Bir düğümü (ve harita kesiti görselini) başka bir bölgeye taşır.
         """
-        clean_target = str(target_region).strip()
-        if not clean_target:
-            logger.warning("Hedef bölge adı boş olamaz.")
+        try:
+            clean_target = _validate_region_name(target_region)
+        except ValueError as exc:
+            logger.warning("Hedef bölge adı geçersiz: %s", exc)
             return None
 
         node = self.get_node(node_id, region=source_region)
@@ -2836,24 +4293,31 @@ class RouteManager:
             return node
 
         if clean_target not in self._regions:
-            self.create_region(clean_target)
+            if not self.create_region(clean_target):
+                return None
 
+        # Atomiklik anlık görüntüsü: hata/kayıt başarısızlığında düğüm
+        # kaynaktan silinmiş olarak kalmasın diye her şey geri alınır.
+        orig_nodes = list(self._regions[orig_region]["nodes"])
+        orig_index = orig_nodes.index(node) if node in orig_nodes else -1
+        node_snapshot = (node.id, node.region, node.patch_path, list(node.routes))
+        target_routes_snapshot = list(self._regions[clean_target]["routes"])
+        old_patch_disk = self._resolve_patch_disk_path(node)
+        patch_moved_to: Optional[str] = None
+        new_id = node.id
         try:
-            old_patch_disk = self._resolve_patch_disk_path(node)
             self._regions[orig_region]["nodes"].remove(node)
 
             # Hedef bölgede ID çakışması varsa yeni ID ata
             if any(n.id == node.id for n in self._regions[clean_target]["nodes"]):
                 new_id = self._next_node_id(clean_target)
-            else:
-                new_id = node.id
 
             new_patch_disk = os.path.join(self._get_region_patches_dir(clean_target), f"node_{new_id}.png")
             os.makedirs(os.path.dirname(new_patch_disk), exist_ok=True)
             if os.path.isfile(old_patch_disk):
                 shutil.move(old_patch_disk, new_patch_disk)
-            else:
-                _safe_imwrite(new_patch_disk, self._prepare_patch_image(None))
+                patch_moved_to = new_patch_disk
+            # Eski yama yoksa sahte siyah kesit yazılmaz; düğüm yamasız taşınır.
 
             node.id = new_id
             node.region = clean_target
@@ -2866,12 +4330,28 @@ class RouteManager:
                     self._regions[clean_target]["routes"].append(r_name)
 
             self._regions[clean_target]["nodes"].append(node)
-            self.save_region(orig_region)
-            self.save_region(clean_target)
+            if not self.save_region(orig_region) or not self.save_region(clean_target):
+                raise OSError("Taşıma kaydı başarısız (save_region False)")
             logger.info("Düğüm taşındı: %s -> %s (Yeni ID=#%d)", orig_region, clean_target, new_id)
             return node
         except Exception as exc:
             logger.error("Düğüm taşıma hatası (#%d -> %s): %s", int(node_id), clean_target, exc)
+            # Geri alma: düğümü kaynak listeye iade et, yamayı geri taşı.
+            try:
+                if patch_moved_to is not None and os.path.isfile(patch_moved_to):
+                    shutil.move(patch_moved_to, old_patch_disk)
+            except Exception as rb_exc:
+                logger.error("Taşıma geri alma (yama) başarısız: %s", rb_exc)
+            node.id, node.region, node.patch_path, node.routes = node_snapshot
+            if node in self._regions[clean_target]["nodes"]:
+                self._regions[clean_target]["nodes"].remove(node)
+            self._regions[clean_target]["routes"] = target_routes_snapshot
+            if node not in self._regions[orig_region]["nodes"]:
+                if 0 <= orig_index <= len(self._regions[orig_region]["nodes"]):
+                    self._regions[orig_region]["nodes"].insert(orig_index, node)
+                else:
+                    self._regions[orig_region]["nodes"].append(node)
+            self._sync_legacy_data()
             return None
 
     # ------------------------------------------------------------------
@@ -2893,7 +4373,14 @@ class RouteManager:
 
         woken_nodes: List[NodeData] = []
         dirty_regions: List[str] = []
-        region_keys = [region] if (region and region in self._regions) else list(self._regions.keys())
+        if region:
+            canon_region = resolve_canonical_region(region)
+            if canon_region not in self._regions:
+                logger.warning("update_resting_nodes: bilinmeyen bölge: %s", region)
+                return []
+            region_keys = [canon_region]
+        else:
+            region_keys = list(self._regions.keys())
 
         for reg_name in region_keys:
             nodes_list: List[NodeData] = self._regions[reg_name].get("nodes", [])
@@ -2964,9 +4451,9 @@ class RouteManager:
             if n.not_gatherable:
                 continue
             if n.is_ready(now=now, rest_duration_sec=rest_duration_sec):
-                if n.state == "resting":
-                    n.state = "active"
-                    n.current_harvests = 0
+                # "get" metodu durum değiştirmez: dinlenmesi bitmiş düğüm
+                # hazır sayılır ama uyandırma (state + sayaç sıfırlama +
+                # kaydetme) update_resting_nodes / toplama akışına aittir.
                 ready_nodes.append(n)
 
         # Kısmi hasat devam eden düğüm varsa (1/3 veya 2/3), 3/3 tamamlanana kadar aynı düğümde kal
@@ -2977,15 +4464,21 @@ class RouteManager:
                 return candidate
 
         # Döngüsel sıra: rota diziliminde son seçilen node'dan bir sonraki hazır node'u seç
+        # Konumlar bir kez sözlüğe alınır; eski kod her hazır aday için
+        # node_order.index() (O(n) tarama) yapıyordu -> O(n^2). İlk
+        # oluşum korunur, böylece yinelenen id'de eski .index() davranışı aynen kalır.
         key = (canon_reg, target_route)
         last_id = self._last_selected_node_id.get(key)
-        node_order = [n.id for n in nodes]
-        last_pos = node_order.index(last_id) if (last_id is not None and last_id in node_order) else -1
+        node_pos: Dict[int, int] = {}
+        for pos, n in enumerate(nodes):
+            if n.id not in node_pos:
+                node_pos[n.id] = pos
+        last_pos = node_pos.get(last_id, -1) if last_id is not None else -1
         selected = None
 
         if ready_nodes:
             for candidate in ready_nodes:
-                cand_pos = node_order.index(candidate.id) if candidate.id in node_order else 9999
+                cand_pos = node_pos.get(candidate.id, 9999)
                 if cand_pos > last_pos:
                     selected = candidate
                     break
@@ -2993,8 +4486,12 @@ class RouteManager:
                 selected = ready_nodes[0]
         elif fallback_to_next and nodes:
             # Tüm düğümler dinlenmede olsa bile stall olmadan döngüye devam et (1 -> 2 -> 3 -> 1...)
-            next_idx = (last_pos + 1) % len(nodes)
-            selected = nodes[next_idx]
+            # Yalnızca toplanabilir düğümler adaydır (parşömen/ara nokta dönmez).
+            gatherable = [n for n in nodes if not n.not_gatherable]
+            if gatherable:
+                gatherable_ids = [n.id for n in gatherable]
+                last_g_pos = gatherable_ids.index(last_id) if (last_id is not None and last_id in gatherable_ids) else -1
+                selected = gatherable[(last_g_pos + 1) % len(gatherable)]
 
         if selected is not None:
             self._last_selected_node_id[key] = selected.id
@@ -3029,6 +4526,11 @@ class RouteManager:
     ) -> Tuple[int, int]:
         """
         Belirtilen bölge ve rota için `(ready_count, resting_count)` istatistiğini döndürür.
+
+        P1-6 (K-06): hazır sayımı `is_ready()` ile aynı kalır; dinlenme
+        sayımı tek `effective_node_state()`'ten türetilir — hatalı /
+        karantinalı / toplanamaz düğüm eskisi gibi "dinleniyor" sayılmaz,
+        hiçbir kovaya girmez (ready + resting toplamdan küçük olabilir).
         """
         target_region = region or self.active_region
         target_route = route or self.active_route
@@ -3039,7 +4541,10 @@ class RouteManager:
         for node in nodes:
             if node.is_ready(now=now, rest_duration_sec=rest_duration_sec):
                 ready_count += 1
-            else:
+            elif (
+                effective_node_state(node, now=now, rest_duration_sec=rest_duration_sec)
+                == "resting"
+            ):
                 resting_count += 1
         return ready_count, resting_count
 
@@ -3076,8 +4581,8 @@ class RouteManager:
             logger.info("Düğüm #%d parşömen, hasat sayılmadı", int(node.id))
             return (int(node.current_harvests), int(target), False)
         if extraction_failed:
-            if node.state not in ("active", "gathering"):
-                node.state = "active"
+            # Çıkarma başarısızsa sayaç da durum da değişmez: dinlenmedeki
+            # ("resting") düğüm "active"e diriltilmez, kısmi hasat korunur.
             self.save_region(node.region)
             return (int(node.current_harvests), int(target), False)
 
@@ -3144,12 +4649,15 @@ class RouteManager:
         node_id: Union[int, NodeData, Dict[str, Any]],
         completed_harvests: Optional[int] = None,
         max_harvests: Optional[int] = None,
-        prompt_reappeared: Optional[bool] = False,
+        prompt_reappeared: Optional[bool] = None,
         rest_minutes: float = 5.0,
         region: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Madde 22 — Yarım Bırakılmış Kaynak (Partial Node) Algılama:
+        ``prompt_reappeared=None`` bilinmiyor demektir; dedektör bunu
+        kendisi doğrular. Varsayılan ``False`` "prompt belirmedi" diye
+        varsayarak düğümü yok yere dinlenmeye alıyordu.
         Başka bir oyuncu kaynağı önceden 1 veya 2 kez toplamışsa (`1/3` veya `2/3` sonrasında
         kaynak yok olup `[F Gather]` tekrar çıkmazsa), 3. toplama için boşuna beklemek yerine
         `mark_node_gathered(node_id, force_deplete=True)` ile düğümü derhal `RESTING` (5 dk)
@@ -3178,15 +4686,16 @@ class RouteManager:
         self,
         node_id: int,
         rest_minutes: Union[float, int, str, None] = 5.0,
-        force_deplete: bool = True,
+        force_deplete: bool = False,
         region: Optional[str] = None,
     ) -> Optional[NodeData]:
         """
         Düğüm toplandığında çağrılır:
-        - `force_deplete=True` (varsayılan veya erken tükenme durumunda):
+        - `force_deplete=False` (varsayılan): `record_harvest_stage` üzerinden
+          3 aşamalı hasat ilerler (`1/3`, `2/3`, `3/3`); tek toplama düğümü
+          erken tüketmez.
+        - `force_deplete=True` (yalnızca erken tükenme / kısmi düğüm durumunda):
           `node.current_harvests = 0` sıfırlanır ve düğüm doğrudan `"resting"` durumuna alınır.
-        - `force_deplete=False`:
-          `record_harvest_stage(node_id, rest_minutes)` metoduna delege edilir (`1/3`, `2/3`, `3/3`).
         """
         # Geriye dönük uyumluluk: mark_node_gathered(node_id, "Verteron") çağrısı
         effective_rest_min: Optional[float] = 5.0
@@ -3240,7 +4749,7 @@ class RouteManager:
         node_id: int,
         region_name: Optional[str] = None,
         rest_minutes: Optional[float] = None,
-        force_deplete: bool = True,
+        force_deplete: bool = False,
     ) -> Optional[NodeData]:
         """Geriye dönük uyumluluk için `mark_node_gathered` takma adı."""
         return self.mark_node_gathered(
@@ -3279,7 +4788,8 @@ class RouteManager:
             logger.warning("Başarısız olarak işaretlenecek düğüm bulunamadı: #%d", int(node_id))
             return None
 
-        node.current_harvests = 0
+        # Kısmi hasat sayacı korunur: başarısız deneme 1/3 veya 2/3
+        # ilerlemeyi silmez (eski kod koşulsuz sıfırlıyordu).
         node.consecutive_failures += 1
         self.consecutive_failures += 1
 
@@ -3287,6 +4797,16 @@ class RouteManager:
         curr_route = str(active_route or self.active_route or "").strip()
 
         # Durum 1: 3 kez üst üste başarısız -> YZ İnceleme + Kara Liste + Kalıcı Silme
+        # Silme kararı kara liste kaydının tamamlanmasına bağlıdır, yama görseli
+        # incelenmesine değil: `verify_and_blacklist_node` yalnızca yama görseli
+        # varsa YZ doğrulaması döndürür (F-1793); yamasız düğümde YZ görsel
+        # inceleme yapamaz ama 3x fiziksel kanıt (düğüm noktasına 3 kez gelindi,
+        # 3'ünde de kaynak bulunamadı) + tamamlanmış kara liste kaydı purge için
+        # yeterlidir. Eski `ai_verified` kapısı yamasız düğümleri hiç silemiyordu:
+        # düğüm bölgede "resting" kalıyor ama koordinatı kara listeli olduğu için
+        # bir daha kaydedilemiyordu (tutarsız durum). Kara liste kaydı kendisi
+        # oluşturulamazsa (örn. blacklist_manager yok + global yönetici hatası)
+        # düğüm silinmez, dinlenmeye alınır.
         if node.consecutive_failures >= effective_limit:
             logger.warning(
                 "🚨 [3x Başarısızlık] Düğüm #%d ardışık %d kez bulunamadı! YZ kontrolü başlatılıyor ve kara listeye ekleniyor...",
@@ -3294,6 +4814,8 @@ class RouteManager:
                 node.consecutive_failures,
             )
             ai_diag = "empty_terrain"
+            ai_verified = False
+            bl_entry = None
             if run_ai_check:
                 try:
                     from core.wrong_node_scan import verify_and_blacklist_node
@@ -3304,6 +4826,7 @@ class RouteManager:
                         blacklist_mgr=getattr(self, "blacklist_manager", None),
                     )
                     ai_diag = verdict
+                    ai_verified = bool(ok)
                     logger.warning(
                         "🧠 [YZ Teşhisi] Düğüm #%d incelendi: %s -> Kara listeye kaydedildi.",
                         node.id,
@@ -3312,7 +4835,7 @@ class RouteManager:
                 except Exception as ai_exc:
                     logger.error("YZ kontrolü ve kara liste ekleme hatası: %s", ai_exc)
                     if getattr(self, "blacklist_manager", None) is not None:
-                        self.blacklist_manager.add_entry(
+                        bl_entry = self.blacklist_manager.add_entry(
                             region=node.region,
                             map_x=node.map_x,
                             map_y=node.map_y,
@@ -3322,9 +4845,27 @@ class RouteManager:
                             source_node_id=node.id,
                         )
 
-            # Düğümü haritadan ve diskten tamamen sil
-            self.delete_node(node.id, region=node.region)
-            return None
+            if bl_entry is not None:
+                # Düğümü haritadan ve diskten tamamen sil. YZ görsel doğrulaması
+                # yapılamadıysa (yama yok) bile 3x fiziksel kanıt + kara liste
+                # kaydı silme için yeterlidir; ai_verified yalnızca teşhis
+                # metninin dürüstlüğü içindir (F-1793), silme kapısı değildir.
+                if not ai_verified:
+                    logger.warning(
+                        "Düğüm #%d YZ görsel doğrulaması olmadan siliniyor: "
+                        "3x fiziksel başarısızlık + kara liste kaydı tamam.",
+                        node.id,
+                    )
+                self.delete_node(node.id, region=node.region)
+                return None
+            logger.warning(
+                "Kara liste kaydı oluşturulamadı, düğüm #%d silinmedi; dinlenmeye alındı.",
+                node.id,
+            )
+            node.state = "resting"
+            node.last_visited_timestamp = time.time()
+            self.save_region(node.region)
+            return node
 
         # Durum 2: 1 veya 2 kez başarısız -> "orayı rotadan çıkarsın"
         if curr_route and curr_route != DEFAULT_ROUTE and curr_route in node.routes:
@@ -3466,8 +5007,9 @@ class RouteManager:
                 best_t = 0.0
                 best_node = n
 
-        vw = getattr(self, "viewport_width", 1920) or 1920
-        vh = getattr(self, "viewport_height", 1080) or 1080
+        # P1-7 (K-20): snap norm'u harita kanvası uzayındadır (ekran
+        # viewport'u değil).
+        vw, vh = self._map_canvas_size()
         calc_norm_x = round(float(best_proj[0]) / float(max(1, vw)), 4)
         calc_norm_y = round(float(best_proj[1]) / float(max(1, vh)), 4)
 
@@ -3544,14 +5086,18 @@ class RouteManager:
         if snap_res.snapped:
             if hasattr(tracker, "set_position") and callable(tracker.set_position):
                 try:
-                    tracker.set_position(snap_res.x, snap_res.y)
-                except Exception:
-                    pass
+                    res = tracker.set_position(snap_res.x, snap_res.y)
+                    if res is False:
+                        logger.warning("Odometri set_position False döndü; düzeltme uygulanamadı.")
+                except Exception as exc:
+                    logger.warning("Odometri set_position hatası (düzeltme uygulanamadı): %s", exc)
             elif hasattr(tracker, "update_position") and callable(tracker.update_position):
                 try:
-                    tracker.update_position(snap_res.x, snap_res.y)
-                except Exception:
-                    pass
+                    res = tracker.update_position(snap_res.x, snap_res.y)
+                    if res is False:
+                        logger.warning("Odometri update_position False döndü; düzeltme uygulanamadı.")
+                except Exception as exc:
+                    logger.warning("Odometri update_position hatası (düzeltme uygulanamadı): %s", exc)
             else:
                 if hasattr(tracker, "map_x"):
                     tracker.map_x = snap_res.x
@@ -3593,8 +5139,8 @@ class RouteManager:
             return []
 
         max_dist = max(10.0, float(max_segment_distance))
-        vw = float(getattr(self, "viewport_width", 1920) or 1920)
-        vh = float(getattr(self, "viewport_height", 1080) or 1080)
+        # P1-7 (K-20): alt düğüm norm'u harita kanvası uzayındadır.
+        vw, vh = self._map_canvas_size()
         created_nodes: List[NodeData] = []
 
         # Ardışık düğümler arasında mesafe kontrolü
@@ -3624,9 +5170,8 @@ class RouteManager:
 
                     if map_frame is not None and isinstance(map_frame, np.ndarray) and map_frame.size > 0:
                         patch_img = self._extract_clean_80x80_patch(map_frame, ix, iy)
-                    else:
-                        patch_img = self._prepare_patch_image(None)
-                    _safe_imwrite(disk_patch_path, patch_img)
+                        _safe_imwrite(disk_patch_path, patch_img)
+                    # map_frame yoksa yama yazılmaz (sahte siyah kesit yok).
 
                     routes_for_node = [target_route] if target_route and target_route != DEFAULT_ROUTE else []
                     new_node = NodeData(
@@ -3761,28 +5306,46 @@ class RouteManager:
     # F8 Anlık Düğüm Kayıt Akışı (Minimap + Açık Harita Hibrit Destekli)
     # ------------------------------------------------------------------
     def _send_map_key(self, input_ctrl: Any) -> bool:
-        """Input kontrolcüsü üzerinden 'M' harita tuşuna basar."""
+        """Input kontrolcüsü üzerinden 'M' harita tuşuna basar.
+
+        Tuşun ulaştığı donanım düzeyinde doğrulanamaz; ancak basma metodu
+        açıkça False dönerse başarısız sayılır (eski kod yalnızca
+        metodun varlığına bakıp her zaman True dönüyordu).
+        """
         if input_ctrl is None:
             logger.debug("input_ctrl nesnesi None olduğu için M tuşuna basılmadı.")
             return False
         try:
+            result: Any = None
             if hasattr(input_ctrl, "press_key"):
-                input_ctrl.press_key("m")
+                result = input_ctrl.press_key("m")
+            elif hasattr(input_ctrl, "tap_key"):
+                result = input_ctrl.tap_key("m")
+            elif hasattr(input_ctrl, "toggle_map"):
+                result = input_ctrl.toggle_map()
+            elif hasattr(input_ctrl, "send_key"):
+                result = input_ctrl.send_key("m")
+            elif callable(input_ctrl):
+                result = input_ctrl("m")
+            else:
+                logger.debug("input_ctrl üzerinde uygun tuş basma metodu bulunamadı.")
+                return False
+            if isinstance(result, bool):
+                return result
+            if isinstance(result, (int, float)):
+                # press_key bekleme süresi (float) döner: 0.0 = gönderim
+                # iptal edildi (odak yok / motion abort / bekleme kesildi),
+                # pozitif değer = tuş gönderildi. F-1642: 0.0 daha önce
+                # bool olmadığı için aşağıdaki "gönderim varsayılır"
+                # dalına düşüp yanlış True dönüyordu.
+                if result <= 0:
+                    logger.debug("M tuşu gönderilemedi (press_key 0.0 döndü).")
+                    return False
+                logger.debug("M tuşu gönderildi (basılı tutma: %.3fs).", float(result))
                 return True
-            if hasattr(input_ctrl, "tap_key"):
-                input_ctrl.tap_key("m")
-                return True
-            if hasattr(input_ctrl, "toggle_map"):
-                input_ctrl.toggle_map()
-                return True
-            if hasattr(input_ctrl, "send_key"):
-                input_ctrl.send_key("m")
-                return True
-            if callable(input_ctrl):
-                input_ctrl("m")
-                return True
-            logger.debug("input_ctrl üzerinde uygun tuş basma metodu bulunamadı.")
-            return False
+            # Dönüş değeri yoksa gönderim varsayılır ama doğrulanamadığı loglanır.
+            logger.debug("M tuşu gönderildi (ulaştığı doğrulanamadı, dönüş değeri yok).")
+            return True
         except Exception as exc:
             logger.debug("M tuşu gönderilirken hata oluştu: %s", exc)
             return False
@@ -3844,8 +5407,14 @@ class RouteManager:
 
         return None
 
-    def _verify_map_open(self, vision_engine: Any, frame: Optional[np.ndarray]) -> bool:
-        """Tam ekran haritanın ('M') açık olup olmadığını kontrol eder."""
+    def _verify_map_open(self, vision_engine: Any, frame: Optional[np.ndarray]) -> Optional[bool]:
+        """Tam ekran haritanın ('M') açık olup olmadığını kontrol eder.
+
+        Üç durumlu (H-sweep ek): True = açık, False = kapalı,
+        None = bilinmiyor. Vision açıkça None döndürürse bool() ile
+        False'a indirilmez, None yayılır; çağrı patlarsa yerel
+        merkez-ROI sezgiseli devreye girer (eski davranış).
+        """
         if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
             return False
 
@@ -3853,9 +5422,12 @@ class RouteManager:
             try:
                 fn = getattr(vision_engine, "is_map_open")
                 try:
-                    return bool(fn(frame))
+                    result = fn(frame)
                 except TypeError:
-                    return bool(fn())
+                    result = fn()
+                if result is None:
+                    return None
+                return bool(result)
             except Exception as exc:
                 logger.debug("vision_engine.is_map_open çağrısı başarısız: %s", exc)
 
@@ -3866,7 +5438,10 @@ class RouteManager:
         center_roi = frame[int(h * 0.25) : int(h * 0.75), int(w * 0.25) : int(w * 0.75)]
         if center_roi.size == 0:
             return False
-        return float(np.std(center_roi)) > 1.0 or float(np.mean(center_roi)) > 5.0
+        # Eski eşik (std>1 veya mean>5) neredeyse her karede True veriyordu
+        # (siyah kare dışında her şey geçerdi). Açık harita, merkez bölgesi
+        # hem parlak hem dokulu bir karedir: iki koşul birlikte aranır.
+        return float(np.std(center_roi)) > 12.0 and float(np.mean(center_roi)) > 10.0
 
     def _locate_minimap_player_center(self, frame: np.ndarray) -> Tuple[int, int]:
         """
@@ -3975,7 +5550,7 @@ class RouteManager:
         max_snap_distance: float = 35.0,
         min_record_distance: float = 5.0,
         **kwargs: Any,
-    ) -> NodeData:
+    ) -> Optional[NodeData]:
         """
         F8 Anlık Düğüm Kayıt Akışı (Hibrit Minimap + Açık Harita):
         1. Güncel ekran görüntüsünü yakalar (`vision_engine` veya `ScreenCapture`).
@@ -3985,7 +5560,8 @@ class RouteManager:
            merkez `cx ~ 0.923, cy ~ 0.165`) üzerindeki oyuncu konumundan 80x80 gri kesiti kırpar.
         3. Merkezdeki oyuncu okunu `cv2.inpaint` ile temizleyerek `patches/node_<id>.png` olarak kaydeder.
         4. `max_harvests=3` (varsayılan) ile `NodeData` oluşturup `region_data.json` dosyasını günceller.
-        5. Asla `"Haritanın açıldığı doğrulanamadı"` hatasıyla `None` döndürmez.
+        5. Yakalama başarısız olursa `None` döner; sentetik siyah kareden
+           uydurma düğüm kaydedilmez (eski davranış "başarılı" kayıttı).
         """
         target_region = str(region or self.active_region or DEFAULT_REGION).strip() or DEFAULT_REGION
         target_route = str(route or self.active_route or DEFAULT_ROUTE).strip() or DEFAULT_ROUTE
@@ -4003,9 +5579,10 @@ class RouteManager:
         try:
             frame = direct_frame if direct_frame is not None else self._grab_frame_from_vision(vision_engine)
 
-            # Eğer use_minimap_for_f8=False ise ve tam harita açık değilse M tuşu ile açmayı dene
+            # Eğer use_minimap_for_f8=False ise ve tam harita açık değilse M tuşu ile açmayı dene.
+            # Bilinmiyor (None) = açık say: M basmak açık haritayı kapatır.
             if not use_minimap_for_f8 and input_ctrl is not None:
-                if frame is None or not self._verify_map_open(vision_engine, frame):
+                if frame is None or self._verify_map_open(vision_engine, frame) is False:
                     if self._send_map_key(input_ctrl):
                         map_opened_by_us = True
                         time.sleep(0.25)
@@ -4013,14 +5590,26 @@ class RouteManager:
                         if new_frame is not None and new_frame.size > 0:
                             frame = new_frame
 
-            # Ekran görüntüsü hala None ise sentetik güvenli kare oluştur (asla None dönme)
+            # Ekran görüntüsü alınamadıysa uydurma kare/düğüm üretilmez.
             if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
-                vw = getattr(self, "viewport_width", 1920) or 1920
-                vh = getattr(self, "viewport_height", 1080) or 1080
-                frame = np.zeros((vh, vw, 3), dtype=np.uint8)
+                logger.error("[F8] Ekran görüntüsü alınamadı; düğüm kaydedilmedi.")
+                if map_opened_by_us and input_ctrl is not None:
+                    self._send_map_key(input_ctrl)
+                return None
+            if direct_frame is None and not np.any(frame):
+                # Yakalama yolu (vision/ScreenCapture) tamamen sıfır, sinyalsiz
+                # kare döndürdü: gerçek oyun karesi değildir, düğüm üretilmez.
+                # (Çağıranın açıkça verdiği kare bu kontrolden muaftır.)
+                logger.error("[F8] Yakalama sinyalsiz (tamamen siyah) kare döndürdü; düğüm kaydedilmedi.")
+                if map_opened_by_us and input_ctrl is not None:
+                    self._send_map_key(input_ctrl)
+                return None
 
             h, w = frame.shape[:2]
             self.update_viewport(w, h)
+            # Üç durumlu: yalnızca KESİN açık (True) merkez kırpımı alır;
+            # bilinmiyor (None) minimap yoluna düşer — oyun karesinin
+            # merkezini tam harita sanıp düğüm yazmak daha kötüdür.
             is_full_map = self._verify_map_open(vision_engine, frame)
 
             # Özel test/vision_engine find_player_on_map sağlıyorsa öncelik ver
@@ -4038,12 +5627,12 @@ class RouteManager:
                 map_x, map_y = custom_player_pos
                 norm_x = round(float(map_x) / float(max(1, w)), 4)
                 norm_y = round(float(map_y) / float(max(1, h)), 4)
-            elif is_full_map and not use_minimap_for_f8:
+            elif is_full_map is True and not use_minimap_for_f8:
                 crop_x, crop_y = w // 2, h // 2
                 map_x, map_y = crop_x, crop_y
                 norm_x = round(float(map_x) / float(max(1, w)), 4)
                 norm_y = round(float(map_y) / float(max(1, h)), 4)
-            elif is_full_map and vision_engine is not None and hasattr(vision_engine, "is_map_open"):
+            elif is_full_map is True and vision_engine is not None and hasattr(vision_engine, "is_map_open"):
                 # Tam ekran harita gerçekten açıksa merkezden kırp
                 crop_x, crop_y = w // 2, h // 2
                 map_x, map_y = crop_x, crop_y
@@ -4209,18 +5798,22 @@ class RouteManager:
             allow_dup = bool(kwargs.get("allow_duplicate", False))
             if effective_min_dist > 0.0 and not allow_dup:
                 existing_for_dup = self.get_route_nodes(region_name=target_region, route_name=target_route)
-                if existing_for_dup:
-                    last_n = existing_for_dup[-1]
-                    d_dup = math.hypot(map_x - last_n.map_x, map_y - last_n.map_y)
-                    if d_dup < effective_min_dist:
-                        logger.info(
-                            "[F8] Düğüm #%d ile çok yakın mesafe (%.1fpx < %.1fpx), mükerrer F8 kaydı atlandı.",
-                            last_n.id,
-                            d_dup,
-                            effective_min_dist,
-                        )
-                        _play_beep(900, 100)
-                        return last_n
+                nearest_dup: Optional[NodeData] = None
+                nearest_dist = float("inf")
+                for cand in existing_for_dup:
+                    d_cand = math.hypot(map_x - cand.map_x, map_y - cand.map_y)
+                    if d_cand < nearest_dist:
+                        nearest_dist = d_cand
+                        nearest_dup = cand
+                if nearest_dup is not None and nearest_dist < effective_min_dist:
+                    logger.info(
+                        "[F8] Düğüm #%d ile çok yakın mesafe (%.1fpx < %.1fpx), mükerrer F8 kaydı atlandı.",
+                        nearest_dup.id,
+                        nearest_dist,
+                        effective_min_dist,
+                    )
+                    _play_beep(900, 100)
+                    return nearest_dup
 
             node = self.add_node(
                 region=target_region,
@@ -4258,33 +5851,11 @@ class RouteManager:
             return node
 
         except Exception as exc:
-            logger.warning("F8 Düğüm kaydı yedek mod ile tamamlanıyor: %s", exc)
+            # Beklenmeyen hata: merkez koordinatlı uydurma düğüm kaydedilmez.
+            logger.error("F8 Düğüm kaydı başarısız, düğüm kaydedilmedi: %s", exc)
             if map_opened_by_us and input_ctrl is not None:
                 self._send_map_key(input_ctrl)
-            vw = getattr(self, "viewport_width", 1920) or 1920
-            vh = getattr(self, "viewport_height", 1080) or 1080
-            fallback_node = self.add_node(
-                region=target_region,
-                route=target_route,
-                patch_img=None,
-                in_air=bool(in_air),
-                map_x=vw // 2,
-                map_y=vh // 2,
-                norm_x=0.5,
-                norm_y=0.5,
-                resource_type=resource_type,
-                max_harvests=max(1, int(max_harvests or DEFAULT_MAX_HARVESTS)),
-                current_harvests=0,
-                source_type=str(source_type or DEFAULT_SOURCE_TYPE),
-                viewport_width=vw,
-                viewport_height=vh,
-            )
-            logger.info(
-                "[F8] Konum başarıyla kaydedildi (Node #%d, %dx Toplama)",
-                fallback_node.id,
-                fallback_node.max_harvests,
-            )
-            return fallback_node
+            return None
 
     # ------------------------------------------------------------------
     # Açık Haritada Düğüm Bulma (Template Matching + Fallback)
@@ -4367,8 +5938,8 @@ class RouteManager:
             open_map_frame = self._grab_frame_from_vision(vision_engine)
 
         if open_map_frame is None or not isinstance(open_map_frame, np.ndarray) or open_map_frame.size == 0:
-            vw = getattr(self, "viewport_width", 1920) or 1920
-            vh = getattr(self, "viewport_height", 1080) or 1080
+            # P1-7 (K-20): yedek koordinat harita kanvası uzayındadır.
+            vw, vh = self._map_canvas_size()
             fallback_x = int(resolved_node.map_x if resolved_node.map_x > 0 else round(resolved_node.norm_x * vw))
             fallback_y = int(resolved_node.map_y if resolved_node.map_y > 0 else round(resolved_node.norm_y * vh))
             under_ov = self._is_point_in_overlay(fallback_x, fallback_y, overlay_rect)
@@ -4377,8 +5948,8 @@ class RouteManager:
             return NodeLocationResult(
                 coords=(fallback_x, fallback_y),
                 confidence=0.0,
-                distance_str="0 m",
-                distance_m=0.0,
+                distance_str="unknown",
+                distance_m=float("inf"),
                 under_overlay=under_ov,
                 used_fallback=True,
             )
@@ -4392,7 +5963,7 @@ class RouteManager:
             map_gray = open_map_frame
 
         map_h, map_w = map_gray.shape[:2]
-        self.update_viewport(map_w, map_h)
+        self.update_viewport(map_w, map_h, space="map")
         target_x: int = 0
         target_y: int = 0
         confidence: float = 0.0
@@ -4430,7 +6001,16 @@ class RouteManager:
                         try:
                             template_bgr = patch_color if patch_color is not None else cv2.cvtColor(patch_gray, cv2.COLOR_GRAY2BGR)
                             if self.orientation_guard is not None:
-                                template_bgr = self.orientation_guard.normalize_patch_to_north(template_bgr)
+                                # F-1772: acik harita (M) sabit-kuzey (north-up)
+                                # duzlemdedir; karede minimap oyuncu oku yoktur,
+                                # bu yuzden yaw kareden olculemez. with_frame
+                                # denemesi neredeyse her zaman ValueError verip
+                                # asagidaki yaw=0.0 yoluna dusuyordu; uretim
+                                # yolu dogrudan odur: yaw acikca 0.0 verilir,
+                                # sessiz varsayilan + istisna yoluna birakilmaz.
+                                template_bgr = self.orientation_guard.normalize_patch_to_north(
+                                    template_bgr, camera_yaw_deg=0.0
+                                )
 
                             sc_score, (sc_cx, sc_cy) = self.patch_normalizer.match_normalized_patch(
                                 search_roi_bgr=open_map_frame,
@@ -4440,7 +6020,15 @@ class RouteManager:
                                 confidence = float(max(0.0, min(1.0, sc_score)))
                                 target_x = int(sc_cx)
                                 target_y = int(sc_cy)
-                                if confidence >= float(match_threshold) or sc_score > 0.55:
+                                # P1-12 / v18: Sobel+CLAHE kabul eşiği ana eşikle
+                                # aynıdır (match_threshold, varsayılan 0.65).
+                                # Eski kod `sc_score > 0.55` ile 0.55-0.65 arası
+                                # ikincil skoru da kabul edip yedeği baypas
+                                # ediyordu — ana eşik 0.65 iken ikincil yolun
+                                # 0.55 ile kabul vermesi tutarsızdı. confidence
+                                # burada zaten max(raw, sc) olduğundan tek
+                                # karşılaştırma yeterlidir.
+                                if confidence >= float(match_threshold):
                                     used_fallback = False
                                     logger.info(
                                         "Düğüm #%d için Sobel+CLAHE normalizasyon skoru ile iyileştirildi: score=%.2f at (%d, %d)",
@@ -4487,7 +6075,14 @@ class RouteManager:
             except Exception as exc:
                 logger.debug("Mesafe hesabı için oyuncu konumu varsayılan merkeze düştü: %s", exc)
 
-        scale = float(getattr(vision_engine, "meters_per_pixel", self.meters_per_pixel))
+        # P1-7 (K-20): dünya-harita mesafesi TEK kaynaktan —
+        # core/corridor_navigator.py WORLD_MAP_METERS_PER_PX (0.28).
+        # vision.py'deki eski 0.25 değeri de aynı sabite bağlandı; iki
+        # modül artık aynı uzay için iki farklı ölçek vermiyor. Hangisinin
+        # doğru olduğu canlı ölçümle kalibre EDİLMEDİ (açık soru) — 0.28,
+        # route_manager / economy_broker / cartography_radar üçlüsünde
+        # zaten kullanılan değer olduğu için seçildi, ölçülmüş değil.
+        scale = float(self.meters_per_pixel)
         pixel_dist = math.hypot(float(target_x - player_x), float(target_y - player_y))
         distance_m = round(pixel_dist * scale, 1)
         distance_int = int(round(distance_m))
@@ -4523,10 +6118,9 @@ class RouteManager:
         Seçili bölge ve rotayı `region_data.json` ve ilgili tüm `patches/node_*.png`
         dosyalarıyla birlikte `.zip` arşivine dışa aktarır.
         """
-        # Eğer 2 argümanla `export_route_zip(region, zip_path)` çağrıldıysa:
-        if zip_path is None and route is not None and (
-            str(route).lower().endswith(".zip") or os.sep in str(route) or "/" in str(route)
-        ):
+        # Eğer 2 argümanla `export_route_zip(region, zip_path)` çağrıldıysa
+        # (zip yolu .zip ile biter; "/" içeren rota adı yol sayılmaz):
+        if zip_path is None and route is not None and str(route).lower().endswith(".zip"):
             zip_path = str(route)
             route = DEFAULT_ROUTE
 
@@ -4537,8 +6131,10 @@ class RouteManager:
             raise ValueError(f"Dışa aktarılacak bölge bulunamadı: {target_region}")
 
         if not zip_path:
-            safe_route = target_route.replace(" ", "_")
-            zip_path = os.path.join(self.base_dir, f"{target_region}_{safe_route}.zip")
+            # Dosya adında geçersiz tüm karakterler temizlenir (sadece boşluk değil).
+            safe_route = re.sub(r"[^A-Za-z0-9._-]+", "_", target_route).strip("._") or "route"
+            safe_region = re.sub(r"[^A-Za-z0-9._-]+", "_", target_region).strip("._") or "region"
+            zip_path = os.path.join(self.base_dir, f"{safe_region}_{safe_route}.zip")
 
         reg_info = self._regions[target_region]
         all_nodes: List[NodeData] = reg_info.get("nodes", [])
@@ -4571,10 +6167,11 @@ class RouteManager:
                     if os.path.isfile(disk_patch):
                         zf.write(disk_patch, arcname=arc_patch_name)
                     else:
-                        # Eksik yama varsa 80x80 boş gri PNG oluşturup arşive ekle
-                        ok, buf = cv2.imencode(".png", self._prepare_patch_image(None))
-                        if ok:
-                            zf.writestr(arc_patch_name, buf.tobytes())
+                        # Eksik yama arşive sahte siyah kesit olarak eklenmez.
+                        logger.warning(
+                            "ZIP dışa aktarma: düğüm #%d yaması eksik, arşive eklenmedi.",
+                            node.id,
+                        )
 
             logger.info(
                 "Rota ZIP dışa aktarıldı: Bölge=%s, Rota=%s, Düğüm=%d -> %s",
@@ -4596,10 +6193,20 @@ class RouteManager:
         """
         `.zip` arşivinden `region_data.json` ve `patches/node_*.png` dosyalarını
         içe aktarır ve içe aktarılan bölge adını döndürür.
+
+        - Aynı ID'li düğüm sessizce ezilmez: yeni benzersiz ID atanır.
+        - Kısmi içe aktarma geri alınır: hata olursa bellek durumu ve
+          üzerine yazılan yama dosyaları eski haline döndürülür.
         """
         if not zip_path or not os.path.isfile(zip_path):
             raise FileNotFoundError(f"İçe aktarılacak ZIP dosyası bulunamadı: {zip_path}")
 
+        region_name: Optional[str] = None
+        region_existed = False
+        nodes_snapshot: List[NodeData] = []
+        routes_snapshot: List[str] = []
+        prev_active_region = self.active_region
+        patch_backups: Dict[str, Optional[bytes]] = {}
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
                 namelist = zf.namelist()
@@ -4612,7 +6219,30 @@ class RouteManager:
                 if json_entry is None:
                     raise ValueError(f"ZIP arşivinde 'region_data.json' bulunamadı: {zip_path}")
 
-                raw_json = json.loads(zf.read(json_entry).decode("utf-8"))
+                # v19: kontrolsüz okuma kapalı — şişirme (zip bomb) ve yol
+                # geçişi (zip-slip) reddedilir; bozuk JSON açıklayıcı
+                # hatayla reddedilir, sessiz geçme / çökme yok.
+                if not _is_safe_zip_entry_name(json_entry):
+                    raise ValueError(
+                        f"ZIP içe aktarma reddedildi: güvensiz arşiv girdisi (yol geçişi): {json_entry!r}"
+                    )
+                json_info = zf.getinfo(json_entry)
+                if json_info.is_dir() or json_info.file_size > ZIP_IMPORT_MAX_JSON_BYTES:
+                    raise ValueError(
+                        f"ZIP içe aktarma reddedildi: 'region_data.json' boyutu sınırı aşıyor "
+                        f"({json_info.file_size} bayt > {ZIP_IMPORT_MAX_JSON_BYTES} bayt): {zip_path}"
+                    )
+                try:
+                    raw_json = json.loads(zf.read(json_entry).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"ZIP içe aktarma reddedildi: 'region_data.json' geçerli JSON değil ({zip_path}): {exc}"
+                    ) from exc
+                if not isinstance(raw_json, dict):
+                    raise ValueError(
+                        f"ZIP içe aktarma reddedildi: 'region_data.json' JSON nesnesi olmalı, "
+                        f"{type(raw_json).__name__} geldi: {zip_path}"
+                    )
                 region_name = str(
                     target_region
                     or raw_json.get("region")
@@ -4620,59 +6250,139 @@ class RouteManager:
                 ).strip()
                 if not region_name:
                     region_name = DEFAULT_REGION
+                region_name = _validate_region_name(region_name)
 
-                if region_name not in self._regions:
-                    self.create_region(region_name)
+                region_existed = region_name in self._regions
+                if not region_existed:
+                    # v19: create_region dönüşü denetlenmiyordu — False
+                    # dönerse (kayıt başarısız) bölge _regions'ta olmaz ve
+                    # aşağıdaki satır anlamsız KeyError ile çöküyordu.
+                    if not self.create_region(region_name):
+                        raise OSError(
+                            f"ZIP içe aktarma reddedildi: bölge oluşturulamadı (kayıt başarısız): {region_name!r}"
+                        )
 
                 reg_info = self._regions[region_name]
+                nodes_snapshot = list(reg_info["nodes"])
+                routes_snapshot = list(reg_info["routes"])
                 existing_routes: List[str] = reg_info["routes"]
-                for r_name in raw_json.get("routes", []):
-                    if r_name and str(r_name) not in existing_routes:
-                        existing_routes.append(str(r_name))
+                raw_routes = raw_json.get("routes", [])
+                if not isinstance(raw_routes, list):
+                    raise ValueError(
+                        f"ZIP içe aktarma reddedildi: 'routes' liste olmalı, "
+                        f"{type(raw_routes).__name__} geldi: {zip_path}"
+                    )
+                for r_name in raw_routes:
+                    if not isinstance(r_name, str) or not r_name.strip():
+                        raise ValueError(
+                            f"ZIP içe aktarma reddedildi: 'routes' yalnızca boş olmayan metin içermeli: {zip_path}"
+                        )
+                    if r_name not in existing_routes:
+                        existing_routes.append(r_name)
+                raw_nodes = raw_json.get("nodes", [])
+                if not isinstance(raw_nodes, list):
+                    raise ValueError(
+                        f"ZIP içe aktarma reddedildi: 'nodes' liste olmalı, "
+                        f"{type(raw_nodes).__name__} geldi: {zip_path}"
+                    )
 
                 patches_dir = self._get_region_patches_dir(region_name)
                 os.makedirs(patches_dir, exist_ok=True)
 
-                # Arşivdeki patch dosyalarını indeksle
+                # Arşivdeki patch dosyalarını indeksle (sınır + yol kontrolü).
                 patch_entries: Dict[str, str] = {}
                 for item_name in namelist:
                     base = os.path.basename(item_name)
                     if base.startswith("node_") and base.lower().endswith(".png"):
+                        if not _is_safe_zip_entry_name(item_name):
+                            raise ValueError(
+                                f"ZIP içe aktarma reddedildi: güvensiz yama girdisi (yol geçişi): {item_name!r}"
+                            )
+                        patch_info = zf.getinfo(item_name)
+                        if patch_info.file_size > ZIP_IMPORT_MAX_PATCH_BYTES:
+                            raise ValueError(
+                                f"ZIP içe aktarma reddedildi: yama dosyası boyutu sınırı aşıyor "
+                                f"({patch_info.file_size} bayt > {ZIP_IMPORT_MAX_PATCH_BYTES} bayt, girdi: {item_name!r})"
+                            )
+                        if base in patch_entries:
+                            logger.warning(
+                                "ZIP içe aktarma: yinelenen yama adı %r (önceki %r korunuyor, %r yoksayıldı).",
+                                base,
+                                patch_entries[base],
+                                item_name,
+                            )
+                            continue
                         patch_entries[base] = item_name
+                total_patch_bytes = 0
 
                 existing_by_id: Dict[int, NodeData] = {
                     n.id: n for n in reg_info["nodes"]
                 }
 
-                for raw_node in raw_json.get("nodes", []):
+                for raw_node in raw_nodes:
                     if not isinstance(raw_node, dict):
                         continue
+                    raw_node = dict(raw_node)
                     raw_node["region"] = region_name
                     imported_node = NodeData.from_dict(raw_node)
                     imported_node.region = region_name
+
+                    if imported_node.id in existing_by_id:
+                        # Sessizce ezme: çakışan ID'ye yeni benzersiz ID ata.
+                        old_id = imported_node.id
+                        imported_node.id = self._next_node_id(region_name)
+                        logger.info(
+                            "ZIP içe aktarma: #%d ID çakışması, yeni ID #%d atandı.",
+                            old_id,
+                            imported_node.id,
+                        )
                     imported_node.patch_path = self._get_patch_rel_path(region_name, imported_node.id)
 
                     patch_filename = f"node_{imported_node.id}.png"
                     dest_patch_path = os.path.join(patches_dir, patch_filename)
+                    if dest_patch_path not in patch_backups:
+                        patch_backups[dest_patch_path] = (
+                            open(dest_patch_path, "rb").read()
+                            if os.path.isfile(dest_patch_path)
+                            else None
+                        )
                     if patch_filename in patch_entries:
-                        with zf.open(patch_entries[patch_filename]) as src_f, open(dest_patch_path, "wb") as dst_f:
-                            shutil.copyfileobj(src_f, dst_f)
-                    elif not os.path.isfile(dest_patch_path):
-                        _safe_imwrite(dest_patch_path, self._prepare_patch_image(None))
+                        # v19: hedef yol kurulan yoldur (patches_dir +
+                        # node_<id>.png) — arşiv girdisindeki yol bileşeni
+                        # hedefe taşınmaz (zip-slip kapalı); yine de açıkça
+                        # doğrula ve kopyayı bayt sınırıyla yap.
+                        if os.path.commonpath(
+                            [os.path.abspath(patches_dir), os.path.abspath(dest_patch_path)]
+                        ) != os.path.abspath(patches_dir):
+                            raise ValueError(
+                                f"ZIP içe aktarma reddedildi: yama hedef yolu bölge dışına çıkıyor: {dest_patch_path!r}"
+                            )
+                        remaining_total = ZIP_IMPORT_MAX_TOTAL_PATCH_BYTES - total_patch_bytes
+                        if remaining_total <= 0:
+                            raise ValueError(
+                                f"ZIP içe aktarma reddedildi: toplam yama boyutu sınırı aşıldı "
+                                f"({ZIP_IMPORT_MAX_TOTAL_PATCH_BYTES} bayt): {zip_path}"
+                            )
+                        with open(dest_patch_path, "wb") as dst_f:
+                            total_patch_bytes += _bounded_zip_copy(
+                                zf,
+                                patch_entries[patch_filename],
+                                dst_f,
+                                min(ZIP_IMPORT_MAX_PATCH_BYTES, remaining_total),
+                                f"yama dosyası {patch_filename!r}",
+                            )
+                    # Arşivde yama yoksa sahte siyah kesit yazılmaz.
 
                     for r_name in imported_node.routes:
                         if r_name and r_name not in existing_routes:
                             existing_routes.append(r_name)
 
-                    if imported_node.id in existing_by_id:
-                        idx = reg_info["nodes"].index(existing_by_id[imported_node.id])
-                        reg_info["nodes"][idx] = imported_node
-                    else:
-                        reg_info["nodes"].append(imported_node)
+                    reg_info["nodes"].append(imported_node)
                     existing_by_id[imported_node.id] = imported_node
 
                 self.active_region = region_name
-                self.save_region(region_name)
+                if not self.save_region(region_name):
+                    raise OSError("İçe aktarma kaydı başarısız (save_region False)")
                 logger.info(
                     "Rota ZIP içe aktarıldı: Bölge=%s, Toplam Düğüm=%d <- %s",
                     region_name,
@@ -4681,26 +6391,87 @@ class RouteManager:
                 )
                 return region_name
         except Exception as exc:
+            # Geri alma: bellek durumu + yama dosyaları.
+            if region_name is not None:
+                try:
+                    if region_name in self._regions:
+                        if region_existed:
+                            self._regions[region_name]["nodes"] = nodes_snapshot
+                            self._regions[region_name]["routes"] = routes_snapshot
+                            self._sync_legacy_data()
+                        else:
+                            self._regions.pop(region_name, None)
+                            self._sync_legacy_data()
+                    for dest_path, old_bytes in patch_backups.items():
+                        try:
+                            if old_bytes is None:
+                                if os.path.isfile(dest_path):
+                                    os.remove(dest_path)
+                            else:
+                                with open(dest_path, "wb") as f:
+                                    f.write(old_bytes)
+                        except OSError:
+                            pass
+                    self.active_region = prev_active_region
+                except Exception as rb_exc:
+                    logger.error("ZIP içe aktarma geri alma hatası: %s", rb_exc)
             logger.error("ZIP içe aktarma hatası (%s): %s", zip_path, exc)
             raise
 
+    def _real_readiness(self) -> dict:
+        """Gerçek hazırlık durumu: base_dir var mı, kaç bölge/düğüm yüklü."""
+        base_ok = os.path.isdir(self.base_dir)
+        node_count = sum(len(r.get("nodes", [])) for r in self._regions.values())
+        return {
+            "base_dir": self.base_dir,
+            "base_dir_exists": base_ok,
+            "regions_loaded": len(self._regions),
+            "nodes_loaded": node_count,
+            "ready": bool(base_ok),
+        }
+
     def get_route_manager_ready_flag(self) -> dict:
-        return {"module": "route_manager", "ready": True}
+        info = self._real_readiness()
+        return {"module": "route_manager", **info}
 
     def get_route_manager_health_summary(self) -> dict:
-        try:
-            return {"route_manager_ready": True}
-        except Exception:
-            return {"route_manager_ready": True}
+        info = self._real_readiness()
+        return {"route_manager_ready": info["ready"], **info}
 
     def get_route_manager_version_info(self) -> dict:
-        return {"module": "route_manager", "version": "2.0.0", "ready": True}
+        info = self._real_readiness()
+        return {"module": "route_manager", "version": __version__, **info}
 
     def get_route_manager_diagnostic_snapshot(self) -> dict:
-        return {"module": "route_manager", "status": "ok", "ready": True}
+        info = self._real_readiness()
+        return {
+            "module": "route_manager",
+            "status": "ok" if info["ready"] else "degraded",
+            **info,
+        }
 
 
-from core.navigation_intel import PartialNodeDetector, handle_extraction_failure  # noqa: E402,F401
+def __getattr__(name: str) -> Any:
+    """Geriye dönük uyumluluk için tembel re-export.
+
+    ``PartialNodeDetector`` / ``handle_extraction_failure`` eskiden dosya
+    sonundaki import ile re-export ediliyordu; bu, navigation_intel ile
+    döngüsel importu yalnızca import sırasına bağlı kılıyordu. Artık
+    modül yüklenirken navigation_intel çekilmez; bu adlar ilk erişimde
+    tembel yüklenir (PEP 562).
+    """
+    if name in ("PartialNodeDetector", "handle_extraction_failure"):
+        from core.navigation_intel import (
+            PartialNodeDetector as _PartialNodeDetector,
+            handle_extraction_failure as _handle_extraction_failure,
+        )
+
+        return (
+            _PartialNodeDetector
+            if name == "PartialNodeDetector"
+            else _handle_extraction_failure
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def get_route_manager_capabilities() -> list:
@@ -4717,8 +6488,22 @@ def get_route_manager_capabilities() -> list:
     ]
 
 
+def _probe_route_manager_contract() -> bool:
+    """Module-level probe (Karar 3 / D94 deseni): sabit True yerine gercek
+    hazirlik olculur. Varsayilan RouteManager kurulabilmeli ve onun
+    ``_real_readiness()`` hazir oldugunu soylemeli (``base_dir`` diskte var)
+    ve capability listesi bos olmamali. Disk yazma yok; herhangi bir
+    hatada False doner, sabit True'ya dusulmez."""
+    try:
+        if not get_route_manager_capabilities():
+            return False
+        return bool(RouteManager()._real_readiness().get("ready"))
+    except Exception:
+        return False
+
+
 def validate_route_manager_contract() -> bool:
-    return bool(get_route_manager_capabilities())
+    return _probe_route_manager_contract()
 
 
 def get_route_manager_baseline_metrics() -> dict:

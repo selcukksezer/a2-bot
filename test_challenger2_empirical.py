@@ -19,7 +19,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -27,23 +27,15 @@ import numpy as np
 # Imports under test
 import core.game_gpu_throttle as throttle
 from core.auto_cartographer import AutoCartographer, VisualOdometryTracker
-from core.route_manager import DEFAULT_REGION, DEFAULT_ROUTE, NodeData, RouteManager
+from core.route_manager import NodeData, RouteManager
 from dataset_factory.dataset_validator import (
-    DEFAULT_IOU_OVERLAP_THRESHOLD,
     box_xywh_to_xyxy,
-    box_xyxy_to_xywh,
-    check_out_of_bounds,
-    check_zero_area,
-    compute_box_iou,
     count_pending_review_items,
-    detect_overlapping_boxes,
     fix_out_of_bounds,
     is_dataset_ready_for_training,
     is_model_stale,
     mark_model_stale,
     sanitize_boxes,
-    validate_dataset,
-    validate_yolo_file,
 )
 
 
@@ -67,15 +59,23 @@ class TestChallenger2Empirical(unittest.TestCase):
 
     def test_01_arbitrary_id_cycling_no_trapping(self):
         """Stress-test arbitrary ID ordering [245, 40, 84, 12, 999] across 5 full cycles."""
-        rm = RouteManager()
+        rm = RouteManager(base_dir=os.path.join(self.temp_dir, "routes_t01"))
         reg = "ArbitraryReg"
         rm.create_region(reg)
 
         arbitrary_ids = [245, 40, 84, 12, 999]
-        rm._regions[reg]["nodes"] = [
-            NodeData(id=nid, region=reg, seq_index=idx + 1)
-            for idx, nid in enumerate(arbitrary_ids)
-        ]
+        # Build the route through the production add path (F-1402): writing
+        # directly to rm._regions[reg]["nodes"] bypassed add_node() and its
+        # seq_index / patch / persistence bookkeeping.
+        for nid in arbitrary_ids:
+            rm.add_node(region=reg, node_id=nid, map_x=100, map_y=100)
+
+        # add_node() must have assigned 1-based seq_index in insertion order.
+        self.assertEqual(
+            [n.seq_index for n in rm.get_route_nodes(reg)],
+            [1, 2, 3, 4, 5],
+            "add_node did not assign 1-based seq_index in insertion order",
+        )
 
         # Call get_next_ready_node across 25 iterations (5 full loops)
         selected_ids = []
@@ -94,16 +94,16 @@ class TestChallenger2Empirical(unittest.TestCase):
 
     def test_02_cycling_with_resting_and_recovery(self):
         """Stress-test route cycling when an arbitrary node enters resting state and then recovers."""
-        rm = RouteManager()
+        rm = RouteManager(base_dir=os.path.join(self.temp_dir, "routes_t02"))
         reg = "RestingTestReg"
         rm.create_region(reg)
 
         arbitrary_ids = [245, 40, 84, 12, 999]
-        nodes = [
-            NodeData(id=nid, region=reg, seq_index=idx + 1)
-            for idx, nid in enumerate(arbitrary_ids)
-        ]
-        rm._regions[reg]["nodes"] = nodes
+        # Production add path (F-1402); the resting/recovery state is then set
+        # on the real stored NodeData objects returned by get_route_nodes().
+        for nid in arbitrary_ids:
+            rm.add_node(region=reg, node_id=nid, map_x=100, map_y=100)
+        nodes = rm.get_route_nodes(reg)
 
         # Advance 2 nodes (245 -> 40)
         n1 = rm.get_next_ready_node(region=reg)
@@ -137,15 +137,13 @@ class TestChallenger2Empirical(unittest.TestCase):
 
     def test_03_partial_harvest_stickiness(self):
         """Stress-test partial harvest (1/3, 2/3): bot must NOT jump to next node until 3/3 complete."""
-        rm = RouteManager()
+        rm = RouteManager(base_dir=os.path.join(self.temp_dir, "routes_t03"))
         reg = "PartialReg"
         rm.create_region(reg)
-        nodes = [
-            NodeData(id=10, region=reg, max_harvests=3, current_harvests=0),
-            NodeData(id=20, region=reg, max_harvests=3, current_harvests=0),
-            NodeData(id=30, region=reg, max_harvests=3, current_harvests=0),
-        ]
-        rm._regions[reg]["nodes"] = nodes
+        # Production add path (F-1402); harvest state is set on the stored nodes.
+        for nid in [10, 20, 30]:
+            rm.add_node(region=reg, node_id=nid, map_x=100, map_y=100, max_harvests=3)
+        nodes = rm.get_route_nodes(reg)
 
         # Pick node 10
         n = rm.get_next_ready_node(region=reg)
@@ -207,6 +205,14 @@ class TestChallenger2Empirical(unittest.TestCase):
         """Verify that record_current_node does NOT produce artificial spirals.
         In the old code, successive calls used angle = count * 0.65, radius = min(...) * (1 + count*0.08)
         which caused coordinates to orbit and spiral away from center artificially.
+
+        Each of the 8 frames is genuinely different (F-1529): the old test fed 8
+        identical black squares, so it could never tell "anchored to vision"
+        apart from "constant fallback". Here the player arrow stays at the same
+        minimap spot while the surrounding terrain changes per frame (fixed
+        texture plus a per-frame brightness offset, so phase correlation still
+        reports zero shift). A count-based spiral would still drift outward
+        regardless of frame content; vision-anchored recording must not.
         """
         routes_base = os.path.join(self.temp_dir, "spiral_test_routes")
         os.makedirs(routes_base, exist_ok=True)
@@ -214,20 +220,61 @@ class TestChallenger2Empirical(unittest.TestCase):
         reg = "SpiralTestReg"
         rm.create_region(reg)
 
-        # Provide a synthetic 1080p frame
-        frame_1080p = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        # Draw simulated minimap background in upper right
-        cv2.rectangle(frame_1080p, (1640, 70), (1900, 275), (100, 100, 100), -1)
+        # Fixed minimap terrain texture (seeded once) + per-frame brightness
+        # offset: patches differ byte-for-byte, but the pattern does not move,
+        # so optical-flow shift stays ~0 and the player stays put.
+        rng = np.random.default_rng(20261108)
+        terrain = rng.integers(60, 140, (1080, 1920), dtype=np.uint8)
+        # Minimap centre on a 1080p frame: (round(1920*0.923), round(1080*0.165)).
+        arrow_cx, arrow_cy = int(round(1920 * 0.923)), int(round(1080 * 0.165))
 
-        # Record 8 nodes sequentially with identical frame (no player movement)
+        frames = []
+        for i in range(8):
+            frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+            # Distinct terrain per frame (brightness offset i*10), plus a
+            # minimap background rect so the frame is not a black square.
+            gray = np.clip(terrain.astype(np.int16) + i * 10, 0, 255).astype(np.uint8)
+            frame[:, :, 0] = gray
+            frame[:, :, 1] = gray
+            frame[:, :, 2] = gray
+            # NOTE: no uniform minimap-background rectangle here — it would
+            # cover the 80x80 patch area around the arrow and make every saved
+            # patch byte-identical again.
+            # Bright white player arrow at the fixed minimap centre.
+            cv2.circle(frame, (arrow_cx, arrow_cy), 5, (255, 255, 255), -1)
+            frames.append(frame)
+
+        # Record 8 nodes sequentially; min_record_distance=0 so the stationary
+        # player yields 8 distinct nodes instead of the duplicate guard
+        # returning the first node 8 times.
         recorded_nodes = []
         for i in range(8):
             node = rm.record_current_node(
-                input_ctrl=frame_1080p,
+                input_ctrl=frames[i],
                 region=reg,
                 use_minimap_for_f8=True,
+                min_record_distance=0,
             )
             recorded_nodes.append(node)
+
+        # 8 distinct nodes must have been created (not 8 references to node #1).
+        self.assertEqual(
+            len({n.id for n in recorded_nodes}),
+            8,
+            f"Expected 8 distinct recorded nodes, got ids {[n.id for n in recorded_nodes]}",
+        )
+        # Each recording must have consumed its own frame: saved patches differ.
+        patch_hashes = []
+        for n in recorded_nodes:
+            patch_path = rm._resolve_patch_disk_path(n)
+            self.assertTrue(os.path.isfile(patch_path), f"Patch file missing: {patch_path}")
+            with open(patch_path, "rb") as fh:
+                patch_hashes.append(hash(fh.read()))
+        self.assertEqual(
+            len(set(patch_hashes)),
+            8,
+            "Saved patches are identical — recordings did not consume distinct frames",
+        )
 
         # Calculate distances from center (960, 540)
         # In the old code, distances grew by 18-20px each step in a trigonometric spiral:
@@ -247,6 +294,14 @@ class TestChallenger2Empirical(unittest.TestCase):
             50.0,
             f"Artificial spiral detected! Consecutive stationary recordings drifted by {max_drift:.1f}px: {distances_from_first}",
         )
+
+        # Stationary player: positions must cluster near the screen centre.
+        for (px, py) in positions:
+            self.assertLess(
+                math.hypot(px - 960, py - 540),
+                50.0,
+                f"Stationary recording wandered from screen centre: ({px}, {py})",
+            )
 
         # Check that norm_x and norm_y are strictly normalized [0.0, 1.0]
         for n in recorded_nodes:
@@ -314,10 +369,52 @@ class TestChallenger2Empirical(unittest.TestCase):
             expected_fallback_y = int(round(node_fallback.norm_y * height))
             self.assertEqual(res.x, expected_fallback_x)
             self.assertEqual(res.y, expected_fallback_y)
+
+            # Template-match path (F-1400): the test previously only exercised
+            # the fallback. Add a node with a real distinctive patch through
+            # the production add path, embed the saved patch in the map frame
+            # at a known spot, and require a real template hit (no fallback).
+            rng = np.random.default_rng(1000 + width)
+            patch = rng.integers(0, 256, (80, 80), dtype=np.uint8)
+            patch[20:40, 20:40] = 255
+            patch[50:62, 50:70] = 0
+            node_match = rm.add_node(
+                region="ViewportReg",
+                node_id=7000 + int(width),
+                map_x=test_x,
+                map_y=test_y,
+                patch_img=patch,
+                viewport_width=width,
+                viewport_height=height,
+            )
+            saved_patch = cv2.imread(rm._resolve_patch_disk_path(node_match), cv2.IMREAD_GRAYSCALE)
+            self.assertIsNotNone(saved_patch, "Saved patch could not be read back")
+            self.assertEqual(saved_patch.shape, (80, 80))
+            map_frame = np.zeros((height, width, 3), dtype=np.uint8)
+            top_left = (300, 200)
+            map_frame[
+                top_left[1]:top_left[1] + 80,
+                top_left[0]:top_left[0] + 80,
+            ] = cv2.cvtColor(saved_patch, cv2.COLOR_GRAY2BGR)
+            res_match = rm.locate_node_on_open_map(
+                node_match, open_map_frame=map_frame, match_threshold=0.8
+            )
+            self.assertFalse(
+                res_match.used_fallback,
+                f"Template match fell back to coordinates on {label} (confidence={res_match.confidence:.3f})",
+            )
+            self.assertGreaterEqual(res_match.confidence, 0.8)
+            self.assertAlmostEqual(res_match.x, top_left[0] + 40, delta=2)
+            self.assertAlmostEqual(res_match.y, top_left[1] + 40, delta=2)
             print(f"  [PASS] 2.2 Viewport {label} ({width}x{height}) scaling verified: norm=({node.norm_x}, {node.norm_y}) -> ({res.x}, {res.y})")
 
     def test_07_visual_odometry_tracker_rescaling(self):
-        """Verify VisualOdometryTracker handles dynamic resolution re-scaling without warping."""
+        """Verify VisualOdometryTracker handles dynamic resolution re-scaling without warping.
+
+        F-0053: harita uzayı kanoniktir — 1440p kare harita uzayını
+        2560x1440'a döndürmez; konum ve norm koordinatlar korunur, yani
+        çözünürlük değişimi haritayı çarpıtmaz (warping yok).
+        """
         tracker = VisualOdometryTracker(initial_map_x=960, initial_map_y=540, map_width=1920, map_height=1080)
         pos = tracker.get_position()
         self.assertEqual(pos, (960.0, 540.0, 0.5, 0.5))
@@ -330,13 +427,17 @@ class TestChallenger2Empirical(unittest.TestCase):
         self.assertAlmostEqual(ny, round(490.0 / 1080.0, 4), places=4)
 
         # Test AutoCartographer resolution adaptation
+        # F-0053: harita uzayı kanoniktir — 1440p kare harita uzayını
+        # 2560x1440'a döndürmez (eski beklenti buydu, 5a70d66 ile değişti);
+        # konum ve norm koordinatlar korunur, harita çarpıtılmaz.
         carto = AutoCartographer(initial_map_x=960, initial_map_y=540, map_width=1920, map_height=1080)
         frame_1440p = np.zeros((1440, 2560, 3), dtype=np.uint8)
         carto.update_player_position(frame_1440p)
-        self.assertEqual(carto.map_width, 2560)
-        self.assertEqual(carto.map_height, 1440)
-        self.assertEqual(carto.odometry_tracker.map_width, 2560)
-        self.assertEqual(carto.odometry_tracker.map_height, 1440)
+        self.assertEqual(carto.map_width, 1920)
+        self.assertEqual(carto.map_height, 1080)
+        self.assertEqual(carto.odometry_tracker.map_width, 1920)
+        self.assertEqual(carto.odometry_tracker.map_height, 1080)
+        self.assertEqual(carto.get_position(), (960.0, 540.0, 0.5, 0.5))
         print("  [PASS] 2.3 VisualOdometryTracker and AutoCartographer dynamic viewport adaptation verified")
 
     # =========================================================================
@@ -475,18 +576,27 @@ class TestChallenger2Empirical(unittest.TestCase):
         self.assertTrue(ready_after, f"Failed to allow training after human approval! Reason: {msg_after}")
         print(f"  [PASS] 4.2 After human approval (pending=0), dataset is ready for training: {msg_after}")
 
+    @unittest.skipIf(
+        not (Path(__file__).resolve().parent / "dataset").is_dir(),
+        "Gerçek veri seti (dataset/) bu makinede yok — canlı denetim atlandı (sessiz geçiş değil)",
+    )
     def test_12_actual_disk_dataset_gate_check(self):
-        """Audit the real disk dataset F:\\a2\\dataset with human gate validator."""
-        real_ds = Path("dataset")
-        if real_ds.is_dir():
-            pending = count_pending_review_items(real_ds)
-            ready, msg = is_dataset_ready_for_training(real_ds)
-            print(f"\n  [AUDIT] Real disk dataset pending count: {pending}")
-            print(f"  [AUDIT] is_dataset_ready_for_training: ready={ready}, msg={msg}")
-            if pending > 0:
-                self.assertFalse(ready, "Real disk dataset has pending reviews but gate returned ready=True!")
-                self.assertIn("İnsan Onay Kapısı", msg)
-            print("  [PASS] 4.3 Real disk dataset correctly enforced human gate")
+        """Audit the real disk dataset with human gate validator (F-1318).
+
+        The old test silently passed when the dataset was absent
+        (``if real_ds.is_dir():`` with no else), so a missing dataset looked
+        like a green gate. Now the test is skipped explicitly when there is no
+        dataset, and the gate is enforced whenever the dataset exists.
+        """
+        real_ds = Path(__file__).resolve().parent / "dataset"
+        pending = count_pending_review_items(real_ds)
+        ready, msg = is_dataset_ready_for_training(real_ds)
+        print(f"\n  [AUDIT] Real disk dataset pending count: {pending}")
+        print(f"  [AUDIT] is_dataset_ready_for_training: ready={ready}, msg={msg}")
+        if pending > 0:
+            self.assertFalse(ready, "Real disk dataset has pending reviews but gate returned ready=True!")
+            self.assertIn("İnsan Onay Kapısı", msg)
+        print("  [PASS] 4.3 Real disk dataset correctly enforced human gate")
 
     def test_13_stale_model_marking(self):
         """Verify mark_model_stale properly records stale manifest and flags."""
@@ -516,25 +626,62 @@ class TestChallenger2Empirical(unittest.TestCase):
     # =========================================================================
 
     def test_14_gpu_throttle_live_game_detection_when_closed(self):
-        """Verify that find_aion_game_processes() and is_game_running() return False/empty
-        on this live workstation when Aion 2 is closed, even with VS Code, Python, and Chrome open.
+        """Verify find_aion_game_processes() / is_game_running() detection logic
+        deterministically (F-1401).
+
+        The old test asserted live machine state ("Aion 2 is closed on this
+        workstation right now"), which is not a property of the code: on a
+        non-Windows host find_aion_game_processes() returns [] unconditionally,
+        and on any host the result depends on whatever happens to be running.
+        Instead, the Windows-only scan path is exercised by faking the OS
+        gate and the two pid sources, and the real filtering logic (own-pid
+        exclusion, exe verification, dedup) is asserted in both directions:
+        - no candidate pids -> [] / not running;
+        - a candidate pid whose exe is Aion2.exe -> [pid] / running;
+        - a candidate pid whose exe is chrome.exe -> filtered out.
         """
-        pids = throttle.find_aion_game_processes()
-        running = throttle.is_game_running()
+        fake_game_pid = 4242
+        fake_browser_pid = 4343
+        own_pid = os.getpid()
 
-        print(f"\n  [LIVE INSPECTION] find_aion_game_processes() -> {pids}")
-        print(f"  [LIVE INSPECTION] is_game_running() -> {running}")
+        def _fake_exe(pid):
+            if pid == fake_game_pid:
+                return r"C:\Program Files\NCSOFT\AION2\Aion2.exe"
+            if pid == fake_browser_pid:
+                return "chrome.exe"
+            return ""
 
-        self.assertEqual(
-            pids,
-            [],
-            f"False positive game detection! Returned PIDs {pids} when game is closed!",
-        )
-        self.assertFalse(
-            running,
-            "is_game_running() returned True when Aion 2 is not running!",
-        )
-        print("  [PASS] 5.1 Live system check: no false positive game detection")
+        with (
+            patch.object(throttle.os, "name", "nt"),
+            patch.object(throttle, "_pids_from_window_titles", return_value=[]),
+            patch.object(throttle, "_pids_from_process_names", return_value=[]),
+            patch.object(throttle, "_get_exe_for_pid", side_effect=_fake_exe),
+        ):
+            # Closed: no candidate pids at all.
+            self.assertEqual(throttle.find_aion_game_processes(), [])
+            self.assertFalse(throttle.is_game_running())
+
+        with (
+            patch.object(throttle.os, "name", "nt"),
+            patch.object(throttle, "_pids_from_window_titles", return_value=[fake_game_pid]),
+            patch.object(throttle, "_pids_from_process_names", return_value=[fake_game_pid]),
+            patch.object(throttle, "_get_exe_for_pid", side_effect=_fake_exe),
+        ):
+            # Running: the same pid from both sources is deduped to one entry.
+            self.assertEqual(throttle.find_aion_game_processes(), [fake_game_pid])
+            self.assertTrue(throttle.is_game_running())
+
+        with (
+            patch.object(throttle.os, "name", "nt"),
+            patch.object(throttle, "_pids_from_window_titles", return_value=[fake_browser_pid, own_pid]),
+            patch.object(throttle, "_pids_from_process_names", return_value=[]),
+            patch.object(throttle, "_get_exe_for_pid", side_effect=_fake_exe),
+        ):
+            # Browser exe and the bot's own pid must never count as the game.
+            self.assertEqual(throttle.find_aion_game_processes(), [])
+            self.assertFalse(throttle.is_game_running())
+
+        print("  [PASS] 5.1 Game detection filtering verified (closed / running / false-positive)")
 
     def test_15_gpu_throttle_executable_and_title_hardening(self):
         """Stress-test process and window title filters against hostile edge cases."""
@@ -592,9 +739,10 @@ class TestChallenger2Empirical(unittest.TestCase):
 
     def test_16_single_and_empty_route_cycling(self):
         """Stress-test 1-node route, empty route, and all-resting route."""
-        rm = RouteManager()
+        rm = RouteManager(base_dir=os.path.join(self.temp_dir, "routes_t16"))
         rm.create_region("SingleNodeReg")
-        rm._regions["SingleNodeReg"]["nodes"] = [NodeData(id=42, region="SingleNodeReg")]
+        # Production add path (F-1402).
+        rm.add_node(region="SingleNodeReg", node_id=42, map_x=100, map_y=100)
 
         # Single node should repeat without getting trapped or throwing
         picks = [rm.get_next_ready_node("SingleNodeReg").id for _ in range(5)]
@@ -606,10 +754,12 @@ class TestChallenger2Empirical(unittest.TestCase):
 
         # All-resting route returns None without crash
         rm.create_region("AllRestingReg")
-        rm._regions["AllRestingReg"]["nodes"] = [
-            NodeData(id=1, region="AllRestingReg", state="resting", last_visited_timestamp=time.time(), rest_duration_sec=9999),
-            NodeData(id=2, region="AllRestingReg", state="resting", last_visited_timestamp=time.time(), rest_duration_sec=9999),
-        ]
+        for nid in [1, 2]:
+            rm.add_node(region="AllRestingReg", node_id=nid, map_x=100, map_y=100)
+        for n in rm.get_route_nodes("AllRestingReg"):
+            n.state = "resting"
+            n.last_visited_timestamp = time.time()
+            n.rest_duration_sec = 9999
         self.assertIsNone(rm.get_next_ready_node("AllRestingReg"))
         print("  [PASS] 6.1 Single-node, empty, and all-resting route edge cases verified")
 
@@ -629,7 +779,12 @@ class TestChallenger2Empirical(unittest.TestCase):
         print(f"  [PASS] 6.2 1000 identical boxes deduplicated to 1 survivor in {elapsed:.3f}s")
 
     def test_18_corrupt_json_in_review_queue(self):
-        """Verify count_pending_review_items handles malformed JSON without crashing."""
+        """Verify count_pending_review_items handles malformed JSON without crashing.
+
+        S-7401: corrupt/unreadable review JSON counts as pending (fail-closed,
+        F-0801) — approval cannot be proven from a file that cannot be read,
+        so the two broken files below are pending, not ignored.
+        """
         temp_ds = Path(self.temp_dir) / "corrupt_json_dataset"
         rev_dir = temp_ds / "review" / "train"
         rev_dir.mkdir(parents=True, exist_ok=True)
@@ -638,10 +793,11 @@ class TestChallenger2Empirical(unittest.TestCase):
         (rev_dir / "broken2.json").write_text("", encoding="utf-8")
         (rev_dir / "valid_done.json").write_text(json.dumps({"done": True, "trusted": []}), encoding="utf-8")
 
-        # Must not throw, should safely ignore broken files
+        # Must not throw; corrupt files count as pending (fail-closed, F-0801),
+        # the valid done file does not.
         count = count_pending_review_items(temp_ds)
-        self.assertEqual(count, 0)
-        print("  [PASS] 6.3 Corrupted review JSON files handled gracefully without crashing")
+        self.assertEqual(count, 2)
+        print("  [PASS] 6.3 Corrupted review JSON files counted as pending (fail-closed) without crashing")
 
 
 if __name__ == "__main__":

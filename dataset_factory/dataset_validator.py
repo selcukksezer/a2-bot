@@ -16,26 +16,49 @@ import json
 import logging
 import math
 import os
+import re
+import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+try:  # P1-13 (K-33): tek "ayni kutu" tanimi box_match.py'dedir.
+    from dataset_factory.box_match import same_box
+except ImportError:  # standalone calistirma: python dataset_validator.py
+    from box_match import same_box  # type: ignore[no-redef]
+
 logger = logging.getLogger("gatherion.dataset_validator")
 
 # Default thresholds
 DEFAULT_IOU_OVERLAP_THRESHOLD: float = 0.80
-DEFAULT_MIN_BOX_DIM: float = 1e-5
-DEFAULT_MIN_BOX_AREA: float = 1e-6
 
 # L17 Box Size Bounds & Guardrails (Micro noise & massive screen-filling bounds)
 MIN_BOX_DIM_BOUND: float = 0.004   # Micro noise threshold: w < 0.004 or h < 0.004
 MAX_BOX_DIM_BOUND: float = 0.65    # Massive box threshold: w > 0.65 or h > 0.65
 MIN_BOX_AREA_BOUND: float = 1.6e-5 # Minimum area: 0.004 * 0.004
 
+# Zero-area / sub-minimal defaults follow the L17 bounds (F-0939): a box smaller
+# than 0.004 in either dimension (or smaller than 0.004*0.004 in area) is micro
+# noise, so check_zero_area must not pass it on its own. This also keeps
+# fix_out_of_bounds' default min_dim consistent with MIN_BOX_DIM_BOUND (F-1044).
+DEFAULT_MIN_BOX_DIM: float = MIN_BOX_DIM_BOUND
+DEFAULT_MIN_BOX_AREA: float = MIN_BOX_AREA_BOUND
+
+# Canonical YOLO class ids for this pipeline (dataset_factory/class_taxonomy.py:
+# CANONICAL_NAMES covers 0..26). validate_label_box / validate_yolo_file reject
+# ids outside this range (F-0941 / F-0851).
+MAX_CANONICAL_CLASS_ID: int = 26
+
 STALE_MANIFEST_NAME = "stale_manifest.json"
 PIPELINE_STATE_NAME = "pipeline_ui_state.json"
+
+# Yayın/doğrulama kabul eşiği (mAP50) — TEK KAYNAK (v11 tazelik kapısı).
+# Dialog (ui/yolo_factory_dialog.py) ve motor (dataset_factory/
+# rtx_trainer_engine.py) aynı eşiği okur: 0.32'lik yarım eğitimi
+# engeller, ulaşılabilir eğitimi geçirir. Eşik değişikliği Selçuk kararıdır.
+MIN_PUBLISH_MAP50 = 0.50
 
 
 @dataclass
@@ -72,6 +95,15 @@ class ValidationReport:
 
     def add_issue(self, issue: ValidationIssue) -> None:
         self.issues.append(issue)
+        self._tally_issue(issue)
+
+    def _tally_issue(self, issue: ValidationIssue) -> None:
+        """Bump severity/type counters for one issue WITHOUT appending it.
+
+        Shared by add_issue() and by the capped path in validate_dataset(),
+        so the counters can never drift apart again (previously the cap
+        branch duplicated this whole chain by hand).
+        """
         if issue.severity == "error":
             self.error_count += 1
             self.valid = False
@@ -151,7 +183,13 @@ def box_xywh_to_xyxy(cx: float, cy: float, w: float, h: float) -> Tuple[float, f
 
 
 def box_xyxy_to_xywh(x1: float, y1: float, x2: float, y2: float) -> Tuple[float, float, float, float]:
-    """Convert corner format (x1, y1, x2, y2) to YOLO center format (cx, cy, w, h)."""
+    """Convert corner format (x1, y1, x2, y2) to YOLO center format (cx, cy, w, h).
+
+    Reversed corners (x2 < x1 or y2 < y1) raise ValueError instead of being
+    silently clamped to a zero-size box (F-1041).
+    """
+    if float(x2) < float(x1) or float(y2) < float(y1):
+        raise ValueError(f"Reversed box corners: ({x1}, {y1}) -> ({x2}, {y2})")
     w = max(0.0, float(x2) - float(x1))
     h = max(0.0, float(y2) - float(y1))
     cx = float(x1) + w * 0.5
@@ -301,7 +339,36 @@ def check_box_size_bounds(
         return True, f"Mikro gürültü kutusu: w={w:.6f} < {min_dim} veya h={h:.6f} < {min_dim}"
     if w > max_dim or h > max_dim:
         return True, f"Aşırı büyük ekranı kaplayan kutu: w={w:.6f} > {max_dim} veya h={h:.6f} > {max_dim}"
+    if w * h < MIN_BOX_AREA_BOUND:
+        return True, f"Alan asgari sınırın altında (alan={w * h:.8f} < {MIN_BOX_AREA_BOUND})"
     return False, ""
+
+
+def _strict_class_id(raw: Any) -> Optional[int]:
+    """Parse a class id strictly -- never silently truncate (S-6301/S-6302).
+
+    Only accepts genuine integers: int (bool hariç), integral float
+    (1.0 -> 1), or an integer-token string ("1", "+3"). Returns the int,
+    or None when the value is not a valid integer class id.
+
+    The old int(raw) truncated 1.9 -> 1 (wrong class in clean data) and
+    int("1.9") raised ValueError that callers swallowed, so the 0..26
+    range check (F-0941) never ran for those boxes.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        if math.isfinite(raw) and raw.is_integer():
+            return int(raw)
+        return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if re.fullmatch(r"[+-]?\d+", s):
+            return int(s)
+        return None
+    return None
 
 
 def validate_label_box(
@@ -333,6 +400,18 @@ def validate_label_box(
     Returns:
         BoxValidationResult(is_valid: bool, message: str)
     """
+    # S-6301: an explicitly passed class_id must also be a genuine integer;
+    # a float 1.9 passed here used to sail through the range check below
+    # after int() truncation (or skip it entirely when unparseable).
+    if class_id is not None:
+        parsed_param_cid = _strict_class_id(class_id)
+        if parsed_param_cid is None:
+            return BoxValidationResult(
+                False,
+                f"Invalid class_id: {class_id!r} (expected an integer 0..{MAX_CANONICAL_CLASS_ID})",
+            )
+        class_id = parsed_param_cid
+
     if isinstance(box_or_cx, dict):
         raw = box_or_cx
         try:
@@ -343,10 +422,17 @@ def validate_label_box(
             if class_id is None:
                 raw_cid = raw.get("class_id", raw.get("cls"))
                 if raw_cid is not None:
-                    try:
-                        class_id = int(raw_cid)
-                    except (ValueError, TypeError):
-                        pass
+                    # S-6301: strict parse -- int(1.9) truncated to 1 and
+                    # int("1.9") raised ValueError that was swallowed here,
+                    # leaving class_id None so step 7 never ran. A
+                    # non-integer class_id is now rejected outright.
+                    parsed_cid = _strict_class_id(raw_cid)
+                    if parsed_cid is None:
+                        return BoxValidationResult(
+                            False,
+                            f"Invalid class_id: {raw_cid!r} (expected an integer 0..{MAX_CANONICAL_CLASS_ID})",
+                        )
+                    class_id = parsed_cid
         except (ValueError, TypeError) as err:
             return BoxValidationResult(False, f"Invalid box dictionary numeric values: {err}")
     elif isinstance(box_or_cx, (list, tuple)):
@@ -358,17 +444,39 @@ def validate_label_box(
                 return BoxValidationResult(False, f"Invalid sequence numbers: {err}")
         elif len(seq) >= 5:
             if class_id is None:
-                try:
-                    class_id = int(seq[0])
-                    val_cx, val_cy, val_w, val_h = float(seq[1]), float(seq[2]), float(seq[3]), float(seq[4])
-                except (ValueError, TypeError):
+                # S-6301: strict parse -- int(1.9) truncated to 1. If seq[0]
+                # is not a genuine integer class id, fall through to the
+                # coordinate reading below (a 5-tuple of pure coordinates);
+                # a non-integral seq[0] then fails the bounds checks there.
+                parsed_seq_cid = _strict_class_id(seq[0])
+                if parsed_seq_cid is not None:
+                    try:
+                        class_id = parsed_seq_cid
+                        val_cx, val_cy, val_w, val_h = float(seq[1]), float(seq[2]), float(seq[3]), float(seq[4])
+                    except (ValueError, TypeError):
+                        try:
+                            val_cx, val_cy, val_w, val_h = float(seq[0]), float(seq[1]), float(seq[2]), float(seq[3])
+                        except (ValueError, TypeError) as err:
+                            return BoxValidationResult(False, f"Invalid sequence numbers: {err}")
+                else:
                     try:
                         val_cx, val_cy, val_w, val_h = float(seq[0]), float(seq[1]), float(seq[2]), float(seq[3])
                     except (ValueError, TypeError) as err:
                         return BoxValidationResult(False, f"Invalid sequence numbers: {err}")
             else:
+                # Explicit class_id + 5-tuple means (class_id, cx, cy, w, h);
+                # reading seq[0..3] as coordinates would shift everything (F-0940).
+                # S-6301: strict parse -- int(1.9) used to truncate silently.
+                seq_cid = _strict_class_id(seq[0])
+                if seq_cid is None:
+                    return BoxValidationResult(False, f"Invalid class_id in sequence: {seq[0]!r}")
+                if seq_cid != class_id:
+                    return BoxValidationResult(
+                        False,
+                        f"Conflicting class_id: argument={class_id}, sequence[0]={seq_cid}",
+                    )
                 try:
-                    val_cx, val_cy, val_w, val_h = float(seq[0]), float(seq[1]), float(seq[2]), float(seq[3])
+                    val_cx, val_cy, val_w, val_h = float(seq[1]), float(seq[2]), float(seq[3]), float(seq[4])
                 except (ValueError, TypeError) as err:
                     return BoxValidationResult(False, f"Invalid sequence numbers: {err}")
         else:
@@ -388,11 +496,10 @@ def validate_label_box(
     if not (math.isfinite(val_cx) and math.isfinite(val_cy) and math.isfinite(val_w) and math.isfinite(val_h)):
         return BoxValidationResult(False, f"Non-finite coordinates: cx={val_cx}, cy={val_cy}, w={val_w}, h={val_h}")
 
-    # 2. Zero-area / negative dimension check
+    # 2. Zero-area / negative dimension check (w <= 0 or h <= 0 already implies
+    # area <= 0, so no separate area branch is reachable here -- F-1043).
     if val_w <= 0.0 or val_h <= 0.0:
         return BoxValidationResult(False, f"Zero or negative dimension: w={val_w:.6f}, h={val_h:.6f}")
-    if (val_w * val_h) <= 0.0:
-        return BoxValidationResult(False, f"Zero box area: area={(val_w * val_h):.8f}")
 
     # 3. Micro noise check (w < min_dim or h < min_dim, default 0.004)
     if val_w < min_dim or val_h < min_dim:
@@ -423,9 +530,12 @@ def validate_label_box(
                 f"Box boundaries extend out of [0.0, 1.0]: x1={x1:.6f}, y1={y1:.6f}, x2={x2:.6f}, y2={y2:.6f}"
             )
 
-    # 7. Optional class_id check
-    if class_id is not None and class_id < 0:
-        return BoxValidationResult(False, f"Invalid negative class_id: {class_id}")
+    # 7. Optional class_id check (canonical taxonomy is 0..26, F-0941)
+    if class_id is not None and (class_id < 0 or class_id > MAX_CANONICAL_CLASS_ID):
+        return BoxValidationResult(
+            False,
+            f"Invalid class_id: {class_id} (expected 0..{MAX_CANONICAL_CLASS_ID})",
+        )
 
     return BoxValidationResult(True, "")
 
@@ -449,12 +559,20 @@ def fix_out_of_bounds(
     if not (math.isfinite(cx) and math.isfinite(cy) and math.isfinite(w) and math.isfinite(h)):
         return None
 
-    # Handle unnormalized pixel coordinates if image dimensions provided
-    if image_width and image_height and (cx > 1.0 or cy > 1.0 or w > 1.0 or h > 1.0):
-        if image_width > 0 and image_height > 0:
+    # P1-7 (K-20): karisik birimli kutu — her koordinat kendi birimine
+    # gore normalize edilir. Eski toplu kural (herhangi biri >1.0 ise
+    # HEPSINI bol) norm bir koordinati da bolup kutuyu kokeneye
+    # cokeriyordu (orn. {"cx": 0.5, "w": 100} -> cx ~= 0.00026).
+    # Piksel oldugu kendi degerinden belli olan (>1.0) koordinat yalnizca
+    # kendi ekseninin goruntu boyutuna bolunur; norm koordinata dokunulmaz.
+    if image_width and image_height and image_width > 0 and image_height > 0:
+        if cx > 1.0:
             cx = cx / float(image_width)
+        if cy > 1.0:
             cy = cy / float(image_height)
+        if w > 1.0:
             w = w / float(image_width)
+        if h > 1.0:
             h = h / float(image_height)
 
     x1, y1, x2, y2 = box_xywh_to_xyxy(cx, cy, w, h)
@@ -479,45 +597,126 @@ def fix_out_of_bounds(
     return round(new_cx, 6), round(new_cy, 6), round(new_w, 6), round(new_h, 6)
 
 
+def _parse_box_for_overlap(box: Any) -> Optional[Tuple[int, Tuple[float, float, float, float]]]:
+    """Parse one box for overlap detection; None if malformed (F-0849)."""
+    if not isinstance(box, dict):
+        return None
+    # S-6302: strict class_id parse -- int(1.9) truncated to 1, so boxes of
+    # different classes looked like the same class in overlap detection.
+    # A non-integer class_id makes the box malformed: skip it (None).
+    cid = _strict_class_id(box.get("class_id", -1))
+    if cid is None:
+        return None
+    try:
+        coords = (
+            float(box.get("cx", 0.0)),
+            float(box.get("cy", 0.0)),
+            float(box.get("w", 0.0)),
+            float(box.get("h", 0.0)),
+        )
+    except (ValueError, TypeError):
+        return None
+    if not all(math.isfinite(v) for v in coords):
+        return None
+    return cid, coords
+
+
 def detect_overlapping_boxes(
     boxes: Sequence[Dict[str, Any]],
     iou_threshold: float = DEFAULT_IOU_OVERLAP_THRESHOLD,
     same_class_only: bool = True,
 ) -> List[Tuple[int, int, float, str]]:
     """Detect pairs of overlapping boxes with IoU > iou_threshold.
-    
+
+    Malformed boxes (non-numeric class_id / coordinates, NaN/Inf) are skipped
+    instead of crashing the whole check (F-0849).
+
+    Fast path, bit-identical results to the old O(n^2) all-pairs scan (same
+    pairs, same (i, j) order, same IoU values, same descriptions):
+    1. Boxes are grouped by class first (same_class_only, the default):
+       different-class pairs can never be a hit, so they are never even
+       visited -- the old scan visited every pair to check the class.
+    2. Within a group a sweep in x1 order stops the inner scan as soon as
+       the next box starts at or after the current box's x2, and a y-interval
+       check skips the IoU entirely. Two boxes whose x- or y-intervals do
+       not intersect have IoU 0, so no hit can be missed.
+    3. Corners are precomputed once per box and the IoU is evaluated inline
+       from them, instead of re-converting xywh -> xyxy on every pair
+       (compute_box_iou does that conversion per call).
+
     Returns list of tuples: (index_i, index_j, iou_score, details_str).
     """
     overlaps: List[Tuple[int, int, float, str]] = []
-    n = len(boxes)
-    for i in range(n):
-        box_i = boxes[i]
-        cid_i = int(box_i.get("class_id", -1))
-        coords_i = (
-            float(box_i.get("cx", 0.0)),
-            float(box_i.get("cy", 0.0)),
-            float(box_i.get("w", 0.0)),
-            float(box_i.get("h", 0.0)),
-        )
-        for j in range(i + 1, n):
-            box_j = boxes[j]
-            cid_j = int(box_j.get("class_id", -1))
-            if same_class_only and cid_i != cid_j:
-                continue
+    parsed: List[Tuple[int, int, Tuple[float, float, float, float]]] = []
+    for idx, box in enumerate(boxes):
+        entry = _parse_box_for_overlap(box)
+        if entry is not None:
+            parsed.append((idx, entry[0], entry[1]))
+    if not parsed:
+        return overlaps
 
-            coords_j = (
-                float(box_j.get("cx", 0.0)),
-                float(box_j.get("cy", 0.0)),
-                float(box_j.get("w", 0.0)),
-                float(box_j.get("h", 0.0)),
+    # Group by class (single group when same_class_only is False).
+    groups: Dict[int, List[Tuple[int, int, Tuple[float, float, float, float]]]] = {}
+    for idx, cid, coords in parsed:
+        groups.setdefault(cid if same_class_only else 0, []).append((idx, cid, coords))
+
+    hits: List[Tuple[int, int, int, float]] = []  # (lo, hi, lo_class, iou)
+    for group in groups.values():
+        # (x1, y1, x2, y2, area, orig_idx, class_id), sorted by x1.
+        sweep = sorted(
+            (
+                coords[0] - coords[2] * 0.5,
+                coords[1] - coords[3] * 0.5,
+                coords[0] + coords[2] * 0.5,
+                coords[1] + coords[3] * 0.5,
+                max(0.0, coords[2]) * max(0.0, coords[3]),
+                idx,
+                cid,
             )
-            iou = compute_box_iou(coords_i, coords_j, is_xywh=True)
-            if iou > iou_threshold:
-                desc = (
-                    f"Kutu #{i} ve #{j} aynı sınıfta ({cid_i}) yüksek örtüşme "
-                    f"(IoU={iou:.3f} > {iou_threshold})"
-                )
-                overlaps.append((i, j, iou, desc))
+            for idx, cid, coords in group
+        )
+        for a in range(len(sweep)):
+            x1_a, y1_a, x2_a, y2_a, area_a, i, cid_i = sweep[a]
+            for b in range(a + 1, len(sweep)):
+                x1_b, y1_b, x2_b, y2_b, area_b, j, cid_j = sweep[b]
+                if x1_b >= x2_a:
+                    # Sorted by x1: every later box starts even further
+                    # right, so none of them can overlap box i in x.
+                    break
+                if y1_b >= y2_a or y2_b <= y1_a:
+                    continue
+                # Inline IoU from precomputed corners (same arithmetic as
+                # compute_box_iou on xyxy input, so values match exactly).
+                iw = (x2_a if x2_a < x2_b else x2_b) - (x1_a if x1_a > x1_b else x1_b)
+                ih = (y2_a if y2_a < y2_b else y2_b) - (y1_a if y1_a > y1_b else y1_b)
+                # compute_box_iou clamps iw/ih to >= 0: a box with negative
+                # w AND h passes the interval guards with iw < 0 and ih < 0,
+                # so an unclamped iw*ih is positive and can false-hit.
+                if iw <= 0.0 or ih <= 0.0:
+                    continue
+                inter = iw * ih
+                if inter <= 1e-12:
+                    continue
+                union = area_a + area_b - inter
+                if union <= 1e-12:
+                    continue
+                iou = inter / union
+                if iou > iou_threshold:
+                    # Description names the class of the lower input index,
+                    # exactly like the old scan did.
+                    lo, hi, lo_cid = (i, j, cid_i) if i < j else (j, i, cid_j)
+                    hits.append((lo, hi, lo_cid, iou))
+    # Restore the original all-pairs (i, j) order: callers (validate_yolo_file)
+    # append these as issues in list order.
+    hits.sort(key=lambda hit: (hit[0], hit[1]))
+    for lo, hi, lo_cid, iou in hits:
+        overlaps.append((
+            lo,
+            hi,
+            iou,
+            f"Kutu #{lo} ve #{hi} aynı sınıfta ({lo_cid}) yüksek örtüşme "
+            f"(IoU={iou:.3f} > {iou_threshold})",
+        ))
     return overlaps
 
 
@@ -560,8 +759,28 @@ def sanitize_boxes(
             )
             continue
 
+        # S-6302: strict class_id parse -- int(1.9) truncated to 1, so a
+        # box with class_id 1.9 entered clean data mislabelled as class 1
+        # (and, via verify_and_sync_review_txt_pair, into training TXT).
+        # A non-integer class_id is a syntax error: the box is dropped.
+        cid = _strict_class_id(raw.get("class_id", raw.get("cls", -1)))
+        if cid is None:
+            issues.append(
+                ValidationIssue(
+                    issue_type="syntax_error",
+                    severity="error",
+                    message=(
+                        f"Kutu #{idx} geçersiz class_id: "
+                        f"{raw.get('class_id', raw.get('cls', -1))!r} "
+                        "(tam sayı bekleniyordu), reddedildi"
+                    ),
+                    file_path=file_path,
+                    box_index=idx,
+                    box=raw,
+                )
+            )
+            continue
         try:
-            cid = int(raw.get("class_id", raw.get("cls", -1)))
             cx = float(raw.get("cx", raw.get("x_center", 0.0)))
             cy = float(raw.get("cy", raw.get("y_center", 0.0)))
             w = float(raw.get("w", raw.get("width", 0.0)))
@@ -579,12 +798,18 @@ def sanitize_boxes(
             )
             continue
 
-        # 1. Zero-area check
+        # 1. Zero-area / micro-noise check. With the L17 defaults, check_zero_area
+        # also catches sub-minimal (micro noise) boxes. Those are reported as
+        # micro_noise (not zero_area) so size-bounds counters stay accurate, and
+        # a zero-area box is ALWAYS dropped: drop_zero_area=False must not let
+        # an invalid box into the cleaned output (F-0942). The flag is kept for
+        # API compatibility but no longer keeps invalid boxes.
         is_zero, zero_msg = check_zero_area(w, h)
         if is_zero:
+            itype_zero = "zero_area" if (w <= 0.0 or h <= 0.0 or not (math.isfinite(w) and math.isfinite(h))) else "micro_noise"
             issues.append(
                 ValidationIssue(
-                    issue_type="zero_area",
+                    issue_type=itype_zero,
                     severity="error",
                     message=f"Kutu #{idx} reddedildi: {zero_msg}",
                     file_path=file_path,
@@ -593,12 +818,11 @@ def sanitize_boxes(
                     details={"w": w, "h": h},
                 )
             )
-            if drop_zero_area:
-                continue
+            continue
 
         # 2. L17 Box size bounds check (micro noise & massive screen-filling box)
         is_bad_size, size_msg = check_box_size_bounds(w, h, min_dim=min_dim, max_dim=max_dim)
-        if is_bad_size and not is_zero:
+        if is_bad_size:
             itype = "micro_noise" if (w < min_dim or h < min_dim) else "massive_box"
             issues.append(
                 ValidationIssue(
@@ -611,8 +835,13 @@ def sanitize_boxes(
                     details={"w": w, "h": h, "min_dim": min_dim, "max_dim": max_dim},
                 )
             )
-            if drop_invalid_size:
-                continue
+            # NOTE (A23): an error-severity size violation must never survive
+            # into the cleaned output. drop_invalid_size=False used to keep
+            # massive boxes (w/h > max_dim) despite the error issue -- the
+            # same self-contradiction F-0942 fixed for drop_zero_area. The
+            # flag is kept for API compatibility but no longer keeps
+            # invalid boxes (no production caller passes False).
+            continue
 
         # 3. Out-of-bounds check
         is_oob, oob_msgs = check_out_of_bounds(cx, cy, w, h)
@@ -671,20 +900,10 @@ def sanitize_boxes(
                 )
                 continue
 
-        # 4. Out-of-bounds center coordinate hard check
-        if cx < 0.0 or cx > 1.0 or cy < 0.0 or cy > 1.0:
-            issues.append(
-                ValidationIssue(
-                    issue_type="out_of_bounds",
-                    severity="error",
-                    message=f"Kutu #{idx} merkez koordinatı sınır dışı: cx={cx:.6f}, cy={cy:.6f}",
-                    file_path=file_path,
-                    box_index=idx,
-                    box=raw,
-                )
-            )
-            continue
-
+        # NOTE (F-1045): the old step-4 centre hard check was unreachable -- step 3
+        # above already rejects unfixable OOB centres and clips fixable ones into
+        # [0, 1], so any box reaching here has its centre in bounds (up to the
+        # 1e-4 tolerance check_out_of_bounds applies).
         clean_box = dict(raw)
         clean_box.update({
             "class_id": cid,
@@ -701,14 +920,30 @@ def sanitize_boxes(
     for b in valid_candidates:
         by_class.setdefault(int(b["class_id"]), []).append(b)
 
+    # Original input order, restored at the end so dedup output does not get
+    # regrouped by class (F-1046).
+    _input_order = {id(b): pos for pos, b in enumerate(valid_candidates)}
+
     deduped_boxes: List[Dict[str, Any]] = []
     for cid, cand_list in by_class.items():
-        # Sort so trusted / hand_label comes first, then confidence, then area
+        # Sort so trusted / hand_label comes first, then confidence, then area.
+        # Confidence may be non-numeric (e.g. a string) -- never crash the
+        # sort, fall back to 0.0 (F-0850).
         def _sort_key(item: Dict[str, Any]) -> Tuple[int, float, float]:
             is_hand = 1 if (item.get("hand_label") is True or item.get("human_approved") is True) else 0
             is_trust = 1 if item.get("trusted") is True else 0
-            conf = float(item.get("confidence", item.get("conf", 0.0)))
-            area = float(item.get("w", 0.0)) * float(item.get("h", 0.0))
+            try:
+                conf = float(item.get("confidence", item.get("conf", 0.0)))
+            except (ValueError, TypeError):
+                conf = 0.0
+            if not math.isfinite(conf):
+                conf = 0.0
+            try:
+                area = float(item.get("w", 0.0)) * float(item.get("h", 0.0))
+            except (ValueError, TypeError):
+                area = 0.0
+            if not math.isfinite(area):
+                area = 0.0
             return (is_hand * 2 + is_trust, conf, area)
 
         sorted_cands = sorted(cand_list, key=_sort_key, reverse=True)
@@ -716,9 +951,26 @@ def sanitize_boxes(
 
         for cand in sorted_cands:
             cand_coords = (cand["cx"], cand["cy"], cand["w"], cand["h"])
+            cand_x1 = cand_coords[0] - cand_coords[2] * 0.5
+            cand_x2 = cand_coords[0] + cand_coords[2] * 0.5
+            cand_y1 = cand_coords[1] - cand_coords[3] * 0.5
+            cand_y2 = cand_coords[1] + cand_coords[3] * 0.5
             is_duplicate = False
             for kept in kept_class_boxes:
                 kept_coords = (kept["cx"], kept["cy"], kept["w"], kept["h"])
+                # Interval prune (kept order is preserved, so the first
+                # duplicate found is still the same one): boxes whose
+                # x- or y-intervals do not intersect have IoU 0 and can
+                # never be a duplicate -- skip the IoU computation.
+                # (A23: same disjoint-interval pre-check; measured ~3x
+                # faster at n=500, see ai-results/A23.json.)
+                if (
+                    kept_coords[0] + kept_coords[2] * 0.5 <= cand_x1
+                    or kept_coords[0] - kept_coords[2] * 0.5 >= cand_x2
+                    or kept_coords[1] + kept_coords[3] * 0.5 <= cand_y1
+                    or kept_coords[1] - kept_coords[3] * 0.5 >= cand_y2
+                ):
+                    continue
                 iou = compute_box_iou(cand_coords, kept_coords, is_xywh=True)
                 if iou > iou_threshold:
                     is_duplicate = True
@@ -742,6 +994,7 @@ def sanitize_boxes(
 
         deduped_boxes.extend(kept_class_boxes)
 
+    deduped_boxes.sort(key=lambda b: _input_order.get(id(b), 0))
     return deduped_boxes, issues
 
 
@@ -827,7 +1080,10 @@ def validate_yolo_file(
         if not line:
             continue
         parts = line.split()
-        if len(parts) < 5:
+        # S-6303: exactly 5 tokens -- the old `< 5` check silently accepted
+        # 6+ token lines ("0 0.5 0.5 0.1 0.1 garbage") and swallowed the
+        # extras, although the error message says "5 eleman bekleniyordu".
+        if len(parts) != 5:
             issues.append(
                 ValidationIssue(
                     issue_type="syntax_error",
@@ -839,8 +1095,31 @@ def validate_yolo_file(
             )
             continue
 
+        # A23: extra tokens past the 5 YOLO columns used to be silently
+        # ignored (e.g. a trailing confidence or garbage column passed QA
+        # with no issue at all). Warn -- the box is still read from the
+        # first 5 columns, so this never flips a file to invalid.
+        if len(parts) > 5:
+            issues.append(
+                ValidationIssue(
+                    issue_type="extra_tokens",
+                    severity="warning",
+                    message=(
+                        f"Satır {line_no}: 5 eleman bekleniyordu, {len(parts)} "
+                        f"bulundu; fazladan tokenlar yok sayıldı ({' '.join(parts[5:])})"
+                    ),
+                    file_path=str(path),
+                    line_number=line_no,
+                )
+            )
+
+        # Class id must be a plain integer token in the canonical range -- the
+        # old int(float(...)) silently truncated "1.9" to class 1 and no class
+        # was ever validated (F-0851).
         try:
-            cid = int(float(parts[0]))
+            if not re.fullmatch(r"[+-]?\d+", parts[0].strip()):
+                raise ValueError(f"class id is not an integer token: {parts[0]!r}")
+            cid = int(parts[0])
             cx = float(parts[1])
             cy = float(parts[2])
             w = float(parts[3])
@@ -857,12 +1136,31 @@ def validate_yolo_file(
             )
             continue
 
-        # Zero-area check
-        is_zero, zero_msg = check_zero_area(w, h)
-        if is_zero:
+        if cid < 0 or cid > MAX_CANONICAL_CLASS_ID:
             issues.append(
                 ValidationIssue(
-                    issue_type="zero_area",
+                    issue_type="syntax_error",
+                    severity="error",
+                    message=f"Satır {line_no}: Geçersiz sınıf kimliği {cid} (beklenen 0..{MAX_CANONICAL_CLASS_ID})",
+                    file_path=str(path),
+                    line_number=line_no,
+                    details={"class_id": cid},
+                )
+            )
+            continue
+
+        # A line that fails any error-severity check is NOT added to the
+        # returned boxes (F-0852); previously it was appended unconditionally.
+        line_has_error = False
+
+        # Zero-area / micro-noise check (sub-minimal sizes surface here as
+        # micro_noise so size_bounds counters stay accurate -- see F-0939).
+        is_zero, zero_msg = check_zero_area(w, h)
+        if is_zero:
+            itype_zero = "zero_area" if (w <= 0.0 or h <= 0.0 or not (math.isfinite(w) and math.isfinite(h))) else "micro_noise"
+            issues.append(
+                ValidationIssue(
+                    issue_type=itype_zero,
                     severity="error",
                     message=f"Satır {line_no}: {zero_msg}",
                     file_path=str(path),
@@ -870,6 +1168,7 @@ def validate_yolo_file(
                     details={"class_id": cid, "w": w, "h": h},
                 )
             )
+            line_has_error = True
 
         # L17 Box size bounds check (micro noise or massive box)
         is_bad_size, size_msg = check_box_size_bounds(w, h, min_dim=min_dim, max_dim=max_dim)
@@ -885,20 +1184,27 @@ def validate_yolo_file(
                     details={"class_id": cid, "w": w, "h": h, "min_dim": min_dim, "max_dim": max_dim},
                 )
             )
+            line_has_error = True
 
         # Out-of-bounds check
         is_oob, oob_msgs = check_out_of_bounds(cx, cy, w, h)
         if is_oob:
+            oob_severity = "error" if strict_bounds else "warning"
             issues.append(
                 ValidationIssue(
                     issue_type="out_of_bounds",
-                    severity="error" if strict_bounds else "warning",
+                    severity=oob_severity,
                     message=f"Satır {line_no}: " + "; ".join(oob_msgs),
                     file_path=str(path),
                     line_number=line_no,
                     details={"class_id": cid, "cx": cx, "cy": cy, "w": w, "h": h},
                 )
             )
+            if oob_severity == "error":
+                line_has_error = True
+
+        if line_has_error:
+            continue
 
         boxes.append({
             "class_id": cid,
@@ -927,11 +1233,22 @@ def validate_yolo_file(
 
 def count_pending_review_items(dataset_dir: Union[str, Path]) -> int:
     """Count how many review items in dataset/review/ are currently pending.
-    
+
     A review JSON is pending if:
-    - It has weak boxes and is not explicitly marked done ("ok" / "no" / human_approved)
+    - It has weak boxes and is not explicitly decided
     - Or payload has `done: None` with weak boxes
-    - Or payload has `requeued: True` and trusted is empty.
+    - Or payload has `requeued: True` and trusted is empty
+    - Or it carries trusted boxes but was never human-approved (done is None
+      and no human_approved flag) -- e.g. a JSON reconstructed from an orphan
+      TXT (F-0800): it must not sail through the gate as "approved"
+    - Or it is corrupt / unreadable / not a JSON object: fail closed, the
+      gate must not open on a file whose decision cannot be proven (F-0801)
+
+    Decided (not pending): done in ("ok", "no", "rejected", True, False).
+    done=False / "rejected" is a decision, exactly as the sync code treats
+    it -- the gate must not count a rejected item as pending (F-0853).
+    A human_approved=True item with no weak boxes is approved even when
+    done is None.
     """
     root = Path(dataset_dir)
     review_dir = root / "review"
@@ -953,11 +1270,14 @@ def count_pending_review_items(dataset_dir: Union[str, Path]) -> int:
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
             except Exception:
+                # Corrupt / unreadable review JSON: cannot prove approval.
+                pending_count += 1
                 continue
             if not isinstance(data, dict):
+                pending_count += 1
                 continue
             done_val = data.get("done")
-            if done_val in ("ok", "no", True):
+            if done_val in ("ok", "no", "rejected", True, False):
                 continue
             weak = data.get("weak") or []
             trusted = data.get("trusted") or []
@@ -965,6 +1285,8 @@ def count_pending_review_items(dataset_dir: Union[str, Path]) -> int:
             if weak:
                 pending_count += 1
             elif requeued and not trusted:
+                pending_count += 1
+            elif trusted and data.get("human_approved") is not True:
                 pending_count += 1
 
     return pending_count
@@ -1005,12 +1327,30 @@ def validate_dataset(
                 )
             )
 
-    splits_to_check = [split] if split in ("train", "val") else ["train", "val"]
+    # "test" is a real split -- scanning train+val for it silently was wrong
+    # (F-1039). An unknown split name fails loudly instead of silently
+    # falling back to train+val.
+    if split is None:
+        splits_to_check = ["train", "val"]
+    elif split in ("train", "val", "test"):
+        splits_to_check = [split]
+    else:
+        raise ValueError(f"Bilinmeyen split: {split!r} (beklenen: 'train', 'val', 'test' veya None)")
     labels_root = root / "labels"
 
     for s in splits_to_check:
         split_dir = labels_root / s
         if not split_dir.is_dir():
+            # A missing split is an error, not a silent skip: otherwise an
+            # empty dataset reports as "valid" (F-0798).
+            report.add_issue(
+                ValidationIssue(
+                    issue_type="missing_split",
+                    severity="error",
+                    message=f"Split dizini bulunamadı: {split_dir}",
+                    file_path=str(split_dir),
+                )
+            )
             continue
         try:
             files = sorted(split_dir.glob("*.txt"))
@@ -1026,19 +1366,11 @@ def validate_dataset(
                 if len(report.issues) < max_issues_to_record:
                     report.add_issue(issue)
                 else:
-                    # Still bump counts
-                    if issue.severity == "error":
-                        report.error_count += 1
-                        report.valid = False
-                    elif issue.severity == "warning":
-                        report.warning_count += 1
-
-                    if issue.issue_type == "duplicate_overlap":
-                        report.duplicate_overlap_count += 1
-                    elif issue.issue_type == "zero_area":
-                        report.zero_area_count += 1
-                    elif issue.issue_type == "out_of_bounds":
-                        report.out_of_bounds_count += 1
+                    # Still bump counts via the same tally add_issue() uses,
+                    # so the capped path can never drift from the uncapped one
+                    # (the old code duplicated the whole counter chain here
+                    # by hand -- see F-0935 for the size_bounds miss it had).
+                    report._tally_issue(issue)
 
     report.finalize()
     return report
@@ -1076,10 +1408,31 @@ def is_dataset_ready_for_training(dataset_dir: Union[str, Path]) -> Tuple[bool, 
     if non_empty == 0:
         return False, "Eğitim engellendi: Eğitim etiketlerinin tümü boş. Onaylı etiket bulunmuyor."
 
-    # 3. QA Validation
+    # 3. QA Validation -- train AND val (when a val split exists). The old code
+    # only checked train and never checked the val split or JSON<->TXT sync
+    # (F-0936).
     report = validate_dataset(root, split="train", check_pending=False)
     if not report.valid:
         return False, f"Eğitim engellendi: QA doğrulaması başarısız ({report.summary})."
+
+    val_labels = root / "labels" / "val"
+    if val_labels.is_dir():
+        val_report = validate_dataset(root, split="val", check_pending=False)
+        if not val_report.valid:
+            return False, f"Eğitim engellendi: val split QA doğrulaması başarısız ({val_report.summary})."
+
+    # JSON<->TXT sync is checked only when a review queue exists at all:
+    # a dataset with labels but no review/ directory at all is outside the
+    # review workflow (its pending gate is already 0) and must not be
+    # blocked for lacking review JSONs for every label.
+    if (root / "review").is_dir():
+        sync_stats = sync_all_review_txt_pairs(root, auto_repair=False)
+        if sync_stats.get("failed", 0) > 0:
+            return (
+                False,
+                f"Eğitim engellendi: {sync_stats['failed']} review JSON/TXT çifti senkron değil. "
+                "Senkronizasyon tamamlanmadan eğitim başlatılamaz.",
+            )
 
     return True, f"Veri seti eğitime hazır ({non_empty} onaylı örnek, QA kontrolleri başarılı)."
 
@@ -1100,6 +1453,7 @@ def mark_model_stale(
     """
     now_str = datetime.now().isoformat()
     clean_reason = str(reason or "Labels updated/approved").strip()
+    wrote_anything = False
 
     # 1. Update pipeline_ui_state.json if dataset_dir exists
     ds_root = Path(dataset_dir) if dataset_dir else Path("dataset")
@@ -1114,6 +1468,7 @@ def mark_model_stale(
             state["validated"] = False
             state["published"] = False
             state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            wrote_anything = True
         except Exception as exc:
             logger.warning("Failed to update pipeline_ui_state: %s", exc)
 
@@ -1128,10 +1483,19 @@ def mark_model_stale(
                 "marked_at": now_str,
             }
             stale_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            wrote_anything = True
         except Exception as exc:
             logger.warning("Failed to write stale manifest: %s", exc)
 
-    logger.info("Model marked stale: %s", clean_reason)
+    # Only claim success when something was actually written (F-0847):
+    # with no state file and no models dir the old code still logged
+    # "Model marked stale" although nothing was marked.
+    if wrote_anything:
+        logger.info("Model marked stale: %s", clean_reason)
+    else:
+        logger.warning(
+            "Model stale işaretlenemedi (hiçbir hedef yazılamadı): %s", clean_reason
+        )
 
 
 def is_model_stale(
@@ -1147,20 +1511,28 @@ def is_model_stale(
     if stale_file.is_file():
         try:
             data = json.loads(stale_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("stale manifest is not a JSON object")
             if data.get("model_stale") is True:
                 return True, str(data.get("reason", "Model işaretlendi: stale"))
-        except Exception:
-            pass
+        except Exception as exc:
+            # A corrupt stale manifest must NOT read as "model güncel" --
+            # fail closed: treat it as stale (F-0848).
+            logger.warning("Bozuk stale manifest (%s): %s", stale_file, exc)
+            return True, f"Stale manifest bozuk, model stale sayılıyor: {stale_file}"
 
     ds_root = Path(dataset_dir) if dataset_dir else Path("dataset")
     state_file = ds_root / PIPELINE_STATE_NAME
     if state_file.is_file():
         try:
             state = json.loads(state_file.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                raise ValueError("pipeline state is not a JSON object")
             if state.get("model_stale") is True:
                 return True, str(state.get("stale_reason", "Labels modified"))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Bozuk pipeline state (%s): %s", state_file, exc)
+            return True, f"Pipeline state bozuk, model stale sayılıyor: {state_file}"
 
     return False, "Model güncel"
 
@@ -1201,8 +1573,21 @@ def atomic_write_text(path: Union[str, Path], content: str, encoding: str = "utf
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target.with_name(f".{target.name}.tmp_{os.getpid()}_{uuid.uuid4().hex[:8]}")
     try:
-        tmp_path.write_text(content, encoding=encoding)
+        # fsync the temp file before replace, and the directory after it, so
+        # a crash/power loss cannot leave a torn or vanished file (F-1040).
+        with open(tmp_path, "w", encoding=encoding) as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp_path, target)
+        try:
+            dir_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     except Exception:
         if tmp_path.exists():
             try:
@@ -1218,12 +1603,207 @@ def atomic_write_json(path: Union[str, Path], data: Any, indent: int = 2) -> Non
     atomic_write_text(path, content, encoding="utf-8")
 
 
+def _backup_before_repair(path: Union[str, Path]) -> Optional[Path]:
+    """Write a single-generation ``.bak`` copy before a repair overwrite.
+
+    P0-1 (K-10): auto-repair writes are destructive by design (a TXT can
+    be emptied, a JSON rebuilt), so the pre-repair file is kept as
+    ``foo.txt`` -> ``foo.txt.bak`` — same convention as
+    ``dataset_factory.label_trust.write_backup`` (P0-2). Best-effort:
+    if the backup cannot be written, a warning is logged and the repair
+    still proceeds (the write itself stays atomic via tmp+rename).
+    Returns the backup path, or None when there was nothing to back up
+    (file missing) or the copy failed.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return None
+    bak = p.with_name(p.name + ".bak")
+    try:
+        bak.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(str(p), str(bak))
+    except OSError as exc:
+        logger.warning("Yedek yazılamadı (%s -> %s): %s", p, bak, exc)
+        return None
+    return bak
+
+
+def _extract_json_array_at(text: str, bracket_idx: int) -> Optional[str]:
+    """Return the balanced ``[...]`` substring starting at ``bracket_idx``.
+
+    String/escape aware, so brackets inside quoted strings do not end
+    the scan. Returns None when the array never closes (truncated text).
+    """
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(bracket_idx, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return text[bracket_idx:i + 1]
+    return None
+
+
+def _salvage_corrupt_review_json(raw_text: str) -> Dict[str, Any]:
+    """Best-effort salvage of a corrupt review JSON's weak list + meta.
+
+    P0-1 (K-10): a corrupt JSON used to be rebuilt from its TXT with
+    ``weak=[]`` and ``done=None`` — the approval flags and the whole
+    weak list were silently deleted. This recovers what the raw text
+    still carries, without ever inventing data:
+
+    - ``"weak"`` array: balanced-bracket scan + ``json.loads``; only
+      dict entries survive (sanitization happens at the call site).
+    - ``"human_approved"`` / ``"approved"`` / ``"done"`` flags: last
+      occurrence wins (same rule as
+      ``atomic_review_sync.extract_salvaged_flags``).
+    - Other top-level scalar fields (e.g. ``source``, ``notes``):
+      depth-1 scan of the outermost object; nested objects/arrays
+      (``trusted``/``boxes``/...) are NOT recovered here — ``trusted``
+      comes from the valid TXT in Case B.
+
+    Returns a dict with only the keys actually found (empty when the
+    text carries nothing salvageable).
+    """
+    salvaged: Dict[str, Any] = {}
+    if not raw_text:
+        return salvaged
+
+    # --- Flags (last occurrence wins) ---
+    for key in ("human_approved", "approved"):
+        matches = list(
+            re.finditer(
+                r'"' + key + r'"\s*:\s*(true|false)',
+                raw_text,
+                flags=re.IGNORECASE,
+            )
+        )
+        if matches:
+            salvaged[key] = matches[-1].group(1).lower() == "true"
+    done_matches = list(
+        re.finditer(
+            r'"done"\s*:\s*("(?:[^"\\]|\\.)*"|true|false|null)',
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if done_matches:
+        try:
+            salvaged["done"] = json.loads(done_matches[-1].group(1))
+        except (ValueError, TypeError):
+            pass
+
+    # --- "weak" array (balanced-bracket scan, then json.loads) ---
+    weak_match = re.search(r'"weak"\s*:', raw_text)
+    if weak_match:
+        bracket_idx = raw_text.find("[", weak_match.end())
+        if bracket_idx != -1:
+            raw_array = _extract_json_array_at(raw_text, bracket_idx)
+            if raw_array is not None:
+                try:
+                    parsed = json.loads(raw_array)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, list):
+                    salvaged["weak"] = parsed
+
+    # --- Other top-level scalar meta (depth-1 scan of the outermost
+    # object). Nested keys (e.g. "class_id" inside a trusted box) are
+    # never lifted to the top level: the walk tracks brace/bracket
+    # depth and only reads "key": value pairs at depth 1; nested
+    # objects/arrays are skipped via their parsed extent. ---
+    _handled = {
+        "stem", "split", "trusted", "weak", "boxes", "annotations",
+        "done", "human_approved", "approved", "auto_repaired",
+    }
+    decoder = json.JSONDecoder()
+    first_brace = raw_text.find("{")
+    if first_brace != -1:
+        depth = 0
+        i = first_brace
+        n = len(raw_text)
+        in_str = False
+        escaped = False
+        while i < n:
+            ch = raw_text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                i += 1
+                continue
+            if ch == '"':
+                if depth == 1:
+                    # Top-level "key": parse the key, then the value.
+                    try:
+                        key, key_end = decoder.raw_decode(raw_text[i:])
+                    except (ValueError, TypeError):
+                        break
+                    j = i + key_end
+                    while j < n and raw_text[j] in " \t\r\n":
+                        j += 1
+                    if j >= n or raw_text[j] != ":":
+                        i = j if j < n else n
+                        continue
+                    j += 1
+                    while j < n and raw_text[j] in " \t\r\n":
+                        j += 1
+                    try:
+                        value, val_end = decoder.raw_decode(raw_text[j:])
+                    except (ValueError, TypeError):
+                        break
+                    if (
+                        isinstance(key, str)
+                        and key not in _handled
+                        and not isinstance(value, (dict, list))
+                    ):
+                        salvaged.setdefault(key, value)
+                    i = j + val_end
+                    continue
+                in_str = True
+                i += 1
+                continue
+            if ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+                if depth <= 0:
+                    break
+            i += 1
+    return salvaged
+
+
 def verify_and_sync_review_txt_pair(
     json_path: Union[str, Path],
     txt_path: Union[str, Path],
-    auto_repair: bool = True,
+    auto_repair: bool = False,
 ) -> bool:
     """Verify consistency between review JSON and labels TXT pair and optionally auto-repair.
+
+    P0-1 (K-10): ``auto_repair`` defaults to False — a silent repair
+    could empty the TXT of a still-pending frame (its JSON holds no
+    trusted boxes yet) or rebuild a corrupt JSON from the TXT while
+    deleting its approval flags and weak list. Callers that really
+    want a repair must opt in explicitly; every repair write is then
+    backed up (``.bak`` before overwrite) on top of the atomic
+    tmp+rename write.
     
     L16 Guardrail:
     - Checks box count and class consistency between review/{split}/{stem}.json and labels/{split}/{stem}.txt.
@@ -1266,7 +1846,10 @@ def verify_and_sync_review_txt_pair(
         weak_list = [b for b in json_data.get("weak", []) if isinstance(b, dict)]
 
         if done_val in ("ok", True):
-            raw_cands = list(trusted_list) + list(weak_list)
+            # done="ok" approves the trusted boxes only. Weak (unapproved)
+            # boxes must never reach the training TXT, and must never be
+            # promoted into "trusted" (F-0799).
+            raw_cands = list(trusted_list)
         elif done_val in ("no", "rejected", False):
             raw_cands = []
         elif "trusted" in json_data:
@@ -1298,9 +1881,18 @@ def verify_and_sync_review_txt_pair(
                 if not s:
                     continue
                 parts = s.split()
-                if len(parts) >= 5:
+                # S-6303: exactly 5 tokens -- the old `>= 5` silently
+                # accepted extra-token lines and parsed only the first 5.
+                if len(parts) == 5:
                     try:
-                        cid = int(float(parts[0]))
+                        # Class id must be a plain integer token, same as
+                        # validate_yolo_file (F-0851). The old int(float(...))
+                        # silently truncated "1.9" to class 1, so a corrupt
+                        # line passed validate_label_box and could be
+                        # double-counted in the sync (S-2101).
+                        if not re.fullmatch(r"[+-]?\d+", parts[0].strip()):
+                            raise ValueError(f"class id is not an integer token: {parts[0]!r}")
+                        cid = int(parts[0])
                         cx = float(parts[1])
                         cy = float(parts[2])
                         w = float(parts[3])
@@ -1374,12 +1966,32 @@ def verify_and_sync_review_txt_pair(
             for b in json_boxes
         ]
         txt_str = ("\n".join(lines_out) + "\n") if lines_out else ""
+        _backup_before_repair(txt_p)
         atomic_write_text(txt_p, txt_str)
 
-        # Also sanitize json_p if it contained dirty/unfiltered boxes
-        if json_data is not None and "trusted" in json_data:
+        # Also sanitize json_p if it contained dirty/unfiltered boxes.
+        # A rejected item (done="no"/"rejected"/False) is EXCLUDED here: its
+        # json_boxes is empty by decision, not by sanitization, and writing
+        # trusted=[] would permanently delete the reviewed boxes from the
+        # JSON record (F-0937). The TXT is still emptied above -- a rejected
+        # frame trains on zero boxes -- but the JSON keeps its boxes.
+        if json_data is not None and "trusted" in json_data and done_val not in ("no", "rejected", False):
             if len(json_data.get("trusted", [])) != len(json_boxes):
                 json_data["trusted"] = json_boxes
+                # Boxes now in "trusted" must not linger in "weak" as well
+                # (F-0938): drop weak entries duplicated into trusted.
+                weak_list = json_data.get("weak")
+                if isinstance(weak_list, list) and weak_list:
+                    # P1-13 (K-33): weak/trusted cakisma temizligi tek tanim
+                    # ``same_box()`` (IoU >= 0.45 + merkez <= 0.05) kullanir;
+                    # eski yerel ``_same_box`` (koordinat basina 1e-6) kaldirildi.
+                    # Eksik geometrili weak girdi eslesmez, listede kalir.
+                    json_data["weak"] = [
+                        b
+                        for b in weak_list
+                        if not any(same_box(b, jb) for jb in json_boxes)
+                    ]
+                _backup_before_repair(json_p)
                 atomic_write_json(json_p, json_data)
 
         logger.info("Atomic sync: repaired %s from %s (%d boxes)", txt_p.name, json_p.name, len(json_boxes))
@@ -1390,14 +2002,51 @@ def verify_and_sync_review_txt_pair(
         stem = txt_p.stem
         parent_name = txt_p.parent.name
         split = parent_name if parent_name in ("train", "val", "test") else "train"
-        repaired_payload = {
+        # P0-1 (K-10): a corrupt JSON used to be rebuilt as
+        # trusted=txt_boxes / weak=[] / done=None — its approval flags
+        # and weak list were silently deleted. Salvage what the raw
+        # text still carries (weak list, flags, scalar meta) and keep
+        # it in the rebuilt payload instead.
+        salvaged: Dict[str, Any] = {}
+        salvaged_weak: List[Dict[str, Any]] = []
+        if json_exists:
+            try:
+                raw_corrupt = json_p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                raw_corrupt = ""
+            salvaged = _salvage_corrupt_review_json(raw_corrupt)
+            raw_weak = salvaged.pop("weak", [])
+            if isinstance(raw_weak, list):
+                weak_cands = [b for b in raw_weak if isinstance(b, dict)]
+                salvaged_weak, _ = sanitize_boxes(
+                    weak_cands, drop_invalid_size=True, auto_fix_coords=True
+                )
+                # Boxes now in "trusted" must not linger in "weak" as
+                # well (F-0938, same rule as Case A).
+                salvaged_weak = [
+                    b
+                    for b in salvaged_weak
+                    if not any(same_box(b, tb) for tb in txt_boxes)
+                ]
+        repaired_payload: Dict[str, Any] = {
             "stem": stem,
             "split": split,
             "trusted": txt_boxes,
-            "weak": [],
-            "done": "ok" if txt_boxes else None,
+            "weak": salvaged_weak,
+            # done=None unless the corrupt JSON actually carried an
+            # approval state: nobody approved these boxes yet (F-0800),
+            # but a salvaged done/human_approved must not be deleted.
+            "done": salvaged.get("done"),
             "auto_repaired": True,
         }
+        if "human_approved" in salvaged:
+            repaired_payload["human_approved"] = salvaged["human_approved"]
+        if "approved" in salvaged:
+            repaired_payload["approved"] = salvaged["approved"]
+        for _meta_key, _meta_val in salvaged.items():
+            if _meta_key not in repaired_payload:
+                repaired_payload[_meta_key] = _meta_val
+        _backup_before_repair(json_p)
         atomic_write_json(json_p, repaired_payload)
         logger.info("Atomic sync: repaired %s from %s (%d boxes)", json_p.name, txt_p.name, len(txt_boxes))
         return True
@@ -1411,9 +2060,12 @@ def sync_all_review_txt_pairs(
     dataset_dir: Union[str, Path],
     *,
     splits: Sequence[str] = ("train", "val"),
-    auto_repair: bool = True,
+    auto_repair: bool = False,
 ) -> Dict[str, Any]:
-    """Scan and verify/synchronize all review JSON and label TXT pairs across dataset splits."""
+    """Scan and verify/synchronize all review JSON and label TXT pairs across dataset splits.
+
+    P0-1 (K-10): ``auto_repair`` defaults to False (verify-only sweep).
+    """
     root = Path(dataset_dir)
     stats: Dict[str, int] = {
         "total_pairs": 0,
@@ -1510,6 +2162,14 @@ def run_self_tests() -> None:
     fixed_px = fix_out_of_bounds(640.0, 360.0, 100.0, 50.0, image_width=1280.0, image_height=720.0)
     assert fixed_px is not None
     assert abs(fixed_px[0] - 0.5) < 1e-4 and abs(fixed_px[1] - 0.5) < 1e-4
+
+    # P1-7 (K-20): mixed-unit box — only the pixel coordinate is divided;
+    # the normalized cx must survive untouched.
+    fixed_mixed = fix_out_of_bounds(0.5, 360.0, 100.0, 0.05, image_width=1280.0, image_height=720.0)
+    assert fixed_mixed is not None
+    assert abs(fixed_mixed[0] - 0.5) < 1e-4 and abs(fixed_mixed[1] - 0.5) < 1e-4, (
+        f"Mixed-unit box collapsed: {fixed_mixed}"
+    )
 
     # Completely out of bounds cannot be salvaged
     assert fix_out_of_bounds(2.5, 2.5, 0.1, 0.1) is None
@@ -1763,6 +2423,122 @@ def run_self_tests() -> None:
         assert stats["total_pairs"] >= 4
         assert stats["failed"] == 0
 
+        # --- Test 9: sweep-line overlap detection == brute-force oracle ---
+        import random as _random
+
+        def _brute_overlaps(boxes, thr=0.80, same_class_only=True):
+            out = []
+            for a in range(len(boxes)):
+                for b in range(a + 1, len(boxes)):
+                    if same_class_only and boxes[a]["class_id"] != boxes[b]["class_id"]:
+                        continue
+                    iou = compute_box_iou(
+                        (boxes[a]["cx"], boxes[a]["cy"], boxes[a]["w"], boxes[a]["h"]),
+                        (boxes[b]["cx"], boxes[b]["cy"], boxes[b]["w"], boxes[b]["h"]),
+                    )
+                    if iou > thr:
+                        out.append((a, b, iou))
+            return out
+
+        rng = _random.Random(20261108)
+        for label, n, spread in (("sparse", 300, 1.0), ("dense", 120, 0.12)):
+            rnd_boxes = [
+                {
+                    "class_id": rng.randrange(3),
+                    "cx": 0.5 + rng.uniform(-spread / 2, spread / 2),
+                    "cy": 0.5 + rng.uniform(-spread / 2, spread / 2),
+                    "w": rng.uniform(0.02, 0.12),
+                    "h": rng.uniform(0.02, 0.12),
+                }
+                for _ in range(n)
+            ]
+            for same_only in (True, False):
+                got = detect_overlapping_boxes(rnd_boxes, same_class_only=same_only)
+                exp = _brute_overlaps(rnd_boxes, same_class_only=same_only)
+                assert [(i, j) for i, j, _, _ in got] == [(a, b) for a, b, _ in exp], (
+                    f"sweep pairs != brute force ({label}, same_class_only={same_only})"
+                )
+                for (_, _, giou, _), (_, _, eiou) in zip(got, exp):
+                    assert abs(giou - eiou) < 1e-9
+                # Malformed boxes are skipped, never crash the sweep.
+                got2 = detect_overlapping_boxes(
+                    rnd_boxes + [{"class_id": "x", "cx": float("nan"), "cy": 0.5, "w": 0.1, "h": 0.1}],
+                    same_class_only=same_only,
+                )
+                assert [(i, j) for i, j, _, _ in got2] == [(a, b) for a, b, _ in exp]
+
+        # --- Test 10: sanitize dedup -- no kept pair overlaps, nothing lost ---
+        dedup_boxes = [
+            {
+                "class_id": rng.randrange(3),
+                # In-bounds by construction (cx/cy in [0.1, 0.9], w/h <= 0.12):
+                # sanitize must keep coordinates verbatim, so "kept" can be
+                # matched against the input by exact coordinates below.
+                "cx": rng.uniform(0.1, 0.9),
+                "cy": rng.uniform(0.1, 0.9),
+                "w": rng.uniform(0.02, 0.12),
+                "h": rng.uniform(0.02, 0.12),
+                "confidence": rng.random(),
+            }
+            for _ in range(300)
+        ]
+        # Plant exact duplicates that must collapse to one kept box.
+        dedup_boxes.append({"class_id": 1, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1, "confidence": 0.99, "hand_label": True})
+        dedup_boxes.append({"class_id": 1, "cx": 0.505, "cy": 0.505, "w": 0.1, "h": 0.1, "confidence": 0.5})
+        kept, dedup_issues = sanitize_boxes(dedup_boxes)
+        assert any(
+            b["class_id"] == 1 and b["cx"] == 0.5 and b["cy"] == 0.5 and b.get("hand_label") is True
+            for b in kept
+        ), "hand-labelled planted box must survive dedup"
+        assert not any(
+            b["class_id"] == 1 and b["cx"] == 0.505 and b["cy"] == 0.505 for b in kept
+        ), "lower-confidence duplicate must be dropped"
+        for a in range(len(kept)):
+            for b in range(a + 1, len(kept)):
+                if kept[a]["class_id"] == kept[b]["class_id"]:
+                    assert compute_box_iou(
+                        (kept[a]["cx"], kept[a]["cy"], kept[a]["w"], kept[a]["h"]),
+                        (kept[b]["cx"], kept[b]["cy"], kept[b]["w"], kept[b]["h"]),
+                    ) <= 0.80, "kept pair still overlaps above threshold"
+        # Every input box is either kept or covered by a kept duplicate.
+        kept_keys = {(b["class_id"], b["cx"], b["cy"], b["w"], b["h"]) for b in kept}
+        for src in dedup_boxes:
+            key = (src["class_id"], src["cx"], src["cy"], src["w"], src["h"])
+            if key in kept_keys:
+                continue
+            assert any(
+                k["class_id"] == src["class_id"]
+                and compute_box_iou(
+                    (src["cx"], src["cy"], src["w"], src["h"]),
+                    (k["cx"], k["cy"], k["w"], k["h"]),
+                ) > 0.80
+                for k in kept
+            ), "dropped box has no kept duplicate covering it"
+        # Deterministic: same input -> same output.
+        kept_again, _ = sanitize_boxes(dedup_boxes)
+        assert kept_again == kept
+
+        # --- Test 11: capped report tallies == uncapped report tallies ---
+        cap_tmp = tmp / "cap_test"
+        (cap_tmp / "labels" / "train").mkdir(parents=True)
+        # 8 files x 3 zero-area lines = 24 errors; cap at 5 recorded issues.
+        for f in range(8):
+            (cap_tmp / "labels" / "train" / f"f{f:02d}.txt").write_text(
+                "0 0.5 0.5 0.0 0.1\n0 0.5 0.5 0.1 0.0\n0 0.5 0.5 0.002 0.1\n",
+                encoding="utf-8",
+            )
+        capped = validate_dataset(cap_tmp, split="train", check_pending=False, max_issues_to_record=5)
+        uncapped = validate_dataset(cap_tmp, split="train", check_pending=False, max_issues_to_record=1000)
+        assert len(capped.issues) == 5, f"expected 5 recorded issues, got {len(capped.issues)}"
+        for field in (
+            "error_count", "warning_count", "zero_area_count",
+            "size_bounds_count", "total_files_scanned", "total_boxes_scanned",
+        ):
+            assert getattr(capped, field) == getattr(uncapped, field), (
+                f"capped {field}={getattr(capped, field)} != uncapped {getattr(uncapped, field)}"
+            )
+        assert capped.valid is False and uncapped.valid is False
+
     print("ALL DATASET QA, HUMAN GATE, STALE MODEL, ATOMIC SYNC, AND BOX BOUND TESTS PASSED!")
 
 
@@ -1773,6 +2549,7 @@ __all__ = [
     "MIN_BOX_DIM_BOUND",
     "MAX_BOX_DIM_BOUND",
     "MIN_BOX_AREA_BOUND",
+    "MAX_CANONICAL_CLASS_ID",
     "STALE_MANIFEST_NAME",
     "PIPELINE_STATE_NAME",
     "BoxValidationResult",

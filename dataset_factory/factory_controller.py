@@ -43,14 +43,13 @@ Exclusive Owner: Dataset Factory Sub-Agent 8 (`dataset_factory/factory_controlle
 from __future__ import annotations
 
 import logging
-import math
+import os
 from pathlib import Path
 import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-import cv2
 import numpy as np
 
 from dataset_factory.active_learning_loop import (
@@ -60,9 +59,9 @@ from dataset_factory.active_learning_loop import (
 )
 from dataset_factory.dataset_curator import (
     DatasetCurator,
-    imread_unicode,
     imwrite_unicode,
 )
+from dataset_factory.lru_frame_cache import imread_unicode  # F-2000: canonical decoder
 from dataset_factory.frame_time_machine import (
     FrameSnapshot,
     PreGatherTimeMachineBuffer,
@@ -82,8 +81,8 @@ from dataset_factory.yolo_auto_labeler import (
     YOLO_CLASSES,
     YOLO_CLASSES_TR,
     YOLOAutoLabeler,
-    map_material_name_to_yolo_class_id,
 )
+from version import __version__
 
 logger = logging.getLogger("DatasetFactory.Controller")
 
@@ -102,21 +101,39 @@ if not logger.handlers:
 
 
 def cuda_training_blocked_by_game() -> str:
-    """Non-empty when AION 2 / Aion2 / 'AION 2' is running. CUDA training must wait."""
+    """Non-empty when AION 2 / Aion2 / 'AION 2' is running. CUDA training must wait.
+
+    Fail-CLOSED: if the process check itself errors, training is treated as
+    blocked instead of silently proceeding -- an unknown game state must
+    never be read as "no game running" (previously the except branch
+    returned "" and training could start on top of the game).
+    """
     try:
         from core.game_gpu_throttle import find_aion_game_processes
 
         pids = find_aion_game_processes()
     except Exception:
-        logger.debug("AION süreç kontrolü atlandı", exc_info=True)
-        return ""
+        logger.warning(
+            "AION süreç kontrolü başarısız; eğitim tedbiren engellendi", exc_info=True
+        )
+        return GAME_BLOCKS_TRAINING_REASON
     if pids:
         return GAME_BLOCKS_TRAINING_REASON
     return ""
 
 
 # ==============================================================================
-# Unified 12-Class YOLO Schema (Compatible with YOLOAutoLabeler & YOLOFactoryDialog)
+# Canonical class-name map (dataset_factory.class_taxonomy.CANONICAL_NAMES,
+# 0..26). The name FACTORY_12_CLASS_NAMES is kept for compatibility, but the
+# contents are the canonical 27-class taxonomy -- NOT the legacy 12/23-class
+# YOLO scheme, where ids 6/7/8 were UI icons (crest / F-prompt / E-icon),
+# 12 was a generic "world material" and 18..22 were shifted consumables/bars,
+# so the same class_id meant different things in different files (F-0802).
+# P1-14 (K-36): NO legacy translation happens here any more. Both live
+# producers emit canonical ids (see _canonicalize_annotations): a bare id is
+# canonical by definition, and a named legacy box resolves by its name.
+# The local 0..15 table below is merged with the taxonomy at import; a
+# taxonomy load failure is a hard error (no silent 16-class fallback).
 # ==============================================================================
 FACTORY_12_CLASS_NAMES: Dict[int, str] = {
     0: "herb_aria",
@@ -124,14 +141,14 @@ FACTORY_12_CLASS_NAMES: Dict[int, str] = {
     2: "herb_targena",
     3: "ore_orichalcum",
     4: "gem_crystal",
-    5: "wood_tree",
-    6: "world_gather_crest",
-    7: "f_gather_prompt",
-    8: "combo_skill_prompt",
+    5: "tree_log",
+    6: "herb_edana",
+    7: "herb_lumina",
+    8: "ore_obsidian",
     9: "minimap_sprout",
     10: "monster_3d",
     11: "minimap_monster_dot",
-    12: "world_material",
+    12: "crystal_blood",
     13: "skill_ui_prompt",
     14: "obstacle",
     15: "path_ground",
@@ -144,13 +161,13 @@ FACTORY_12_CLASS_LABELS_TR: Dict[int, str] = {
     3: "3: Orichalcum / Maden Cevheri",
     4: "4: Gem / Kristal (Sapphire/Ruby/Diamond)",
     5: "5: Ağaç / Kereste (Yggdrasil/Asvata)",
-    6: "6: 3B Amblem (Beyaz Kanatlı İkon)",
-    7: "7: F Gather (Etkileşim İstem Kutusu)",
-    8: "8: Kombo İkonu (Q/E)",
+    6: "6: Edana (Mor/Pembe Bitki)",
+    7: "7: Lumina (Sarı/Altın Parıltılı Bitki)",
+    8: "8: Obsidyen (Koyu Kristal Maden)",
     9: "9: Minimap Filiz (3 Yapraklı İkon)",
     10: "10: 3B Canavar (monster_3d)",
     11: "11: Minimap Canavar (minimap_monster_dot)",
-    12: "12: Dünya Malzemesi (adı bilinmeyen)",
+    12: "12: Kan Kristali (Kırmızı Kristal)",
     13: "13: Skill/Arayüz (F/E değil)",
     14: "14: Engel",
     15: "15: Yol/Zemin",
@@ -160,15 +177,74 @@ try:
     from dataset_factory.class_taxonomy import dataset_class_names as _taxonomy_class_names
     from dataset_factory.class_taxonomy import dataset_labels_tr as _taxonomy_labels_tr
 
+    # A27: _taxonomy_labels_tr() was rebuilt on every loop iteration
+    # (once per class id >= 16); call it once.
+    _taxonomy_labels = _taxonomy_labels_tr()
     for _cid, _name in _taxonomy_class_names().items():
         FACTORY_12_CLASS_NAMES.setdefault(int(_cid), _name)
         if int(_cid) >= 16:
             FACTORY_12_CLASS_LABELS_TR.setdefault(
                 int(_cid),
-                f"{int(_cid)}: {_taxonomy_labels_tr().get(int(_cid), _name)}",
+                f"{int(_cid)}: {_taxonomy_labels.get(int(_cid), _name)}",
             )
-except Exception:
-    pass
+    # P1-14 (K-38): taxonomy load failure is a HARD error — a silent
+    # fallback to the local 16-class table would mislabel every class
+    # >= 16 and write a wrong nc into data.yaml. The merged map must
+    # cover the full canonical taxonomy (27 classes, 0..26).
+    if set(FACTORY_12_CLASS_NAMES) != set(range(27)):
+        raise RuntimeError(
+            "Taksonomi eksik: FACTORY_12_CLASS_NAMES 27 sınıfı kapsamıyor "
+            f"(kapsanan: {sorted(FACTORY_12_CLASS_NAMES)})"
+        )
+except Exception as exc:
+    raise RuntimeError(
+        "Taksonomi yüklenemedi (dataset_factory.class_taxonomy): "
+        "factory_controller kanonik 27 sınıf olmadan çalışamaz"
+    ) from exc
+
+
+def _canonicalize_annotations(annotations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate live annotations against the canonical (0..26) taxonomy.
+
+    P1-14 (K-36, K-37) — SEÇİLEN YÖN: kör legacy çeviri KALDIRILDI.
+    Gerekçe: iki canlı üretici de (``YOLOAutoLabeler`` ve
+    ``DatasetCurator``'un fallback labeler'ı) bugün kanonik id üretiyor
+    (labeler: "legacy ids must never be reintroduced here"; curator
+    ``resolve_yolo_class_id_and_name`` 0..26 dışı id'de ValueError verir);
+    hiçbir kutuda legacy-köken bayrağı yok, yani "kökeni kanıtlı legacy
+    kutu" canlı yolda mevcut değil. Kör çeviri kanonik id'yi bozuyordu
+    (6 herb_edana -> 13 skill_ui_prompt). İsim kanıtı olan legacy kutu
+    zaten isim-öncelikli ``sanitize`` ile doğru çözülür (``crest`` -> 13,
+    ``hp_potion`` -> 22); isimsiz kutuda çıplak id kanonik sayılır.
+    ``translate_legacy_yolo_class_id`` yalnızca açıkça legacy işaretli
+    disk verisinin migrasyonunda kullanılır, burada asla.
+
+    Annotations that cannot be resolved to a canonical class are dropped
+    (with a warning) instead of entering the dataset as poison.
+    Already-canonical annotations pass through unchanged.
+    """
+    from dataset_factory.class_taxonomy import try_sanitize_class_id_and_name
+
+    canonical: List[Dict[str, Any]] = []
+    for ann in annotations or []:
+        if not isinstance(ann, dict):
+            continue
+        raw_cid = ann.get("class_id", ann.get("cls"))
+        name = ann.get("class_name") or ann.get("material_name") or ann.get("name") or ""
+        sanitized = try_sanitize_class_id_and_name(
+            raw_cid if raw_cid is not None else -1, str(name)
+        )
+        if sanitized is None:
+            logger.warning(
+                "Kanonik olmayan kutu atıldı (class_id=%r, class_name=%r)",
+                raw_cid,
+                name,
+            )
+            continue
+        fixed = dict(ann)
+        fixed["class_id"], fixed["class_name"] = sanitized
+        canonical.append(fixed)
+    return canonical
 
 
 class AutoLabelingDatasetFactory:
@@ -188,6 +264,9 @@ class AutoLabelingDatasetFactory:
     DEFAULT_TARGET_IMAGES: int = 100000
     DEFAULT_LOOKBACK_SEC: float = 2.0
     DEFAULT_PUSH_INTERVAL_SEC: float = 0.25
+    # Bound on how long a cached "latest preview on disk" answer may be
+    # reused (see _find_latest_preview_on_disk).
+    _PREVIEW_SCAN_CACHE_TTL_SEC: float = 10.0
 
     def __init__(
         self,
@@ -250,8 +329,14 @@ class AutoLabelingDatasetFactory:
             max_capacity=240,
         )
 
-        # 2. Multi-Class 3D + Minimap Automatic YOLO Labeler
-        self.auto_labeler = YOLOAutoLabeler()
+        # 2. Multi-Class 3D + Minimap Automatic YOLO Labeler — LAZY (P2-20).
+        # `YOLOAutoLabeler()` kurulumu `VisionEngine.load_template()`
+        # zincirini tetikler (şablon PNG decode + çok ölçekli piramit);
+        # dialog açılışında UI thread'de kurulmaz, ilk etiketleme
+        # kullanımında `auto_labeler` property'si üzerinden kurulur.
+        # `DatasetCurator`'a None verilir — küratörün kendi
+        # `_get_auto_labeler()`'ı zaten aynı lazy yüklemeyi yapar.
+        self._auto_labeler: Optional[Any] = None
 
         # 3. Perceptual dHash Deduplicator & Sharpness Quality Gate
         self.quality_gate = DatasetQualityGate(
@@ -270,7 +355,7 @@ class AutoLabelingDatasetFactory:
             target_goal=self.auto_train_threshold,
             class_names=dict(FACTORY_12_CLASS_NAMES),
             val_ratio=float(val_ratio),
-            auto_labeler=self.auto_labeler,
+            auto_labeler=None,
             augmentor=self.augmentor,
             quality_gate=self.quality_gate,
         )
@@ -305,12 +390,17 @@ class AutoLabelingDatasetFactory:
             on_sample_recorded=self._on_shadow_sample_recorded,
             lookback_sec=self.lookback_sec,
             background_worker=False,
+            passive_shadow_enabled=self.passive_shadow_mode,
         )
 
         # Runtime counters and state tracking
         self._gather_events_total: int = 0
         self._gather_samples_accepted: int = 0
         self._gather_samples_rejected: int = 0
+        # v20-yz: gezinme (roaming) çekimi sayaçları — hasat sayaçlarından ayrı.
+        self._roaming_events_total: int = 0
+        self._roaming_samples_accepted: int = 0
+        self._roaming_samples_rejected: int = 0
         self._synthetic_variants_saved: int = 0
         self._active_learning_saves: int = 0
         self._last_saved_preview_path: str = ""
@@ -319,18 +409,85 @@ class AutoLabelingDatasetFactory:
         self._auto_train_triggered_count: int = 0
         self._cached_gpu_info: Optional[Dict[str, Any]] = None
         self._cached_gpu_ts: float = 0.0
+        # (latest_preview_path | None, previews_dir_mtime | None, monotonic_ts)
+        self._latest_preview_cache: Optional[Tuple[Optional[Path], Optional[float], float]] = None
+        # P2-20: başlangıç durumu senkronizasyonu ertelendi — bayrak
+        # `_ensure_initial_state()` ile ilk `get_factory_status()`
+        # çağrısında (ya da bootstrap sonunda) kurulur.
+        self._initial_state_synced: bool = False
 
         # Ensure initial dataset directories, data.yaml, and initial preview exist
         self.curator.ensure_dataset_structure()
-        self._sync_initial_state()
+        # P2-20: `_sync_initial_state()` artık __init__'te çağrılmaz —
+        # tam manifest taraması + sınıf sayımı, dialog penceresi açılıp
+        # yükleme worker'ı başladıktan sonra ilk durum sorgusunda yapılır.
+
+    # ==========================================================================
+    # Lazy Initialization (P2-20)
+    # ==========================================================================
+    @property
+    def auto_labeler(self) -> Any:
+        """`YOLOAutoLabeler`, ilk kullanımda kurulur (P2-20 lazy).
+
+        Kurulum `VisionEngine.load_template()` zincirini çalıştırır
+        (şablon PNG decode + piramit); `__init__` bunu yapmaz. Setter
+        enjeksiyonu destekler (testler `factory.auto_labeler = ...`
+        atayabilir).
+        """
+        labeler = self._auto_labeler
+        if labeler is None:
+            from dataset_factory.yolo_auto_labeler import YOLOAutoLabeler
+
+            labeler = YOLOAutoLabeler()
+            self._auto_labeler = labeler
+        return labeler
+
+    @auto_labeler.setter
+    def auto_labeler(self, value: Any) -> None:
+        self._auto_labeler = value
+
+    def _ensure_initial_state(self) -> None:
+        """Başlangıç durumu senkronizasyonunu bir kez çalıştır (P2-20 lazy).
+
+        `__init__` artık `_sync_initial_state()` çağırmaz; ilk
+        `get_factory_status()` (ya da bootstrap sonu) bu kapıdan geçer.
+        RLock altında çift kontrollü bayrak — tekrar çağrı bedava.
+        """
+        if self._initial_state_synced:
+            return
+        with self._lock:
+            if self._initial_state_synced:
+                return
+            self._sync_initial_state()
+
+    def seed_gpu_info(self, gpu_info: Optional[Dict[str, Any]]) -> None:
+        """Worker'da probe edilmiş GPU bilgisini önbelleğe tohumla (P2-20).
+
+        Yükleme worker'ı `get_dataset_stats()` içinde zaten
+        `probe_gpu_environment()` çalıştırır (nvidia-smi + import
+        denemeleri); UI thread'deki `_get_gpu_info_cached()` ilk
+        çağrısı aynı probe'u tekrar etmesin diye sonuç buradan
+        yazılır. Boş/eksik dict yoksayılır (önbellek kirlenmez).
+        """
+        if not isinstance(gpu_info, dict) or not gpu_info:
+            return
+        with self._lock:
+            self._cached_gpu_info = dict(gpu_info)
+            self._cached_gpu_ts = time.time()
 
     # ==========================================================================
     # Internal Initialization & Synchronization Helpers
     # ==========================================================================
     def _sync_initial_state(self) -> None:
-        """Sync preview path and class counts from existing `dataset/` files on disk."""
+        """Sync preview path and class counts from existing `dataset/` files on disk.
+
+        P2-20: kör `rebuild_manifest_stats()` taraması kalktı —
+        `get_manifest_stats()` manifest dosyası varsa onu okur (yalnızca
+        yoksa/bozuksa tam tarama yapar); `get_factory_status()` zaten
+        aynı manifestten okuduğu için sayılar tutarlı kalır.
+        """
         with self._lock:
-            manifest = self.curator.rebuild_manifest_stats()
+            manifest = self.curator.get_manifest_stats()
             class_id_counts = manifest.get("class_id_counts", {})
             mapped_counts: Dict[Union[int, str], int] = {}
             for cid_str, cnt in class_id_counts.items():
@@ -346,21 +503,66 @@ class AutoLabelingDatasetFactory:
             latest_preview = self._find_latest_preview_on_disk()
             if latest_preview:
                 self._last_saved_preview_path = str(latest_preview)
+            # P2-20: doğrudan çağrı da (bootstrap sonu gibi) senkron
+            # sayılır — kapı bir daha çalışmaz.
+            self._initial_state_synced = True
 
     def _find_latest_preview_on_disk(self) -> Optional[Path]:
-        """Return the most recently modified preview image in `dataset/previews/`."""
+        """Return the most recently modified preview image in `dataset/previews/`.
+
+        The previews directory grows by one file per saved sample, so a full
+        scan on every status poll costs ~100-230 ms once a few thousand
+        previews exist (this VM's filesystem: ~0.1 ms per stat). The result
+        is cached and reused while the directory mtime is unchanged
+        (creating a preview file changes it) and the cache is younger than
+        `_PREVIEW_SCAN_CACHE_TTL_SEC`; the TTL bounds staleness for the
+        in-place rewrite edge (`latest_*.jpg` is overwritten without
+        changing the directory mtime). A cached miss (no previews yet) is
+        cached the same way, so status polling before the first save no
+        longer rescans the directory on every poll. The scan itself uses a
+        single `os.scandir` pass with one stat per file instead of
+        iterdir + per-file `is_file()` + a second stat per file in the sort
+        key, and `max`-style tracking instead of a full sort.
+        """
         if not self.previews_dir.exists():
             return None
-        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-        previews = [
-            p
-            for p in self.previews_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in valid_exts
-        ]
-        if not previews:
+        try:
+            dir_mtime = self.previews_dir.stat().st_mtime
+        except OSError:
+            dir_mtime = None
+        cached = self._latest_preview_cache
+        if (
+            cached is not None
+            and dir_mtime is not None
+            and cached[1] == dir_mtime
+            and (time.monotonic() - cached[2]) < self._PREVIEW_SCAN_CACHE_TTL_SEC
+            and (cached[0] is None or cached[0].exists())
+        ):
+            return cached[0]
+
+        valid_suffixes = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+        best_path: Optional[Path] = None
+        best_mtime = -1.0
+        try:
+            with os.scandir(self.previews_dir) as it:
+                for entry in it:
+                    if not entry.name.lower().endswith(valid_suffixes):
+                        continue
+                    try:
+                        # DirEntry caches the stat: is_file() + stat() below
+                        # is a single syscall per file.
+                        if not entry.is_file():
+                            continue
+                        mtime = entry.stat().st_mtime
+                    except OSError:
+                        continue
+                    if mtime > best_mtime:
+                        best_mtime = mtime
+                        best_path = Path(entry.path)
+        except OSError:
             return None
-        previews.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        return previews[0]
+        self._latest_preview_cache = (best_path, dir_mtime, time.monotonic())
+        return best_path
 
     def _get_gpu_info_cached(self, max_age_sec: float = 15.0) -> Dict[str, Any]:
         """Return cached GPU probe dictionary to avoid repeated subprocess calls on fast UI polls."""
@@ -386,10 +588,14 @@ class AutoLabelingDatasetFactory:
         detections: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Adapter callback used by `ShadowGameplayRecorder` to invoke `YOLOAutoLabeler`."""
+        # V20-YZ-ETİKET: gölge kayıt öğrenme yakalamasıdır — karedeki HER
+        # ŞEY etiketlenir (full_scan=True), yoksa HUD/yol kutuları hiç
+        # üretilemezdi.
         return self.auto_labeler.auto_label_frame(
             frame=frame,
             extra_detections=detections,
             known_material_name=material_hint,
+            full_scan=True,
         )
 
     def _on_shadow_sample_recorded(self, sample_record: Dict[str, Any]) -> None:
@@ -423,7 +629,10 @@ class AutoLabelingDatasetFactory:
             update_manifest=True,
         )
         with self._lock:
-            self._active_learning_saves += 1
+            # Count only a save that really happened: previously the counter
+            # rose even when save_labeled_sample() reported saved=False.
+            if save_res.get("saved"):
+                self._active_learning_saves += 1
             if save_res.get("preview_path"):
                 self._last_saved_preview_path = str(save_res["preview_path"])
             if save_res.get("image_path"):
@@ -458,7 +667,7 @@ class AutoLabelingDatasetFactory:
         """
         Called on each bot/vision tick to:
           1. Push the current frame into `PreGatherTimeMachineBuffer` (throttled to every `0.25s`
-             unless `force` or explicit event flags are active).
+             unless explicit event flags are active).
           2. Check `ActiveLearningLoop` (and `ShadowGameplayRecorder`) if passive shadow recording
              (`passive_shadow_mode`) or active-learning event triggers (`manual_f8_pressed`,
              `extraction_failed`, borderline confidence detections) are present.
@@ -475,6 +684,42 @@ class AutoLabelingDatasetFactory:
                 "span_seconds": self.time_machine.span_seconds,
             }
 
+        ts = float(timestamp) if timestamp is not None else time.time()
+
+        # Fast path (A27): skip the full-HUD game-frame gate (~0.4-1.2 s on a
+        # full-HD frame; measured 403-1165 ms on reference_screenshots) for
+        # frames the time machine would throttle away anyway. Only when there
+        # is no active-learning trigger (no detections/flags/status_text) and
+        # shadow mode is off -- in that case the frame changes nothing
+        # downstream: it is not buffered and no mining runs, so the result
+        # is identical to the throttled path below. The gate has no
+        # shared-cache side effect here (require_novelty=False,
+        # require_foreground=False); only its diagnostic counters move.
+        # The throttle test mirrors push_frame() exactly (backwards ts, or
+        # elapsed < min_push_interval_sec - 1e-6); a concurrent push can only
+        # make the frame throttle sooner, never later.
+        if (
+            not self.passive_shadow_mode
+            and not detections
+            and not manual_f8_pressed
+            and not manual_f_pressed
+            and not extraction_failed
+            and not status_text
+        ):
+            latest_snapshot = self.time_machine.get_latest_frame()
+            if latest_snapshot is not None:
+                elapsed = ts - latest_snapshot.timestamp
+                if elapsed < 0.0 or elapsed < (self.time_machine.min_push_interval_sec - 1e-6):
+                    return {
+                        "ingested": False,
+                        "throttled": True,
+                        "timestamp": ts,
+                        "buffered_frames": len(self.time_machine),
+                        "span_seconds": round(self.time_machine.span_seconds, 3),
+                        "active_learning": None,
+                        "mined_sample_saved": False,
+                    }
+
         # Central Game Frame Gate: unconditionally drop non-game captures before saving or buffering
         is_valid, gate_reason = is_valid_game_frame(frame, require_foreground=False, require_novelty=False)
         if not is_valid:
@@ -485,8 +730,6 @@ class AutoLabelingDatasetFactory:
                 "buffered_frames": len(self.time_machine),
                 "span_seconds": round(self.time_machine.span_seconds, 3),
             }
-
-        ts = float(timestamp) if timestamp is not None else time.time()
 
         # 1. If Passive Shadow Mode is enabled, delegate observation to ShadowGameplayRecorder
         #    (which pushes into self.time_machine and evaluates self.active_learning).
@@ -547,11 +790,15 @@ class AutoLabelingDatasetFactory:
             )
             # If user manually pressed F8 to mine a false negative, auto-label & save immediately
             if manual_f8_pressed and al_decision.get("should_capture"):
+                # V20-YZ-ETİKET: F8 yanlış-negatif madenciliği karedeki HER
+                # ŞEYİ etiketler (full_scan=True).
                 anns = self.auto_labeler.auto_label_frame(
                     frame=frame,
                     extra_detections=detections,
                     known_material_name=material_hint,
+                    full_scan=True,
                 )
+                anns = _canonicalize_annotations(anns)
                 if anns:
                     q_dec = self.quality_gate.evaluate_frame(frame, anns, record_on_accept=True)
                     if q_dec.accepted:
@@ -565,7 +812,8 @@ class AutoLabelingDatasetFactory:
                         )
                         mined_saved = bool(saved_info.get("saved", False))
                         with self._lock:
-                            self._active_learning_saves += 1
+                            if mined_saved:
+                                self._active_learning_saves += 1
                             if saved_info.get("preview_path"):
                                 self._last_saved_preview_path = str(saved_info["preview_path"])
                             if saved_info.get("image_path"):
@@ -595,6 +843,10 @@ class AutoLabelingDatasetFactory:
         lookback_sec: Optional[float] = None,
         reference_ts: Optional[float] = None,
         force_save: bool = False,
+        # v20-yz: gezinme çekimi — hasat bitmeden, yürüyüş/keşif sırasında
+        # periyodik kare kaydı. Kayıt yolu hasatla birebir aynıdır; yalnızca
+        # sayaç/etiket/stem ayrılır, hasat istatistiği kirlenmez.
+        roaming: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -617,13 +869,44 @@ class AutoLabelingDatasetFactory:
           6. If `total_images >= auto_train_threshold` (default `100000`), flags
              `auto_train_ready=True` and optionally triggers 1-Click RTX training!
         """
-        with self._lock:
-            self._gather_events_total += 1
-            gather_seq = self._gather_events_total
+        # v20-yz: gezinme çekimi hasat sayacına karışmaz — ayrı sayaç +
+        # ayrı etiket ("Roaming"). Kayıt yolu hasatla birebir aynıdır.
+        _seq_label = "Roaming" if roaming else "Gather"
+        if roaming:
+            with self._lock:
+                self._roaming_events_total += 1
+                gather_seq = self._roaming_events_total
+        else:
+            with self._lock:
+                self._gather_events_total += 1
+                gather_seq = self._gather_events_total
+
+        # max_harvests is no longer a dead parameter: a node is harvested at
+        # most max_harvests times, so a harvest_stage beyond it is clamped
+        # (and reported) instead of silently producing stage 4+/3 samples.
+        max_harvests = max(1, int(max_harvests))
+        if int(harvest_stage) > max_harvests:
+            logger.warning(
+                "Gather #%d: harvest_stage %d > max_harvests %d; aşama %d'ye kırpıldı",
+                gather_seq,
+                int(harvest_stage),
+                max_harvests,
+                max_harvests,
+            )
+            harvest_stage = max_harvests
+        if kwargs:
+            # **kwargs used to swallow unknown arguments silently.
+            logger.warning("on_gather_success: bilinmeyen argümanlar yoksayıldı: %s", sorted(kwargs))
 
         if not self.auto_label_on_gather and not force_save:
+            logger.warning(
+                "%s #%d atlandı: auto_label_on_gather kapalı (YZ kare çekimi devre dışı)",
+                _seq_label,
+                gather_seq,
+            )
             return {
                 "saved": False,
+                "roaming": bool(roaming),
                 "reason": "auto_label_on_gather_disabled",
                 "gather_event_index": gather_seq,
             }
@@ -645,15 +928,17 @@ class AutoLabelingDatasetFactory:
         if snapshot is not None and snapshot.frame is not None and snapshot.frame.size > 0:
             target_frame = snapshot.frame
             used_time_machine = True
-            ref_clock = (
-                float(reference_ts)
-                if reference_ts is not None
-                else (
-                    self.time_machine.get_latest_frame().timestamp
-                    if self.time_machine.get_latest_frame() is not None
+            # One lookup: get_latest_frame() takes the buffer lock, and the
+            # previous expression called it twice (condition + value).
+            if reference_ts is not None:
+                ref_clock = float(reference_ts)
+            else:
+                latest_snapshot = self.time_machine.get_latest_frame()
+                ref_clock = (
+                    latest_snapshot.timestamp
+                    if latest_snapshot is not None
                     else time.time()
                 )
-            )
             actual_lookback_sec = max(0.0, ref_clock - snapshot.timestamp)
             cached_detections = list(snapshot.detections or [])
             region_name = str(snapshot.region_name or "")
@@ -664,9 +949,19 @@ class AutoLabelingDatasetFactory:
             actual_lookback_sec = 0.0
         else:
             with self._lock:
-                self._gather_samples_rejected += 1
+                if roaming:
+                    self._roaming_samples_rejected += 1
+                else:
+                    self._gather_samples_rejected += 1
+            logger.warning(
+                "%s #%d atlandı: time machine tamponunda ve argümanda kare yok "
+                "(feed_live_frame beslemiyor olabilir)",
+                _seq_label,
+                gather_seq,
+            )
             return {
                 "saved": False,
+                "roaming": bool(roaming),
                 "reason": "no_frame_available_in_buffer_or_argument",
                 "gather_event_index": gather_seq,
             }
@@ -674,11 +969,15 @@ class AutoLabelingDatasetFactory:
         # Central Game Frame Gate: unconditionally drop non-game captures before saving to disk
         valid_gate, gate_reason = is_valid_game_frame(target_frame, require_foreground=False, require_novelty=False)
         if not valid_gate and not force_save:
-            logger.warning("Gather sample dropped by GameFrameGate: %s", gate_reason)
+            logger.warning("%s sample dropped by GameFrameGate: %s", _seq_label, gate_reason)
             with self._lock:
-                self._gather_samples_rejected += 1
+                if roaming:
+                    self._roaming_samples_rejected += 1
+                else:
+                    self._gather_samples_rejected += 1
             return {
                 "saved": False,
+                "roaming": bool(roaming),
                 "reason": f"game_frame_gate_rejected: {gate_reason}",
                 "used_time_machine": used_time_machine,
                 "actual_lookback_sec": round(actual_lookback_sec, 3),
@@ -705,27 +1004,46 @@ class AutoLabelingDatasetFactory:
             except (TypeError, ValueError):
                 known_target_xy = None
         elif "target_xy" in node_dict and isinstance(node_dict["target_xy"], (list, tuple)) and len(node_dict["target_xy"]) >= 2:
-            known_target_xy = (int(node_dict["target_xy"][0]), int(node_dict["target_xy"][1]))
+            try:
+                known_target_xy = (int(node_dict["target_xy"][0]), int(node_dict["target_xy"][1]))
+            except (TypeError, ValueError):
+                logger.warning("Bozuk node_info target_xy yoksayıldı: %r", node_dict.get("target_xy"))
+                known_target_xy = None
 
         # Step 2: Run YOLOAutoLabeler on the t - 2.0s frame
+        # V20-YZ-ETİKET: hasat/gezinme çekimi karedeki HER ŞEYİ etiketler
+        # (full_scan=True) — yoksa HUD/yol kutuları stem kapısında elenirdi.
         annotations = self.auto_labeler.auto_label_frame(
             frame=target_frame,
             extra_detections=cached_detections if cached_detections else None,
             known_target_xy=known_target_xy,
             known_material_name=resolved_material,
+            full_scan=True,
         )
 
         # Fallback to DatasetCurator's salient 3D patch detector if frame had no crest/prompt templates
         if not annotations:
-            annotations = self.curator.auto_label_frame(target_frame)
+            annotations = self.curator.auto_label_frame(target_frame, full_scan=True)
+
+        # P1-14 (K-36): both labelers emit the CANONICAL scheme (0..26);
+        # _canonicalize_annotations only validates, never translates (F-0802
+        # legacy claim was contradicted by the labeler's own docstring).
+        annotations = _canonicalize_annotations(annotations)
 
         # Ensure if a specific material_name was gathered (e.g. "Aria", "Mela", "Orichalcum"),
         # at least one 3D resource mesh box (0..5) reflects the gathered material class
         if resolved_material:
-            expected_cid = map_material_name_to_yolo_class_id(resolved_material, default_id=0)
+            # P1-14 (F4): resolve the gathered name through the taxonomy
+            # FIRST. map_material_name_to_yolo_class_id(..., default_id=0)
+            # would silently turn an unmapped name ("Iron Ore", "Lura",
+            # "Odyle") into herb_aria (0) and fabricate a hint box for a
+            # material that was never seen. Unmapped -> no hint, no align.
+            from dataset_factory.class_taxonomy import class_id_for_material_text
+
+            _expected = class_id_for_material_text(resolved_material)
+            expected_cid = int(_expected) if _expected is not None else -1
             has_mesh_box = any(0 <= int(a.get("class_id", -1)) <= 5 for a in annotations)
             if not has_mesh_box and 0 <= expected_cid <= 5:
-                img_h, img_w = target_frame.shape[:2]
                 # Hint only — never a high-conf train box without a real mesh hit.
                 annotations.append(
                     {
@@ -761,9 +1079,20 @@ class AutoLabelingDatasetFactory:
 
         if not gate_decision.accepted and not force_save:
             with self._lock:
-                self._gather_samples_rejected += 1
+                if roaming:
+                    self._roaming_samples_rejected += 1
+                else:
+                    self._gather_samples_rejected += 1
+            logger.info(
+                "%s #%d atlandı (quality gate): %s (sharpness=%.2f)",
+                _seq_label,
+                gather_seq,
+                gate_decision.reason,
+                gate_decision.sharpness,
+            )
             return {
                 "saved": False,
+                "roaming": bool(roaming),
                 "reason": gate_decision.reason,
                 "sharpness": round(gate_decision.sharpness, 2),
                 "dhash": gate_decision.dhash,
@@ -780,6 +1109,15 @@ class AutoLabelingDatasetFactory:
                 cid, str(ann.get("class_name", f"class_{cid}"))
             )
 
+        # Trusted boxes only: the material-hint fallback appends a weak
+        # (conf 0.35, weak=True) box when no mesh was found -- it is saved as
+        # a hint, but reporting it in box_count inflated the counts.
+        trusted_anns = [
+            ann
+            for ann in validated_anns
+            if not ann.get("weak") and not ann.get("synthetic_fallback")
+        ]
+
         split = gate_decision.split if gate_decision.split in ("train", "val") else "train"
 
         # Compute Active Learning sample priority (1.0 .. 3.0) based on class rarity
@@ -794,7 +1132,14 @@ class AutoLabelingDatasetFactory:
             (resolved_material or "node").lower(),
         ).strip("_") or "node"
         ts_ms = int(time.time() * 1000) % 10000000
-        base_stem = f"gather_t2s_{mat_slug}_s{int(harvest_stage)}_{ts_ms}_{gather_seq:04d}"
+        # The stem records the ACTUAL lookback of the frame used (0.0 when
+        # the buffer was empty and the live frame was used instead), never a
+        # fixed "t2s" when the real lookback was shorter.
+        _stem_kind = "roaming" if roaming else "gather"
+        base_stem = (
+            f"{_stem_kind}_t{actual_lookback_sec:.1f}s_{mat_slug}_s{int(harvest_stage)}_"
+            f"{ts_ms}_{gather_seq:04d}"
+        )
 
         base_save_res = self.curator.save_labeled_sample(
             frame=target_frame,
@@ -843,10 +1188,12 @@ class AutoLabelingDatasetFactory:
             for v_idx, (v_suffix, v_frame, v_anns) in enumerate(variants):
                 if not v_anns:
                     continue
-                v_split = DatasetQualityGate.choose_split(
-                    gather_seq * 10 + v_idx + 1,
-                    val_ratio=self.quality_gate.val_ratio,
-                )
+                # B-01 (dilim 27) / K2 (dilim 03): varyant ana kareyle AYNI
+                # split'e gider. Eskiden `gather_seq * 10 + v_idx + 1` ile
+                # bağımsız takvimden atanıyordu; varyant ana karenin piksel
+                # kopyası olduğu için karşı split'e düşmesi train/val
+                # sızıntısıydı (val, train'in ezberini ölçüyordu).
+                v_split = split
                 v_stem = f"{base_stem}_{v_suffix}"
                 v_res = self.curator.save_labeled_sample(
                     frame=v_frame,
@@ -875,6 +1222,9 @@ class AutoLabelingDatasetFactory:
                 auto_train_info = self.rtx_trainer.start_training_async(
                     data_yaml_path=self.data_yaml_path,
                     epochs=50,
+                    # B-01: otomatik eğitim de onaylı-havuz kuralına uyar;
+                    # eskiden ham dataset/data.yaml ile sessizce eğitiyordu.
+                    use_approved_only=True,
                 )
                 auto_train_launched = bool(auto_train_info.get("started", False))
                 if auto_train_launched:
@@ -883,6 +1233,7 @@ class AutoLabelingDatasetFactory:
 
         result_payload: Dict[str, Any] = {
             "saved": True,
+            "roaming": bool(roaming),
             "gather_event_index": gather_seq,
             "harvest_stage": int(harvest_stage),
             "material_name": resolved_material or "auto_detected",
@@ -898,12 +1249,14 @@ class AutoLabelingDatasetFactory:
             "image_path": str(base_save_res.get("image_path", "")),
             "label_path": str(base_save_res.get("label_path", "")),
             "preview_path": preview_path_str,
-            "box_count": len(validated_anns),
+            "box_count": len(trusted_anns),
+            "weak_box_count": len(validated_anns) - len(trusted_anns),
             "annotations": validated_anns,
             "augmented_variants_saved": len(augmented_saved_paths),
             "augmented_image_paths": augmented_saved_paths,
             "total_samples_added_this_gather": 1 + len(augmented_saved_paths),
-            "total_boxes_added_this_gather": len(validated_anns) + augmented_boxes_count,
+            "total_boxes_added_this_gather": len(trusted_anns) + augmented_boxes_count,
+            "max_harvests": max_harvests,
             "total_images": total_images_now,
             "target_images": self.auto_train_threshold,
             "progress_pct": float(manifest.get("progress_pct", 0.0)),
@@ -911,20 +1264,34 @@ class AutoLabelingDatasetFactory:
             "auto_train_launched": auto_train_launched,
             "auto_train_info": auto_train_info,
             "message_tr": (
-                f"Toplamadan {actual_lookback_sec:.1f} sn önceki kare otomatik etiketlendi "
-                f"({len(validated_anns)} kutu, +{len(augmented_saved_paths)} sentetik varyant). "
+                f"{'Gezinirken' if roaming else 'Toplamadan'} {actual_lookback_sec:.1f} sn önceki kare otomatik etiketlendi "
+                f"({len(trusted_anns)} kutu, +{len(augmented_saved_paths)} sentetik varyant). "
                 f"İlerleme: {total_images_now} / {self.auto_train_threshold}."
             ),
         }
 
         with self._lock:
-            self._gather_samples_accepted += 1
+            if roaming:
+                self._roaming_samples_accepted += 1
+            else:
+                self._gather_samples_accepted += 1
             self._synthetic_variants_saved += len(augmented_saved_paths)
             if preview_path_str:
                 self._last_saved_preview_path = preview_path_str
             if base_save_res.get("image_path"):
                 self._last_saved_image_path = str(base_save_res["image_path"])
             self._last_gather_result = result_payload
+
+        logger.info(
+            "YZ kare kaydedildi%s #%d: %s (%s, %d kutu, +%d varyant) -> %s",
+            " (gezinme)" if roaming else "",
+            gather_seq,
+            result_payload["material_name"],
+            split,
+            len(trusted_anns),
+            len(augmented_saved_paths),
+            str(base_save_res.get("image_path", "")),
+        )
 
         return result_payload
 
@@ -936,14 +1303,20 @@ class AutoLabelingDatasetFactory:
         Returns live statistics in Turkish & structured JSON:
           - `total_images`, `target_images: 100000`, `progress_pct`
           - `train_images`, `val_images`, `total_boxes`
-          - `class_counts` (canonical 12 class names -> box count, plus `class_counts_by_id` & `class_counts_tr`)
+          - `class_counts` (canonical class names -> box count, plus `class_counts_by_id` & `class_counts_tr`)
           - `gpu_info` (hardware probe from `RTXTrainerEngine`)
           - `last_saved_preview_path` (plus `latest_preview_path` alias)
           - `is_training`, `training_metrics`
           - Turkish diagnostic summaries (`status_tr`, `summary_tr`, `time_machine_status_tr`, `gpu_status_tr`)
         """
         with self._lock:
-            manifest = self.curator.rebuild_manifest_stats()
+            # P2-20: başlangıç senkronizasyonu ilk durum sorgusunda
+            # yapılır — __init__ artık tam manifest taraması yapmaz.
+            self._ensure_initial_state()
+            # Cached manifest (get_manifest_stats reads dataset/manifest_stats.json
+            # and rebuilds only when the file is missing): status polling must
+            # not rescan the whole dataset directory on every call.
+            manifest = self.curator.get_manifest_stats()
             trainer_status = self.rtx_trainer.get_status()
             gpu_info = self._get_gpu_info_cached()
             tm_stats = self.time_machine.get_stats()
@@ -1049,7 +1422,8 @@ class AutoLabelingDatasetFactory:
                 "status_tr": status_tr,
                 "summary_tr": (
                     f"Toplam {total_images}/{target_images} etiketli kare "
-                    f"(Train: {train_images}, Val: {val_images}) ve 12 sınıfta {total_boxes} YOLO kutusu."
+                    f"(Train: {train_images}, Val: {val_images}) ve "
+                    f"{len(FACTORY_12_CLASS_NAMES)} sınıfta {total_boxes} YOLO kutusu."
                 ),
                 "time_machine_status_tr": tm_status_tr,
                 "gpu_status_tr": gpu_status_tr,
@@ -1062,6 +1436,10 @@ class AutoLabelingDatasetFactory:
                 "gather_events_total": self._gather_events_total,
                 "gather_samples_accepted": self._gather_samples_accepted,
                 "gather_samples_rejected": self._gather_samples_rejected,
+                # v20-yz: gezinme çekimi sayaçları (hasattan ayrı).
+                "roaming_events_total": self._roaming_events_total,
+                "roaming_samples_accepted": self._roaming_samples_accepted,
+                "roaming_samples_rejected": self._roaming_samples_rejected,
                 "synthetic_variants_saved": self._synthetic_variants_saved,
                 "active_learning_saves": self._active_learning_saves,
                 "time_machine": tm_stats,
@@ -1098,9 +1476,17 @@ class AutoLabelingDatasetFactory:
         force_fallback: bool = False,
         model: str = "yolo11n.pt",
         allow_opencv_fallback: bool = False,
+        # B-01 (dilim 24): imzada yoktu; dialog `inspect.signature` ile
+        # koşullu geçirdiği için bayrak sessizce düşüyor, eğitim ham
+        # `dataset/data.yaml` ile çalışıyordu. Varsayılan True: ürün
+        # vaadi "Sadece Onaylananlarla Eğit"tir.
+        only_approved: bool = True,
+        data_yaml_path: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """
-        Launches `RTXTrainerEngine` on `dataset/data.yaml`.
+        Launches `RTXTrainerEngine` on the approved dataset
+        (`dataset/approved/data_approved.yaml`) by default, or on
+        `dataset/data.yaml` when `only_approved=False`.
 
         Args:
             epochs: Number of training epochs (default `50`).
@@ -1114,6 +1500,12 @@ class AutoLabelingDatasetFactory:
             force_fallback: Force built-in OpenCV/NumPy prototype trainer mode.
             model: Ultralytics weights name (e.g. `yolo11m.pt`).
             allow_opencv_fallback: Factory default False — never fake-complete via Mode B.
+            only_approved: Train strictly with human-approved samples
+                           (`dataset/approved/data_approved.yaml`, default `True`).
+                           `False` trains on the raw `dataset/data.yaml`.
+            data_yaml_path: Explicit training yaml; honoured as-is. When omitted
+                            and `only_approved=True`, the engine resolves the
+                            approved yaml; otherwise the raw dataset yaml.
 
         Returns:
             Dictionary containing final training metrics (`mAP50`, `mAP50_95`, `box_loss`,
@@ -1129,6 +1521,8 @@ class AutoLabelingDatasetFactory:
                 force_fallback=bool(force_fallback),
                 model=str(model),
                 allow_opencv_fallback=bool(allow_opencv_fallback),
+                only_approved=bool(only_approved),
+                data_yaml_path=data_yaml_path,
             )
 
         prepared = self.prepare_one_click_dataset()
@@ -1143,7 +1537,9 @@ class AutoLabelingDatasetFactory:
             }
 
         return self.rtx_trainer.run_training_sync(
-            data_yaml_path=self.data_yaml_path,
+            data_yaml_path=(
+                data_yaml_path if data_yaml_path is not None else self.data_yaml_path
+            ),
             epochs=int(epochs),
             progress_callback=progress_callback,
             imgsz=int(imgsz),
@@ -1151,6 +1547,7 @@ class AutoLabelingDatasetFactory:
             force_fallback=bool(force_fallback),
             model=str(model),
             allow_opencv_fallback=bool(allow_opencv_fallback),
+            use_approved_only=bool(only_approved),
         )
 
     def stop_training(self) -> None:
@@ -1191,6 +1588,8 @@ class AutoLabelingDatasetFactory:
         force_fallback: bool,
         model: str = "yolo11n.pt",
         allow_opencv_fallback: bool = False,
+        only_approved: bool = True,
+        data_yaml_path: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """Return immediately. Dataset bootstrap and the CUDA launch run on a side thread."""
         existing = getattr(self, "_one_click_thread", None)
@@ -1217,7 +1616,11 @@ class AutoLabelingDatasetFactory:
                         progress_callback(dict(payload))
                     return
                 self._last_one_click_result = self.rtx_trainer.start_training_async(
-                    data_yaml_path=self.data_yaml_path,
+                    data_yaml_path=(
+                        data_yaml_path
+                        if data_yaml_path is not None
+                        else self.data_yaml_path
+                    ),
                     epochs=int(epochs),
                     progress_callback=progress_callback,
                     imgsz=int(imgsz),
@@ -1225,6 +1628,7 @@ class AutoLabelingDatasetFactory:
                     force_fallback=bool(force_fallback),
                     model=str(model),
                     allow_opencv_fallback=bool(allow_opencv_fallback),
+                    use_approved_only=bool(only_approved),
                 )
             except Exception as exc:
                 logger.exception("One-click dataset bootstrap failed: %s", exc)
@@ -1247,10 +1651,22 @@ class AutoLabelingDatasetFactory:
             daemon=True,
         )
         self._one_click_thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            return {
+                "started": False,
+                "bootstrap_pending": False,
+                "training_started": False,
+                "reason": f"Bootstrap thread could not be started: {exc}",
+            }
         return {
+            # "started" means the bootstrap THREAD started, not training:
+            # dataset bootstrap runs first and CUDA training only starts
+            # afterwards (and only once the game has exited).
             "started": True,
             "bootstrap_pending": True,
+            "training_started": False,
             "thread_name": thread.name,
         }
 
@@ -1262,10 +1678,14 @@ class AutoLabelingDatasetFactory:
         augment_multiplier: Optional[int] = None,
         augment_factor: Optional[int] = None,
         max_source_frames: int = 24,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """
         Bootstraps `dataset/` from `reference_screenshots/` and `video_frames/`,
         generating synthetic variants and updating `dataset/manifest_stats.json`.
+
+        P2-8 (DF.9): `should_stop` verilirse küratör kare sınırında
+        durur; kısmi sonuç `cancelled: True` ile döner.
         """
         if augment_factor is not None:
             factor = max(0, int(augment_factor))
@@ -1278,6 +1698,7 @@ class AutoLabelingDatasetFactory:
             augment_factor=factor,
             save_base_previews=True,
             save_variant_previews=False,
+            should_stop=should_stop,
         )
         self._sync_initial_state()
         status = self.get_factory_status()
@@ -1287,6 +1708,9 @@ class AutoLabelingDatasetFactory:
                 "bootstrapped_frames_added": int(boot_res.get("total_samples_saved", 0)),
                 "bootstrapped_boxes_added": int(boot_res.get("total_boxes", 0)),
                 "bootstrap_summary": boot_res,
+                # P2-8: kısmi (iptal edilmiş) tarama açıkça işaretlenir.
+                "cancelled": bool(boot_res.get("cancelled", False)),
+                "interrupted": bool(boot_res.get("interrupted", False)),
             }
         )
         return status
@@ -1321,8 +1745,10 @@ class AutoLabelingDatasetFactory:
         }
 
     def get_factory_controller_health_summary(self) -> dict:
+        # Delegates to the real contract validator (canonical taxonomy match
+        # etc.) instead of unconditionally reporting ready.
         try:
-            return {"factory_controller_ready": True}
+            return {"factory_controller_ready": bool(validate_factory_controller_contract())}
         except Exception:
             return {"factory_controller_ready": False}
 
@@ -1330,7 +1756,7 @@ class AutoLabelingDatasetFactory:
         return {"module": "factory_controller", "ready": True}
 
     def get_factory_controller_version_info(self) -> dict:
-        return {"module": "factory_controller", "version": "2.0.0", "ready": True}
+        return {"module": "factory_controller", "version": __version__, "ready": True}
 
     def get_factory_controller_diagnostic_snapshot(self) -> dict:
         return {"module": "factory_controller", "status": "ok", "ready": True}
@@ -1391,43 +1817,108 @@ def get_factory_controller_capabilities() -> list:
 
 
 def validate_factory_controller_contract() -> bool:
-    return bool(get_factory_controller_capabilities())
+    """Real contract check for the factory controller.
+
+    Previously this only checked that a hard-coded capability list was
+    non-empty (a tautology), and the readiness/audit/seal/certificate chain
+    built on it was fake assurance. Now it verifies the actual invariants:
+    the factory class exists, the class-name map is exactly the canonical
+    0..26 taxonomy, and the game-block check returns a string.
+    """
+    try:
+        if not get_factory_controller_capabilities():
+            return False
+        if not isinstance(AutoLabelingDatasetFactory, type):
+            return False
+        from dataset_factory.class_taxonomy import CANONICAL_NAMES
+
+        if dict(FACTORY_12_CLASS_NAMES) != dict(CANONICAL_NAMES):
+            return False
+        if not isinstance(cuda_training_blocked_by_game(), str):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+# The readiness/audit/seal/certificate wrappers below used to call
+# validate_factory_controller_contract() once PER NESTING LEVEL (8 calls for
+# get_factory_controller_audit_summary), each re-importing the taxonomy and
+# re-comparing the 27-entry map. The nesting also meant the levels could
+# theoretically disagree with each other. Each public wrapper now validates
+# exactly once and threads the single result through private builders, so
+# the nested payload is built from one consistent verdict. Public names,
+# signatures and returned payloads are unchanged.
+def _chain_baseline_metrics(valid: bool) -> dict:
+    return {"module": "factory_controller", "contract_valid": valid, "capability_count": len(get_factory_controller_capabilities())}
+
+
+def _chain_readiness_status(valid: bool) -> dict:
+    return {"module": "factory_controller", "ready": valid, "metrics": _chain_baseline_metrics(valid)}
+
+
+def _chain_audit_record(valid: bool) -> dict:
+    return {"module": "factory_controller", "audit_passed": valid, "readiness": _chain_readiness_status(valid)}
+
+
+def _chain_operational_digest(valid: bool) -> dict:
+    return {"module": "factory_controller", "operational": valid, "audit": _chain_audit_record(valid)}
+
+
+def _chain_telemetry_payload(valid: bool) -> dict:
+    return {"module": "factory_controller", "payload": _chain_operational_digest(valid)}
+
+
+def _chain_integrity_seal(valid: bool) -> dict:
+    return {"module": "factory_controller", "sealed": valid, "telemetry": _chain_telemetry_payload(valid)}
+
+
+def _chain_compliance_certificate(valid: bool) -> dict:
+    return {"module": "factory_controller", "certified": valid, "seal": _chain_integrity_seal(valid)}
+
+
+def _chain_readiness_probe(valid: bool) -> dict:
+    return {"module": "factory_controller", "ready": valid, "certificate": _chain_compliance_certificate(valid)}
+
+
+def _chain_audit_summary(valid: bool) -> dict:
+    return {"module": "factory_controller", "audit_passed": valid, "probe": _chain_readiness_probe(valid)}
 
 
 def get_factory_controller_baseline_metrics() -> dict:
-    return {"module": "factory_controller", "contract_valid": validate_factory_controller_contract(), "capability_count": len(get_factory_controller_capabilities())}
+    return _chain_baseline_metrics(validate_factory_controller_contract())
 
 
 def get_factory_controller_readiness_status() -> dict:
-    return {"module": "factory_controller", "ready": validate_factory_controller_contract(), "metrics": get_factory_controller_baseline_metrics()}
+    return _chain_readiness_status(validate_factory_controller_contract())
 
 
 def get_factory_controller_audit_record() -> dict:
-    return {"module": "factory_controller", "audit_passed": validate_factory_controller_contract(), "readiness": get_factory_controller_readiness_status()}
+    return _chain_audit_record(validate_factory_controller_contract())
 
 
 def get_factory_controller_operational_digest() -> dict:
-    return {"module": "factory_controller", "operational": validate_factory_controller_contract(), "audit": get_factory_controller_audit_record()}
+    return _chain_operational_digest(validate_factory_controller_contract())
 
 
 def get_factory_controller_telemetry_payload() -> dict:
-    return {"module": "factory_controller", "payload": get_factory_controller_operational_digest()}
+    return _chain_telemetry_payload(validate_factory_controller_contract())
 
 
 def get_factory_controller_integrity_seal() -> dict:
-    return {"module": "factory_controller", "sealed": validate_factory_controller_contract(), "telemetry": get_factory_controller_telemetry_payload()}
+    return _chain_integrity_seal(validate_factory_controller_contract())
 
 
 def get_factory_controller_compliance_certificate() -> dict:
-    return {"module": "factory_controller", "certified": validate_factory_controller_contract(), "seal": get_factory_controller_integrity_seal()}
+    return _chain_compliance_certificate(validate_factory_controller_contract())
 
 
 def get_factory_controller_readiness_probe() -> dict:
-    return {"module": "factory_controller", "ready": validate_factory_controller_contract(), "certificate": get_factory_controller_compliance_certificate()}
+    return _chain_readiness_probe(validate_factory_controller_contract())
 
 
 def get_factory_controller_audit_summary() -> dict:
-    return {"module": "factory_controller", "audit_passed": validate_factory_controller_contract(), "probe": get_factory_controller_readiness_probe()}
+    return _chain_audit_summary(validate_factory_controller_contract())
 
 
 

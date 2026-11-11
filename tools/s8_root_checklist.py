@@ -15,11 +15,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 S8_ROOT_DIR = ROOT / "vendor" / "android_hid" / "s8_root"
@@ -102,6 +103,118 @@ def _prop(adb: str, serial: str, name: str) -> str:
     return (out or "").splitlines()[0].strip() if out else ""
 
 
+_GETPROP_LINE_RE = re.compile(r"^\[([^\]]+)\]: \[(.*)\]\s*$")
+
+
+def _props_batch(adb: str, serial: str, names: List[str]) -> Dict[str, str]:
+    """Read several props with ONE `adb shell getprop` call.
+
+    A single bare `getprop` prints every property as `[name]: [value]`
+    lines; parsing that one round-trip replaces one adb call per property
+    (9 calls -> 1 in main()). Any name missing from the batch output —
+    or a failed batch call — falls back to the per-property `_prop`
+    probe, so behaviour is identical to the old sequential reads.
+    """
+    found: Dict[str, str] = {}
+    code, out = _run(adb, ["shell", "getprop"], serial=serial)
+    if code == 0 and out:
+        wanted = set(names)
+        for line in out.splitlines():
+            m = _GETPROP_LINE_RE.match(line.strip())
+            if m and m.group(1) in wanted:
+                found[m.group(1)] = m.group(2)
+    for name in names:
+        if name not in found:
+            found[name] = _prop(adb, serial, name)
+    return found
+
+
+def _self_test_props_batch() -> int:
+    """In-process test for `_props_batch` (run: `--self-test`).
+
+    Stubs the module-level `_run` with a fake adb and checks: (1) a full
+    batch hit issues exactly 1 adb call, (2) a name missing from the batch
+    output is filled by exactly 1 per-property fallback call, (3) a failed
+    batch call falls back to per-property probes for every name.
+    """
+    failures: List[str] = []
+
+    def check(cond: bool, label: str, detail: object = None) -> None:
+        if not cond:
+            failures.append(f"{label}: {detail!r}" if detail is not None else label)
+
+    calls: List[List[str]] = []
+    batch_lines = [
+        "[ro.product.model]: [SM-G950F]",
+        "[ro.product.device]: [dreamlte]",
+        "[ro.boot.flash.locked]: [0]",
+        "[weird.prop]: [a]b]",  # value containing ']' parses to 'a]b'
+    ]
+
+    def fake_run(adb: str, args: List[str], serial: str = "") -> Tuple[int, str]:
+        calls.append(list(args))
+        if args == ["shell", "getprop"]:
+            return 0, "\n".join(batch_lines)
+        if args[:2] == ["shell", "getprop"]:
+            single = {"ro.product.model": "SM-G950F", "ro.boot.flash.locked": "0"}
+            return 0, single.get(args[2], "")
+        return 99, "unexpected"
+
+    global _run
+    real_run = _run
+    try:
+        _run = fake_run  # type: ignore[assignment]
+        names = ["ro.product.model", "ro.product.device", "ro.boot.flash.locked"]
+        got = _props_batch("adb", "serial-1", names)
+        check(
+            got == {
+                "ro.product.model": "SM-G950F",
+                "ro.product.device": "dreamlte",
+                "ro.boot.flash.locked": "0",
+            },
+            "full batch values",
+            got,
+        )
+        check(len(calls) == 1, "full batch = 1 adb call", calls)
+
+        calls.clear()
+        got = _props_batch("adb", "serial-1", ["ro.product.model", "missing.prop"])
+        check(got["ro.product.model"] == "SM-G950F", "partial batch hit", got)
+        check(got["missing.prop"] == "", "missing name falls back to ''", got)
+        check(len(calls) == 2, "partial batch = 1 batch + 1 fallback", calls)
+        check(
+            calls[1] == ["shell", "getprop", "missing.prop"],
+            "fallback probes the missing name",
+            calls,
+        )
+
+        calls.clear()
+        got = _props_batch("adb", "serial-1", ["weird.prop"])
+        check(got["weird.prop"] == "a]b", "value with ']' parses", got)
+        check(len(calls) == 1, "bracket value needs no fallback", calls)
+
+        def failing_run(adb: str, args: List[str], serial: str = "") -> Tuple[int, str]:
+            calls.append(list(args))
+            if args == ["shell", "getprop"]:
+                return 1, "error: device offline"
+            return 0, "SM-G950F" if args[2] == "ro.product.model" else ""
+
+        _run = failing_run  # type: ignore[assignment]
+        calls.clear()
+        got = _props_batch("adb", "serial-1", ["ro.product.model", "ro.product.device"])
+        check(got["ro.product.model"] == "SM-G950F", "failed batch falls back", got)
+        check(len(calls) == 3, "failed batch = 1 batch + 2 fallbacks", calls)
+    finally:
+        _run = real_run  # type: ignore[assignment]
+
+    if failures:
+        for f in failures:
+            print(f"SELF-TEST FAIL: {f}", file=sys.stderr)
+        return 1
+    print("SELF-TEST OK: _props_batch (full/partial/bracket/failed-batch)")
+    return 0
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -110,13 +223,20 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _print_staged_artifacts() -> None:
+def _print_staged_artifacts() -> bool:
+    """Print staged artifacts; return False if any staged hash mismatches.
+
+    F-1152: a SHA256 mismatch no longer silently stages the artifact —
+    the Magisk APK is NOT copied to Magisk-v31.1.zip and the caller must
+    treat the run as failed (non-zero exit).
+    """
     print("")
     print(f"--- Staged folder: {S8_ROOT_DIR} ---")
     S8_ROOT_DIR.mkdir(parents=True, exist_ok=True)
     twrp_local = S8_ROOT_DIR / TWRP_TAR_NAME
     magisk_local = S8_ROOT_DIR / MAGISK_APK_NAME
     magisk_zip = S8_ROOT_DIR / "Magisk-v31.1.zip"
+    artifacts_ok = True
 
     if twrp_local.is_file() and twrp_local.stat().st_size > 1_000_000:
         digest = _sha256_file(twrp_local)
@@ -125,6 +245,9 @@ def _print_staged_artifacts() -> None:
         if TWRP_TAR_SHA256:
             ok = digest.lower() == TWRP_TAR_SHA256.lower()
             print(f"    staged_expected={TWRP_TAR_SHA256}  match={ok}")
+            if not ok:
+                print("    ERROR: TWRP SHA256 MISMATCH — do NOT flash this file; re-download and re-verify.")
+                artifacts_ok = False
         print("    Odin: load this file in AP slot (Auto Reboot OFF)")
     else:
         print(f"  TWRP tar: MISSING under {S8_ROOT_DIR}")
@@ -141,11 +264,18 @@ def _print_staged_artifacts() -> None:
         digest = _sha256_file(magisk_local)
         print(f"  Magisk APK: {magisk_local}")
         print(f"    size={magisk_local.stat().st_size}  sha256={digest}")
+        magisk_ok = True
         if MAGISK_APK_SHA256:
-            ok = digest.lower() == MAGISK_APK_SHA256.lower()
-            print(f"    expected={MAGISK_APK_SHA256}  match={ok}")
+            magisk_ok = digest.lower() == MAGISK_APK_SHA256.lower()
+            print(f"    expected={MAGISK_APK_SHA256}  match={magisk_ok}")
+            if not magisk_ok:
+                print("    ERROR: Magisk SHA256 MISMATCH — staged copy BLOCKED; do NOT flash this file; re-download and re-verify.")
+                artifacts_ok = False
         print("    TWRP flash: copy/rename APK → Magisk-v31.1.zip (same bytes) then Install")
-        if not magisk_zip.is_file():
+        if not magisk_ok:
+            # F-1152: never stage a hash-mismatched APK as the flashable ZIP.
+            print("    Magisk ZIP staging SKIPPED due to SHA256 mismatch.")
+        elif not magisk_zip.is_file():
             try:
                 shutil.copy2(magisk_local, magisk_zip)
                 print(f"  Magisk ZIP (staged copy): {magisk_zip}")
@@ -179,6 +309,7 @@ def _print_staged_artifacts() -> None:
     else:
         print("  Multidisabler: MISSING — fetch Ian Macdonald v3.1 for dreamlte/Pie")
         print("    https://github.com/ianmacd/multidisabler-samsung/releases/tag/v3.1")
+    return artifacts_ok
 
 
 def _print_odin_steps(*, skip_oem_unlock: bool, unlocked_hint: str) -> None:
@@ -258,7 +389,14 @@ def _print_odin_steps(*, skip_oem_unlock: bool, unlocked_hint: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="SM-G950F root/HID operator checklist (no flash)")
     ap.add_argument("--serial", default="", help="adb serial (optional)")
+    ap.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the in-process _props_batch test and exit (no adb needed)",
+    )
     args = ap.parse_args()
+    if args.self_test:
+        return _self_test_props_batch()
     serial = str(args.serial or "").strip()
 
     print("=== SM-G950F root kit checklist (operator; no remote flash) ===")
@@ -276,6 +414,7 @@ def main() -> int:
     unlocked_hint = "unknown"
     rooted = False
     has_hid = False
+    probe_done = False  # F-1153: True only when live props were actually read.
     adb = _find_adb()
 
     if not adb:
@@ -296,15 +435,32 @@ def main() -> int:
             print("No authorized device — connect SM-G950F, accept RSA, re-run.")
         else:
             print(f"Using serial: {serial}")
-            model = _prop(adb, serial, "ro.product.model")
-            device = _prop(adb, serial, "ro.product.device")
-            release = _prop(adb, serial, "ro.build.version.release")
-            bootloader = _prop(adb, serial, "ro.boot.bootloader")
-            vbs = _prop(adb, serial, "ro.boot.verifiedbootstate")
-            locked = _prop(adb, serial, "ro.boot.flash.locked")
-            warranty = _prop(adb, serial, "ro.boot.warranty_bit")
-            oem_allowed = _prop(adb, serial, "sys.oem_unlock_allowed")
-            usb = _prop(adb, serial, "sys.usb.config")
+            # One batched `getprop` round-trip for all 9 props (was 9 calls);
+            # missing names fall back to per-property probes inside.
+            props = _props_batch(
+                adb,
+                serial,
+                [
+                    "ro.product.model",
+                    "ro.product.device",
+                    "ro.build.version.release",
+                    "ro.boot.bootloader",
+                    "ro.boot.verifiedbootstate",
+                    "ro.boot.flash.locked",
+                    "ro.boot.warranty_bit",
+                    "sys.oem_unlock_allowed",
+                    "sys.usb.config",
+                ],
+            )
+            model = props["ro.product.model"]
+            device = props["ro.product.device"]
+            release = props["ro.build.version.release"]
+            bootloader = props["ro.boot.bootloader"]
+            vbs = props["ro.boot.verifiedbootstate"]
+            locked = props["ro.boot.flash.locked"]
+            warranty = props["ro.boot.warranty_bit"]
+            oem_allowed = props["sys.oem_unlock_allowed"]
+            usb = props["sys.usb.config"]
             code_id, id_out = _run(adb, ["shell", "id"], serial=serial)
             code_hid, hid_out = _run(adb, ["shell", "ls", "-la", "/dev/hidg0"], serial=serial)
             code_su, su_out = _run(adb, ["shell", "su", "-c", "id"], serial=serial)
@@ -332,16 +488,22 @@ def main() -> int:
                 skip_oem = False
                 unlocked_hint = "probe-failed-recheck"
             else:
+                probe_done = True
                 ok_model = model == EXPECTED_MODEL and device == EXPECTED_DEVICE
                 if "G950U" in model or "G950W" in model:
                     print("STOP: Snapdragon / unlock-hostile variant — do NOT use dreamlte TWRP.")
                     print("Fall back: Pico HID or Interception (PC).")
                     return 3
                 if not ok_model:
+                    # F-1217: a model/device mismatch must NOT print the
+                    # dreamlte flash steps — they would target the wrong device.
                     print(
-                        f"WARN: model/device mismatch — expected "
-                        f"{EXPECTED_MODEL}/{EXPECTED_DEVICE}"
+                        "STOP: model/device mismatch — expected "
+                        f"{EXPECTED_MODEL}/{EXPECTED_DEVICE}, got "
+                        f"model={model!r} device={device!r}."
                     )
+                    print("Do NOT flash dreamlte TWRP/Magisk on this device.")
+                    return 3
 
                 # Unlock heuristic: flash.locked=0 and/or orange verified boot
                 skip_oem = locked == "0" or vbs == "orange"
@@ -380,8 +542,7 @@ def main() -> int:
                         "--push --forward --write-settings"
                     )
                     print("      set GATHERION_HID_TCP=127.0.0.1:18765")
-                    _print_staged_artifacts()
-                    return 0
+                    return 0 if _print_staged_artifacts() else 2
                 if rooted and not has_hid:
                     print(
                         "NEXT: open /dev/hidg0 "
@@ -391,10 +552,9 @@ def main() -> int:
                         "      then: python tools\\setup_android_usb_hid.py "
                         "--push --enable-gadget"
                     )
-                    _print_staged_artifacts()
-                    return 0
+                    return 0 if _print_staged_artifacts() else 2
 
-    _print_staged_artifacts()
+    artifacts_ok = _print_staged_artifacts()
     _print_odin_steps(skip_oem_unlock=skip_oem, unlocked_hint=unlocked_hint)
 
     print("")
@@ -416,6 +576,15 @@ def main() -> int:
     print(f'  "{adb_hint}" shell su -c "ls -l /dev/hidg0"')
     print("")
     print("GOAL: live key proof via /dev/hidg0 OR Interception — docs alone ≠ done.")
+    # F-1153: exit 0 only when a live probe actually ran AND no staged
+    # artifact failed its hash check. No probe (adb missing / no device /
+    # probe failed) or a hash mismatch exits 2.
+    if not probe_done:
+        print("RESULT: no live probe ran — exit 2 (re-run with the device connected).")
+        return 2
+    if not artifacts_ok:
+        print("RESULT: staged artifact hash mismatch — exit 2 (re-download and re-verify).")
+        return 2
     return 0
 
 

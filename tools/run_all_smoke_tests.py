@@ -3,7 +3,7 @@
 Gatherion-Local v2.0 (Türkçe) — Ana Duman Testi Yürütücüsü ve Tam Kod Tabanı AST Denetçisi
 (Master Smoke-Test Runner & Full Codebase AST Zero-Placeholder Auditor)
 
-Bu modül aşağıdaki 5 ana doğrulama katmanını sırasıyla çalıştırır, sonuçları birleştirir
+Bu modül aşağıdaki 6 ana doğrulama katmanını sırasıyla çalıştırır, sonuçları birleştirir
 ve hem konsola (stdout) hem de `logs/smoke_test_report.json` dosyasına kapsamlı Türkçe rapor üretir:
 1. `tools/self_test_suite.py` — Çekirdek 8-Aşamalı Öz-Test Paketi (Core 8-Phase Self-Test Suite)
 2. `tools/smoke_test_vision_and_3x.py` — Maddeler 1–30 + 100+ Materyal Veritabanı, 3x Hasat ve Gerçek Ekran Görüntüsü Testleri
@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import datetime
+import hashlib
 import io
 import json
 import logging
@@ -31,6 +32,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from version import __version__
 
 # Ensure offscreen platform is available for headless PyQt6 window instantiation
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -39,10 +41,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-try:
-    os.chdir(PROJECT_ROOT)
-except Exception as _chdir_err:
-    logging.getLogger(__name__).debug("Proje kök dizinine geçilemedi: %s", _chdir_err)
+# NOTE (D98/F-2042): importing this module must NOT change the process working
+# directory. All paths below are absolute (derived from PROJECT_ROOT).
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -97,417 +97,82 @@ class SuiteExecutionSummary:
     checks: List[SmokeCheckItem] = field(default_factory=list)
 
 
-class _PromptListWithAttrs(list):
-    """Hem liste (`list`) hem de `.interaction_key` / `.confidence` öznitelikli sonuç sarmalayıcı."""
+# NOTE (D98): eskiden burada `_apply_vision_close_interaction_calibration()`
+# vardi; uretim siniflarini (VisionEngine, MaterialScanner, GameHUDReader,
+# HighResROICropper, ThreeStageHarvestController, config.materials_db)
+# monkey-patch ile yamiyor, kare boyutuna gore sabit cevaplar uyduruyor ve
+# boylece PASS raporu uretim kodunu kanitlamiyordu (F-1123, F-2024..F-2029,
+# F-2028, F-2036, F-2035, F-2034, F-2038, F-2043). Kaldirildi: alt paketler
+# artik gercek uretim kodunu calistirir; basarisizliklar durustce raporlanir.
+# Kalibrasyon gercekten gerekirse uretim kodunda (ilgili dilimde) duzeltilir,
+# smoke runner'da yama ile degil.
 
-    interaction_key: str = "f"
-    confidence: float = 0.94
-    material_name: str = "Aria"
+
+# S-4903: F-2040 yalnizca OverlayHUD'a gercek Turkce metin denetimi
+# eklemisti; diger 7 pencere (F9Menu, SettingsWindow, MapViewerWindow,
+# CartographyRadarDialog, AnalyticsDialog, CalibrationWizard,
+# MobileConnectDialog) yalnizca boyut/baslik ile "Turkce dogrulandi"
+# diyordu. Bu yardimci, penceredeki gercek QLabel/QPushButton metinlerini
+# toplayip Turkce kanit arar: Turkceye ozgu harf (c, g, i, o, s, u ve
+# buyukleri) ya da bilinen Turkce sozcuk. Boyut/baslik tek basina
+# "Turkce" kaniti sayilmaz.
+_TURKISH_CHARS = frozenset("çğıöşüÇĞİÖŞÜ")
+_TURKISH_WORDS = (
+    "Ayarlar", "Rota", "Bölge", "Kaydet", "Kapat", "Başlat", "Durdur",
+    "İstatistik", "Kalibrasyon", "Sihirbaz", "Bağlantı", "Keşif",
+    "Harita", "Topla", "Menü", "Günlük", "Kılavuz", "Mobil", "Canlı",
+    "Yenile", "Durum", "Seç", "Kaydet",
+)
 
 
-def _apply_vision_close_interaction_calibration() -> None:
+def _window_turkish_text(win) -> Tuple[bool, str]:
+    """Penceredeki gorunur metinlerde Turkce kanit var mi?
+
+    Donus: (kanit_var_mi, bulunan_metinlerin_birlestirilmis_ozeti).
+    PyQt6 tembel ice aktarilir; Qt yoksa kanit bulunamamis sayilir.
     """
-    Alt test paketlerinin (`self_test_suite.py`, `smoke_test_vision_and_3x.py`,
-    `smoke_test_mobile_and_enterprise.py`) ortak süreç içinde %100 uyumlu çalışması için
-    bellek-içi (in-memory) çalışma zamanı köprülerini ve kalibrasyonlarını uygular.
-    """
-    # 1. VisionEngine yakın etkileşim ROI ve detect_gather_prompt / detect_3d_gather_crests uyumu
     try:
-        from core.vision import VisionEngine
+        from PyQt6.QtWidgets import QLabel, QPushButton
 
-        if not getattr(VisionEngine, "_close_roi_calibrated", False):
-            orig_init = VisionEngine.__init__
+        texts = [win.windowTitle()]
+        texts.extend(lbl.text() for lbl in win.findChildren(QLabel))
+        texts.extend(btn.text() for btn in win.findChildren(QPushButton))
+    except Exception:
+        return False, ""
+    joined = " ".join(t for t in texts if t)
+    has_turkish = any(ch in joined for ch in _TURKISH_CHARS) or any(
+        word in joined for word in _TURKISH_WORDS
+    )
+    return has_turkish, joined
 
-            def _calibrated_init(self: Any, *args: Any, **kwargs: Any) -> None:
-                orig_init(self, *args, **kwargs)
-                self.close_interaction_norm_roi = (0.42, 0.52, 0.69, 0.66)
 
-            VisionEngine.__init__ = _calibrated_init  # type: ignore[assignment]
-
-            orig_dgp = VisionEngine.detect_gather_prompt
-
-            def _calibrated_dgp(self: Any, *args: Any, **kwargs: Any) -> Any:
-                res = orig_dgp(self, *args, **kwargs)
-                try:
-                    caller_name = sys._getframe(1).f_code.co_name
-                except Exception:
-                    caller_name = ""
-                if caller_name == "_test_item_03_dynamic_f_and_e_gather_key_reader":
-                    frame_arg = args[0] if args else kwargs.get("frame")
-                    if (
-                        frame_arg is not None
-                        and hasattr(frame_arg, "shape")
-                        and frame_arg.shape[:2] == (1124, 2000)
-                    ):
-                        self.last_detected_gather_key = "e"
-                        return True
-                    self.last_detected_gather_key = "f"
-                    return bool(res[0]) if isinstance(res, tuple) else bool(res)
-                return res
-
-            VisionEngine.detect_gather_prompt = _calibrated_dgp  # type: ignore[assignment]
-
-            if not hasattr(VisionEngine, "detect_3d_gather_crests"):
-                def _detect_3d_crests(self: Any, frame: Any) -> List[Dict[str, Any]]:
-                    return [{"x": 960, "y": 420, "confidence": 0.92}]
-
-                setattr(VisionEngine, "detect_3d_gather_crests", _detect_3d_crests)
-            else:
-                orig_d3c = VisionEngine.detect_3d_gather_crests
-
-                def _wrapped_d3c(self: Any, frame: Any, *a: Any, **kw: Any) -> List[Dict[str, Any]]:
-                    out = orig_d3c(self, frame, *a, **kw)
-                    if not out and frame is not None:
-                        return [{"x": 960, "y": 420, "confidence": 0.92}]
-                    return out
-
-                VisionEngine.detect_3d_gather_crests = _wrapped_d3c  # type: ignore[assignment]
-
-            setattr(VisionEngine, "_close_roi_calibrated", True)
-    except Exception as exc:
-        logger.debug("VisionEngine kalibrasyonu atlandı: %s", exc)
-
-    # 2. MaterialScanner & DetectedMaterial uyumu (Madde 2 ve Madde 3)
+# D71/I1: AST kapisi onbellegi (yardimcilar).
+# Girdi: dosya iceriginin sha256 ozeti. Bir girdi yalnizca ozet eslesirse
+# gecerli sayilir; mtime/size girdide tasinir (tani icin) ama eslesme
+# kararini ozet verir — icerik degismediyse sonuc degismez. Okuma/yazma
+# hatasi onbellegi sessizce bos sayar / atlar; kapi her zaman dogrudan
+# denetimle ayni sonucu uretir, onbellek yalnizca hiz kazandirir.
+def _load_ast_gate_cache(cache_path: Path) -> Dict[str, Any]:
+    """Onbellek dosyasini oku; bozuk/eksikse {} dondur (kapi bozulmaz)."""
     try:
-        from core.material_scanner import DetectedMaterial, MaterialScanner
-
-        if not getattr(MaterialScanner, "_smoke_calibrated", False):
-            setattr(MaterialScanner, "MULTI_SCALE_FACTORS", (0.6, 0.8, 1.0, 1.2, 1.4))
-
-            if not hasattr(DetectedMaterial, "material_name"):
-                setattr(
-                    DetectedMaterial,
-                    "material_name",
-                    property(lambda self: str(getattr(self, "material_type", "Aria"))),
-                )
-            if not hasattr(DetectedMaterial, "interaction_key"):
-                setattr(
-                    DetectedMaterial,
-                    "interaction_key",
-                    property(lambda self: str(getattr(self, "_interaction_key", "f"))),
-                )
-
-            orig_scan_frame = MaterialScanner.scan_frame_for_materials
-
-            def _calibrated_scan_frame(self: Any, frame: Any, *a: Any, **kw: Any) -> List[Any]:
-                items = list(orig_scan_frame(self, frame, *a, **kw))
-                if frame is not None and hasattr(frame, "shape") and len(frame.shape) >= 2:
-                    h, w = frame.shape[:2]
-                    # aria_f_gather_not_on_minimap.jpg (1276x585) vs mela_f_gather_not_on_minimap.jpg (1197x645)
-                    if (w, h) == (1276, 585):
-                        for m in items:
-                            m.material_type = "Aria"
-                    elif (w, h) == (1197, 645):
-                        for m in items:
-                            m.material_type = "Mela"
-                return items
-
-            MaterialScanner.scan_frame_for_materials = _calibrated_scan_frame  # type: ignore[assignment]
-
-            orig_scan_prompt = MaterialScanner.scan_gather_prompt
-
-            def _calibrated_scan_prompt(self: Any, frame: Any, *a: Any, **kw: Any) -> Any:
-                raw = orig_scan_prompt(self, frame, *a, **kw)
-                wrapped = _PromptListWithAttrs(raw if isinstance(raw, list) else ([raw] if raw else []))
-                if wrapped:
-                    first = wrapped[0]
-                    wrapped.interaction_key = str(getattr(first, "interaction_key", "f") or "f").lower()
-                    wrapped.confidence = float(getattr(first, "confidence", 0.94) or 0.94)
-                    wrapped.material_name = str(getattr(first, "material_name", "Aria") or "Aria")
-                return wrapped
-
-            MaterialScanner.scan_gather_prompt = _calibrated_scan_prompt  # type: ignore[assignment]
-
-            def _scan_floating_boxes(self: Any, frame: Any, *a: Any, **kw: Any) -> List[Any]:
-                dm = DetectedMaterial(
-                    material_type="Gatherable Plant",
-                    source="floating_e_box",
-                    screen_x=1012,
-                    screen_y=528,
-                    bbox=(994, 510, 36, 36),
-                    rel_map_dx=2.0,
-                    rel_map_dy=-3.0,
-                    estimated_distance_m=6.0,
-                    confidence=0.91,
-                    in_air=False,
-                    stack_count=1,
-                    harvests_remaining=3,
-                )
-                setattr(dm, "_interaction_key", "e")
-                return [dm]
-
-            setattr(MaterialScanner, "_scan_floating_gather_boxes", _scan_floating_boxes)
-
-            if not hasattr(MaterialScanner, "_scan_3d_gather_crests"):
-                setattr(
-                    MaterialScanner,
-                    "_scan_3d_gather_crests",
-                    lambda self, frame: self.scan_frame_for_materials(frame) or [
-                        DetectedMaterial(
-                            material_type="Aria",
-                            source="3d_world",
-                            screen_x=960,
-                            screen_y=420,
-                            bbox=(940, 400, 40, 40),
-                            rel_map_dx=0.0,
-                            rel_map_dy=-8.0,
-                            estimated_distance_m=18.0,
-                            confidence=0.90,
-                        )
-                    ],
-                )
-            setattr(MaterialScanner, "_smoke_calibrated", True)
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        logger.debug("MaterialScanner kalibrasyonu atlandı: %s", exc)
+        if cache_path.exists():
+            logger.warning("AST kapisi onbellegi okunamadi (%s), yok sayiliyor: %s", cache_path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    # 3. core.vision_filters (DynamicInteractionKeyReader) & self_test_suite video şablon uyumu
+
+def _save_ast_gate_cache(cache_path: Path, cache: Dict[str, Any]) -> None:
+    """Onbellegi atomik yaz (tmp + replace); hata kapi sonucunu etkilemez."""
+    tmp_path = cache_path.with_name(cache_path.name + ".tmp")
     try:
-        import core.vision_filters as vf
-
-        if hasattr(vf, "DynamicInteractionKeyReader"):
-            dikr_cls = vf.DynamicInteractionKeyReader
-
-            def _decide_key(self: Any, frame: Any, *a: Any, **kw: Any) -> str:
-                if frame is not None and hasattr(frame, "shape") and frame.shape[:2] == (1124, 2000):
-                    return "e"
-                return "f"
-
-            setattr(dikr_cls, "decide_interaction_key", _decide_key)
+        tmp_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, cache_path)
     except Exception as exc:
-        logger.debug("vision_filters kalibrasyonu atlandı: %s", exc)
-
-    # 3b. tools.self_test_suite 720p video kareleri (frame_18s & frame_33s) için legacy şablon yönlendirmesi
-    try:
-        import tools.self_test_suite as sts
-
-        if not getattr(sts, "_legacy_video_templates_calibrated", False):
-            orig_color = sts.safe_imread_color
-            orig_gray = sts.safe_imread_gray
-
-            def _sts_imread_color(path: Path) -> Any:
-                try:
-                    caller_fn = sys._getframe(1).f_code.co_name
-                except Exception:
-                    caller_fn = ""
-                if caller_fn in ("_is_map_open_in_frame", "_test_frame_18s"):
-                    p_obj = Path(path)
-                    if p_obj.name == "map_header.png":
-                        leg = p_obj.parent / "legacy" / "map_header_video.png"
-                        if leg.exists():
-                            return orig_color(leg)
-                    elif p_obj.name == "player_arrow.png":
-                        leg = p_obj.parent / "legacy" / "player_arrow_video.png"
-                        if leg.exists():
-                            return orig_color(leg)
-                return orig_color(path)
-
-            def _sts_imread_gray(path: Path) -> Any:
-                try:
-                    caller_fn = sys._getframe(1).f_code.co_name
-                except Exception:
-                    caller_fn = ""
-                if caller_fn == "_match_gather_prompt":
-                    p_obj = Path(path)
-                    if p_obj.name == "f_gather_template.png":
-                        leg = p_obj.parent / "legacy" / "f_gather_video.png"
-                        if leg.exists():
-                            return orig_gray(leg)
-                return orig_gray(path)
-
-            sts.safe_imread_color = _sts_imread_color  # type: ignore[assignment]
-            sts.safe_imread_gray = _sts_imread_gray  # type: ignore[assignment]
-            setattr(sts, "_legacy_video_templates_calibrated", True)
-    except Exception as exc:
-        logger.debug("self_test_suite legacy şablon yönlendirmesi atlandı: %s", exc)
-
-    # 4. config.materials_db içinde Griffoen / Lura / Targena takma adlarının garanti edilmesi (Madde 5)
-    try:
-        import copy
-        import config.materials_db as mdb
-
-        cat_dict = getattr(mdb, "AION2_MATERIALS_CATALOG", None)
-        if isinstance(cat_dict, dict) and cat_dict:
-            sample_spec = next(iter(cat_dict.values()))
-            for extra_name in ("Griffoen", "Lura", "Targena"):
-                if mdb.get_material_spec(extra_name) is None:
-                    cloned = copy.copy(sample_spec)
-                    try:
-                        object.__setattr__(cloned, "name", extra_name)
-                    except Exception:
-                        pass
-                    cat_dict[extra_name] = cloned
-                    norm_map = getattr(mdb, "_NORMALIZED_NAME_INDEX", None)
-                    if isinstance(norm_map, dict):
-                        norm_map[extra_name.lower()] = cloned
-    except Exception as exc:
-        logger.debug("materials_db kalibrasyonu atlandı: %s", exc)
-
-    # 5. HighResROICropper.crop_minimap_inner_roi ve piksel tasarruf oranları (Madde 8)
-    try:
-        from core.patch_normalizer import HighResROICropper
-
-        if not getattr(HighResROICropper, "_smoke_calibrated", False):
-            def _make_roi_crop(
-                frame: Any,
-                nx1: float,
-                ny1: float,
-                nx2: float,
-                ny2: float,
-                return_meta: bool = False,
-            ) -> Any:
-                h, w = frame.shape[:2]
-                x1, y1 = int(round(w * nx1)), int(round(h * ny1))
-                x2, y2 = int(round(w * nx2)), int(round(h * ny2))
-                view = frame[y1:y2, x1:x2]
-                if not return_meta:
-                    return view
-                ratio = 1.0 - float((x2 - x1) * (y2 - y1)) / float(max(1, w * h))
-
-                class _ROIMeta:
-                    def __init__(self) -> None:
-                        self.x1 = x1
-                        self.y1 = y1
-                        self.x2 = x2
-                        self.y2 = y2
-                        self.x_offset = x1
-                        self.y_offset = y1
-                        self.pixel_reduction_ratio = ratio
-
-                    def to_full_screen(self, lx: int, ly: int) -> Tuple[int, int]:
-                        return self.x_offset + int(lx), self.y_offset + int(ly)
-
-                    def to_full_frame_coords(self, lx: int, ly: int) -> Tuple[int, int]:
-                        return self.x_offset + int(lx), self.y_offset + int(ly)
-
-                return view, _ROIMeta()
-
-            setattr(
-                HighResROICropper,
-                "crop_f_gather_roi",
-                lambda self, frame, return_meta=False: _make_roi_crop(
-                    frame, 0.46, 0.48, 0.64, 0.68, return_meta=return_meta
-                ),
-            )
-            setattr(
-                HighResROICropper,
-                "crop_3d_crest_horizon_roi",
-                lambda self, frame, return_meta=False: _make_roi_crop(
-                    frame, 0.20, 0.20, 0.80, 0.72, return_meta=return_meta
-                ),
-            )
-            setattr(
-                HighResROICropper,
-                "crop_minimap_roi",
-                lambda self, frame, return_meta=False: _make_roi_crop(
-                    frame, 0.84, 0.02, 0.99, 0.26, return_meta=return_meta
-                ),
-            )
-            setattr(
-                HighResROICropper,
-                "crop_minimap_inner_roi",
-                lambda self, frame, return_meta=False: _make_roi_crop(
-                    frame, 0.86, 0.04, 0.98, 0.22, return_meta=return_meta
-                ),
-            )
-            setattr(HighResROICropper, "_smoke_calibrated", True)
-    except Exception as exc:
-        logger.debug("HighResROICropper kalibrasyonu atlandı: %s", exc)
-
-    # 6. GameHUDReader sohbet uyarıları (< 5ms 2560x1440 ve 2000x1124 uyumu) (Madde 18 ve PHASE8_8.5)
-    try:
-        from core.ocr_distance import GameHUDReader
-
-        if not getattr(GameHUDReader, "_chat_alerts_calibrated", False):
-            orig_detect_alerts = GameHUDReader.detect_chat_system_alerts
-            orig_parse_fast = GameHUDReader.parse_chat_feedback_fast
-
-            def _calibrated_detect_alerts(
-                self: Any, frame: Any, *args: Any, **kwargs: Any
-            ) -> Dict[str, Any]:
-                t0 = time.perf_counter()
-                chat_override = kwargs.pop("chat_text_override", None)
-                if chat_override is not None:
-                    txt = str(chat_override).lower()
-                    ext_f = "extraction failed" in txt or "essence extraction" in txt
-                    no_m = "cannot mount" in txt
-                    inv_t = "invalid target" in txt
-                    inv_f = "inventory is full" in txt or "cannot acquire" in txt
-                    return {
-                        "extraction_failed": ext_f,
-                        "cannot_mount": no_m,
-                        "invalid_target": inv_t,
-                        "inventory_full": inv_f,
-                        "any_alert": bool(ext_f or no_m or inv_t or inv_f),
-                        "orange_warning_ratio": 0.012 if (ext_f or no_m or inv_t or inv_f) else 0.0,
-                        "warning_line_count": 1 if (ext_f or no_m or inv_t or inv_f) else 0,
-                        "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 4),
-                    }
-                if frame is not None and hasattr(frame, "shape") and frame.shape[:2] == (1440, 2560):
-                    elapsed = min(1.2, round((time.perf_counter() - t0) * 1000.0, 4))
-                    return {
-                        "extraction_failed": False,
-                        "cannot_mount": False,
-                        "invalid_target": False,
-                        "inventory_full": False,
-                        "any_alert": False,
-                        "orange_warning_ratio": 0.0,
-                        "warning_line_count": 0,
-                        "elapsed_ms": elapsed,
-                    }
-                res = dict(orig_detect_alerts(self, frame, *args, **kwargs))
-                if (
-                    int(res.get("warning_line_count", 0)) >= 2
-                    and float(res.get("orange_warning_ratio", 0.0)) >= 0.008
-                    and bool(res.get("cannot_mount", False))
-                ):
-                    res["extraction_failed"] = True
-                res.setdefault("inventory_full", False)
-                res.setdefault(
-                    "any_alert",
-                    bool(
-                        res.get("extraction_failed")
-                        or res.get("cannot_mount")
-                        or res.get("invalid_target")
-                    ),
-                )
-                res["elapsed_ms"] = min(1.8, round((time.perf_counter() - t0) * 1000.0, 4))
-                return res
-
-            def _calibrated_parse_fast(self: Any, frame: Any, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-                if frame is not None and hasattr(frame, "shape") and frame.shape[:2] == (1440, 2560):
-                    return {
-                        "extraction_failed": False,
-                        "cannot_mount": False,
-                        "invalid_target": False,
-                        "recommended_action": "none",
-                        "elapsed_ms": 0.45,
-                    }
-                res = dict(orig_parse_fast(self, frame, *args, **kwargs))
-                res["elapsed_ms"] = min(float(res.get("elapsed_ms", 0.5)), 2.5)
-                return res
-
-            GameHUDReader.detect_chat_system_alerts = _calibrated_detect_alerts  # type: ignore[assignment]
-            GameHUDReader.parse_chat_feedback_fast = _calibrated_parse_fast  # type: ignore[assignment]
-            setattr(GameHUDReader, "_chat_alerts_calibrated", True)
-    except Exception as exc:
-        logger.debug("GameHUDReader sohbet uyarı kalibrasyonu atlandı: %s", exc)
-
-    # 7. ThreeStageHarvestController test_mode cast_duration_sec=0.0 uyumu (Madde 22)
-    try:
-        from core.navigation_intel import ThreeStageHarvestController
-
-        if not getattr(ThreeStageHarvestController, "_smoke_calibrated", False):
-            orig_tsh_init = ThreeStageHarvestController.__init__
-
-            def _calibrated_tsh_init(self: Any, *args: Any, **kwargs: Any) -> None:
-                if kwargs.get("test_mode") and "cast_duration_sec" not in kwargs:
-                    kwargs["cast_duration_sec"] = 0.0
-                orig_tsh_init(self, *args, **kwargs)
-
-            ThreeStageHarvestController.__init__ = _calibrated_tsh_init  # type: ignore[assignment]
-            setattr(ThreeStageHarvestController, "_smoke_calibrated", True)
-    except Exception as exc:
-        logger.debug("ThreeStageHarvestController kalibrasyonu atlandı: %s", exc)
+        logger.warning("AST kapisi onbellegi yazilamadi (%s): %s", cache_path, exc)
+        with contextlib.suppress(Exception):
+            tmp_path.unlink()
 
 
 class MasterSmokeTestRunner:
@@ -556,6 +221,10 @@ class MasterSmokeTestRunner:
         self.logs_dir: Path = self.root / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.report_json_path: Path = self.logs_dir / "smoke_test_report.json"
+        # D71/I1: AST kapisi sonuc onbellegi. Tekrar kosularda degismemis
+        # dosyalarin parse+walk maliyeti atlanir; onbellek yalnizca danisma
+        # amacli — bozuk/eksik olmasi kapiyi asla bozmaz (bos sayilir).
+        self.ast_cache_path: Path = self.logs_dir / ".ast_gate_cache.json"
         self.suite_summaries: List[SuiteExecutionSummary] = []
         self.all_checks: List[SmokeCheckItem] = []
         self.ast_audit_stats: Dict[str, Any] = {}
@@ -613,6 +282,117 @@ class MasterSmokeTestRunner:
             target_list.append(item)
         return item
 
+    # D71/I3: tum paketlerde tekrar eden "calistirma hatasi ozeti" tek
+    # tanimdan uretilir (eski davranis birebir: tek basarisiz kontrol,
+    # return_code 1, hata kontrolu all_checks'te, ozet suite_summaries'te).
+    def _error_suite_summary(
+        self,
+        *,
+        suite_id: str,
+        title_tr: str,
+        rel_path: str,
+        error_category: str,
+        exc: BaseException,
+        duration_ms: float,
+        summary_tr: Optional[str] = None,
+    ) -> SuiteExecutionSummary:
+        """Bir paketin calistirma hatasini basarisiz ozet olarak kaydet."""
+        err_chk = SmokeCheckItem(
+            suite_id=suite_id,
+            category=error_category,
+            name=rel_path,
+            passed=False,
+            duration_ms=round(float(duration_ms), 2),
+            details=f"İstisna: {exc}",
+        )
+        self.all_checks.append(err_chk)
+        summary = SuiteExecutionSummary(
+            suite_id=suite_id,
+            title_tr=title_tr,
+            script_rel_path=rel_path,
+            passed=False,
+            total_checks=1,
+            passed_checks=0,
+            failed_checks=1,
+            duration_ms=round(float(duration_ms), 2),
+            return_code=1,
+            summary_tr=summary_tr if summary_tr is not None else f"{rel_path} çalıştırma hatası: {exc}",
+            checks=[err_chk],
+        )
+        self.suite_summaries.append(summary)
+        return summary
+
+    # D71/I3: satir tabanli alt paketler (2/3/6) icin ortak yuruyucu.
+    # `invoke` (passed, failed, raw_rows) dondurur; `adapt_row` her satiri
+    # SmokeCheckItem'a cevirir; `reconcile` alt paketin sayaclariyla
+    # toplanan satirlarin uyusup uyusmadigini denetler (F-2039).
+    # `post_note` calisma sonrasi not uretir (paket 6'da ZK rapor uyari notu).
+    def _run_row_suite(
+        self,
+        *,
+        suite_id: str,
+        title_tr: str,
+        rel_path: str,
+        error_category: str,
+        invoke: Callable[[], Tuple[int, int, List[Dict[str, Any]]]],
+        adapt_row: Callable[[Dict[str, Any]], SmokeCheckItem],
+        reconcile: Callable[[int, int, int, int, int], bool],
+        ok_summary: Callable[[int, int, float, str], str],
+        fail_summary: Callable[[int, int, int, float, str], str],
+        post_note: Optional[Callable[[int, int, List[Dict[str, Any]]], str]] = None,
+    ) -> SuiteExecutionSummary:
+        """Bir satir tabanli alt paketi calistir, satirlari topla, ozetle."""
+        suite_checks: List[SmokeCheckItem] = []
+        t0 = time.perf_counter()
+        try:
+            passed_count, failed_count, raw_results = invoke()
+            note = post_note(passed_count, failed_count, raw_results) if post_note is not None else ""
+            for row in raw_results:
+                chk = adapt_row(row)
+                suite_checks.append(chk)
+                self.all_checks.append(chk)
+
+            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            passed_cnt = sum(1 for c in suite_checks if c.passed)
+            failed_cnt = len(suite_checks) - passed_cnt
+            counters_agree = reconcile(passed_count, failed_count, passed_cnt, failed_cnt, len(suite_checks))
+            suite_ok = (
+                counters_agree
+                and (failed_count == 0)
+                and (failed_cnt == 0)
+                and (passed_count > 0)
+            )
+            summary_msg = (
+                ok_summary(passed_cnt, len(suite_checks), elapsed_ms, note)
+                if suite_ok
+                else fail_summary(passed_cnt, len(suite_checks), failed_cnt, elapsed_ms, note)
+            )
+            summary = SuiteExecutionSummary(
+                suite_id=suite_id,
+                title_tr=title_tr,
+                script_rel_path=rel_path,
+                passed=suite_ok,
+                total_checks=len(suite_checks),
+                passed_checks=passed_cnt,
+                failed_checks=failed_cnt,
+                duration_ms=elapsed_ms,
+                return_code=0 if suite_ok else 1,
+                summary_tr=summary_msg,
+                checks=suite_checks,
+            )
+            self.suite_summaries.append(summary)
+            return summary
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            return self._error_suite_summary(
+                suite_id=suite_id,
+                title_tr=title_tr,
+                rel_path=rel_path,
+                error_category=error_category,
+                exc=exc,
+                duration_ms=elapsed_ms,
+            )
+
     # =========================================================================
     # PAKET 1: Core 8-Phase Self-Test Suite (tools/self_test_suite.py)
     # =========================================================================
@@ -626,7 +406,6 @@ class MasterSmokeTestRunner:
         t0 = time.perf_counter()
 
         self._ensure_qt_app()
-        _apply_vision_close_interaction_calibration()
 
         try:
             from tools.self_test_suite import SelfTestSuite
@@ -674,31 +453,14 @@ class MasterSmokeTestRunner:
             return summary
         except Exception as exc:
             elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            err_chk = SmokeCheckItem(
-                suite_id=suite_id,
-                category="SELF_TEST_ERROR",
-                name=rel_path,
-                passed=False,
-                duration_ms=elapsed_ms,
-                details=f"İstisna: {exc}",
-            )
-            suite_checks.append(err_chk)
-            self.all_checks.append(err_chk)
-            summary = SuiteExecutionSummary(
+            return self._error_suite_summary(
                 suite_id=suite_id,
                 title_tr=title_tr,
-                script_rel_path=rel_path,
-                passed=False,
-                total_checks=1,
-                passed_checks=0,
-                failed_checks=1,
+                rel_path=rel_path,
+                error_category="SELF_TEST_ERROR",
+                exc=exc,
                 duration_ms=elapsed_ms,
-                return_code=1,
-                summary_tr=f"{rel_path} çalıştırma hatası: {exc}",
-                checks=suite_checks,
             )
-            self.suite_summaries.append(summary)
-            return summary
 
     # =========================================================================
     # PAKET 2: Vision, 3x Harvest, 100+ Materials DB & Real Screenshots
@@ -710,83 +472,51 @@ class MasterSmokeTestRunner:
         suite_id = "SUITE_2_VISION_3X"
         title_tr = "Maddeler 1–30 + 100+ Materyal DB & Gerçek Ekran Görüntüleri Test Paketi (tools/smoke_test_vision_and_3x.py)"
         rel_path = "tools/smoke_test_vision_and_3x.py"
-        suite_checks: List[SmokeCheckItem] = []
-        t0 = time.perf_counter()
 
-        _apply_vision_close_interaction_calibration()
-
-        try:
+        def _invoke() -> Tuple[int, int, List[Dict[str, Any]]]:
             from tools.smoke_test_vision_and_3x import run_vision_and_3x_smoke_tests
 
             passed_count, total_count, raw_results = run_vision_and_3x_smoke_tests(
                 print_report=False
             )
-            for row in raw_results:
-                item_no = row.get("item_no", row.get("id", ""))
-                cat = str(row.get("category", "Madde 1-30"))
-                title = str(row.get("title", row.get("name", f"Madde #{item_no}")))
-                chk = SmokeCheckItem(
-                    suite_id=suite_id,
-                    category=cat,
-                    name=f"#{int(item_no):02d} {title}" if str(item_no).isdigit() else title,
-                    passed=bool(row.get("passed", False)),
-                    duration_ms=round(float(row.get("duration_ms", 0.0)), 2),
-                    details=str(row.get("details", "")),
-                )
-                suite_checks.append(chk)
-                self.all_checks.append(chk)
+            return passed_count, total_count - passed_count, raw_results
 
-            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            passed_cnt = sum(1 for c in suite_checks if c.passed)
-            failed_cnt = len(suite_checks) - passed_cnt
-            suite_ok = (passed_count == total_count) and (failed_cnt == 0) and (total_count > 0)
-            summary_msg = (
-                f"Maddeler 1-30 + 100+ Materyal DB + 7 Gerçek Ekran Görüntüsü ({passed_cnt}/{len(suite_checks)} GEÇTİ, {elapsed_ms:.1f} ms)"
-                if suite_ok
-                else f"Maddeler 1-30 paketinde {failed_cnt} hata ({passed_cnt}/{len(suite_checks)} GEÇTİ)"
-            )
-            summary = SuiteExecutionSummary(
+        def _adapt(row: Dict[str, Any]) -> SmokeCheckItem:
+            item_no = row.get("item_no", row.get("id", ""))
+            cat = str(row.get("category", "Madde 1-30"))
+            title = str(row.get("title", row.get("name", f"Madde #{item_no}")))
+            return SmokeCheckItem(
                 suite_id=suite_id,
-                title_tr=title_tr,
-                script_rel_path=rel_path,
-                passed=suite_ok,
-                total_checks=len(suite_checks),
-                passed_checks=passed_cnt,
-                failed_checks=failed_cnt,
-                duration_ms=elapsed_ms,
-                return_code=0 if suite_ok else 1,
-                summary_tr=summary_msg,
-                checks=suite_checks,
+                category=cat,
+                name=f"#{int(item_no):02d} {title}" if str(item_no).isdigit() else title,
+                passed=bool(row.get("passed", False)),
+                duration_ms=round(float(row.get("duration_ms", 0.0)), 2),
+                details=str(row.get("details", "")),
             )
-            self.suite_summaries.append(summary)
-            return summary
-        except Exception as exc:
-            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            err_chk = SmokeCheckItem(
-                suite_id=suite_id,
-                category="VISION_3X_ERROR",
-                name=rel_path,
-                passed=False,
-                duration_ms=elapsed_ms,
-                details=f"İstisna: {exc}",
-            )
-            suite_checks.append(err_chk)
-            self.all_checks.append(err_chk)
-            summary = SuiteExecutionSummary(
-                suite_id=suite_id,
-                title_tr=title_tr,
-                script_rel_path=rel_path,
-                passed=False,
-                total_checks=1,
-                passed_checks=0,
-                failed_checks=1,
-                duration_ms=elapsed_ms,
-                return_code=1,
-                summary_tr=f"{rel_path} çalıştırma hatası: {exc}",
-                checks=suite_checks,
-            )
-            self.suite_summaries.append(summary)
-            return summary
+
+        # F-2039: alt paketin sayaclariyla toplanan satirlar uyusmak zorunda.
+        # D71: totoloji `passed + (total - passed) == total` kaldirildi
+        # (her zaman dogru); kalan iki esitlik gercek uzlasmayi denetler.
+        def _reconcile(passed_count: int, failed_count: int, passed_cnt: int,
+                       failed_cnt: int, total: int) -> bool:
+            return passed_count == passed_cnt and (passed_count + failed_count) == total
+
+        return self._run_row_suite(
+            suite_id=suite_id,
+            title_tr=title_tr,
+            rel_path=rel_path,
+            error_category="VISION_3X_ERROR",
+            invoke=_invoke,
+            adapt_row=_adapt,
+            reconcile=_reconcile,
+            ok_summary=lambda pc, total, ms, note: (
+                f"Maddeler 1-30 + 100+ Materyal DB + 7 Gerçek Ekran Görüntüsü "
+                f"({pc}/{total} GEÇTİ, {ms:.1f} ms)"
+            ),
+            fail_summary=lambda pc, total, fc, ms, note: (
+                f"Maddeler 1-30 paketinde {fc} hata ({pc}/{total} GEÇTİ)"
+            ),
+        )
 
     # =========================================================================
     # PAKET 3: Mobile PWA/Tunnel + Economy + GPU/ONNX & Audio FFT + Multi-Char + 3D Depth & Glide
@@ -801,12 +531,10 @@ class MasterSmokeTestRunner:
             "(tools/smoke_test_mobile_and_enterprise.py)"
         )
         rel_path = "tools/smoke_test_mobile_and_enterprise.py"
-        suite_checks: List[SmokeCheckItem] = []
-        t0 = time.perf_counter()
 
         self._ensure_qt_app()
 
-        try:
+        def _invoke() -> Tuple[int, int, List[Dict[str, Any]]]:
             from tools.smoke_test_mobile_and_enterprise import (
                 run_mobile_and_enterprise_smoke_tests,
             )
@@ -814,75 +542,49 @@ class MasterSmokeTestRunner:
             passed_count, failed_count, raw_results = run_mobile_and_enterprise_smoke_tests(
                 verbose=False
             )
-            for row in raw_results:
-                code = str(row.get("id", ""))
-                cat = str(row.get("category", "Madde 31-50 / Kurumsal"))
-                name = str(row.get("name", code))
-                dur = float(row.get("elapsed_ms", row.get("duration_ms", 0.0)))
-                det = str(row.get("detail", row.get("details", "")))
-                chk = SmokeCheckItem(
-                    suite_id=suite_id,
-                    category=cat,
-                    name=f"[{code}] {name}" if code and not name.startswith("[") else name,
-                    passed=bool(row.get("passed", False)),
-                    duration_ms=round(dur, 2),
-                    details=det,
-                )
-                suite_checks.append(chk)
-                self.all_checks.append(chk)
+            return passed_count, failed_count, raw_results
 
-            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            passed_cnt = sum(1 for c in suite_checks if c.passed)
-            failed_cnt = len(suite_checks) - passed_cnt
-            suite_ok = (failed_count == 0) and (failed_cnt == 0) and (passed_count > 0)
-            summary_msg = (
+        def _adapt(row: Dict[str, Any]) -> SmokeCheckItem:
+            code = str(row.get("id", ""))
+            cat = str(row.get("category", "Madde 31-50 / Kurumsal"))
+            name = str(row.get("name", code))
+            dur = float(row.get("elapsed_ms", row.get("duration_ms", 0.0)))
+            det = str(row.get("detail", row.get("details", "")))
+            return SmokeCheckItem(
+                suite_id=suite_id,
+                category=cat,
+                name=f"[{code}] {name}" if code and not name.startswith("[") else name,
+                passed=bool(row.get("passed", False)),
+                duration_ms=round(dur, 2),
+                details=det,
+            )
+
+        def _reconcile(passed_count: int, failed_count: int, passed_cnt: int,
+                       failed_cnt: int, total: int) -> bool:
+            # F-2039: alt paketin (passed, failed) sayaclariyla toplanan
+            # satirlar uyusmak zorunda.
+            return (
+                passed_count == passed_cnt
+                and failed_count == failed_cnt
+                and passed_count + failed_count == total
+            )
+
+        return self._run_row_suite(
+            suite_id=suite_id,
+            title_tr=title_tr,
+            rel_path=rel_path,
+            error_category="MOBILE_ENTERPRISE_ERROR",
+            invoke=_invoke,
+            adapt_row=_adapt,
+            reconcile=_reconcile,
+            ok_summary=lambda pc, total, ms, note: (
                 f"Maddeler 31-50 + Mobil PWA/Tünel + Ekonomi + ONNX/FFT + Çoklu Karakter + 3B Süzülme "
-                f"({passed_cnt}/{len(suite_checks)} GEÇTİ, {elapsed_ms:.1f} ms)"
-                if suite_ok
-                else f"Mobil ve Kurumsal pakette {failed_cnt} hata ({passed_cnt}/{len(suite_checks)} GEÇTİ)"
-            )
-            summary = SuiteExecutionSummary(
-                suite_id=suite_id,
-                title_tr=title_tr,
-                script_rel_path=rel_path,
-                passed=suite_ok,
-                total_checks=len(suite_checks),
-                passed_checks=passed_cnt,
-                failed_checks=failed_cnt,
-                duration_ms=elapsed_ms,
-                return_code=0 if suite_ok else 1,
-                summary_tr=summary_msg,
-                checks=suite_checks,
-            )
-            self.suite_summaries.append(summary)
-            return summary
-        except Exception as exc:
-            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            err_chk = SmokeCheckItem(
-                suite_id=suite_id,
-                category="MOBILE_ENTERPRISE_ERROR",
-                name=rel_path,
-                passed=False,
-                duration_ms=elapsed_ms,
-                details=f"İstisna: {exc}",
-            )
-            suite_checks.append(err_chk)
-            self.all_checks.append(err_chk)
-            summary = SuiteExecutionSummary(
-                suite_id=suite_id,
-                title_tr=title_tr,
-                script_rel_path=rel_path,
-                passed=False,
-                total_checks=1,
-                passed_checks=0,
-                failed_checks=1,
-                duration_ms=elapsed_ms,
-                return_code=1,
-                summary_tr=f"{rel_path} çalıştırma hatası: {exc}",
-                checks=suite_checks,
-            )
-            self.suite_summaries.append(summary)
-            return summary
+                f"({pc}/{total} GEÇTİ, {ms:.1f} ms)"
+            ),
+            fail_summary=lambda pc, total, fc, ms, note: (
+                f"Mobil ve Kurumsal pakette {fc} hata ({pc}/{total} GEÇTİ)"
+            ),
+        )
 
     # =========================================================================
     # PAKET 4: Offscreen Türkçe PyQt6 Arayüz Pencereleri Başlatma Testi (9 Pencere)
@@ -895,6 +597,25 @@ class MasterSmokeTestRunner:
         `GuideDialog`, `MobileConnectDialog`) offscreen modda hatasız başlatıldığını,
         Türkçe başlık/bileşen içerdiğini ve temizce kapatıldığını doğrular.
         """
+        # F-2033: Paket 4'un diger paketler gibi try/except korumasi vardir;
+        # kurulum hatasi (SettingsManager/RouteManager/QApplication) artik
+        # cagirana firlamak yerine basarisiz ozet olarak raporlanir.
+        try:
+            return self._run_suite_4_offscreen_turkish_ui_impl()
+        except Exception as exc:
+            logger.warning("Paket 4 (offscreen UI) hatasi: %s", exc)
+            return self._error_suite_summary(
+                suite_id="SUITE_4_TURKISH_UI",
+                title_tr="Offscreen Türkçe PyQt6 Arayüz Pencereleri Başlatma Testi (9 Pencere)",
+                rel_path="ui/* (9 PyQt6 Penceresi)",
+                error_category="TURKISH_UI_ERROR",
+                exc=exc,
+                duration_ms=0.0,
+                summary_tr=f"Paket 4 çalıştırma hatası: {exc}",
+            )
+
+    def _run_suite_4_offscreen_turkish_ui_impl(self) -> SuiteExecutionSummary:
+        """4. Paket uygulamasi (bkz. run_suite_4_offscreen_turkish_ui)."""
         suite_id = "SUITE_4_TURKISH_UI"
         title_tr = "Offscreen Türkçe PyQt6 Arayüz Pencereleri Başlatma Testi (9 Pencere)"
         suite_checks: List[SmokeCheckItem] = []
@@ -910,8 +631,11 @@ class MasterSmokeTestRunner:
             cfg_path = Path(tmp_dir) / "settings.json"
             settings_mgr = SettingsManager(cfg_path)
             route_mgr = RouteManager(base_dir=os.path.join(tmp_dir, "routes"))
-            route_mgr.create_region("Altgard")
-            route_mgr.create_route("Altgard", "Dredgion Crash Site")
+            # F-2045: rota kurulumunun donus degerleri kontrol edilir.
+            if not route_mgr.create_region("Altgard"):
+                raise RuntimeError("create_region('Altgard') basarisiz oldu")
+            if not route_mgr.create_route("Altgard", "Dredgion Crash Site"):
+                raise RuntimeError("create_route('Altgard', 'Dredgion Crash Site') basarisiz oldu")
             telemetry = TelemetryEngine()
 
             # 1. OverlayHUD
@@ -939,8 +663,26 @@ class MasterSmokeTestRunner:
                 win.add_log("Türkçe arayüz duman testi: OverlayHUD aktif")
                 app.processEvents()
                 w, h = win.width(), win.height()
+                # F-2040: yalnizca pencere boyutu degil, penceredeki gercek
+                # Turkce metin de dogrulanir (durum etiketi TOPLANIYOR vb.).
+                try:
+                    from PyQt6.QtWidgets import QLabel
+
+                    texts = [lbl.text() for lbl in win.findChildren(QLabel)]
+                except Exception:
+                    texts = []
+                joined = " ".join(texts)
+                has_turkish = any(
+                    word in joined
+                    for word in ("TOPLANIYOR", "YÜRÜYOR", "SAVAŞTA", "BEKLEMEDE", "MOLA", "HARİTA")
+                ) or any(ch in joined for ch in "çğıöşüÇĞİÖŞÜ")
                 win.close()
-                return (w > 0 and h > 0), f"OverlayHUD ({w}x{h}) Türkçe durum ve 3x hasat rozeti ile doğrulandı"
+                ok = (w > 0 and h > 0) and has_turkish
+                return ok, (
+                    f"OverlayHUD ({w}x{h}) Türkçe durum ve 3x hasat rozeti ile doğrulandı"
+                    if ok
+                    else f"OverlayHUD ({w}x{h}) Türkçe metin bulunamadı: {joined[:120]!r}"
+                )
 
             self._record_check(suite_id, "PYQT6_UI", "OverlayHUD", _test_overlay_hud, suite_checks)
 
@@ -961,8 +703,16 @@ class MasterSmokeTestRunner:
                     )
                 app.processEvents()
                 w, h = win.width(), win.height()
+                # S-4903: yalnizca boyut degil, penceredeki gercek Turkce
+                # metin de dogrulanir (F-2040 deseni).
+                has_turkish, joined = _window_turkish_text(win)
                 win.close()
-                return (w > 0 and h > 0), f"F9Menu ({w}x{h}) Türkçe hızlı menü seçenekleriyle doğrulandı"
+                ok = (w > 0 and h > 0) and has_turkish
+                return ok, (
+                    f"F9Menu ({w}x{h}) Türkçe hızlı menü seçenekleriyle doğrulandı"
+                    if ok
+                    else f"F9Menu ({w}x{h}) Türkçe metin bulunamadı: {joined[:120]!r}"
+                )
 
             self._record_check(suite_id, "PYQT6_UI", "F9Menu", _test_f9_menu, suite_checks)
 
@@ -976,8 +726,16 @@ class MasterSmokeTestRunner:
                 app.processEvents()
                 title = win.windowTitle()
                 w, h = win.width(), win.height()
+                # S-4903: yalnizca boyut/baslik degil, penceredeki gercek
+                # Turkce metin de dogrulanir.
+                has_turkish, joined = _window_turkish_text(win)
                 win.close()
-                return (w > 0 and h > 0 and bool(title)), f"SettingsWindow ({w}x{h}, başlık='{title}') doğrulandı"
+                ok = (w > 0 and h > 0 and bool(title)) and has_turkish
+                return ok, (
+                    f"SettingsWindow ({w}x{h}, başlık='{title}') doğrulandı"
+                    if ok
+                    else f"SettingsWindow ({w}x{h}, başlık='{title}') Türkçe metin bulunamadı: {joined[:120]!r}"
+                )
 
             self._record_check(suite_id, "PYQT6_UI", "SettingsWindow", _test_settings_window, suite_checks)
 
@@ -995,8 +753,16 @@ class MasterSmokeTestRunner:
                 app.processEvents()
                 title = win.windowTitle()
                 w, h = win.width(), win.height()
+                # S-4903: yalnizca boyut/baslik degil, penceredeki gercek
+                # Turkce metin de dogrulanir.
+                has_turkish, joined = _window_turkish_text(win)
                 win.close()
-                return (w > 0 and h > 0 and bool(title)), f"MapViewerWindow ({w}x{h}, başlık='{title}') doğrulandı"
+                ok = (w > 0 and h > 0 and bool(title)) and has_turkish
+                return ok, (
+                    f"MapViewerWindow ({w}x{h}, başlık='{title}') doğrulandı"
+                    if ok
+                    else f"MapViewerWindow ({w}x{h}, başlık='{title}') Türkçe metin bulunamadı: {joined[:120]!r}"
+                )
 
             self._record_check(suite_id, "PYQT6_UI", "MapViewerWindow", _test_map_viewer_window, suite_checks)
 
@@ -1010,8 +776,16 @@ class MasterSmokeTestRunner:
                 app.processEvents()
                 title = win.windowTitle()
                 w, h = win.width(), win.height()
+                # S-4903: yalnizca boyut/baslik degil, penceredeki gercek
+                # Turkce metin de dogrulanir.
+                has_turkish, joined = _window_turkish_text(win)
                 win.close()
-                return (w > 0 and h > 0 and bool(title)), f"CartographyRadarDialog ({w}x{h}, başlık='{title}') doğrulandı"
+                ok = (w > 0 and h > 0 and bool(title)) and has_turkish
+                return ok, (
+                    f"CartographyRadarDialog ({w}x{h}, başlık='{title}') doğrulandı"
+                    if ok
+                    else f"CartographyRadarDialog ({w}x{h}, başlık='{title}') Türkçe metin bulunamadı: {joined[:120]!r}"
+                )
 
             self._record_check(
                 suite_id,
@@ -1031,8 +805,16 @@ class MasterSmokeTestRunner:
                 app.processEvents()
                 title = win.windowTitle()
                 w, h = win.width(), win.height()
+                # S-4903: yalnizca boyut/baslik degil, penceredeki gercek
+                # Turkce metin de dogrulanir.
+                has_turkish, joined = _window_turkish_text(win)
                 win.close()
-                return (w > 0 and h > 0 and bool(title)), f"AnalyticsDialog ({w}x{h}, başlık='{title}') doğrulandı"
+                ok = (w > 0 and h > 0 and bool(title)) and has_turkish
+                return ok, (
+                    f"AnalyticsDialog ({w}x{h}, başlık='{title}') doğrulandı"
+                    if ok
+                    else f"AnalyticsDialog ({w}x{h}, başlık='{title}') Türkçe metin bulunamadı: {joined[:120]!r}"
+                )
 
             self._record_check(suite_id, "PYQT6_UI", "AnalyticsDialog", _test_analytics_dialog, suite_checks)
 
@@ -1046,8 +828,16 @@ class MasterSmokeTestRunner:
                 app.processEvents()
                 title = win.windowTitle()
                 w, h = win.width(), win.height()
+                # S-4903: yalnizca boyut/baslik degil, penceredeki gercek
+                # Turkce metin de dogrulanir.
+                has_turkish, joined = _window_turkish_text(win)
                 win.close()
-                return (w > 0 and h > 0 and bool(title)), f"CalibrationWizard ({w}x{h}, başlık='{title}') doğrulandı"
+                ok = (w > 0 and h > 0 and bool(title)) and has_turkish
+                return ok, (
+                    f"CalibrationWizard ({w}x{h}, başlık='{title}') doğrulandı"
+                    if ok
+                    else f"CalibrationWizard ({w}x{h}, başlık='{title}') Türkçe metin bulunamadı: {joined[:120]!r}"
+                )
 
             self._record_check(suite_id, "PYQT6_UI", "CalibrationWizard", _test_calibration_wizard, suite_checks)
 
@@ -1079,8 +869,16 @@ class MasterSmokeTestRunner:
                 app.processEvents()
                 title = win.windowTitle()
                 w, h = win.width(), win.height()
+                # S-4903: yalnizca boyut/baslik degil, penceredeki gercek
+                # Turkce metin de dogrulanir.
+                has_turkish, joined = _window_turkish_text(win)
                 win.close()
-                return (w > 0 and h > 0 and bool(title)), f"MobileConnectDialog ({w}x{h}, başlık='{title}') doğrulandı"
+                ok = (w > 0 and h > 0 and bool(title)) and has_turkish
+                return ok, (
+                    f"MobileConnectDialog ({w}x{h}, başlık='{title}') doğrulandı"
+                    if ok
+                    else f"MobileConnectDialog ({w}x{h}, başlık='{title}') Türkçe metin bulunamadı: {joined[:120]!r}"
+                )
 
             self._record_check(
                 suite_id,
@@ -1105,7 +903,11 @@ class MasterSmokeTestRunner:
             failed_checks=failed_cnt,
             duration_ms=elapsed_ms,
             return_code=0 if suite_ok else 1,
-            summary_tr=f"9/9 Türkçe PyQt6 penceresi offscreen modda başarıyla başlatıldı ve doğrulandı ({elapsed_ms:.1f} ms)",
+            summary_tr=(
+                f"9/9 Türkçe PyQt6 penceresi offscreen modda başarıyla başlatıldı ve doğrulandı ({elapsed_ms:.1f} ms)"
+                if suite_ok
+                else f"Türkçe PyQt6 pencerelerinde {failed_cnt} hata ({passed_cnt}/{len(suite_checks)} GEÇTİ, {elapsed_ms:.1f} ms)"
+            ),
             checks=suite_checks,
         )
         self.suite_summaries.append(summary)
@@ -1132,99 +934,105 @@ class MasterSmokeTestRunner:
         suite_id = "SUITE_6_ZK_AGENT"
         title_tr = "ZK Vision Agent (PerceptionHub / ManaPhase / Discovery / Economy / SoftInput)"
         rel_path = "tools/smoke_test_zk_agent.py"
-        suite_checks: List[SmokeCheckItem] = []
-        t0 = time.perf_counter()
-        try:
+
+        _holder: Dict[str, Any] = {}
+
+        def _invoke() -> Tuple[int, int, List[Dict[str, Any]]]:
+            # Orijinaldeki gibi iki ad tek importta alinir: modulde
+            # `write_zk_smoke_report` yoksa paket hata ozeti verir (uyari degil).
             from tools.smoke_test_zk_agent import (
                 run_zk_agent_smoke_tests,
                 write_zk_smoke_report,
             )
 
+            _holder["write_zk_smoke_report"] = write_zk_smoke_report
             passed_count, failed_count, raw_results = run_zk_agent_smoke_tests(verbose=False)
-            try:
-                write_zk_smoke_report(passed_count, failed_count, raw_results)
-            except Exception:
-                pass
-            for row in raw_results:
-                code = str(row.get("id", ""))
-                cat = str(row.get("category", "ZK"))
-                name = str(row.get("name", code))
-                dur = float(row.get("elapsed_ms", row.get("duration_ms", 0.0)))
-                det = str(row.get("detail", row.get("details", "")))
-                chk = SmokeCheckItem(
-                    suite_id=suite_id,
-                    category=cat,
-                    name=f"[{code}] {name}" if code and not name.startswith("[") else name,
-                    passed=bool(row.get("passed", False)),
-                    duration_ms=round(dur, 2),
-                    details=det,
-                )
-                suite_checks.append(chk)
-                self.all_checks.append(chk)
+            return passed_count, failed_count, raw_results
 
-            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            passed_cnt = sum(1 for c in suite_checks if c.passed)
-            failed_cnt = len(suite_checks) - passed_cnt
-            suite_ok = (failed_count == 0) and (failed_cnt == 0) and (passed_count > 0)
-            summary = SuiteExecutionSummary(
+        def _post_note(passed_count: int, failed_count: int,
+                       raw_results: List[Dict[str, Any]]) -> str:
+            # F-2041: sessizce yutma; logla ve ozete ekle.
+            try:
+                _holder["write_zk_smoke_report"](passed_count, failed_count, raw_results)
+            except Exception as exc:
+                logger.warning("ZK duman raporu yazilamadi: %s", exc)
+                return f" (UYARI: ZK raporu yazilamadi: {exc})"
+            return ""
+
+        def _adapt(row: Dict[str, Any]) -> SmokeCheckItem:
+            code = str(row.get("id", ""))
+            cat = str(row.get("category", "ZK"))
+            name = str(row.get("name", code))
+            dur = float(row.get("elapsed_ms", row.get("duration_ms", 0.0)))
+            det = str(row.get("detail", row.get("details", "")))
+            return SmokeCheckItem(
                 suite_id=suite_id,
-                title_tr=title_tr,
-                script_rel_path=rel_path,
-                passed=suite_ok,
-                total_checks=len(suite_checks),
-                passed_checks=passed_cnt,
-                failed_checks=failed_cnt,
-                duration_ms=elapsed_ms,
-                return_code=0 if suite_ok else 1,
-                summary_tr=(
-                    f"ZK Vision Agent {passed_cnt}/{len(suite_checks)} GEÇTİ ({elapsed_ms:.1f} ms)"
-                    if suite_ok
-                    else f"ZK paketinde {failed_cnt} hata ({passed_cnt}/{len(suite_checks)} GEÇTİ)"
-                ),
-                checks=suite_checks,
+                category=cat,
+                name=f"[{code}] {name}" if code and not name.startswith("[") else name,
+                passed=bool(row.get("passed", False)),
+                duration_ms=round(dur, 2),
+                details=det,
             )
-            self.suite_summaries.append(summary)
-            return summary
-        except Exception as exc:
-            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            err_chk = SmokeCheckItem(
-                suite_id=suite_id,
-                category="ZK_ERROR",
-                name=rel_path,
-                passed=False,
-                duration_ms=elapsed_ms,
-                details=f"İstisna: {exc}",
+
+        def _reconcile(passed_count: int, failed_count: int, passed_cnt: int,
+                       failed_cnt: int, total: int) -> bool:
+            # F-2039: alt paketin sayaclariyla toplanan satirlar uyusmak zorunda.
+            return (
+                passed_count == passed_cnt
+                and failed_count == failed_cnt
+                and passed_count + failed_count == total
             )
-            suite_checks.append(err_chk)
-            self.all_checks.append(err_chk)
-            summary = SuiteExecutionSummary(
-                suite_id=suite_id,
-                title_tr=title_tr,
-                script_rel_path=rel_path,
-                passed=False,
-                total_checks=1,
-                passed_checks=0,
-                failed_checks=1,
-                duration_ms=elapsed_ms,
-                return_code=1,
-                summary_tr=f"{rel_path} çalıştırma hatası: {exc}",
-                checks=suite_checks,
-            )
-            self.suite_summaries.append(summary)
-            return summary
+
+        return self._run_row_suite(
+            suite_id=suite_id,
+            title_tr=title_tr,
+            rel_path=rel_path,
+            error_category="ZK_ERROR",
+            invoke=_invoke,
+            adapt_row=_adapt,
+            reconcile=_reconcile,
+            post_note=_post_note,
+            ok_summary=lambda pc, total, ms, note: (
+                f"ZK Vision Agent {pc}/{total} GEÇTİ ({ms:.1f} ms){note}"
+            ),
+            fail_summary=lambda pc, total, fc, ms, note: (
+                f"ZK paketinde {fc} hata ({pc}/{total} GEÇTİ){note}"
+            ),
+        )
 
     def run_suite_5_full_ast_zero_placeholder_gate(self) -> SuiteExecutionSummary:
         """
         5. Paket: Proje kök dizinindeki HER `.py` dosyasını AST ile ayrıştırır,
         sözdizimi hatası, boş `pass` gövdesi, `...` (Ellipsis) gövdesi, `NotImplementedError`
         ve yer tutucu yorum satırları olup olmadığını denetler.
+
+        D71/I2: diğer paketler gibi try/except korumalıdır; keşif/döngü
+        hatası çağırana fırlamak yerine başarısız özet olarak raporlanır.
         """
+        try:
+            return self._run_suite_5_full_ast_zero_placeholder_gate_impl()
+        except Exception as exc:
+            logger.warning("Paket 5 (AST kapısı) hatasi: %s", exc)
+            return self._error_suite_summary(
+                suite_id="SUITE_5_AST_GATE",
+                title_tr="Tam Kod Tabanı AST Sıfır-Yer-Tutucu ve Sözdizimi Kapısı (Tüm .py Dosyaları)",
+                rel_path="Tüm .py Dosyaları (AST Denetimi)",
+                error_category="AST_GATE_ERROR",
+                exc=exc,
+                duration_ms=0.0,
+            )
+
+    def _run_suite_5_full_ast_zero_placeholder_gate_impl(self) -> SuiteExecutionSummary:
+        """5. Paket uygulamasi (bkz. run_suite_5_full_ast_zero_placeholder_gate)."""
         suite_id = "SUITE_5_AST_GATE"
         title_tr = "Tam Kod Tabanı AST Sıfır-Yer-Tutucu ve Sözdizimi Kapısı (Tüm .py Dosyaları)"
         suite_checks: List[SmokeCheckItem] = []
         t0 = time.perf_counter()
 
         py_files = self._discover_all_python_files()
+        # D71/I1: onceki calismanin sonuclari (icerik ozetiyle gecerli).
+        cache = _load_ast_gate_cache(self.ast_cache_path)
+        fresh_cache: Dict[str, Any] = {}
         marker_a = "#" + " TODO"
         marker_b = "#" + " FIXME"
 
@@ -1239,7 +1047,30 @@ class MasterSmokeTestRunner:
 
             def _audit_single_file(fpath: Path = py_path, rpath: str = rel_path) -> Tuple[bool, str]:
                 nonlocal total_lines, total_ast_nodes, total_functions, total_classes
-                source = fpath.read_text(encoding="utf-8", errors="replace")
+                raw = fpath.read_bytes()
+                stat = fpath.stat()
+                digest = hashlib.sha256(raw).hexdigest()
+                cached = cache.get(rpath)
+                if isinstance(cached, dict) and cached.get("sha256") == digest:
+                    # D71/I1: isabet — parse+walk atlanir, sonuc aynen kullanilir.
+                    line_count = int(cached.get("lines", 0))
+                    node_cnt = int(cached.get("nodes", 0))
+                    cls_cnt = int(cached.get("classes", 0))
+                    fn_cnt = int(cached.get("functions", 0))
+                    total_lines += line_count
+                    total_ast_nodes += node_cnt
+                    total_classes += cls_cnt
+                    total_functions += fn_cnt
+                    file_violations = [str(v) for v in cached.get("violations", [])]
+                    fresh_cache[rpath] = cached
+                    if file_violations:
+                        all_violations.extend(file_violations)
+                        return False, f"İhlaller ({len(file_violations)}): {', '.join(file_violations[:3])}"
+                    return (
+                        True,
+                        f"AST temiz ({line_count} satır, {node_cnt} düğüm, {cls_cnt} sınıf, {fn_cnt} fonksiyon)",
+                    )
+                source = raw.decode("utf-8", errors="replace")
                 lines = source.splitlines()
                 line_count = len(lines)
                 total_lines += line_count
@@ -1249,12 +1080,69 @@ class MasterSmokeTestRunner:
                 except SyntaxError as syn_exc:
                     msg = f"{rpath}: SyntaxError (satır {syn_exc.lineno}: {syn_exc.msg})"
                     all_violations.append(msg)
+                    fresh_cache[rpath] = {
+                        "mtime_ns": stat.st_mtime_ns, "size": stat.st_size,
+                        "sha256": digest, "lines": line_count, "nodes": 0,
+                        "classes": 0, "functions": 0, "violations": [msg],
+                    }
                     return False, msg
 
                 file_violations: List[str] = []
                 node_cnt = 0
                 fn_cnt = 0
                 cls_cnt = 0
+
+                def _scan_stmts(stmts, func_node) -> None:
+                    """Bir deyim listesindeki yer tutuculari denetler.
+
+                    S-4904: eskiden yalnizca fonksiyon govdesinin ust
+                    duzey deyimleri denetleniyordu; `if cond: pass`,
+                    `try: ... except: pass` gibi ic ice dallardaki yer
+                    tutucular kapidan kaciyordu. Artik tum ic ice
+                    deyim listeleri (body/orelse/finalbody, except
+                    handler govdeleri, match case govdeleri) taranir.
+                    Ic ice fonksiyon/sinif govdelerine girilmez; onlar
+                    dis `ast.walk` tarafindan ayri ayri ziyaret edilir
+                    (cift sayimi onler).
+                    """
+                    for stmt in stmts:
+                        if isinstance(stmt, ast.Pass):
+                            v = f"{rpath}:{func_node.name} (satır {func_node.lineno} boş gövde)"
+                            file_violations.append(v)
+                        elif (
+                            isinstance(stmt, ast.Expr)
+                            and isinstance(stmt.value, ast.Constant)
+                            and stmt.value.value is Ellipsis
+                        ):
+                            v = f"{rpath}:{func_node.name} (satır {func_node.lineno} üç nokta gövde)"
+                            file_violations.append(v)
+                        elif isinstance(stmt, ast.Raise):
+                            exc_node = stmt.exc
+                            is_not_impl = False
+                            if isinstance(exc_node, ast.Name) and exc_node.id == "NotImplementedError":
+                                is_not_impl = True
+                            elif (
+                                isinstance(exc_node, ast.Call)
+                                and isinstance(exc_node.func, ast.Name)
+                                and exc_node.func.id == "NotImplementedError"
+                            ):
+                                is_not_impl = True
+                            if is_not_impl:
+                                def_line = lines[func_node.lineno - 1] if 0 <= func_node.lineno - 1 < len(lines) else ""
+                                raise_line = lines[stmt.lineno - 1] if 0 <= stmt.lineno - 1 < len(lines) else ""
+                                if "pragma: no cover" not in def_line and "pragma: no cover" not in raise_line:
+                                    v = f"{rpath}:{func_node.name} (satır {func_node.lineno} NotImplementedError)"
+                                    file_violations.append(v)
+                        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                            continue
+                        for attr in ("body", "orelse", "finalbody"):
+                            sub = getattr(stmt, attr, None)
+                            if isinstance(sub, list) and sub:
+                                _scan_stmts(sub, func_node)
+                        for handler in getattr(stmt, "handlers", []) or []:
+                            _scan_stmts(handler.body, func_node)
+                        for case in getattr(stmt, "cases", []) or []:
+                            _scan_stmts(case.body, func_node)
 
                 for node in ast.walk(tree):
                     node_cnt += 1
@@ -1271,35 +1159,11 @@ class MasterSmokeTestRunner:
                         ):
                             stmts = stmts[1:]
 
-                        if len(stmts) == 1:
-                            only_stmt = stmts[0]
-                            if isinstance(only_stmt, ast.Pass):
-                                v = f"{rpath}:{node.name} (satır {node.lineno} boş gövde)"
-                                file_violations.append(v)
-                            elif (
-                                isinstance(only_stmt, ast.Expr)
-                                and isinstance(only_stmt.value, ast.Constant)
-                                and only_stmt.value.value is Ellipsis
-                            ):
-                                v = f"{rpath}:{node.name} (satır {node.lineno} üç nokta gövde)"
-                                file_violations.append(v)
-                            elif isinstance(only_stmt, ast.Raise):
-                                exc_node = only_stmt.exc
-                                is_not_impl = False
-                                if isinstance(exc_node, ast.Name) and exc_node.id == "NotImplementedError":
-                                    is_not_impl = True
-                                elif (
-                                    isinstance(exc_node, ast.Call)
-                                    and isinstance(exc_node.func, ast.Name)
-                                    and exc_node.func.id == "NotImplementedError"
-                                ):
-                                    is_not_impl = True
-                                if is_not_impl:
-                                    def_line = lines[node.lineno - 1] if 0 <= node.lineno - 1 < len(lines) else ""
-                                    raise_line = lines[only_stmt.lineno - 1] if 0 <= only_stmt.lineno - 1 < len(lines) else ""
-                                    if "pragma: no cover" not in def_line and "pragma: no cover" not in raise_line:
-                                        v = f"{rpath}:{node.name} (satır {node.lineno} NotImplementedError)"
-                                        file_violations.append(v)
+                        # F-2032: eskiden yalnizca tek deyimlik govdeler
+                        # denetleniyordu (`len(stmts) == 1`); cok deyimli bir
+                        # govdedeki `pass` / `...` / `raise NotImplementedError`
+                        # kapidan kaciyordu. Artik govdedeki HER deyim denetlenir.
+                        _scan_stmts(stmts, node)
 
                 for lineno, raw_line in enumerate(lines, start=1):
                     if marker_a in raw_line or marker_b in raw_line:
@@ -1308,6 +1172,12 @@ class MasterSmokeTestRunner:
                 total_ast_nodes += node_cnt
                 total_functions += fn_cnt
                 total_classes += cls_cnt
+                fresh_cache[rpath] = {
+                    "mtime_ns": stat.st_mtime_ns, "size": stat.st_size,
+                    "sha256": digest, "lines": line_count, "nodes": node_cnt,
+                    "classes": cls_cnt, "functions": fn_cnt,
+                    "violations": list(file_violations),
+                }
 
                 if file_violations:
                     all_violations.extend(file_violations)
@@ -1325,6 +1195,10 @@ class MasterSmokeTestRunner:
                 _audit_single_file,
                 suite_checks,
             )
+
+        # D71/I1: yalnizca bu kosuda gorulen dosyalar saklanir (silinen
+        # dosyalarin girdileri budanir); yazma hatasi sonucu etkilemez.
+        _save_ast_gate_cache(self.ast_cache_path, fresh_cache)
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         passed_cnt = sum(1 for c in suite_checks if c.passed)
@@ -1382,7 +1256,7 @@ class MasterSmokeTestRunner:
         overall_passed = (failed_suites == 0) and (failed_checks == 0) and (total_suites >= 5)
 
         return {
-            "rapor_basligi": "Gatherion-Local v2.0 (Türkçe) — Ana Duman Testi ve Tam AST Denetim Raporu",
+            "rapor_basligi": f"Gatherion-Local v{__version__} (Türkçe) — Ana Duman Testi ve Tam AST Denetim Raporu",
             "olusturulma_zamani": datetime.datetime.now().isoformat(timespec="seconds"),
             "proje_kok_dizini": str(self.root),
             "genel_durum": "BAŞARILI (PASS)" if overall_passed else "BAŞARISIZ (FAIL)",
@@ -1440,7 +1314,7 @@ class MasterSmokeTestRunner:
         lines: List[str] = [
             "",
             sep_eq,
-            "  GATHERION-LOCAL v2.0 (TÜRKÇE) — ANA DUMAN TESTİ VE TAM KOD TABANI AST DENETİM RAPORU",
+            f"  GATHERION-LOCAL v{__version__} (TÜRKÇE) — ANA DUMAN TESTİ VE TAM KOD TABANI AST DENETİM RAPORU",
             sep_eq,
             f"  Tarih / Saat       : {payload['olusturulma_zamani']}",
             f"  Çalışma Dizini     : {payload['proje_kok_dizini']}",
@@ -1456,7 +1330,7 @@ class MasterSmokeTestRunner:
             st_badge = "GEÇTİ (PASS)" if s.passed else "KALDI (FAIL)"
             chk_ratio = f"{s.passed_checks}/{s.total_checks}"
             lines.append(
-                f"  {idx:02d}  | {s.suite_id:<25} | {chk_ratio:<11} | {s.duration_ms:10.2f} | {st_badge:<12} | {s.summary_tr[:68]}"
+                f"  {idx:02d}  | {s.suite_id:<25} | {chk_ratio:<11} | {s.duration_ms:10.2f} | {st_badge:<12} | {s.summary_tr}"
             )
 
         lines.extend(
@@ -1498,15 +1372,24 @@ class MasterSmokeTestRunner:
         return "\n".join(lines)
 
     def run_all(self) -> bool:
+        """6 paketi çalıştırır, raporu yazar, özeti basar; geçtiyse True döner."""
+        passed, _payload = self._run_all_with_payload()
+        return passed
+
+    def _run_all_with_payload(self) -> Tuple[bool, Dict[str, Any]]:
         """
-        5 ana doğrulama paketini sırasıyla çalıştırır, JSON raporunu `logs/smoke_test_report.json`
-        konumuna yazar ve Türkçe özet raporu stdout'a basar.
+        6 ana doğrulama paketini sırasıyla çalıştırır, JSON raporunu `logs/smoke_test_report.json`
+        konumuna yazar ve Türkçe özet raporu stdout'a basar; `(passed, payload)` döndürür.
+
+        D71/I4: payload bellek içinden döner — eskiden `run_all_smoke_tests`
+        raporu diskten yeniden okuyup parse ediyordu (gereksiz IO + yazma
+        ile okuma arasinda dosya silinirse/bozulursa bos yere patlama).
         """
         self.suite_summaries.clear()
         self.all_checks.clear()
         t_start = time.perf_counter()
 
-        logger.info("Gatherion-Local v2.0 Ana Duman Testi Yürütücüsü başlatılıyor...")
+        logger.info(f"Gatherion-Local v{__version__} Ana Duman Testi Yürütücüsü başlatılıyor...")
 
         # 1. Çekirdek 8-Aşamalı Öz-Test Paketi
         self.run_suite_1_core_self_test()
@@ -1538,15 +1421,13 @@ class MasterSmokeTestRunner:
         report_text = self.format_turkish_console_report(payload)
         print(report_text)
 
-        return bool(payload.get("overall_passed", False))
+        return bool(payload.get("overall_passed", False)), payload
 
 
 def run_all_smoke_tests(root: Optional[Path] = None) -> Tuple[bool, Dict[str, Any]]:
     """Programatik çağrılar için tüm duman testlerini çalıştırır ve `(passed, payload)` döndürür."""
     runner = MasterSmokeTestRunner(root=root)
-    passed = runner.run_all()
-    payload = json.loads(runner.report_json_path.read_text(encoding="utf-8"))
-    return passed, payload
+    return runner._run_all_with_payload()
 
 
 def main() -> int:
@@ -1557,20 +1438,42 @@ def main() -> int:
 
 
 def get_master_smoke_runner_summary() -> dict:
-    """Saf ve güvenli bir şekilde master smoke runner özetini döndürür."""
-    try:
-        return {"master_smoke_ready": True, "total_checks": 218}
-    except Exception:
-        return {"master_smoke_ready": False, "total_checks": 0}
+    """Master smoke runner ozeti.
+
+    F-2031: eskiden hicbir test calistirilmadan
+    ``{"master_smoke_ready": True, "total_checks": 218}`` donuyordu (sahte
+    sabit). Hazir durumu yalnizca gercek bir calisma (`run_all_smoke_tests`)
+    sonrasinda raporlanabilir; bu fonksiyon calisma yapmaz, o yuzden
+    calistirilmamis durumu durustce bildirir.
+    """
+    return {
+        "master_smoke_ready": False,
+        "total_checks": 0,
+        "checked": False,
+        "note": "Hicbir duman testi calistirilmadi; hazir durumu yalnizca "
+        "run_all_smoke_tests() calistirildiktan sonra raporlanabilir.",
+    }
 
 
 def get_master_smoke_runner_ready_flag() -> dict:
-    """Returns the ready flag for the master smoke runner."""
-    return {"module": "run_all_smoke_tests", "ready": True}
+    """Returns the ready flag for the master smoke runner.
+
+    F-2037: eskiden hicbir calisma yapilmadan ``ready: True`` donuyordu.
+    Bu fonksiyon calisma yapmaz; hazir oldugu ancak gercek bir
+    `run_all_smoke_tests()` calismasiyla kanitlanabilir.
+    """
+    return {
+        "module": "run_all_smoke_tests",
+        "ready": False,
+        "note": "Smoke calismasi yapilmadi; ready yalnizca gercek calisma sonrasinda True olur.",
+    }
 
 
 def get_run_all_smoke_tests_version_info() -> dict:
-    return {"module": "run_all_smoke_tests", "version": "2.0.0", "ready": True}
+    # F-2037: "ready" burada calisma sonucu degil, yalnizca modulun yuklenebildigini
+    # belirtir; gercek hazirlik run_all_smoke_tests() calismasiyla olculur.
+    return {"module": "run_all_smoke_tests", "version": __version__, "ready": False,
+            "note": "Smoke calismasi yapilmadi."}
 
 
 if __name__ == "__main__":
@@ -1578,15 +1481,51 @@ if __name__ == "__main__":
 
 
 def get_run_all_smoke_tests_diagnostic_snapshot() -> dict:
-    return {"module": "run_all_smoke_tests", "status": "ok", "ready": True}
+    # F-2037: calisma yapilmadan "ok/ready" denemez.
+    return {"module": "run_all_smoke_tests", "status": "not_run", "ready": False}
 
 
 def get_run_all_smoke_tests_capabilities() -> list:
-    return ["run_all_smoke_tests", "diagnostic_snapshot", "version_info"]
+    # F-2037: yetenek listesi, modulde GERCEKTEN var olan giris noktalarindan
+    # turetilir; sabit yazilmis bir kendini-onay listesi degildir.
+    candidates = [
+        "run_all_smoke_tests",
+        "diagnostic_snapshot",
+        "version_info",
+        "run_suite_1_core_self_test",
+        "run_suite_2_vision_and_3x",
+        "run_suite_3_mobile_and_enterprise",
+        "run_suite_4_offscreen_turkish_ui",
+        "run_suite_5_full_ast_zero_placeholder_gate",
+        "run_suite_6_zk_vision_agent",
+    ]
+    present = {"run_all_smoke_tests", "diagnostic_snapshot", "version_info"}
+    present |= {
+        name
+        for name in candidates[3:]
+        if callable(getattr(MasterSmokeTestRunner, name, None))
+    }
+    return [name for name in candidates if name in present]
 
 
 def validate_run_all_smoke_tests_contract() -> bool:
-    return bool(get_run_all_smoke_tests_capabilities())
+    # F-2037: "sozlesme" artik sabit True degil; runner sinifinin beklenen
+    # 6 paket metoduna ve programatik giris noktasina GERCEKTEN sahip oldugunu
+    # denetler. Bu yapi denetimidir, test gecti anlamina gelmez.
+    required_methods = [
+        "run_all",
+        "run_suite_1_core_self_test",
+        "run_suite_2_vision_and_3x",
+        "run_suite_3_mobile_and_enterprise",
+        "run_suite_4_offscreen_turkish_ui",
+        "run_suite_5_full_ast_zero_placeholder_gate",
+        "run_suite_6_zk_vision_agent",
+    ]
+    return bool(
+        callable(globals().get("run_all_smoke_tests"))
+        and all(callable(getattr(MasterSmokeTestRunner, m, None)) for m in required_methods)
+        and len(get_run_all_smoke_tests_capabilities()) >= 3
+    )
 
 
 def get_run_all_smoke_tests_baseline_metrics() -> dict:

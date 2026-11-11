@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
-"""After a monster select, combat must enter the existing attack step."""
+"""After a monster select, combat must enter the attack step via keys (T + hotbar).
+
+The attack entry of ``_step_combat_mode`` is the key-based rotation: the T key
+(right-click attack = T) is held via ``_sync_combat_right_button(True)`` and
+hotbar skills are cast via ``_cast_one_combat_skill``. ``fight_back_step`` is
+NOT this path's entry — it is the legacy route-mode entry
+(``core/state_machine.py`` calls it from the route loop only), so a test that
+claims "attack entry called" must not point at ``fight_back_step``.
+"""
 
 import threading
 import time
 import unittest
 
 import numpy as np
+from PyQt6.QtCore import QThread
 
 from core.state_machine import BotWorker
 
@@ -39,14 +48,20 @@ class _Recovery:
         self.fight_calls += 1
 
     def fight_back(self, input_ctrl=None, frame=None):
-        raise AssertionError("fight_back_step is the attack entry")
+        raise AssertionError("fight_back_step must not be called on the combat path")
 
     def execute_combat_step(self, input_ctrl=None, frame=None):
-        raise AssertionError("fight_back_step is the attack entry")
+        raise AssertionError("fight_back_step must not be called on the combat path")
 
 
 def _worker(bar_after_tab):
     worker = BotWorker.__new__(BotWorker)
+    # QThread.__init__ is required: BotWorker properties (is_paused, ...) and
+    # _check_game_focus() raise RuntimeError without it.
+    try:
+        QThread.__init__(worker)
+    except Exception:
+        pass
     worker._lock = threading.RLock()
     worker._mode = "combat"
     worker._state = "WAITING"
@@ -105,23 +120,27 @@ class CombatSelectEntersAttackTests(unittest.TestCase):
         worker._step_combat_mode()
         return worker, right
 
-    def test_successful_monster_select_calls_attack_entry(self):
+    def test_successful_monster_select_enters_key_attack(self):
         worker, right = self._run(True)
         skills = [key for key in worker.input_driver.pressed if key not in ("tab", "f")]
         self.assertIn("tab", worker.input_driver.pressed)
-        self.assertEqual(worker.combat_recovery.fight_calls, 0)
+        # Attack entry is the key rotation: T held + hotbar skills cast.
+        self.assertIn(True, right, "T-key attack hold was never requested")
+        self.assertIn("t", worker.input_driver.pressed)
         self.assertTrue(skills)
-        # AION2 mouse-look: sticky RMB disabled (camera orbit); skills via keys only.
-        self.assertNotIn(True, right)
         self.assertEqual(worker._state, "FIGHTING")
+        # fight_back_step is the legacy route-mode entry, not this path's:
+        # it must NOT be called by _step_combat_mode.
+        self.assertEqual(worker.combat_recovery.fight_calls, 0)
 
-    def test_failed_select_does_not_call_attack_entry(self):
+    def test_failed_select_does_not_enter_attack(self):
         worker, right = self._run(False)
         skills = [key for key in worker.input_driver.pressed if key not in ("tab", "f")]
         self.assertIn("tab", worker.input_driver.pressed)
+        self.assertNotIn(True, right, "no target, so no T-key attack hold")
+        self.assertNotIn("t", worker.input_driver.pressed)
         self.assertEqual(worker.combat_recovery.fight_calls, 0)
         self.assertEqual(skills, [])
-        self.assertNotIn(True, right)
         self.assertNotEqual(worker._state, "FIGHTING")
 
 

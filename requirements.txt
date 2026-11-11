@@ -6,11 +6,8 @@ mss>=9.0.1
 numpy>=1.24.0
 pydirectinput>=1.0.4
 keyboard>=0.13.5
-Pillow>=10.0.0
 pywin32>=306
-winshell>=0.6
 psutil>=5.9.0
-requests>=2.31.0
 
 # Mobile Remote Dashboard, QR Code & Encrypted Local Vault
 qrcode>=7.4.2
@@ -19,15 +16,17 @@ cryptography>=41.0.0
 # Self-Training YOLO Dataset Factory, RTX FP16 Trainer & ONNX GPU Runtime
 # (For NVIDIA RTX GPUs: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124)
 torch>=2.2.0
-torchvision>=0.17.0
 ultralytics>=8.1.0
-onnx>=1.15.0
-onnxslim>=0.1.30
 onnxruntime-gpu>=1.17.0
 pyyaml>=6.0.1
 
 # Optional Audio Loopback DSP (WASAPI FFT Frequency Analysis)
 sounddevice>=0.4.6
+pyaudio>=0.2.13
+
+# Optional capture / GPU telemetry (imported defensively with try/except in code)
+dxcam>=0.0.5
+pynvml>=11.5.0
 
 # Serial / Network HID (Leonardo COM + Android TCP bridge client uses same stack)
 pyserial>=3.5

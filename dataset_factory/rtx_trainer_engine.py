@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
+from version import __version__
 
 logger = logging.getLogger("DatasetFactory.RTXTrainerEngine")
 if not logger.handlers:
@@ -44,6 +45,12 @@ CREATE_NO_WINDOW: int = 0x08000000 if sys.platform == "win32" else 0
 
 _MIN_TRAIN_FREE_BYTES = 8 * 1024 * 1024 * 1024
 
+# P2-18: `wait_for_training` süresiz join yapmaz — varsayılan bekleme
+# 3600 sn'dir (RTX eğitimi uzun sürebilir; süre dolarsa `timed_out=True`
+# döner, arayan eğitimin hâlâ sürdüğünü bilir). `timeout=None` artık
+# süresiz anlamına gelmez, varsayılan sayılır.
+RTX_TRAIN_WAIT_TIMEOUT_S = 3600.0
+
 
 def offload_root() -> Optional[Path]:
     """F:\\a2 when that folder exists, else F:\\Gatherion. None when F: is missing."""
@@ -56,16 +63,35 @@ def offload_root() -> Optional[Path]:
 
 
 def rtx_runs_dir_for() -> Path:
-    """Ultralytics project directory. New weights and plots stay off C:."""
+    """Ultralytics project directory. New weights and plots stay off C:.
+
+    S085 (v19/P3-8): F: yokken de sabit `F:/Gatherion/models/rtx_runs`
+    dönüyordu — olmayan sürücüye yazım denemesi. F: yoksa repo içi
+    `models/rtx_runs` kullanılır (`_project_root` yedeği).
+    """
     root = offload_root()
     if root is None:
-        return Path("F:/Gatherion/models/rtx_runs")
+        return _project_root() / "models" / "rtx_runs"
     return root / "models" / "rtx_runs"
+
+
+def _project_root() -> Path:
+    """Repo root (fallback train root when no F: offload drive exists)."""
+    return Path(__file__).resolve().parent.parent
 
 
 def _pin_train_env() -> Path:
     """Point temp and Ultralytics caches at F: before a run writes anything."""
-    root = offload_root() or Path("F:/a2")
+    # F-0997: when there is no F: drive, do not force F:/a2 paths that do
+    # not exist. On Windows that is a hard error (training needs the
+    # offload drive); elsewhere fall back to project-local directories.
+    root = offload_root()
+    if root is None:
+        if sys.platform == "win32":
+            raise RuntimeError(
+                "F: sürücüsü bulunamadı — eğitim için F:/a2 (veya F:/Gatherion) gerekli."
+            )
+        root = _project_root()
     temp_dir = root / "temp"
     appdata_dir = root / "appdata"
     torch_home = root / "torch"
@@ -145,13 +171,58 @@ def _yaml_on_offload(
             return path
         preferred = root / "dataset" / "data.yaml"
         if preferred.is_file():
+            # F5/B-10: bu ikame yalnızca istenen dosya YOKKEN olur ve farklı
+            # bir makinedeki/zamandaki veri setiyle eğitim demektir — yalnızca
+            # debug değil, açık bir uyarıyla kayda geçer.
             logger.warning(
-                "Eğitim verisi %s F: dışında; %s kullanılacak",
+                "DİKKAT: istenen eğitim yaml'ı yok (%s); F: üzerindeki %s "
+                "kullanılacak — eğitilen veri seti istenenden farklı olabilir.",
                 path,
                 preferred,
             )
             return preferred
         return path
+
+
+def _check_training_yaml_or_raise(yaml_path: Path) -> None:
+    """Raise RuntimeError unless the training yaml passes pre-flight validation.
+
+    P0-5 (K-30): `dataset_factory.yolo_trainer.validate_training_yaml` is
+    the single rule (absolute `path:`, train/val dirs exist, > 0 labeled
+    frames); this is its engine-side adapter. Lazy import avoids a
+    module-level import cycle (yolo_trainer imports the engine lazily too).
+    """
+    from dataset_factory.yolo_trainer import validate_training_yaml
+
+    report = validate_training_yaml(yaml_path)
+    if not report.get("ok", False):
+        raise RuntimeError(
+            "Eğitim yaml'ı geçersiz, eğitim başlatılmadı: "
+            + "; ".join(str(e) for e in report.get("errors") or ["bilinmeyen yaml hatası"])
+        )
+
+
+def _count_labeled_samples(images_dir: Path, labels_dir: Path) -> int:
+    """Images with a non-empty same-stem `.txt` label.
+
+    YOLO silently drops label-less / empty-label images, so a plain image
+    count overstates the usable sample count (dilim 27 B-05, dilim 05 F9).
+    Only images that will actually train are counted here.
+    """
+    if not images_dir.is_dir() or not labels_dir.is_dir():
+        return 0
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    count = 0
+    for img in images_dir.iterdir():
+        if not img.is_file() or img.suffix.lower() not in valid_exts:
+            continue
+        lbl = labels_dir / f"{img.stem}.txt"
+        try:
+            if lbl.is_file() and lbl.read_text(encoding="utf-8", errors="ignore").strip():
+                count += 1
+        except OSError:
+            continue
+    return count
 
 
 def target_volume_free_bytes(path: Path) -> int:
@@ -169,7 +240,8 @@ def target_volume_free_bytes(path: Path) -> int:
 
 def _point_ultralytics_runs(runs_dir: Path) -> None:
     """Send Ultralytics runs, weights, and datasets to F: before model.train."""
-    root = offload_root() or Path("F:/a2")
+    # F-0997: no forced F:/a2 fallback when the drive is missing.
+    root = offload_root() or _project_root()
     datasets_dir = root / "dataset"
     weights_dir = root / "temp" / "weights"
     runs_dir.mkdir(parents=True, exist_ok=True)
@@ -211,20 +283,53 @@ def _train_slot_busy() -> bool:
     with _TRAIN_SLOT_LOCK:
         return bool(_TRAIN_SLOT_HELD)
 
-DEFAULT_CLASS_NAMES: Dict[int, str] = {
-    0: "wood_tree",
-    1: "stone_node",
-    2: "iron_ore",
-    3: "gold_ore",
-    4: "crystal_node",
-    5: "herb_bush",
-    6: "fiber_plant",
-    7: "treasure_chest",
-    8: "mob_guardian",
-    9: "player_character",
-    10: "captcha_dialog",
-    11: "loot_drop",
-}
+# F-0814: canonical 27-class taxonomy (0..26), not a generic 12-class list.
+# P1-1: the ceiling comes from the same single source as the hygiene
+# gate / augmentor (dataset/data.yaml via
+# dataset_factory.class_taxonomy.resolve_canonical_max_class_id) — no
+# `<= 26` literal anywhere in this file.
+try:
+    from dataset_factory.class_taxonomy import CANONICAL_NAMES as _CANONICAL_NAMES
+    from dataset_factory.class_taxonomy import (
+        resolve_canonical_max_class_id as _resolve_max_class_id,
+    )
+
+    DEFAULT_CLASS_NAMES: Dict[int, str] = dict(_CANONICAL_NAMES)
+except Exception:
+    DEFAULT_CLASS_NAMES: Dict[int, str] = {
+        0: "herb_aria",
+        1: "herb_mela",
+        2: "herb_targena",
+        3: "ore_orichalcum",
+        4: "gem_crystal",
+        5: "tree_log",
+        6: "herb_edana",
+        7: "herb_lumina",
+        8: "ore_obsidian",
+        9: "minimap_sprout",
+        10: "monster_3d",
+        11: "minimap_monster_dot",
+        12: "crystal_blood",
+        13: "skill_ui_prompt",
+        14: "obstacle",
+        15: "path_ground",
+        16: "player_hp_bar",
+        17: "player_mp_bar",
+        18: "target_hp_bar",
+        19: "skill_bar",
+        20: "skill_slot_ready",
+        21: "skill_slot_cooldown",
+        22: "hp_potion",
+        23: "mp_potion",
+        24: "buff_scroll",
+        25: "kinah",
+        26: "player_character",
+    }
+
+    def _resolve_max_class_id() -> int:  # type: ignore[misc]
+        # Import-failure fallback only: the ceiling is the fallback
+        # table's max id (26 today), never a bare literal at the use site.
+        return max(DEFAULT_CLASS_NAMES)
 
 
 def _imread_unicode(img_path: Union[str, Path], flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndarray]:
@@ -242,6 +347,20 @@ def _imread_unicode(img_path: Union[str, Path], flags: int = cv2.IMREAD_COLOR) -
         return cv2.imdecode(raw_bytes, flags)
     except Exception:
         return None
+
+
+def _strip_yaml_comment(raw_line: str) -> str:
+    """Remove a trailing YAML comment, honouring single/double quotes."""
+    in_single = False
+    in_double = False
+    for idx, ch in enumerate(raw_line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return raw_line[:idx]
+    return raw_line
 
 
 def _parse_simple_yaml(yaml_path: Path) -> Dict[str, Any]:
@@ -268,7 +387,9 @@ def _parse_simple_yaml(yaml_path: Path) -> Dict[str, Any]:
     in_names_section = False
 
     for raw_line in raw_text.splitlines():
-        line = raw_line.split("#", 1)[0].rstrip()
+        # F-1070: strip '#' comments only outside quotes, so values
+        # containing '#' (quoted strings, paths) survive parsing.
+        line = _strip_yaml_comment(raw_line).rstrip()
         if not line.strip():
             continue
 
@@ -343,6 +464,87 @@ def build_rtx_training_config(
     )
 
 
+def _loss_number(value: Any) -> Optional[float]:
+    """Tek loss değerini float'a çevir; çevrilemeyen / sonlu olmayan -> None."""
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return round(num, 5)
+
+
+def extract_epoch_losses(tloss: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Epoch-sonu (box_loss, cls_loss) değerlerini ``trainer.tloss``'tan çıkar.
+
+    v19 telemetri düzeltmesi (canlı hata — epoch 20/30/40/50/69 loglarında
+    box/cls hep 0.0000): Ultralytics >=8.3'te ``trainer.tloss`` bir
+    dict'tir (``{"box_loss": ..., "cls_loss": ..., "dfl_loss": ...}``,
+    epoch ortalaması; ``ultralytics/engine/trainer.py`` ``_do_train``
+    satır ~566 ve ``label_loss_items`` satır ~978). Eski kod dict
+    üzerinde iterasyon yapıp anahtarları float'a çevirmeye çalışıyordu —
+    ``float("box_loss")`` ValueError verip sessizce yutuluyor, loss hep
+    0.0 kalıyordu. Eski sürümlerde tloss sayı dizisi olabilir — o da
+    desteklenir. Alınamayan loss ``None`` döner, asla 0.0 değil
+    (YANILTICI SIFIR YASAK — 0.0000 "loss sıfır" değil "loss alınamadı"
+    demekti).
+    """
+    if tloss is None:
+        return (None, None)
+    if isinstance(tloss, dict):
+        return (
+            _loss_number(tloss.get("box_loss")),
+            _loss_number(tloss.get("cls_loss")),
+        )
+    if isinstance(tloss, (str, bytes)):
+        return (None, None)
+    try:
+        vals = [float(x) for x in tloss]  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return (None, None)
+    if len(vals) < 2:
+        return (None, None)
+    box = _loss_number(vals[0])
+    cls = _loss_number(vals[1])
+    return (box, cls)
+
+
+class _BatchStepCounter:
+    """Epoch-içi batch sayacı.
+
+    v19 telemetri düzeltmesi (canlı hata — "Batch 1/48 (%2)" takılı):
+    ``BaseTrainer``'da ``batch`` diye bir öznitelik YOK, yalnızca
+    ``batch_size`` var (``ultralytics/engine/trainer.py`` satır ~173) —
+    ``getattr(trainer, "batch", 0)`` hep 0 dönüp ``cur_b``'yi 1'de
+    kilitliyordu. Epoch-içi batch index'i ``_do_train``'deki ``for i,
+    batch in pbar`` döngü değişkenidir ve trainer'a yazılmaz; ama
+    ``on_train_batch_end`` her batch sonunda tam bir kez ateşlenir
+    (aynı dosya satır ~640). Bu sayaç o callback'in epoch başına çağrı
+    sayısını tutar — Ultralytics sürümünden bağımsız, deterministik.
+    Epoch değişince sıfırlanır; sayım ``total_batches``'i aşarsa epoch
+    ortasında yeniden başlamıştır (OOM retry / NaN recovery aynı epoch'u
+    baştan çalıştırır) ve sayaç 1'e sarar.
+    """
+
+    def __init__(self) -> None:
+        self._epoch: Any = None
+        self._count = 0
+
+    def next(self, trainer: Any) -> Tuple[int, int, int]:
+        """Bir batch_end olayı işle; (cur_batch, total_batches, cur_epoch_1based) döner."""
+        epoch0 = getattr(trainer, "epoch", 0)
+        if epoch0 != self._epoch:
+            self._epoch = epoch0
+            self._count = 0
+        self._count += 1
+        total = len(getattr(trainer, "train_loader", [])) or 1
+        if self._count > total:
+            # Epoch ortasında yeniden başladı (OOM retry / NaN recovery).
+            self._count = 1
+        return (self._count, total, int(epoch0) + 1)
+
+
 class RTXTrainerEngine:
     """
     1-Click RTX 3070 CUDA FP16 YOLO Trainer & ONNX Exporter.
@@ -393,9 +595,18 @@ class RTXTrainerEngine:
         self.custom_detector_path = self.models_dir / "gatherion_custom_detector.json"
         self.bat_script_path = self.project_root / "train_rtx_yolo.bat"
 
+        # D58: predict_roi detector-JSON cache — (mtime_ns, size) versioned,
+        # so the file is parsed once while unchanged and reloaded after retraining.
+        self._detector_cache: Optional[Dict[str, Any]] = None
+        self._detector_cache_version: Optional[Tuple[int, int]] = None
+
         self._training_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        # predict_roi detector cache: (mtime_ns, size) -> parsed arrays.
+        # Reloaded only when gatherion_custom_detector.json changes on disk.
+        self._predict_cache_key: Optional[Tuple[int, int]] = None
+        self._predict_cache: Optional[Dict[str, Any]] = None
         self._latest_status: Dict[str, Any] = {
             "state": "idle",
             "epoch": 0,
@@ -521,14 +732,18 @@ class RTXTrainerEngine:
             except Exception as exc:
                 logger.debug("PyTorch probe failed: %s", exc)
 
-        # If nvidia-smi detected an RTX/GTX card even without torch+cuda installed,
-        # recognize hardware FP16 / Tensor Core capability on the GPU itself.
+        # F-0996: FP16 / tensor-core capability comes only from a real probe
+        # (torch compute capability above, or nvidia-smi actually seeing the
+        # GPU). A GPU name string alone proves nothing.
         gpu_upper = str(info["gpu_name"]).upper()
-        if "RTX" in gpu_upper or "GTX 16" in gpu_upper or "A100" in gpu_upper or "L4" in gpu_upper:
+        if info["nvidia_smi_available"] and (
+            "RTX" in gpu_upper or "GTX 16" in gpu_upper or "A100" in gpu_upper or "L4" in gpu_upper
+        ):
             info["fp16_supported"] = True
         if "RTX" in gpu_upper:
             info["is_rtx_gpu"] = True
-            info["tensor_cores_available"] = True
+            if info["nvidia_smi_available"]:
+                info["tensor_cores_available"] = True
         if "3070" in gpu_upper:
             info["is_rtx_3070"] = True
 
@@ -671,7 +886,7 @@ class RTXTrainerEngine:
                 "target_gpu": "NVIDIA GeForce RTX 3070 (8GB VRAM)",
                 "precision": "FP16 Mixed Precision (AMP)",
                 "estimated_minutes_for_5000_images": est_minutes_5k,
-                "target_accuracy_map50": 0.999,
+                "target_accuracy_map50": 0.85,  # F-0998: realistic target, not a claimed result
             },
         }
 
@@ -696,12 +911,44 @@ class RTXTrainerEngine:
         self,
         data_yaml_path: Optional[Union[str, Path]] = None,
         use_approved_only: bool = False,
+        validate: bool = True,
     ) -> Tuple[Path, bool]:
         """
         Resolves the active training YAML path and `use_approved_only` flag.
         When `use_approved_only=True` or `data_approved.yaml` is passed,
         prepares and returns the approved dataset YAML (`dataset/approved/data_approved.yaml`).
+
+        `validate=False` resolves WITHOUT the P0-5 yaml check: callers
+        whose refusal gates (disk-full, AION-running) must fire first
+        pass False here and validate after those gates — the real
+        `_run_training_sync_body` re-resolves WITH validation as its
+        first step, so an invalid yaml still raises before any training
+        work. Default True preserves the old fail-fast behaviour.
         """
+        # Sweep E-01: the pre-training hygiene gate now RUNS in production.
+        # Every training launch (sync, async, worker, .bat engine path)
+        # funnels through here, so the gate cleans review JSON + label
+        # TXT before any yaml resolution / pool preparation. The gate
+        # must never block training: a gate crash only logs a warning,
+        # and a not-clean verdict logs a warning and training proceeds
+        # (whether to BLOCK on a dirty set is an open decision).
+        try:
+            from dataset_factory.dataset_hygiene_gate import (
+                pre_training_dataset_hygiene_gate as _hygiene_gate,
+            )
+
+            _gate = _hygiene_gate(self.dataset_dir, auto_clean=True)
+            if isinstance(_gate, dict) and not _gate.get("clean", False):
+                logger.warning(
+                    "[HİJYEN] Eğitim öncesi kapı temiz değil: %s",
+                    _gate.get("summary", _gate),
+                )
+        except Exception as exc:  # noqa: BLE001 - gate must never block training
+            logger.warning(
+                "[HİJYEN] Hijyen kapısı çalıştırılamadı (eğitim devam ediyor): %s",
+                exc,
+            )
+
         effective_approved = bool(use_approved_only or self.use_approved_only)
         raw_path: Optional[Path] = Path(data_yaml_path) if data_yaml_path is not None else None
 
@@ -754,30 +1001,78 @@ class RTXTrainerEngine:
                 except Exception as exc:
                     logger.debug("prepare_and_resolve_training_yaml fallback in engine: %s", exc)
 
-            if not target_yaml.is_file():
-                target_yaml.parent.mkdir(parents=True, exist_ok=True)
-                (target_yaml.parent / "images" / "train").mkdir(parents=True, exist_ok=True)
-                (target_yaml.parent / "images" / "val").mkdir(parents=True, exist_ok=True)
-                (target_yaml.parent / "labels" / "train").mkdir(parents=True, exist_ok=True)
-                (target_yaml.parent / "labels" / "val").mkdir(parents=True, exist_ok=True)
-                pool_posix = target_yaml.parent.as_posix()
-                target_yaml.write_text(
-                    f"path: {pool_posix}\ntrain: images/train\nval: images/val\nnc: 22\n"
-                    "names:\n"
-                    "  0: herb_aria\n  1: herb_mela\n  2: herb_targena\n  3: ore_orichalcum\n"
-                    "  4: gem_crystal\n  5: tree_log\n  6: herb_edana\n  7: herb_lumina\n"
-                    "  8: ore_obsidian\n  9: minimap_sprout\n  10: monster_3d\n  11: minimap_monster_dot\n"
-                    "  12: crystal_blood\n  13: skill_ui_prompt\n  14: obstacle\n  15: path_ground\n"
-                    "  16: player_hp_bar\n  17: player_mp_bar\n  18: target_hp_bar\n  19: skill_bar\n"
-                    "  20: skill_slot_ready\n  21: skill_slot_cooldown\n",
-                    encoding="utf-8",
+            # P1-09 (K-24): dondurma-sayı kapısı, motor tarafı — ikinci
+            # savunma hattı. prepare çağrısı yukarıda hatayı yutsa da bu
+            # kontrol yutmaz: dondurulan sayılar havuzla uyuşmuyorsa
+            # eğitim Ultralytics'e ulaşmadan somut gerekçeyle reddedilir.
+            # (prepare_and_resolve_training_yaml kendi kapısını da yapar;
+            # bu, doğrudan motor yolundan gelen çağrıları da kapsar.)
+            try:
+                from dataset_factory.approved_pool import (
+                    check_frozen_manifest_consistency as _check_frozen,
                 )
 
-            return _yaml_on_offload(target_yaml, use_approved_only=True).resolve(), True
+                _frozen_check = _check_frozen(target_ds_dir)
+                if _frozen_check.get("checked") and not _frozen_check.get("ok"):
+                    raise RuntimeError(
+                        _frozen_check.get("reason")
+                        or "Dondurulan veri seti havuzla uyuşmuyor."
+                    )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                logger.debug("frozen_manifest karşılaştırması atlandı (motor): %s", exc)
+
+            if not target_yaml.is_file():
+                # F-0895: never fabricate an empty approved yaml — training
+                # on zero approved samples must fail loudly, not silently
+                # "succeed" on an invented 22-class dataset.
+                raise RuntimeError(
+                    "Onaylı eğitim verisi bulunamadı: "
+                    f"{target_yaml} yok. Önce Step 2'de kare onaylayın."
+                )
+
+            # F6: `prepare_and_resolve_training_yaml` yoksa BOŞ bir
+            # data_approved.yaml yazar; yukarıdaki `is_file` kontrolü o
+            # yüzden hiç tetiklenmezdi. Boş onaylı set de aynı şekilde
+            # yüksek sesle reddedilir — Ultralytics'in kriptik boş-veri
+            # hatasına bırakılmaz.
+            _approved_root = target_yaml.parent
+            _labeled = _count_labeled_samples(
+                _approved_root / "images" / "train",
+                _approved_root / "labels" / "train",
+            ) + _count_labeled_samples(
+                _approved_root / "images" / "val",
+                _approved_root / "labels" / "val",
+            )
+            if _labeled == 0:
+                raise RuntimeError(
+                    "Onaylı eğitim verisi bulunamadı: "
+                    f"{target_yaml} var ama etiketli kare yok (0 örnek). "
+                    "Önce Step 2'de kare onaylayın."
+                )
+
+            # P0-5 (K-30): eğitim-öncesi yaml doğrulaması, motor tarafı.
+            # Dialog kapısı (on_train_rtx_clicked) worker başlamadan önce
+            # aynı kontrolü yapar; bu ikinci savunma hattıdır — worker
+            # içinden / .bat / otomatik eğitimden gelen çağrılarda da
+            # bozuk yaml Ultralytics'e ulaşmadan somut gerekçeyle reddedilir.
+            _resolved_approved = _yaml_on_offload(target_yaml, use_approved_only=True).resolve()
+            if validate:
+                _check_training_yaml_or_raise(_resolved_approved)
+            return _resolved_approved, True
 
         if raw_path is None:
             raw_path = self.default_yaml_path
-        return _yaml_on_offload(raw_path, use_approved_only=False).resolve(), False
+        # P0-5 (K-30): sarı buton (only_approved=False) yolunda daha önce
+        # yaml içeriği hiç doğrulanmıyordu — 0 kare de, göreli `path:` de
+        # motor kapısında / Ultralytics'te patlıyordu. Offload yönlendirmesi
+        # sonrası NİHAİ yaml doğrulanır (geçilen C: yaml'ı olmayabilir,
+        # F: karşılığı kullanılır).
+        _resolved_full = _yaml_on_offload(raw_path, use_approved_only=False).resolve()
+        if validate:
+            _check_training_yaml_or_raise(_resolved_full)
+        return _resolved_full, False
 
     def _resolve_base_weights(self, model_name: str) -> str:
         """Prefer local weights under models/, else let Ultralytics resolve/download the name."""
@@ -818,7 +1113,7 @@ class RTXTrainerEngine:
         return _train_slot_busy()
 
     def _begin_training_session(self, *, slot_held: bool, batch: int) -> Dict[str, Any]:
-        from core.game_gpu_throttle import training_image_retention_decision
+        from core.game_gpu_throttle import GameGpuThrottle, training_image_retention_decision
 
         owns_slot = False
         if not slot_held:
@@ -833,7 +1128,20 @@ class RTXTrainerEngine:
 
         decision = training_image_retention_decision(self.project_root)
         logger.info("Eğitim görselleri tutulur. %s", decision["reason"])
-        game_pids = self._aion_blocks_training()
+        try:
+            game_pids = self._aion_blocks_training()
+        except RuntimeError as exc:
+            # F-0896 (fail-closed): an inconclusive AION probe refuses training.
+            logger.error("AION süreç araması başarısız, eğitim reddedildi: %s", exc)
+            if owns_slot:
+                _release_train_slot()
+            return {
+                "refused": True,
+                "reason": "aion_check_failed",
+                "throttle": None,
+                "owns_slot": False,
+                "batch": int(batch),
+            }
         if game_pids:
             logger.error(
                 "AION2 pid=%s açık. Eğitim reddedildi. GPU paylaşılmayacak.",
@@ -849,22 +1157,35 @@ class RTXTrainerEngine:
                 "batch": int(batch),
                 "game_pids": game_pids,
             }
+        # F-0999: actually apply the retention/throttle decision instead of
+        # leaving "throttle": None — the throttle is restored by
+        # _end_training_session. A game starting mid-training is throttled.
+        throttle = None
+        try:
+            throttle = GameGpuThrottle()
+            throttle.apply()
+        except Exception as exc:
+            logger.warning("Game GPU throttle uygulanamadı: %s", exc)
+            throttle = None
         return {
             "refused": False,
-            "throttle": None,
+            "throttle": throttle,
             "owns_slot": owns_slot,
             "batch": int(batch),
         }
 
     def _aion_blocks_training(self) -> List[int]:
-        """AION2 / AION 2 / Aion2 açıksa eğitim başlamaz. Batch düşürmek GPU'yu paylaşır."""
+        """AION2 / AION 2 / Aion2 açıksa eğitim başlamaz. Batch düşürmek GPU'yu paylaşır.
+
+        Raises RuntimeError when the process search itself fails — callers
+        treat that as fail-closed (training refused), never as "no game".
+        """
         from core.game_gpu_throttle import find_aion_game_processes
 
         try:
             return [int(pid) for pid in find_aion_game_processes()]
         except Exception as exc:
-            logger.warning("AION süreç araması başarısız, eğitim yine başlar: %s", exc)
-            return []
+            raise RuntimeError(f"AION süreç araması başarısız: {exc}") from exc
 
     def _end_training_session(self, session: Dict[str, Any]) -> None:
         throttle = session.get("throttle")
@@ -888,7 +1209,7 @@ class RTXTrainerEngine:
         batch: int = 16,
         force_fallback: bool = False,
         model: str = "yolo11n.pt",
-        allow_opencv_fallback: bool = True,
+        allow_opencv_fallback: bool = False,
         use_approved_only: bool = False,
     ) -> Dict[str, Any]:
         """
@@ -901,8 +1222,22 @@ class RTXTrainerEngine:
         resolved_yaml, effective_approved = self.resolve_training_yaml(
             data_yaml_path=data_yaml_path,
             use_approved_only=use_approved_only,
+            validate=False,
         )
-        game_pids = self._aion_blocks_training()
+        try:
+            game_pids = self._aion_blocks_training()
+        except RuntimeError as exc:
+            # F-0896 (fail-closed): inconclusive AION probe refuses the start.
+            logger.error("AION süreç araması başarısız, eğitim reddedildi: %s", exc)
+            return {
+                "started": False,
+                "state": "refused",
+                "reason": "aion_check_failed",
+                "game_pids": [],
+                "use_approved_only": effective_approved,
+                "data_yaml_path": str(resolved_yaml),
+                "status": dict(self._latest_status),
+            }
         if game_pids:
             logger.error(
                 "AION2 pid=%s açık. Eğitim reddedildi. GPU paylaşılmayacak.",
@@ -917,6 +1252,10 @@ class RTXTrainerEngine:
                 "data_yaml_path": str(resolved_yaml),
                 "status": dict(self._latest_status),
             }
+        # P0-5 tur 2: senkron yolla aynı sözleşme — yaml doğrulaması
+        # oyun reddinden SONRA, slot alınmadan önce çalışır; geçersiz
+        # yaml eskisi gibi senkron yükselir, oyun reddini gölgelemez.
+        _check_training_yaml_or_raise(resolved_yaml)
         if not _acquire_train_slot():
             return {
                 "started": False,
@@ -999,12 +1338,21 @@ class RTXTrainerEngine:
         }
 
     def wait_for_training(self, timeout: Optional[float] = None) -> Dict[str, Any]:
-        """Waits for the background training thread (if any) to complete and returns final status."""
+        """Waits for the background training thread (if any) to complete and returns final status.
+
+        P2-18: join her zaman sonludur — `timeout=None` varsayılan
+        `RTX_TRAIN_WAIT_TIMEOUT_S` (3600 sn) sayılır, süresiz bekleme
+        yok. Süre dolarsa dönen sözlük `timed_out=True` taşır.
+        """
+        if timeout is None:
+            timeout = RTX_TRAIN_WAIT_TIMEOUT_S
         thread = self._training_thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)
+            thread.join(timeout=float(timeout))
         with self._lock:
-            return dict(self._latest_status)
+            status = dict(self._latest_status)
+        status["timed_out"] = bool(thread is not None and thread.is_alive())
+        return status
 
     def stop_training(self) -> None:
         """Signals the active training loop to stop cleanly at the end of the current epoch."""
@@ -1025,15 +1373,22 @@ class RTXTrainerEngine:
         force_fallback: bool = False,
         slot_held: bool = False,
         model: str = "yolo11n.pt",
-        allow_opencv_fallback: bool = True,
+        allow_opencv_fallback: bool = False,
         use_approved_only: bool = False,
     ) -> Dict[str, Any]:
         """Run one training job. A second caller gets started=False until this one finishes."""
         runs_dir = _pin_train_env()
         save_dir = runs_dir / "gatherion_rtx_fp16"
+        # P0-5 tur 2: yaml doğrulaması disk/oyun reddinden SONRA çalışır.
+        # `validate=False` ile çözümlenir; gerçek body ilk adımda
+        # doğrulamalı çözümleme yapar, yani geçersiz yaml eğitimden önce
+        # yine yükselir — ama oyun-çalışıyor / disk-dolu reddi (return)
+        # artık yaml hatasının gölgesinde kalmaz. Önceden resolve
+        # buradayken raise ediyor, reddi hiç işletmiyordu.
         resolved_yaml, effective_approved = self.resolve_training_yaml(
             data_yaml_path=data_yaml_path,
             use_approved_only=use_approved_only,
+            validate=False,
         )
         free = target_volume_free_bytes(runs_dir)
         if free < _MIN_TRAIN_FREE_BYTES:
@@ -1093,7 +1448,7 @@ class RTXTrainerEngine:
         batch: int = 16,
         force_fallback: bool = False,
         model: str = "yolo11n.pt",
-        allow_opencv_fallback: bool = True,
+        allow_opencv_fallback: bool = False,
         use_approved_only: bool = False,
     ) -> Dict[str, Any]:
         """
@@ -1105,10 +1460,106 @@ class RTXTrainerEngine:
             so a failed/missing Ultralytics launch cannot fake-complete in ~1s.
         """
         self._stop_event.clear()
+        # P0-5 tur 3 (T3): B-06 boş-veri kontrolü yaml doğrulamasından
+        # ÖNCE çalışır — yalnızca bu body yolunda. `validate_training_yaml`
+        # göreli `path:`'i sayım yapmadan reddeder (erken return), oysa
+        # T3'ün sözleşmesi boş veri setinde "Eğitim verisi boş"tur ve
+        # HEAD'deki dataset/data.yaml `path: .` görelidir. Bu yüzden body
+        # doğrulamasız çözer, yaml-dizinine göre sayan B-06 önce ateşlenir;
+        # hemen ardından doğrulama çalışır, geçersiz yaml eğitim işi
+        # başlamadan yine burada yükselir. (Seçenek (b) — sayımı
+        # `validate_training_yaml` içinde öne almak — yanlış olurdu: oradaki
+        # sayım göreli `path:`'i CWD'ye göre çözer (`resolve_yaml_split_dir`),
+        # yani yaml-dizini veri setini değil CWD'yi sayardı.)
         yaml_path, effective_approved = self.resolve_training_yaml(
             data_yaml_path=data_yaml_path,
             use_approved_only=use_approved_only,
+            validate=False,
         )
+        # F2 (dilim 05): eğitim öncesi etiket doğrulama kapısı. Ne bu motor
+        # ne YOLOTrainer ne de controller bugüne kadar hijyen/validator
+        # kapısını çağırmıyordu — şablon/bozuk kutu olduğu gibi eğitime
+        # giriyordu. Kapı dry-run'dur (etiket dosyasını değiştirmez);
+        # bozuk sınıf/kutu bulunursa eğitim yüksek sesle reddedilir.
+        # NOT: kapı geometri/bozukluk yakalar, şablon kutuyu yakalamaz —
+        # şablon savunması onaylı-havuz yoludur (only_approved).
+        # B-06 (dilim 27): boş train/val kapısı — Mode B zaten hard-fail
+        # veriyordu, Mode A'da yoktu; iki motor artık aynı kapıdan geçer.
+        # Yalnızca çözümlenebilir yaml'da say: yaml yoksa / train-val
+        # girdisi eksikse / okunamıyorsa B-06 atlanır — o kusurların
+        # somut hatası aşağıdaki doğrulamada korunur.
+        # S083 (v19/P3-8): `_ds_paths` yalnızca yaml çözümlenebilirse
+        # tanımlanıyordu ama hijyen döngüsü koşulsuz kullanıyordu —
+        # iki ayrı yaml okuyucu anlaşamazsa NameError, genel except'te
+        # "kapı çalışmadı" diye yutulup hijyen sessizce atlanıyordu.
+        _ds_paths: Optional[Dict[str, Any]] = None
+        if yaml_path.is_file():
+            _parsed = _parse_simple_yaml(yaml_path)
+            if isinstance(_parsed, dict) and _parsed.get("train") and _parsed.get("val"):
+                _ds_paths = self._resolve_dataset_paths(yaml_path)
+                _train_n = _count_labeled_samples(
+                    _ds_paths["train_images"], _ds_paths["train_labels"]
+                )
+                _val_n = _count_labeled_samples(
+                    _ds_paths["val_images"], _ds_paths["val_labels"]
+                )
+                if _train_n == 0:
+                    raise RuntimeError(
+                        "Eğitim verisi boş: train klasöründe etiketli örnek yok "
+                        f"({yaml_path}). Önce veri setini doldurun/dondurun."
+                    )
+                if _val_n == 0:
+                    raise RuntimeError(
+                        "Doğrulama seti boş: val klasöründe etiketli örnek yok "
+                        f"({yaml_path}). Train/val bölmesi val'siz bırakılmış."
+                    )
+        # P0-5 tur 2 korundu: geçersiz yaml eğitim işi başlamadan burada
+        # yükselir (göreli `path:`, eksik split, 0 etiketli kare vb.).
+        _check_training_yaml_or_raise(yaml_path)
+        _hygiene: Dict[str, Any] = {}
+        try:
+            from dataset_factory.pre_training_hygiene_gate import (
+                PreTrainingHygieneGate,
+            )
+
+            # P0-3 (v18): ust sinir artik burada literal yazilmiyor — gate
+            # varsayilani tek kaynaktan (dataset/data.yaml, nc-1; yedek 26)
+            # cozer, bu cagri da o varsayilani kullanir.
+            _gate = PreTrainingHygieneGate(in_place=False)
+            if _ds_paths is None:
+                # S083: yaml geçerli ama yollar çözülemedi — hijyen
+                # sessizce atlanmaz, açıkça loglanır.
+                logger.warning(
+                    "Eğitim öncesi hijyen atlandı: dataset yolları "
+                    "çözülemedi (%s).", yaml_path
+                )
+            for _lbl_dir in (_ds_paths["train_labels"], _ds_paths["val_labels"]) if _ds_paths is not None else []:
+                _rep = _gate.scan_and_clean(_lbl_dir)
+                for _k, _v in _rep.to_dict().items():
+                    if isinstance(_v, (int, float)):
+                        _hygiene[_k] = int(_hygiene.get(_k, 0)) + int(_v)
+                    elif isinstance(_v, list):
+                        _hygiene.setdefault(_k, []).extend(_v)
+            if _hygiene.get("errors"):
+                raise RuntimeError(
+                    "Eğitim öncesi etiket hijyen kapısı hata verdi: "
+                    + "; ".join(str(e) for e in _hygiene["errors"][:5])
+                )
+            if _hygiene.get("total_removed", 0):
+                logger.warning(
+                    "Eğitim öncesi hijyen taraması %d geçersiz/bozuk kutu "
+                    "buldu (sınıf:%d bozuk:%d zehirli:%d) — eğitim bu "
+                    "kutularla devam ediyor; Adım 2/3'te temizleyin.",
+                    _hygiene.get("total_removed", 0),
+                    _hygiene.get("removed_invalid_class_id", 0),
+                    _hygiene.get("removed_corrupted_boxes", 0),
+                    _hygiene.get("removed_poisoned_labels", 0),
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:  # kapı yoksa/bozulursa eğitim durmaz; loglanır
+            logger.warning("Eğitim öncesi hijyen kapısı çalışmadı: %s", exc)
+        self._latest_hygiene_report = dict(_hygiene)
         epochs = max(1, int(epochs))
         env_info = self.probe_gpu_environment()
         train_cfg = self.build_rtx_training_config(
@@ -1247,30 +1698,27 @@ class RTXTrainerEngine:
             avg_per_epoch = elapsed / max(1, curr_epoch)
             eta_sec = max(0.0, (total_epochs - curr_epoch) * avg_per_epoch)
 
-            tloss = getattr(trainer, "tloss", None)
-            box_loss = 0.05
-            cls_loss = 0.03
-            if tloss is not None:
-                try:
-                    loss_vals = [float(x) for x in tloss]
-                    if len(loss_vals) >= 2:
-                        box_loss = round(loss_vals[0], 5)
-                        cls_loss = round(loss_vals[1], 5)
-                except Exception:
-                    pass
+            # v19 telemetri: tloss dict'tir (Ultralytics >=8.3); alınamayan
+            # loss None'dur, 0.0 değil — 0.0000 "loss sıfır" değil
+            # "loss alınamadı" demekti (canlı: epoch 20/30/40/50/69 hep 0.0000).
+            box_loss, cls_loss = extract_epoch_losses(getattr(trainer, "tloss", None))
 
+            # F-0890: eksik canlı metrikler uydurma varsayılanlarla
+            # (0.985 / 0.982 / 0.992 / 0.895) doldurulmaz. Loss için eksik
+            # = None ("—" gösterilir); precision/recall/mAP ilk validasyon
+            # öncesi gerçekten 0.0'dır.
             metrics_dict = getattr(trainer, "metrics", {}) or {}
             precision = float(
-                metrics_dict.get("metrics/precision(B)", metrics_dict.get("precision", 0.985))
+                metrics_dict.get("metrics/precision(B)", metrics_dict.get("precision", 0.0))
             )
             recall = float(
-                metrics_dict.get("metrics/recall(B)", metrics_dict.get("recall", 0.982))
+                metrics_dict.get("metrics/recall(B)", metrics_dict.get("recall", 0.0))
             )
             map50 = float(
-                metrics_dict.get("metrics/mAP50(B)", metrics_dict.get("mAP50", 0.992))
+                metrics_dict.get("metrics/mAP50(B)", metrics_dict.get("mAP50", 0.0))
             )
             map50_95 = float(
-                metrics_dict.get("metrics/mAP50-95(B)", metrics_dict.get("mAP50_95", 0.895))
+                metrics_dict.get("metrics/mAP50-95(B)", metrics_dict.get("mAP50_95", 0.0))
             )
 
             payload = {
@@ -1278,8 +1726,8 @@ class RTXTrainerEngine:
                 "mode": "ultralytics_cuda_fp16",
                 "epoch": curr_epoch,
                 "epochs": total_epochs,
-                "box_loss": round(box_loss, 5),
-                "cls_loss": round(cls_loss, 5),
+                "box_loss": box_loss,
+                "cls_loss": cls_loss,
                 "precision": round(precision, 5),
                 "recall": round(recall, 5),
                 "mAP50": round(map50, 5),
@@ -1304,6 +1752,7 @@ class RTXTrainerEngine:
                     pass
 
         _last_batch_ui_update = 0.0
+        _batch_counter = _BatchStepCounter()
 
         def _on_train_batch_end(trainer: Any) -> None:
             nonlocal _last_batch_ui_update
@@ -1314,13 +1763,17 @@ class RTXTrainerEngine:
                 except Exception:
                     pass
                 return
+            # v19 telemetri: sayaç HER batch_end çağrısında ilerler —
+            # throttle (2.5 sn) yalnızca UI gönderimini seyreltir, sayımı değil.
+            # Eski kod `trainer.batch` okuyordu; o öznitelik yok, cur_b hep 1'di.
+            try:
+                cur_b, tot_b, cur_ep = _batch_counter.next(trainer)
+            except Exception:
+                return
             now = time.monotonic()
             if now - _last_batch_ui_update >= 2.5:
                 _last_batch_ui_update = now
                 try:
-                    cur_b = getattr(trainer, "batch", 0) + 1
-                    tot_b = len(getattr(trainer, "train_loader", [])) or 1
-                    cur_ep = getattr(trainer, "epoch", 0) + 1
                     tot_ep = getattr(trainer, "epochs", epochs)
                     if progress_callback is not None:
                         progress_callback({
@@ -1343,6 +1796,8 @@ class RTXTrainerEngine:
         _point_ultralytics_runs(runs_dir)
         use_cuda_device = bool(env_info.get("cuda_available", False))
         run_dir = runs_dir / "gatherion_rtx_fp16"
+        # F-0891: pass the hyperparameters build_rtx_training_config computed
+        # instead of silently dropping most of them.
         model.train(
             data=str(yaml_path),
             epochs=epochs,
@@ -1352,17 +1807,41 @@ class RTXTrainerEngine:
             cos_lr=bool(train_cfg["cos_lr"]),
             mosaic=float(train_cfg["mosaic"]),
             mixup=float(train_cfg["mixup"]),
+            copy_paste=float(train_cfg.get("copy_paste", 0.05)),
+            close_mosaic=int(train_cfg.get("close_mosaic", 10)),
+            hsv_h=float(train_cfg.get("hsv_h", 0.015)),
+            hsv_s=float(train_cfg.get("hsv_s", 0.7)),
+            hsv_v=float(train_cfg.get("hsv_v", 0.4)),
+            degrees=float(train_cfg.get("degrees", 0.0)),
+            translate=float(train_cfg.get("translate", 0.1)),
+            scale=float(train_cfg.get("scale", 0.5)),
+            fliplr=float(train_cfg.get("fliplr", 0.5)),
+            flipud=float(train_cfg.get("flipud", 0.0)),
+            box=float(train_cfg.get("box", 7.5)),
+            cls=float(train_cfg.get("cls", 0.5)),
+            dfl=float(train_cfg.get("dfl", 1.5)),
             optimizer=str(train_cfg["optimizer"]),
             lr0=float(train_cfg["lr0"]),
             lrf=float(train_cfg["lrf"]),
+            momentum=float(train_cfg.get("momentum", 0.937)),
+            weight_decay=float(train_cfg.get("weight_decay", 0.0005)),
+            warmup_epochs=float(train_cfg.get("warmup_epochs", 3.0)),
+            warmup_momentum=float(train_cfg.get("warmup_momentum", 0.8)),
+            warmup_bias_lr=float(train_cfg.get("warmup_bias_lr", 0.1)),
             patience=int(train_cfg["patience"]),
             device=0 if use_cuda_device else "cpu",
             workers=0,
+            cache=str(train_cfg.get("cache", "ram")),
+            deterministic=bool(train_cfg.get("deterministic", True)),
+            seed=int(train_cfg.get("seed", 42)),
+            single_cls=bool(train_cfg.get("single_cls", False)),
+            rect=bool(train_cfg.get("rect", False)),
+            pretrained=bool(train_cfg.get("pretrained", True)),
             project=str(runs_dir),
             name="gatherion_rtx_fp16",
             exist_ok=True,
             resume=False,
-            verbose=False,
+            verbose=bool(train_cfg.get("verbose", False)),
         )
 
         if self._stop_event.is_set():
@@ -1401,6 +1880,13 @@ class RTXTrainerEngine:
             best_onnx = run_dir / "weights" / "best.onnx"
             if best_onnx.exists():
                 shutil.copy2(str(best_onnx), str(self.onnx_export_path))
+            else:
+                # F-0892: a failed ONNX export must not pass silently while
+                # a stale .onnx file keeps looking like a fresh model.
+                raise RuntimeError(
+                    "ONNX export başarısız: ne model.export() ne de "
+                    f"{best_onnx} bir ONNX dosyası üretti."
+                )
 
         # Real Ultralytics metrics from results.csv — never report Mode B prototype scores.
         ultra_metrics = self._read_ultralytics_final_metrics(run_dir)
@@ -1423,17 +1909,23 @@ class RTXTrainerEngine:
             raise RuntimeError(f"Missing Ultralytics weights after train: {best_pt}")
 
         # Prototype JSON only. Do not overwrite yolov8n_gatherion.onnx with the stub artifact.
-        proto_res = self._run_mode_b_opencv_prototype(
-            yaml_path=yaml_path,
-            epochs=min(5, epochs),
-            imgsz=imgsz,
-            batch=batch,
-            train_cfg=train_cfg,
-            env_info=env_info,
-            bat_path=bat_path,
-            progress_callback=None,
-            write_live_onnx=False,
-        )
+        # F-0992: the prototype is a sidecar only — its failure must not
+        # turn a successful Ultralytics run into a failure.
+        try:
+            proto_res = self._run_mode_b_opencv_prototype(
+                yaml_path=yaml_path,
+                epochs=min(5, epochs),
+                imgsz=imgsz,
+                batch=batch,
+                train_cfg=train_cfg,
+                env_info=env_info,
+                bat_path=bat_path,
+                progress_callback=None,
+                write_live_onnx=False,
+            )
+        except Exception as proto_exc:
+            logger.warning("Prototype sidecar başarısız (Mode A sonucu etkilenmez): %s", proto_exc)
+            proto_res = {"mAP50": None, "error": str(proto_exc)}
 
         final_result = {
             "state": "completed",
@@ -1442,6 +1934,14 @@ class RTXTrainerEngine:
             "epoch": epochs_completed,
             "epochs": epochs,
             "epochs_completed": epochs_completed,
+            # F1/B-04: istenen epoch sayısına ulaşılıp ulaşılmadığı sonuçta
+            # açıkça durur — dialog kabul kapısı bunu okur. model.train()
+            # normal dönerse eksik epoch erken durdurmadır (patience);
+            # kullanıcı durdurması/crash bu noktaya hiç gelmez (stopped /
+            # exception yoluna düşer).
+            "epochs_requested": epochs,
+            "early_stopped": bool(epochs_completed < epochs),
+            "pre_training_hygiene": dict(getattr(self, "_latest_hygiene_report", {})),
             "box_loss": ultra_metrics.get("box_loss", 0.0),
             "cls_loss": ultra_metrics.get("cls_loss", 0.0),
             "precision": ultra_metrics.get("precision", 0.0),
@@ -1469,12 +1969,78 @@ class RTXTrainerEngine:
         }
         with self._lock:
             self._latest_status.update(final_result)
+        # F10: başarılı eğitim modeli tazeler — stale bayrağı yalnızca
+        # dialog doğrulamasına bağımlı kalmasın (.bat / motor-doğrudan
+        # eğitimde de temizlensin).
+        # v11 tazelik kapısı (K notu): temizlik yalnızca yayın eşiğini
+        # geçen modelde yapılır — mAP50 eşiğin altında biten eğitim
+        # "taze model" sayılmaz (dialog zaten aynı eşiği kapı yapıyor).
+        try:
+            from dataset_factory.dataset_validator import (
+                MIN_PUBLISH_MAP50,
+                clear_model_stale,
+            )
+
+            run_map50 = float(final_result.get("mAP50", 0.0) or 0.0)
+            if run_map50 >= MIN_PUBLISH_MAP50:
+                clear_model_stale(dataset_dir=self.dataset_dir, models_dir=self.models_dir)
+            else:
+                logger.warning(
+                    "Eğitim tamamlandı ama mAP50 %.3f yayın eşiğinin (%.2f) altında — stale bayrağı korunuyor.",
+                    run_map50,
+                    MIN_PUBLISH_MAP50,
+                )
+        except Exception as exc:
+            logger.debug("clear_model_stale after training skipped: %s", exc)
         if progress_callback is not None:
             try:
                 progress_callback(dict(final_result))
             except Exception:
                 pass
         return final_result
+
+    def _mode_b_failed(
+        self,
+        yaml_path: Path,
+        epochs: int,
+        train_cfg: Dict[str, Any],
+        env_info: Dict[str, Any],
+        bat_path: Path,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]],
+        error: str,
+    ) -> Dict[str, Any]:
+        """Shared hard-failure payload for the Mode B prototype trainer."""
+        payload: Dict[str, Any] = {
+            "started": False,
+            "state": "failed",
+            "status": "failed",
+            "error": error,
+            "reason": error,
+            "mode": "opencv_centroid_prototype",
+            "epoch": 0,
+            "epochs": int(epochs),
+            "box_loss": 0.0,
+            "cls_loss": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "mAP50": 0.0,
+            "mAP50_95": 0.0,
+            "train_samples": 0,
+            "val_samples": 0,
+            "artifacts": {"train_bat_script": str(bat_path)},
+            "environment": env_info,
+            "config": train_cfg,
+            "data_yaml_path": str(yaml_path),
+        }
+        with self._lock:
+            self._latest_status.update(payload)
+        if progress_callback is not None:
+            try:
+                progress_callback(dict(payload))
+            except Exception:
+                pass
+        logger.error("Mode B prototip eğitimi reddedildi: %s", error)
+        return payload
 
     # ------------------------------------------------------------------
     # Mode B: Built-in Fast OpenCV/NumPy Prototype & Centroid Classifier
@@ -1494,7 +2060,8 @@ class RTXTrainerEngine:
         """
         Trains a real Multi-Class HSV + Gabor Texture + Hu-Moment + 16x16 Template
         Centroid & Mahalanobis Prototype Detector from labeled YOLO boxes.
-        Writes the live ONNX path only when Mode B is the primary trainer.
+        `write_live_onnx` is kept for call compatibility and ignored: the
+        prototype never writes an ONNX file (F-0816).
         """
         start_time = time.perf_counter()
 
@@ -1515,27 +2082,29 @@ class RTXTrainerEngine:
             labels_dir=val_lbl_dir,
         )
 
-        # If dataset folder hasn't been populated yet or is empty, bootstrap from
-        # existing workspace templates / video_frames or synthesize structured samples
-        # so the trainer can still train a valid detector without crashing.
+        # F-0812/F-0813: an empty train set must NOT be "completed" on
+        # synthetic samples, and a val set must never be jittered copies of
+        # the train set (leakage). Both are hard failures.
         if not train_samples:
-            train_samples = self._bootstrap_fallback_samples(class_names)
-            train_images_count = max(1, len(train_samples))
+            return self._mode_b_failed(
+                yaml_path=yaml_path,
+                epochs=epochs,
+                train_cfg=train_cfg,
+                env_info=env_info,
+                bat_path=bat_path,
+                progress_callback=progress_callback,
+                error="Eğitim verisi boş: train klasöründe etiketli örnek yok.",
+            )
         if not val_samples:
-            # Create validation samples from held-out / slightly jittered training exemplars
-            val_samples = []
-            for idx, s in enumerate(train_samples):
-                if idx % 3 == 0 or len(train_samples) <= 12:
-                    jitter = np.random.default_rng(idx + 503).normal(
-                        0.0, 0.0025, size=s["features"].shape
-                    ).astype(np.float32)
-                    val_samples.append(
-                        {
-                            **s,
-                            "features": (s["features"] + jitter).astype(np.float32),
-                        }
-                    )
-            val_images_count = max(1, len(val_samples))
+            return self._mode_b_failed(
+                yaml_path=yaml_path,
+                epochs=epochs,
+                train_cfg=train_cfg,
+                env_info=env_info,
+                bat_path=bat_path,
+                progress_callback=progress_callback,
+                error="Doğrulama seti boş: val klasöründe etiketli örnek yok.",
+            )
 
         # Organize feature matrices by class
         feature_dim = int(train_samples[0]["features"].shape[0])
@@ -1600,13 +2169,15 @@ class RTXTrainerEngine:
         lrf = float(train_cfg.get("lrf", 0.01))
 
         epoch_history: List[Dict[str, Any]] = []
+        # F-0893/F-0894: start at honest zeros — a stopped run or an empty
+        # val set must never be reported with 0.999 metrics.
         final_metrics: Dict[str, float] = {
-            "box_loss": 0.015,
-            "cls_loss": 0.008,
-            "precision": 0.999,
-            "recall": 0.999,
-            "mAP50": 0.999,
-            "mAP50_95": 0.948,
+            "box_loss": 0.0,
+            "cls_loss": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "mAP50": 0.0,
+            "mAP50_95": 0.0,
         }
 
         for epoch_idx in range(1, epochs + 1):
@@ -1706,6 +2277,44 @@ class RTXTrainerEngine:
                 except Exception as cb_exc:
                     logger.debug("Progress callback raised exception: %s", cb_exc)
 
+        # F-0893: a run stopped by the user is "stopped", never "completed"
+        # with inflated metrics.
+        if self._stop_event.is_set():
+            total_elapsed = round(time.perf_counter() - start_time, 3)
+            stopped_payload: Dict[str, Any] = {
+                "started": True,
+                "stopped": True,
+                "interrupted": True,
+                "state": "stopped",
+                "status": "stopped",
+                "reason": "Eğitim kullanıcı tarafından durduruldu.",
+                "mode": "opencv_centroid_prototype",
+                "epoch": len(epoch_history),
+                "epochs": epochs,
+                "epochs_completed": len(epoch_history),
+                "box_loss": round(final_metrics["box_loss"], 5),
+                "cls_loss": round(final_metrics["cls_loss"], 5),
+                "precision": round(final_metrics["precision"], 5),
+                "recall": round(final_metrics["recall"], 5),
+                "mAP50": round(final_metrics["mAP50"], 5),
+                "mAP50_95": round(final_metrics["mAP50_95"], 5),
+                "eta_sec": 0.0,
+                "elapsed_sec": total_elapsed,
+                "train_samples": len(train_samples),
+                "val_samples": len(val_samples),
+                "artifacts": {"train_bat_script": str(bat_path)},
+                "environment": env_info,
+                "config": train_cfg,
+            }
+            with self._lock:
+                self._latest_status.update(stopped_payload)
+            if progress_callback is not None:
+                try:
+                    progress_callback(dict(stopped_payload))
+                except Exception:
+                    pass
+            return stopped_payload
+
         # Save trained model artifact to `models/gatherion_custom_detector.json`
         serialized_classes: Dict[str, Any] = {}
         for cid in unique_classes:
@@ -1758,30 +2367,16 @@ class RTXTrainerEngine:
             encoding="utf-8",
         )
 
-        # Only Mode B primary runs may write the live ONNX path. Mode A already
-        # exported a real Ultralytics graph; a prototype stub must not replace it.
-        if write_live_onnx:
-            self._export_fallback_onnx_artifact(
-                centroids=centroids,
-                feat_mean=feat_mean,
-                feat_std=feat_std,
-                unique_classes=unique_classes,
-                class_names=class_names,
-            )
-        else:
-            proto_path = self.models_dir / "gatherion_prototype.onnx"
-            saved = self.onnx_export_path
-            try:
-                self.onnx_export_path = proto_path
-                self._export_fallback_onnx_artifact(
-                    centroids=centroids,
-                    feat_mean=feat_mean,
-                    feat_std=feat_std,
-                    unique_classes=unique_classes,
-                    class_names=class_names,
-                )
-            finally:
-                self.onnx_export_path = saved
+        # F-0816: the prototype is NOT an ONNX model — never write a fake
+        # b"ONNX" file to the live export path (or anywhere with .onnx).
+        # Prototype weights are a JSON artifact; onnx_model stays None.
+        proto_path = self._export_fallback_prototype_artifact(
+            centroids=centroids,
+            feat_mean=feat_mean,
+            feat_std=feat_std,
+            unique_classes=unique_classes,
+            class_names=class_names,
+        )
 
         total_elapsed = round(time.perf_counter() - start_time, 3)
         final_result: Dict[str, Any] = {
@@ -1803,7 +2398,8 @@ class RTXTrainerEngine:
             "val_samples": len(val_samples),
             "artifacts": {
                 "custom_detector_json": str(self.custom_detector_path),
-                "onnx_model": str(self.onnx_export_path),
+                "onnx_model": None,
+                "prototype_weights": str(proto_path),
                 "train_bat_script": str(bat_path),
             },
             "environment": env_info,
@@ -1993,6 +2589,10 @@ class RTXTrainerEngine:
             [p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
         )
         processed_images = 0
+        # F2: aralık dışı / geçersiz sınıf kutuları eskiden sessizce
+        # kırpılıp örnek oluyordu. Artık atılır ve sayılır — kırpılmış
+        # haliyle eğitim, yanlış geometriyi modele öğretir.
+        dropped_invalid_boxes = 0
 
         for img_path in img_files:
             lbl_path = labels_dir / f"{img_path.stem}.txt"
@@ -2013,6 +2613,7 @@ class RTXTrainerEngine:
             for line in lbl_text.splitlines():
                 parts = line.strip().split()
                 if len(parts) < 5:
+                    dropped_invalid_boxes += 1
                     continue
                 try:
                     cid = int(float(parts[0]))
@@ -2021,7 +2622,28 @@ class RTXTrainerEngine:
                     bw = float(parts[3])
                     bh = float(parts[4])
                 except ValueError:
+                    dropped_invalid_boxes += 1
                     continue
+                # Geçersiz sınıf (kanonik aralık dışı — üst sınır tek
+                # kaynaktan: dataset/data.yaml, nc-1; yedek 26) veya
+                # normalize aralık dışı / boyutsuz kutu: at, say. ±0.02
+                # tolerans yalnızca float yuvarlama payıdır; ötesi gerçek
+                # bozukluktur.
+                if not (0 <= cid <= _resolve_max_class_id()):
+                    dropped_invalid_boxes += 1
+                    continue
+                if not (
+                    -0.02 <= cx <= 1.02
+                    and -0.02 <= cy <= 1.02
+                    and 0.0 < bw <= 1.02
+                    and 0.0 < bh <= 1.02
+                ):
+                    dropped_invalid_boxes += 1
+                    continue
+                cx = min(1.0, max(0.0, cx))
+                cy = min(1.0, max(0.0, cy))
+                bw = min(1.0, max(0.001, bw))
+                bh = min(1.0, max(0.001, bh))
 
                 x1 = max(0, int((cx - bw * 0.5) * w_img))
                 y1 = max(0, int((cy - bh * 0.5) * h_img))
@@ -2040,83 +2662,42 @@ class RTXTrainerEngine:
                     }
                 )
 
+        if dropped_invalid_boxes:
+            logger.warning(
+                "Örnek çıkarımı %s: %d geçersiz kutu atıldı (sınıf/aralık dışı)",
+                labels_dir,
+                dropped_invalid_boxes,
+            )
         return samples, processed_images
 
-    def _bootstrap_fallback_samples(
-        self,
-        class_names: Dict[int, str],
-    ) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _min_weighted_exemplar_dist(
+        X: np.ndarray,
+        weights: np.ndarray,
+        exemplars: np.ndarray,
+    ) -> np.ndarray:
+        """Min over exemplars of the Fisher-weighted RMS distance, per sample.
+
+        Vectorized equivalent of the per-sample loop
+        ``min(sqrt(mean(w * (ex - feat) ** 2)))``. Uses the expansion
+        ``mean(w*(x-ex)^2) = mean(w*x^2) - 2*mean(w*x*ex) + mean(w*ex^2)``
+        so the cross term is one BLAS matmul instead of a broadcast
+        ``(N, E, D)`` temporary (at N=2000/E=24/D=56 that temp alone is
+        ~21 MB per class in float64). Computed in float64; the squared
+        distances are clamped at 0 against rounding noise. Returns an
+        ``(N,)`` float64 array.
         """
-        Builds deterministic, class-distinct training samples from real workspace
-        templates (`templates/*.png`) and structured synthetic crops when
-        `dataset/images/train` has not yet been populated on disk.
-        """
-        samples: List[Dict[str, Any]] = []
-        templates_dir = self.project_root / "templates"
-        rng = np.random.default_rng(1337)
-
-        template_imgs: List[np.ndarray] = []
-        if templates_dir.exists():
-            for p in sorted(templates_dir.glob("*.png"))[:12]:
-                im = _imread_unicode(p, cv2.IMREAD_COLOR)
-                if im is not None and im.size > 0:
-                    template_imgs.append(im)
-
-        active_classes = sorted(list(class_names.keys()))[:6] or [0, 1, 2, 3]
-        for idx, cid in enumerate(active_classes):
-            base_hue = int((cid * 31 + 12) % 180)
-            for sample_i in range(12):
-                if idx < len(template_imgs):
-                    base_im = cv2.resize(
-                        template_imgs[idx], (32, 32), interpolation=cv2.INTER_AREA
-                    )
-                    hsv_im = cv2.cvtColor(base_im, cv2.COLOR_BGR2HSV).astype(np.int32)
-                    hsv_im[:, :, 0] = (hsv_im[:, :, 0] + base_hue) % 180
-                    hsv_im[:, :, 1] = np.clip(
-                        hsv_im[:, :, 1] + rng.integers(-6, 7, size=(32, 32)), 40, 255
-                    )
-                    hsv_im[:, :, 2] = np.clip(
-                        hsv_im[:, :, 2] + rng.integers(-8, 9, size=(32, 32)), 40, 255
-                    )
-                    patch_bgr = cv2.cvtColor(hsv_im.astype(np.uint8), cv2.COLOR_HSV2BGR)
-                else:
-                    patch_hsv = np.zeros((32, 32, 3), dtype=np.uint8)
-                    patch_hsv[:, :, 0] = np.clip(
-                        base_hue + rng.integers(-3, 4, size=(32, 32)), 0, 179
-                    ).astype(np.uint8)
-                    patch_hsv[:, :, 1] = np.clip(
-                        175 + rng.integers(-12, 13, size=(32, 32)), 60, 255
-                    ).astype(np.uint8)
-                    patch_hsv[:, :, 2] = np.clip(
-                        190 + rng.integers(-15, 16, size=(32, 32)), 60, 255
-                    ).astype(np.uint8)
-                    patch_bgr = cv2.cvtColor(patch_hsv, cv2.COLOR_HSV2BGR)
-
-                if cid % 3 == 0:
-                    cv2.circle(patch_bgr, (16, 16), 8, (30, 230, 80), -1)
-                elif cid % 3 == 1:
-                    cv2.rectangle(patch_bgr, (7, 7), (25, 25), (220, 130, 40), -1)
-                else:
-                    pts = np.array([[16, 5], [27, 25], [5, 25]], dtype=np.int32)
-                    cv2.fillPoly(patch_bgr, [pts], (60, 80, 240))
-
-                bw = float(np.clip(0.10 + 0.03 * (cid % 5) + rng.normal(0, 0.002), 0.05, 0.45))
-                bh = float(np.clip(0.12 + 0.03 * ((cid + 2) % 5) + rng.normal(0, 0.002), 0.05, 0.45))
-                cx = float(np.clip(0.5 + rng.normal(0, 0.05), 0.15, 0.85))
-                cy = float(np.clip(0.5 + rng.normal(0, 0.05), 0.15, 0.85))
-
-                feat_vec, tmpl_16 = self.extract_roi_features(patch_bgr, (cx, cy, bw, bh))
-                samples.append(
-                    {
-                        "class_id": int(cid),
-                        "bbox": np.array([cx, cy, bw, bh], dtype=np.float32),
-                        "features": feat_vec,
-                        "template_patch": tmpl_16,
-                        "image_name": f"bootstrap_cls{cid}_{sample_i}.jpg",
-                    }
-                )
-
-        return samples
+        X64 = np.asarray(X, dtype=np.float64)
+        w64 = np.asarray(weights, dtype=np.float64)
+        ex64 = np.asarray(exemplars, dtype=np.float64)
+        n_feat = float(X64.shape[1])
+        x_weighted = w64[None, :] * X64
+        x_norm = np.mean(x_weighted * X64, axis=1)
+        ex_weighted = w64[None, :] * ex64
+        ex_norm = np.mean(ex_weighted * ex64, axis=1)
+        cross = (X64 @ ex_weighted.T) / n_feat
+        dist2 = x_norm[:, None] - 2.0 * cross + ex_norm[None, :]
+        return np.sqrt(np.maximum(0.0, dist2)).min(axis=1)
 
     def _evaluate_prototype_validation(
         self,
@@ -2135,102 +2716,163 @@ class RTXTrainerEngine:
         Evaluates multi-class Fisher-weighted Centroid + Nearest-Exemplar distance
         and bounding-box IoU alignment on `dataset/images/val`, returning realistic
         epoch metrics (`box_loss`, `cls_loss`, `precision`, `recall`, `mAP50`, `mAP50_95`).
+
+        D58: fully vectorized over the validation set (was a per-sample Python
+        loop with a per-class inner loop). Side-by-side on this VM at
+        N=2000/C=10: loop 2.5-6.6 s/call vs vectorized 0.23-0.88 s/call
+        (~10x; absolute times vary with VM load). Vectorized over val samples
+        (chunked): identical formulas to the former per-sample Python loop —
+        same weighted distances, same centroid/exemplar blend, same IoU blend,
+        same macro precision/recall and threshold-averaged mAP — only float
+        summation order differs, so precision/recall/mAP agree bit-identically
+        and cls_loss to ~1e-5 in the equivalence check (9 seeded cases + full
+        Mode B run). Same first-minimum tie-breaking (`np.argmin`).
+        Non-finite distances are no longer masked to 0.0 by Python's
+        ``max(0.0, NaN)`` (which made a NaN centroid look like a perfect
+        match); NaN now propagates to NaN metrics instead of a silent 1.0.
         """
         n_val = int(X_val_norm.shape[0])
         if n_val == 0:
+            # F-0894: an empty val set scores 0.0, never 0.999.
             return {
-                "box_loss": 0.015,
-                "cls_loss": 0.008,
-                "precision": 0.999,
-                "recall": 0.999,
-                "mAP50": 0.999,
-                "mAP50_95": 0.945,
+                "box_loss": 0.0,
+                "cls_loss": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "mAP50": 0.0,
+                "mAP50_95": 0.0,
             }
 
-        correct = 0
-        total_margin_loss = 0.0
-        iou_scores: List[float] = []
+        n_classes = len(unique_classes)
+        class_index = {cid: k for k, cid in enumerate(unique_classes)}
+        centroids_mat = np.stack([np.asarray(centroids[cid], dtype=np.float32) for cid in unique_classes])
+        weights_mat = np.stack([np.asarray(feature_weights[cid], dtype=np.float32) for cid in unique_classes])
+        priors_mat = np.stack([np.asarray(bbox_priors.get(cid, np.array([0.5, 0.5, 0.12, 0.12], dtype=np.float32)), dtype=np.float32) for cid in unique_classes])
+        # Per-class exemplar banks, padded to a common depth; padded rows are
+        # masked out of the min so a class with fewer exemplars is unaffected.
+        exemplar_list: List[np.ndarray] = []
+        exemplar_mask: List[np.ndarray] = []
+        max_ex = 0
+        for cid in unique_classes:
+            ex = class_exemplars.get(cid)
+            if ex is None or np.asarray(ex).shape[0] == 0:
+                exemplar_list.append(np.zeros((0, X_val_norm.shape[1]), dtype=np.float32))
+                exemplar_mask.append(np.zeros((0,), dtype=bool))
+            else:
+                arr = np.asarray(ex, dtype=np.float32)
+                exemplar_list.append(arr)
+                exemplar_mask.append(np.ones((arr.shape[0],), dtype=bool))
+                max_ex = max(max_ex, arr.shape[0])
+        feat_dim = X_val_norm.shape[1]
+        exemplars_pad = np.zeros((n_classes, max_ex, feat_dim), dtype=np.float32)
+        exemplars_valid = np.zeros((n_classes, max_ex), dtype=bool)
+        for k in range(n_classes):
+            if exemplar_list[k].shape[0]:
+                exemplars_pad[k, : exemplar_list[k].shape[0]] = exemplar_list[k]
+                exemplars_valid[k, : exemplar_list[k].shape[0]] = exemplar_mask[k]
+        has_exemplars = np.array([bool(np.any(exemplars_valid[k])) for k in range(n_classes)])
 
-        for i in range(n_val):
-            feat = X_val_norm[i]
-            true_cid = int(y_val[i])
-            gt_bbox = bboxes_val[i]
+        # Exemplar banks in matmul form: min_e mean(w*(e-x)^2) expands to
+        # (sum w*e^2 - 2*(w*e).x + sum w*x^2)/D, which is one GEMM per chunk
+        # instead of a (chunk, K, E, D) temporary (that form measured 13.2 s
+        # vs 1.5 s for the expansion on 2000 samples x 27 classes; the two
+        # agree to <5e-7 absolute distance). Invalid (padded) exemplars get
+        # A=+inf so the min ignores them.
+        ex_a = np.where(
+            exemplars_valid,
+            np.sum(weights_mat[:, None, :] * np.square(exemplars_pad), axis=2),
+            np.inf,
+        ) if max_ex > 0 else np.zeros((n_classes, 0), dtype=np.float32)
+        ex_b = (weights_mat[:, None, :] * exemplars_pad).reshape(n_classes * max_ex, feat_dim) if max_ex > 0 else np.zeros((0, feat_dim), dtype=np.float32)
 
-            best_cid = unique_classes[0]
-            best_dist = float("inf")
-            true_dist = float("inf")
+        y_idx = np.array([class_index.get(int(t), -1) for t in y_val], dtype=np.int64)
+        gt_bbox = np.asarray(bboxes_val, dtype=np.float32)
+        blend_ex = 0.65 * progress_ratio
+        # F3 (dilim 05): tahmin kutusu eskiden %88 oranında ground-truth
+        # kutudan türetiliyordu (`blend_box = 0.88 * progress_ratio`) ve IoU
+        # aynı ground-truth'a karşı ölçülüyordu — Mode B mAP50'si yapısal
+        # olarak şişikti, model başarısını değil "tahmin GT'ye ne kadar
+        # benzetildi"yi ölçüyordu. Artık tahmin kutusu yalnızca modelin
+        # kendi prior'udur (blend 0); mAP50 burada sentroid-sınıflandırma
+        # + prior-kutu başarısını ölçer, öğrenilmiş kutu regresyonunu değil.
+        # Bu metrik asla gerçek YOLO mAP'si gibi sunulmaz.
+        blend_box = 0.0
 
-            for cid in unique_classes:
-                diff = feat - centroids[cid]
-                centroid_dist = float(
-                    np.sqrt(max(0.0, float(np.mean(feature_weights[cid] * np.square(diff)))))
+        # Distances for every (sample, class), in chunks so the (chunk, K, E, D)
+        # exemplar tensor stays bounded (~37 MB at chunk=256, K=27, E=24, D=56).
+        best_idx = np.zeros((n_val,), dtype=np.int64)
+        true_dist = np.full((n_val,), np.inf, dtype=np.float64)
+        chunk = 256
+        for start in range(0, n_val, chunk):
+            stop = min(n_val, start + chunk)
+            x = X_val_norm[start:stop].astype(np.float32)  # (m, D)
+            diff = x[:, None, :] - centroids_mat[None, :, :]  # (m, K, D)
+            centroid_dist = np.sqrt(
+                np.maximum(0.0, np.mean(weights_mat[None, :, :] * np.square(diff), axis=2))
+            )  # (m, K)
+            dist = centroid_dist.copy()
+            if max_ex > 0 and np.any(has_exemplars):
+                # (m, K*E) GEMM, then (m, K, E); see precomputation above.
+                s2 = x @ ex_b.T  # (m, K*E)
+                s2 = s2.reshape(stop - start, n_classes, max_ex)
+                s3 = (np.square(x) @ weights_mat.T)  # (m, K) = sum_d w[k,d]*x[m,d]^2
+                d2 = (ex_a[None, :, :] - 2.0 * s2 + s3[:, :, None]) / float(feat_dim)
+                min_ex_dist = np.sqrt(np.maximum(0.0, np.min(d2, axis=2)))  # (m, K)
+                dist = np.where(
+                    has_exemplars[None, :],
+                    (1.0 - blend_ex) * centroid_dist + blend_ex * min_ex_dist,
+                    centroid_dist,
                 )
-                exemplars = class_exemplars.get(cid)
-                if exemplars is not None and exemplars.shape[0] > 0:
-                    ex_diffs = exemplars - feat[None, :]
-                    ex_dists = np.sqrt(
-                        np.maximum(
-                            0.0,
-                            np.mean(feature_weights[cid][None, :] * np.square(ex_diffs), axis=1),
-                        )
-                    )
-                    min_ex_dist = float(np.min(ex_dists))
-                    # As training progresses, blend centroid distance with exemplar manifold distance
-                    dist = (1.0 - 0.65 * progress_ratio) * centroid_dist + (
-                        0.65 * progress_ratio
-                    ) * min_ex_dist
-                else:
-                    dist = centroid_dist
+            best_idx[start:stop] = np.argmin(dist, axis=1)
+            rows = np.arange(stop - start)
+            valid_true = y_idx[start:stop] >= 0
+            td = np.full((stop - start,), np.inf, dtype=np.float64)
+            td[valid_true] = dist[rows[valid_true], y_idx[start:stop][valid_true]]
+            true_dist[start:stop] = td
 
-                if dist < best_dist:
-                    best_dist = dist
-                    best_cid = cid
-                if cid == true_cid:
-                    true_dist = dist
+        predicted = np.array([unique_classes[k] for k in best_idx], dtype=np.int64)
+        truths = np.asarray(y_val, dtype=np.int64)
+        correct_flags = (predicted == truths).astype(np.float64)
 
-            if best_cid == true_cid:
-                correct += 1
+        # IoU between ground-truth box and predicted/refined box (same blend).
+        # F3 (devamı): prior'ı olmayan sınıf eskiden doğrudan GT kutuya
+        # düşüyordu (`np.where(has_prior, priors_mat, gt_bbox)`) — IoU=1
+        # garantiliydi. Artık prior'suz sınıf nötr varsayılan prior'u
+        # (0.12 x 0.12, `priors_mat`'in kendi varsayılanı) kullanır; GT
+        # hiçbir yoldan tahmin kutusuna girmez.
+        prior_wh = priors_mat[best_idx, 2:4]  # (n, 2)
+        pred_wh = (1.0 - blend_box) * prior_wh + blend_box * gt_bbox[:, 2:4]
+        inter = np.minimum(gt_bbox[:, 2:4], pred_wh)
+        inter_area = np.maximum(0.0, inter[:, 0]) * np.maximum(0.0, inter[:, 1])
+        union_area = gt_bbox[:, 2] * gt_bbox[:, 3] + pred_wh[:, 0] * pred_wh[:, 1] - inter_area + 1e-6
+        iou_scores = inter_area / union_area
 
-            total_margin_loss += min(2.0, true_dist * 0.12)
-
-            # Compute IoU between ground-truth box and predicted/refined box
-            prior_wh = bbox_priors.get(best_cid, gt_bbox)[2:4]
-            pred_w = (1.0 - 0.88 * progress_ratio) * float(prior_wh[0]) + (
-                0.88 * progress_ratio
-            ) * float(gt_bbox[2])
-            pred_h = (1.0 - 0.88 * progress_ratio) * float(prior_wh[1]) + (
-                0.88 * progress_ratio
-            ) * float(gt_bbox[3])
-            inter_w = min(float(gt_bbox[2]), pred_w)
-            inter_h = min(float(gt_bbox[3]), pred_h)
-            inter_area = max(0.0, inter_w) * max(0.0, inter_h)
-            union_area = (
-                float(gt_bbox[2] * gt_bbox[3]) + (pred_w * pred_h) - inter_area + 1e-6
-            )
-            iou_scores.append(float(inter_area / union_area))
-
-        raw_acc = float(correct) / float(n_val)
-        mean_iou = float(np.mean(iou_scores)) if iou_scores else 0.94
-
-        warmup_curve = 1.0 - math.exp(-5.0 * progress_ratio)
-        precision = min(0.9994, 0.72 * raw_acc + 0.2794 * warmup_curve)
-        recall = min(0.9992, 0.70 * raw_acc + 0.2992 * warmup_curve)
-        map50 = min(0.9992, 0.50 * (precision + recall) * (0.88 + 0.12 * warmup_curve))
-        if progress_ratio >= 0.95 and raw_acc >= 0.85:
-            map50 = max(map50, 0.999)
-            precision = max(precision, 0.999)
-            recall = max(recall, 0.9985)
-
-        map50_95 = min(0.968, map50 * (0.78 + 0.18 * mean_iou * warmup_curve))
-        box_loss = max(
-            0.0112,
-            float(avg_box_err) * (1.15 - 0.92 * progress_ratio) + 0.075 * (1.0 - warmup_curve),
-        )
-        cls_loss = max(
-            0.0062,
-            (total_margin_loss / float(n_val)) * (1.1 - 0.90 * progress_ratio)
-            + 0.045 * (1.0 - warmup_curve),
-        )
+        # F-0815: honest metrics, computed from actual predictions — no
+        # warmup-curve inflation, no 0.999 floors/caps.
+        precision = 0.0
+        recall = 0.0
+        precisions: List[float] = []
+        recalls: List[float] = []
+        for cid in unique_classes:
+            tp = int(np.sum((predicted == cid) & (truths == cid)))
+            fp = int(np.sum((predicted == cid) & (truths != cid)))
+            fn = int(np.sum((predicted != cid) & (truths == cid)))
+            precisions.append((tp / (tp + fp)) if (tp + fp) > 0 else 0.0)
+            recalls.append((tp / (tp + fn)) if (tp + fn) > 0 else 0.0)
+        precision = float(np.mean(precisions)) if precisions else 0.0
+        recall = float(np.mean(recalls)) if recalls else 0.0
+        # mAP50: fraction of val samples both correctly classified and with
+        # IoU >= 0.50 against the ground-truth box; mAP50-95 averages the
+        # same fraction over IoU thresholds 0.50..0.95. F3: bu mAP bir
+        # PROTOTİP skorudur (sentroid-sınıflandırma + prior-kutu) — gerçek
+        # YOLO mAP'si değildir, yayın kapısında kullanılmaz.
+        map50 = float(np.mean((correct_flags > 0) & (iou_scores >= 0.50))) if n_val else 0.0
+        thresholds = np.array([0.50 + 0.05 * k for k in range(10)], dtype=np.float64)
+        map50_95 = float(
+            np.mean((correct_flags[None, :] > 0) & (iou_scores[None, :] >= thresholds[:, None]))
+        ) if n_val else 0.0
+        box_loss = max(0.0, float(avg_box_err))
+        cls_loss = max(0.0, float(np.sum(np.minimum(2.0, true_dist * 0.12))) / float(n_val))
 
         return {
             "box_loss": box_loss,
@@ -2239,7 +2881,9 @@ class RTXTrainerEngine:
             "recall": recall,
             "mAP50": map50,
             "mAP50_95": map50_95,
+            "metrics_kind": "opencv_prototype_prior",
         }
+
 
     # ------------------------------------------------------------------
     # ONNX Fallback Exporter & 1-Click RTX Batch Script Generator
@@ -2291,14 +2935,12 @@ class RTXTrainerEngine:
                         "mAP50_95": _f("metrics/mAP50-95(B)", "mAP50_95"),
                         "epochs_completed": float(epochs_completed),
                     }
-            if epochs_completed > 0 and "epochs_completed" not in best:
-                best["epochs_completed"] = float(epochs_completed)
             return best
         except Exception as exc:
             logger.debug("Ultralytics results.csv okunamadı: %s", exc)
             return empty
 
-    def _export_fallback_onnx_artifact(
+    def _export_fallback_prototype_artifact(
         self,
         centroids: Dict[int, np.ndarray],
         feat_mean: np.ndarray,
@@ -2306,30 +2948,28 @@ class RTXTrainerEngine:
         unique_classes: List[int],
         class_names: Dict[int, str],
     ) -> Path:
-        """
-        Writes a compact ONNX / serialized prototype weight file at
-        `models/yolov8n_gatherion.onnx` when Ultralytics is not installed so any
-        component checking for the ONNX artifact path finds a non-empty model file.
-        """
-        self.onnx_export_path.parent.mkdir(parents=True, exist_ok=True)
-        centroid_matrix = np.vstack([centroids[c] for c in unique_classes]).astype(np.float32)
+        """Writes prototype weights as JSON (never a fake .onnx file).
 
-        header_meta = {
-            "magic": "GATHERION_ONNX_PROTOTYPE_V2",
-            "opset": 12,
-            "half": True,
+        F-0816: the previous implementation wrote b"ONNX" + raw bytes to
+        `models/yolov8n_gatherion.onnx` — not a valid ONNX graph. The
+        prototype is a centroid classifier; its weights are JSON.
+        """
+        proto_path = self.models_dir / "gatherion_prototype.json"
+        proto_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "format": "GatherionPrototypeWeights_v1",
             "num_classes": len(unique_classes),
             "feature_dim": int(feat_mean.shape[0]),
             "classes": {str(c): class_names.get(c, f"class_{c}") for c in unique_classes},
+            "feature_mean": [round(float(x), 6) for x in feat_mean.tolist()],
+            "feature_std": [round(float(x), 6) for x in feat_std.tolist()],
+            "centroids": {
+                str(c): [round(float(x), 6) for x in centroids[c].tolist()]
+                for c in unique_classes
+            },
         }
-        header_bytes = (json.dumps(header_meta) + "\n").encode("utf-8")
-        weights_bytes = (
-            feat_mean.astype(np.float16).tobytes()
-            + feat_std.astype(np.float16).tobytes()
-            + centroid_matrix.astype(np.float16).tobytes()
-        )
-        self.onnx_export_path.write_bytes(b"ONNX" + header_bytes + weights_bytes)
-        return self.onnx_export_path
+        proto_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        return proto_path
 
     def _generate_rtx_batch_script(
         self,
@@ -2350,17 +2990,33 @@ class RTXTrainerEngine:
         mosaic = float(train_cfg.get("mosaic", 1.0))
         mixup = float(train_cfg.get("mixup", 0.15))
         patience = int(train_cfg.get("patience", 15))
-        home = offload_root() or Path("F:/a2")
+        # F-0997: no forced F:/a2 fallback when the drive is missing.
+        home = offload_root() or _project_root()
+        # F-0993: the launcher must train the configured base model.
+        base_model = str(train_cfg.get("model") or "yolo11n.pt")
         runs_posix = str(rtx_runs_dir_for()).replace("\\", "/")
         onnx_out = str((home / "models" / "yolov8n_gatherion.onnx")).replace("\\", "/")
         yaml_on_f = _yaml_on_offload(data_yaml_path)
         yaml_str = str(yaml_on_f).replace("\\", "/")
+        onnx_out_win = str(onnx_out).replace("/", "\\")
         home_win = str(home)
 
         bat_content = f"""@echo off
 set "GATHERION_HOME={home_win}"
 if not exist "%GATHERION_HOME%\\main.py" set "GATHERION_HOME=F:\\Gatherion"
+if not exist "%GATHERION_HOME%\\dataset\\data.yaml" (
+    echo [HATA] Egitim hedefi bulunamadi: "%GATHERION_HOME%\\dataset\\data.yaml"
+    exit /b 1
+)
 cd /d "%GATHERION_HOME%"
+if errorlevel 1 (
+    echo [HATA] Calisma dizinine gecilemedi: "%GATHERION_HOME%"
+    exit /b 1
+)
+set "PYTHON_EXE=C:\\Users\\selçuk\\AppData\\Local\\Programs\\Python\\Python310\\python.exe"
+if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"
+if exist "%~dp0.venv\\Scripts\\python.exe" set "PYTHON_EXE=%~dp0.venv\\Scripts\\python.exe"
+if exist "%~dp0venv\\Scripts\\python.exe" set "PYTHON_EXE=%~dp0venv\\Scripts\\python.exe"
 set "PYTHONUTF8=1"
 set "TEMP=%GATHERION_HOME%\\temp"
 set "TMP=%GATHERION_HOME%\\temp"
@@ -2383,26 +3039,40 @@ echo   Config       : epochs={epochs}, imgsz={imgsz}, batch={batch}, amp=True (F
 echo ============================================================================
 echo.
 
-python -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
+"%PYTHON_EXE%" -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
 if not errorlevel 1 goto :CHECK_ULTRA
 echo [INFO] PyTorch CUDA bulunamadi veya CPU surumu kurulu. RTX 3070 icin PyTorch CUDA 12.4 kuruluyor...
-pip install --upgrade --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu124
+"%PYTHON_EXE%" -m pip install --upgrade --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu124
+if errorlevel 1 (
+    echo [HATA] PyTorch CUDA kurulumu basarisiz oldu.
+    exit /b 1
+)
 
 :CHECK_ULTRA
-python -c "import ultralytics" >nul 2>&1
+"%PYTHON_EXE%" -c "import ultralytics" >nul 2>&1
 if not errorlevel 1 goto :START_TRAIN
 echo [INFO] Installing Ultralytics YOLO and ONNX Runtime GPU dependencies...
-pip install -U ultralytics onnx onnxslim onnxruntime-gpu
+"%PYTHON_EXE%" -m pip install -U ultralytics onnx onnxslim onnxruntime-gpu
+if errorlevel 1 (
+    echo [HATA] Ultralytics kurulumu basarisiz oldu.
+    exit /b 1
+)
 
 :START_TRAIN
 echo [INFO] Starting RTX FP16 Mixed-Precision Training...
-python -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; print(f'[INFO] Active Training Device: {{dev}} (CUDA={{use_cuda}}, GPU={{torch.cuda.get_device_name(0) if use_cuda else \"CPU\"}})'); m = YOLO('yolov8n.pt'); m.train(data=r'{yaml_str}', epochs={epochs}, imgsz={imgsz}, batch={batch}, amp=use_cuda, cos_lr=True, mosaic={mosaic}, mixup={mixup}, optimizer='AdamW', lr0={lr0}, patience={patience}, device=dev, workers=0, project=r'{runs_posix}', name='gatherion_rtx_fp16', exist_ok=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz={imgsz}); out_p = Path(r'{onnx_out}'); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
+"%PYTHON_EXE%" -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; cpu='CPU'; print(f'[INFO] Active Training Device: {{dev}} (CUDA={{use_cuda}}, GPU={{torch.cuda.get_device_name(0) if use_cuda else cpu}})'); m = YOLO('{base_model}'); m.train(data=r'{yaml_str}', epochs={epochs}, imgsz={imgsz}, batch={batch}, amp=use_cuda, cos_lr=True, mosaic={mosaic}, mixup={mixup}, optimizer='AdamW', lr0={lr0}, patience={patience}, device=dev, workers=0, project=r'{runs_posix}', name='gatherion_rtx_fp16', exist_ok=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz={imgsz}); out_p = Path(r'{onnx_out}'); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
 if not errorlevel 1 goto :TRAIN_DONE
 
-echo [WARN] Ultralytics training exited with an error. Running built-in OpenCV Prototype Trainer fallback...
-python -c "from pathlib import Path; from dataset_factory.rtx_trainer_engine import RTXTrainerEngine; eng = RTXTrainerEngine(); res = eng.run_training_sync(Path(r'{yaml_str}'), epochs={epochs}, force_fallback=True); print('[SUCCESS] Trained custom detector:', res['artifacts'])"
+echo [HATA] Ultralytics egitimi basarisiz oldu; model uretilmedi.
+echo [HATA] OpenCV prototip yedegi fabrika tarafindan kapalidir (sahte-tamamlama vermesin diye) — yedek egitici calistirilmiyor.
+exit /b 1
 
 :TRAIN_DONE
+if not exist "{onnx_out_win}" (
+    echo [HATA] Egitim bitti gorunuyor ama ONNX dosyasi yok: {onnx_out_win}
+    echo [HATA] Model uretilmedi; bot eski modelle calismaya devam eder.
+    exit /b 1
+)
 echo.
 echo ============================================================================
 echo   TRAINING COMPLETE! Model saved to: models/yolov8n_gatherion.onnx
@@ -2425,9 +3095,41 @@ echo ===========================================================================
         exists = onnx_path.exists()
         size_bytes = int(onnx_path.stat().st_size) if exists else 0
 
+        # F-0994: existence is not validity — actually load/check the model.
+        # The old fake b"ONNX"-header artifact must fail this check.
+        valid = False
         cuda_loaded = False
         detector_backend = "none"
         error_msg: Optional[str] = None
+        if not exists:
+            error_msg = f"ONNX dosyası yok: {onnx_path}"
+        elif size_bytes == 0:
+            error_msg = f"ONNX dosyası boş: {onnx_path}"
+        else:
+            try:
+                import onnx as _onnx  # type: ignore
+
+                _model = _onnx.load(str(onnx_path))
+                _onnx.checker.check_model(_model)
+                valid = True
+            except ImportError:
+                try:
+                    import onnxruntime as _ort  # type: ignore
+
+                    _sess = _ort.InferenceSession(
+                        str(onnx_path), providers=["CPUExecutionProvider"]
+                    )
+                    valid = True
+                    if any("CUDA" in prov for prov in _sess.get_providers()):
+                        cuda_loaded = True
+                except ImportError:
+                    error_msg = (
+                        "ONNX doğrulaması için ne `onnx` ne `onnxruntime` kurulu değil."
+                    )
+                except Exception as exc:  # noqa: BLE001 - invalid model file
+                    error_msg = f"ONNX dosyası geçersiz: {exc}"
+            except Exception as exc:  # noqa: BLE001 - invalid model file
+                error_msg = f"ONNX dosyası geçersiz: {exc}"
 
         try:
             from core.neural_audio_perception import ONNXYolo3DDetector
@@ -2451,6 +3153,8 @@ echo ===========================================================================
             "onnx_path": str(onnx_path),
             "exists": exists,
             "size_bytes": size_bytes,
+            "valid": valid,
+            "onnx_ready": bool(valid),
             "cuda_loaded": cuda_loaded,
             "detector_backend": detector_backend,
             "error": error_msg,
@@ -2458,6 +3162,23 @@ echo ===========================================================================
 
     # Live Inference Helper on Trained Custom Detector
     # ------------------------------------------------------------------
+    def _load_custom_detector(self) -> Dict[str, Any]:
+        """Load `gatherion_custom_detector.json`, cached by file version.
+
+        D58: the detector JSON was re-read and re-parsed on every
+        `predict_roi` call (per-frame in live use). The parsed dict is now
+        cached while the file's ``(mtime_ns, size)`` version is unchanged
+        and reloaded as soon as retraining rewrites the file.
+        """
+        stat = self.custom_detector_path.stat()
+        version = (stat.st_mtime_ns, stat.st_size)
+        if self._detector_cache is not None and self._detector_cache_version == version:
+            return self._detector_cache
+        data = json.loads(self.custom_detector_path.read_text(encoding="utf-8"))
+        self._detector_cache = data
+        self._detector_cache_version = version
+        return data
+
     def predict_roi(
         self,
         roi_bgr: np.ndarray,
@@ -2466,6 +3187,11 @@ echo ===========================================================================
         """
         Classifies a cropped BGR region using the trained `gatherion_custom_detector.json`
         prototype model and returns `{class_id, class_name, confidence, distance}`.
+
+        D58: distances are computed in a single pass (the old code computed
+        them twice — once for the best class, once for the softmax) and the
+        detector JSON plus the prebuilt centroid/weight arrays come from the
+        `_predict_cache` (keyed by file mtime_ns + size, so a retrain reloads it).
         """
         if not self.custom_detector_path.exists():
             return {
@@ -2475,50 +3201,108 @@ echo ===========================================================================
                 "distance": float("inf"),
             }
 
-        data = json.loads(self.custom_detector_path.read_text(encoding="utf-8"))
-        feat_mean = np.array(data["feature_mean"], dtype=np.float32)
-        feat_std = np.array(data["feature_std"], dtype=np.float32)
-        classes_dict: Dict[str, Any] = data.get("classes", {})
+        # Cache the parsed detector (keyed by mtime_ns + size, so a retrain
+        # reloads it): the old code re-read + re-parsed the JSON and rebuilt
+        # every centroid/weight array on each call.
+        try:
+            stat = self.custom_detector_path.stat()
+            cache_key = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            cache_key = None
+        if cache_key is None or cache_key != self._predict_cache_key or self._predict_cache is None:
+            data = json.loads(self.custom_detector_path.read_text(encoding="utf-8"))
+            classes_dict: Dict[str, Any] = data.get("classes", {})
+            class_ids = [int(cinfo["class_id"]) for cinfo in classes_dict.values()]
+            cache = {
+                "feature_mean": np.array(data["feature_mean"], dtype=np.float32),
+                "feature_std": np.array(data["feature_std"], dtype=np.float32),
+                "class_ids": class_ids,
+                "class_names": [str(cinfo["class_name"]) for cinfo in classes_dict.values()],
+                "centroids": np.stack(
+                    [np.array(cinfo["centroid"], dtype=np.float32) for cinfo in classes_dict.values()]
+                )
+                if class_ids
+                else np.zeros((0, 0), dtype=np.float32),
+                "weights": np.stack(
+                    [np.array(cinfo["feature_weights"], dtype=np.float32) for cinfo in classes_dict.values()]
+                )
+                if class_ids
+                else np.zeros((0, 0), dtype=np.float32),
+            }
+            self._predict_cache = cache
+            self._predict_cache_key = cache_key
+        else:
+            cache = self._predict_cache
+
+        feat_mean = cache["feature_mean"]
+        feat_std = cache["feature_std"]
 
         feat_vec, _ = self.extract_roi_features(roi_bgr, norm_bbox_xywh)
         feat_norm = (feat_vec - feat_mean) / (feat_std + 1e-5)
 
-        best_cid = -1
-        best_name = "unknown"
-        best_dist = float("inf")
+        if not cache["class_ids"]:
+            return {
+                "class_id": -1,
+                "class_name": "unknown",
+                "confidence": 0.0,
+                "distance": float("inf"),
+            }
 
-        for cid_str, cinfo in classes_dict.items():
-            centroid = np.array(cinfo["centroid"], dtype=np.float32)
-            weights = np.array(cinfo["feature_weights"], dtype=np.float32)
-            diff = feat_norm - centroid
-            dist = float(np.sqrt(max(0.0, float(np.mean(weights * np.square(diff))))))
-            if dist < best_dist:
-                best_dist = dist
-                best_cid = int(cinfo["class_id"])
-                best_name = str(cinfo["class_name"])
-
-        confidence = float(math.exp(-0.45 * best_dist))
+        # One vectorized distance pass (the old code looped over all classes
+        # twice); confidence is the same softmax share over -distance.
+        diffs = feat_norm[None, :] - cache["centroids"]
+        dists = np.sqrt(
+            np.maximum(0.0, np.mean(cache["weights"] * np.square(diffs), axis=1))
+        )
+        best_pos = int(np.argmin(dists))
+        best_dist = float(dists[best_pos])
+        neg = -dists.astype(np.float64)
+        neg = neg - float(np.max(neg))
+        weights_soft = np.exp(neg)
+        confidence = float(weights_soft[best_pos] / float(np.sum(weights_soft)))
         return {
-            "class_id": best_cid,
-            "class_name": best_name,
+            "class_id": int(cache["class_ids"][best_pos]),
+            "class_name": str(cache["class_names"][best_pos]),
             "confidence": round(confidence, 4),
             "distance": round(best_dist, 4),
         }
 
     def get_rtx_trainer_health_summary(self) -> dict:
+        # F-0995: readiness reflects a real probe, not a hardcoded True.
         try:
-            return {"rtx_trainer_ready": True}
-        except Exception:
-            return {"rtx_trainer_ready": False}
+            env = self.probe_gpu_environment()
+            ready = bool(env.get("ultralytics_installed"))
+            return {
+                "rtx_trainer_ready": ready,
+                "ultralytics_installed": ready,
+                "cuda_available": bool(env.get("cuda_available")),
+                "gpu_name": env.get("gpu_name"),
+                "reason": (
+                    "Ultralytics yüklü — Mode A eğitimi mümkün."
+                    if ready
+                    else "Ultralytics yüklü değil — Mode A eğitimi mümkün değil."
+                ),
+            }
+        except Exception as exc:
+            return {"rtx_trainer_ready": False, "error": str(exc)}
 
     def get_rtx_trainer_engine_ready_flag(self) -> dict:
-        return {"module": "rtx_trainer_engine", "ready": True}
+        return {"module": "rtx_trainer_engine", "ready": validate_rtx_trainer_engine_contract()}
 
     def get_rtx_trainer_engine_version_info(self) -> dict:
-        return {"module": "rtx_trainer_engine", "version": "2.0.0", "ready": True}
+        return {
+            "module": "rtx_trainer_engine",
+            "version": __version__,
+            "ready": validate_rtx_trainer_engine_contract(),
+        }
 
     def get_rtx_trainer_engine_diagnostic_snapshot(self) -> dict:
-        return {"module": "rtx_trainer_engine", "status": "ok", "ready": True}
+        ready = validate_rtx_trainer_engine_contract()
+        return {
+            "module": "rtx_trainer_engine",
+            "status": "ok" if ready else "not_ready",
+            "ready": ready,
+        }
 
 
 def get_rtx_trainer_engine_capabilities() -> list:
@@ -2526,77 +3310,111 @@ def get_rtx_trainer_engine_capabilities() -> list:
 
 
 def validate_rtx_trainer_engine_contract() -> bool:
-    return bool(get_rtx_trainer_engine_capabilities())
+    """Real contract check (F-0995): canonical 27-class taxonomy intact,
+    the engine class importable, and the GPU probe runnable with
+    Ultralytics available for Mode A training."""
+    try:
+        # P1-1: the expected id set comes from the same single source
+        # (dataset/data.yaml, nc-1) — not a hardcoded range(27).
+        if set(DEFAULT_CLASS_NAMES.keys()) != set(range(_resolve_max_class_id() + 1)):
+            return False
+        if RTXTrainerEngine is None:
+            return False
+        env = RTXTrainerEngine.probe_gpu_environment_static()
+        return bool(env.get("ultralytics_installed"))
+    except Exception:
+        return False
 
 
-def get_rtx_trainer_engine_baseline_metrics() -> dict:
+def _rtx_trainer_engine_contract_ok(_contract_ok: Optional[bool] = None) -> bool:
+    """P2-1: zincir ici tek dogrulama (bkz. telemetry.py'deki aciklama).
+
+    ``validate_rtx_trainer_engine_contract()`` her cagrida
+    ``probe_gpu_environment_static()``'i bastan kosar (nvidia-smi alt
+    sureci + torch/onnxruntime/ultralytics yoklamasi); zincir bunu
+    ust duzey okuma basina bir kez yapar. Cagrilar arasi onbellek
+    yoktur — her ust duzey okuma taze prob yapar.
+    """
+    if _contract_ok is not None:
+        return bool(_contract_ok)
+    return bool(validate_rtx_trainer_engine_contract())
+
+
+def get_rtx_trainer_engine_baseline_metrics(_contract_ok: Optional[bool] = None) -> dict:
     return {
         "module": "rtx_trainer_engine",
-        "contract_valid": validate_rtx_trainer_engine_contract(),
+        "contract_valid": _rtx_trainer_engine_contract_ok(_contract_ok),
         "capability_count": len(get_rtx_trainer_engine_capabilities()),
     }
 
 
-def get_rtx_trainer_engine_readiness_status() -> dict:
+def get_rtx_trainer_engine_readiness_status(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _rtx_trainer_engine_contract_ok(_contract_ok)
     return {
         "module": "rtx_trainer_engine",
-        "ready": validate_rtx_trainer_engine_contract(),
-        "metrics": get_rtx_trainer_engine_baseline_metrics(),
+        "ready": ok,
+        "metrics": get_rtx_trainer_engine_baseline_metrics(_contract_ok=ok),
     }
 
 
-def get_rtx_trainer_engine_audit_record() -> dict:
+def get_rtx_trainer_engine_audit_record(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _rtx_trainer_engine_contract_ok(_contract_ok)
     return {
         "module": "rtx_trainer_engine",
-        "audit_passed": validate_rtx_trainer_engine_contract(),
-        "readiness": get_rtx_trainer_engine_readiness_status(),
+        "audit_passed": ok,
+        "readiness": get_rtx_trainer_engine_readiness_status(_contract_ok=ok),
     }
 
 
-def get_rtx_trainer_engine_operational_digest() -> dict:
+def get_rtx_trainer_engine_operational_digest(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _rtx_trainer_engine_contract_ok(_contract_ok)
     return {
         "module": "rtx_trainer_engine",
-        "operational": validate_rtx_trainer_engine_contract(),
-        "audit": get_rtx_trainer_engine_audit_record(),
+        "operational": ok,
+        "audit": get_rtx_trainer_engine_audit_record(_contract_ok=ok),
     }
 
 
-def get_rtx_trainer_engine_telemetry_payload() -> dict:
+def get_rtx_trainer_engine_telemetry_payload(_contract_ok: Optional[bool] = None) -> dict:
     return {
         "module": "rtx_trainer_engine",
-        "payload": get_rtx_trainer_engine_operational_digest(),
+        "payload": get_rtx_trainer_engine_operational_digest(_contract_ok=_contract_ok),
     }
 
 
-def get_rtx_trainer_engine_integrity_seal() -> dict:
+def get_rtx_trainer_engine_integrity_seal(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _rtx_trainer_engine_contract_ok(_contract_ok)
     return {
         "module": "rtx_trainer_engine",
-        "sealed": validate_rtx_trainer_engine_contract(),
-        "telemetry": get_rtx_trainer_engine_telemetry_payload(),
+        "sealed": ok,
+        "telemetry": get_rtx_trainer_engine_telemetry_payload(_contract_ok=ok),
     }
 
 
-def get_rtx_trainer_engine_compliance_certificate() -> dict:
+def get_rtx_trainer_engine_compliance_certificate(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _rtx_trainer_engine_contract_ok(_contract_ok)
     return {
         "module": "rtx_trainer_engine",
-        "certified": validate_rtx_trainer_engine_contract(),
-        "seal": get_rtx_trainer_engine_integrity_seal(),
+        "certified": ok,
+        "seal": get_rtx_trainer_engine_integrity_seal(_contract_ok=ok),
     }
 
 
-def get_rtx_trainer_engine_readiness_probe() -> dict:
+def get_rtx_trainer_engine_readiness_probe(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _rtx_trainer_engine_contract_ok(_contract_ok)
     return {
         "module": "rtx_trainer_engine",
-        "ready": validate_rtx_trainer_engine_contract(),
-        "certificate": get_rtx_trainer_engine_compliance_certificate(),
+        "ready": ok,
+        "certificate": get_rtx_trainer_engine_compliance_certificate(_contract_ok=ok),
     }
 
 
-def get_rtx_trainer_engine_audit_summary() -> dict:
+def get_rtx_trainer_engine_audit_summary(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _rtx_trainer_engine_contract_ok(_contract_ok)
     return {
         "module": "rtx_trainer_engine",
-        "audit_passed": validate_rtx_trainer_engine_contract(),
-        "probe": get_rtx_trainer_engine_readiness_probe(),
+        "audit_passed": ok,
+        "probe": get_rtx_trainer_engine_readiness_probe(_contract_ok=ok),
     }
 
 

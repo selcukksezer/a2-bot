@@ -8,6 +8,7 @@ buff_scroll triggers the corresponding scroll key.
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,27 @@ def smart_setup(tmp_path: Path):
     return manager, combat
 
 
+def _fresh_dispatch_setup(t0: float, buff_duration_sec: float = 60.0):
+    """Tuş gönderimini doğrulamak için cooldown'u kirlenmemiş yeni bir kurulum döner.
+
+    `check_emergency_recovery` yalnızca karar verir (tuşa basmaz); gerçek basım
+    `trigger_emergency_recovery(..., send_key_fn=...)` yolundan olur. Bu yardımcı,
+    karar testlerinin cooldown durumunu bozmadan dispatch'i ayrı bir örnekte
+    doğrulamayı sağlar. Dönen TemporaryDirectory test bitene dek tutulmalıdır.
+    """
+    tmpdir = tempfile.TemporaryDirectory()
+    manager = SmartConsumableManager(
+        calibrated_rois_path=Path(tmpdir.name) / "calibrated_rois.json",
+        seed_defaults=False,
+    )
+    manager.learn_slot_assignment("F1", "hp_potion")
+    manager.learn_slot_assignment("F2", "mp_potion")
+    manager.learn_slot_assignment("F5", "buff_scroll", buff_duration_sec=buff_duration_sec)
+    manager.mark_buff_applied("F5", duration_sec=buff_duration_sec, now=t0)
+    combat = ManaPhaseCombat(consumable_manager=manager)
+    return manager, combat, tmpdir
+
+
 def test_hp_drop_triggers_hp_potion_key(smart_setup) -> None:
     """1. Verify that when HP drops below threshold, the hp_potion key is triggered."""
     manager, combat = smart_setup
@@ -48,12 +70,44 @@ def test_hp_drop_triggers_hp_potion_key(smart_setup) -> None:
     assert healthy_res["hp_potion_triggered"] is False
     assert healthy_res["hp_potion_key"] is None
 
-    # Low HP (55% < 65% smart threshold) -> triggers F1 (hp_potion)
+    # Low HP (55% < 65% smart threshold) -> needs F1 (hp_potion), but
+    # the first low sample after a healthy one is an unconfirmed cliff
+    # (v20 madde 6, `_hp_low_reading_confirmed`): the diagnosis already
+    # reflects the measurement (hp_potion_needed True) while the key
+    # waits for a second consecutive low sample to confirm the drop.
     low_hp_res = combat.check_emergency_recovery(player_hp=0.55, player_mp=0.90, now=t0 + 10.0)
     assert low_hp_res["hp_potion_needed"] is True
-    assert low_hp_res["hp_potion_triggered"] is True
-    assert low_hp_res["hp_potion_key"] == "F1"
-    assert "F1" in low_hp_res["keys_to_press"]
+    assert low_hp_res["hp_potion_triggered"] is False
+    assert low_hp_res["hp_potion_key"] is None
+    assert low_hp_res["keys_to_press"] == []
+
+    # Second consecutive low sample confirms the drop -> triggers F1.
+    low_hp_confirmed = combat.check_emergency_recovery(player_hp=0.55, player_mp=0.90, now=t0 + 11.0)
+    assert low_hp_confirmed["hp_potion_needed"] is True
+    assert low_hp_confirmed["hp_potion_triggered"] is True
+    assert low_hp_confirmed["hp_potion_key"] == "F1"
+    assert "F1" in low_hp_confirmed["keys_to_press"]
+
+    # Gerçek tuş basımı: aynı senaryo trigger yoluyla F1'i gerçekten göndermeli.
+    _, combat2, _tmpdir = _fresh_dispatch_setup(t0)
+    dispatched: list[str] = []
+    healthy_dispatch = combat2.trigger_emergency_recovery(
+        player_hp=0.90, player_mp=0.90, send_key_fn=dispatched.append, now=t0 + 5.0
+    )
+    assert healthy_dispatch["hp_potion_triggered"] is False
+    assert dispatched == []
+    # İlk düşük örnek doğrulanmamış uçurumdur: tuş gönderilmez.
+    low_dispatch = combat2.trigger_emergency_recovery(
+        player_hp=0.55, player_mp=0.90, send_key_fn=dispatched.append, now=t0 + 10.0
+    )
+    assert low_dispatch["hp_potion_triggered"] is False
+    assert dispatched == []
+    # İkinci düşük örnek düşüşü doğrular: F1 gerçekten gönderilir.
+    low_dispatch_confirmed = combat2.trigger_emergency_recovery(
+        player_hp=0.55, player_mp=0.90, send_key_fn=dispatched.append, now=t0 + 11.0
+    )
+    assert low_dispatch_confirmed["hp_potion_triggered"] is True
+    assert dispatched == ["F1"]
 
 
 def test_mp_drop_triggers_mp_potion_key(smart_setup) -> None:
@@ -74,6 +128,20 @@ def test_mp_drop_triggers_mp_potion_key(smart_setup) -> None:
     assert low_mp_res["mp_potion_triggered"] is True
     assert low_mp_res["mp_potion_key"] == "F2"
     assert "F2" in low_mp_res["keys_to_press"]
+
+    # Gerçek tuş basımı: aynı senaryo trigger yoluyla F2'yi gerçekten göndermeli.
+    _, combat2, _tmpdir = _fresh_dispatch_setup(t0)
+    dispatched: list[str] = []
+    healthy_dispatch = combat2.trigger_emergency_recovery(
+        player_hp=0.90, player_mp=0.80, send_key_fn=dispatched.append, now=t0 + 5.0
+    )
+    assert healthy_dispatch["mp_potion_triggered"] is False
+    assert dispatched == []
+    low_dispatch = combat2.trigger_emergency_recovery(
+        player_hp=0.90, player_mp=0.35, send_key_fn=dispatched.append, now=t0 + 10.0
+    )
+    assert low_dispatch["mp_potion_triggered"] is True
+    assert dispatched == ["F2"]
 
 
 def test_buff_scroll_expired_triggers_scroll_key(smart_setup) -> None:
@@ -98,6 +166,20 @@ def test_buff_scroll_expired_triggers_scroll_key(smart_setup) -> None:
     assert "F5" in expired_res["buff_keys"]
     assert "F5" in expired_res["keys_to_press"]
 
+    # Gerçek tuş basımı: buff aktifken hiçbir tuş, süresi dolunca F5 gönderilmeli.
+    _, combat2, _tmpdir = _fresh_dispatch_setup(t0, buff_duration_sec=45.0)
+    dispatched: list[str] = []
+    active_dispatch = combat2.trigger_emergency_recovery(
+        player_hp=0.95, player_mp=0.95, send_key_fn=dispatched.append, now=t0 + 20.0
+    )
+    assert active_dispatch["buff_expired"] is False
+    assert dispatched == []
+    expired_dispatch = combat2.trigger_emergency_recovery(
+        player_hp=0.95, player_mp=0.95, send_key_fn=dispatched.append, now=t0 + 50.0
+    )
+    assert expired_dispatch["buff_expired"] is True
+    assert dispatched == ["F5"]
+
 
 def test_consumable_cooldown_prevents_duplicate_trigger_until_ready(smart_setup) -> None:
     """4. Verify potion cooldown lockouts prevent spamming until cooldown expires."""
@@ -110,6 +192,16 @@ def test_consumable_cooldown_prevents_duplicate_trigger_until_ready(smart_setup)
     assert first["hp_potion_triggered"] is True
     assert first["mp_potion_triggered"] is True
     assert first["keys_to_press"] == ["F1", "F2"]
+
+    # P0-6: karar tek başına damgalamaz — gönderim onayı olmadan
+    # cooldown başlamaz, yeniden karar da tetikler.
+    unconfirmed = combat.check_emergency_recovery(player_hp=0.48, player_mp=0.28, now=t0 + 4.0)
+    assert unconfirmed["hp_potion_triggered"] is True
+    assert unconfirmed["mp_potion_triggered"] is True
+    assert unconfirmed["keys_to_press"] == ["F1", "F2"]
+
+    # t0'daki basım onaylanınca cooldown başlar.
+    combat.mark_potions_sent(["F1", "F2"], hp_key="F1", mp_key="F2", now=t0)
 
     # 4 seconds later (< 10s cooldown), neither potion should re-trigger
     during_cd = combat.check_emergency_recovery(player_hp=0.48, player_mp=0.28, now=t0 + 4.0)
@@ -124,6 +216,26 @@ def test_consumable_cooldown_prevents_duplicate_trigger_until_ready(smart_setup)
     assert after_cd["hp_potion_triggered"] is True
     assert after_cd["mp_potion_triggered"] is True
     assert after_cd["keys_to_press"] == ["F1", "F2"]
+
+    # Gerçek tuş basımı: cooldown boyunca hiçbir tuş, cooldown bitince F1+F2 gönderilmeli.
+    _, combat2, _tmpdir = _fresh_dispatch_setup(t0, buff_duration_sec=120.0)
+    dispatched: list[str] = []
+    first_dispatch = combat2.trigger_emergency_recovery(
+        player_hp=0.50, player_mp=0.30, send_key_fn=dispatched.append, now=t0
+    )
+    assert first_dispatch["hp_potion_triggered"] is True
+    assert first_dispatch["mp_potion_triggered"] is True
+    assert dispatched == ["F1", "F2"]
+    combat2.trigger_emergency_recovery(
+        player_hp=0.48, player_mp=0.28, send_key_fn=dispatched.append, now=t0 + 4.0
+    )
+    assert dispatched == ["F1", "F2"]
+    after_cd_dispatch = combat2.trigger_emergency_recovery(
+        player_hp=0.48, player_mp=0.28, send_key_fn=dispatched.append, now=t0 + 11.0
+    )
+    assert after_cd_dispatch["hp_potion_triggered"] is True
+    assert after_cd_dispatch["mp_potion_triggered"] is True
+    assert dispatched == ["F1", "F2", "F1", "F2"]
 
 
 def test_combined_emergency_hp_mp_and_expired_buff_scroll_dispatch(smart_setup) -> None:
@@ -159,10 +271,12 @@ def test_visual_slot_classification_and_decide_consumable_action(tmp_path: Path)
         seed_defaults=False,
     )
 
-    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    # Half-resolution frame (540x960): the consumable ROI is relative, so
+    # slot geometry and every assertion below are identical to 1080p input.
+    frame = np.zeros((540, 960, 3), dtype=np.uint8)
     roi = manager.current_consumable_bar_roi
-    y1, y2 = int(round(roi[1] * 1080)), int(round(roi[3] * 1080))
-    x1, x2 = int(round(roi[0] * 1920)), int(round(roi[2] * 1920))
+    y1, y2 = int(round(roi[1] * 540)), int(round(roi[3] * 540))
+    x1, x2 = int(round(roi[0] * 960)), int(round(roi[2] * 960))
     slot_w = float(x2 - x1) / 10.0
 
     # Slot F3 (index 2): Red HP potion

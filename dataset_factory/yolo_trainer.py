@@ -39,7 +39,6 @@ import inspect
 import json
 import logging
 import os
-import shutil
 import sys
 import threading
 import time
@@ -91,9 +90,18 @@ except ImportError:
         def __init__(self, parent: Optional[Any] = None) -> None:
             super().__init__(daemon=True)
             self._parent = parent
+            self._interruption_requested = False
 
         def isRunning(self) -> bool:
             return self.is_alive()
+
+        # F-1971: the PyQt-less fallback must offer the same interruption
+        # API the worker relies on (isInterruptionRequested/requestInterruption).
+        def isInterruptionRequested(self) -> bool:
+            return bool(self._interruption_requested)
+
+        def requestInterruption(self) -> None:
+            self._interruption_requested = True
 
         def wait(self, timeout_ms: int = 15000) -> bool:
             self.join(timeout=max(0.001, timeout_ms / 1000.0))
@@ -124,8 +132,189 @@ except Exception as _rtx_import_exc:
 # Helper Utilities
 # =============================================================================
 
+def _canonical_class_names() -> Dict[int, str]:
+    """Canonical 27-class taxonomy (0..26) for fallback approved yamls."""
+    try:
+        from dataset_factory.class_taxonomy import CANONICAL_NAMES
+
+        return dict(CANONICAL_NAMES)
+    except Exception:
+        return {
+            0: "herb_aria", 1: "herb_mela", 2: "herb_targena",
+            3: "ore_orichalcum", 4: "gem_crystal", 5: "tree_log",
+            6: "herb_edana", 7: "herb_lumina", 8: "ore_obsidian",
+            9: "minimap_sprout", 10: "monster_3d", 11: "minimap_monster_dot",
+            12: "crystal_blood", 13: "skill_ui_prompt", 14: "obstacle",
+            15: "path_ground", 16: "player_hp_bar", 17: "player_mp_bar",
+            18: "target_hp_bar", 19: "skill_bar", 20: "skill_slot_ready",
+            21: "skill_slot_cooldown", 22: "hp_potion", 23: "mp_potion",
+            24: "buff_scroll", 25: "kinah", 26: "player_character",
+        }
+
+
+def resolve_yaml_split_dir(yaml_path: Path, parsed: Dict[str, Any], split_key: str) -> Path:
+    """Resolve one `train`/`val` entry of a dataset yaml the way Ultralytics does.
+
+    P0-5 (K-28/K-30, F058 — Ultralytics 8.4.209 `check_det_dataset`,
+    `data/utils.py:796-811`): a relative `path:` is resolved against the
+    TRAINING PROCESS's working directory (CWD), NOT against the yaml's own
+    directory. The yaml-dir fallback applies only when the `path:` key is
+    ABSENT. The old `_count_images_for_yaml` resolved a relative `path:`
+    against the yaml dir, so the counter and the engine looked at different
+    directories — the counter said "N kare" while training found 0 images.
+    Both now share this one function, so the counted directory IS the
+    directory the engine will read.
+
+    All three yaml writers in this repo write an ABSOLUTE `path:` (faz-1
+    0d727f6), so in practice the relative branch never fires for our own
+    yamls; it exists so a hand-written / foreign yaml is counted exactly
+    where Ultralytics would look, and `validate_training_yaml` rejects it
+    before training starts.
+    """
+    base_raw = parsed.get("path")
+    if base_raw is None or str(base_raw).strip() == "":
+        # No `path:` key: Ultralytics falls back to the yaml's directory.
+        base = Path(yaml_path).parent
+    else:
+        base = Path(str(base_raw))
+        if not base.is_absolute():
+            # Ultralytics rule: relative `path:` is CWD-relative.
+            base = Path.cwd() / base
+    rel = parsed.get(split_key)
+    if rel is None or str(rel).strip() == "":
+        return base
+    d = Path(str(rel))
+    if d.is_absolute():
+        return d
+    return base / d
+
+
+def validate_training_yaml(yaml_path: Union[str, Path]) -> Dict[str, Any]:
+    """Validate a dataset yaml BEFORE training starts (P0-5, K-30).
+
+    Checks, in order: file exists, parses, `path:` present AND absolute,
+    `train`/`val` entries present, both split dirs exist (resolved with the
+    Ultralytics rule in `resolve_yaml_split_dir` — the same rule the engine
+    uses), and at least one LABELED image exists across both splits (images
+    without a non-empty .txt are silently dropped by YOLO, so a raw image
+    count would lie — see `count_labeled_images`).
+
+    Returns a dict: `ok` (bool), `errors` (list of concrete, user-facing
+    Turkish reasons — each names the file/dir that is wrong), `train_count`
+    / `val_count` (labeled images per split), `total_labeled`, `base_dir`
+    (the resolved `path:` value). Callers must NOT start training when
+    `ok` is False; they surface `errors` to the user instead of letting
+    the worker thread / Ultralytics fail with a cryptic message.
+    """
+    yaml_p = Path(yaml_path)
+    errors: List[str] = []
+    info: Dict[str, Any] = {
+        "ok": False,
+        "errors": errors,
+        "yaml_path": str(yaml_p),
+        "base_dir": "",
+        "train_count": 0,
+        "val_count": 0,
+        "total_labeled": 0,
+    }
+    if not yaml_p.is_file():
+        errors.append(f"eğitim yaml'ı yok: {yaml_p}")
+        return info
+    try:
+        from dataset_factory.rtx_trainer_engine import _parse_simple_yaml
+
+        parsed = _parse_simple_yaml(yaml_p)
+    except Exception as exc:
+        errors.append(f"eğitim yaml'ı okunamadı ({yaml_p}): {exc}")
+        return info
+    if not isinstance(parsed, dict):
+        errors.append(f"eğitim yaml'ı geçersiz (sözlük değil): {yaml_p}")
+        return info
+
+    base_raw = parsed.get("path")
+    if base_raw is None or str(base_raw).strip() == "":
+        errors.append(
+            f"yaml'da `path:` yok ({yaml_p}) — Ultralytics train/val'i "
+            "çalışma klasörüne (CWD) göre çözer, yaml'ın dizinine göre değil; "
+            "`path:` mutlak yol olmalı."
+        )
+        return info
+    base = Path(str(base_raw))
+    if not base.is_absolute():
+        errors.append(
+            f"yaml'daki `path:` göreli ('{base_raw}') — mutlak yol olmalı; "
+            "Ultralytics göreli yolu eğitim sürecinin çalışma klasörüne "
+            f"(CWD) göre çözer ve yanlış dizini arar. yaml: {yaml_p}"
+        )
+        return info
+    info["base_dir"] = str(base)
+
+    counts: Dict[str, int] = {}
+    for key in ("train", "val"):
+        rel = parsed.get(key)
+        if rel is None or str(rel).strip() == "":
+            errors.append(f"yaml'da `{key}:` yok: {yaml_p}")
+            counts[key] = 0
+            continue
+        split_dir = resolve_yaml_split_dir(yaml_p, parsed, key)
+        if not split_dir.is_dir():
+            errors.append(
+                f"`{key}` dizini yok: {split_dir} "
+                f"(yaml: {yaml_p} — `path:` {base_raw}, `{key}:` {rel})"
+            )
+            counts[key] = 0
+            continue
+        labels_dir = base / "labels" / key
+        counts[key] = count_labeled_images(split_dir, labels_dir)
+    info["train_count"] = counts.get("train", 0)
+    info["val_count"] = counts.get("val", 0)
+    info["total_labeled"] = info["train_count"] + info["val_count"]
+    if info["total_labeled"] == 0:
+        # P0-5 tur 2: 0-etiketli-kare hatası eski B-06 kapısının
+        # ("Eğitim verisi boş") sözleşme cümlesiyle başlar — iki kapı
+        # aynı koşulu yakalar; dışarıya dönük eski mesaj korunur.
+        # Diğer geçersizlik nedenlerinin mesajları aynen kalır.
+        errors.append(
+            "Eğitim verisi boş: etiketli kare yok (0 örnek) — train/val "
+            f"dizinlerinde .txt etiketli görsel bulunamadı (yaml: {yaml_p}). "
+            "Önce kare onaylayın/dondurun."
+        )
+    info["ok"] = not errors
+    return info
+
+
+def _count_images_for_yaml(yaml_path: Path) -> int:
+    """Count images in the train/val dirs a dataset yaml points at.
+
+    F-1990: a custom yaml's own data must be counted, not the whole dataset.
+    Falls back to 0 when the yaml cannot be parsed (caller falls back).
+
+    P0-5 (K-30): the split dirs are resolved with `resolve_yaml_split_dir`
+    — the Ultralytics rule (relative `path:` is CWD-relative) — so this
+    counter and the training engine look at the SAME directory. It used to
+    resolve a relative `path:` against the yaml's own directory, which is
+    NOT what Ultralytics does.
+    """
+    try:
+        from dataset_factory.rtx_trainer_engine import _parse_simple_yaml
+
+        parsed = _parse_simple_yaml(Path(yaml_path))
+    except Exception:
+        return 0
+    total = 0
+    for key in ("train", "val"):
+        if not parsed.get(key):
+            continue
+        total += count_images_in_dir(resolve_yaml_split_dir(Path(yaml_path), parsed, key))
+    return total
+
+
 def _resolve_project_root(hint: Optional[Union[str, Path]] = None) -> Path:
-    """Resolves project root path, favoring F:/a2 if exists."""
+    """Resolves project root path.
+
+    F-1994: no hardcoded F:/a2 preference — offload_root() already returns
+    F:/a2 when that drive/folder exists; otherwise the repo root is used.
+    """
     if hint is not None:
         p = Path(hint).resolve()
         if p.exists():
@@ -134,9 +323,6 @@ def _resolve_project_root(hint: Optional[Union[str, Path]] = None) -> Path:
         preferred = offload_root()
         if preferred is not None and preferred.exists():
             return preferred
-    p_a2 = Path("F:/a2")
-    if p_a2.is_dir():
-        return p_a2
     return Path(__file__).resolve().parent.parent
 
 
@@ -169,55 +355,280 @@ def _normalize_dataset_and_approved_dir(
     return raw.parent, raw, raw / "approved"
 
 
+_IMAGE_EXTENSIONS = frozenset(
+    {".jpg", ".png", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+)
+
+_DEFAULT_MODEL = "yolo11n.pt"
+
+
 def count_images_in_dir(directory: Path) -> int:
-    """Counts valid image files (.jpg, .png, .jpeg) in a directory."""
+    """Counts valid image files (.jpg, .png, .jpeg, .webp, .bmp, .tif/.tiff).
+
+    Uses `os.scandir` + `DirEntry.is_file()` (d_type, no per-file stat) instead
+    of `Path.iterdir()` + `Path.is_file()` (one `stat` per entry): ~7x faster
+    on a 3500-entry directory (median ~300 ms -> ~42 ms/call, timeit, 5x10
+    reps). Suffix matching is identical (`os.path.splitext`, lower-cased).
+    """
     if not directory.is_dir():
         return 0
     count = 0
-    for f in directory.iterdir():
-        if f.is_file() and f.suffix.lower() in (".jpg", ".png", ".jpeg"):
-            count += 1
+    with os.scandir(directory) as it:
+        for entry in it:
+            if entry.is_file():
+                _, ext = os.path.splitext(entry.name)
+                if ext.lower() in _IMAGE_EXTENSIONS:
+                    count += 1
     return count
 
 
+def normalize_training_params(
+    epochs: int = 25,
+    imgsz: int = 640,
+    batch: int = 16,
+    model: str = "yolo11n.pt",
+) -> Tuple[int, int, int, str]:
+    """Clamps training hyperparameters to sane ranges (single validation point).
+
+    The worker used to clamp epochs/imgsz/batch/model while `run_training_sync`
+    / `start_training_async` passed raw values to the engine, so `epochs=0`
+    behaved differently per entry point. All three now share this helper.
+    """
+    return (
+        max(1, int(epochs)),
+        max(320, int(imgsz)),
+        max(1, int(batch)),
+        str(model or _DEFAULT_MODEL).strip() or _DEFAULT_MODEL,
+    )
+
+
+def _training_status_message(only_approved: bool, sample_count: int) -> str:
+    """Canonical `[EĞİTİM] ...` start line, byte-identical in every caller."""
+    if only_approved:
+        return (
+            "[EĞİTİM] Sadece onaylanan temiz veri seti ile eğitim başlatılıyor: "
+            f"{sample_count} onaylı kare"
+        )
+    return f"[EĞİTİM] Tüm veri seti ile eğitim başlatılıyor: {sample_count} kare"
+
+
+def _empty_approved_result(yaml_path: Path) -> Dict[str, Any]:
+    """Failure dict returned when only_approved=True but 0 samples exist."""
+    err_msg = "Onaylanmış eğitim karesi bulunamadı. Lütfen önce Step 2'de kareleri onaylayın."
+    return {
+        "started": False,
+        "status": "failed",
+        "state": "failed",
+        "error": err_msg,
+        "reason": err_msg,
+        "only_approved": True,
+        "use_approved_only": True,
+        "approved_count": 0,
+        "data_yaml_path": str(yaml_path),
+    }
+
+
+def _invalid_yaml_result(
+    yaml_path: Path, errors: List[str], only_approved: bool
+) -> Dict[str, Any]:
+    """Failure dict returned when the training yaml fails pre-flight validation.
+
+    P0-5 (K-30): the worker thread / Ultralytics must never be the first
+    thing to discover a bad yaml. The concrete reasons travel in `error` /
+    `reason` so the UI can show them verbatim instead of a generic
+    "Eğitim başarısız.".
+    """
+    err_msg = "Eğitim yaml'ı geçersiz: " + "; ".join(errors)
+    return {
+        "started": False,
+        "status": "failed",
+        "state": "failed",
+        "error": err_msg,
+        "reason": err_msg,
+        "only_approved": bool(only_approved),
+        "use_approved_only": bool(only_approved),
+        "approved_count": 0,
+        "data_yaml_path": str(yaml_path),
+    }
+
+
+def _engine_supports_kwarg(engine: Any, method_name: str, kwarg: str) -> bool:
+    """True when `engine.<method_name>` accepts `kwarg` (best effort)."""
+    try:
+        return kwarg in inspect.signature(getattr(engine, method_name)).parameters
+    except Exception:
+        return False
+
+
+def _annotate_training_result(
+    result: Any,
+    only_approved: bool,
+    sample_count: int,
+    yaml_path: Path,
+) -> Any:
+    """Adds trainer bookkeeping fields to an engine result dict (in place)."""
+    if isinstance(result, dict):
+        result["only_approved"] = only_approved
+        result["use_approved_only"] = only_approved
+        result["sample_count"] = sample_count
+        result["selected_yaml"] = str(yaml_path)
+    return result
+
+
+def classify_training_result(
+    result: Any,
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """Pure classification of an engine/worker training result.
+
+    Returns `(outcome, message, status_line)`:
+    - `("finished", None, None)` — training completed; caller emits the result.
+    - `("deferred", reason, "Eğitim Durumu: {reason}")` — game still running.
+    - `("failed", err, status_line_or_None)` — caller emits training_failed(err),
+      plus status_text(status_line) when one is given (stopped case only).
+
+    Extracted verbatim (same branch order, same strings) from
+    `YOLOTrainingWorker.run()` so every branch is unit-testable without
+    spinning up a thread.
+    """
+    if isinstance(result, dict) and (
+        result.get("waiting_for_game_exit") or result.get("reason") == "aion2_running"
+    ):
+        reason = "Eğitim, oyun kapanana kadar bekliyor."
+        return "deferred", reason, f"Eğitim Durumu: {reason}"
+
+    if isinstance(result, dict) and (
+        result.get("stopped")
+        or result.get("interrupted")
+        or result.get("status") == "stopped"
+        or result.get("state") == "stopped"
+    ):
+        err = str(result.get("reason") or "Eğitim kullanıcı tarafından durduruldu.")
+        return "failed", err, f"Eğitim Durumu: Durduruldu ({err})"
+
+    if isinstance(result, dict) and (
+        result.get("started") is False
+        or result.get("status") == "failed"
+        or result.get("state") in ("failed", "refused", "busy")
+    ):
+        err = str(result.get("reason") or result.get("error") or "Eğitim başarısız.")
+        return "failed", err, None
+
+    # F-1972: a None / empty / content-free result is a failure,
+    # never a silent "success".
+    if not isinstance(result, dict) or not result:
+        return "failed", "Eğitim sonucu boş/belirsiz — eğitim başarısız sayıldı.", None
+
+    if (
+        result.get("status") not in ("success", "completed")
+        and result.get("state") not in ("completed", "success")
+        and result.get("started") is not True
+    ):
+        err = str(result.get("reason") or result.get("error") or "Eğitim sonucu başarısız sayıldı.")
+        return "failed", err, None
+
+    return "finished", None, None
+
+
+def count_labeled_images(images_dir: Path, labels_dir: Path) -> int:
+    """Images with a non-empty same-stem `.txt` label — the ones YOLO will
+    actually train on.
+
+    `count_images_in_dir` counts every image, including label-less ones
+    YOLO silently drops (dilim 05 F9, dilim 27 B-05). Callers that report
+    "N kareyle eğitim" must use this, not the raw image count.
+    """
+    if not images_dir.is_dir():
+        return 0
+    count = 0
+    for f in images_dir.iterdir():
+        if not f.is_file() or f.suffix.lower() not in (
+            ".jpg",
+            ".png",
+            ".jpeg",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
+        ):
+            continue
+        lbl = labels_dir / f"{f.stem}.txt"
+        try:
+            if lbl.is_file() and lbl.read_text(encoding="utf-8", errors="ignore").strip():
+                count += 1
+        except OSError:
+            continue
+    return count
+
+
+def count_images_missing_labels(images_dir: Path, labels_dir: Path) -> int:
+    """Counts images in `images_dir` with no same-stem `.txt` in `labels_dir`.
+
+    Diagnostic only: YOLO training silently drops label-less images, so
+    `count_images_in_dir` overstates the usable sample count when this
+    is > 0. Does not change any count; callers only warn on it.
+    """
+    if not images_dir.is_dir():
+        return 0
+    label_stems: Set[str] = set()
+    if labels_dir.is_dir():
+        label_stems = {f.stem for f in labels_dir.iterdir() if f.is_file() and f.suffix.lower() == ".txt"}
+    missing = 0
+    for f in images_dir.iterdir():
+        if f.is_file() and f.suffix.lower() in (
+            ".jpg", ".png", ".jpeg", ".webp", ".bmp", ".tif", ".tiff",
+        ) and f.stem not in label_stems:
+            missing += 1
+    return missing
+
+
+def read_stale_manifest(models_dir: Optional[Union[str, Path]]) -> Tuple[bool, Optional[str]]:
+    """Reads `models/stale_manifest.json` without raising.
+
+    Returns `(is_stale, reason)`. `(False, None)` when the file is absent,
+    malformed, or `model_stale` is not exactly `True` — a missing or broken
+    manifest must never block training, it only means "no stale signal".
+    """
+    if models_dir is None:
+        return False, None
+    manifest = Path(models_dir) / "stale_manifest.json"
+    if not manifest.is_file():
+        return False, None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return False, None
+    if not isinstance(data, dict) or data.get("model_stale") is not True:
+        return False, None
+    reason = data.get("reason")
+    return True, str(reason) if reason is not None else None
+
+
 def _write_fallback_approved_yaml(approved_dir: Path, approved_yaml_path: Path) -> Path:
-    """Writes canonical 22-class `data_approved.yaml` into `approved_dir`."""
+    """Writes canonical 27-class `data_approved.yaml` into `approved_dir`."""
     approved_dir.mkdir(parents=True, exist_ok=True)
     (approved_dir / "images" / "train").mkdir(parents=True, exist_ok=True)
     (approved_dir / "images" / "val").mkdir(parents=True, exist_ok=True)
     (approved_dir / "labels" / "train").mkdir(parents=True, exist_ok=True)
     (approved_dir / "labels" / "val").mkdir(parents=True, exist_ok=True)
-    pool_posix = approved_dir.as_posix()
+    # B-09 DÜZELTME (2026-11-10, canlı kanıt): `path:` MUTLAK yol
+    # yazar — eski göreli `.` YANLIŞTI. Ultralytics göreli path'i
+    # yaml'ın dizinine göre DEĞİL, eğitim sürecinin çalışma klasörüne
+    # (CWD, PC'de F:\a2) göre çözer; `.` yazılınca eğitim
+    # F:\a2\images\val'i aradı ve düştü. Bu fallback yaml da aynı
+    # data_approved.yaml'ı yazdığı için aynı hataya düşerdi.
+    # Taşınabilirlik doğruluk karşısında ikincildir; yaml her
+    # hazırlıkta yeniden üretilir. Windows uyumu için as_posix.
+    names = _canonical_class_names()
     lines = [
         "# Ultralytics YOLO Configuration - Approved Dataset Pool (A09 Standalone Fallback)",
-        f"path: {pool_posix}",
+        f"path: {Path(approved_dir).resolve().as_posix()}",
         "train: images/train",
         "val: images/val",
-        "nc: 22",
+        f"nc: {len(names)}",
         "names:",
-        "  0: herb_aria",
-        "  1: herb_mela",
-        "  2: herb_targena",
-        "  3: ore_orichalcum",
-        "  4: gem_crystal",
-        "  5: tree_log",
-        "  6: herb_edana",
-        "  7: herb_lumina",
-        "  8: ore_obsidian",
-        "  9: minimap_sprout",
-        "  10: monster_3d",
-        "  11: minimap_monster_dot",
-        "  12: crystal_blood",
-        "  13: skill_ui_prompt",
-        "  14: obstacle",
-        "  15: path_ground",
-        "  16: player_hp_bar",
-        "  17: player_mp_bar",
-        "  18: target_hp_bar",
-        "  19: skill_bar",
-        "  20: skill_slot_ready",
-        "  21: skill_slot_cooldown",
     ]
+    for cid in sorted(names.keys()):
+        lines.append(f"  {cid}: {names[cid]}")
     content = "\n".join(lines) + "\n"
     approved_yaml_path.parent.mkdir(parents=True, exist_ok=True)
     approved_yaml_path.write_text(content, encoding="utf-8")
@@ -242,8 +653,6 @@ def prepare_and_resolve_training_yaml(
         return ds_dir / "data.yaml"
 
     approved_yaml = approved_dir / "data_approved.yaml"
-    nested_ds = ds_dir / "dataset"
-    nested_existed = nested_ds.exists()
 
     pool: Any = None
     prep_result: Any = None
@@ -258,8 +667,15 @@ def prepare_and_resolve_training_yaml(
         if ApprovedDatasetPool is not None and isinstance(pool, ApprovedDatasetPool):
             pool_root_resolved = Path(getattr(pool, "pool_root", approved_dir)).resolve()
             if pool_root_resolved != approved_dir.resolve():
-                if not nested_existed and nested_ds.is_dir() and ds_dir.name.lower() == "dataset":
-                    shutil.rmtree(nested_ds, ignore_errors=True)
+                # F-1974: a pool-path mismatch must NEVER delete user data
+                # (the old code removed a whole dataset/dataset tree).
+                # Just use a correctly scoped pool and warn.
+                logger.warning(
+                    "Approved pool singleton points at %s, expected %s; "
+                    "using a scoped pool instead (no files deleted).",
+                    pool_root_resolved,
+                    approved_dir.resolve(),
+                )
                 scoped_pool = ApprovedDatasetPool(pool_root=approved_dir, project_root=proj_root)
                 scoped_pool.sync_from_disk()
                 prep_result = scoped_pool.prepare_approved_training_dataset(source_dataset_dir=ds_dir)
@@ -269,6 +685,21 @@ def prepare_and_resolve_training_yaml(
                     pass
     except Exception as exc:
         logger.debug("Scoped ApprovedDatasetPool reconciliation skipped: %s", exc)
+
+    # P1-09 (K-24): dondurma-sayı kapısı — eğitim, dondurulan setle
+    # başlamalı. frozen_manifest.json varsa ve approved_pool kaynaklıysa
+    # sayıları havuzla uyuşmalı; uyumsuzluk eğitimi başlatmaz (donmuş set
+    # bayatlamıştır — Adım 3'te yeniden dondurmak gerekir). Manifesto
+    # yoksa yalnızca uyarılır (dondurmasız akışlar kilitlenmez).
+    frozen_check = dataset_factory.approved_pool.check_frozen_manifest_consistency(
+        dataset_dir=ds_dir
+    )
+    if frozen_check.get("checked") and not frozen_check.get("ok"):
+        raise RuntimeError(
+            frozen_check.get("reason") or "Dondurulan veri seti havuzla uyuşmuyor."
+        )
+    if not frozen_check.get("checked"):
+        logger.warning("[EĞİTİM] %s", frozen_check.get("reason") or "Dondurma karşılaştırması yapılamadı.")
 
     if isinstance(prep_result, (str, Path)):
         cand = Path(prep_result)
@@ -368,56 +799,36 @@ class YOLOTrainer:
     def count_approved_samples(self) -> int:
         """
         Calculates the number of approved images in `dataset/approved/`.
-        Uses `ApprovedDatasetPool.get_approved_stats()` or inspects the disk directly.
+
+        Counts only images with a non-empty label file (dilim 05 F9):
+        YOLO silently drops label-less images, so the raw image count
+        overstated the usable sample count. Disk is the truth — no
+        manifest/pool fallback: a stale manifest must not inflate the
+        number the training status line reports.
         """
         train_img_dir = self.approved_dir / "images" / "train"
         val_img_dir = self.approved_dir / "images" / "val"
-        disk_count = count_images_in_dir(train_img_dir) + count_images_in_dir(val_img_dir)
-        if disk_count > 0:
-            return disk_count
-
-        pool = self.get_approved_pool()
-        if pool is not None:
-            try:
-                stats = pool.get_approved_stats()
-                count = int(stats.get("total_approved_images", 0))
-                if count > 0:
-                    return count
-            except Exception as ex:
-                logger.debug("Failed to get approved stats from pool: %s", ex)
-
-        manifest_p = self.approved_dir / "approved_manifest.json"
-        if manifest_p.is_file():
-            try:
-                data = json.loads(manifest_p.read_text(encoding="utf-8"))
-                stems = data.get("stems", {})
-                if isinstance(stems, dict):
-                    return len(stems)
-                return int(data.get("total_approved_images", 0))
-            except Exception:
-                pass
-
-        return 0
+        train_lbl_dir = self.approved_dir / "labels" / "train"
+        val_lbl_dir = self.approved_dir / "labels" / "val"
+        return count_labeled_images(train_img_dir, train_lbl_dir) + count_labeled_images(
+            val_img_dir, val_lbl_dir
+        )
 
     def count_total_dataset_samples(self) -> int:
         """
         Calculates the number of total images in `dataset/images/{train,val}`.
+
+        Counts only images with a non-empty label file (dilim 27 B-03/B-05).
+        Disk is the truth: the old `manifest_stats.json` fallback let a
+        stale cache claim frames that no longer exist on disk.
         """
         train_img_dir = self.dataset_dir / "images" / "train"
         val_img_dir = self.dataset_dir / "images" / "val"
-        count = count_images_in_dir(train_img_dir) + count_images_in_dir(val_img_dir)
-        if count > 0:
-            return count
-
-        manifest_stats = self.dataset_dir / "manifest_stats.json"
-        if manifest_stats.is_file():
-            try:
-                data = json.loads(manifest_stats.read_text(encoding="utf-8"))
-                return int(data.get("total_frames", data.get("total_images", 0)))
-            except Exception:
-                pass
-
-        return 0
+        train_lbl_dir = self.dataset_dir / "labels" / "train"
+        val_lbl_dir = self.dataset_dir / "labels" / "val"
+        return count_labeled_images(train_img_dir, train_lbl_dir) + count_labeled_images(
+            val_img_dir, val_lbl_dir
+        )
 
     # -------------------------------------------------------------------------
     # Core YAML & Dataset Resolution
@@ -468,6 +879,22 @@ class YOLOTrainer:
           - Returns: `(yaml_path, count)`.
         """
         if only_approved:
+            # A02: a custom yaml is silently ignored on this branch today —
+            # warn instead of letting the caller believe it was honoured.
+            if custom_yaml is not None:
+                logger.warning(
+                    "custom_yaml verildi (%s) ama only_approved=True; "
+                    "özel yaml yok sayılıyor, data_approved.yaml kullanılıyor.",
+                    custom_yaml,
+                )
+            # A02: yolo_trainer never consulted models/stale_manifest.json —
+            # warn when training starts while the published model is stale.
+            stale, stale_reason = read_stale_manifest(self.models_dir)
+            if stale:
+                logger.warning(
+                    "[EĞİTİM] Model bayat olarak işaretli (models/stale_manifest.json): %s",
+                    stale_reason or "sebep belirtilmemiş",
+                )
             if auto_generate or not self.approved_yaml_path.is_file():
                 yaml_p = prepare_and_resolve_training_yaml(
                     dataset_dir=self.dataset_dir,
@@ -481,7 +908,22 @@ class YOLOTrainer:
                 self._generate_fallback_approved_yaml()
                 yaml_p = self.approved_yaml_path
 
-            log_line = f"[EĞİTİM] Sadece onaylanan temiz veri seti ile eğitim başlatılıyor: {count} onaylı kare"
+            # A02: count counts images even when their .txt label is missing
+            # (YOLO drops those silently); warn with the measured number.
+            missing_labels = count_images_missing_labels(
+                self.approved_dir / "images" / "train", self.approved_dir / "labels" / "train"
+            ) + count_images_missing_labels(
+                self.approved_dir / "images" / "val", self.approved_dir / "labels" / "val"
+            )
+            if missing_labels > 0:
+                logger.warning(
+                    "[EĞİTİM] %d onaylı görselin etiket (.txt) dosyası yok; "
+                    "bu kareler eğitimde sessizce atlanır, sayılan %d kare kullanılabilir olandan fazla olabilir.",
+                    missing_labels,
+                    count,
+                )
+
+            log_line = _training_status_message(True, count)
             logger.info(log_line)
             print(log_line, flush=True)
 
@@ -489,15 +931,28 @@ class YOLOTrainer:
         else:
             if custom_yaml is not None:
                 yaml_p = Path(custom_yaml).resolve()
+                # A02: a nonexistent custom yaml was silently forwarded to
+                # the engine, which failed later with an unrelated error.
+                if not yaml_p.is_file():
+                    logger.warning(
+                        "custom_yaml dosyası bulunamadı: %s; motor bu yolla çağrılacak ve hata verebilir.",
+                        yaml_p,
+                    )
             else:
                 yaml_p = prepare_and_resolve_training_yaml(
                     dataset_dir=self.dataset_dir,
                     only_approved=False,
                 ).resolve()
 
-            count = self.count_total_dataset_samples()
+            # F-1990: when a custom yaml is given, count ITS train/val
+            # images instead of reporting the whole dataset total.
+            if custom_yaml is not None and Path(custom_yaml).is_file():
+                yaml_count = _count_images_for_yaml(Path(custom_yaml))
+                count = yaml_count if yaml_count > 0 else self.count_total_dataset_samples()
+            else:
+                count = self.count_total_dataset_samples()
 
-            log_line = f"[EĞİTİM] Tüm veri seti ile eğitim başlatılıyor: {count} kare"
+            log_line = _training_status_message(False, count)
             logger.info(log_line)
             print(log_line, flush=True)
 
@@ -522,7 +977,7 @@ class YOLOTrainer:
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
         force_fallback: bool = False,
-        allow_opencv_fallback: bool = True,
+        allow_opencv_fallback: bool = False,
         use_approved_only: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -532,55 +987,22 @@ class YOLOTrainer:
         Points strictly to `dataset/approved/data_approved.yaml` when `only_approved=True`
         (or `use_approved_only=True`).
         """
-        if use_approved_only is not None:
-            only_approved = bool(use_approved_only)
-        elif data_yaml_path is not None and Path(data_yaml_path).name.lower() == "data_approved.yaml":
-            only_approved = True
-
-        yaml_path, sample_count = self.resolve_training_data_yaml(
+        only_approved, yaml_path, sample_count, early_result = self._prepare_training_run(
             only_approved=only_approved,
-            custom_yaml=data_yaml_path,
+            data_yaml_path=data_yaml_path,
+            status_callback=status_callback,
+            use_approved_only=use_approved_only,
+            emit_error_status=True,
         )
+        if early_result is not None:
+            return early_result
 
-        status_msg = (
-            f"[EĞİTİM] Sadece onaylanan temiz veri seti ile eğitim başlatılıyor: {sample_count} onaylı kare"
-            if only_approved
-            else f"[EĞİTİM] Tüm veri seti ile eğitim başlatılıyor: {sample_count} kare"
-        )
-        if callable(status_callback):
-            try:
-                status_callback(status_msg)
-            except Exception:
-                pass
-
-        if only_approved and sample_count == 0:
-            err_msg = "Onaylanmış eğitim karesi bulunamadı. Lütfen önce Step 2'de kareleri onaylayın."
-            logger.warning("[EĞİTİM] %s", err_msg)
-            if callable(status_callback):
-                try:
-                    status_callback(f"[HATA] {err_msg}")
-                except Exception:
-                    pass
-            return {
-                "started": False,
-                "status": "failed",
-                "state": "failed",
-                "error": err_msg,
-                "reason": err_msg,
-                "only_approved": True,
-                "use_approved_only": True,
-                "approved_count": 0,
-                "data_yaml_path": str(yaml_path),
-            }
+        epochs, imgsz, batch, model = normalize_training_params(epochs, imgsz, batch, model)
 
         engine = self.get_engine()
         call_kwargs: Dict[str, Any] = dict(kwargs)
-        try:
-            sig = inspect.signature(engine.run_training_sync)
-            if "use_approved_only" in sig.parameters:
-                call_kwargs["use_approved_only"] = only_approved
-        except Exception:
-            pass
+        if _engine_supports_kwarg(engine, "run_training_sync", "use_approved_only"):
+            call_kwargs["use_approved_only"] = only_approved
 
         result = engine.run_training_sync(
             data_yaml_path=yaml_path,
@@ -594,13 +1016,102 @@ class YOLOTrainer:
             **call_kwargs,
         )
 
-        if isinstance(result, dict):
-            result["only_approved"] = only_approved
-            result["use_approved_only"] = only_approved
-            result["sample_count"] = sample_count
-            result["selected_yaml"] = str(yaml_path)
+        return _annotate_training_result(result, only_approved, sample_count, yaml_path)
 
-        return result
+    def _prepare_training_run(
+        self,
+        only_approved: bool,
+        data_yaml_path: Optional[Union[str, Path]],
+        status_callback: Optional[Callable[[str], None]],
+        use_approved_only: Optional[bool],
+        emit_error_status: bool,
+    ) -> Tuple[bool, Path, int, Optional[Dict[str, Any]]]:
+        """Shared prologue of `run_training_sync` / `start_training_async`.
+
+        Normalizes the approved-only flag, resolves the dataset yaml, emits
+        the start status line and, when only_approved=True with 0 samples,
+        returns the early failure dict as the 4th element (None otherwise).
+        `emit_error_status` preserves the historical asymmetry: the sync path
+        reports the empty-approved error via status_callback ("[HATA] ..."),
+        the async path does not.
+        """
+        if use_approved_only is not None:
+            only_approved = bool(use_approved_only)
+        # F-1987: a data_approved.yaml filename no longer silently overrides
+        # an explicit only_approved=False — the caller's flag wins; warn.
+        if (
+            data_yaml_path is not None
+            and Path(data_yaml_path).name.lower() == "data_approved.yaml"
+            and not only_approved
+        ):
+            logger.warning(
+                "data_approved.yaml verildi ama only_approved=False; "
+                "çağrıcının seçimi geçerli sayılıyor."
+            )
+
+        yaml_path, sample_count = self.resolve_training_data_yaml(
+            only_approved=only_approved,
+            custom_yaml=data_yaml_path,
+        )
+
+        # P0-5 (K-30): pre-flight yaml validation — path absolute, train/val
+        # dirs exist, > 0 labeled frames. This is the trainer-side gate for
+        # every entry point (sync, async, worker, .bat): a bad yaml must
+        # fail HERE with a concrete reason, not inside the worker thread or
+        # inside Ultralytics. The dialog shows the same check before the
+        # worker even starts (on_train_rtx_clicked); this is the second
+        # line of defence for non-UI callers.
+        yaml_report = validate_training_yaml(yaml_path)
+        if not yaml_report["ok"]:
+            # P0-5 tur 2: only_approved + TEK hata 0-etiketli-kare ise
+            # eski boş-havuz sözleşmesi korunur ("Onaylanmış eğitim
+            # karesi bulunamadı") — yaml kapısı ile eski kapı aynı
+            # koşulu yakalar; dışarıya dönük mesaj değişmez. Başka bir
+            # geçersizlik (göreli path, eksik dizin, eksik dosya) varsa
+            # yaml mesajı aynen kalır — ayırt edicilik korunur.
+            _yaml_errors = list(yaml_report["errors"])
+            if (
+                only_approved
+                and len(_yaml_errors) == 1
+                and "etiketli kare yok" in _yaml_errors[0]
+            ):
+                empty_result = _empty_approved_result(yaml_path)
+                logger.warning("[EĞİTİM] %s", empty_result["error"])
+                if emit_error_status and callable(status_callback):
+                    try:
+                        status_callback(f"[HATA] {empty_result['error']}")
+                    except Exception:
+                        pass
+                return only_approved, yaml_path, sample_count, empty_result
+            invalid_result = _invalid_yaml_result(
+                yaml_path, _yaml_errors, only_approved
+            )
+            logger.warning("[EĞİTİM] %s", invalid_result["error"])
+            if emit_error_status and callable(status_callback):
+                try:
+                    status_callback(f"[HATA] {invalid_result['error']}")
+                except Exception:
+                    pass
+            return only_approved, yaml_path, sample_count, invalid_result
+
+        status_msg = _training_status_message(only_approved, sample_count)
+        if callable(status_callback):
+            try:
+                status_callback(status_msg)
+            except Exception:
+                pass
+
+        if only_approved and sample_count == 0:
+            err_msg = "Onaylanmış eğitim karesi bulunamadı. Lütfen önce Step 2'de kareleri onaylayın."
+            logger.warning("[EĞİTİM] %s", err_msg)
+            if emit_error_status and callable(status_callback):
+                try:
+                    status_callback(f"[HATA] {err_msg}")
+                except Exception:
+                    pass
+            return only_approved, yaml_path, sample_count, _empty_approved_result(yaml_path)
+
+        return only_approved, yaml_path, sample_count, None
 
     # -------------------------------------------------------------------------
     # Asynchronous Training Execution
@@ -617,57 +1128,29 @@ class YOLOTrainer:
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         status_callback: Optional[Callable[[str], None]] = None,
         force_fallback: bool = False,
-        allow_opencv_fallback: bool = True,
+        allow_opencv_fallback: bool = False,
         use_approved_only: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Starts training asynchronously on a background thread.
         """
-        if use_approved_only is not None:
-            only_approved = bool(use_approved_only)
-        elif data_yaml_path is not None and Path(data_yaml_path).name.lower() == "data_approved.yaml":
-            only_approved = True
-
-        yaml_path, sample_count = self.resolve_training_data_yaml(
+        only_approved, yaml_path, sample_count, early_result = self._prepare_training_run(
             only_approved=only_approved,
-            custom_yaml=data_yaml_path,
+            data_yaml_path=data_yaml_path,
+            status_callback=status_callback,
+            use_approved_only=use_approved_only,
+            emit_error_status=False,
         )
+        if early_result is not None:
+            return early_result
 
-        status_msg = (
-            f"[EĞİTİM] Sadece onaylanan temiz veri seti ile eğitim başlatılıyor: {sample_count} onaylı kare"
-            if only_approved
-            else f"[EĞİTİM] Tüm veri seti ile eğitim başlatılıyor: {sample_count} kare"
-        )
-        if callable(status_callback):
-            try:
-                status_callback(status_msg)
-            except Exception:
-                pass
-
-        if only_approved and sample_count == 0:
-            err_msg = "Onaylanmış eğitim karesi bulunamadı. Lütfen önce Step 2'de kareleri onaylayın."
-            logger.warning("[EĞİTİM] %s", err_msg)
-            return {
-                "started": False,
-                "status": "failed",
-                "state": "failed",
-                "error": err_msg,
-                "reason": err_msg,
-                "only_approved": True,
-                "use_approved_only": True,
-                "approved_count": 0,
-                "data_yaml_path": str(yaml_path),
-            }
+        epochs, imgsz, batch, model = normalize_training_params(epochs, imgsz, batch, model)
 
         engine = self.get_engine()
         call_kwargs: Dict[str, Any] = dict(kwargs)
-        try:
-            sig = inspect.signature(engine.start_training_async)
-            if "use_approved_only" in sig.parameters:
-                call_kwargs["use_approved_only"] = only_approved
-        except Exception:
-            pass
+        if _engine_supports_kwarg(engine, "start_training_async", "use_approved_only"):
+            call_kwargs["use_approved_only"] = only_approved
 
         result = engine.start_training_async(
             data_yaml_path=yaml_path,
@@ -681,45 +1164,16 @@ class YOLOTrainer:
             **call_kwargs,
         )
 
-        if isinstance(result, dict):
-            result["only_approved"] = only_approved
-            result["use_approved_only"] = only_approved
-            result["sample_count"] = sample_count
-            result["selected_yaml"] = str(yaml_path)
-
-        return result
-
-    # -------------------------------------------------------------------------
-    # Convenience Wrapper
-    # -------------------------------------------------------------------------
-
-    def train(
-        self,
-        epochs: int = 25,
-        only_approved: bool = True,
-        async_run: bool = False,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Unified training entry point (sync or async)."""
-        if async_run:
-            return self.start_training_async(epochs=epochs, only_approved=only_approved, **kwargs)
-        return self.run_training_sync(epochs=epochs, only_approved=only_approved, **kwargs)
-
-    def get_status(self) -> Dict[str, Any]:
-        """Queries current status from the underlying training engine."""
-        try:
-            engine = self.get_engine()
-            return engine.get_status()
-        except Exception:
-            return {"state": "idle", "started": False}
+        return _annotate_training_result(result, only_approved, sample_count, yaml_path)
 
     def stop_training(self) -> None:
         """Requests training stop."""
         try:
             engine = self.get_engine()
             engine.stop_training()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Was a silent `pass`: a failing stop request left no trace.
+            logger.debug("stop_training failed (ignored): %s", exc)
 
 
 # =============================================================================
@@ -754,15 +1208,14 @@ class YOLOTrainingWorker(QThread):
         trainer: Optional[YOLOTrainer] = None,
         project_root: Optional[Union[str, Path]] = None,
         dataset_dir: Optional[Union[str, Path]] = None,
-        allow_opencv_fallback: bool = True,
+        allow_opencv_fallback: bool = False,
         force_fallback: bool = False,
     ) -> None:
         super().__init__(parent)
         self.controller = controller
-        self.epochs = max(1, int(epochs))
-        self.imgsz = max(320, int(imgsz))
-        self.batch = max(1, int(batch))
-        self.model = str(model or "yolo11n.pt").strip() or "yolo11n.pt"
+        self.epochs, self.imgsz, self.batch, self.model = normalize_training_params(
+            epochs, imgsz, batch, model
+        )
         self.only_approved = bool(only_approved)
         self.allow_opencv_fallback = bool(allow_opencv_fallback)
         self.force_fallback = bool(force_fallback)
@@ -777,7 +1230,15 @@ class YOLOTrainingWorker(QThread):
             )
 
     def is_stop_requested(self) -> bool:
-        return bool(getattr(self, "_stop_requested", False) or self.isInterruptionRequested())
+        # F-1971: defensive — never crash on a thread object without the
+        # interruption API (e.g. a plain threading.Thread).
+        interruption = False
+        if hasattr(self, "isInterruptionRequested"):
+            try:
+                interruption = bool(self.isInterruptionRequested())
+            except Exception:
+                interruption = False
+        return bool(getattr(self, "_stop_requested", False) or interruption)
 
     def stop(self) -> None:
         """Requests training stop across worker and underlying trainer/controller."""
@@ -795,8 +1256,11 @@ class YOLOTrainingWorker(QThread):
                 pass
 
     def _emit_progress(self, payload: Dict[str, Any]) -> None:
+        # F-1996: when a stop was requested, stop and do NOT emit another
+        # progress update afterwards.
         if self.is_stop_requested():
             self.stop()
+            return
         self.progress_updated.emit(dict(payload))
 
     def run(self) -> None:
@@ -810,11 +1274,7 @@ class YOLOTrainingWorker(QThread):
                 only_approved=self.only_approved
             )
 
-            status_line = (
-                f"[EĞİTİM] Sadece onaylanan temiz veri seti ile eğitim başlatılıyor: {sample_count} onaylı kare"
-                if self.only_approved
-                else f"[EĞİTİM] Tüm veri seti ile eğitim başlatılıyor: {sample_count} kare"
-            )
+            status_line = _training_status_message(self.only_approved, sample_count)
             self.status_text.emit(status_line)
 
             # 2. Check if approved dataset is empty
@@ -872,36 +1332,16 @@ class YOLOTrainingWorker(QThread):
                     force_fallback=self.force_fallback,
                 )
 
-            # 5. Handle training result
-            if isinstance(result, dict) and (
-                result.get("waiting_for_game_exit") or result.get("reason") == "aion2_running"
-            ):
-                reason = "Eğitim, oyun kapanana kadar bekliyor."
-                self.status_text.emit(f"Eğitim Durumu: {reason}")
-                self.training_deferred.emit(reason)
-                return
-
-            if isinstance(result, dict) and (
-                result.get("stopped")
-                or result.get("interrupted")
-                or result.get("status") == "stopped"
-                or result.get("state") == "stopped"
-            ):
-                err = str(result.get("reason") or "Eğitim kullanıcı tarafından durduruldu.")
-                self.status_text.emit(f"Eğitim Durumu: Durduruldu ({err})")
-                self.training_failed.emit(err)
-                return
-
-            if isinstance(result, dict) and (
-                result.get("started") is False
-                or result.get("status") == "failed"
-                or result.get("state") in ("failed", "refused", "busy")
-            ):
-                err = str(result.get("reason") or result.get("error") or "Eğitim başarısız.")
-                self.training_failed.emit(err)
-                return
-
-            self.training_finished.emit(result if isinstance(result, dict) else {"status": "success"})
+            # 5. Handle training result (pure classifier: same branches/strings).
+            outcome, message, status_line = classify_training_result(result)
+            if status_line is not None:
+                self.status_text.emit(status_line)
+            if outcome == "deferred":
+                self.training_deferred.emit(message)
+            elif outcome == "failed":
+                self.training_failed.emit(message)
+            else:
+                self.training_finished.emit(result)
 
         except Exception as exc:
             logger.exception("YOLO training worker error: %s", exc)

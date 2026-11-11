@@ -24,6 +24,7 @@ from typing import Any, Dict
 import numpy as np
 import pytest
 
+from dataset_factory.exemplar_memory import ExemplarMemory, extract_crop_features
 from dataset_factory.label_cache import (
     LabelCache,
     LabelCacheEntry,
@@ -32,21 +33,24 @@ from dataset_factory.label_cache import (
 )
 
 
-class MockExemplarMemory:
-    """Mock ExemplarMemory for fast testing of suppression and reinforcement."""
+def _distinct_crop(seed: int, base_bgr: tuple[int, int, int]) -> np.ndarray:
+    """A real image crop: flat base colour plus seeded per-pixel jitter, so
+    extract_crop_features() yields a genuine (non-identical) feature dict."""
+    rng = np.random.default_rng(seed)
+    crop = np.full((64, 64, 3), base_bgr, dtype=np.int16)
+    crop = crop + rng.integers(-12, 13, (64, 64, 3))
+    return np.clip(crop, 0, 255).astype(np.uint8)
 
-    def __init__(self) -> None:
-        self.suppress_neg_threshold = 0.82
-        self.reinforce_pos_threshold = 0.70
-        self.reassign_pos_threshold = 0.78
-        self._negative = []
-        self._positive = []
 
-    def match_negative(self, crop: np.ndarray, class_id: int = None):
-        return 0.0, None
-
-    def match_positive(self, crop: np.ndarray):
-        return 0.0, None, None, None
+def _real_exemplar_memory(tmp_path: Path, pos_crop=None, neg_crop=None) -> ExemplarMemory:
+    """A REAL ExemplarMemory (tmp JSON) populated through the production
+    add_positive_exemplar / add_negative_exemplar API — no stub match_*."""
+    memory = ExemplarMemory(json_path=tmp_path / "learned_exemplars.json")
+    if pos_crop is not None:
+        assert memory.add_positive_exemplar(pos_crop, class_id=0, class_name="herb_aria", source="ui_approval")
+    if neg_crop is not None:
+        assert memory.add_negative_exemplar(neg_crop, class_id=14, class_name="obstacle", source="ui_rejection")
+    return memory
 
 
 @pytest.fixture
@@ -178,23 +182,24 @@ def test_candidate_crops_delta_relabel(temp_cache_dir):
     img3 = temp_cache_dir["img3"]
     rev1 = 1000
 
-    # Create dummy candidate crops with synthetic feature histograms
-    dummy_feature_pos = {"hsv_hist": [0.01] * 432, "aspect_ratio": 1.2, "texture": [0.1] * 5}
-    dummy_feature_neg = {"hsv_hist": [0.05] * 432, "aspect_ratio": 0.8, "texture": [0.8] * 5}
+    # Candidate crops carry features extracted from REAL crops with the
+    # production extractor (extract_crop_features), not hand-made histograms.
+    neg_crop = _distinct_crop(seed=77, base_bgr=(35, 45, 40))
+    pos_crop = _distinct_crop(seed=78, base_bgr=(200, 140, 60))
 
     candidate_crops = [
         {
             "class_id": 0,
             "class_name": "herb_aria",
             "confidence": 0.86,
-            "feature": dummy_feature_pos,
+            "feature": extract_crop_features(pos_crop),
             "bbox": [0.5, 0.5, 0.1, 0.1],
         },
         {
             "class_id": 14,
             "class_name": "obstacle",
             "confidence": 0.70,
-            "feature": dummy_feature_neg,
+            "feature": extract_crop_features(neg_crop),
             "bbox": [0.2, 0.2, 0.05, 0.05],
         },
         {
@@ -216,11 +221,10 @@ def test_candidate_crops_delta_relabel(temp_cache_dir):
     rev2 = 2000
     assert cache.can_delta_relabel(img3, exemplar_revision=rev2) is True
 
-    # Setup mock exemplar memory with a negative match matching the obstacle feature
-    memory = MockExemplarMemory()
-    memory._negative = [
-        {"class_id": 14, "hsv_hist": [0.05] * 432, "aspect_ratio": 0.8, "texture": [0.8] * 5}
-    ]
+    # Real production memory: the obstacle crop is registered as a learned
+    # negative exemplar (class 14) via the real add API, so re-evaluation must
+    # suppress it through the real compute_similarity path.
+    memory = _real_exemplar_memory(temp_cache_dir["dir"], pos_crop=pos_crop, neg_crop=neg_crop)
 
     # Re-evaluate candidate crops
     refined = cache.re_evaluate_candidate_crops(
@@ -329,7 +333,9 @@ def test_positive_reinforcement_in_delta_crops(temp_cache_dir):
     cache = LabelCache(cache_path=temp_cache_dir["cache_file"])
     img = temp_cache_dir["img1"]
 
-    pos_feature = {"hsv_hist": [0.02] * 432, "aspect_ratio": 1.0, "texture": [0.3] * 5}
+    # Feature extracted from a REAL crop with the production extractor.
+    pos_crop = _distinct_crop(seed=55, base_bgr=(200, 140, 60))
+    pos_feature = extract_crop_features(pos_crop)
     crops = [
         {
             "class_id": 0,
@@ -342,16 +348,8 @@ def test_positive_reinforcement_in_delta_crops(temp_cache_dir):
 
     cache.record_label(img, exemplar_revision=10, candidate_crops=crops, box_count=1)
 
-    memory = MockExemplarMemory()
-    memory._positive = [
-        {
-            "class_id": 0,
-            "class_name": "herb_aria",
-            "hsv_hist": [0.02] * 432,
-            "aspect_ratio": 1.0,
-            "texture": [0.3] * 5,
-        }
-    ]
+    # REAL ExemplarMemory holding the same crop as a learned positive exemplar.
+    memory = _real_exemplar_memory(temp_cache_dir["dir"], pos_crop=pos_crop)
 
     refined = cache.re_evaluate_candidate_crops(
         file_path=img,
@@ -363,4 +361,68 @@ def test_positive_reinforcement_in_delta_crops(temp_cache_dir):
     # Confidence should have been reinforced / boosted
     assert refined[0]["confidence"] > 0.75
     assert refined[0].get("exemplar_reinforced") is True
+
+
+def test_non_numeric_confidence_does_not_abort_delta_relabel(temp_cache_dir):
+    """S-2103: a single non-numeric confidence ('high', None) loaded from a
+    disk cache must not raise ValueError and abort the whole file's delta
+    relabel; the bad crop falls back to its default and the remaining crops
+    are still processed."""
+    cache = LabelCache(cache_path=temp_cache_dir["cache_file"])
+    img = temp_cache_dir["img1"]
+
+    good_crop = _distinct_crop(seed=91, base_bgr=(200, 140, 60))
+    crops = [
+        {
+            "class_id": 2,
+            "class_name": "crystal",
+            "confidence": "high",  # non-numeric; hand-label branch (was line 675)
+            "hand_label": True,
+            "bbox": [0.8, 0.8, 0.1, 0.1],
+        },
+        {
+            "class_id": 0,
+            "class_name": "herb_aria",
+            "confidence": "high",  # non-numeric; confidence-floor check (was line 767)
+            "feature": extract_crop_features(good_crop),
+            "bbox": [0.4, 0.4, 0.2, 0.2],
+        },
+        {
+            "class_id": 0,
+            "class_name": "herb_aria",
+            "confidence": None,  # non-numeric; same floor check
+            "feature": extract_crop_features(good_crop),
+            "bbox": [0.5, 0.5, 0.2, 0.2],
+        },
+        {
+            "class_id": 0,
+            "class_name": "herb_aria",
+            "confidence": 0.90,
+            "feature": extract_crop_features(good_crop),
+            "bbox": [0.1, 0.1, 0.2, 0.2],
+        },
+    ]
+
+    cache.record_label(img, exemplar_revision=10, candidate_crops=crops, box_count=4)
+
+    memory = _real_exemplar_memory(temp_cache_dir["dir"])
+
+    # Must not raise ValueError.
+    refined = cache.re_evaluate_candidate_crops(
+        file_path=img,
+        exemplar_memory=memory,
+        exemplar_revision=20,
+    )
+
+    # Hand-labeled crop survives with the immunity floor confidence.
+    hand = [c for c in refined if c.get("hand_label") is True]
+    assert len(hand) == 1
+    assert hand[0]["confidence"] == 0.95
+    # The good numeric crop survives; the two non-numeric non-hand crops
+    # fall back to 0.0 and are dropped by the confidence floor.
+    assert any(c.get("bbox") == [0.1, 0.1, 0.2, 0.2] for c in refined)
+    assert len(refined) == 2
+    entry = cache.get_entry(img)
+    assert entry.exemplar_revision == 20
+    assert entry.box_count == 2
 

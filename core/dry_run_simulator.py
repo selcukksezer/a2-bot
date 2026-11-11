@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from version import __version__
 
 
 class DryRunReplaySimulator:
@@ -47,6 +48,10 @@ class DryRunReplaySimulator:
         self._active_harvest_stage: int = 1
         self._virtual_cursor_xy: Tuple[float, float] = (0.0, 0.0)
         self._last_audit_report: Optional[Dict[str, Any]] = None
+        # A13: son denetimin koşulduğu koordinatlar — render, düğüm sayısı
+        # aynı ama geometrisi farklı bir rotada bayat denetimi kullanmasın.
+        self._last_audit_coords: Optional[List[Tuple[float, float]]] = None
+        self._recorded_events: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Geometry & Zigzag / Self-Intersection Detection
@@ -54,15 +59,44 @@ class DryRunReplaySimulator:
 
     @staticmethod
     def _extract_xy(node: Dict[str, Any], idx: int = 0) -> Tuple[float, float]:
-        """Extracts `(x, y)` coordinates from a route node dictionary."""
+        """Extracts `(x, y)` coordinates from a route node dictionary.
+
+        Raises ValueError when the node carries no coordinates: inventing a
+        point on a circle fabricates route geometry (fake distances, fake
+        crossings) and must never silently stand in for real data.
+        """
         if "x" in node and "y" in node:
             return float(node["x"]), float(node["y"])
         if "pos" in node and isinstance(node["pos"], (list, tuple)) and len(node["pos"]) >= 2:
             return float(node["pos"][0]), float(node["pos"][1])
         if "screen_pos" in node and isinstance(node["screen_pos"], (list, tuple)) and len(node["screen_pos"]) >= 2:
             return float(node["screen_pos"][0]), float(node["screen_pos"][1])
-        angle = (idx * 0.65) % (2.0 * math.pi)
-        return 480.0 + 220.0 * math.cos(angle), 360.0 + 220.0 * math.sin(angle)
+        raise ValueError(f"route node {node.get('id', idx)!r} has no coordinates (x/y, pos, screen_pos)")
+
+    def _valid_coords(
+        self, nodes: List[Dict[str, Any]]
+    ) -> Tuple[List[Tuple[float, float]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """(coords, valid_nodes, skipped) — coordinate-less nodes are skipped, not invented."""
+        coords: List[Tuple[float, float]] = []
+        valid: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        for idx, node in enumerate(nodes):
+            try:
+                coords.append(self._extract_xy(node, idx))
+                valid.append(node)
+            except (ValueError, TypeError, KeyError) as exc:
+                skipped.append({"node_index": idx, "node_id": node.get("id", f"node_{idx}"), "reason": str(exc)})
+        return coords, valid, skipped
+
+    def record_click(self, x: int, y: int, label: str = "left") -> bool:
+        """Record one simulated click (dry-run only, no physical input)."""
+        self._recorded_events.append({"type": "click", "x": int(x), "y": int(y), "label": str(label)})
+        return True
+
+    def record_key_press(self, key: str, hold_ms: float = 55.0) -> bool:
+        """Record one simulated key press (dry-run only, no physical input)."""
+        self._recorded_events.append({"type": "key", "key": str(key), "hold_ms": float(hold_ms)})
+        return True
 
     @staticmethod
     def _ccw(ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> float:
@@ -116,12 +150,22 @@ class DryRunReplaySimulator:
     # Route Loading & Reference Frame Discovery
     # ------------------------------------------------------------------
 
-    def load_route_nodes(self, region_or_path: str | Path) -> List[Dict[str, Any]]:
-        """Loads `nodes` from either a direct JSON file path or a region name under `routes/<region>/region_data.json`."""
+    def load_route_nodes(self, region_or_path: str | Path, strict: bool = False) -> List[Dict[str, Any]]:
+        """Loads `nodes` from either a direct JSON file path or a region name under `routes/<region>/region_data.json`.
+
+        Missing/corrupt files return [] (and log a warning) unless strict=True,
+        in which case FileNotFoundError / ValueError is raised.
+        """
+        import logging as _logging
+
+        _log = _logging.getLogger("Gatherion.DryRunSimulator")
         candidate = Path(region_or_path)
         if not candidate.exists():
             candidate = self.base_dir / "routes" / str(region_or_path).strip().lower() / "region_data.json"
         if not candidate.exists():
+            _log.warning("load_route_nodes: route file not found: %s", candidate)
+            if strict:
+                raise FileNotFoundError(f"route file not found: {candidate}")
             return []
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
@@ -129,8 +173,13 @@ class DryRunReplaySimulator:
                 return list(data["nodes"])
             if isinstance(data, list):
                 return list(data)
-        except (OSError, json.JSONDecodeError):
-            return []
+            _log.warning("load_route_nodes: %s has no 'nodes' list", candidate)
+            if strict:
+                raise ValueError(f"route file has no 'nodes' list: {candidate}")
+        except (OSError, json.JSONDecodeError) as exc:
+            _log.warning("load_route_nodes: cannot read %s: %s", candidate, exc)
+            if strict:
+                raise ValueError(f"cannot read route file {candidate}: {exc}") from exc
         return []
 
     def discover_reference_frames(self, max_frames: int = 24) -> List[Path]:
@@ -160,36 +209,57 @@ class DryRunReplaySimulator:
         detecting self-intersections and sharp zigzag reversals, and returning a full telemetry dict.
         """
         t_start = time.perf_counter()
-        coords: List[Tuple[float, float]] = [self._extract_xy(n, idx) for idx, n in enumerate(nodes)]
+        # Coordinate-less nodes are skipped (reported), never invented.
+        # A route is OPEN: the last node does not wrap back to the first.
+        coords, valid_nodes, skipped_nodes = self._valid_coords(nodes)
+        nodes = valid_nodes
         n_count = len(coords)
 
         segments: List[Dict[str, Any]] = []
         total_distance_px = 0.0
-        for i in range(n_count):
-            if n_count < 2:
-                break
+        for i in range(n_count - 1):
             p1 = coords[i]
-            p2 = coords[(i + 1) % n_count]
+            p2 = coords[i + 1]
             dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
             total_distance_px += dist
             segments.append(
                 {
                     "segment_index": i,
                     "from_idx": i,
-                    "to_idx": (i + 1) % n_count,
+                    "to_idx": i + 1,
                     "p1": p1,
                     "p2": p2,
                     "distance_px": round(dist, 2),
                 }
             )
 
-        # Detect geometric self-intersections between non-adjacent segments
+        # Detect geometric self-intersections between non-adjacent segments.
+        # AABB pre-filter (D25): two segments can only strictly intersect
+        # when their axis-aligned bounding boxes overlap. One bbox per
+        # segment is precomputed, so most of the O(S^2) pair checks become
+        # four float compares instead of a 4x _ccw exact test. Pairs whose
+        # boxes merely touch are still sent to the exact test, so the
+        # result is identical to the unfiltered check (profiled: the exact
+        # test was ~74% of run_8x_route_audit wall time at n=400).
+        seg_bboxes: List[Tuple[float, float, float, float]] = [
+            (
+                min(s["p1"][0], s["p2"][0]),
+                min(s["p1"][1], s["p2"][1]),
+                max(s["p1"][0], s["p2"][0]),
+                max(s["p1"][1], s["p2"][1]),
+            )
+            for s in segments
+        ]
+        # A13: rota AÇIK — ilk/son segment çifti gerçek bir kesişimdir,
+        # kapalı rota sarması değildir; atlanmaz. Paylaşılan uç nokta
+        # teması zaten katı eşitsizlik testinden geçemez.
         self_intersections: List[Dict[str, Any]] = []
         num_seg = len(segments)
         for i in range(num_seg):
+            ax0, ay0, ax1, ay1 = seg_bboxes[i]
             for j in range(i + 2, num_seg):
-                # Skip adjacent wrap-around pair (0 and num_seg - 1)
-                if i == 0 and j == num_seg - 1:
+                bx0, by0, bx1, by1 = seg_bboxes[j]
+                if ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0:
                     continue
                 hit, point = self._segments_intersect(
                     segments[i]["p1"],
@@ -206,13 +276,14 @@ class DryRunReplaySimulator:
                         }
                     )
 
-        # Detect sharp zigzag turn reversals (> 145 deg turn change)
+        # Detect sharp zigzag turn reversals (> 145 deg turn change).
+        # Interior nodes only: an open route has no turn at the endpoints.
         zigzag_nodes: List[Dict[str, Any]] = []
         if n_count >= 3:
-            for i in range(n_count):
-                p_prev = coords[(i - 1) % n_count]
+            for i in range(1, n_count - 1):
+                p_prev = coords[i - 1]
                 p_curr = coords[i]
-                p_next = coords[(i + 1) % n_count]
+                p_next = coords[i + 1]
                 turn_deg = self._turn_angle_deg(p_prev, p_curr, p_next)
                 if turn_deg >= 145.0:
                     zigzag_nodes.append(
@@ -274,6 +345,8 @@ class DryRunReplaySimulator:
             "estimated_real_harvest_sec": round(total_real_harvest_sec, 2),
             "estimated_real_total_sec": round(total_real_cycle_sec, 2),
             "simulated_8x_duration_sec": round(simulated_8x_duration_sec, 2),
+            "skipped_node_count": len(skipped_nodes),
+            "skipped_nodes": skipped_nodes,
             "self_intersection_count": len(self_intersections),
             "self_intersections": self_intersections,
             "zigzag_count": len(zigzag_nodes),
@@ -283,6 +356,7 @@ class DryRunReplaySimulator:
             "audit_execution_ms": round(elapsed_wall_ms, 3),
         }
         self._last_audit_report = report
+        self._last_audit_coords = [tuple(c) for c in coords]
         return report
 
     # ------------------------------------------------------------------
@@ -316,11 +390,25 @@ class DryRunReplaySimulator:
             for gy in range(0, h, 80):
                 cv2.line(canvas, (0, gy), (w, gy), (36, 42, 50), 1)
 
+        # Freshness check against the VALID node count. The audit's
+        # node_count counts VALID (coordinate-bearing) nodes, so comparing
+        # against len(raw nodes) never matched when coordinate-less nodes
+        # were present and re-ran the full O(S^2) audit on every frame
+        # (D25). The audit itself still runs on the raw node list, so
+        # skipped_nodes reporting is unchanged.
+        # A13: bayat denetim yalnızca düğüm sayısı aynı diye kullanılmaz —
+        # aynı uzunlukta ama farklı geometrideki rota eski kesişim/zigzag
+        # değerlerini gösterirdi. Koordinat parmak izi tutmazsa yeniden denetle.
+        coords_raw, _valid, _skipped = self._valid_coords(nodes)
         audit = self._last_audit_report
-        if audit is None or audit.get("node_count") != len(nodes):
+        if (
+            audit is None
+            or audit.get("node_count") != len(coords_raw)
+            or self._last_audit_coords is None
+            or self._last_audit_coords != [tuple(c) for c in coords_raw]
+        ):
             audit = self.run_8x_route_audit(nodes, execute_time_scaled_sleep=False)
-
-        coords_raw: List[Tuple[float, float]] = [self._extract_xy(n, idx) for idx, n in enumerate(nodes)]
+        nodes = _valid
         if coords_raw:
             xs = [p[0] for p in coords_raw]
             ys = [p[1] for p in coords_raw]
@@ -337,13 +425,12 @@ class DryRunReplaySimulator:
 
             mapped = [to_canvas(pt) for pt in coords_raw]
 
-            # Draw route edges
+            # Draw route edges (open route: no wrap-around edge)
             n_pts = len(mapped)
-            for i in range(n_pts):
-                if n_pts >= 2:
-                    p1 = mapped[i]
-                    p2 = mapped[(i + 1) % n_pts]
-                    cv2.arrowedLine(canvas, p1, p2, (200, 170, 60), 2, cv2.LINE_AA, tipLength=0.04)
+            for i in range(n_pts - 1):
+                p1 = mapped[i]
+                p2 = mapped[i + 1]
+                cv2.arrowedLine(canvas, p1, p2, (200, 170, 60), 2, cv2.LINE_AA, tipLength=0.04)
 
             # Highlight self-intersections in bright magenta/red
             for inter in audit.get("self_intersections", []):
@@ -388,7 +475,7 @@ class DryRunReplaySimulator:
         cv2.rectangle(canvas, (0, 0), (w, 54), (16, 18, 22), -1)
         hud_text = (
             f"DRY-RUN {self.speed_multiplier:.1f}x | Nodes: {audit['node_count']} | "
-            f"Real: {audit['estimated_real_total_sec']:.1f}s -> 8x: {audit['simulated_8x_duration_sec']:.1f}s | "
+            f"Real: {audit['estimated_real_total_sec']:.1f}s -> {self.speed_multiplier:g}x: {audit['simulated_8x_duration_sec']:.1f}s | "
             f"Crossings: {audit['self_intersection_count']} | Zigzags: {audit['zigzag_count']}"
         )
         cv2.putText(
@@ -403,21 +490,29 @@ class DryRunReplaySimulator:
         )
         return canvas
 
-    def get_simulator_health_summary(self) -> dict:
-        """Safely returns simulator health summary dictionary."""
+    def _probe_ready(self) -> bool:
+        """Cheap self-probe: an empty audit must run and touch no input."""
         try:
-            return {"simulator_ready": True}
+            report = self.run_8x_route_audit([], execute_time_scaled_sleep=False)
+            return bool(report) and report.get("keyboard_mouse_touched") is False
         except Exception:
-            return {"simulator_ready": False}
+            return False
+
+    def get_simulator_health_summary(self) -> dict:
+        """Health from a real probe — never an unconditional True."""
+        ready = self._probe_ready()
+        return {"simulator_ready": ready, "speed_multiplier": self.speed_multiplier}
 
     def get_dry_run_simulator_ready_flag(self) -> dict:
-        return {"module": "dry_run_simulator", "ready": True}
+        ready = self._probe_ready()
+        return {"module": "dry_run_simulator", "ready": ready}
 
     def get_dry_run_simulator_version_info(self) -> dict:
-        return {"module": "dry_run_simulator", "version": "2.0.0", "ready": True}
+        return {"module": "dry_run_simulator", "version": __version__, "ready": self._probe_ready()}
 
     def get_dry_run_simulator_diagnostic_snapshot(self) -> dict:
-        return {"module": "dry_run_simulator", "status": "ok", "ready": True}
+        ready = self._probe_ready()
+        return {"module": "dry_run_simulator", "status": "ok" if ready else "probe_failed", "ready": ready}
 
     def get_dry_run_simulator_capabilities(self) -> list:
         return ["dry_run_simulator", "diagnostic_snapshot", "version_info"]

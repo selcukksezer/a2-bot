@@ -27,17 +27,45 @@ from core.mana_phase_combat import ManaPhaseCombat
 from core.state_machine import BotMode, BotState, BotWorker
 
 
+@pytest.fixture(autouse=True)
+def _isolated_lifetime_stats(tmp_path):
+    """DEV-D088: the sustained-target-loss path records a monster kill via
+    get_lifetime_stats() (module singleton, default
+    config/lifetime_stats.json) — each run incremented the REAL repo file.
+    Redirect the lookup to a tmp-backed store; no test here asserts on
+    lifetime stats."""
+    from core.lifetime_stats import LifetimeStatsStore
+
+    store = LifetimeStatsStore(path=str(tmp_path / "lifetime_stats.json"))
+    with patch("core.lifetime_stats.get_lifetime_stats", return_value=store):
+        yield
+
+
 class _MockDriver:
     def __init__(self, trusted: bool = True):
         self.trusted = trusted
         self.pressed: list[str] = []
         self.mouse_events: list[str] = []
+        self.held_keys: set[str] = set()
+        self.key_events: list[tuple[str, str]] = []
 
     def keyboard_inject_trusted(self) -> bool:
         return self.trusted
 
     def press_key(self, key: str, **kwargs) -> bool:
         self.pressed.append(str(key).lower())
+        return True
+
+    def key_down(self, key: str, **kwargs) -> bool:
+        name = str(key).lower()
+        self.held_keys.add(name)
+        self.key_events.append(("down", name))
+        return True
+
+    def key_up(self, key: str, **kwargs) -> bool:
+        name = str(key).lower()
+        self.held_keys.discard(name)
+        self.key_events.append(("up", name))
         return True
 
     def send_key(self, key: str, **kwargs) -> bool:
@@ -93,10 +121,9 @@ def _create_combat_worker(driver: _MockDriver) -> BotWorker:
     worker._set_state_internal = MagicMock()
     worker._handle_combat_and_death = MagicMock(return_value=False)
     worker._check_and_trigger_auto_potions = MagicMock()
-    worker._spam_combat_mouse = MagicMock()
-    worker._sync_combat_left_button = MagicMock()
-    worker._sync_combat_right_button = MagicMock()
-    worker._release_combat_left_button = MagicMock()
+    # NOTE (F-2048): _spam_combat_mouse / _sync_combat_*_button are deliberately
+    # NOT mocked here — they are the production attack path and must be proven
+    # to use T/R keys with zero mouse events (see the assertions below).
     worker._zk_post_combat_tick = MagicMock()
     worker._maybe_run_skill_discovery = MagicMock()
     worker._log_combat_skill_knobs_once = MagicMock()
@@ -146,6 +173,10 @@ def test_transient_target_flicker_sustains_combat_without_tab_or_soft_aim():
     # Skills should fire uninterrupted!
     assert len(skills_fired) == 4
     assert skills_fired == ["1", "2", "3", "4"]
+    # F-2048: the attack itself must go through the T key (right-click attack
+    # = T), never through the mouse — no mouse down/up or camera nudge at all.
+    assert "t" in driver.pressed
+    assert driver.mouse_events == []
 
     # Tick 2: 150ms after lock was active (particles still exploding)
     skills_fired.clear()
@@ -167,6 +198,8 @@ def test_transient_target_flicker_sustains_combat_without_tab_or_soft_aim():
     assert worker._combat_was_targeting is True
     assert worker._combat_no_target_streak == 3
     assert skills_fired == ["1", "2", "3", "4"]
+    # F-2048: still zero mouse activity after three full combat ticks.
+    assert driver.mouse_events == []
 
 
 def test_sustained_target_loss_triggers_clean_death_loot_and_tab():
@@ -196,3 +229,43 @@ def test_sustained_target_loss_triggers_clean_death_loot_and_tab():
     worker._press_combat_tab.assert_called_with(soft_aim=False)
     assert worker._combat_was_targeting is False
     assert worker._combat_no_target_streak == 0
+    # F-2048: the death/loot transition also issues no mouse input.
+    assert driver.mouse_events == []
+
+
+def test_combat_attack_uses_T_R_keys_not_mouse():
+    """Direct proof of the R/T rule (F-2048): the production attack path
+    presses T for the right-click attack and R for the left-click attack,
+    holds/releases them via key_down/key_up, and never touches the mouse."""
+    driver = _MockDriver(trusted=True)
+    worker = _create_combat_worker(driver)
+
+    # Right-click attack = T key pulse, no mouse event.
+    worker._last_combat_mouse_spam_ts = 0.0
+    worker._spam_combat_mouse("right")
+    assert "t" in driver.pressed
+    assert driver.mouse_events == []
+
+    # Left-click attack = R key pulse, no mouse event.
+    worker._last_combat_mouse_spam_ts = 0.0
+    worker._spam_combat_mouse("left")
+    assert "r" in driver.pressed
+    assert driver.mouse_events == []
+
+    # T hold/release for a selected target (right button sync).
+    worker._sync_combat_right_button(True)
+    assert "t" in driver.held_keys
+    assert ("down", "t") in driver.key_events
+    assert driver.mouse_events == []
+    worker._release_combat_right_button()
+    assert "t" not in driver.held_keys
+    assert ("up", "t") in driver.key_events
+    assert driver.mouse_events == []
+
+    # R hold/release for the mana-regen phase (left button sync).
+    worker._sync_combat_left_button(True)
+    assert "r" in driver.held_keys
+    assert driver.mouse_events == []
+    worker._release_combat_left_button()
+    assert "r" not in driver.held_keys
+    assert driver.mouse_events == []

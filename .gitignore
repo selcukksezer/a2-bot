@@ -31,6 +31,7 @@ _tmp_mapcheck/
 
 # Secrets, Tokens & Encrypted Local Vault
 config/.vault_salt
+config/.vault_secret
 config/gatherion_256bit_token.txt
 config/mobile_token.txt
 config/mobile_relay.json

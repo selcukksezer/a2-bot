@@ -21,6 +21,7 @@ import statistics
 import sys
 import threading
 import time
+import warnings
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
@@ -28,6 +29,7 @@ import mss
 import numpy as np
 
 from core.capture import SHARED_BUFFER_HEIGHT, SHARED_BUFFER_WIDTH, ZeroCopyFrameRingBuffer
+from version import __version__
 
 try:
     import dxcam  # type: ignore
@@ -38,6 +40,44 @@ except Exception:
     _HAS_DXCAM = False
 
 logger = logging.getLogger(__name__)
+
+# D03: normalize_illumination her çağrıda cv2.createCLAHE yapıyordu (çağrı
+# başına ~2 ms + tekrarlı native nesne kurulumu). CLAHE parametreleri sabittir,
+# tek paylaşılan örnek yeter; apply çağrıları kilit altında serileştirilir.
+_CLAHE_LOCK: threading.RLock = threading.RLock()
+_CLAHE: Optional[Any] = None
+
+
+def _get_clahe() -> Any:
+    """Returns the shared CLAHE instance (clipLimit=2.2, tile 8x8)."""
+    global _CLAHE
+    if _CLAHE is None:
+        with _CLAHE_LOCK:
+            if _CLAHE is None:
+                _CLAHE = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    return _CLAHE
+
+
+# D03: varyans kontrolleri için örnekleme üst sınırı. match_template_tolerant
+# kareyi float64'e çevirip tam std alıyordu (1080p BGR'de ~625 ms ve ~50 MB
+# geçici dizi); uint8 örnek std aynı "sabit mi?" kararını ~5 ms'de verir.
+# Şablonlar genelde küçük kalır (stride 1, tam std, davranış değişmez).
+_MAX_STD_SAMPLE_ELEMENTS: int = 262144
+
+
+def _sampled_std(arr: np.ndarray) -> float:
+    """Standard deviation over a systematic spatial sample of `arr`.
+
+    Exact (stride 1) below the sample cap; above it, a strided view with at
+    most `_MAX_STD_SAMPLE_ELEMENTS` elements. A constant array still yields
+    exactly 0.0 at any stride, so the zero-variance guard keeps its verdict.
+    """
+    if arr is None or arr.size == 0:
+        return 0.0
+    if arr.size <= _MAX_STD_SAMPLE_ELEMENTS:
+        return float(np.std(arr))
+    stride = max(1, int(math.ceil(math.sqrt(arr.size / _MAX_STD_SAMPLE_ELEMENTS))))
+    return float(np.std(arr[::stride, ::stride]))
 
 # Windows Extended Window Style Constants
 GWL_EXSTYLE: int = -20
@@ -97,10 +137,18 @@ class DXGIDesktopCapture:
 
         self._lock: threading.RLock = threading.RLock()
         self._thread_local: threading.local = threading.local()
+        # F-1842: close() tüm thread'lerin mss örneklerini kapatabilsin.
+        self._sct_instances: set = set()
         self._dxcam_camera: Optional[Any] = None
         self._backend_name: str = "mss"
         self._last_frame: Optional[np.ndarray] = None
         self._last_capture_ts: float = 0.0
+        # F-1837: yakalama arızası siyah kare olarak gizlenmesin.
+        self._last_capture_ok: bool = False
+        self._last_capture_error: str = ""
+        self._capture_error_count: int = 0
+        # F-1848: son grab bölge grab'i ise halka bayat tam kare tutar.
+        self._last_grab_was_region: bool = False
         self.monitor_geometry: Dict[str, int] = {
             "left": 0,
             "top": 0,
@@ -111,7 +159,7 @@ class DXGIDesktopCapture:
             width=SHARED_BUFFER_WIDTH,
             height=SHARED_BUFFER_HEIGHT,
             channels=3,
-            ring_size=3,
+            ring_size=8,
         )
 
         # Optional lazy-loaded DPI / Focus helpers
@@ -126,13 +174,15 @@ class DXGIDesktopCapture:
         `WindowFocusLossSuspender` (or `ForegroundFocusGuard`) from `core.dpi_focus_guard`
         (wrapped in try/except) and returns monitor scale and focus status dict.
         """
+        # F-1853: yardımcılar yüklenemezse varsayılan "odaklı / 1.0x" raporu
+        # verilmez; bilinmeyen durum bilinmeyen olarak raporlanır.
         result: Dict[str, Any] = {
-            "scale_factor": 1.0,
-            "scale_percent": 100,
-            "dpi": 96,
-            "awareness_level": "uninitialized",
-            "is_focused": True,
-            "focus_info": "FocusGuard uninitialized or inactive",
+            "scale_factor": None,
+            "scale_percent": None,
+            "dpi": None,
+            "awareness_level": "unknown",
+            "is_focused": None,
+            "focus_info": "unknown — FocusGuard unavailable",
             "latency_ms": 0.0,
         }
 
@@ -202,8 +252,14 @@ class DXGIDesktopCapture:
     def _initialize_backend(self) -> None:
         """Initializes DXGI Desktop Duplication if available, else thread-safe MSS."""
         with self._lock:
+            # S-0203: mss örneği açılamazsa bunu ayırt et — geometri sorgusu
+            # hatası mss'in kendisinin kurulamadığı anlamına gelmez, yalnızca
+            # mss.mss() çağrısının patlaması backend'i kullanılamaz yapar.
+            mss_available = False
+            mss_error = ""
             try:
                 sct = self._get_mss()
+                mss_available = True
                 monitors = getattr(sct, "monitors", None) or []
                 if len(monitors) > self.monitor_idx:
                     mon = dict(monitors[self.monitor_idx])
@@ -221,6 +277,8 @@ class DXGIDesktopCapture:
                     "height": max(1, int(mon.get("height", 1080))),
                 }
             except Exception as exc:
+                if not mss_available:
+                    mss_error = str(exc)
                 logger.warning("Failed to query initial monitor geometry via mss: %s", exc)
 
             if self.prefer_dxcam and _HAS_DXCAM and dxcam is not None:
@@ -241,6 +299,19 @@ class DXGIDesktopCapture:
                         exc,
                     )
 
+            # S-0203: ne dxcam ne mss kurulabildiyse backend "mss" diye
+            # raporlanmaz — hiç kurulmamışken hazır görünürdü. "unavailable"
+            # _compute_ready'de False üretir; grab_desktop zaten bu durumda
+            # arızayı yükseltir (son geçerli kare yoksa RuntimeError).
+            if not mss_available:
+                self._dxcam_camera = None
+                self._backend_name = "unavailable"
+                logger.error(
+                    "DXGIDesktopCapture backend unavailable: mss could not be "
+                    "created (%s) and dxcam is not available.",
+                    mss_error or "unknown error",
+                )
+                return
             self._dxcam_camera = None
             self._backend_name = "mss"
             logger.info(
@@ -251,6 +322,18 @@ class DXGIDesktopCapture:
     def _get_mss(self) -> Any:
         """Returns the current thread's isolated `mss.mss()` instance."""
         sct = getattr(self._thread_local, "sct", None)
+        if sct is not None:
+            # P2-4 (K-17): close() başka thread'in thread-local'ini
+            # temizleyemez (threading.local yalnızca sahibi thread'den
+            # yazılır) — ama close() örneği _sct_instances'tan çıkarır.
+            # Kayıtta olmayan örnek kapalıdır/atılmıştır: bayat örneği
+            # düşürüp taze örnek açılır; yoksa close() sonrası ilk grab
+            # her thread'de kapalı handle'a çarpıp RuntimeError verirdi.
+            with self._lock:
+                if sct in self._sct_instances:
+                    return sct
+            self._thread_local.sct = None
+            sct = None
         if sct is None:
             try:
                 import warnings
@@ -258,14 +341,33 @@ class DXGIDesktopCapture:
                     warnings.simplefilter("ignore", DeprecationWarning)
                     sct = mss.mss()
                 self._thread_local.sct = sct
+                with self._lock:
+                    self._sct_instances.add(sct)
+                    # close() bırakma (release) anlamındadır: kapalı
+                    # backend, taze örnekle yeniden canlanır.
+                    if self._backend_name == "closed":
+                        self._backend_name = "mss"
             except Exception as exc:
                 logger.error("Unable to create thread-local MSS instance: %s", exc)
                 raise
         return sct
 
     @property
+    def last_capture_ok(self) -> bool:
+        """Son yakalama denemesi gerçek bir kare üretti mi (F-1837)."""
+        return self._last_capture_ok
+
+    @property
+    def last_frame_age_s(self) -> Optional[float]:
+        """Son başarılı yakalamadan beri geçen süre (saniye); hiç kare
+        yoksa None. Bayat kareyi çağıran ayırt edebilsin diye (A17)."""
+        if self._last_capture_ts <= 0.0:
+            return None
+        return max(0.0, time.perf_counter() - self._last_capture_ts)
+
+    @property
     def backend_name(self) -> str:
-        """Returns the active desktop capture backend identifier (`'dxcam'` or `'mss'`)."""
+        """Returns the active desktop capture backend identifier (`'dxcam'`, `'mss'`, `'unavailable'` or `'closed'`)."""
         return self._backend_name
 
     def grab_desktop(
@@ -306,17 +408,37 @@ class DXGIDesktopCapture:
                 bgra = np.asarray(raw, dtype=np.uint8)
                 frame = np.ascontiguousarray(bgra[:, :, :3], dtype=np.uint8)
             except Exception as exc:
-                logger.error("Desktop buffer capture failed: %s", exc)
-                h = max(1, bbox.get("height", 100))
-                w = max(1, bbox.get("width", 100))
-                frame = np.zeros((h, w, 3), dtype=np.uint8)
+                # F-1837: yakalama tamamen başarısız olunca siyah kare gerçek
+                # kareymiş gibi dönülüp ring buffer'a yazılmaz. Son geçerli
+                # kare varsa o döner; yoksa arıza yükseltilir.
+                self._last_capture_ok = False
+                self._last_capture_error = str(exc)
+                self._capture_error_count += 1
+                logger.error(
+                    "Desktop buffer capture failed (#%d): %s",
+                    self._capture_error_count,
+                    exc,
+                )
+                if self._last_frame is not None:
+                    logger.warning(
+                        "grab_desktop: geçerli kare alınamadı; son geçerli "
+                        "kare döndürülüyor (ring buffer'a yazılmadı)."
+                    )
+                    return self._last_frame
+                raise RuntimeError(f"Desktop capture failed: {exc}") from exc
 
+        self._last_capture_ok = True
+        self._last_capture_error = ""
         with self._lock:
             if region is None:
                 shared_view = self.ring_buffer.write_frame(frame)
                 self._last_frame = shared_view
+                self._last_grab_was_region = False
             else:
+                # F-1848: bölge grab'i tam kare halkasını güncellemez; bu
+                # bayrak grab_roi_view'un bayat kareden okumasını engeller.
                 self._last_frame = frame
+                self._last_grab_was_region = True
             self._last_capture_ts = time.perf_counter()
 
         return self._last_frame if self._last_frame is not None else frame
@@ -355,7 +477,9 @@ class DXGIDesktopCapture:
         shared ring buffer (`ZeroCopyFrameRingBuffer`). Supports both pixel coordinates
         and normalized `[0.0 .. 1.0]` coordinates.
         """
-        if refresh or self.ring_buffer.frame_sequence == 0:
+        # F-1848: son grab bölge grab'i ise halka bayat tam kare tutar;
+        # ROI okumadan önce tam kare tazelenir.
+        if refresh or self.ring_buffer.frame_sequence == 0 or self._last_grab_was_region:
             self.grab_desktop(region=None)
         return self.ring_buffer.grab_roi_view(x1, y1, x2, y2)
 
@@ -363,32 +487,54 @@ class DXGIDesktopCapture:
         self,
         region: Optional[Union[Dict[str, int], Tuple[int, int, int, int]]],
     ) -> Dict[str, int]:
-        """Normalizes a region specification into an MSS-compatible bounding dictionary."""
+        """Normalizes a region specification into an MSS-compatible bounding dictionary.
+
+        Tuple anlamı — TEK tanım (P3-7, v18): tuple HER ZAMAN
+        ``(left, top, right, bottom)`` — mutlak ekran koordinatlarında
+        sol/üst ve sağ/alt köşe; ``(x, y, w, h)`` olarak okunmaz.
+        Eskiden heuristik vardı: üçüncü/dördüncü değer ilk ikisinden
+        büyükse sağ/alt, değilse genişlik/yükseklik sayılırdı — örn.
+        ``(100, 100, 200, 150)`` girdisi (x, y, w, h) ise 200x150'lik
+        bölge demekken sessizce 100x50'lik bölgeye dönüşüyordu.
+        grab_desktop'un docstring'i zaten (left, top, right, bottom)
+        diyordu; kod şimdi docstring ile aynı tanımı kullanıyor.
+        Bozuk tuple (right <= left veya bottom <= top) tüm monitöre düşer
+        (diğer biçimsiz girdilerle aynı kural).
+        """
         if region is None:
             return dict(self.monitor_geometry)
 
-        if isinstance(region, dict):
-            left = int(region.get("left", self.monitor_geometry["left"]))
-            top = int(region.get("top", self.monitor_geometry["top"]))
-            width = max(1, int(region.get("width", self.monitor_geometry["width"])))
-            height = max(1, int(region.get("height", self.monitor_geometry["height"])))
+        geo = self.monitor_geometry
+        gx, gy = int(geo.get("left", 0)), int(geo.get("top", 0))
+        gw, gh = int(geo.get("width", 1920)), int(geo.get("height", 1080))
+
+        def _clamp(left: int, top: int, width: int, height: int) -> Dict[str, int]:
+            # F-1847: dict dalı hiç clamp yapmıyordu; bölge monitör
+            # sınırları içine çekilir.
+            left = max(gx, min(left, gx + gw - 1))
+            top = max(gy, min(top, gy + gh - 1))
+            width = max(1, min(width, gx + gw - left))
+            height = max(1, min(height, gy + gh - top))
             return {"left": left, "top": top, "width": width, "height": height}
 
+        if isinstance(region, dict):
+            left = int(region.get("left", region.get("x", gx)))
+            top = int(region.get("top", region.get("y", gy)))
+            width = max(1, int(region.get("width", region.get("w", gw))))
+            height = max(1, int(region.get("height", region.get("h", gh))))
+            return _clamp(left, top, width, height)
+
         if isinstance(region, (tuple, list)) and len(region) == 4:
-            x0, y0, x1_or_w, y1_or_h = (int(v) for v in region)
-            if x1_or_w > x0 and y1_or_h > y0:
-                return {
-                    "left": x0,
-                    "top": y0,
-                    "width": max(1, x1_or_w - x0),
-                    "height": max(1, y1_or_h - y0),
-                }
-            return {
-                "left": x0,
-                "top": y0,
-                "width": max(1, x1_or_w),
-                "height": max(1, y1_or_h),
-            }
+            left, top, right, bottom = (int(v) for v in region)
+            # Tek tanım: (left, top, right, bottom). Ters/bozuk kutu
+            # (right <= left veya bottom <= top) tüm monitöre düşer.
+            if right <= left or bottom <= top:
+                logger.debug(
+                    "Degenerate region tuple %r; falling back to full monitor geometry",
+                    region,
+                )
+                return dict(self.monitor_geometry)
+            return _clamp(left, top, max(1, right - left), max(1, bottom - top))
 
         return dict(self.monitor_geometry)
 
@@ -396,24 +542,29 @@ class DXGIDesktopCapture:
     def normalize_illumination(image: np.ndarray) -> np.ndarray:
         """
         Normalizes lighting, gamma, and semi-transparent UI opacity variations
-        using CLAHE on the luminance channel (or grayscale directly) so template
+        using CLAHE on the grayscale luminance channel so template
         matching remains resilient to day/night cycles and UI alpha blending.
+        (The 3D input path used to round-trip through LAB; the output was
+        grayscale either way, so CLAHE now runs directly on gray.)
         """
         try:
             if image is None or image.size == 0:
                 return np.zeros((1, 1), dtype=np.uint8)
 
             if image.ndim == 3 and image.shape[2] >= 3:
-                lab = cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2LAB)
-                l_channel, a_channel, b_channel = cv2.split(lab)
-                clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-                l_norm = clahe.apply(l_channel)
-                merged = cv2.merge((l_norm, a_channel, b_channel))
-                bgr_norm = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-                gray = cv2.cvtColor(bgr_norm, cv2.COLOR_BGR2GRAY)
+                # D03: eski yol BGR->LAB->split->CLAHE(L)->merge->LAB->BGR->
+                # GRAY yapıyordu (~450 ms @1080p) ama sonuç yine gri tondu;
+                # a/b kanalları CLAHE sonrası atılıyordu. Çıktı zaten gri
+                # olduğundan CLAHE doğrudan gri ton üzerinde uygulanır
+                # (~115 ms @1080p); 2D dalı zaten hep böyle çalışıyordu.
+                gray_in = cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2GRAY)
+                clahe = _get_clahe()
+                with _CLAHE_LOCK:
+                    gray = clahe.apply(gray_in)
             elif image.ndim == 2:
-                clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-                gray = clahe.apply(image)
+                clahe = _get_clahe()
+                with _CLAHE_LOCK:
+                    gray = clahe.apply(image)
             else:
                 gray = np.asarray(image, dtype=np.uint8)
 
@@ -445,11 +596,15 @@ class DXGIDesktopCapture:
             if frame_gray is None or frame_gray.size == 0:
                 return float(np.clip(target_base, self.min_threshold, self.max_threshold))
 
-            std_dev = float(np.std(frame_gray))
+            # D03: tam kare std yerine örneklenmiş std (1080p gri: ~15 ms -> ~4 ms).
+            std_dev = _sampled_std(frame_gray)
             # Typical UI grayscale std_dev spans ~20 (low contrast/translucent) to ~75 (sharp contrast)
             contrast_factor = float(np.clip((std_dev - 20.0) / 55.0, 0.0, 1.0))
             dynamic_thr = self.min_threshold + contrast_factor * (self.max_threshold - self.min_threshold)
-            blended = 0.5 * dynamic_thr + 0.5 * target_base
+            # F-1849: eşik neredeyse hiç dinamik değildi (0.5 dinamik +
+            # 0.5 çağıran eşiği). Dinamik bileşen baskındır; çağıran eşiği
+            # yalnızca hafifçe çeker.
+            blended = 0.75 * dynamic_thr + 0.25 * target_base
             return float(np.clip(blended, self.min_threshold, self.max_threshold))
         except Exception as exc:
             logger.debug("compute_dynamic_threshold error: %s", exc)
@@ -473,7 +628,19 @@ class DXGIDesktopCapture:
         """
         try:
             if frame is None or template is None or frame.size == 0 or template.size == 0:
-                return False, 0.0, (0, 0), self.min_threshold
+                return False, 0.0, (-1, -1), self.min_threshold
+
+            # F-1840: siyah/boş (varyanssız) kare boş şablonla %100 eşleşirdi.
+            # Varyanssız kare veya şablon eşleşme sayılmaz.
+            # D03 + A-üst: önce örneklenmiş uint8 std ile hızlı yoklama
+            # (1080p'de ~625 ms -> ~5 ms); örnek 0.0 verirse tam std ile
+            # doğrulanır — seyrek varyanslı kare örneklemede 0.0 görünebilir.
+            # Tam std uint8 üzerinde hesaplanır: float64 kopyasıyla bit-bit
+            # aynı sonuç verir (sıfır karede 0.0), kesin kararı o verir.
+            if _sampled_std(np.asarray(frame)) == 0.0 and float(np.std(frame)) == 0.0:
+                return False, 0.0, (-1, -1), self.min_threshold
+            if _sampled_std(np.asarray(template)) == 0.0 and float(np.std(template)) == 0.0:
+                return False, 0.0, (-1, -1), self.min_threshold
 
             if normalize_lighting:
                 proc_frame = self.normalize_illumination(frame)
@@ -493,7 +660,7 @@ class DXGIDesktopCapture:
             fh, fw = proc_frame.shape[:2]
             th, tw = proc_tmpl.shape[:2]
             if th > fh or tw > fw or th < 2 or tw < 2:
-                return False, 0.0, (0, 0), self.min_threshold
+                return False, 0.0, (-1, -1), self.min_threshold
 
             effective_threshold = self.compute_dynamic_threshold(proc_frame, base_threshold=threshold)
             res = cv2.matchTemplate(proc_frame, proc_tmpl, cv2.TM_CCOEFF_NORMED)
@@ -503,13 +670,24 @@ class DXGIDesktopCapture:
                 score = 0.0
 
             matched = score >= effective_threshold
-            return matched, score, (int(max_loc[0]), int(max_loc[1])), effective_threshold
+            # F-1850: başarısızlıkta (0, 0) geçerli bir konum gibi dönülmez;
+            # eşleşme yoksa konum (-1, -1) sentinel'idir.
+            loc = (int(max_loc[0]), int(max_loc[1])) if matched else (-1, -1)
+            return matched, score, loc, effective_threshold
         except Exception as exc:
             logger.error("Tolerant template match failed: %s", exc)
-            return False, 0.0, (0, 0), self.min_threshold
+            return False, 0.0, (-1, -1), self.min_threshold
 
     def close(self) -> None:
-        """Releases any held desktop duplication or MSS resources."""
+        """Releases any held desktop duplication or MSS resources.
+
+        P2-4 (K-17): set'ten çıkarılan örnekler `_get_mss()` tarafından
+        artık canlı sayılmaz — diğer thread'lerin thread-local'inde
+        kalan bayat referans, üyelik denetiminde elenip taze örnekle
+        değiştirilir (threading.local başka thread'den temizlenemez).
+        close() bırakma (release) anlamındadır: sonraki grab taze
+        örnekle yeniden açılır ve backend adı "mss"e döner.
+        """
         with self._lock:
             if self._dxcam_camera is not None:
                 try:
@@ -520,23 +698,55 @@ class DXGIDesktopCapture:
                     logger.debug("Error stopping dxcam camera: %s", exc)
                 self._dxcam_camera = None
 
-            sct = getattr(self._thread_local, "sct", None)
-            if sct is not None:
+            # F-1842: yalnızca çağıran thread'in örneği değil, oluşturulmuş
+            # tüm mss örnekleri kapatılır; backend adı da "closed" olur.
+            instances = list(self._sct_instances)
+            self._sct_instances.clear()
+            for sct in instances:
                 try:
                     sct.close()
                 except Exception as exc:
-                    logger.debug("Error closing thread-local MSS: %s", exc)
+                    logger.debug("Error closing MSS instance: %s", exc)
+            try:
                 self._thread_local.sct = None
+            except Exception:
+                pass
+            self._backend_name = "closed"
+
+    def _compute_ready(self) -> Tuple[bool, str]:
+        """Gerçek hazırlık kontrolü: backend + son yakalama durumu."""
+        if self._backend_name == "closed":
+            return False, "capture backend closed"
+        if self._backend_name not in ("mss", "dxcam"):
+            return False, f"capture backend unavailable: {self._backend_name}"
+        # S-0203: hiç kare alınmamışken hazır sayılmaz (kardeş sınıf
+        # ScreenCapture._compute_ready ile aynı kural: "no frame captured yet").
+        # Önceden bu dal yoktu: _last_capture_ts yalnızca başarı yolunda
+        # atandığı için başlangıçta ts=0.0, ok=False iken ready=True dönüyordu.
+        if self._last_capture_ts <= 0.0:
+            return False, "no frame captured yet"
+        if not self._last_capture_ok:
+            return False, f"last capture failed: {self._last_capture_error or 'unknown error'}"
+        return True, "OK"
 
     def get_stealth_capture_health_summary(self) -> dict:
         """Returns stealth capture readiness health summary."""
-        try:
-            return {"stealth_capture_ready": True}
-        except Exception:
-            return {"stealth_capture_ready": False}
+        # F-1839: koşulsuz True yerine gerçek kontrol.
+        ready, reason = self._compute_ready()
+        return {
+            "stealth_capture_ready": ready,
+            "reason": reason,
+            "backend": self._backend_name,
+            "last_capture_ok": self._last_capture_ok,
+            # A17: bayat kare teşhisi — yaş + sıra + hata sayacı.
+            "frame_sequence": self.ring_buffer.frame_sequence,
+            "last_frame_age_s": self.last_frame_age_s,
+            "capture_error_count": self._capture_error_count,
+        }
 
     def get_stealth_capture_ready_flag(self) -> dict:
-        return {"module": "stealth_capture", "ready": True}
+        ready, reason = self._compute_ready()
+        return {"module": "stealth_capture", "ready": ready, "reason": reason}
 
 
 class AdaptiveFramePacer:
@@ -547,8 +757,11 @@ class AdaptiveFramePacer:
     selecting a Gaussian-jittered target FPS based on the current bot activity state:
       - `WALKING`: 8 - 12 FPS (`83.3ms - 125.0ms`)
       - `APPROACHING` / `GATHERING`: 20 - 30 FPS (`33.3ms - 50.0ms`)
-      - `COMBAT`: 15 - 22 FPS (`45.5ms - 66.7ms`)
+      - `COMBAT`: 12 - 18 FPS (`55.6ms - 83.3ms`)
       - `PAUSED` / `BREAK`: 2 - 4 FPS (`250.0ms - 500.0ms`)
+
+    Bilinmeyen durumlar sessizce WALKING sayılmaz; uyarı loglanır ve
+    WALKING aralığı açıkça yedek olarak kullanılır (F-1854).
     """
 
     DEFAULT_STATE_FPS_RANGES: Dict[str, Tuple[float, float]] = {
@@ -588,6 +801,7 @@ class AdaptiveFramePacer:
         self._last_sleep_interval: float = 0.1
         self._last_target_fps: float = 10.0
         self._recent_intervals: List[float] = []
+        self._unknown_states_warned: set = set()
 
     def _resolve_fps_bounds(self, state: str) -> Tuple[float, float]:
         """Maps any state string to its configured `(min_fps, max_fps)` bounds."""
@@ -605,6 +819,15 @@ class AdaptiveFramePacer:
         if any(tok in normalized for tok in ("WALK", "MOVE", "NAV", "PATROL", "ROAM")):
             return self.state_fps_ranges["WALKING"]
 
+        # F-1854: bilinmeyen durum sessizce WALKING olmaz; bir kez uyarı
+        # loglanır, WALKING aralığı açık yedek olarak döner.
+        if normalized not in self._unknown_states_warned:
+            self._unknown_states_warned.add(normalized)
+            logger.warning(
+                "AdaptiveFramePacer: bilinmeyen durum '%s'; WALKING aralığı "
+                "yedek olarak kullanılıyor.",
+                normalized,
+            )
         return self.state_fps_ranges["WALKING"]
 
     def get_next_sleep_interval(self, state: str = "WALKING") -> float:
@@ -630,10 +853,23 @@ class AdaptiveFramePacer:
                 min_interval = 1.0 / max_fps
                 max_interval = 1.0 / min_fps
                 interval_sec = max(min_interval, min(max_interval, interval_sec))
+                # A17: mikro-pertürbasyon clamp ÖNCESİ uygulanıyordu; sınıra
+                # takılan çekişlerin hepsi özdeş aralığa düşüyordu (1000
+                # örnekte ~39 tekrar). Pertürbasyon clamp SONRASI, sınırda
+                # içe dönük uygulanır ki ardışık çağrılar özdeş aralık
+                # üretmesin (simetrik pertürbasyon sınırı aşıp yeniden
+                # clamp'lenerek yine özdeş değer üretirdi).
+                if interval_sec <= min_interval:
+                    interval_sec = min_interval + self._rng.uniform(0.0, 0.001)
+                elif interval_sec >= max_interval:
+                    interval_sec = max_interval - self._rng.uniform(0.0, 0.001)
+                else:
+                    interval_sec += self._rng.uniform(-0.0005, 0.0005)
+                    interval_sec = max(min_interval, min(max_interval, interval_sec))
 
-                # Explicitly guard against accidental 60 FPS (16.666ms) harmonic lock
-                if abs(interval_sec - (1.0 / 60.0)) < 0.0015:
-                    interval_sec += self._rng.uniform(0.004, 0.009)
+                # F-1860: eski 60 FPS koruması ölü koddu — tüm durum
+                # aralıkları en fazla 30 FPS'tir (en kısa aralık ~33 ms),
+                # 16.67 ms harmoniği zaten ulaşılamaz; kaldırıldı.
 
                 self._last_target_fps = 1.0 / interval_sec
                 self._last_sleep_interval = interval_sec
@@ -708,6 +944,11 @@ class StealthOverlayManager:
         self._active_identity: str = SAFE_SYSTEM_IDENTITIES[0]
         self._click_through_enabled: bool = False
 
+    @property
+    def click_through_enabled(self) -> bool:
+        """F-1858: _click_through_enabled artık bu dosyada okunur."""
+        return self._click_through_enabled
+
     def select_safe_identity(self, deterministic_index: Optional[int] = None) -> str:
         """
         Returns a benign system overlay title from `SAFE_SYSTEM_IDENTITIES`, either
@@ -743,27 +984,44 @@ class StealthOverlayManager:
         Win32 window text if a native `HWND` exists.
         """
         chosen_title = self.select_safe_identity(deterministic_index=deterministic_index)
+        # F-1861: widget yokken / setter başarısızken bile "uygulandı"
+        # dönülmezdi; başarı en az bir setter'ın çalışmasına bağlıdır.
+        applied = False
         try:
-            if widget is not None:
-                set_title_fn = getattr(widget, "setWindowTitle", None)
-                if callable(set_title_fn):
-                    set_title_fn(chosen_title)
+            if widget is None:
+                logger.warning(
+                    "apply_stealth_window_identity: widget yok; kimlik uygulanamadı."
+                )
+                return ""
+            set_title_fn = getattr(widget, "setWindowTitle", None)
+            if callable(set_title_fn):
+                set_title_fn(chosen_title)
+                applied = True
 
-                set_obj_name_fn = getattr(widget, "setObjectName", None)
-                if callable(set_obj_name_fn):
-                    safe_obj_name = chosen_title.replace(" ", "") + "Window"
-                    set_obj_name_fn(safe_obj_name)
+            set_obj_name_fn = getattr(widget, "setObjectName", None)
+            if callable(set_obj_name_fn):
+                safe_obj_name = chosen_title.replace(" ", "") + "Window"
+                set_obj_name_fn(safe_obj_name)
+                applied = True
 
-                hwnd = self._extract_hwnd(widget)
-                if hwnd and sys.platform == "win32":
-                    try:
-                        ctypes.windll.user32.SetWindowTextW(ctypes.wintypes.HWND(hwnd), chosen_title)
-                    except Exception as win_exc:
-                        logger.debug("SetWindowTextW skipped or failed for HWND=%s: %s", hwnd, win_exc)
+            hwnd = self._extract_hwnd(widget)
+            if hwnd and sys.platform == "win32":
+                try:
+                    ctypes.windll.user32.SetWindowTextW(ctypes.wintypes.HWND(hwnd), chosen_title)
+                    applied = True
+                except Exception as win_exc:
+                    logger.debug("SetWindowTextW skipped or failed for HWND=%s: %s", hwnd, win_exc)
 
+            if not applied:
+                logger.error(
+                    "Stealth window identity uygulanamadı: widget üzerinde "
+                    "kullanılabilir setter yok."
+                )
+                return ""
             logger.info("Applied stealth window identity: '%s'", chosen_title)
         except Exception as exc:
             logger.error("Failed to apply stealth window identity: %s", exc)
+            return ""
 
         return chosen_title
 
@@ -833,10 +1091,14 @@ class StealthOverlayManager:
 
             verified_style = int(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))
             if verified_style == 0 and new_style != 0:
-                # Offscreen QPA platform does not maintain Win32 HWND tables; store virtual style on widget
-                if widget is not None and not isinstance(widget, int):
-                    setattr(widget, "_stealth_ex_style", int(new_style))
-                verified_style = int(new_style)
+                # F-1841: doğrulama okuması 0 ise GetWindowLongW başarısız
+                # olmuştur; sanal stil yedeğiyle sahte başarı üretilmez.
+                logger.error(
+                    "set_click_through doğrulaması başarısız: "
+                    "GetWindowLongW 0 döndü (HWND=0x%X).",
+                    hwnd,
+                )
+                return False
 
             is_transparent_set = bool(verified_style & WS_EX_TRANSPARENT)
             is_layered_set = bool(verified_style & WS_EX_LAYERED)
@@ -876,63 +1138,136 @@ class StealthOverlayManager:
             return 0
 
     def get_stealth_capture_ready_flag(self) -> dict:
-        return {"module": "stealth_capture", "ready": True}
+        # S-0202: koşulsuz True yerine yöneticinin gerçek durumu: aktif
+        # kimlik güvenli sistem kimliklerinden biri ve yasak sözcük
+        # içermiyor olmalı. Click-through bir moddur (HUD etkileşimliyken
+        # kapalı olması meşrudur), hazırlık kapısı değildir; yine de
+        # raporlanır. Bu sınıfın yakalama backend'i yoktur; yakalama
+        # hazırlığı DXGIDesktopCapture / StealthCapture _compute_ready
+        # yolundadır.
+        identity_ok = (
+            bool(self._active_identity)
+            and self._active_identity in self.SAFE_TITLES
+            and self.is_title_safe(self._active_identity)
+        )
+        return {
+            "module": "stealth_capture",
+            "ready": identity_ok,
+            "reason": "OK" if identity_ok else f"unsafe overlay identity: {self._active_identity!r}",
+            "click_through_enabled": self._click_through_enabled,
+            "active_identity": self._active_identity,
+        }
 
 
 class StealthCapture(DXGIDesktopCapture):
     """Stealth capture facade inheriting isolated desktop duplication capture."""
 
     def get_stealth_capture_ready_flag(self) -> dict:
-        return {"module": "stealth_capture", "ready": True}
+        ready, reason = self._compute_ready()
+        return {"module": "stealth_capture", "ready": ready, "reason": reason}
 
     def get_stealth_capture_version_info(self) -> dict:
-        return {"module": "stealth_capture", "version": "2.0.0", "ready": True}
+        ready, reason = self._compute_ready()
+        return {"module": "stealth_capture", "version": __version__, "ready": ready, "reason": reason}
 
     def get_stealth_capture_diagnostic_snapshot(self) -> dict:
-        return {"module": "stealth_capture", "status": "ok", "ready": True}
+        ready, reason = self._compute_ready()
+        return {
+            "module": "stealth_capture",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+            "reason": reason,
+            "backend": self._backend_name,
+            "frame_sequence": self.ring_buffer.frame_sequence,
+            "last_frame_age_s": self.last_frame_age_s,
+            "capture_error_count": self._capture_error_count,
+        }
 
 
 def get_stealth_capture_capabilities() -> list:
     return ["stealth_capture", "frame_acquisition", "diagnostic_snapshot"]
 
 
+def _probe_stealth_capture_backend() -> bool:
+    """Gerçek backend probu (S-0202): yetenek listesi + mss monitör sorgusu.
+
+    Liste sabiti hiç boşalmadığı için `bool(liste)` totolojiydi; prob
+    `mss` örneği açıp gerçek monitör listesini okur (dxcam Windows'a
+    özeldir; yedek backend mss'tir). Ekransız / mss açılamayan ortamda
+    False döner — yakalama gerçekten yoktur.
+    """
+    try:
+        if not get_stealth_capture_capabilities():
+            return False
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            with mss.mss() as sct:
+                monitors = getattr(sct, "monitors", None) or []
+                return len(monitors) > 0
+    except Exception:
+        return False
+
+
 def validate_stealth_capture_contract() -> bool:
-    return bool(get_stealth_capture_capabilities())
+    # S-0202 (Karar 3): totoloji değil — gerçek mss backend probuna delege.
+    return _probe_stealth_capture_backend()
 
 
-def get_stealth_capture_baseline_metrics() -> dict:
-    return {"module": "stealth_capture", "contract_valid": validate_stealth_capture_contract(), "capability_count": len(get_stealth_capture_capabilities())}
+def _stealth_capture_contract_ok(_contract_ok: Optional[bool] = None) -> bool:
+    """P2-1: zincir ici tek dogrulama (bkz. telemetry.py'deki aciklama).
+
+    ``validate_stealth_capture_contract()`` her cagrida
+    ``_probe_stealth_capture_backend()``'i kosar; prob zaten
+    ``with mss.mss()`` ile ornegi kapatir (kaynak sizintisi yok),
+    zincir bunu ust duzey okuma basina bir kez yapar. Cagrilar arasi
+    onbellek yoktur.
+    """
+    if _contract_ok is not None:
+        return bool(_contract_ok)
+    return bool(validate_stealth_capture_contract())
 
 
-def get_stealth_capture_readiness_status() -> dict:
-    return {"module": "stealth_capture", "ready": validate_stealth_capture_contract(), "metrics": get_stealth_capture_baseline_metrics()}
+def get_stealth_capture_baseline_metrics(_contract_ok: Optional[bool] = None) -> dict:
+    return {"module": "stealth_capture", "contract_valid": _stealth_capture_contract_ok(_contract_ok), "capability_count": len(get_stealth_capture_capabilities())}
 
 
-def get_stealth_capture_audit_record() -> dict:
-    return {"module": "stealth_capture", "audit_passed": validate_stealth_capture_contract(), "readiness": get_stealth_capture_readiness_status()}
+def get_stealth_capture_readiness_status(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _stealth_capture_contract_ok(_contract_ok)
+    return {"module": "stealth_capture", "ready": ok, "metrics": get_stealth_capture_baseline_metrics(_contract_ok=ok)}
 
 
-def get_stealth_capture_operational_digest() -> dict:
-    return {"module": "stealth_capture", "operational": validate_stealth_capture_contract(), "audit": get_stealth_capture_audit_record()}
+def get_stealth_capture_audit_record(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _stealth_capture_contract_ok(_contract_ok)
+    return {"module": "stealth_capture", "audit_passed": ok, "readiness": get_stealth_capture_readiness_status(_contract_ok=ok)}
 
 
-def get_stealth_capture_telemetry_payload() -> dict:
-    return {"module": "stealth_capture", "telemetry_ready": validate_stealth_capture_contract(), "digest": get_stealth_capture_operational_digest()}
+def get_stealth_capture_operational_digest(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _stealth_capture_contract_ok(_contract_ok)
+    return {"module": "stealth_capture", "operational": ok, "audit": get_stealth_capture_audit_record(_contract_ok=ok)}
 
 
-def get_stealth_capture_integrity_seal() -> dict:
-    return {"module": "stealth_capture", "sealed": validate_stealth_capture_contract(), "telemetry": get_stealth_capture_telemetry_payload()}
+def get_stealth_capture_telemetry_payload(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _stealth_capture_contract_ok(_contract_ok)
+    return {"module": "stealth_capture", "telemetry_ready": ok, "digest": get_stealth_capture_operational_digest(_contract_ok=ok)}
 
 
-def get_stealth_capture_compliance_certificate() -> dict:
-    return {"module": "stealth_capture", "certified": validate_stealth_capture_contract(), "seal": get_stealth_capture_integrity_seal()}
+def get_stealth_capture_integrity_seal(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _stealth_capture_contract_ok(_contract_ok)
+    return {"module": "stealth_capture", "sealed": ok, "telemetry": get_stealth_capture_telemetry_payload(_contract_ok=ok)}
 
 
-def get_stealth_capture_readiness_probe() -> dict:
-    return {"module": "stealth_capture", "ready": validate_stealth_capture_contract(), "certificate": get_stealth_capture_compliance_certificate()}
+def get_stealth_capture_compliance_certificate(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _stealth_capture_contract_ok(_contract_ok)
+    return {"module": "stealth_capture", "certified": ok, "seal": get_stealth_capture_integrity_seal(_contract_ok=ok)}
 
 
-def get_stealth_capture_audit_summary() -> dict:
-    return {"module": "stealth_capture", "audit_passed": validate_stealth_capture_contract(), "probe": get_stealth_capture_readiness_probe()}
+def get_stealth_capture_readiness_probe(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _stealth_capture_contract_ok(_contract_ok)
+    return {"module": "stealth_capture", "ready": ok, "certificate": get_stealth_capture_compliance_certificate(_contract_ok=ok)}
+
+
+def get_stealth_capture_audit_summary(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _stealth_capture_contract_ok(_contract_ok)
+    return {"module": "stealth_capture", "audit_passed": ok, "probe": get_stealth_capture_readiness_probe(_contract_ok=ok)}
 
 

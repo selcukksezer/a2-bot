@@ -6,6 +6,8 @@ from __future__ import annotations
 import ast
 import os
 import sys
+import unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -86,7 +88,8 @@ def test_image_keep_and_refuses_while_aion_runs() -> None:
     engine = RTXTrainerEngine()
     seen = {}
 
-    def _body(self, data_yaml_path, epochs=50, progress_callback=None, imgsz=640, batch=16, force_fallback=False):
+    def _body(self, data_yaml_path, epochs=50, progress_callback=None, imgsz=640, batch=16, force_fallback=False,
+            model="yolo11n.pt", allow_opencv_fallback=True, use_approved_only=False, **kwargs):
         seen["batch"] = batch
         seen["called"] = True
         return {"started": True, "batch": batch}
@@ -141,7 +144,8 @@ def test_disk_dolu_does_not_train() -> None:
     engine = RTXTrainerEngine()
     called = {"body": False}
 
-    def _body(self, data_yaml_path, epochs=50, progress_callback=None, imgsz=640, batch=16, force_fallback=False):
+    def _body(self, data_yaml_path, epochs=50, progress_callback=None, imgsz=640, batch=16, force_fallback=False,
+            model="yolo11n.pt", allow_opencv_fallback=True, use_approved_only=False, **kwargs):
         called["body"] = True
         return {"started": True}
 
@@ -159,16 +163,27 @@ def test_disk_dolu_does_not_train() -> None:
         assert result.get("error") == "disk dolu"
         assert called["body"] is False
         assert _train_slot_busy() is False
-        assert str(engine_mod.rtx_runs_dir_for()) == os.path.join("F:\\a2", "models", "rtx_runs")
-        assert str(result.get("save_dir")) == os.path.join(
-            "F:\\a2", "models", "rtx_runs", "gatherion_rtx_fp16"
-        )
+        # Platform/behavior-driven runs-dir check (F-1334): never hard-code
+        # the Windows "F:\a2" path. The contract is that the runs dir is
+        # <offload_root>/models/rtx_runs when an F: volume exists, and the
+        # repo-local models/rtx_runs when it does not (S085: F: yokken
+        # sabit F:/ yoluna yazım denemesi yok).
+        runs_dir = engine_mod.rtx_runs_dir_for()
+        assert runs_dir.parts[-2:] == ("models", "rtx_runs")
+        root = engine_mod.offload_root()
+        if root is None:
+            assert runs_dir == engine_mod._project_root() / "models" / "rtx_runs"
+        else:
+            assert runs_dir == root / "models" / "rtx_runs"
+        assert Path(str(result.get("save_dir"))) == runs_dir / "gatherion_rtx_fp16"
     finally:
         engine_mod.target_volume_free_bytes = original
         _release_train_slot()
 
 
 def test_sounds_attribute() -> None:
+    import types
+
     source = open(os.path.join(ROOT, "main.py"), encoding="utf-8").read()
     tree = ast.parse(source)
     click_ok = False
@@ -180,12 +195,60 @@ def test_sounds_attribute() -> None:
                 for item in node.body
             )
     assert click_ok and assigned
+    # winsound is Windows-only. main.py keeps the Linux-safe guarded
+    # import (R22), and other test modules may already have installed
+    # their own stub (e.g. d81's no-op stub at collection time), so
+    # setdefault would be a no-op: assign directly and restore after.
+    calls = []
+    winsound_stub = types.ModuleType("winsound")
+    winsound_stub.Beep = lambda freq, duration: calls.append((freq, duration))
+    _previous_winsound = sys.modules.get("winsound")
+    sys.modules["winsound"] = winsound_stub
     from main import GatherionOrchestrator, UiClickSounds
 
     sounds = UiClickSounds()
     assert hasattr(sounds, "play_click")
     assert hasattr(GatherionOrchestrator, "trigger_ai_training_and_open_dialog")
-    sounds.play_click()
+    # F-1553: play_click() must be asserted, not just called — it returns
+    # None and must actually attempt the beep on the success path.
+    assert sounds.play_click() is None
+    assert calls == [(880, 40)]
+    # ... and must swallow a failing sound backend instead of raising.
+    calls.clear()
+    real_beep = winsound_stub.Beep
+    winsound_stub.Beep = lambda freq, duration: (_ for _ in ()).throw(RuntimeError("no audio"))
+    try:
+        assert sounds.play_click() is None
+    finally:
+        winsound_stub.Beep = real_beep
+    assert calls == []
+    # Restore whatever stub (if any) occupied sys.modules before this test,
+    # so later tests see the suite state as if this test never ran.
+    if _previous_winsound is None:
+        sys.modules.pop("winsound", None)
+    else:
+        sys.modules["winsound"] = _previous_winsound
+
+
+def load_tests(loader, tests, pattern):
+    """Expose the plain test functions to unittest discovery (S-4101).
+
+    pytest already collects the module-level test_* functions; unittest
+    discovery only finds TestCase classes, so without this it reports
+    0 tests for this file. load_tests is only consulted by unittest,
+    so pytest collection is unchanged (no double run).
+    Same fix as F-1333 in test_train_click_bootstrap.py.
+    """
+    suite = unittest.TestSuite()
+    for _name in (
+        "test_names_and_missing_process",
+        "test_own_process_restore",
+        "test_image_keep_and_refuses_while_aion_runs",
+        "test_disk_dolu_does_not_train",
+        "test_sounds_attribute",
+    ):
+        suite.addTest(unittest.FunctionTestCase(globals()[_name]))
+    return suite
 
 
 def main() -> None:

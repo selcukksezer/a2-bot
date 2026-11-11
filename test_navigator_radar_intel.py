@@ -67,6 +67,18 @@ class TestHeadingBearingAlignment:
         bearing_nw = module.compute_bearing(origin, (50.0, 50.0))
         assert abs(bearing_nw - 315.0) < 0.01, f"North-West must be 315°, got {bearing_nw}"
 
+    def test_compass_bearing_coincident_points_returns_nan(self):
+        """
+        core.navigator documents that coincident points have no direction:
+        compute_bearing returns NaN instead of inventing a bearing (e.g. North).
+        This is navigator-specific: corridor_navigator / navigation_intel
+        return 0.0 for the same input (see found_bugs), so it is NOT
+        parametrized over the three modules like the other bearing tests.
+        """
+        assert math.isnan(nav.compute_bearing((100.0, 100.0), (100.0, 100.0)))
+        # Within the 1e-6 coincidence epsilon -> still no direction.
+        assert math.isnan(nav.compute_bearing((100.0, 100.0), (100.0000005, 100.0)))
+
     @pytest.mark.parametrize(
         "module",
         [nav, cor_nav, nav_intel],
@@ -204,13 +216,16 @@ class TestRadarIntelArrivalAndStuck:
         """
         detector = nav_intel.WaypointArrivalDetector(waypoint_radius_px=20.0, waypoint_radius_m=3.0)
 
-        # Inside radius (distance = 10px <= 20px)
+        # Inside both radii (distance = 5px <= 20px, 5*0.55 = 2.75m <= 3m).
+        # F-0324 [O1]: AND semantics — pixel radius alone (e.g. 10px = 5.5m)
+        # is no longer arrival.
         res_in = detector.is_arrival_reached(
             player_pos=(100.0, 100.0),
-            waypoint_pos=(108.0, 106.0),  # dist = 10.0px
+            waypoint_pos=(104.0, 103.0),  # dist = 5.0px
         )
         assert res_in["arrived"] is True
         assert res_in["reached_px"] is True
+        assert res_in["reached_m"] is True
 
         # Outside radius (distance = 30px > 20px, and distance_m > 3m)
         res_out = detector.is_arrival_reached(
@@ -222,26 +237,42 @@ class TestRadarIntelArrivalAndStuck:
     def test_waypoint_arrival_meter_radius(self):
         """
         Confirms waypoint arrival is detected when world distance <= 3.0m.
+
+        Pixel and meter inputs must agree physically: the detector converts
+        with meters_per_px=0.55, so a claimed distance_m has to match the
+        pixel geometry (distance_m == hypot(dx, dy) * 0.55). Injecting an
+        unrelated distance_m (e.g. 2.5m for a 70px-apart pair) tests nothing.
         """
         detector = nav_intel.WaypointArrivalDetector(waypoint_radius_px=20.0, waypoint_radius_m=3.0)
 
-        # 2.5m <= 3.0m -> arrived
+        # Player (0, 0) -> waypoint (4, 2): pixel distance is hypot(4, 2)
+        # = 4.472px, i.e. 4.472 * 0.55 = 2.46m <= 3.0m -> arrived.
+        px_in = math.hypot(4.0, 2.0)
+        m_in = round(px_in * detector.meters_per_px, 2)
         res_in = detector.is_arrival_reached(
             player_pos=(0, 0),
-            waypoint_pos=(50, 50),
-            distance_m=2.5,
+            waypoint_pos=(4.0, 2.0),
+            distance_m=m_in,
         )
         assert res_in["arrived"] is True
         assert res_in["reached_m"] is True
+        assert res_in["pixel_distance"] == pytest.approx(px_in, abs=0.01)
+        assert res_in["distance_m"] == pytest.approx(m_in, abs=0.01)
 
-        # 4.2m > 3.0m -> not arrived
+        # Player (0, 0) -> waypoint (50, 50): pixel distance is hypot(50, 50)
+        # = 70.71px (> 20px), i.e. 70.71 * 0.55 = 38.89m (> 3.0m) -> not
+        # arrived. No injected distance is needed: both values derive from
+        # the positions through the detector's own scale.
+        px_out = math.hypot(50.0, 50.0)
         res_out = detector.is_arrival_reached(
             player_pos=(0, 0),
             waypoint_pos=(50, 50),
-            distance_m=4.2,
-            pixel_distance=35.0,
         )
         assert res_out["arrived"] is False
+        assert res_out["reached_px"] is False
+        assert res_out["reached_m"] is False
+        assert res_out["pixel_distance"] == pytest.approx(px_out, abs=0.01)
+        assert res_out["distance_m"] == pytest.approx(px_out * detector.meters_per_px, abs=0.01)
 
     def test_clean_sequential_node_transition(self):
         """
@@ -254,9 +285,9 @@ class TestRadarIntelArrivalAndStuck:
         ]
         detector = nav_intel.WaypointArrivalDetector(waypoint_radius_px=20.0)
 
-        # Player at (105, 105) approaches Node A at (100, 100) -> distance ~7.07px <= 20px
+        # Player at (103, 103) approaches Node A at (100, 100) -> distance ~4.24px <= 20px and ~2.33m <= 3m
         step1 = detector.check_and_transition(
-            player_pos=(105.0, 105.0),
+            player_pos=(103.0, 103.0),
             waypoint_pos=(100.0, 100.0),
             nodes=nodes,
             current_index=0,
@@ -427,11 +458,11 @@ class TestNavigationIntelIntegration:
         assert cycle1["turn_data"]["in_deadband"] is True  # 0° vs 0° -> in deadband (no turn)
         assert cycle1["arrival_info"]["arrived"] is False
 
-        # Player arrives within 15px of Node 1
+        # Player arrives within 3px (1.65m) of Node 1 — inside both radii.
         cycle2 = intel.step_navigation_cycle(
-            player_pos=(100.0, 65.0),
+            player_pos=(100.0, 53.0),
             player_heading=0.0,
-            waypoint_pos=(100.0, 50.0),  # dist = 15px <= 20px
+            waypoint_pos=(100.0, 50.0),  # dist = 3px <= 20px, 1.65m <= 3m
             nodes=nodes,
             current_index=0,
             movement_keys_held=True,

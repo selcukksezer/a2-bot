@@ -4,6 +4,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from core.rl_reward_log import ObstacleMemory, compute_reward, RlRewardLog
 from core.slot_economy import SlotEconomy
@@ -30,6 +31,45 @@ class SlotEconomyTests(unittest.TestCase):
         self.eco.record_drop(kina=100, slot_id="Slot_B_001_001")
         pick = self.eco.pick_slot_ucb()
         self.assertIsNotNone(pick)
+        self.assertEqual(pick.slot_id, "Slot_A_000_000")
+
+    def test_ucb_explore_branch_picks_least_visited(self):
+        """F-1550: the UCB exploration branch runs deterministically.
+
+        Note the constructor clamps explore_ratio into [0.05, 0.5], so the
+        old setUp value 0.0 actually meant 0.05 (a 5% explore chance, never
+        exercised deterministically). Forcing random.random pins each branch:
+        0.0 -> explore (least-visited slot), 0.99 -> exploit (max UCB/KPH).
+        """
+        self.assertEqual(self.eco.explore_ratio, 0.05)
+        eco = SlotEconomy(db_path=self.db, explore_ratio=0.5)
+        eco.enter_slot("Slot_A_000_000", cx=10, cy=20, region="A")
+        eco.enter_slot("Slot_A_000_000", cx=10, cy=20, region="A")
+        eco.record_drop(kina=2000, item_name="Aria", slot_id="Slot_A_000_000")
+        eco.enter_slot("Slot_B_001_001", cx=110, cy=120, region="B")
+        eco.record_drop(kina=100, slot_id="Slot_B_001_001")
+        visits = {s["slot_id"]: s["visits"] for s in eco.list_slots()}
+        # S265 (v19/P3-8) reversed the O8 pin: visits is the UCB pull
+        # count, so only enter_slot increments it — a drop is a reward
+        # observation inside a pull, not a new pull. (The O8 comment
+        # cited D16/F-1936, but F-1936's substantive fix is the KPH-scaled
+        # UCB bonus, which still stands; its visits+1 side effect
+        # inflated n_i for drop-rich slots and let a never-entered slot
+        # look pulled once.)
+        self.assertEqual(visits["Slot_A_000_000"], 2)
+        self.assertEqual(visits["Slot_B_001_001"], 1)
+
+        with mock.patch("random.random", return_value=0.0):
+            pick = eco.pick_slot_ucb()
+        self.assertIsNotNone(pick)
+        self.assertTrue(pick.explore)
+        self.assertEqual(pick.reason, "explore_least_visits")
+        self.assertEqual(pick.slot_id, "Slot_B_001_001")
+
+        with mock.patch("random.random", return_value=0.99):
+            pick = eco.pick_slot_ucb()
+        self.assertIsNotNone(pick)
+        self.assertFalse(pick.explore)
         self.assertEqual(pick.slot_id, "Slot_A_000_000")
 
     def test_obstacle_merge(self):

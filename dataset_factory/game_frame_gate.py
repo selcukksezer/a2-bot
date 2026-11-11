@@ -24,7 +24,7 @@ Multi-stage capture guard for AION 2 data ingestion and dataset sanitization:
 
 3. Kapı 3 (Visual Novelty / dHash Gate):
    - Computes 64-bit gradient perceptual difference hash (dHash).
-   - Maintains an in-memory LRU hash cache with FIFO/LRU eviction.
+   - Maintains an in-memory LRU hash cache with LRU eviction.
    - Rejects frames with Hamming distance `dHash < 6` to eliminate duplicate/spam captures.
 
 Exclusive Owner: Worker 15 (`dataset_factory/game_frame_gate.py`)
@@ -32,13 +32,14 @@ Exclusive Owner: Worker 15 (`dataset_factory/game_frame_gate.py`)
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict
 import ctypes
 from ctypes import wintypes
 import logging
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -110,6 +111,26 @@ BLOCKED_WINDOW_TITLES: Sequence[str] = (
     "görev yöneticisi",
 )
 
+# D52/I4: blocked-title patterns are compiled ONCE at import, not rebuilt
+# (re.escape + re.compile + cache lookup) on every Gate-1 call. Same
+# word-boundary semantics as the old per-call re.search (F-1054).
+_BLOCKED_TITLE_PATTERNS: Tuple[re.Pattern, ...] = tuple(
+    re.compile(r"\b" + re.escape(title) + r"\b") for title in BLOCKED_WINDOW_TITLES
+)
+
+# D52/I4: own PID cached once; the old per-call os.getpid() is the same
+# value for the life of the process.
+_OWN_PID: int = os.getpid()
+
+_MASK64 = (1 << 64) - 1
+
+
+def _popcount_u64(values: np.ndarray) -> np.ndarray:
+    """Vectorized population count of a uint64 array (bit counts per element)."""
+    return np.unpackbits(
+        np.ascontiguousarray(values).view(np.uint8).reshape(-1, 8), axis=1
+    ).sum(axis=1)
+
 
 def _get_process_name_for_pid(pid: int) -> str:
     """Best-effort process executable name lookup for a given PID on Windows."""
@@ -174,7 +195,9 @@ class GameFrameGate:
         self.focus_guard: ForegroundFocusGuard = focus_guard or ForegroundFocusGuard()
         self.is_game_running_fn: Callable[[], bool] = is_game_running_fn or is_game_running
 
-        self._hash_cache: deque[int] = deque(maxlen=self.max_hash_cache)
+        # F-1053: gerçek LRU — erişim sırası tazelenir (OrderedDict);
+        # eskiden deque (FIFO) idi, isabet sırayı tazelemiyordu.
+        self._hash_cache: OrderedDict = OrderedDict()
         self._simulated_game_running: Optional[bool] = None
 
         self.stats: Dict[str, int] = {
@@ -193,18 +216,40 @@ class GameFrameGate:
         self._load_templates()
 
     def _load_templates(self) -> None:
-        """Pre-load grayscale UI templates for fast cross-correlation."""
+        """Pre-load grayscale UI templates for fast cross-correlation.
+
+        F-0863: yol templates_dir.parent ile kuruluyordu; özel
+        templates_dir verilince yanlış dizine bakılırdı. Şablonlar
+        _templates_dir altındadır ("templates/" öneki atılır).
+        F-0953: yükleme hatası artık sessiz değil; bozuk dosya
+        uyarılır, hiç şablon yüklenemediyse dedektörlerin ölü olduğu
+        açıkça loglanır.
+        """
+        failed: List[str] = []
         for key, rel_path in self.DEFAULT_TEMPLATES:
-            full_path = self._templates_dir.parent / rel_path
-            if full_path.is_file():
-                try:
-                    raw = np.fromfile(str(full_path), dtype=np.uint8)
-                    if raw.size > 0:
-                        tpl = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
-                        if tpl is not None and tpl.size > 0:
-                            self._templates[key] = tpl
-                except Exception as exc:
-                    logger.debug("Optional template %s failed to load: %s", key, exc)
+            rel = rel_path[len("templates/"):] if rel_path.startswith("templates/") else rel_path
+            full_path = self._templates_dir / rel
+            if not full_path.is_file():
+                logger.debug("Optional template %s not found: %s", key, full_path)
+                failed.append(key)
+                continue
+            try:
+                raw = np.fromfile(str(full_path), dtype=np.uint8)
+                if raw.size > 0:
+                    tpl = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+                    if tpl is not None and tpl.size > 0:
+                        self._templates[key] = tpl
+                        continue
+                failed.append(key)
+            except Exception as exc:
+                logger.warning("Template %s failed to load (%s): %s", key, full_path, exc)
+                failed.append(key)
+        if failed:
+            logger.debug("GameFrameGate: %d templates unavailable: %s", len(failed), ", ".join(failed))
+        if not self._templates:
+            logger.warning(
+                "GameFrameGate: no templates loaded; prompt/minimap-template detectors are dead"
+            )
 
     def set_simulated_game_state(
         self,
@@ -216,6 +261,13 @@ class GameFrameGate:
         self._simulated_game_running = is_running
         if foreground_title is not None or foreground_pid is not None:
             self.focus_guard.set_simulated_foreground_window(foreground_title, foreground_pid)
+
+    def clear_simulated_game_state(self) -> None:
+        """Resets simulated game state (F-0954): the simulated running
+        flag and the focus guard simulation are cleared, so the
+        simulation cannot leak into the global singleton / production."""
+        self._simulated_game_running = None
+        self.focus_guard.clear_simulated_foreground_window()
 
     def clear_hash_cache(self) -> None:
         """Empties the perceptual LRU dHash cache."""
@@ -239,7 +291,13 @@ class GameFrameGate:
                 return frame[:, :, 0]
             if frame.shape[2] == 4:
                 return cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-            return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if frame.shape[2] == 3:
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # F-0864: 2/5 kanallı kare cv2 hatasıyla çökertirdi; açık
+            # ValueError verilir, çağıran False döner.
+            raise ValueError(
+                f"Unsupported channel count: {frame.shape[2]} (expected 1, 3 or 4)"
+            )
         raise ValueError(f"Unsupported frame shape: {frame.shape}")
 
     @staticmethod
@@ -251,10 +309,10 @@ class GameFrameGate:
         gray = GameFrameGate._to_grayscale(frame)
         resized = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
         diff = resized[:, 1:] > resized[:, :-1]
-        val = 0
-        for bit in diff.flatten():
-            val = (val << 1) | int(bool(bit))
-        return int(val)
+        # A14: bit-packing via np.packbits is bit-identical to the
+        # 64-step Python loop (verified on 300 random frames, 0
+        # mismatches) and ~20x faster on the packing step.
+        return int.from_bytes(np.packbits(diff.flatten()).tobytes(), "big")
 
     @staticmethod
     def hamming_distance(h1: int, h2: int) -> int:
@@ -298,12 +356,14 @@ class GameFrameGate:
             )
 
         # Check Gatherion UI itself
-        if "gatherion" in title_lower or (pid > 0 and pid == os.getpid()):
+        if "gatherion" in title_lower or (pid > 0 and pid == _OWN_PID):
             return False, f"gatherion_ui_focused: Foreground window is Gatherion UI ('{title}', PID={pid})"
 
-        # Check blocked window title markers
-        for blocked_title in BLOCKED_WINDOW_TITLES:
-            if blocked_title in title_lower:
+        # Check blocked window title markers (word-boundary match, F-1054:
+        # alt-dize eşleşmesi "decode" içindeki "code" gibi yanlış
+        # pozitif üretirdi). Patterns are precompiled at module level.
+        for pattern in _BLOCKED_TITLE_PATTERNS:
+            if pattern.search(title_lower):
                 return (
                     False,
                     f"blocked_foreground_window: Active window title matches blocked non-game app: '{title}'",
@@ -340,8 +400,14 @@ class GameFrameGate:
             num, _, stats, _ = cv2.connectedComponentsWithStats(arrow_mask)
             for idx in range(1, num):
                 _, _, bw, bh, area = stats[idx]
-                if 8 <= area <= 800 and 3 <= bw <= 55 and 3 <= bh <= 55:
-                    return True, "minimap_compass_arrow"
+                # F-0955: eşikler çok gevşekti (8 px leke bile ok
+                # sayılırdı). Ok kompakt, üçgene yakın bir parlak
+                # bileşendir: alan/boyut alt sınırı ve doluluk oranı
+                # istenir.
+                if 20 <= area <= 600 and 5 <= bw <= 45 and 5 <= bh <= 45:
+                    fill = float(area) / max(1, int(bw) * int(bh))
+                    if 0.20 <= fill <= 0.95:
+                        return True, "minimap_compass_arrow"
 
         # 2. Minimap circular boundary via circular edge distribution
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -470,8 +536,12 @@ class GameFrameGate:
         if tb_roi.size > 0:
             tb_std = float(np.std(tb_roi))
             tb_mean = float(np.mean(tb_roi))
-            # Standard Windows taskbar: dark solid strip across entire bottom
-            if tb_std < 10.0 and tb_mean < 55.0 and tb_roi.shape[0] >= 24:
+            # Standard Windows taskbar: dark solid strip across entire bottom.
+            # A14: the strip is int(h*0.045) rows, so a fixed ">= 24 rows"
+            # floor disabled this veto below ~534 px height (16 rows at
+            # 360p) and a noise frame with a taskbar passed Gate 2.
+            # 8 rows is enough to tell a solid strip from texture.
+            if tb_std < 10.0 and tb_mean < 55.0 and tb_roi.shape[0] >= 8:
                 return True, f"windows_taskbar_detected (std={tb_std:.1f}, mean={tb_mean:.1f})"
 
         # Check Browser URL bar & tabs: solid light strip at top
@@ -479,7 +549,9 @@ class GameFrameGate:
         if top_roi.size > 0:
             top_std = float(np.std(top_roi))
             top_mean = float(np.mean(top_roi))
-            if top_std < 8.0 and top_mean > 210.0 and top_roi.shape[0] >= 24:
+            # A14: same resolution floor as the taskbar check (21 rows
+            # at 360p < 24 disabled the browser veto at low resolution).
+            if top_std < 8.0 and top_mean > 210.0 and top_roi.shape[0] >= 8:
                 return True, f"browser_tab_bar_detected (std={top_std:.1f}, mean={top_mean:.1f})"
 
         return False, ""
@@ -493,6 +565,10 @@ class GameFrameGate:
             return False, "invalid_frame: Frame is None or empty"
         if frame.ndim not in (2, 3):
             return False, f"invalid_shape: Frame dimension {frame.ndim} is not supported"
+        # F-0864: kanal sayısı denetlenir; 2/5 kanallı kare cv2
+        # hatasıyla çökertirdi.
+        if frame.ndim == 3 and frame.shape[2] not in (1, 3, 4):
+            return False, f"invalid_channels: Frame has {frame.shape[2]} channels (expected 1, 3 or 4)"
 
         h, w = frame.shape[:2]
         if h < 32 or w < 32:
@@ -503,6 +579,8 @@ class GameFrameGate:
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         elif frame.shape[2] == 4:
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        elif frame.shape[2] == 1:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         else:
             frame_bgr = frame
 
@@ -518,10 +596,14 @@ class GameFrameGate:
         if mean_val > 250.0 and std_val < 8.0:
             return False, f"blank_white_canvas: Frame is pure white canvas ({mean_val:.2f} > 250.0)"
 
-        # 2. Check for small training crops (e.g. vid_crop_frame_... or 3D patch)
-        is_small_crop = h < 500 and w < 600
-        if is_small_crop and std_val > 14.0:
-            return True, f"accepted_crop_texture: small crop ({w}x{h}) with natural texture"
+        # 2. Masaüstü/tarayıcı kanıtı HUD kanıtından ÖNCE veto eder
+        # (F-0956): eskiden yalnızca HUD kanıtı yoksa çalışırdı; masaüstü
+        # karesi HUD benzeri bir lekeyle geçebilirdi.
+        # F-0865: küçük crop'lar artık HUD kanıtı olmadan kabul
+        # edilmez; önceki "accepted_crop_texture" erken kabulü kaldırıldı.
+        is_desk, desk_reason = self._detect_desktop_or_browser_canvas(frame_bgr)
+        if is_desk:
+            return False, f"desktop_or_browser_canvas: {desk_reason}"
 
         # 3. Gather evidence from genuine game HUD features
         evidence: List[str] = []
@@ -545,11 +627,6 @@ class GameFrameGate:
         if evidence:
             return True, f"accepted_hud_evidence: {', '.join(evidence)}"
 
-        # 4. If no HUD found, check if it's explicitly a desktop or browser canvas
-        is_desk, desk_reason = self._detect_desktop_or_browser_canvas(frame_bgr)
-        if is_desk:
-            return False, f"desktop_or_browser_canvas: {desk_reason}"
-
         return (
             False,
             "no_hud_evidence: Frame lacks genuine Aion game UI features (minimap, compass arrow, HP frame, skill bar)",
@@ -566,12 +643,37 @@ class GameFrameGate:
         """
         Kapı 3: Computes 64-bit dHash and checks LRU cache.
         Rejects frames with perceptual Hamming distance dHash < 6.
+        Invalid frames return False instead of crashing (F-0866).
         """
-        dhash = self.compute_dhash(frame)
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return False, "invalid_frame: Frame is None or empty"
+        try:
+            dhash = self.compute_dhash(frame)
+        except Exception as exc:
+            return False, f"invalid_frame: dHash could not be computed ({exc})"
 
         if self._hash_cache:
-            min_dist = min(self.hamming_distance(dhash, cached) for cached in self._hash_cache)
+            # D52/I3: vectorized Hamming scan over the whole LRU cache
+            # (one XOR + popcount) instead of a Python-level
+            # hamming_distance() call per cached hash. np.argmin returns
+            # the FIRST minimum, matching the old strictly-less scan, so
+            # the LRU touch below moves the same entry to the end.
+            # Keys are dHash values (< 2**64); both sides are masked to
+            # 64 bits exactly like hamming_distance() does.
+            keys = list(self._hash_cache)
+            cached = np.fromiter(
+                (int(h) & _MASK64 for h in keys),
+                dtype=np.uint64,
+                count=len(keys),
+            )
+            dists = _popcount_u64(cached ^ np.uint64(dhash & _MASK64))
+            idx = int(np.argmin(dists))
+            min_dist = int(dists[idx])
+            closest = keys[idx]
             if min_dist < self.min_dhash_distance:
+                # F-1053: gerçek LRU — isabet eden hash en sona alınır.
+                if closest is not None:
+                    self._hash_cache.move_to_end(closest)
                 return (
                     False,
                     f"duplicate_frame: Perceptual dHash distance {min_dist} < {self.min_dhash_distance} (duplicate/spam)",
@@ -580,7 +682,9 @@ class GameFrameGate:
             min_dist = 64
 
         if update_cache:
-            self._hash_cache.append(dhash)
+            self._hash_cache[dhash] = None
+            while len(self._hash_cache) > self.max_hash_cache:
+                self._hash_cache.popitem(last=False)
 
         return True, f"visual_novelty_ok: dhash={dhash:#018x}, min_hamming={min_dist}"
 
@@ -643,32 +747,52 @@ def is_valid_game_frame(
     frame: np.ndarray,
     require_foreground: bool = True,
     require_novelty: bool = True,
+    gate: Optional[GameFrameGate] = None,
 ) -> Tuple[bool, str]:
     """
     Convenience function routing directly to the default `GameFrameGate.is_valid_game_frame()`.
+
+    F-0957: varsayılan tekil kapının dHash önbelleği tüm çağıranlar
+    arasında paylaşılır; yalıtım isteyen çağıran kendi kapı örneğini
+    `gate` ile verir (örn. OmniGameLearner kendi örneğini kullanır).
     """
-    return _GLOBAL_FRAME_GATE.is_valid_game_frame(
+    use_gate = gate if gate is not None else _GLOBAL_FRAME_GATE
+    return use_gate.is_valid_game_frame(
         frame=frame,
         require_foreground=require_foreground,
         require_novelty=require_novelty,
     )
 
 
-def check_visual_hud(frame: np.ndarray) -> Tuple[bool, str]:
+def check_visual_hud(frame: np.ndarray, gate: Optional[GameFrameGate] = None) -> Tuple[bool, str]:
     """Inspects only Kapı 2 (Visual HUD Evidence)."""
-    return _GLOBAL_FRAME_GATE.check_gate2_visual_hud(frame)
+    use_gate = gate if gate is not None else _GLOBAL_FRAME_GATE
+    return use_gate.check_gate2_visual_hud(frame)
 
 
-def check_process_and_focus() -> Tuple[bool, str]:
+def check_process_and_focus(gate: Optional[GameFrameGate] = None) -> Tuple[bool, str]:
     """Inspects only Kapı 1 (Process & Focus Guard)."""
-    return _GLOBAL_FRAME_GATE.check_gate1_process_and_focus()
+    use_gate = gate if gate is not None else _GLOBAL_FRAME_GATE
+    return use_gate.check_gate1_process_and_focus()
 
 
-def check_visual_novelty(frame: np.ndarray, update_cache: bool = True) -> Tuple[bool, str]:
+def check_visual_novelty(
+    frame: np.ndarray,
+    update_cache: bool = True,
+    gate: Optional[GameFrameGate] = None,
+) -> Tuple[bool, str]:
     """Inspects only Kapı 3 (Perceptual Novelty / dHash)."""
-    return _GLOBAL_FRAME_GATE.check_gate3_visual_novelty(frame, update_cache=update_cache)
+    use_gate = gate if gate is not None else _GLOBAL_FRAME_GATE
+    return use_gate.check_gate3_visual_novelty(frame, update_cache=update_cache)
 
 
-def clear_frame_gate_cache() -> None:
+def clear_frame_gate_cache(gate: Optional[GameFrameGate] = None) -> None:
     """Clears the default GameFrameGate perceptual LRU cache."""
-    _GLOBAL_FRAME_GATE.clear_hash_cache()
+    use_gate = gate if gate is not None else _GLOBAL_FRAME_GATE
+    use_gate.clear_hash_cache()
+
+
+def reset_simulated_game_state(gate: Optional[GameFrameGate] = None) -> None:
+    """Clears simulated game state on the default (or given) gate (F-0954)."""
+    use_gate = gate if gate is not None else _GLOBAL_FRAME_GATE
+    use_gate.clear_simulated_game_state()

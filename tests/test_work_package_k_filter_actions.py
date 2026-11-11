@@ -47,17 +47,72 @@ if _app is None:
 from ui.yolo_factory_dialog import CLASS_ID_TO_SPEC, YOLOFactoryDialog
 
 
-@pytest.fixture
-def factory_dialog(tmp_path: Path) -> YOLOFactoryDialog:
-    """Fixture providing an initialized YOLOFactoryDialog with test configuration."""
+@pytest.fixture(scope="module")
+def _shared_dialog() -> YOLOFactoryDialog:
+    """One YOLOFactoryDialog for the whole module.
+
+    Constructing the dialog costs ~3-7s per test (full Qt UI build), which
+    dominated this file's runtime (setup ~35s of ~52s total). The dialog is
+    stateless between tests once the reset fixture below restores the five
+    inputs _filtered_review_indices() reads (_review_items, search text,
+    class filter, bulk_range threshold, queue filter mode) and rebinds
+    _dataset_dir to the current test's tmp_path. Tests never rely on a
+    freshly constructed dialog: each one (re)assigns _review_items and its
+    filter mode before asserting.
+    """
     dlg = YOLOFactoryDialog()
     dlg._auto_confirm_dialogs = True
+    return dlg
+
+
+@pytest.fixture
+def factory_dialog(_shared_dialog: YOLOFactoryDialog, tmp_path: Path) -> YOLOFactoryDialog:
+    """Per-test dialog: the shared instance, reset to a known state.
+
+    Reset covers every piece of state a test in this file can leave behind:
+    review items, search text, class filter, threshold slider (default 90),
+    queue filter mode, and the tmp_path-backed dataset dir (bulk actions
+    persist/delete real files under it, so it must point at *this* test's
+    tmp_path, not a previous test's).
+    """
+    dlg = _shared_dialog
+    # [YOLO-ASYNC] Paylaşılan dialogun __init__'teki başlangıç yüklemesi
+    # (üretim dizini) bitmeden durum sıfırlanırsa, bitince kuyruğu üretim
+    # taramasıyla ezer — önce bitmesini bekle.
+    assert dlg.wait_for_yolo_load(), "async kuyruk yüklemesi 10 sn'de bitmedi"
     # Redirect dataset dir to tmp_path to prevent touching production files
     dlg._dataset_dir = lambda: tmp_path  # type: ignore[assignment]
     (tmp_path / "review" / "train").mkdir(parents=True, exist_ok=True)
     (tmp_path / "labels" / "train").mkdir(parents=True, exist_ok=True)
     (tmp_path / "images" / "train").mkdir(parents=True, exist_ok=True)
+    dlg._review_items = []
+    dlg.review_search_edit.clear()
+    all_idx = dlg.review_class_filter.findData(-1)
+    if all_idx >= 0:
+        dlg.review_class_filter.setCurrentIndex(all_idx)
+    dlg.bulk_range.setValue(90)
+    dlg.set_queue_filter_mode("all")
     return dlg
+
+
+def _box(confidence: float, class_id: int, bbox: List[float]) -> Dict[str, Any]:
+    """One fixture box in the canonical cx/cy schema (B-04).
+
+    ``bbox`` is [x1, y1, x2, y2] on a 100px canvas (all fixture corners
+    are <= 95); the normalizer only accepts normalized cx/cy/w/h, so a
+    bbox-only box is rejected as "cx eksik" and can never persist.
+    The ``bbox`` key is kept for traceability; persist reads cx/cy/w/h.
+    """
+    x1, y1, x2, y2 = (float(v) for v in bbox)
+    return {
+        "confidence": confidence,
+        "class_id": class_id,
+        "bbox": [x1, y1, x2, y2],
+        "cx": round((x1 + x2) / 200.0, 6),
+        "cy": round((y1 + y2) / 200.0, 6),
+        "w": round((x2 - x1) / 100.0, 6),
+        "h": round((y2 - y1) / 100.0, 6),
+    }
 
 
 def _create_sample_review_items(tmp_path: Path) -> List[Dict[str, Any]]:
@@ -67,7 +122,7 @@ def _create_sample_review_items(tmp_path: Path) -> List[Dict[str, Any]]:
         {
             "stem": "frame_susp_1",
             "split": "train",
-            "weak": [{"confidence": 0.42, "class_id": 0, "bbox": [10, 10, 50, 50]}],
+            "weak": [_box(0.42, 0, [10, 10, 50, 50])],
             "trusted": [],
             "done": None,
             "path": str(tmp_path / "review" / "train" / "frame_susp_1.json"),
@@ -76,7 +131,7 @@ def _create_sample_review_items(tmp_path: Path) -> List[Dict[str, Any]]:
         {
             "stem": "frame_susp_2",
             "split": "train",
-            "weak": [{"confidence": 0.55, "class_id": 3, "bbox": [20, 20, 60, 60]}],
+            "weak": [_box(0.55, 3, [20, 20, 60, 60])],
             "trusted": [],
             "done": None,
             "path": str(tmp_path / "review" / "train" / "frame_susp_2.json"),
@@ -86,7 +141,7 @@ def _create_sample_review_items(tmp_path: Path) -> List[Dict[str, Any]]:
             "stem": "frame_conf_1",
             "split": "train",
             "weak": [],
-            "trusted": [{"confidence": 0.96, "class_id": 3, "bbox": [30, 30, 70, 70]}],
+            "trusted": [_box(0.96, 3, [30, 30, 70, 70])],
             "done": None,
             "path": str(tmp_path / "review" / "train" / "frame_conf_1.json"),
         },
@@ -112,8 +167,8 @@ def _create_sample_review_items(tmp_path: Path) -> List[Dict[str, Any]]:
         {
             "stem": "frame_mixed_1",
             "split": "train",
-            "weak": [{"confidence": 0.35, "class_id": 1, "bbox": [15, 15, 45, 45]}],
-            "trusted": [{"confidence": 0.94, "class_id": 0, "bbox": [55, 55, 95, 95]}],
+            "weak": [_box(0.35, 1, [15, 15, 45, 45])],
+            "trusted": [_box(0.94, 0, [55, 55, 95, 95])],
             "done": None,
             "path": str(tmp_path / "review" / "train" / "frame_mixed_1.json"),
         },
@@ -162,7 +217,8 @@ def test_dynamic_button_labels_across_all_filter_modes(
     assert dlg.btn_prune_low_confidence.text() == "✂️ Şüpheli Etiketleri Sil · Görseli Koru (2 kare)"
     assert dlg.btn_bulk_prune_boxes.text() == "✂️ Şüpheli Etiketleri Sil · Görseli Koru (2 kare)"
     assert dlg.btn_prune_low_confidence.isEnabled() is True
-    assert dlg.btn_live_relabel_all.text() == "🎯 Şüphelileri Canlı Yeniden Etiketle (2 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Şüphelileri Canlı Yeniden Etiketle (2 kare)"
 
     # 2. Mode: empty (2 items: frame_empty_1, frame_empty_2)
     dlg.set_queue_filter_mode("empty")
@@ -173,7 +229,8 @@ def test_dynamic_button_labels_across_all_filter_modes(
     assert dlg.btn_bulk_approve.text() == "✓ Etiketsizleri Onayla (2 kare)"
     assert dlg.btn_prune_low_confidence.text() == "✂️ Etiketsiz Kutu Temizle (2 kare)"
     assert dlg.btn_prune_low_confidence.isEnabled() is False  # Pruning disabled when empty!
-    assert dlg.btn_live_relabel_all.text() == "🎯 Tüm Etiketsizleri Canlı Etiketle (2 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Tüm Etiketsizleri Canlı Etiketle (2 kare)"
 
     # 3. Mode: confident (1 item: frame_conf_1)
     dlg.set_queue_filter_mode("confident")
@@ -184,7 +241,8 @@ def test_dynamic_button_labels_across_all_filter_modes(
     assert dlg.btn_bulk_approve.text() == "✓ Tüm Eminleri Otomatik Onayla (1 kare)"
     assert dlg.btn_prune_low_confidence.text() == "✂️ Düşük Güvenli Etiketleri Sil (1 kare)"
     assert dlg.btn_prune_low_confidence.isEnabled() is True
-    assert dlg.btn_live_relabel_all.text() == "🎯 Filtredeki Eminleri Canlı Etiketle (1 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Filtredeki Eminleri Canlı Etiketle (1 kare)"
 
     # 4. Mode: unlabeled_and_suspicious / unlabeled_or_suspicious (4 items: 2 susp + 2 empty)
     # 4. Mode: unlabeled_and_suspicious / unlabeled_or_suspicious (5 items: 2 susp + 2 empty + 1 mixed with weak)
@@ -194,7 +252,8 @@ def test_dynamic_button_labels_across_all_filter_modes(
     assert dlg.btn_bulk_reject.text() == "✕ Etiketsiz & Şüphelileri Reddet (5 kare)"
     assert dlg.btn_bulk.text() == "✓ Etiketsiz & Şüphelileri Onayla (5 kare)"
     assert dlg.btn_prune_low_confidence.text() == "✂️ Şüpheli Etiketleri Sil · Görseli Koru (5 kare)"
-    assert dlg.btn_live_relabel_all.text() == "🎯 Etiketsiz & Şüphelileri Canlı Etiketle (5 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Etiketsiz & Şüphelileri Canlı Etiketle (5 kare)"
 
     dlg.set_queue_filter_mode("unlabeled_or_suspicious")
     filtered = dlg._filtered_review_indices()
@@ -209,7 +268,8 @@ def test_dynamic_button_labels_across_all_filter_modes(
     assert dlg.btn_bulk_reject.text() == "✕ Eşik Altı Filtredekileri Reddet (5 kare)"
     assert dlg.btn_bulk.text() == "✓ Eşik Altı Filtredekileri Onayla (5 kare)"
     assert dlg.btn_prune_low_confidence.text() == "✂️ Eşik Altı Etiketleri Sil · Görseli Koru (5 kare)"
-    assert dlg.btn_live_relabel_all.text() == "🎯 Eşik Altı Filtredekileri Canlı Etiketle (5 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Eşik Altı Filtredekileri Canlı Etiketle (5 kare)"
 
     # Mode: above (>= 0.90: 1 item frame_conf_1)
     dlg.set_queue_filter_mode("above")
@@ -217,8 +277,13 @@ def test_dynamic_button_labels_across_all_filter_modes(
     assert len(filtered) == 1
     assert dlg.btn_bulk_reject.text() == "✕ Eşik Üstü Filtredekileri Reddet (1 kare)"
     assert dlg.btn_bulk.text() == "✓ Eşik Üstü Filtredekileri Onayla (1 kare)"
-    assert dlg.btn_prune_low_confidence.text() == "✂️ Eşik Altı Etiketleri Sil · Görseli Koru (1 kare)"
-    assert dlg.btn_live_relabel_all.text() == "🎯 Eşik Üstü Filtredekileri Canlı Etiketle (1 kare)"
+    # NOTE (D89/F-2064): in 'above' mode the prune button must say "Eşik Üstü"
+    # like its siblings. Production already says "Eşik Üstü" here
+    # (ui/yolo_factory_dialog.py _update_filter_action_buttons, 'above' branch),
+    # so this assertion pins the correct label against a copy-paste regression.
+    assert dlg.btn_prune_low_confidence.text() == "✂️ Eşik Üstü Etiketleri Sil · Görseli Koru (1 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Eşik Üstü Filtredekileri Canlı Etiketle (1 kare)"
 
     # 5. Mode: mixed (1 item: frame_mixed_1)
     dlg.set_queue_filter_mode("mixed")
@@ -227,7 +292,8 @@ def test_dynamic_button_labels_across_all_filter_modes(
     assert dlg.btn_bulk_reject.text() == "✕ Karışık Kareleri Reddet (1 kare)"
     assert dlg.btn_bulk.text() == "✓ Karışık Kareleri Onayla (1 kare)"
     assert dlg.btn_prune_low_confidence.text() == "✂️ Sadece Şüpheli Etiketleri Sil · Görseli Koru (1 kare)"
-    assert dlg.btn_live_relabel_all.text() == "🎯 Karışık Kareleri Canlı Etiketle (1 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Karışık Kareleri Canlı Etiketle (1 kare)"
 
     # 6. Mode: all (6 items total)
     dlg.set_queue_filter_mode("all")
@@ -236,7 +302,8 @@ def test_dynamic_button_labels_across_all_filter_modes(
     assert dlg.btn_bulk_reject.text() == "✕ Filtredekileri Reddet (6 kare)"
     assert dlg.btn_bulk.text() == "✓ Filtredekileri Onayla (6 kare)"
     assert dlg.btn_prune_low_confidence.text() == "✂️ Düşük Güvenli Etiketleri Sil · Görseli Koru (6 kare)"
-    assert dlg.btn_live_relabel_all.text() == "🎯 Filtredekileri Canlı Yeniden Etiketle (6 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Filtredekileri Canlı Yeniden Etiketle (6 kare)"
 
 
 def test_dynamic_button_labels_with_class_filter(
@@ -257,7 +324,8 @@ def test_dynamic_button_labels_with_class_filter(
     assert dlg.btn_bulk_reject.text() == "✕ Filtredeki [ore_orichalcum] Karelerini Reddet (2 kare)"
     assert dlg.btn_bulk.text() == "✓ Filtredeki [ore_orichalcum] Karelerini Onayla (2 kare)"
     assert dlg.btn_prune_low_confidence.text() == "✂️ [ore_orichalcum] Düşük Etiketleri Sil · Görseli Koru (2 kare)"
-    assert dlg.btn_live_relabel_all.text() == "🎯 Filtredeki [ore_orichalcum] Karelerini Canlı Etiketle (2 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Filtredeki [ore_orichalcum] Karelerini Canlı Etiketle (2 kare)"
 
     # Reset class filter
     all_idx = dlg.review_class_filter.findData(-1)
@@ -279,7 +347,8 @@ def test_dynamic_button_labels_with_search_filter(
     assert dlg.btn_bulk_reject.text() == "✕ Filtredeki [conf] Karelerini Reddet (1 kare)"
     assert dlg.btn_bulk.text() == "✓ Filtredeki [conf] Karelerini Onayla (1 kare)"
     assert dlg.btn_prune_low_confidence.text() == "✂️ [conf] Düşük Etiketleri Sil · Görseli Koru (1 kare)"
-    assert dlg.btn_live_relabel_all.text() == "🎯 Filtredeki [conf] Karelerini Canlı Etiketle (1 kare)"
+    assert dlg.btn_live_relabel_all.text() == "🤖 Tümünü Canlı Yeniden Etiketle (6 kare)"  # F-0606 [O3]: "Tümünü" butonu filtre kapsamlı metin almaz, tüm kuyruğu sayar
+    assert dlg.btn_live_relabel_filtered.text() == "🎯 Filtredeki [conf] Karelerini Canlı Etiketle (1 kare)"
 
     dlg.review_search_edit.clear()
 
@@ -345,13 +414,15 @@ def test_strict_filter_scope_isolation_bulk_approve(
 
     dlg._bulk_approve()
 
-    # Suspicious items should now have their weak boxes promoted to trusted and marked done="ok"
-    assert by_stem["frame_susp_1"]["done"] == "ok"
-    assert len(by_stem["frame_susp_1"]["weak"]) == 0
-    assert len(by_stem["frame_susp_1"]["trusted"]) == 1
-    assert by_stem["frame_susp_2"]["done"] == "ok"
-    assert len(by_stem["frame_susp_2"]["weak"]) == 0
-    assert len(by_stem["frame_susp_2"]["trusted"]) == 1
+    # F-0609 [O3]: suspicious-mode bulk approve no longer promotes
+    # sub-threshold boxes — frame_susp_1 (0.42) and frame_susp_2 (0.55)
+    # stay pending at the default 0.90 threshold instead of done="ok".
+    assert by_stem["frame_susp_1"]["done"] is None
+    assert len(by_stem["frame_susp_1"]["weak"]) == 1
+    assert len(by_stem["frame_susp_1"]["trusted"]) == 0
+    assert by_stem["frame_susp_2"]["done"] is None
+    assert len(by_stem["frame_susp_2"]["weak"]) == 1
+    assert len(by_stem["frame_susp_2"]["trusted"]) == 0
 
     # Empty and mixed items must remain untouched (done is None)
     assert by_stem["frame_empty_1"]["done"] is None
@@ -372,8 +443,8 @@ def test_strict_filter_scope_isolation_bulk_prune(
             "stem": "target_item",
             "split": "train",
             "weak": [
-                {"confidence": 0.30, "class_id": 0, "bbox": [10, 10, 30, 30]},
-                {"confidence": 0.95, "class_id": 3, "bbox": [40, 40, 80, 80]},
+                _box(0.30, 0, [10, 10, 30, 30]),
+                _box(0.95, 3, [40, 40, 80, 80]),
             ],
             "trusted": [],
             "done": None,
@@ -382,7 +453,7 @@ def test_strict_filter_scope_isolation_bulk_prune(
         {
             "stem": "other_item",
             "split": "train",
-            "weak": [{"confidence": 0.25, "class_id": 1, "bbox": [10, 10, 20, 20]}],
+            "weak": [_box(0.25, 1, [10, 10, 20, 20])],
             "trusted": [],
             "done": None,
             "path": str(tmp_path / "review" / "train" / "other_item.json"),
@@ -431,18 +502,35 @@ def test_bulk_reject_below_compatibility_alias(
 def test_filter_change_events_trigger_button_updates(
     factory_dialog: YOLOFactoryDialog, tmp_path: Path
 ):
-    """Verify that GUI events (combobox change, slider change) automatically refresh button labels."""
+    """Verify that GUI events (combobox change, slider change) automatically refresh button labels.
+
+    W4 (57120c9): the queue_filter combo follows prototype panel-2 status
+    modes (all/pending/ok/no/high/low) — the old suspicious/empty modes are
+    still supported programmatically via set_queue_filter_mode (covered by
+    test_dynamic_button_labels_across_all_filter_modes) but are NOT combo
+    items, so findData("suspicious") is -1 and setCurrentIndex(-1) would
+    silently fall back to "all". Drive the combo through its real items
+    instead: pending (all 6 fixture items, done=None) then ok (none
+    approved) — the (6 kare) -> (0 kare) label change proves the
+    currentIndexChanged event refreshed the buttons.
+    """
     dlg = factory_dialog
     dlg._review_items = _create_sample_review_items(tmp_path)
 
-    # 1. ComboBox change
-    idx_susp = dlg.queue_filter.findData("suspicious")
-    dlg.queue_filter.setCurrentIndex(idx_susp)
-    assert "Tüm Şüphelileri" in dlg.btn_bulk_reject.text()
+    # 1. ComboBox change: pending -> ok
+    idx_pending = dlg.queue_filter.findData("pending")
+    assert idx_pending >= 0
+    dlg.queue_filter.setCurrentIndex(idx_pending)
+    assert dlg._queue_filter_mode == "pending"
+    assert len(dlg._filtered_review_indices()) == 6
+    assert dlg.btn_bulk_reject.text() == "✕ Filtredekileri Reddet (6 kare)"
 
-    idx_empty = dlg.queue_filter.findData("empty")
-    dlg.queue_filter.setCurrentIndex(idx_empty)
-    assert "Tüm Etiketsizleri" in dlg.btn_bulk_reject.text()
+    idx_ok = dlg.queue_filter.findData("ok")
+    assert idx_ok >= 0
+    dlg.queue_filter.setCurrentIndex(idx_ok)
+    assert dlg._queue_filter_mode == "ok"
+    assert len(dlg._filtered_review_indices()) == 0
+    assert dlg.btn_bulk_reject.text() == "✕ Filtredekileri Reddet (0 kare)"
 
     # 2. Threshold slider change
     dlg.bulk_range.setValue(95)

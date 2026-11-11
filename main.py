@@ -17,23 +17,65 @@ Integrates all specialized agent modules:
 
 import os
 import sys
+from version import __version__
+
+
+def _resolve_bot_home() -> str:
+    """Bot home dizini — platform-bağımsız çözümleme (P2-25, bölüm 8).
+
+    Sıra: ``GATHERION_HOME`` ortam değişkeni (varsa ve dizinse) ->
+    Windows'ta eski ``F:\\a2`` / ``F:\\Gatherion`` (sürücü varsa) ->
+    "" (repo-yerel yedek; log/temp/ayar repo altına çözülür).
+    Üç ayrı yerdeki dağınık ``F:\\`` kontrolünün tek adresidir;
+    F: olmayan PC'de (veya Windows-dışı sistemde) yollar sessizce
+    başka bir diske kaymaz, repo altına düşer.
+    """
+    env_home = os.environ.get("GATHERION_HOME", "").strip()
+    if env_home and os.path.isdir(env_home):
+        return env_home
+    if os.name == "nt":
+        if os.path.isdir(r"F:\a2"):
+            return r"F:\a2"
+        if os.path.isdir(r"F:\\"):
+            return r"F:\Gatherion"
+    return ""
 
 
 def _attach_windowless_stdio() -> None:
     """pythonw.exe has no console; append prints and tracebacks to logs/gatherion.log."""
     if sys.stdout is not None and sys.stderr is not None:
         return
-    log_dir = r"F:\a2\logs" if os.path.isdir(r"F:\a2") else os.path.join(
+    _home = _resolve_bot_home()
+    log_dir = os.path.join(_home, "logs") if _home else os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "logs"
     )
-    os.makedirs(log_dir, exist_ok=True)
-    stream = open(
-        os.path.join(log_dir, "gatherion.log"),
-        "a",
-        encoding="utf-8",
-        errors="replace",
-        buffering=1,
-    )
+    # F-1254: import anında dosya açılışı çökmesin; hata olursa stderr'de kalınır.
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        stream = open(
+            os.path.join(log_dir, "gatherion.log"),
+            "a",
+            encoding="utf-8",
+            errors="replace",
+            buffering=1,
+        )
+    except Exception:
+        # sweep-26 F9: gatherion.log açılamazsa pythonw altında hata tamamen
+        # görünmez kalırdı. Son çare: %TEMP% altına tek satırlık iz bırak;
+        # o da açılamazsa gerçekten yazılacak yer yoktur.
+        try:
+            import tempfile
+
+            with open(
+                os.path.join(tempfile.gettempdir(), "gatherion-stdio-error.txt"),
+                "a",
+                encoding="utf-8",
+                errors="replace",
+            ) as fh:
+                fh.write("gatherion.log acilamadi; pythonw stdio baglanamadi.\n")
+        except Exception:
+            pass
+        return
     if sys.stdout is None:
         sys.stdout = stream
     if sys.stderr is None:
@@ -42,15 +84,94 @@ def _attach_windowless_stdio() -> None:
 
 _attach_windowless_stdio()
 
+# sweep-26 F8: _bot_home() logging kurulmadan önce çağrılır; F: yoksa
+# sessizce sistem varsayılanlarına düşülürdü. Uyarı metni burada saklanır,
+# main() içinde logger kurulduktan sonra warning olarak basılır.
+_BOOT_HOME_WARNING: str = ""
+
+
+def _show_startup_alert(message: str, title: str = "Gatherion") -> None:
+    """Windows mesaj kutusu — pythonw altında stderr görünmez (F9), bu
+    yüzden kritik açılış hataları ayrıca MessageBox ile gösterilir.
+    Windows-dışı platformda ve hata halinde sessizce atlanır."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, message, title, 0x40)  # MB_ICONINFORMATION
+    except Exception as exc:
+        try:
+            logger.debug("Başlangıç uyarı penceresi gösterilemedi: %s", exc)
+        except Exception:
+            pass
+
+
+# sweep-26 F1: tek instance kilidi. CreateMutex hiç yoktu; çift bot aynı
+# anda çalışabiliyordu. Oturum-içi (Local) mutex: yönetici yetkisi
+# gerektirmez, süreç bitince işletim sistemi serbest bırakır.
+_SINGLE_INSTANCE_MUTEX_NAME = "Gatherion-Local-v2.0-SingleInstance"
+_SINGLE_INSTANCE_MUTEX_HANDLE = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    """True: bu örnek tek örnek (kilit alındı). False: başka bir örnek
+    zaten çalışıyor. Windows-dışı platformda ve mutex oluşturulamazsa
+    kilitsiz devam edilir (eski davranış — fail-open, sessiz değil:
+    oluşturamama debug loglanır)."""
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.GetLastError.restype = wintypes.DWORD
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.CreateMutexW(None, True, _SINGLE_INSTANCE_MUTEX_NAME)
+        if not handle:
+            logger.debug("Tek instance mutex'i oluşturulamadı; kilitsiz devam ediliyor.")
+            return True
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
+            return False
+        _SINGLE_INSTANCE_MUTEX_HANDLE = handle
+        return True
+    except Exception as exc:
+        logger.debug("Tek instance kilidi kurulamadı: %s", exc)
+        return True
+
+
+def _release_single_instance_lock() -> None:
+    """Kapatışta mutex'i bırak (süreç bitince OS zaten bırakır; bu açık bırakma)."""
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+    handle = _SINGLE_INSTANCE_MUTEX_HANDLE
+    _SINGLE_INSTANCE_MUTEX_HANDLE = None
+    if handle is None or os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception as exc:
+        logger.debug("Tek instance mutex'i bırakılamadı: %s", exc)
+
 
 def _bot_home() -> str:
-    """F:\\a2 when that copy exists, else F:\\Gatherion. Empty when F: is missing."""
-    if os.path.isdir(r"F:\a2"):
-        return r"F:\a2"
-    if os.path.isdir(r"F:\\"):
-        home = r"F:\Gatherion"
+    """Bot home dizini (``_resolve_bot_home``); yoksa "" (repo-yerel yedek)."""
+    home = _resolve_bot_home()
+    if home:
         os.makedirs(home, exist_ok=True)
         return home
+    global _BOOT_HOME_WARNING
+    _BOOT_HOME_WARNING = (
+        "F: surucusu bulunamadi; TEMP/TORCH/YOLO yollari pinlenmedi, "
+        "sistem varsayilanlariyla devam ediliyor (ayarlar/rota F: uzerindeyse bot baska dizindeki bos ayarlarla acilmis olabilir)."
+    )
     return ""
 
 
@@ -76,21 +197,47 @@ def _pin_bot_env() -> None:
 _pin_bot_env()
 
 import logging
+
+# P0-9 (K-15): logger LOG_DIR çözümünden ÖNCE bağlanır. setup_logging()
+# LOG_FILE'a (dolayısıyla LOG_DIR'a) bağımlı olduğu için logger ancak
+# aşağıda kurulabiliyordu; oysa LOG_DIR makedirs koruması (F-1254)
+# logger.debug kullanıyordu — makedirs hatasında import NameError ile
+# çöküyordu. Erken logger handler'sızdır (root'a propagate eder);
+# setup_logging() aşağıda aynı logger nesnesine (getLogger aynı adı
+# döndürür) dosya/stdout handler'larını ekler.
+logger = logging.getLogger("Gatherion.Main")
+
 import socket
-import subprocess
 import threading
 import time
-import winsound
-from typing import Any, Optional
+
+# [STARTUP] Python import süresi ölçümü (main() içinde loglanır).
+_IMPORT_T0 = time.monotonic()
+import weakref
+from typing import Any, Dict, Optional
+
+try:
+    import winsound
+except ImportError:  # Windows-only modul; Linux/macOS'ta yok (R22)
+    winsound = None  # type: ignore[assignment]
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 # Ensure workspace root is on sys.path and stdout uses UTF-8 for Turkish output
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
+
+# v20/session-logs: oturum dosyasi yardimcilari (core/session_log.py;
+# yalnizca stdlib — core/__init__ yalnizca `version` import eder).
+from core.session_log import prune_old_sessions, resolve_session_log_path
+
+# v20/bot-ani-kapanma: sessiz process olumu kanit altyapisi (faulthandler +
+# excepthook + atexit kapanis kaydi + RSS izleme). Yalnizca stdlib
+# (+istege bagli psutil); Qt yok, main.py import aninda guvenle alinir.
+from core.crash_evidence import install_crash_evidence, note_graceful_shutdown
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -103,22 +250,43 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception as _stderr_exc:
         os.environ["PYTHONIOENCODING"] = "utf-8"
 
-# Configure root & file logger. New lines go to F: so C: is not the log disk.
+# Configure root & file logger. New lines go to the bot home logs dir
+# (P2-25: _resolve_bot_home) so C: is not the log disk; without a bot
+# home they stay repo-local.
 def _resolve_log_dir() -> str:
-    if os.path.isdir(r"F:\a2"):
-        return r"F:\a2\logs"
-    if os.path.isdir("F:\\"):
-        path = r"F:\Gatherion\logs"
-        os.makedirs(path, exist_ok=True)
+    home = _resolve_bot_home()
+    if home:
+        path = os.path.join(home, "logs")
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            # P0-9 (K-15): F-1254 sözü — log dizini oluşturulamazsa
+            # import çökmesin. Buradaki makedirs korumasızdı; hata
+            # LOG_DIR atamasında import'u öldürüyordu. Repo-yerel
+            # yedeğe düşülür; aşağıdaki makedirs koruması durumu
+            # (artık bağlı olan) logger ile kaydeder.
+            return os.path.join(BASE_DIR, "logs")
         return path
     return os.path.join(BASE_DIR, "logs")
 
 
 LOG_DIR = _resolve_log_dir()
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_FILE = os.path.join(LOG_DIR, "bot.log")
+# F-1254: log dizini oluşturulamazsa import çökmesin; setup_logging
+# dosya handler'ı açamazsa yalnızca stdout'a loglar.
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except Exception as exc:
+    logger.debug("Log dizini oluşturulamadı: %s", exc)
+# v20/session-logs: tek upuzun bot.log yerine her başlatmada yeni oturum
+# dosyası (logs/session_YYYY-MM-DD_HHMMSS.log); en son 20 tutulur.
+# LOG_FILE adı korunur — copy_report_to_clipboard / open_log_file /
+# hata mesajları aynı adı kullanır, artık oturum dosyasını gösterir.
+SESSION_LOG_FILE = os.fspath(resolve_session_log_path(LOG_DIR))
+LOG_FILE = SESSION_LOG_FILE
 LOG_FORMAT = "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s"
-LOG_DATEFMT = "%H:%M:%S"
+# sweep-29 O-5: saat biçiminde tarih yoktu — çok günlük tek dosyada aynı
+# saat iki güne ait olabiliyordu; panik satırının günü belirsizdi.
+LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 # Base anchored paths for configuration, dataset, models, templates, and routes
 CONFIG_DIR = os.path.join(BASE_DIR, "config")
@@ -132,7 +300,8 @@ ROUTES_DIR = os.path.join(BASE_DIR, "routes")
 
 
 def setup_logging() -> logging.Logger:
-    """Configures unified root logging to logs/bot.log and stdout without duplicate handlers."""
+    """Configures unified root logging to the current session log file
+    (logs/session_YYYY-MM-DD_HHMMSS.log) and stdout without duplicate handlers."""
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
@@ -141,12 +310,26 @@ def setup_logging() -> logging.Logger:
     for existing in list(root_logger.handlers):
         root_logger.removeHandler(existing)
 
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    file_handler.setFormatter(formatter)
+    file_handler = None
+    try:
+        # v20/session-logs: oturum dosyası başlatmada bir kez açılır;
+        # rotasyon yok — her oturum kendi dosyasında, eskiler budanır
+        # (eski tek dosya bot.log 5 MB'de dönüyor, 5 yedek tutuyordu).
+        file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        # En son 20 oturum tutulur; eskiler sessizce silinir (F-1254:
+        # budama hatası import'u öldürmez).
+        prune_old_sessions(LOG_DIR)
+    except Exception as exc:
+        # F-1254: log dosyası açılamazsa (salt okunur disk vb.) import
+        # çökmez; yalnızca stdout handler ile devam edilir.
+        print(f"WARNING: log dosyası açılamadı ({LOG_FILE}): {exc}", file=sys.stderr)
+
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
 
-    root_logger.addHandler(file_handler)
+    if file_handler is not None:
+        root_logger.addHandler(file_handler)
     root_logger.addHandler(stream_handler)
     return logging.getLogger("Gatherion.Main")
 
@@ -236,7 +419,7 @@ from core.questlog_importer import QuestlogImporter
 from core.route_manager import RouteManager
 from core.sequential_router import SequentialRoutePlanner
 from core.skill_bar_reader import MicroCameraLookAround, SkillBarReader
-from core.state_machine import BotMode, BotState, BotWorker
+from core.state_machine import BotMode, BotWorker
 from core.stealth_capture import AdaptiveFramePacer, DXGIDesktopCapture, StealthOverlayManager
 from core.telemetry import TelemetryEngine
 from core.uac_elevator import ensure_admin_elevation, is_admin
@@ -266,24 +449,132 @@ from ui.settings_window import SettingsWindow
 deduplicate_loggers()
 
 
+_LAN_IP_CACHE_TTL_S = 60.0
+_LAN_IP_CACHE: Dict[str, Any] = {"ip": "", "ts": 0.0}
+
+
 def get_local_lan_ip() -> str:
-    """Resolves the primary LAN IPv4 address for the Mobile Remote Dashboard URL."""
+    """Resolves the primary LAN IPv4 address for the Mobile Remote Dashboard URL.
+
+    The result is cached for _LAN_IP_CACHE_TTL_S seconds: the UDP probe (plus
+    a possible DNS lookup) is pure overhead when the dashboard URL is asked
+    for repeatedly, and a LAN address does not change second to second.
+    """
+    now = time.monotonic()
+    cached_ip = _LAN_IP_CACHE.get("ip", "")
+    if cached_ip and now - _LAN_IP_CACHE.get("ts", 0.0) < _LAN_IP_CACHE_TTL_S:
+        return str(cached_ip)
+    resolved = "127.0.0.1"
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(0.5)
             sock.connect(("8.8.8.8", 80))
             ip_addr = sock.getsockname()[0]
             if ip_addr and not ip_addr.startswith("127."):
-                return str(ip_addr)
+                resolved = str(ip_addr)
     except Exception:
         logger.debug("UDP LAN IP probe fallback")
+    if resolved == "127.0.0.1":
+        try:
+            hostname_ip = socket.gethostbyname(socket.gethostname())
+            if hostname_ip:
+                resolved = str(hostname_ip)
+        except Exception:
+            logger.debug("Hostname IP lookup fallback")
+    _LAN_IP_CACHE["ip"] = resolved
+    _LAN_IP_CACHE["ts"] = now
+    return resolved
+
+
+def _safe_reconnect(signal: Any, slot: Any) -> bool:
+    """Disconnect-then-connect a Qt signal, tolerating stale/missing links.
+
+    Disconnect failures (slot was never connected) are swallowed, exactly
+    like the inline try/except blocks this replaces; connect failures are
+    debug-logged. Returns True only when connect() succeeded, never raises.
+    """
+    disconnect = getattr(signal, "disconnect", None)
+    if callable(disconnect):
+        try:
+            disconnect(slot)
+        except Exception:
+            pass
+    connect = getattr(signal, "connect", None)
+    if not callable(connect):
+        return False
     try:
-        hostname_ip = socket.gethostbyname(socket.gethostname())
-        if hostname_ip:
-            return str(hostname_ip)
-    except Exception:
-        logger.debug("Hostname IP lookup fallback")
-    return "127.0.0.1"
+        connect(slot)
+        return True
+    except Exception as exc:
+        logger.debug("Sinyal bağlama hatası: %s", exc)
+        return False
+
+
+def _reload_detector(detector: Any, target_path: str, label: str) -> bool:
+    """Point one ONNX detector at target_path and reload it.
+
+    Returns True only when the detector reports a successful load.
+    A missing detector/loader, a False load result, or an exception all
+    return False (and are logged) instead of raising — F-1137: a False
+    load result must never be reported as a live update.
+    """
+    if detector is None:
+        return False
+    try:
+        detector.model_path = target_path
+    except Exception as exc:
+        logger.warning("%s model yolu ayarlanamadı: %s", label, exc)
+        return False
+    loader = getattr(detector, "_load_model_if_available", None)
+    if not callable(loader):
+        return False
+    try:
+        loaded = bool(loader())
+    except Exception as exc:
+        logger.warning("%s yeniden yükleme hatası: %s", label, exc)
+        return False
+    if not loaded:
+        logger.warning("%s modeli yükleyemedi: %s", label, target_path)
+    return loaded
+
+
+def _stop_quietly(target: Any, method_name: str, label: str) -> bool:
+    """Call target.method_name() if present. Errors are NOT swallowed
+    silently (sweep Y-4): they are logged as warnings with the label so a
+    failing shutdown step is visible in bot.log. Returns True only when
+    the call ran without error. A missing target/method is a no-op
+    returning False."""
+    if target is None:
+        return False
+    method = getattr(target, method_name, None)
+    if not callable(method):
+        return False
+    try:
+        method()
+        return True
+    except Exception as exc:
+        logger.warning("%s kapanış hatası (yoksayıldı): %s", label, exc, exc_info=True)
+        return False
+
+
+# Menu action -> (BotMode value or None for plain resume, watchdog state).
+# Single source of truth for the six mode branches of handle_menu_action.
+_MENU_MODE_ACTIONS: Dict[str, tuple] = {
+    "resume": (None, "WALKING"),
+    "auto_record": (BotMode.AUTO_RECORD.value, "WALKING"),
+    "manual_record": (BotMode.MANUAL_RECORD.value, "WAITING"),
+    "explorer": (BotMode.EXPLORER_MODE.value, "WALKING"),
+    "explorer_mode": (BotMode.EXPLORER_MODE.value, "WALKING"),
+    "combat": (BotMode.COMBAT_MODE.value, "FIGHTING"),
+    "combat_mode": (BotMode.COMBAT_MODE.value, "FIGHTING"),
+    "savas": (BotMode.COMBAT_MODE.value, "FIGHTING"),
+    "savaş": (BotMode.COMBAT_MODE.value, "FIGHTING"),
+    "fight": (BotMode.COMBAT_MODE.value, "FIGHTING"),
+    "route": (BotMode.ROUTE_MODE.value, "WALKING"),
+    "route_mode": (BotMode.ROUTE_MODE.value, "WALKING"),
+    "gather": (BotMode.ROUTE_MODE.value, "WALKING"),
+    "topla": (BotMode.ROUTE_MODE.value, "WALKING"),
+}
 
 
 class HotkeyBridge(QObject):
@@ -303,9 +594,11 @@ def create_tray_icon_pixmap() -> QIcon:
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-    # Outer dark circle
+    # Outer dark circle — 3px cyan ring (not 1px): the 64px pixmap is
+    # downscaled to ~16px in the tray, where a 1px ring aliases away and
+    # the dark disc blends into a dark taskbar. Ring colour unchanged.
     painter.setBrush(QColor("#12161c"))
-    painter.setPen(QColor("#38bdf8"))
+    painter.setPen(QPen(QColor("#38bdf8"), 3))
     painter.drawEllipse(4, 4, 56, 56)
 
     # Inner glowing diamond / node emblem
@@ -320,10 +613,25 @@ class UiClickSounds:
     """Kısa tıklama sesi. Eksik olursa tek tık eğitim 'sounds' ile çökmez."""
 
     def play_click(self) -> None:
+        # Backend'i çağrı anında çöz: modül import anında bağlanan
+        # winsound, test stub'ları kurulmadan önce bağlanmış olabilir
+        # (örn. d81'in no-op stub'u) ya da Linux'ta None olabilir (R22
+        # koruması). sys.modules'taki güncel kayıt her zaman önceliklidir.
         try:
-            winsound.Beep(880, 40)
+            backend = sys.modules.get("winsound", winsound)
+            if backend is None:
+                logger.debug("Tıklama sesi atlandı")
+                return
+            backend.Beep(880, 40)
         except Exception:
             logger.debug("Tıklama sesi atlandı", exc_info=True)
+
+
+# S-0204: modül düzeyi readiness probunun başvurduğu canlı orchestrator
+# (zayıf referans — GC'yi engellemez; kayıt yoksa yalnızca sözleşme probu
+# çalışır). GatherionOrchestrator.__init__'de kaydedilir, shutdown()'da
+# temizlenir.
+_LIVE_ORCHESTRATOR_REF = None
 
 
 class GatherionOrchestrator(QObject):
@@ -334,10 +642,16 @@ class GatherionOrchestrator(QObject):
     and system tray.
     """
 
-    APP_TITLE = "Gatherion-Local v2.0 (Türkçe)"
+    APP_TITLE = f"Gatherion-Local v{__version__} (Türkçe)"
 
     def __init__(self, app: QApplication) -> None:
         super().__init__()
+        # [STARTUP] Açılış faz kronometresi (faz + toplam süre logları için).
+        self._startup_t0 = time.monotonic()
+        self._startup_last_t = self._startup_t0
+        # S-0204: canlı örnek modül düzeyi readiness probuna bağlanır.
+        global _LIVE_ORCHESTRATOR_REF
+        _LIVE_ORCHESTRATOR_REF = weakref.ref(self)
         self.app = app
         self.app.setApplicationName(self.APP_TITLE)
         if hasattr(self.app, "setApplicationDisplayName"):
@@ -345,19 +659,29 @@ class GatherionOrchestrator(QObject):
         self.hotkey_bridge = HotkeyBridge()
 
         # 1. Initialize Configuration & OPSEC Encrypted Vault (Agents 1 & 25)
+        # sweep-26 F3: bozuk settings.json sessizce varsayılan olurdu —
+        # load_error açılışta hiç okunmuyordu. Dosya varlığı SettingsManager
+        # kurulmadan ÖNCE ölçülür (reset_to_defaults dosyayı yazar).
+        settings_existed = os.path.exists(SETTINGS_JSON_PATH)
         self.settings_mgr = SettingsManager(SETTINGS_JSON_PATH)
         self.settings = getattr(self.settings_mgr, "settings", None) or self.settings_mgr.load()
+        self._settings_load_error = getattr(self.settings_mgr, "load_error", None)
+        self._settings_was_missing = not settings_existed
         self.vault_crypto = LocalVaultCrypto()
         self._sync_encrypted_vault()
+        self._startup_phase("1. Ayarlar + kasa")
 
         # 2. Initialize Capture, Vision & Stealth Managers (Agents 3, 14, 22)
-        self.capture = ScreenCapture()
+        # F-23-07 (v11): monitor_idx ayarı bağlandı — çoklu monitör
+        # ayarı önceden ölüydü (ScreenCapture hep varsayılan 1).
+        self.capture = ScreenCapture(monitor_idx=int(self.settings.display.monitor_idx))
         self.dxg_capture = DXGIDesktopCapture()
-        self.vision = VisionEngine()
+        self.vision = VisionEngine(monitor_idx=int(self.settings.display.monitor_idx))
         self.stealth_overlay_mgr = StealthOverlayManager()
         self.frame_pacer = AdaptiveFramePacer()
         self.hud_reader = GameHUDReader()
         self.preprocessor = AdaptivePreprocessor()
+        self._startup_phase("2. Yakalama + görüş")
 
         # 3. Initialize Input Driver, WindMouse & Biometrics (Agents 2, 21, 23)
         self.input_ctrl = InputController()
@@ -367,6 +691,7 @@ class GatherionOrchestrator(QObject):
         self.physical_guard = PhysicalInputGuard()
         self.human_timing = HumanTimingEngine()
         self.organic_anti_afk = OrganicAntiAFK()
+        self._startup_phase("3. Girdi sürücüsü")
 
         # 4. Initialize Route Manager, Questlog Importer & Sequential Cartography (Agents 4, 5, 11, 16-19)
         self.route_mgr = RouteManager(base_dir=ROUTES_DIR)
@@ -383,14 +708,31 @@ class GatherionOrchestrator(QObject):
         )
 
         # Ensure default region/route is populated or synced with settings
-        self._ensure_initial_route_ready()
+        # F-1199: rota hazırlanamazsa bot boş rotayla "başlatıldı" sayılmaz.
+        self._initial_route_ready: bool = self._ensure_initial_route_ready()
+        if not self._initial_route_ready:
+            logger.warning(
+                "Başlangıç rotası hazır değil — bot rota boşken açılıyor; "
+                "rota noktaları eklenmeden rota moduna geçmeyin."
+            )
+        self._startup_phase("4. Rota + keşif")
 
         # 5. Initialize Combat, Behavioral Guard, Telemetry, Watchdog & Panic (Agents 6, 12, 15, 24, 25)
-        self.combat_recovery = CombatRecovery(self.vision, self.input_ctrl)
+        # F-23-07 (v11): fly_unreachable ayarı bağlandı — önceden
+        # CombatRecovery hep True alıyordu (legacy shim); artık
+        # ayardaki değer (varsayılan True) geçiliyor.
+        self.combat_recovery = CombatRecovery(
+            fly_unreachable=bool(self.settings.route.fly_unreachable),
+            vision=self.vision,
+            input_ctrl=self.input_ctrl,
+        )
         self.behavioral_guard = BehavioralStealthGuard()
-        self.telemetry = TelemetryEngine()
+        # v20-istatistik (R2): üretim motoru geçmiş oturum olaylarını yükler —
+        # "Bugün" restart sonrası da bugünün daha önceki oturumlarını gösterir.
+        self.telemetry = TelemetryEngine(history_path="logs/telemetry_history.json")
         self.panic_system = PanicAlertSystem()
         self.watchdog = BotWatchdog(recovery_callback=self._on_watchdog_recovery)
+        self._startup_phase("5. Savaş + watchdog")
 
         # 5.5 Initialize Enterprise Vision Filters, Patch Normalizer, Economy, Audio/YOLO, Multi-Char & 3D Depth Guards
         self.admin_elevated: bool = bool(is_admin())
@@ -423,16 +765,41 @@ class GatherionOrchestrator(QObject):
         self.pet_buff_mgr = PetAndBuffManager()
         self.depth_avoider = MonocularDepthObstacleAvoidance()
         self.glide_pilot = GlideWaypointController()
+        self._startup_phase("5.5. YOLO/3D/audio bileşenleri")
 
         # 6. Initialize UI Windows (Agents 8, 9, 10, 12, 13, 20)
         self.overlay = OverlayHUD()
         self.overlay.setWindowTitle(f"{self.APP_TITLE} — Oyun İçi Durum Paneli")
         if hasattr(self.overlay, "version_label"):
-            self.overlay.version_label.setText("v2.0")
+            self.overlay.version_label.setText(f"v{__version__}")
         self.stealth_overlay_mgr.apply_stealth_window_identity(self.overlay)
         if self.settings.gathering.show_overlay:
             self.overlay.show()
         self.sounds = UiClickSounds()
+        self._startup_phase("6. Arayüz (HUD + F9)")
+
+        # sweep-26 F3/F8/F6: açılış koşulları artık yalnızca logda kalmıyor —
+        # bozuk/eksik ayar dosyası ve yönetici-yoksun çalışma overlay'de görünür.
+        if getattr(self, "_settings_load_error", None):
+            logger.warning(
+                "Ayar dosyası bozuk; varsayılanlarla açıldı: %s",
+                self._settings_load_error,
+            )
+            self.overlay.add_log(
+                "⚠️ Ayar dosyası bozuk — varsayılanlarla açıldı "
+                "(yedek: settings.json.corrupt.bak)."
+            )
+        elif getattr(self, "_settings_was_missing", False):
+            logger.warning("settings.json yoktu; varsayılan ayarlarla açıldı.")
+            self.overlay.add_log("⚠️ settings.json bulunamadı — varsayılan ayarlarla açıldı.")
+        if not getattr(self, "admin_elevated", True):
+            logger.warning(
+                "Bot yönetici yetkisi olmadan çalışıyor; Interception "
+                "(donanım HID) yönetici isteyebilir, tuşlar oyuna gitmeyebilir."
+            )
+            self.overlay.add_log(
+                "⚠️ Yönetici yetkisi yok — tuşlar oyuna gitmezse yöneticiyle başlatın."
+            )
 
         self.f9_menu = F9Menu(route_manager=self.route_mgr)
         if hasattr(self.overlay, "bind_f9_menu"):
@@ -454,6 +821,9 @@ class GatherionOrchestrator(QObject):
             route_manager=self.route_mgr,
             combat_recovery=self.combat_recovery,
             overlay_rect_provider=self.overlay.get_screen_rect,
+            material_scanner=self.material_scanner,
+            minimap_scanner=self.minimap_scanner,
+            yolo_detector=self.yolo_detector,
         )
         self.worker.telemetry = self.telemetry
         self.worker.watchdog = self.watchdog
@@ -468,8 +838,9 @@ class GatherionOrchestrator(QObject):
                 self.explorer_ctrl.bind_ai_sources(
                     yolo_detector=getattr(self, "yolo_detector", None),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                # F-1196: bağlama hatası çıplak pass ile yutulurdu.
+                logger.warning("Explorer AI kaynak bağlama hatası: %s", exc)
         self.worker.human_timing = self.human_timing
         self.worker.organic_anti_afk = self.organic_anti_afk
         self.worker.frame_pacer = self.frame_pacer
@@ -477,10 +848,37 @@ class GatherionOrchestrator(QObject):
         self.worker.biometric_clicker = self.biometric_clicker
         self.worker.behavioral_guard = self.behavioral_guard
         self.worker.panic_system = self.panic_system
+        # F-0163 [O1]: watchdog daemon'ını üretimde başlat — PanicAlertSystem
+        # tek başına poll etmez; zaten çalışıyorsa False döner.
+        try:
+            _panic = getattr(self, "panic_system", None)
+            if _panic is not None and hasattr(_panic, "start_watchdog_polling"):
+                # sweep-21 B-01: detektörler poll başlamadan ÖNCE bağlanır —
+                # yoksa poll 6/6 detektörsüz (kör) çalışır. Bind docstring'in
+                # istediği tek satırdır.
+                if hasattr(_panic, "bind_production_watchdog_sources"):
+                    try:
+                        _wiring = _panic.bind_production_watchdog_sources(worker=self.worker)
+                        logger.info("Watchdog üretim kaynakları bağlandı: %s", _wiring)
+                    except Exception as _bind_exc:
+                        logger.warning("Watchdog üretim kaynağı bağlanamadı: %s", _bind_exc)
+                _poll_started = _panic.start_watchdog_polling(input_ctrl=self.input_ctrl)
+                if not _poll_started:
+                    # sweep-21 B-12: başlamama artık yalnızca debug'da değil.
+                    logger.warning("Watchdog polling başlatılamadı (zaten çalışıyor olabilir).")
+        except Exception as _wd_exc:
+            logger.warning("Watchdog polling başlatılamadı: %s", _wd_exc)
         self.worker.dpi_guard = self.dpi_guard
         self.worker.focus_monitor = self.focus_monitor
         if hasattr(self.input_ctrl, "focus_monitor"):
             self.input_ctrl.focus_monitor = self.focus_monitor
+        # F-0083: focus guard'ı input sürücüsüne bağla — oyun odakta
+        # değilken tuş gönderilmez (press_key 0.0 döner). Guard
+        # çalışamazsa (Linux) sarmalayıcı tuşu geçirir, kilitlemez.
+        try:
+            self.focus_monitor.attach_to_input_driver(self.input_ctrl)
+        except Exception as _fg_exc:
+            logger.warning("Focus guard input sürücüsüne bağlanamadı: %s", _fg_exc)
         self.worker.route_backup_mgr = self.route_backup_mgr
         self.worker.template_tuner = self.template_tuner
         self.worker.feather_filter = self.feather_filter
@@ -501,11 +899,39 @@ class GatherionOrchestrator(QObject):
         self.worker.broker_scanner = self.broker_scanner
         self.worker.crafting_controller = self.crafting_controller
         self.worker.economy_calculator = self.economy_calculator
-        self.worker.yolo_detector = self.yolo_detector
+        # v20-onnx-reload: tek paylaşımlı detektör — hub/reflex/scanner
+        # BotWorker kurulumunda bağlandı; adopt hem yeniden bağlar hem de
+        # (eski yol) üzerine yazılmış orphan instance varsa close eder.
+        if hasattr(self.worker, "adopt_shared_yolo_detector"):
+            self.worker.adopt_shared_yolo_detector(self.yolo_detector)
+        else:
+            self.worker.yolo_detector = self.yolo_detector
+        for _ms in (
+            getattr(self.worker, "material_scanner", None),
+            getattr(self, "material_scanner", None),
+        ):
+            try:
+                if _ms is not None and hasattr(_ms, "set_yolo_detector"):
+                    _ms.set_yolo_detector(self.yolo_detector)
+            except Exception as _ms_exc:
+                logger.debug("material scanner detector wiring skipped: %s", _ms_exc)
         self.worker.audio_analyzer = self.audio_analyzer
         self.worker.alt_char_mgr = self.alt_char_mgr
         self.worker.task_scheduler = self.task_scheduler
         self.worker.pet_buff_mgr = self.pet_buff_mgr
+        # F-0143: alt-karakter/rotasyon/buff yöneticilerinin üretim
+        # bağlamını bağla — sonrasında her toplamada zaten çalışan
+        # record_gather zinciri takvim/rotasyon/buff denetimini tetikler.
+        try:
+            self.alt_char_mgr.bind_runtime_context(
+                input_ctrl=self.input_ctrl,
+                route_mgr=self.route_mgr,
+                task_scheduler=self.task_scheduler,
+                pet_buff_mgr=self.pet_buff_mgr,
+                frame_provider=lambda: self.vision.capture_screen(),
+            )
+        except Exception as _mc_exc:
+            logger.warning("Alt-karakter üretim bağlamı bağlanamadı: %s", _mc_exc)
         self.worker.depth_avoider = self.depth_avoider
         self.worker.glide_pilot = self.glide_pilot
 
@@ -513,11 +939,13 @@ class GatherionOrchestrator(QObject):
         self.bot_worker = self.worker
         self.routes = self.route_mgr
         self.overlay_hud = self.overlay
+        self._startup_phase("7. BotWorker")
 
         # 8. Connect Signals & Hotkeys
         self._connect_signals()
         self._setup_hotkeys()
         self._setup_system_tray()
+        self._startup_phase("8. Sinyaller + kısayol tuşları")
         self.shell: Optional[GatherionShell] = None
 
         # 9. Initialize Mobile Remote Control Server & Cloud Tunnel (v2.0 Mobile Suite)
@@ -528,47 +956,162 @@ class GatherionOrchestrator(QObject):
 
             self.tunnel_mgr = FreeCloudTunnelManager()
         except Exception as tun_exc:
-            logger.debug("FreeCloudTunnelManager başlatma atlandı: %s", tun_exc)
+            # sweep-26 F5: tünel yöneticisi kurulamazsa mobil tünel hiç
+            # olmayacaktı ama bu yalnızca debug'da kalıyordu.
+            logger.warning(
+                "FreeCloudTunnelManager başlatılamadı; mobil tünel kurulmayacak: %s",
+                tun_exc,
+            )
 
         try:
             from core.mobile_server import MobileRemoteServer
 
             self.mobile_server = MobileRemoteServer(orchestrator=self, port=8765)
+            # F-0105/F-1889 [O1]: 256-bit kimlik doğrulayıcıyı canlı sunucuya
+            # bağla — sunucunun kendi kısa token'ı yerine
+            # MobileTokenAuthenticator token'ı zorunlu olur.
+            try:
+                _token_auth = getattr(self, "mobile_token_auth", None)
+                if _token_auth is not None:
+                    _token_auth.bind_to_mobile_server(self.mobile_server)
+                    # Y-3 (dilim 22): bind sonrası diskteki
+                    # config/mobile_token.txt artık geçersizdir (sunucunun
+                    # kendi kısa token'ını tutar). Canlı 256-bit token
+                    # dosyaya yazılır ki o dosyadaki tokenla giriş 401
+                    # vermesin.
+                    try:
+                        if hasattr(self.mobile_server, "sync_token_file"):
+                            self.mobile_server.sync_token_file()
+                    except Exception as _sync_exc:
+                        logger.debug("Mobil token dosya senkronu atlandı: %s", _sync_exc)
+            except Exception as _bind_exc:
+                logger.debug("Mobil token bağlama atlandı: %s", _bind_exc)
             self.mobile_server.start()
         except Exception as mob_exc:
-            logger.debug("MobileRemoteServer başlatma atlandı: %s", mob_exc)
+            # F-1140: başlatma hatası yalnızca debug loga gömülürdü.
+            self.mobile_server = None
+            logger.warning("MobileRemoteServer başlatılamadı: %s", mob_exc)
+            try:
+                self.overlay.add_log(f"⚠️ Mobil sunucu başlatılamadı: {mob_exc}")
+            except Exception as exc:
+                logger.debug("Mobil sunucu hatası overlay'e yazılamadı: %s", exc)
+
+        # F-0140 [O1]: imzalı ntfy komutlarını canlı sunucuya bağla.
+        if self.tunnel_mgr is not None:
+            try:
+                self.tunnel_mgr.set_remote_command_handler(self._on_remote_command)
+            except Exception as _rc_exc:
+                logger.debug("Uzaktan komut bağlama atlandı: %s", _rc_exc)
 
         # Otomatik Ücretsiz Cloudflare Tünelini arka planda başlat
         if self.tunnel_mgr is not None:
             def _on_mobile_tunnel_ready(public_url: str, method: str) -> None:
-                token = getattr(self.mobile_server, "auth_token", "") if self.mobile_server else ""
-                full_pub_url = f"{public_url}/?token={token}" if token else public_url
+                # Y-2 (dilim 22): 8765 doluysa sunucu 8766-8775'e geçer;
+                # tünel + LAN URL'si sunucunun GERÇEK portunu kullanır.
+                srv_port = 8765
+                try:
+                    if self.mobile_server is not None:
+                        srv_port = int(getattr(self.mobile_server, "port", 8765) or 8765)
+                except Exception:
+                    srv_port = 8765
+                # P2-25 (bölüm 8, F079-K1): token'lı URL hiçbir şekilde
+                # print edilmez — pythonw altında stdout logs/gatherion.log'a
+                # bağlanır, yani print == loga yazmak demektir. v16'da URL
+                # zaten "<redacted>" ile basılıyordu; baskı yine de tamamen
+                # kaldırıldı (token bu kapsama hiç okunmuyor): hazır bilgisi
+                # token'suz logger + overlay üzerinden verilir; gerçek
+                # bağlantı Mobil Bağlan penceresindeki QR kodla kurulur.
                 lan_ip = self._get_lan_ip()
-                full_lan_url = f"http://{lan_ip}:8765/?token={token}" if token else f"http://{lan_ip}:8765"
-                print("\n" + "=" * 76)
-                print("       📱 GATHERION MOBİL UZAKTAN KONTROL BAĞLANTISI HAZIR")
-                print("=" * 76)
-                print(f"  [+] İnternet Bağlantısı (Dünyanın Her Yerinden / Mobil Veri):")
-                print(f"      👉 {full_pub_url}")
-                print(f"  [+] Yerel Wi-Fi Bağlantısı (Aynı Ağdaki Telefonlar):")
-                print(f"      👉 {full_lan_url}")
-                print("=" * 76 + "\n")
-                logger.info("Mobil Tünel Aktif: %s (Wi-Fi: %s)", full_pub_url, full_lan_url)
+                logger.info(
+                    "Mobil Tünel Aktif: %s (Wi-Fi: http://%s:%d)",
+                    public_url,
+                    lan_ip,
+                    srv_port,
+                )
                 if hasattr(self, "overlay") and self.overlay is not None:
                     self.overlay.add_log(f"📱 Mobil Link: {public_url}")
                 try:
                     url_file = os.path.join(BASE_DIR, "config", "mobile_url.txt")
                     with open(url_file, "w", encoding="utf-8") as f:
-                        f.write(f"PUBLIC_URL={full_pub_url}\nLAN_URL={full_lan_url}\n")
-                except Exception:
-                    pass
+                        f.write(f"PUBLIC_URL={public_url}\nLAN_URL=http://{lan_ip}:{srv_port}\n")
+                except Exception as exc:
+                    logger.debug("mobile_url.txt yazılamadı: %s", exc)
 
             self.tunnel_mgr.on_url_ready = _on_mobile_tunnel_ready
+            # F-1198: cloudflared ikilisi zaten varsa indirme istenmez;
+            # yalnızca eksikse otomatik indirilir.
+            _cloudflared_missing = True
+            try:
+                _find_binary = getattr(self.tunnel_mgr, "find_cloudflared_binary", None)
+                if callable(_find_binary):
+                    _cloudflared_missing = _find_binary() is None
+            except Exception:
+                _cloudflared_missing = True
+            if _cloudflared_missing:
+                logger.info("cloudflared bulunamadı; otomatik indirme yapılacak.")
+            # Y-2 (dilim 22): tünel sunucunun gerçek portuna açılır.
+            _tunnel_port = 8765
+            try:
+                if self.mobile_server is not None:
+                    _tunnel_port = int(getattr(self.mobile_server, "port", 8765) or 8765)
+            except Exception:
+                _tunnel_port = 8765
             threading.Thread(
-                target=lambda: self.tunnel_mgr.start_tunnel(port=8765, auto_download_cloudflared=True),
+                target=lambda: self._start_tunnel_in_background(_tunnel_port, _cloudflared_missing),
                 name="AutoCloudflareStarter",
                 daemon=True,
             ).start()
+
+            # Y-6 (dilim 22): tünel koptuğunda bot kör devam etmesin.
+            # İzleyici 30 sn'de bir kontrol eder; süreç ölmüşse bayat
+            # URL temizlenir (check_tunnel_alive) ve tünel yeniden
+            # başlatılır (yeniden deneme en fazla 120 sn'de bir).
+            def _monitor_mobile_tunnel() -> None:
+                last_restart_ts = 0.0
+                while True:
+                    try:
+                        time.sleep(30.0)
+                    except Exception:
+                        return
+                    try:
+                        mgr = getattr(self, "tunnel_mgr", None)
+                        if mgr is None:
+                            return
+                        check = getattr(mgr, "check_tunnel_alive", None)
+                        if not callable(check):
+                            return
+                        if check():
+                            continue
+                        logger.warning(
+                            "Mobil tünel koptu (canlı değil); bayat URL temizlendi, yeniden başlatma denenecek."
+                        )
+                        try:
+                            lan_ip = self._get_lan_ip()
+                        except Exception:
+                            lan_ip = ""
+                        try:
+                            url_file = os.path.join(BASE_DIR, "config", "mobile_url.txt")
+                            with open(url_file, "w", encoding="utf-8") as f:
+                                f.write(f"LAN_URL=http://{lan_ip}:{_tunnel_port}\nTUNNEL_DOWN=1\n")
+                        except Exception as exc:
+                            logger.debug("mobile_url.txt bayat URL temizliği yazılamadı: %s", exc)
+                        now = time.time()
+                        if now - last_restart_ts < 120.0:
+                            continue
+                        last_restart_ts = now
+                        try:
+                            mgr.start_tunnel(port=_tunnel_port, auto_download_cloudflared=False)
+                        except Exception as exc:
+                            logger.warning("Mobil tünel yeniden başlatılamadı: %s", exc)
+                    except Exception as exc:
+                        logger.debug("Mobil tünel izleyici uyarısı: %s", exc)
+
+            threading.Thread(
+                target=_monitor_mobile_tunnel,
+                name="MobileTunnelMonitor",
+                daemon=True,
+            ).start()
+        self._startup_phase("9. Mobil sunucu + tünel")
 
         self._install_shell()
 
@@ -580,16 +1123,62 @@ class GatherionOrchestrator(QObject):
         self.worker.start()
 
         logger.info(
-            "Gatherion-Local v2.0 (Türkçe) başlatıldı (Bölge: %s | Rota: %s)",
+            f"Gatherion-Local v{__version__} (Türkçe) başlatıldı (Bölge: %s | Rota: %s)",
             self.route_mgr.active_region,
             self.route_mgr.active_route,
         )
         self.overlay.add_log(
-            "Gatherion v2.0 hazır "
+            f"Gatherion v{__version__} hazır "
             f"({getattr(self, '_pause_chord_label', 'Ctrl+Alt+F10')}: Durdur/Başlat, "
             f"{getattr(self, '_menu_chord_label', 'Ctrl+Alt+F9')}: Menü, "
             f"{getattr(self, '_node_chord_label', 'Ctrl+Alt+F8')}: Nokta Kaydet)"
         )
+        # sweep-26 F7: boş rotayla "hazır" deniyordu; bayrak yalnızca
+        # logda kalıyordu. Rota yoksa overlay'de de görünür.
+        if not self._initial_route_ready:
+            self.overlay.add_log(
+                "⚠️ Başlangıç rotası hazır değil — rota noktası eklenmeden "
+                "rota moduna geçmeyin."
+            )
+
+        # [STARTUP] Açılış tamam + arayüz hazır logu.
+        _startup_total = time.monotonic() - self._startup_t0
+        logger.info("[STARTUP] Açılış tamam: %.1f sn", _startup_total)
+        QTimer.singleShot(
+            0,
+            lambda: logger.info(
+                "[STARTUP] Arayüz hazır (UI responsive) — toplam %.1f sn",
+                time.monotonic() - self._startup_t0,
+            ),
+        )
+
+        # [UI-WATCHDOG] UI thread donma dedektörü: timer UI thread'de
+        # çalışır; donma sırasında tetiklenmez, donma bitince bir kez
+        # büyük farkla loglar — bu istenen davranış.
+        self._ui_watchdog_last_tick = time.monotonic()
+        self._ui_watchdog_timer = QTimer(self)
+        self._ui_watchdog_timer.setInterval(500)
+        self._ui_watchdog_timer.timeout.connect(self._on_ui_watchdog_tick)
+        self._ui_watchdog_timer.start()
+
+    def _startup_phase(self, label: str) -> None:
+        """[STARTUP] faz süresi + toplam açılış süresi logu."""
+        now = time.monotonic()
+        phase = now - self._startup_last_t
+        total = now - self._startup_t0
+        self._startup_last_t = now
+        logger.info("[STARTUP] %s: %.1f sn (toplam %.1f sn)", label, phase, total)
+
+    def _on_ui_watchdog_tick(self) -> None:
+        """500 ms'lik UI timer tick'i; 2 sn'yi aşan gecikme donma şüphesidir."""
+        now = time.monotonic()
+        gap = now - self._ui_watchdog_last_tick
+        self._ui_watchdog_last_tick = now
+        if gap > 2.0:
+            logger.warning(
+                "[UI-WATCHDOG] UI thread %.1f sn yanıt vermedi (donma şüphesi)",
+                gap,
+            )
 
     # =========================================================================
     # Initialization & Sync Helpers
@@ -617,11 +1206,63 @@ class GatherionOrchestrator(QObject):
         win = getattr(self, "settings_win", None)
         if win is not None and hasattr(win, "save_settings"):
             win.save_settings()
+            return
+        # sweep-26 F10: shell de ayar penceresi de yoksa kayıt sessizce
+        # atlanırdı — oturumdaki ayar değişikliği kaybolurdu.
+        logger.warning(
+            "Çıkışta ayar kaydı atlandı: ana pencere ve ayar penceresi yok."
+        )
 
-    def _ensure_initial_route_ready(self) -> None:
+    def _overlay_log_safe(self, message: str) -> None:
+        """Overlay'e log satırı; overlay yoksa/hatalıysa debug'da kalır."""
+        try:
+            overlay = getattr(self, "overlay", None)
+            if overlay is not None:
+                overlay.add_log(message)
+        except Exception as exc:
+            logger.debug("Overlay log yazılamadı: %s", exc)
+
+    def _start_tunnel_in_background(self, port: int, auto_download_cloudflared: bool) -> None:
+        """Tünel kurulumu arka plan thread'inde. sweep-26 F5: start_tunnel
+        dönüş değeri atılıyordu — cloudflared/tünel hatası hiç görünmüyordu.
+        Artık başarısızlık warning + overlay'de görünür.
+        port: mobil sunucunun gerçek portu (I Y-2 — 8765 sabitlenmez)."""
+        mgr = getattr(self, "tunnel_mgr", None)
+        if mgr is None:
+            return
+        try:
+            status = mgr.start_tunnel(
+                port=port, auto_download_cloudflared=auto_download_cloudflared
+            )
+        except Exception as exc:
+            logger.warning("Mobil tünel başlatılamadı: %s", exc)
+            self._overlay_log_safe(f"⚠️ Mobil tünel kurulamadı: {exc}")
+            return
+        started = False
+        error = ""
+        if isinstance(status, dict):
+            started = bool(status.get("tunnel_started"))
+            error = str(status.get("tunnel_error") or "")
+        else:
+            started = bool(status)
+        if not started:
+            logger.warning("Mobil tünel kurulamadı: %s", error or "bilinmeyen hata")
+            self._overlay_log_safe(
+                f"⚠️ Mobil tünel kurulamadı: {error or 'bilinmeyen hata'}"
+            )
+
+    def _get_lan_ip(self) -> str:
+        """F-1122: tünel-hazır geri çağrısının çağırdığı metot (önceden tanımsızdı)."""
+        return get_local_lan_ip()
+
+    def _ensure_initial_route_ready(self) -> bool:
         """
         Ensures the active region/route from settings exists in RouteManager.
         If Altgard · Dredgion Crash Site has no nodes yet, pre-populates or syncs cleanly.
+
+        Returns True only when the active route has at least one node
+        afterwards; False when route preparation failed or the route is
+        still empty (F-1199: bot boş rotayla "başlatıldı" sayılmaz).
         """
         try:
             target_reg = self.settings.active_region or "Altgard"
@@ -643,8 +1284,19 @@ class GatherionOrchestrator(QObject):
                 self.sequential_planner.apply_sequential_order_to_route(
                     self.route_mgr, region="Altgard", route="Dredgion Crash Site", mode="smooth_loop"
                 )
+                nodes = self.route_mgr.get_route_nodes(target_reg, target_rt)
+            if not nodes:
+                logger.warning(
+                    "Başlangıç rotası hazır değil: %s · %s için rota noktası yok; "
+                    "bot rota boşken başlatılıyor.",
+                    target_reg,
+                    target_rt,
+                )
+                return False
+            return True
         except Exception as exc:
-            logger.warning("Başlangıç rotası kontrol uyarısı: %s", exc)
+            logger.error("Başlangıç rotası hazırlanamadı: %s", exc)
+            return False
 
     def _connect_signals(self) -> None:
         """Wires signals between BotWorker, OverlayHUD, F9Menu, and HotkeyBridge."""
@@ -694,6 +1346,36 @@ class GatherionOrchestrator(QObject):
         self.hotkey_bridge.f8_pressed.connect(self._on_f8_record_node)
         self.hotkey_bridge.f10_pressed.connect(self.on_f10_hotkey)
         self.hotkey_bridge.user_key_interrupted.connect(self.worker.on_user_key_pressed)
+
+        # F-0569 [O1]: F9 menüsünü worker/overlay/route_manager ile bağla
+        # (shell bu noktada henüz None — _install_shell'da yeniden bağlanır).
+        try:
+            self.f9_menu.bind_targets(
+                shell=getattr(self, "shell", None),
+                overlay=self.overlay,
+                worker=self.worker,
+                route_manager=self.route_mgr,
+            )
+        except Exception as _bind_exc:
+            logger.debug("F9Menu bind_targets atlandı: %s", _bind_exc)
+
+    def _on_remote_command(self, cmd: str, record: Dict[str, Any]) -> None:
+        """F-0140 [O1]: imzalı ntfy uzaktan komutunu canlı HTTP sunucusunun
+        execute_action dispatcher'ına yönlendir. ntfy komut adları sunucunun
+        eylem adlarına çevrilir (f8->record_f8, skip->skip_node,
+        panic->panic_stop); çevrilemeyenler execute_action'da dürüstçe
+        reddedilir (ok:False)."""
+        server = getattr(self, "mobile_server", None)
+        if server is None or not hasattr(server, "execute_action"):
+            logger.debug("Uzaktan komut yoksayıldı (mobil sunucu yok): %s", cmd)
+            return
+        action_map = {"f8": "record_f8", "skip": "skip_node", "panic": "panic_stop"}
+        payload = dict((record or {}).get("meta") or {})
+        payload["action"] = action_map.get(str(cmd).strip().lower(), str(cmd).strip().lower())
+        try:
+            server.execute_action(payload)
+        except Exception as exc:
+            logger.warning("Uzaktan komut çalıştırılamadı (%s): %s", cmd, exc)
 
     @pyqtSlot(dict)
     def _on_worker_hud_update(self, data: dict) -> None:
@@ -785,6 +1467,20 @@ class GatherionOrchestrator(QObject):
             claimed.add("f9")
         if results.get("F10"):
             claimed.add("f10")
+        # F-1200: üç akor da kaydedilemezse hiçbir uyarı yoktu.
+        if not claimed:
+            logger.warning(
+                "Yerel kısayol akorlarının hiçbiri kaydedilemedi "
+                "(F8/F9/F10: %s); kısayollar yalnızca klavye kancasıyla çalışır.",
+                results,
+            )
+            try:
+                self.overlay.add_log("⚠️ Yerel kısayollar kaydedilemedi (F8/F9/F10).")
+            except Exception as exc:
+                logger.debug("Kısayol hatası overlay'e yazılamadı: %s", exc)
+        elif len(claimed) < 3:
+            missing = {"f8", "f9", "f10"} - claimed
+            logger.warning("Yerel kısayol akorları kısmen kaydedildi; eksik: %s", sorted(missing))
         listener = getattr(self.input_ctrl, "hotkey_listener", None)
         if listener is not None and hasattr(listener, "set_hook_actions"):
             listener.set_hook_actions({"f8", "f9", "f10"} - claimed)
@@ -816,6 +1512,30 @@ class GatherionOrchestrator(QObject):
             self.tray.setToolTip(self.APP_TITLE)
 
             tray_menu = QMenu()
+            tray_menu.setStyleSheet("""
+                QMenu {
+                    background-color: #181b20;
+                    color: #e5e7eb;
+                    border: 1px solid #2d323b;
+                    border-radius: 6px;
+                    padding: 4px;
+                    font-family: 'Segoe UI', sans-serif;
+                    font-size: 13px;
+                }
+                QMenu::item {
+                    padding: 8px 22px 8px 14px;
+                    border-radius: 4px;
+                }
+                QMenu::item:selected {
+                    background-color: #2563eb;
+                    color: #ffffff;
+                }
+                QMenu::separator {
+                    height: 1px;
+                    background: #2d323b;
+                    margin: 6px 8px;
+                }
+            """)
             act_resume = QAction(
                 f"Devam Et / Duraklat ({getattr(self, '_pause_chord_label', 'Ctrl+Alt+F10')})",
                 self.app,
@@ -929,18 +1649,17 @@ class GatherionOrchestrator(QObject):
                     if p_widget is not None:
                         self._on_shell_page_created(p_key, p_widget)
 
-            # Query page() for all standard NAV keys
-            for nav_key in ("settings", "radar", "map", "yolo", "calibration", "stats", "mobile", "guide"):
-                getter = getattr(self.shell, "page", None)
-                if callable(getter):
-                    try:
-                        p = getter(nav_key)
-                        if p is not None:
-                            self._on_shell_page_created(nav_key, p)
-                    except Exception as exc:
-                        logger.debug("Sayfa sorgulama uyarısı (%s): %s", nav_key, exc)
+            # [STARTUP] Eager sayfa sorgulama döngüsü kaldırıldı: shell.page()
+            # çağrısı lazy sayfaları zorla kurdurup açılışı yavaşlatıyordu.
+            # Sayfa bağlaması page_created sinyali + _mount/open_tool
+            # hook'larıyla (_hook_shell_page_creation) çalışmaya devam eder.
 
             self.shell.show()
+            # F-0569 [O1]: shell artık var — F9 menüsüne shell'i de bağla.
+            try:
+                self.f9_menu.bind_targets(shell=self.shell)
+            except Exception as _bind_exc:
+                logger.debug("F9Menu shell bind atlandı: %s", _bind_exc)
         except Exception as exc:
             logger.error("Ana pencere kurulamadı, F9 menüsü ayrı açılacak: %s", exc, exc_info=True)
             self.shell = None
@@ -1015,14 +1734,7 @@ class GatherionOrchestrator(QObject):
         if norm_key == "calibration":
             self.calibration_win = widget
             if hasattr(widget, "template_updated"):
-                try:
-                    widget.template_updated.disconnect(self._on_template_updated)
-                except Exception:
-                    pass
-                try:
-                    widget.template_updated.connect(self._on_template_updated)
-                except Exception as exc:
-                    logger.debug("calibration_win.template_updated bağlama hatası: %s", exc)
+                _safe_reconnect(widget.template_updated, self._on_template_updated)
 
         elif norm_key == "map":
             self.map_viewer_win = widget
@@ -1038,41 +1750,13 @@ class GatherionOrchestrator(QObject):
         elif norm_key == "settings":
             self.settings_win = widget
             if hasattr(widget, "settings_saved"):
-                try:
-                    widget.settings_saved.disconnect(self._on_settings_saved)
-                except Exception:
-                    pass
-                try:
-                    widget.settings_saved.connect(self._on_settings_saved)
-                except Exception:
-                    pass
+                _safe_reconnect(widget.settings_saved, self._on_settings_saved)
             if hasattr(widget, "quit_requested"):
-                try:
-                    widget.quit_requested.disconnect(self.shutdown)
-                except Exception:
-                    pass
-                try:
-                    widget.quit_requested.connect(self.shutdown)
-                except Exception:
-                    pass
+                _safe_reconnect(widget.quit_requested, self.shutdown)
             if hasattr(widget, "route_changed"):
-                try:
-                    widget.route_changed.disconnect(self._on_settings_route_changed)
-                except Exception:
-                    pass
-                try:
-                    widget.route_changed.connect(self._on_settings_route_changed)
-                except Exception as exc:
-                    logger.debug("settings_win.route_changed bağlama hatası: %s", exc)
+                _safe_reconnect(widget.route_changed, self._on_settings_route_changed)
             if hasattr(widget, "selective_gather_changed"):
-                try:
-                    widget.selective_gather_changed.disconnect(self.handle_selective_gather_changed)
-                except Exception:
-                    pass
-                try:
-                    widget.selective_gather_changed.connect(self.handle_selective_gather_changed)
-                except Exception as exc:
-                    logger.debug("settings_win.selective_gather_changed bağlama hatası: %s", exc)
+                _safe_reconnect(widget.selective_gather_changed, self.handle_selective_gather_changed)
 
         elif norm_key == "radar":
             self.radar_win = widget
@@ -1113,8 +1797,8 @@ class GatherionOrchestrator(QObject):
                 if hasattr(worker_scanner, "_load_optional_templates"):
                     try:
                         worker_scanner._load_optional_templates()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("İsteğe bağlı şablonlar yüklenemedi: %s", exc)
 
             # 3. Reload Material Scanner optional templates if available
             mat_scanner = getattr(self, "material_scanner", None)
@@ -1156,13 +1840,13 @@ class GatherionOrchestrator(QObject):
                         try:
                             auto_labeler.exemplar_memory._last_loaded_mtime = -1.0
                             auto_labeler.exemplar_memory.load()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("Exemplar memory yüklenemedi: %s", exc)
                     if hasattr(auto_labeler, "reload_exemplars"):
                         try:
                             auto_labeler.reload_exemplars()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("Exemplar'lar yeniden yüklenemedi: %s", exc)
 
             t_name = os.path.basename(str(template_path)) if template_path else "şablon"
             if hasattr(self, "overlay") and hasattr(self.overlay, "add_log"):
@@ -1260,45 +1944,10 @@ class GatherionOrchestrator(QObject):
         if widget is None:
             return
 
-        if hasattr(widget, "node_toggled"):
-            try:
-                widget.node_toggled.disconnect(self._on_map_node_toggled)
-            except Exception:
-                pass
-            try:
-                widget.node_toggled.connect(self._on_map_node_toggled)
-            except Exception:
-                pass
-
-        if hasattr(widget, "node_deleted"):
-            try:
-                widget.node_deleted.disconnect(self._on_map_node_deleted)
-            except Exception:
-                pass
-            try:
-                widget.node_deleted.connect(self._on_map_node_deleted)
-            except Exception:
-                pass
-
-        if hasattr(widget, "route_changed"):
-            try:
-                widget.route_changed.disconnect(self._on_settings_route_changed)
-            except Exception:
-                pass
-            try:
-                widget.route_changed.connect(self._on_settings_route_changed)
-            except Exception:
-                pass
-
-        if hasattr(widget, "region_changed"):
-            try:
-                widget.region_changed.disconnect(self._on_settings_route_changed)
-            except Exception:
-                pass
-            try:
-                widget.region_changed.connect(self._on_settings_route_changed)
-            except Exception:
-                pass
+        _safe_reconnect(getattr(widget, "node_toggled", None), self._on_map_node_toggled)
+        _safe_reconnect(getattr(widget, "node_deleted", None), self._on_map_node_deleted)
+        _safe_reconnect(getattr(widget, "route_changed", None), self._on_settings_route_changed)
+        _safe_reconnect(getattr(widget, "region_changed", None), self._on_settings_route_changed)
 
         canvas = getattr(widget, "canvas", None)
         if canvas is not None:
@@ -1307,45 +1956,67 @@ class GatherionOrchestrator(QObject):
                 if sig is not None and hasattr(sig, "connect"):
                     try:
                         sig.connect(self._on_canvas_node_added)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("MapViewer canvas sinyali (%s) bağlanamadı: %s", sig_name, exc)
             for sig_name in ("node_moved", "node_dragged", "node_position_changed"):
                 sig = getattr(canvas, sig_name, None)
                 if sig is not None and hasattr(sig, "connect"):
                     try:
                         sig.connect(self._on_canvas_node_moved)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("MapViewer canvas sinyali (%s) bağlanamadı: %s", sig_name, exc)
 
     def _connect_yolo_factory_signals(self, widget: Any) -> None:
         """Connects model publish signals/buttons to live ONNX reload in self.worker."""
         if widget is None:
             return
+        # [P2-19/F044-02] Odak/modalite kararı: YOLO Fabrikası açıkken
+        # bot durur. Interception HID enjeksiyonu OS seviyesinde gerçek
+        # tuş gibi görünür — dialog, botun R basışını insanın R basışından
+        # ayırt edemez; Alt-Tab auto-pause da kurtarmaz (own-PID pencereler
+        # "Gatherion UI" sayılıp odaklı sayılır). Dialog görünürken
+        # `BotWorker.pause`, gizlenince/kapanınca yalnızca dialogun
+        # duraklattığı bot `resume` edilir (kullanıcının önceden
+        # duraklattığı bota dokunulmaz — bayrak dialog tarafında tutulur).
+        if hasattr(widget, "set_bot_pause_hooks"):
+            try:
+                worker = getattr(self, "worker", None)
+                if worker is not None:
+                    widget.set_bot_pause_hooks(
+                        pause_fn=lambda: worker.pause(
+                            "YOLO Fabrikası açık — bot duraklatıldı"
+                        ),
+                        resume_fn=worker.resume,
+                        is_paused_fn=lambda: bool(getattr(worker, "is_paused", False)),
+                    )
+            except Exception as exc:
+                logger.debug("YOLO factory bot-pause kancası bağlanamadı: %s", exc)
         if hasattr(widget, "model_published"):
-            try:
-                widget.model_published.disconnect(self.reload_ai_model)
-            except Exception:
-                pass
-            try:
-                widget.model_published.connect(self.reload_ai_model)
-            except Exception:
-                pass
+            _safe_reconnect(widget.model_published, self.reload_ai_model)
         btn_pub = getattr(widget, "btn_publish", None)
         if btn_pub is not None and hasattr(btn_pub, "clicked"):
             try:
                 btn_pub.clicked.connect(lambda: QTimer.singleShot(600, self.reload_ai_model))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("YOLO factory btn_publish connect atlandı: %s", exc)
+
+    def _refresh_map_views(self) -> None:
+        """HUD snapshot + radar + settings-table refresh shared by the four
+        map/node sync handlers. Raises so callers keep their own error
+        logging (identical to the pre-refactor behaviour)."""
+        self.worker._emit_hud_snapshot()
+        for window, method in (
+            (getattr(self, "radar_win", None), "reload_map_and_nodes"),
+            (getattr(self, "settings_win", None), "load_nodes_table"),
+        ):
+            if window is not None and hasattr(window, method):
+                getattr(window, method)()
 
     @pyqtSlot(int)
     def _on_map_node_toggled(self, node_id: int) -> None:
         try:
             self.overlay.add_log(f"Harita: Nokta #{node_id} durumu güncellendi")
-            self.worker._emit_hud_snapshot()
-            if self.radar_win is not None and hasattr(self.radar_win, "reload_map_and_nodes"):
-                self.radar_win.reload_map_and_nodes()
-            if self.settings_win is not None and hasattr(self.settings_win, "load_nodes_table"):
-                self.settings_win.load_nodes_table()
+            self._refresh_map_views()
         except Exception as exc:
             logger.debug("Map node toggled hatası: %s", exc)
 
@@ -1353,31 +2024,19 @@ class GatherionOrchestrator(QObject):
     def _on_map_node_deleted(self, node_id: int) -> None:
         try:
             self.overlay.add_log(f"Harita: Nokta #{node_id} silindi")
-            self.worker._emit_hud_snapshot()
-            if self.radar_win is not None and hasattr(self.radar_win, "reload_map_and_nodes"):
-                self.radar_win.reload_map_and_nodes()
-            if self.settings_win is not None and hasattr(self.settings_win, "load_nodes_table"):
-                self.settings_win.load_nodes_table()
+            self._refresh_map_views()
         except Exception as exc:
             logger.debug("Map node deleted hatası: %s", exc)
 
     def _on_canvas_node_added(self, *args: Any) -> None:
         try:
-            self.worker._emit_hud_snapshot()
-            if self.radar_win is not None and hasattr(self.radar_win, "reload_map_and_nodes"):
-                self.radar_win.reload_map_and_nodes()
-            if self.settings_win is not None and hasattr(self.settings_win, "load_nodes_table"):
-                self.settings_win.load_nodes_table()
+            self._refresh_map_views()
         except Exception as exc:
             logger.debug("Canvas node added sync hatası: %s", exc)
 
     def _on_canvas_node_moved(self, *args: Any) -> None:
         try:
-            self.worker._emit_hud_snapshot()
-            if self.radar_win is not None and hasattr(self.radar_win, "reload_map_and_nodes"):
-                self.radar_win.reload_map_and_nodes()
-            if self.settings_win is not None and hasattr(self.settings_win, "load_nodes_table"):
-                self.settings_win.load_nodes_table()
+            self._refresh_map_views()
         except Exception as exc:
             logger.debug("Canvas node moved sync hatası: %s", exc)
 
@@ -1407,56 +2066,54 @@ class GatherionOrchestrator(QObject):
         logger.info("Canlı ONNX modeli yeniden yükleniyor: %s", target_path)
         reloaded = False
 
-        # 1. Update self.yolo_detector
+        # 1-3. Reload each detector via the shared helper (F-1137: a False
+        # load result must never be reported as a live update).
+        # NOTE: the state_machine detector's load exception used to log at
+        # debug level; the helper logs it at warning like the other two.
         if hasattr(self, "yolo_detector") and self.yolo_detector is not None:
-            try:
-                self.yolo_detector.model_path = target_path
-                if hasattr(self.yolo_detector, "_load_model_if_available"):
-                    self.yolo_detector._load_model_if_available()
-                    reloaded = True
-            except Exception as exc:
-                logger.warning("self.yolo_detector yeniden yükleme hatası: %s", exc)
+            if _reload_detector(self.yolo_detector, target_path, "self.yolo_detector"):
+                reloaded = True
 
         # 2. Update self.worker.yolo_detector
         worker_detector = getattr(self.worker, "yolo_detector", None)
         if worker_detector is not None and worker_detector is not getattr(self, "yolo_detector", None):
-            try:
-                worker_detector.model_path = target_path
-                if hasattr(worker_detector, "_load_model_if_available"):
-                    worker_detector._load_model_if_available()
-                    reloaded = True
-            except Exception as exc:
-                logger.warning("worker.yolo_detector yeniden yükleme hatası: %s", exc)
+            if _reload_detector(worker_detector, target_path, "worker.yolo_detector"):
+                reloaded = True
 
         # 3. If worker has state_machine with yolo_detector
         sm = getattr(self.worker, "state_machine", None)
         if sm is not None:
             sm_detector = getattr(sm, "yolo_detector", None)
             if sm_detector is not None and sm_detector is not getattr(self, "yolo_detector", None):
-                try:
-                    sm_detector.model_path = target_path
-                    if hasattr(sm_detector, "_load_model_if_available"):
-                        sm_detector._load_model_if_available()
-                        reloaded = True
-                except Exception:
-                    pass
+                if _reload_detector(sm_detector, target_path, "state_machine yolo_detector"):
+                    reloaded = True
 
         # 4. If worker has dedicated reload methods
         if hasattr(self.worker, "reload_model"):
             try:
-                self.worker.reload_model(target_path)
-                reloaded = True
+                _reload_result = self.worker.reload_model(target_path)
+                if _reload_result is not False:
+                    reloaded = True
             except Exception as exc:
                 logger.debug("worker.reload_model hatası: %s", exc)
         elif hasattr(self.worker, "reload_yolo_weights"):
             try:
-                self.worker.reload_yolo_weights(target_path)
-                reloaded = True
+                _reload_result = self.worker.reload_yolo_weights(target_path)
+                if _reload_result is not False:
+                    reloaded = True
             except Exception as exc:
                 logger.debug("worker.reload_yolo_weights hatası: %s", exc)
 
-        if hasattr(self, "overlay") and hasattr(self.overlay, "add_log"):
-            self.overlay.add_log(f"YZ Modeli canlı güncellendi: {os.path.basename(target_path)}")
+        if reloaded:
+            if hasattr(self, "overlay") and hasattr(self.overlay, "add_log"):
+                self.overlay.add_log(f"YZ Modeli canlı güncellendi: {os.path.basename(target_path)}")
+        else:
+            logger.warning(
+                "ONNX modeli canlı güncellenemedi: %s (hiçbir dedektör modeli yükleyemedi)",
+                target_path,
+            )
+            if hasattr(self, "overlay") and hasattr(self.overlay, "add_log"):
+                self.overlay.add_log("⚠️ YZ Modeli güncellenemedi (model yüklenemedi).")
 
         return reloaded
 
@@ -1553,20 +2210,18 @@ class GatherionOrchestrator(QObject):
                 self.overlay.add_log(f"🛑 [{pause_name}] Bot Durduruldu!")
                 logger.info("[Hotkey] %s -> bot kullanıcı tarafından durduruldu.", pause_name)
                 try:
-                    import winsound
                     winsound.Beep(700, 180)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Bip sesi çalınamadı: %s", exc)
             else:
                 pause_name = getattr(self, "_pause_chord_label", "Ctrl+Alt+F10")
                 self.worker.resume()
                 self.overlay.add_log(f"▶️ [{pause_name}] Bot Başlatıldı / Devam Ediyor.")
                 logger.info("[Hotkey] %s -> bot tekrar başlatıldı/devam ettirildi.", pause_name)
                 try:
-                    import winsound
                     winsound.Beep(1200, 150)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Bip sesi çalınamadı: %s", exc)
         except Exception as exc:
             logger.error("F10 kısayolu işlenirken hata: %s", exc)
 
@@ -1580,12 +2235,24 @@ class GatherionOrchestrator(QObject):
             recorded = self.worker.trigger_f8_record()
             region = self.route_mgr.active_region or "Altgard"
             route = self.route_mgr.active_route or "Dredgion Crash Site"
-            logger.info(
-                "F8 ile mevcut konum rota noktası olarak kaydedildi (%s · %s).",
-                region,
-                route,
-            )
-            self.overlay.add_log(f"F8: Yeni nokta kaydedildi ({region} · {route})")
+            # F-1138: trigger_f8_record() None dönerken (kuyruğa alındı veya
+            # başarısız) koşulsuz "kaydedildi" yazılırdı.
+            if isinstance(recorded, dict):
+                logger.info(
+                    "F8 ile mevcut konum rota noktası olarak kaydedildi (%s · %s).",
+                    region,
+                    route,
+                )
+                self.overlay.add_log(f"F8: Yeni nokta kaydedildi ({region} · {route})")
+            elif getattr(self.worker, "isRunning", lambda: False)():
+                # Worker çalışırken kayıt kuyruğa alınır; sonuç
+                # node_recorded sinyaliyle gelir.
+                logger.info("F8 kaydı kuyruğa alındı (%s · %s).", region, route)
+                self.overlay.add_log(f"F8: Nokta kaydı kuyruğa alındı ({region} · {route})")
+            else:
+                logger.warning("F8 nokta kaydı başarısız oldu (%s · %s).", region, route)
+                self.overlay.add_log(f"⚠️ F8: Nokta kaydedilemedi ({region} · {route})")
+                return
             self.worker._emit_hud_snapshot()
 
             if self.map_viewer_win is not None and self.map_viewer_win.isVisible():
@@ -1608,41 +2275,25 @@ class GatherionOrchestrator(QObject):
         """Handles selections emitted from F9Menu or System Tray."""
         self.handle_menu_action(action)
 
+    def _activate_bot_mode(self, mode_value: Optional[str], watchdog_state: str) -> None:
+        """Shared resume/set_mode sequence for the menu mode actions listed
+        in _MENU_MODE_ACTIONS (mode_value None = plain resume, no set_mode)."""
+        if hasattr(self.watchdog, "set_paused"):
+            self.watchdog.set_paused(False, state=watchdog_state)
+        if mode_value is not None:
+            self.worker.set_mode(mode_value)
+        self.worker.resume()
+
     @pyqtSlot(str)
     def handle_menu_action(self, action: str) -> None:
         """Handles selections emitted from F9Menu or System Tray."""
         act = (action or "").strip().lower()
         logger.info("Menü eylemi tetiklendi: %s", act)
 
-        if act == "resume":
-            if hasattr(self.watchdog, "set_paused"):
-                self.watchdog.set_paused(False, state="WALKING")
-            self.worker.resume()
-        elif act == "auto_record":
-            if hasattr(self.watchdog, "set_paused"):
-                self.watchdog.set_paused(False, state="WALKING")
-            self.worker.set_mode(BotMode.AUTO_RECORD.value)
-            self.worker.resume()
-        elif act == "manual_record":
-            if hasattr(self.watchdog, "set_paused"):
-                self.watchdog.set_paused(False, state="WAITING")
-            self.worker.set_mode(BotMode.MANUAL_RECORD.value)
-            self.worker.resume()
-        elif act in ("explorer", "explorer_mode"):
-            if hasattr(self.watchdog, "set_paused"):
-                self.watchdog.set_paused(False, state="WALKING")
-            self.worker.set_mode(BotMode.EXPLORER_MODE.value)
-            self.worker.resume()
-        elif act in ("combat", "combat_mode", "savas", "savaş", "fight"):
-            if hasattr(self.watchdog, "set_paused"):
-                self.watchdog.set_paused(False, state="FIGHTING")
-            self.worker.set_mode(BotMode.COMBAT_MODE.value)
-            self.worker.resume()
-        elif act in ("route", "route_mode", "gather", "topla"):
-            if hasattr(self.watchdog, "set_paused"):
-                self.watchdog.set_paused(False, state="WALKING")
-            self.worker.set_mode(BotMode.ROUTE_MODE.value)
-            self.worker.resume()
+        mode_action = _MENU_MODE_ACTIONS.get(act)
+        if mode_action is not None:
+            mode_value, watchdog_state = mode_action
+            self._activate_bot_mode(mode_value, watchdog_state)
         elif act in ("toggle_minimap_auto_record", "minimap_auto_record"):
             if hasattr(self.f9_menu, "is_minimap_auto_record_enabled"):
                 self._on_minimap_auto_record_toggled(
@@ -1667,15 +2318,38 @@ class GatherionOrchestrator(QObject):
         elif act in ("guide", "stuck_guide"):
             self.open_guide_dialog()
         elif act in ("copy_support", "support"):
-            SupportDiagnostics.copy_report_to_clipboard(
+            # F-1192: copy_report_to_clipboard rapor metnini döner, kopya
+            # başarısını bildirmez; pano içeriği doğrulanarak yazılır.
+            report_text = SupportDiagnostics.copy_report_to_clipboard(
                 settings=self.settings,
                 route_manager=self.route_mgr,
                 telemetry=self.telemetry,
                 log_path=LOG_FILE,
             )
-            self.overlay.add_log("Destek tanılama raporu panoya kopyalandı")
+            copied = False
+            try:
+                from PyQt6.QtWidgets import QApplication
+
+                app = QApplication.instance()
+                clipboard = QApplication.clipboard() if app is not None else None
+                if clipboard is not None and isinstance(report_text, str) and report_text:
+                    copied = clipboard.text() == report_text
+            except Exception as exc:
+                logger.debug("Pano doğrulama okuması atlandı: %s", exc)
+            if copied:
+                self.overlay.add_log("Destek tanılama raporu panoya kopyalandı")
+            else:
+                logger.warning("Destek raporu panoya kopyalanamadı (doğrulama başarısız).")
+                self.overlay.add_log("⚠️ Destek raporu panoya kopyalanamadı.")
         elif act in ("exit", "quit"):
             self.shutdown()
+        else:
+            # F-1252: bilinmeyen menü eylemi sessizce yutulurdu.
+            logger.warning("Bilinmeyen menü eylemi yoksayıldı: %r", action)
+            try:
+                self.overlay.add_log(f"⚠️ Bilinmeyen menü eylemi: {act}")
+            except Exception as exc:
+                logger.debug("Bilinmeyen menü eylemi overlay'e yazılamadı: %s", exc)
 
     @pyqtSlot(str, str)
     def handle_route_selected(self, region: str, route: str) -> None:
@@ -1752,17 +2426,30 @@ class GatherionOrchestrator(QObject):
                 )
                 if hasattr(routes, "build_proximity_material_route"):
                     try:
-                        routes.build_proximity_material_route(
+                        # S-6901: dönüş değeri yok sayılmayacak — [] dönerse
+                        # (bölge yüklenemedi / materyale uyan düğüm yok,
+                        # core/route_manager.py:2155,2166) 'oluşturuldu' logu
+                        # yazılmaz, uyarı loglanır.
+                        route_nodes = routes.build_proximity_material_route(
                             region_name=region,
                             target_materials=mats,
                             start_xy=start_xy,
                             persist_route=True,
                         )
-                        logger.info(
-                            "Yakınlığa göre materyal rotası oluşturuldu: %s · %s",
-                            region,
-                            mats,
-                        )
+                        if route_nodes:
+                            logger.info(
+                                "Yakınlığa göre materyal rotası oluşturuldu: %s · %s (%d düğüm)",
+                                region,
+                                mats,
+                                len(route_nodes),
+                            )
+                        else:
+                            logger.warning(
+                                "Yakınlığa göre materyal rotası oluşturulamadı: %s · %s "
+                                "— bölge yüklenemedi veya materyale uyan düğüm yok",
+                                region,
+                                mats,
+                            )
                     except Exception as prox_exc:
                         logger.debug(
                             "build_proximity_material_route çağrı hatası: %s", prox_exc
@@ -1770,8 +2457,8 @@ class GatherionOrchestrator(QObject):
                 if worker is not None and hasattr(worker, "_auto_sort_sequential_route"):
                     try:
                         worker._auto_sort_sequential_route(mode="smooth_loop")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Seçili rota otomatik sıralanamadı: %s", exc)
 
             # 4. Notify MapViewerWindow
             map_win = getattr(self, "map_viewer_win", None)
@@ -1832,8 +2519,8 @@ class GatherionOrchestrator(QObject):
                         self.f9_menu.set_selected_materials(
                             mats, auto_proximity=auto_prox
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("F9 menü malzeme seçimi uygulanamadı: %s", exc)
 
             if hasattr(self, "settings_win") and self.settings_win is not None:
                 if hasattr(self.settings_win, "set_selected_materials"):
@@ -1841,8 +2528,8 @@ class GatherionOrchestrator(QObject):
                         self.settings_win.set_selected_materials(
                             mats, auto_proximity=auto_prox
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Ayar penceresi malzeme seçimi uygulanamadı: %s", exc)
 
             if worker is not None and hasattr(worker, "_emit_hud_snapshot"):
                 worker._emit_hud_snapshot()
@@ -1943,7 +2630,18 @@ class GatherionOrchestrator(QObject):
             return
         try:
             if self.settings_win is None:
-                self.settings_win = SettingsWindow(self.settings_mgr, self.route_mgr)
+                # S-4301: live server + shared token authenticator are
+                # wired in so the "Mobil Token Döndür" button in the
+                # live SettingsWindow actually rotates the token the
+                # server enforces (previously the rotation code lived
+                # only in the never-instantiated SettingsDialog).
+                self.settings_win = SettingsWindow(
+                    self.settings_mgr,
+                    self.route_mgr,
+                    mobile_server=self.mobile_server,
+                    mobile_token_auth=self.mobile_token_auth,
+                    telemetry=self.telemetry,
+                )
                 self.settings_win.setWindowTitle(f"{self.APP_TITLE} — Ayarlar & Noktalar")
                 if hasattr(self.settings_win, "settings_saved"):
                     self.settings_win.settings_saved.connect(self._on_settings_saved)
@@ -1961,6 +2659,22 @@ class GatherionOrchestrator(QObject):
         except Exception as exc:
             logger.error("SettingsWindow açılamadı: %s", exc, exc_info=True)
 
+    @staticmethod
+    def _resolve_pause_on_alt_tab(settings: Any) -> bool:
+        """F-1193: `or` mantığı açık False ayarını yok sayardı.
+
+        route.pause_on_alt_tab açıkça False ise False'dur; yalnızca
+        ayarlanmamışsa (None/eksik) gathering değerine, o da yoksa True'ya
+        düşülür.
+        """
+        route_val = getattr(getattr(settings, "route", None), "pause_on_alt_tab", None)
+        if route_val is not None:
+            return bool(route_val)
+        gathering_val = getattr(getattr(settings, "gathering", None), "pause_on_alt_tab", None)
+        if gathering_val is not None:
+            return bool(gathering_val)
+        return True
+
     def _on_settings_saved(self) -> None:
         try:
             self.settings = self.settings_mgr.load()
@@ -1973,11 +2687,17 @@ class GatherionOrchestrator(QObject):
             self.overlay.add_log("Ayarlar kaydedildi ve uygulandı")
             if hasattr(self.worker, "set_pause_on_alt_tab"):
                 self.worker.set_pause_on_alt_tab(
-                    bool(
-                        getattr(self.settings.route, "pause_on_alt_tab", True)
-                        or getattr(self.settings.gathering, "pause_on_alt_tab", True)
-                    )
+                    self._resolve_pause_on_alt_tab(self.settings)
                 )
+            # F-23-01/F-23-11: iksir eşikleri + keşif oranını canlı nesnelere
+            # yaz (ManaPhaseCombat.set_thresholds, SlotEconomy.set_explore_ratio).
+            # Eskiden bu değerler yalnızca bot başlangıcında okunuyor, ayar
+            # değişse bile yeniden başlatmaya kadar eski değer kullanılıyordu.
+            if hasattr(self.worker, "refresh_consumable_settings"):
+                try:
+                    self.worker.refresh_consumable_settings()
+                except Exception as exc:
+                    logger.debug("Canlı tüketim/keşif ayarları uygulanamadı: %s", exc)
             self._apply_hotkey_labels()
             self._register_native_chords()
             self.worker._emit_hud_snapshot()
@@ -1994,6 +2714,19 @@ class GatherionOrchestrator(QObject):
                 route_manager=self.route_mgr, region_name=region, route_name=route
             )
             self._connect_map_viewer_signals(self.map_viewer_win)
+            # v20/map-nodes: bağımsız pencere de keşif anında yenilensin.
+            # register_map_viewer üretimde hiç çağrılmıyordu ve bu pencereye
+            # set_auto_cartographer da yapılmıyordu — poll'u kartografsız
+            # no-op'tu, düğüm ancak pencere yeniden açılınca görünürdü.
+            try:
+                explorer = getattr(self, "explorer_ctrl", None)
+                if explorer is not None and hasattr(explorer, "register_map_viewer"):
+                    explorer.register_map_viewer(self.map_viewer_win)
+                cartographer = getattr(explorer, "auto_cartographer", None) if explorer is not None else None
+                if cartographer is not None and hasattr(self.map_viewer_win, "set_auto_cartographer"):
+                    self.map_viewer_win.set_auto_cartographer(cartographer)
+            except Exception as exc:
+                logger.debug("Harita görüntüleyici canlı senkronizasyona bağlanamadı: %s", exc)
             self.map_viewer_win.show()
             self.map_viewer_win.raise_()
         except Exception as exc:
@@ -2065,6 +2798,8 @@ class GatherionOrchestrator(QObject):
                     factory_controller=factory_ctrl,
                     parent=self.settings_win,
                 )
+                if hasattr(self.yolo_factory_win, "set_shared_yolo_detector"):
+                    self.yolo_factory_win.set_shared_yolo_detector(self.yolo_detector)
                 self._connect_yolo_factory_signals(self.yolo_factory_win)
             self.yolo_factory_win.show()
             self.yolo_factory_win.raise_()
@@ -2086,8 +2821,8 @@ class GatherionOrchestrator(QObject):
                             dialog = fn("yolo")
                             if dialog is not None:
                                 break
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("YOLO dialog getter hatası yoksayıldı: %s", exc)
                 if dialog is None and hasattr(self.shell, "pages"):
                     dialog = self.shell.pages.get("yolo")
                 if dialog is not None:
@@ -2149,8 +2884,10 @@ class GatherionOrchestrator(QObject):
         except Exception as exc:
             logger.warning("Günlük dosyası harici olarak açılamadı: %s", exc)
 
-    def get_mobile_dashboard_url(self) -> str:
-        """Returns the live Mobile Remote Dashboard URL (http://<LAN_IP>:8765)."""
+    def get_mobile_dashboard_url(self) -> Optional[str]:
+        """Canlı mobil panel URL'si. sweep-26 F5: sunucu çalışmıyorken bile
+        ölü `http://<LAN>:8765` döndürüyordu; artık None döner — banner
+        ölü link basmaz."""
         try:
             if self.mobile_server is not None:
                 if hasattr(self.mobile_server, "get_lan_url") and callable(
@@ -2159,125 +2896,283 @@ class GatherionOrchestrator(QObject):
                     return str(self.mobile_server.get_lan_url())
                 if hasattr(self.mobile_server, "lan_url") and self.mobile_server.lan_url:
                     return str(self.mobile_server.lan_url)
-        except Exception:
-            logger.debug("Mobile server URL lookup fallback")
-        return f"http://{get_local_lan_ip()}:8765"
+        except Exception as exc:
+            logger.warning("Mobil sunucu URL'si okunamadı: %s", exc)
+            return None
+        return None
 
     def get_main_controller_ready_flag(self) -> dict:
         """Returns the readiness flag for GatherionController."""
-        return {"module": "main", "ready": True}
+        health = self.get_main_controller_health_summary()
+        return {
+            "module": "main",
+            "ready": bool(health.get("controller_ready")),
+            "checks": health.get("checks", {}),
+        }
 
     def get_main_controller_health_summary(self) -> dict:
         """Returns health summary for GatherionMainController safely."""
+        # F-1253: her zaman "hazır/sertifikalı" dönülmezdi; alt sistemlerin
+        # gerçek hazırlık bayrakları toplanır.
         try:
-            return {"controller_ready": True, "enterprise_modules_wired": 11}
-        except Exception:
-            return {"controller_ready": False, "enterprise_modules_wired": 0}
+            checks: dict = {}
+            capture = getattr(self, "capture", None)
+            if capture is not None and hasattr(capture, "get_capture_health_summary"):
+                checks["capture"] = bool(capture.get_capture_health_summary().get("ready"))
+            optimizer = getattr(self, "route_optimizer", None)
+            if optimizer is not None and hasattr(optimizer, "get_path_optimizer_health_summary"):
+                checks["path_optimizer"] = bool(
+                    optimizer.get_path_optimizer_health_summary().get("ready")
+                )
+            dxg = getattr(self, "dxg_capture", None)
+            if dxg is not None and hasattr(dxg, "get_stealth_capture_health_summary"):
+                checks["stealth_capture"] = bool(
+                    dxg.get_stealth_capture_health_summary().get("stealth_capture_ready")
+                )
+            worker = getattr(self, "worker", None)
+            checks["worker_present"] = worker is not None
+            ready = bool(checks) and all(checks.values())
+            wired = sum(1 for v in checks.values() if v)
+            return {
+                "controller_ready": ready,
+                "enterprise_modules_wired": wired,
+                "checks": checks,
+            }
+        except Exception as exc:
+            return {"controller_ready": False, "enterprise_modules_wired": 0, "error": str(exc)}
 
     def get_main_version_info(self) -> dict:
         """Returns version info for main module."""
-        return {"module": "main", "version": "2.0.0", "ready": True}
+        return {"module": "main", "version": __version__, "ready": True}
 
     def shutdown(self) -> None:
         """Gracefully stops all background threads, mobile server, tunnel, saves telemetry, and exits."""
         if getattr(self, "_shutdown_done", False):
             return
         self._shutdown_done = True
-        logger.info("Gatherion-Local v2.0 (Türkçe) kapatılıyor")
+        # S-0204: kapanan örnek artık canlı prob sayılmaz.
+        global _LIVE_ORCHESTRATOR_REF
+        _LIVE_ORCHESTRATOR_REF = None
+        logger.info(f"Gatherion-Local v{__version__} (Türkçe) kapatılıyor")
+        # v20/bot-ani-kapanma: temiz kapanis isareti -- atexit kaydi
+        # graceful=True yazarsa olum normal kapanisti; bu satir olmadan
+        # atexit'e ulasilmasi anormal olumun kanitidir.
+        try:
+            note_graceful_shutdown()
+        except Exception:
+            pass
         try:
             self._persist_settings_on_exit()
-        except Exception:
-            logger.debug("Çıkışta ayar kaydı atlandı", exc_info=True)
-        try:
-            self.watchdog.stop()
-        except Exception:
-            logger.debug("Watchdog stop ignored")
-        try:
-            self.worker.stop()
-        except Exception:
-            logger.debug("Worker stop ignored")
+        except Exception as exc:
+            # sweep Y-4: kapanışta ayar kaydı hatası debug'da yutuluyordu.
+            logger.warning("Çıkışta ayar kaydı atlandı: %s", exc, exc_info=True)
+        _stop_quietly(getattr(self, "watchdog", None), "stop", "Watchdog stop")
+        _stop_quietly(getattr(self, "worker", None), "stop", "Worker stop")
         worker = getattr(self, "worker", None)
         if worker is not None and getattr(worker, "isRunning", lambda: False)():
             try:
                 worker.requestInterruption()
-            except Exception:
-                logger.debug("Worker interruption skipped", exc_info=True)
+            except Exception as exc:
+                # sweep Y-4: kapanış hataları debug'da yutuluyordu.
+                logger.warning("Worker interruption hatası: %s", exc, exc_info=True)
+            # F-1194: güvensiz terminate() + yok sayılan bekleme yerine önce
+            # kibar bekleme. P2-8 (K-17): `terminate()` ani öldürmedir,
+            # kilit/kaynak bırakır — son çare olarak bile kullanılmaz;
+            # durmayan worker ikinci grace penceresi + hata loguyla
+            # bırakılır, thread referansı korunur.
             try:
-                worker.terminate()
-                worker.wait(2000)
-            except Exception:
-                logger.debug("Worker terminate skipped", exc_info=True)
-        try:
-            if self.mobile_server is not None and hasattr(self.mobile_server, "stop"):
-                self.mobile_server.stop()
-        except Exception:
-            logger.debug("Mobile server stop ignored")
-        try:
-            if self.tunnel_mgr is not None and hasattr(self.tunnel_mgr, "stop"):
-                self.tunnel_mgr.stop()
-        except Exception:
-            logger.debug("Tunnel manager stop ignored")
-        try:
-            self.telemetry.save_session_report()
-        except Exception:
-            logger.debug("Telemetry save ignored")
-        try:
-            if hasattr(self, "tray") and self.tray is not None:
-                self.tray.hide()
-        except Exception:
-            logger.debug("Tray hide ignored")
+                stopped = worker.wait(4000)
+            except Exception as exc:
+                stopped = False
+                logger.warning("Worker bekleme hatası: %s", exc, exc_info=True)
+            if not stopped and getattr(worker, "isRunning", lambda: False)():
+                logger.warning(
+                    "Worker 4 sn'de durmadı; 4 sn daha bekleniyor (terminate yok, P2-8)."
+                )
+                try:
+                    stopped = worker.wait(4000)
+                except Exception as exc:
+                    stopped = False
+                    logger.warning("Worker bekleme hatası: %s", exc, exc_info=True)
+            if not stopped and getattr(worker, "isRunning", lambda: False)():
+                logger.error(
+                    "Worker kapanışta durmadı; terminate() uygulanmadı (P2-8)."
+                )
+        # F-1194: yakalama/girdi kapatılmadan çıkılırdı.
+        _stop_quietly(getattr(self, "capture", None), "close", "Capture close")
+        _stop_quietly(getattr(self, "dxg_capture", None), "close", "DXGI capture close")
+        _stop_quietly(getattr(self, "input_ctrl", None), "close", "Input controller close")
+        _stop_quietly(getattr(self, "mobile_server", None), "stop", "Mobile server stop")
+        _stop_quietly(getattr(self, "tunnel_mgr", None), "stop", "Tunnel manager stop")
+        _stop_quietly(getattr(self, "telemetry", None), "save_session_report", "Telemetry save")
+        _stop_quietly(getattr(self, "tray", None), "hide", "Tray hide")
         self.app.quit()
 
     def get_main_diagnostic_snapshot(self) -> dict:
-        """Returns diagnostic snapshot for main module."""
-        return {"module": "main", "status": "ok", "ready": True}
+        """Returns diagnostic snapshot for main module.
+
+        S-0204: "ready" artık sabit True değil; modül sözleşmesinin gerçek
+        probuna (validate_main_contract) bağlıdır.
+        """
+        return {"module": "main", "status": "ok", "ready": validate_main_contract()}
 
     def get_main_capabilities(self) -> list:
         """Returns supported capabilities for main module."""
-        return ["main", "diagnostic_snapshot", "version_info"]
+        return list(_MAIN_CAPABILITIES)
 
 
 def main() -> int:
+    # [STARTUP] Python import süresi (modül düzeyi _IMPORT_T0'dan beri).
+    logger.info("[STARTUP] Python importları: %.1f sn", time.monotonic() - _IMPORT_T0)
+    # v20/bot-ani-kapanma (11 Kasim 17:33:54 sessiz olum): faulthandler +
+    # excepthook + atexit + RSS izleme app.exec() oncesi kurulur; bir daha
+    # ani kapanmada sebep logs/crash_*.log / faulthandler.log /
+    # exit_trace.log uclusunden okunur. Kurulum hatasi botu durdurmaz.
+    try:
+        install_crash_evidence(LOG_DIR, logger)
+    except Exception as exc:
+        logger.warning("Crash kanit altyapisi kurulamadi: %s", exc)
+    # sweep-26 F8: F: yoksa _pin_bot_env sessizce çıkıyordu; uyarı burada
+    # logger kurulduktan sonra görünür olur.
+    if _BOOT_HOME_WARNING:
+        logger.warning("%s", _BOOT_HOME_WARNING)
+
     if "--elevate" in sys.argv:
-        ensure_admin_elevation(dry_run=False)
+        # F-1139: dönüş değeri yok sayılırdı; yükseltme hem yeni hem eski
+        # süreci çalışır bırakırdı. exit_on_elevate ile yükselen süreç
+        # başlatılınca bu süreç çıkar; yükseltme reddedilirse bot
+        # yükseltmesiz başlatılmaz.
+        try:
+            elevated = ensure_admin_elevation(dry_run=False, exit_on_elevate=True)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            logger.error("Yönetici yükseltmesi sırasında hata: %s", exc)
+            return 1
+        if not elevated:
+            logger.error(
+                "Yönetici yükseltmesi başarısız/reddedildi; --elevate ile "
+                "bot yükseltmesiz başlatılmıyor."
+            )
+            print("Yönetici yükseltmesi başarısız oldu; bot başlatılmadı.", file=sys.stderr)
+            return 1
+
+    # sweep-26 F1: tek instance kilidi. İkinci örnek burada durur — çift
+    # bot, çift tuş ve ayar dosyası çakışması olmaz. pythonw altında stderr
+    # görünmez; kullanıcıya mesaj kutusu + oturum log dosyası ile bildirilir.
+    if not _acquire_single_instance_lock():
+        _dup_msg = (
+            "Gatherion zaten çalışıyor — ikinci örnek başlatılmadı. "
+            "Çalışan botu kapatıp tekrar deneyin."
+        )
+        logger.error(_dup_msg)
+        print(_dup_msg, file=sys.stderr)
+        _show_startup_alert(_dup_msg, "Gatherion zaten çalışıyor")
+        return 2
 
     # QWebEngine / YOLO factory: must be set before QApplication is created.
     try:
         from PyQt6.QtCore import Qt
 
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("AA_ShareOpenGLContexts ayarlanamadı: %s", exc)
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    orchestrator = GatherionOrchestrator(app)
+    # F-1195: orchestrator kurulumu korumasızdı; init hatası çıplak
+    # traceback ile çökerdi.
+    try:
+        orchestrator = GatherionOrchestrator(app)
+    except Exception as exc:
+        logger.error("Gatherion başlatılamadı (orchestrator kurulum hatası): %s", exc)
+        print(f"Gatherion başlatılamadı: {exc}", file=sys.stderr)
+        print(f"Detay için {os.path.basename(LOG_FILE)} dosyasına bakın.", file=sys.stderr)
+        # sweep-26 F9: pythonw altında stderr görünmez — hata mesaj
+        # kutusuyla da gösterilir.
+        _show_startup_alert(
+            f"Gatherion başlatılamadı: {exc}\nDetay için {os.path.basename(LOG_FILE)} dosyasına bakın.",
+            "Gatherion başlatılamadı",
+        )
+        return 1
     mobile_url = orchestrator.get_mobile_dashboard_url()
 
     if "--self-test" in sys.argv:
         QTimer.singleShot(800, orchestrator.shutdown)
 
     print("\n" + "=" * 72)
-    print("  GATHERION-LOCAL v2.0 (TÜRKÇE) BAŞLATILDI!")
+    print(f"  GATHERION-LOCAL v{__version__} (TÜRKÇE) BAŞLATILDI!")
     print(f"  [{orchestrator._menu_chord_label}]  -> Soldaki menüyü aç/kapa (yürüyüşü duraklatmaz)")
     print(f"  [{orchestrator._menu_chord_label} + Enter] -> Aktif Modda Devam Et (Resume)")
     print(f"  [{orchestrator._node_chord_label}]  -> Mevcut Konumu Rota Noktası Olarak Kaydet")
     print(f"  [{orchestrator._pause_chord_label}] -> Duraklat / Devam")
     print("  [3x Toplama Modu] -> Her Noktada 3 Kademeli Hasat & Minimap Oto-Kayıt")
-    print(f"  [Mobil Kontrol]   -> {mobile_url}")
+    print(f"  [Mobil Kontrol]   -> {mobile_url}" if mobile_url else f"  [Mobil Kontrol]   -> ÇALIŞMIYOR (mobil sunucu başlatılamadı; ayrıntı: {os.path.basename(LOG_FILE)})")
     print("=" * 72 + "\n")
 
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        _release_single_instance_lock()
 
 
 if __name__ == "__main__":
     sys.exit(main())
 
 
+# S-0204: modül düzeyi capability listesi — daha önce yalnızca sınıf
+# metodu vardı; modül düzeyi validate_main_contract() / baseline
+# fonksiyonları tanımsız ada başvurup NameError veriyordu.
+_MAIN_CAPABILITIES = ["main", "diagnostic_snapshot", "version_info"]
+
+
+def get_main_capabilities() -> list:
+    """Returns supported capabilities for main module (module level)."""
+    return list(_MAIN_CAPABILITIES)
+
+
+def _get_live_orchestrator():
+    """Returns the live GatherionOrchestrator instance, or None.
+
+    S-0204: modül düzeyi prob fonksiyonlarının gerçek bileşen durumuna
+    delege edebilmesi için zayıf referans üzerinden çözülür.
+    """
+    ref = _LIVE_ORCHESTRATOR_REF
+    if ref is None:
+        return None
+    try:
+        return ref()
+    except Exception:
+        return None
+
+
 def validate_main_contract() -> bool:
-    """Validates module contract for main.py."""
-    return bool(get_main_capabilities())
+    """Validates module contract for main.py.
+
+    S-0204 (Karar 3): totoloji değil gerçek prob — capability listesinin
+    boş olmaması yetmez; GatherionOrchestrator sınıfının sözleşmeye dahil
+    arayüzü (sinyal bağlama, kapatma, sağlık özeti, capability) yerinde mi
+    kontrol edilir. Arayüz eksikse False döner.
+    """
+    try:
+        caps = get_main_capabilities()
+        if not caps:
+            return False
+        required = (
+            "_connect_signals",
+            "_connect_map_viewer_signals",
+            "_connect_yolo_factory_signals",
+            "shutdown",
+            "get_main_controller_health_summary",
+            "get_main_controller_ready_flag",
+            "get_main_diagnostic_snapshot",
+            "get_main_capabilities",
+        )
+        return all(callable(getattr(GatherionOrchestrator, name, None)) for name in required)
+    except Exception as exc:
+        logger.debug("main contract probu başarısız: %s", exc)
+        return False
 
 
 def get_main_baseline_metrics() -> dict:
@@ -2286,8 +3181,41 @@ def get_main_baseline_metrics() -> dict:
 
 
 def get_main_readiness_status() -> dict:
-    """Returns readiness status for main.py."""
-    return {"module": "main", "ready": validate_main_contract(), "metrics": get_main_baseline_metrics()}
+    """Returns readiness status for main.py.
+
+    S-0204 (Karar 3): canlı orchestrator kaydı varsa gerçek alt sistem
+    sağlığı (get_main_controller_health_summary) probalanır; kayıt yoksa
+    yalnızca modül sözleşmesi probalanır ve "live": False olarak
+    işaretlenir — çalışmayan bir örneğin sağlığı "hazır" sayılmaz.
+    """
+    contract_valid = validate_main_contract()
+    live = _get_live_orchestrator()
+    if live is None:
+        return {
+            "module": "main",
+            "ready": contract_valid,
+            "live": False,
+            "metrics": get_main_baseline_metrics(),
+        }
+    try:
+        health = live.get_main_controller_health_summary()
+        ready = bool(contract_valid and health.get("controller_ready"))
+        return {
+            "module": "main",
+            "ready": ready,
+            "live": True,
+            "checks": health.get("checks", {}),
+            "metrics": get_main_baseline_metrics(),
+        }
+    except Exception as exc:
+        logger.debug("Canlı readiness probu başarısız: %s", exc)
+        return {
+            "module": "main",
+            "ready": False,
+            "live": True,
+            "error": str(exc),
+            "metrics": get_main_baseline_metrics(),
+        }
 
 
 def get_main_audit_record() -> dict:

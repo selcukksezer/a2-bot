@@ -11,16 +11,26 @@ import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
+from core.corridor_navigator import (
+    DEFAULT_DEADBAND_DEG,
+    MAX_DEADBAND_DEG,
+    MIN_DEADBAND_DEG,
+    MINIMAP_METERS_PER_PX as PIXEL_TO_METER_DEFAULT,
+)
 from core.input_driver import InputDriver
 from core.vision import Vision
 from core.route_manager import RouteManager
+# P1-7 (K-20): minimap metre/piksel ölçeğinin tek kaynağı.
+from core.corridor_navigator import MINIMAP_METERS_PER_PX
+from version import __version__
 
-DEFAULT_DEADBAND_DEG: float = 6.0
-MIN_DEADBAND_DEG: float = 5.0
-MAX_DEADBAND_DEG: float = 8.0
+# P3-3: ölü-bölge (6.0/5.0/8.0) ve minimap ölçeği (0.55) tek tanımı
+# `core/corridor_navigator.py`dedir; buradaki isimler yeniden ihraç edilir
+# (`from core.navigator import DEFAULT_DEADBAND_DEG, ...` çalışmaya devam eder).
+# DEFAULT_WAYPOINT_RADIUS_PX/M tek tanımı da buradadır (P3-3 v19);
+# `core/navigation_intel.py` bu iki adı buradan içe aktarır.
 DEFAULT_WAYPOINT_RADIUS_PX: float = 20.0
 DEFAULT_WAYPOINT_RADIUS_M: float = 3.0
-PIXEL_TO_METER_DEFAULT: float = 0.55
 
 
 def compute_bearing(from_pos: Tuple[float, float], to_pos: Tuple[float, float]) -> float:
@@ -30,11 +40,13 @@ def compute_bearing(from_pos: Tuple[float, float], to_pos: Tuple[float, float]) 
     North is 0°, East is 90°, South is 180°, West is 270°.
     Eliminates 180° inversion bug between Cartesian (0° = East) and
     Minimap / Compass arrow heading (0° = North).
+    Returns float("nan") when both points coincide: no direction exists,
+    so no arbitrary bearing (e.g. North) is invented.
     """
     dx = float(to_pos[0]) - float(from_pos[0])
     dy = float(to_pos[1]) - float(from_pos[1])
     if abs(dx) <= 1e-6 and abs(dy) <= 1e-6:
-        return 0.0
+        return float("nan")
     angle = math.degrees(math.atan2(dx, -dy))
     return round((angle + 360.0) % 360.0, 2)
 
@@ -189,19 +201,34 @@ def compass_to_cartesian(compass_deg: float) -> float:
 
 
 def extract_node_xy(node: Any) -> Tuple[float, float]:
-    """Safely extracts (x, y) coordinates from dict, object, or tuple."""
+    """
+    Safely extracts (x, y) coordinates from dict, object, or tuple.
+    Raises ValueError when the node carries no usable coordinates instead of
+    silently inventing (0, 0) (which would navigate/click at the map origin).
+    Callers that scan many nodes must skip nodes raising ValueError.
+    """
     try:
         if isinstance(node, (tuple, list, np.ndarray)) and len(node) >= 2:
             return float(node[0]), float(node[1])
         if isinstance(node, dict):
-            mx = node.get("map_x", node.get("x", 0.0))
-            my = node.get("map_y", node.get("y", 0.0))
-            return float(mx or 0.0), float(my or 0.0)
-        mx = getattr(node, "map_x", getattr(node, "x", 0.0))
-        my = getattr(node, "map_y", getattr(node, "y", 0.0))
-        return float(mx or 0.0), float(my or 0.0)
-    except Exception:
-        return 0.0, 0.0
+            if "map_x" in node or "x" in node:
+                mx = node.get("map_x", node.get("x"))
+                my = node.get("map_y", node.get("y"))
+                if mx is None or my is None:
+                    raise ValueError(f"node has incomplete coordinates: {node!r}")
+                return float(mx), float(my)
+            raise ValueError(f"node has no coordinates (map_x/map_y or x/y): {node!r}")
+        if hasattr(node, "map_x") or hasattr(node, "x"):
+            mx = getattr(node, "map_x", getattr(node, "x", None))
+            my = getattr(node, "map_y", getattr(node, "y", None))
+            if mx is None or my is None:
+                raise ValueError(f"node has incomplete coordinates: {node!r}")
+            return float(mx), float(my)
+        raise ValueError(f"node has no coordinates: {node!r}")
+    except (ValueError, TypeError):
+        raise
+    except Exception as exc:
+        raise ValueError(f"node coordinates unparseable: {node!r} ({exc})") from exc
 
 
 def find_nearest_waypoint(
@@ -216,16 +243,24 @@ def find_nearest_waypoint(
         return -1, None, float("inf")
     px, py = float(player_pos[0]), float(player_pos[1])
     best_idx = -1
-    best_dist = float("inf")
+    # Karesel mesafeyle karşılaştır (sqrt monoton: sıralama aynı); tek sqrt
+    # sonda yapılır, düğüm başına hypot kalkar.
+    best_dist_sq = float("inf")
     best_node = None
     for idx, node in enumerate(nodes):
-        nx, ny = extract_node_xy(node)
-        d = math.hypot(nx - px, ny - py)
-        if d < best_dist:
-            best_dist = d
+        try:
+            nx, ny = extract_node_xy(node)
+        except ValueError:
+            # Coordinate-less node: skip it instead of treating it as (0, 0).
+            continue
+        dx = nx - px
+        dy = ny - py
+        d_sq = dx * dx + dy * dy
+        if d_sq < best_dist_sq:
+            best_dist_sq = d_sq
             best_idx = idx
             best_node = node
-    return best_idx, best_node, round(best_dist, 2)
+    return best_idx, best_node, round(math.sqrt(best_dist_sq), 2)
 
 
 def resume_route_after_interrupt(
@@ -240,6 +275,9 @@ def resume_route_after_interrupt(
     Finds the nearest waypoint to player_pos.
     If advance_if_reached=True and player is already within waypoint_radius_px,
     advances to the next sequential waypoint in cyclical order.
+    `last_index` (the waypoint active before the interrupt) is honoured: when the
+    player is still within waypoint_radius_px of that node, resume stays on it
+    instead of jumping to the geometrically nearest node.
     """
     if not nodes:
         return {
@@ -250,7 +288,33 @@ def resume_route_after_interrupt(
             "cyclical": True,
         }
     n = len(nodes)
+    try:
+        last_idx = int(last_index) if last_index is not None else -1
+    except (TypeError, ValueError):
+        last_idx = -1
+    if 0 <= last_idx < n:
+        try:
+            lx, ly = extract_node_xy(nodes[last_idx])
+            last_dist = math.hypot(lx - float(player_pos[0]), ly - float(player_pos[1]))
+            if last_dist <= float(waypoint_radius_px):
+                return {
+                    "resumed_index": last_idx,
+                    "active_node": nodes[last_idx],
+                    "distance_px": round(last_dist, 2),
+                    "resumed_from": "last_index",
+                    "cyclical": True,
+                }
+        except ValueError:
+            pass
     nearest_idx, nearest_node, dist_px = find_nearest_waypoint(player_pos, nodes)
+    if nearest_idx < 0:
+        return {
+            "resumed_index": -1,
+            "active_node": None,
+            "distance_px": float("inf"),
+            "resumed_from": "no_valid_node",
+            "cyclical": True,
+        }
     if advance_if_reached and dist_px <= float(waypoint_radius_px) and n > 1:
         target_idx = (nearest_idx + 1) % n
         return {
@@ -297,7 +361,10 @@ class WaypointArrivalDetector:
         Determines whether the player has arrived at the target waypoint.
         Arrival criteria:
         1. pixel_distance <= waypoint_radius_px (<=20px), OR
-        2. distance_m <= waypoint_radius_m (<=3.0m).
+        2. distance_m <= waypoint_radius_m (<=3.0m) — only when an explicitly
+           measured `distance_m` is supplied. Deriving metres from pixels with
+           the same scale would make this check a strict subset of (1) and
+           therefore dead; the derived value is reported as an estimate only.
         """
         px = float(player_pos[0])
         py = float(player_pos[1])
@@ -309,11 +376,14 @@ class WaypointArrivalDetector:
 
         if distance_m is not None:
             dist_m = float(distance_m)
+            dist_m_measured = True
         else:
+            # Estimate only — never used for the metre-threshold decision.
             dist_m = px_dist * self.pixel_to_meter
+            dist_m_measured = False
 
         reached_px = bool(px_dist <= self.waypoint_radius_px)
-        reached_m = bool(dist_m <= self.waypoint_radius_m)
+        reached_m = bool(dist_m_measured and dist_m <= self.waypoint_radius_m)
         arrived = bool(reached_px or reached_m)
 
         return {
@@ -322,6 +392,7 @@ class WaypointArrivalDetector:
             "reached_m": reached_m,
             "pixel_distance": round(px_dist, 2),
             "distance_m": round(dist_m, 2),
+            "distance_m_measured": dist_m_measured,
             "threshold_px": self.waypoint_radius_px,
             "threshold_m": self.waypoint_radius_m,
         }
@@ -365,7 +436,9 @@ class WaypointArrivalDetector:
                 next_idx = (curr_idx + 1) % n
             else:
                 next_idx = min(n - 1, curr_idx + 1)
-            transitioned = (next_idx != curr_idx) or (n == 1)
+            # A single-node route has nowhere to transition to: staying on the
+            # same node is not a transition (and not a completed lap).
+            transitioned = bool(next_idx != curr_idx)
             return {
                 "arrived": True,
                 "transitioned": transitioned,
@@ -476,7 +549,19 @@ class CyclicalRouteFollower:
 
         n = len(self.nodes)
         curr_node = self.nodes[self.current_index % n]
-        waypoint_xy = extract_node_xy(curr_node)
+        try:
+            waypoint_xy = extract_node_xy(curr_node)
+        except ValueError as exc:
+            return {
+                "active": False,
+                "arrived": False,
+                "transitioned": False,
+                "current_index": self.current_index,
+                "active_node": curr_node,
+                "turn_needed": False,
+                "in_deadband": True,
+                "error": f"current waypoint has no coordinates: {exc}",
+            }
 
         # 1. Arrival & Cyclical Transition Check
         arrival = self.arrival_detector.check_and_transition(
@@ -501,7 +586,13 @@ class CyclicalRouteFollower:
 
         # 2. Bearing & Anti-Inversion Heading
         target_bearing = compute_bearing(player_pos, waypoint_xy)
-        cleaned_heading = normalize_compass_heading(player_heading)
+        if not math.isfinite(target_bearing):
+            # Player is exactly on the waypoint: no direction exists, so hold
+            # the current heading instead of steering toward an invented one.
+            target_bearing = normalize_compass_heading(player_heading)
+        cleaned_heading = anti_inversion_compass_heading(
+            player_heading, reference_bearing=target_bearing
+        )
 
         # 3. Turn Damping
         turn_data = self.turn_controller.calculate_turn(
@@ -542,55 +633,107 @@ class MapNavigator:
             waypoint_radius_m=DEFAULT_WAYPOINT_RADIUS_M,
         )
         self.turn_controller = TurnDampingController(deadband_deg=DEFAULT_DEADBAND_DEG)
+        # Cached cyclical follower for follow_cyclical_step(): state (index,
+        # laps, turn controller) must survive across calls instead of being
+        # rebuilt from scratch on every step.
+        self._cyclical_follower: Optional[CyclicalRouteFollower] = None
+        self._cyclical_follower_nodes: List[Any] = []
 
-    def is_map_open(self, threshold=0.80):
+    def is_map_open(self, threshold=0.80) -> Optional[bool]:
         """
         Detects if the in-game world map (M) is currently visible on screen.
         Delegates to VisionEngine.is_map_open when available for multi-zone accuracy.
+
+        Üç durumlu (H-sweep ek; G grubu vision.is_map_open'u üç durumlu
+        yaptı): True = açık, False = kapalı, None = bilinmiyor. Vision
+        açıkça None döndürürse bool() ile False'a indirilmez, None olduğu
+        gibi yayılır — bilinmiyor durumunda kör M basmak açık haritayı
+        kapatır (fail-open). Vision motoru yoksa da doğrulanamadığı için
+        None döner. Yerel sezgisel yedek yalnızca vision'da is_map_open
+        yoksa / çağrı patlarsa devreye girer; vision'ın None'u otorite
+        sayılır.
         """
-        if self.vision is not None and hasattr(self.vision, "is_map_open"):
+        if self.vision is None:
+            return None
+        if hasattr(self.vision, "is_map_open"):
             try:
-                return bool(self.vision.is_map_open())
+                result = self.vision.is_map_open()
+                if result is None:
+                    return None
+                return bool(result)
             except Exception:
                 pass
-        screen_bgr = self.vision.grab_screen(grayscale=False)
-        hsv = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2HSV)
+        try:
+            screen_bgr = self.vision.grab_screen(grayscale=False)
+        except Exception:
+            return False
+        if screen_bgr is None or getattr(screen_bgr, "size", 0) == 0:
+            return False
+        try:
+            hsv = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2HSV)
+        except Exception:
+            return False
         h, w, _ = screen_bgr.shape
-        center_sat = np.mean(hsv[int(h*0.3):int(h*0.7), int(w*0.3):int(w*0.7), 1])
-        return center_sat < 65
+        # Fallback heuristic needs two agreeing signals, not saturation alone:
+        # a desaturated centre AND a lit map canvas (a dark/loading screen is
+        # desaturated too, but it is not the open map).
+        center_hsv = hsv[int(h * 0.3):int(h * 0.7), int(w * 0.3):int(w * 0.7)]
+        center_sat = float(np.mean(center_hsv[:, :, 1]))
+        center_val = float(np.mean(center_hsv[:, :, 2]))
+        return bool(center_sat < 65 and center_val > 40)
 
     def open_map(self, max_wait=2.0):
-        """Opens map with M key and waits until visible."""
-        if not self.is_map_open():
+        """Opens map with M key and waits until visible.
+
+        Üç durumlu: durum bilinmiyorsa (None) kör M basılmaz — harita
+        zaten açıksa M kapatır. None yayılır; çağıran başarısız sayar
+        (örn. navigate_to_node hedefe tıklamaz).
+        """
+        state = self.is_map_open()
+        if state is False:
             self.driver.toggle_map()
             start = time.time()
             while time.time() - start < max_wait:
                 time.sleep(0.1)
-                if self.is_map_open():
+                if self.is_map_open() is True:
                     time.sleep(0.15) # Wait for animation
                     return True
-        return self.is_map_open()
+            return self.is_map_open()
+        return state
 
     def close_map(self, max_wait=2.0):
-        """Closes map with M key and waits until closed."""
-        if self.is_map_open():
+        """Closes map with M key and waits until closed.
+
+        Üç durumlu: durum bilinmiyorsa (None) kör M basılmaz — harita
+        zaten kapalıysa M açar. None yayılır (eskiden yanlışlıkla
+        True döner, 'kapalı' sanılırdı).
+        """
+        state = self.is_map_open()
+        if state is True:
             self.driver.toggle_map()
             start = time.time()
             while time.time() - start < max_wait:
                 time.sleep(0.1)
-                if not self.is_map_open():
+                if self.is_map_open() is False:
                     time.sleep(0.1)
                     return True
-        return not self.is_map_open()
+            final = self.is_map_open()
+            return None if final is None else (not final)
+        if state is False:
+            return True
+        return None
 
     def get_navigator_status_summary(self) -> dict:
-        """Returns navigator status summary safely."""
-        try:
-            return {"navigator_ready": True}
-        except Exception:
-            return {"navigator_ready": False}
+        """Returns navigator status summary from real component state."""
+        ready = self.routes is not None and self.vision is not None and self.driver is not None
+        return {
+            "navigator_ready": bool(ready),
+            "routes": self.routes is not None,
+            "vision": self.vision is not None,
+            "driver": self.driver is not None,
+        }
 
-    def navigate_to_node(self, node: dict, timeout_sec=60):
+    def navigate_to_node(self, node: dict):
         """
         Executes navigation to a specified node:
         1. Opens map (M)
@@ -598,41 +741,98 @@ class MapNavigator:
         3. Clicks target
         4. Closes map (M)
         5. Returns status
+        The map is always closed again (try/finally), even when an intermediate
+        step fails. A node without coordinates and without a usable patch match
+        is rejected (False) instead of clicking at (None, None) / (0, 0).
+
+        P1-10 (K-14): eski `timeout_sec` parametresi ölüydü — bu metot
+        tıklamadan sonra dönüyor, seyahati hiç izlemiyor, zaman aşımını
+        hiç uygulamıyordu; parametre yalnızca son print'te geçiyordu.
+        Seyahat izleme + zaman aşımı zaten çağıranda yaşıyor
+        (`modules/route_runner.py` WALKING durumu: toplanma istemi =
+        varış, `walk_timeout_sec` = zaman aşımı) — bu metot içinde
+        ikinci bir izleme döngüsü ESC/duraklatma denetimini
+        engelleyeceği için parametre kaldırıldı, izleme çağıranda kaldı.
         """
-        print(f"\n[Navigator] '{node['name']}' konumuna rota başlatılıyor...")
+        name = node.get("name", "?") if isinstance(node, dict) else "?"
+        print(f"\n[Navigator] '{name}' konumuna rota başlatılıyor...")
 
         # 1. Open Map
         if not self.open_map():
             print("[Navigator] Hata: Harita açılamadı!")
             return False
 
-        # 2. Determine Click Target
-        target_x = node.get("map_x")
-        target_y = node.get("map_y")
+        try:
+            # 2. Determine Click Target
+            target_x = node.get("map_x")
+            target_y = node.get("map_y")
 
-        # Optional: refine coordinate via patch matching if patch exists
-        patch_file = node.get("patch_file")
-        if patch_file:
-            patch_path = os.path.join(self.routes.patch_dir, patch_file)
-            if os.path.exists(patch_path):
-                patch_gray = cv2.imread(patch_path, cv2.IMREAD_GRAYSCALE)
-                map_gray = self.vision.grab_screen(grayscale=True)
-                res = cv2.matchTemplate(map_gray, patch_gray, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                if max_val >= 0.70:
-                    ph, pw = patch_gray.shape
-                    target_x = max_loc[0] + pw // 2
-                    target_y = max_loc[1] + ph // 2
-                    print(f"[Navigator] Harita şablon eşleşmesi: %{int(max_val*100)} -> ({target_x}, {target_y})")
+            # Optional: refine coordinate via patch matching if patch exists
+            patch_file = node.get("patch_file")
+            if patch_file:
+                patch_path = os.path.join(self.routes.patch_dir, patch_file)
+                if not os.path.exists(patch_path):
+                    print(f"[Navigator] Uyarı: Harita yaması bulunamadı: {patch_path}; kayıtlı koordinat kullanılıyor.")
+                else:
+                    patch_gray = cv2.imread(patch_path, cv2.IMREAD_GRAYSCALE)
+                    if patch_gray is None or patch_gray.size == 0:
+                        print(f"[Navigator] Hata: Harita yaması okunamadı: {patch_path}")
+                        return False
+                    map_gray = self.vision.grab_screen(grayscale=True)
+                    res = cv2.matchTemplate(map_gray, patch_gray, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                    if max_val >= 0.70:
+                        ph, pw = patch_gray.shape
+                        target_x = max_loc[0] + pw // 2
+                        target_y = max_loc[1] + ph // 2
+                        print(f"[Navigator] Harita şablon eşleşmesi: %{int(max_val*100)} -> ({target_x}, {target_y})")
+                    else:
+                        print(
+                            f"[Navigator] Uyarı: Yama eşleşmesi zayıf ({float(max_val):.2f} < 0.70); "
+                            f"kayıtlı koordinat kullanılıyor: ({target_x}, {target_y})"
+                        )
 
-        # 3. Click target on map
-        time.sleep(random.uniform(0.15, 0.3))
-        self.driver.human_click(target_x, target_y, button='left')
-        time.sleep(random.uniform(0.2, 0.4))
+            if target_x is None or target_y is None:
+                print("[Navigator] Hata: Düğümde koordinat yok (map_x/map_y) ve yama eşleşmesi yok; tıklama yapılmadı.")
+                return False
+            try:
+                target_x = float(target_x)
+                target_y = float(target_y)
+            except (TypeError, ValueError):
+                print(f"[Navigator] Hata: Düğüm koordinatı sayısal değil: ({target_x!r}, {target_y!r}); tıklama yapılmadı.")
+                return False
+            if not (math.isfinite(target_x) and math.isfinite(target_y)):
+                print("[Navigator] Hata: Düğüm koordinatı sonlu değil; tıklama yapılmadı.")
+                return False
 
-        # 4. Close Map
-        self.close_map()
-        print(f"[Navigator] Hedefe tıklandı, yürüyüş başladı (Zaman aşımı: {timeout_sec}s)")
+            # S215 (v19/P3-8): yalnızca sonluluk denetleniyordu — ekran
+            # dışı koordinat (negatif / ekranı aşan) kör tıklamaya
+            # gidiyordu. Ekran boyutu vision'dan okunur; çözülemezse
+            # denetim atlanır (eski davranış), çözülürse sınır dışı
+            # hedef reddedilir (kenara kırpılıp yanlış yere tıklanmaz).
+            screen_w = getattr(self.vision, "screen_w", None)
+            screen_h = getattr(self.vision, "screen_h", None)
+            if not (isinstance(screen_w, (int, float)) and isinstance(screen_h, (int, float)) and screen_w > 0 and screen_h > 0):
+                try:
+                    _probe = self.vision.grab_screen(grayscale=True)
+                    if _probe is not None and getattr(_probe, "size", 0) > 0:
+                        screen_h, screen_w = _probe.shape[:2]
+                except Exception:
+                    screen_w = screen_h = None
+            if screen_w is not None and screen_h is not None:
+                if not (0 <= target_x < float(screen_w) and 0 <= target_y < float(screen_h)):
+                    print(f"[Navigator] Hata: Düğüm koordinatı ekran dışında: ({target_x}, {target_y}) / ekran {int(screen_w)}x{int(screen_h)}; tıklama yapılmadı.")
+                    return False
+
+            # 3. Click target on map
+            time.sleep(random.uniform(0.15, 0.3))
+            self.driver.human_click(target_x, target_y, button='left')
+            time.sleep(random.uniform(0.2, 0.4))
+        finally:
+            # 4. Close Map — always, even when a step above failed.
+            self.close_map()
+
+        print("[Navigator] Hedefe tıklandı, yürüyüş başladı (seyahat izleme + zaman aşımı route_runner WALKING durumunda)")
         return True
 
     def compute_bearing(self, current_pos: Tuple[float, float], target_pos: Tuple[float, float]) -> float:
@@ -682,6 +882,9 @@ class MapNavigator:
         3. Applies turn damping and deadband (±5° to ±8°)
         """
         bearing = compute_bearing(current_pos, target_pos)
+        if not math.isfinite(bearing):
+            # Coincident points have no direction; hold the current heading.
+            bearing = normalize_compass_heading(player_heading)
         turn_data = self.calculate_turn(
             player_heading=player_heading,
             target_bearing=bearing,
@@ -775,21 +978,48 @@ class MapNavigator:
         """
         Executes a single step of cyclical route navigation:
         arrival check (<=20px / <=3m) -> sequence transition -> anti-inversion bearing -> ±6° turn damping.
+        Reuses one cached CyclicalRouteFollower per node list so lap count,
+        current index and turn-damping state survive across calls; the follower
+        is only rebuilt when the node list changes (current_index seeds it then).
         """
-        follower = self.create_cyclical_follower(nodes=nodes, start_index=current_index)
-        return follower.step(player_pos=player_pos, player_heading=player_heading, distance_m=distance_m, now=now)
+        nodes_list = list(nodes)
+        if (
+            self._cyclical_follower is None
+            or self._cyclical_follower_nodes != nodes_list
+        ):
+            self._cyclical_follower = self.create_cyclical_follower(
+                nodes=nodes_list, start_index=current_index
+            )
+            self._cyclical_follower_nodes = nodes_list
+        return self._cyclical_follower.step(
+            player_pos=player_pos,
+            player_heading=player_heading,
+            distance_m=distance_m,
+            now=now,
+        )
+
+    def reset_cyclical_follower(self) -> None:
+        """Drops the cached follower so the next follow_cyclical_step() rebuilds it."""
+        self._cyclical_follower = None
+        self._cyclical_follower_nodes = []
+
+    def _components_ready(self) -> bool:
+        """True when all three collaborators the navigator needs are present."""
+        return self.routes is not None and self.vision is not None and self.driver is not None
 
     def get_navigator_health_summary(self) -> dict:
-        return {"module": "navigator", "ready": True}
+        ready = self._components_ready()
+        return {"module": "navigator", "ready": ready, "status": "ok" if ready else "degraded"}
 
     def get_navigator_ready_flag(self) -> dict:
-        return {"module": "navigator", "ready": True}
+        return {"module": "navigator", "ready": self._components_ready()}
 
     def get_navigator_version_info(self) -> dict:
-        return {"module": "navigator", "version": "2.0.0", "ready": True}
+        return {"module": "navigator", "version": __version__, "ready": self._components_ready()}
 
     def get_navigator_diagnostic_snapshot(self) -> dict:
-        return {"module": "navigator", "status": "ok", "ready": True}
+        ready = self._components_ready()
+        return {"module": "navigator", "status": "ok" if ready else "degraded", "ready": ready}
 
 
 def get_navigator_capabilities() -> list:
@@ -797,7 +1027,30 @@ def get_navigator_capabilities() -> list:
 
 
 def validate_navigator_contract() -> bool:
-    return bool(get_navigator_capabilities())
+    """
+    Real contract check (not an unconditional True): capabilities are present,
+    bearing math follows the compass convention, and the arrival detector
+    honours both the pixel and the measured-metre thresholds.
+    """
+    try:
+        if not get_navigator_capabilities():
+            return False
+        if compute_bearing((0.0, 0.0), (0.0, -1.0)) != 0.0:
+            return False
+        if compute_bearing((0.0, 0.0), (1.0, 0.0)) != 90.0:
+            return False
+        if math.isfinite(compute_bearing((1.0, 1.0), (1.0, 1.0))):
+            return False
+        det = WaypointArrivalDetector()
+        if not det.is_arrival_reached((100.0, 100.0), (105.0, 100.0))["arrived"]:
+            return False
+        if not det.is_arrival_reached((0.0, 0.0), (50.0, 50.0), distance_m=2.0)["reached_m"]:
+            return False
+        if det.is_arrival_reached((0.0, 0.0), (50.0, 50.0), distance_m=9.0)["arrived"]:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def get_navigator_baseline_metrics() -> dict:

@@ -32,48 +32,45 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from version import __version__
 
 try:
     from core.corridor_navigator import (
         ContestedNodeDetector,
         PredictivePreWalkScheduler,
         ZAxisCliffFilter,
+        jump_length_threshold,
     )
 except ImportError:
     from .corridor_navigator import (  # type: ignore[no-redef]
         ContestedNodeDetector,
         PredictivePreWalkScheduler,
         ZAxisCliffFilter,
+        jump_length_threshold,
     )
 
 try:
     from core.route_manager import (
+        MAP_CANVAS_HEIGHT,
+        MAP_CANVAS_WIDTH,
         RouteManager,
-        SUBREGION_BOUNDING_AREAS,
-        SUBREGION_CANONICAL_MAP,
-        SUBREGION_TO_CANONICAL,
         build_proximity_material_route,
         filter_nodes_by_material,
         filter_nodes_by_subregion,
-        get_canonical_region,
         get_subregion_bounding_area,
-        get_subregion_info,
         is_subregion,
         resolve_canonical_region,
         sort_nodes_by_proximity,
     )
 except ImportError:
     from .route_manager import (  # type: ignore[no-redef]
+        MAP_CANVAS_HEIGHT,
+        MAP_CANVAS_WIDTH,
         RouteManager,
-        SUBREGION_BOUNDING_AREAS,
-        SUBREGION_CANONICAL_MAP,
-        SUBREGION_TO_CANONICAL,
         build_proximity_material_route,
         filter_nodes_by_material,
         filter_nodes_by_subregion,
-        get_canonical_region,
         get_subregion_bounding_area,
-        get_subregion_info,
         is_subregion,
         resolve_canonical_region,
         sort_nodes_by_proximity,
@@ -84,19 +81,13 @@ try:
         DEFAULT_DEADBAND_DEG,
         DEFAULT_WAYPOINT_RADIUS_M,
         DEFAULT_WAYPOINT_RADIUS_PX,
-        MAX_DEADBAND_DEG,
-        MIN_DEADBAND_DEG,
         PIXEL_TO_METER_DEFAULT,
         CyclicalRouteFollower,
         TurnDampingController,
         WaypointArrivalDetector,
-        anti_inversion_compass_heading,
         apply_turn_damping,
-        cartesian_to_compass,
-        compass_to_cartesian,
         compute_angle_diff,
         compute_bearing,
-        extract_node_xy,
         find_nearest_waypoint,
         normalize_compass_heading,
         resume_route_after_interrupt,
@@ -106,19 +97,13 @@ except ImportError:
         DEFAULT_DEADBAND_DEG,
         DEFAULT_WAYPOINT_RADIUS_M,
         DEFAULT_WAYPOINT_RADIUS_PX,
-        MAX_DEADBAND_DEG,
-        MIN_DEADBAND_DEG,
         PIXEL_TO_METER_DEFAULT,
         CyclicalRouteFollower,
         TurnDampingController,
         WaypointArrivalDetector,
-        anti_inversion_compass_heading,
         apply_turn_damping,
-        cartesian_to_compass,
-        compass_to_cartesian,
         compute_angle_diff,
         compute_bearing,
-        extract_node_xy,
         find_nearest_waypoint,
         normalize_compass_heading,
         resume_route_after_interrupt,
@@ -138,17 +123,78 @@ if not logger.handlers:
 
 Point2D = Tuple[float, float]
 
+# `_turn_cost` hızlı yolu için eşik: `theta > 0.45 * pi` <=> `cos(theta) < cos(0.45 * pi)`
+# (`theta in [0, pi]` aralığında `cos` monoton azaldığı için eşdeğerdir).
+_COS_SHARP_TURN = math.cos(math.pi * 0.45)
 
-def _extract_xy(
-    node: Any,
-    fallback_width: float = 1920.0,
-    fallback_height: float = 1080.0,
-) -> Point2D:
+
+# B-01 (sweep-slice30): norm_x/norm_y harita kanvası (1280x720) uzayında
+# tanımlıdır (kanonik değer core/route_manager.py MAP_CANVAS_*).
+_NORM_CANVAS_FALLBACK_WARNED = False
+
+
+def _warn_norm_canvas_fallback_once() -> None:
+    """Norm dalı boyutsuz çağrıldı: kanvas varsayıldı — süreçte bir kez uyar."""
+    global _NORM_CANVAS_FALLBACK_WARNED
+    if not _NORM_CANVAS_FALLBACK_WARNED:
+        _NORM_CANVAS_FALLBACK_WARNED = True
+        logger.warning(
+            "Norm-koordinat dönüşümünde boyut verilmedi; harita kanvası "
+            "1280x720 varsayıldı (eski sessiz 1920x1080 yanlış ölçekti). "
+            "Çağıran gerçek boyutu geçirmeli."
+        )
+
+
+def _norm_xy_to_px(
+    nx: Any,
+    ny: Any,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
+) -> Optional[Point2D]:
+    """norm_x/norm_y -> piksel. Boyut yoksa kanvas varsayılır (bir kez uyarılır).
+
+    (0.5, 0.5) yer tutucu merkezdir, gerçek koordinat değil — reddedilir
+    (None döner). Ölçülemeyen norm da None döner.
     """
-    Bir düğüm nesnesinden (`NodeData`, `dict` veya `(x, y)` tuple) 2B harita
-    koordinatını `(x, y)` piksel cinsinden güvenli biçimde çıkarır.
+    if nx is None or ny is None:
+        return None
+    try:
+        fx = float(nx)
+        fy = float(ny)
+    except (TypeError, ValueError):
+        return None
+    if fx == 0.5 and fy == 0.5:
+        return None
+    if fallback_width is None or fallback_height is None:
+        _warn_norm_canvas_fallback_once()
+    width = MAP_CANVAS_WIDTH if fallback_width is None else float(fallback_width)
+    height = MAP_CANVAS_HEIGHT if fallback_height is None else float(fallback_height)
+    return fx * width, fy * height
+
+
+def _extract_xy_or_none(
+    node: Any,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
+) -> Optional[Point2D]:
+    """
+    Bir düğümden 2B koordinat çıkarır; koordinat yoksa / çıkarılamazsa
+    `None` döndürür (sessiz `(0, 0)` hayalet koordinat üretmez).
+
+    Kural: `None` yalnızca hiçbir koordinat kaynağı yoksa döner (map
+    anahtarları hiç yok ve kullanılabilir norm da yok). Açıkça verilmiş
+    map `(0, 0)` gerçek köşedir (örn. dikdörtgenin orijin köşesi):
+    norm geçerliyse norm tercih edilir, yoksa açık `(0.0, 0.0)` döner
+    — v18'de P1-7 bu dalda koşulsuz `None` döndürüp gerçek (0,0)
+    köşesini koordinatsız saydı (F3 regresyonu).
+
+    Boyut verilmezse norm dönüşümü harita kanvası 1280x720 ile yapılır
+    (B-01) ve bir kez uyarı loglanır. (0.5, 0.5) norm yer tutucusu her
+    dalda reddedilir.
     """
     try:
+        if node is None:
+            return None
         if isinstance(node, (tuple, list, np.ndarray)) and len(node) >= 2:
             return float(node[0]), float(node[1])
 
@@ -156,35 +202,91 @@ def _extract_xy(
             mx = node.get("map_x", node.get("x"))
             my = node.get("map_y", node.get("y"))
             if mx is None and my is None:
-                nx = node.get("norm_x")
-                ny = node.get("norm_y")
-                if nx is not None and ny is not None:
-                    return float(nx) * fallback_width, float(ny) * fallback_height
-                return 0.0, 0.0
+                return _norm_xy_to_px(
+                    node.get("norm_x"), node.get("norm_y"),
+                    fallback_width, fallback_height,
+                )
             if float(mx or 0.0) == 0.0 and float(my or 0.0) == 0.0:
-                nx = node.get("norm_x")
-                ny = node.get("norm_y")
-                if nx is not None and ny is not None and not (float(nx) == 0.5 and float(ny) == 0.5):
-                    return float(nx) * fallback_width, float(ny) * fallback_height
+                px = _norm_xy_to_px(
+                    node.get("norm_x"), node.get("norm_y"),
+                    fallback_width, fallback_height,
+                )
+                # F3 (v18 regresyon düzeltmesi): norm geçerliyse o
+                # kullanılır; norm yer tutucu/eksikse açık (0,0) harita
+                # koordinatı gerçektir — aşağıdaki satır (0.0, 0.0)
+                # döndürür. P1-7'nin koşulsuz `return px` hâli gerçek
+                # orijin köşesini None yapıp calculate_route_metrics /
+                # evaluate_sequence_quality'i kırıyordu.
+                if px is not None:
+                    return px
             return float(mx or 0.0), float(my or 0.0)
 
         mx = getattr(node, "map_x", getattr(node, "x", None))
         my = getattr(node, "map_y", getattr(node, "y", None))
         if mx is None and my is None:
-            nx = getattr(node, "norm_x", None)
-            ny = getattr(node, "norm_y", None)
-            if nx is not None and ny is not None:
-                return float(nx) * fallback_width, float(ny) * fallback_height
-            return 0.0, 0.0
+            return _norm_xy_to_px(
+                getattr(node, "norm_x", None), getattr(node, "norm_y", None),
+                fallback_width, fallback_height,
+            )
         if float(mx or 0.0) == 0.0 and float(my or 0.0) == 0.0:
-            nx = getattr(node, "norm_x", None)
-            ny = getattr(node, "norm_y", None)
-            if nx is not None and ny is not None and not (float(nx) == 0.5 and float(ny) == 0.5):
-                return float(nx) * fallback_width, float(ny) * fallback_height
+            px = _norm_xy_to_px(
+                getattr(node, "norm_x", None), getattr(node, "norm_y", None),
+                fallback_width, fallback_height,
+            )
+            # F3: dict dalıyla aynı kural — norm geçerliyse o, yoksa
+            # açık (0,0) gerçek koordinattır (koşulsuz None yok).
+            if px is not None:
+                return px
         return float(mx or 0.0), float(my or 0.0)
     except Exception as exc:
         logger.debug("Koordinat çıkarılamadı (%r): %s", node, exc)
-        return 0.0, 0.0
+        return None
+
+
+def _extract_xy(
+    node: Any,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
+) -> Optional[Point2D]:
+    """
+    Bir düğüm nesnesinden (`NodeData`, `dict` veya `(x, y)` tuple) 2B harita
+    koordinatını `(x, y)` piksel cinsinden güvenli biçimde çıkarır.
+
+    P1-7 (K-20): gerçekten koordinatsız düğümde artık sessiz `(0.0, 0.0)`
+    hayaleti döndürmez — `None` döner. Çağıran koordinatsız düğümü turdan
+    çıkarmak / atlamak zorundadır (`_extract_xy_or_none` ile aynı kural;
+    bu ad yalnızca geriye dönük uyumluluk için korundu, yeni kod doğrudan
+    `_extract_xy_or_none` kullanmalıdır). Açıkça verilmiş map `(0, 0)`
+    ise gerçek koordinattır, `None` değildir (F3).
+    Boyut verilmezse norm dönüşümü harita kanvası 1280x720 ile yapılır (B-01).
+    """
+    return _extract_xy_or_none(node, fallback_width, fallback_height)
+
+
+def _dict_last_visited_ts(node: Dict[str, Any]) -> float:
+    """
+    Dict düğümün son ziyaret zaman damgasını döndürür. `last_visited_timestamp`
+    ve `last_visited` anahtarlarından sıfır olmayan (en güncel) olanı alınır;
+    bayat/sıfır bir anahtar diğerini ezemez.
+    """
+    try:
+        candidates = []
+        for key in ("last_visited_timestamp", "last_visited"):
+            val = node.get(key)
+            if val is not None:
+                candidates.append(float(val or 0.0))
+        return max(candidates) if candidates else 0.0
+    except Exception:
+        return 0.0
+
+
+def _stack_wait_discount(max_harvests: int) -> float:
+    """Stack kümesi düğümler için bekleme süresi indirimi (sn): 3x -> 4.5, 2x -> 3.5."""
+    if max_harvests >= 9:
+        return 4.5
+    if max_harvests >= 6:
+        return 3.5
+    return 0.0
 
 
 
@@ -220,11 +322,29 @@ def _is_node_ready(
         if hasattr(node, "is_ready") and callable(node.is_ready):
             return bool(node.is_ready(now=now, rest_duration_sec=rest_duration_sec))
         if isinstance(node, dict):
+            # Dict dalı da `state` alanına bakar: 'resting' düğüm, dinlenme
+            # süresi dolmadıysa hazır değildir (nesne dalındaki
+            # `NodeData.is_ready()` ile aynı kural). Zaman damgası
+            # bayat/sıfır bir anahtarla ezilmez.
+            state_val = str(node.get("state", "") or "").strip().lower()
+            if state_val == "resting":
+                if "rest_remaining_sec" in node and node["rest_remaining_sec"] is not None:
+                    return float(node["rest_remaining_sec"]) <= 0.0
+                last_ts = _dict_last_visited_ts(node)
+                if last_ts <= 0.0:
+                    return False
+                curr = time.time() if now is None else float(now)
+                rest = int(
+                    rest_duration_sec
+                    if rest_duration_sec is not None
+                    else node.get("rest_duration_sec", 300)
+                )
+                return (curr - last_ts) >= float(rest)
             if "ready" in node:
                 return bool(node["ready"])
             if "rest_remaining_sec" in node and node["rest_remaining_sec"] is not None:
                 return float(node["rest_remaining_sec"]) <= 0.0
-            last_ts = float(node.get("last_visited_timestamp", node.get("last_visited", 0.0)) or 0.0)
+            last_ts = _dict_last_visited_ts(node)
             if last_ts <= 0.0:
                 return True
             curr = time.time() if now is None else float(now)
@@ -248,10 +368,14 @@ def _is_node_ready(
                 else (getattr(node, "rest_duration_sec", 300) or 300)
             )
             return (curr - last_ts) >= float(rest)
+        if str(getattr(node, "state", "active") or "active").strip().lower() == "resting":
+            return False
         return True
     except Exception as exc:
         logger.debug("Düğüm hazırlık kontrolü hatası: %s", exc)
-        return True
+        # Hata durumunda fail-closed: hazırlığı doğrulanamayan düğüm
+        # hazır sayılmaz (önceden `True` dönüyor, dinlenen düğüme gidiliyordu).
+        return False
 
 
 def _remaining_rest_seconds(
@@ -266,8 +390,10 @@ def _remaining_rest_seconds(
         if isinstance(node, dict):
             if "rest_remaining_sec" in node and node["rest_remaining_sec"] is not None:
                 return max(0.0, float(node["rest_remaining_sec"]))
-            last_ts = float(node.get("last_visited_timestamp", node.get("last_visited", 0.0)) or 0.0)
+            last_ts = _dict_last_visited_ts(node)
             if last_ts <= 0.0:
+                if str(node.get("state", "") or "").strip().lower() == "resting":
+                    return float(rest_duration_sec) if rest_duration_sec is not None else 300.0
                 return 0.0
             curr = time.time() if now is None else float(now)
             rest = float(
@@ -290,16 +416,25 @@ def _remaining_rest_seconds(
                 else (getattr(node, "rest_duration_sec", 300) or 300)
             )
             return max(0.0, rest - (curr - last_ts))
+        if str(getattr(node, "state", "active") or "active").strip().lower() == "resting":
+            return float(rest_duration_sec) if rest_duration_sec is not None else 300.0
         return 0.0
     except Exception as exc:
         logger.debug("Kalan dinlenme süresi hesaplama hatası: %s", exc)
-        return 0.0
+        # Hata durumunda fail-closed: kalan süre bilinmiyorsa düğüm
+        # hazır sayılmaz (önceden `0.0` dönüyor, hemen hazır sanılıyordu).
+        try:
+            return float(rest_duration_sec) if rest_duration_sec is not None else 300.0
+        except (TypeError, ValueError):
+            return 300.0
 
 
 def _extract_max_harvests(node: Any) -> int:
     """
     Düğümün maksimum hasat kapasitesini (`max_harvests`) güvenli biçimde döndürür.
-    Normal düğümler için varsayılan `3`, minimap `2x`/`3x` stack kümeleri için `6` veya `9` olur.
+    Açıkça belirtilen kapasiteye (ör. `max_harvests=1` veya `2`) saygı duyulur;
+    yalnızca kapasite belirtilmemişse varsayılan `3 * stack_count` kullanılır
+    (minimap `2x`/`3x` stack kümeleri için `6` veya `9`).
     """
     try:
         if isinstance(node, dict):
@@ -310,8 +445,9 @@ def _extract_max_harvests(node: Any) -> int:
             stack_cnt = getattr(node, "stack_count", 1)
 
         stack_val = max(1, int(stack_cnt or 1))
-        base_max = int(raw_max) if raw_max is not None and int(raw_max) > 0 else (3 * stack_val)
-        return max(1, max(base_max, 3 * stack_val))
+        if raw_max is not None:
+            return max(1, int(raw_max))
+        return max(1, 3 * stack_val)
     except Exception as exc:
         logger.debug("max_harvests çıkarılamadı (%r): %s", node, exc)
         return 3
@@ -458,6 +594,7 @@ class SequentialRoutePlanner:
         )
         self.max_opt_iterations: int = int(max(10, max_opt_iterations))
         self._current_seq_pos: int = -1
+        self._active_nodes: List[Any] = []
         self.cliff_filter: ZAxisCliffFilter = cliff_filter or ZAxisCliffFilter()
         self.prewalk_scheduler: PredictivePreWalkScheduler = (
             prewalk_scheduler or PredictivePreWalkScheduler()
@@ -509,8 +646,16 @@ class SequentialRoutePlanner:
         nodes: Sequence[Any],
         start_xy: Optional[Tuple[float, float]] = None,
     ) -> List[Any]:
-        """Sorts nodes using Greedy Nearest-Neighbor + 2-Opt TSP proximity optimization."""
-        return sort_nodes_by_proximity(nodes, start_xy=start_xy)
+        """Sorts nodes using Greedy Nearest-Neighbor + 2-Opt TSP proximity optimization.
+
+        Norm dönüşümüne harita kanvası (1280x720) açıkça geçirilir (B-01).
+        """
+        return sort_nodes_by_proximity(
+            nodes,
+            start_xy=start_xy,
+            fallback_width=MAP_CANVAS_WIDTH,
+            fallback_height=MAP_CANVAS_HEIGHT,
+        )
 
     def build_proximity_material_route(
         self,
@@ -562,7 +707,7 @@ class SequentialRoutePlanner:
             ready_nodes = target_nodes
             unready_nodes = []
 
-        reordered = sort_nodes_by_proximity(ready_nodes, start_xy=current_xy) + unready_nodes
+        reordered = sort_nodes_by_proximity(ready_nodes, start_xy=current_xy, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT) + unready_nodes
         if update_seq_indices:
             for idx, n in enumerate(reordered, start=1):
                 _set_seq_index(n, idx)
@@ -590,7 +735,7 @@ class SequentialRoutePlanner:
             return None, -1, []
 
         if reorder_remaining:
-            ordered = sort_nodes_by_proximity(candidates, start_xy=player_pos)
+            ordered = sort_nodes_by_proximity(candidates, start_xy=player_pos, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
         else:
             ordered = candidates
 
@@ -694,8 +839,33 @@ class SequentialRoutePlanner:
             if not nodes:
                 return []
 
+            # P1-7 (K-20): koordinatsız düğüm (0,0) hayaleti olarak tura
+            # girmez — turdan çıkarılır ve loglanır. Filtre, n<=2 kısa
+            # yolundan ÖNCE çalışır: 1-2 düğümlü rota da hayalet taşıyamaz.
             node_list = list(nodes)
+            filtered_nodes: List[Any] = []
+            dropped = 0
+            for item in node_list:
+                if _extract_xy_or_none(item, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT) is None:
+                    dropped += 1
+                    logger.warning(
+                        "build_sequential_order: koordinatsız düğüm turdan "
+                        "çıkarıldı (id=%r).",
+                        item.get("id") if isinstance(item, dict) else getattr(item, "id", None),
+                    )
+                else:
+                    filtered_nodes.append(item)
+            if dropped:
+                logger.warning(
+                    "build_sequential_order: %d koordinatsız düğüm çıkarıldı, "
+                    "%d düğüm kaldı.",
+                    dropped,
+                    len(filtered_nodes),
+                )
+            node_list = filtered_nodes
             n = len(node_list)
+            if n == 0:
+                return []
             if n <= 2:
                 for idx, item in enumerate(node_list, start=1):
                     _set_seq_index(item, idx)
@@ -709,13 +879,16 @@ class SequentialRoutePlanner:
                 )
                 clean_mode = "smooth_loop"
 
-            coords: List[Point2D] = [_extract_xy(item) for item in node_list]
+            coords: List[Point2D] = [
+                xy for xy in (_extract_xy_or_none(item, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT) for item in node_list)
+                if xy is not None
+            ]
 
             if clean_mode in ("proximity", "nearest_neighbor", "2opt", "greedy_tsp"):
                 start_pt = None
                 if walk_trajectory and len(walk_trajectory) > 0:
                     start_pt = (float(walk_trajectory[0][0]), float(walk_trajectory[0][1]))
-                ordered_nodes = sort_nodes_by_proximity(node_list, start_xy=start_pt)
+                ordered_nodes = sort_nodes_by_proximity(node_list, start_xy=start_pt, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
                 for seq_idx, item in enumerate(ordered_nodes, start=1):
                     _set_seq_index(item, seq_idx)
                 logger.info(
@@ -743,10 +916,27 @@ class SequentialRoutePlanner:
             return ordered_nodes
         except Exception as exc:
             logger.error("build_sequential_order sırasında hata: %s", exc)
-            fallback = list(nodes) if nodes else []
-            for seq_idx, item in enumerate(fallback, start=1):
-                _set_seq_index(item, seq_idx)
-            return fallback
+            # Yedek sıralı gibi davranmaz: önce yakınlık sırası denenir;
+            # o da olmazsa giriş sırası olduğu gibi (sıralanmamış) döndürülür.
+            try:
+                ordered_fallback = sort_nodes_by_proximity(list(nodes), fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
+                for seq_idx, item in enumerate(ordered_fallback, start=1):
+                    _set_seq_index(item, seq_idx)
+                logger.warning(
+                    "build_sequential_order yedeği: yakınlık sırası kullanıldı (mod=%s).",
+                    mode,
+                )
+                return ordered_fallback
+            except Exception as fallback_exc:
+                logger.error(
+                    "build_sequential_order yedek sıralama da başarısız (%s); "
+                    "sıralanmamış giriş sırası döndürülüyor.",
+                    fallback_exc,
+                )
+                fallback = list(nodes) if nodes else []
+                for seq_idx, item in enumerate(fallback, start=1):
+                    _set_seq_index(item, seq_idx)
+                return fallback
 
     def apply_sequential_order_to_route(
         self,
@@ -801,15 +991,26 @@ class SequentialRoutePlanner:
                     merged_nodes: List[Any] = []
                     for existing in all_region_nodes:
                         if id(existing) in ordered_set:
-                            merged_nodes.append(next(ordered_iter))
+                            # S097 (v19/P3-8): build_sequential_order
+                            # koordinatsız düğümü turdan çıkarır; yinelenen
+                            # id'lerde de sayaç tükenebilir. Varsayımsız
+                            # next() StopIteration atıp tüm kaydetmeyi
+                            # düşürüyordu — tükenince mevcut düğüm korunur.
+                            nxt = next(ordered_iter, None)
+                            merged_nodes.append(nxt if nxt is not None else existing)
                         else:
                             merged_nodes.append(existing)
                     regions_store[canon_region]["nodes"] = merged_nodes
 
                 if reassign_ids:
-                    for new_id, node_obj in enumerate(regions_store[canon_region]["nodes"], start=1):
-                        if hasattr(node_obj, "id"):
-                            node_obj.id = new_id
+                    # `NodeData.id` kalıcı kimliktir; 1..N diye yeniden
+                    # numaralamak eski id'lere bakan tüm referansları bozar.
+                    # Parametre geriye dönük uyumluluk için korunur ancak
+                    # artık kimlikleri değiştirmez.
+                    logger.warning(
+                        "reassign_ids=True yoksayıldı: düğüm kimlikleri "
+                        "(NodeData.id) kalıcıdır, yeniden numaralanmaz."
+                    )
 
             # Son seçilen düğüm işaretçisini sıfırla ki yeni sıranın başından başlasın
             last_sel = getattr(route_manager, "_last_selected_node_id", None)
@@ -850,7 +1051,11 @@ class SequentialRoutePlanner:
         traj: List[Point2D] = []
         if walk_trajectory is not None:
             for pt in walk_trajectory:
-                xy = _extract_xy(pt)
+                # P1-7 (K-20): koordinatsız iz noktası (0,0) hayaleti
+                # olarak çoklu doğruya girmez — atlanır.
+                xy = _extract_xy(pt, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
+                if xy is None:
+                    continue
                 if not traj or _euclidean(traj[-1], xy) > 1e-5:
                     traj.append(xy)
 
@@ -994,9 +1199,20 @@ class SequentialRoutePlanner:
         for start_idx in range(0, n, step):
             candidates.append(self._angular_nearest_neighbor_init(coords, dist_matrix, start_idx))
 
+        # Aynı turu iki kez iyileştirme: tekrar eden adayları tekilleştir.
+        seen_tours = set()
+        unique_candidates: List[List[int]] = []
+        for cand in candidates:
+            key = tuple(cand)
+            if key not in seen_tours:
+                seen_tours.add(key)
+                unique_candidates.append(cand)
+        candidates = unique_candidates
+
         best_tour: List[int] = candidates[0]
         best_score = float("inf")
 
+        _smooth_start = time.perf_counter()
         for cand in candidates:
             # Hızlı 2-Opt + Or-Opt ile adayları değerlendir
             refined = self._two_opt_loop(cand, dist_matrix, coords, use_angular=False)
@@ -1005,6 +1221,11 @@ class SequentialRoutePlanner:
             if score < best_score:
                 best_score = score
                 best_tour = refined
+        logger.debug(
+            "smooth_loop aday iyileştirme: %d aday, %.3f sn",
+            len(candidates),
+            time.perf_counter() - _smooth_start,
+        )
 
         # En iyi tur üzerinde Açısal Süreklilik (Angular Continuity) + kesişim giderme uygula
         best_tour = self._two_opt_loop(best_tour, dist_matrix, coords, use_angular=True)
@@ -1025,13 +1246,12 @@ class SequentialRoutePlanner:
         """Merkez (centroid) etrafında saat yönünde açısal sıralama ile başlangıç çemberi üretir."""
         pts = np.asarray(coords, dtype=np.float64)
         cx, cy = float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))
-        angles = []
-        for idx, (x, y) in enumerate(coords):
-            ang = math.atan2(y - cy, x - cx)
-            rad = math.hypot(x - cx, y - cy)
-            angles.append((ang, rad, idx))
-        angles.sort(key=lambda item: (item[0], item[1]))
-        return [idx for _, _, idx in angles]
+        # Vektörel `atan2`/`hypot`: skaler döngüyle bit-bit aynı açıları
+        # üretir; sıralama anahtarı (açı, yarıçap) `lexsort` ile korunur.
+        angles = np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx)
+        radii = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+        order = np.lexsort((radii, angles))
+        return [int(idx) for idx in order]
 
     def _angular_nearest_neighbor_init(
         self,
@@ -1042,41 +1262,60 @@ class SequentialRoutePlanner:
         """
         Klasik En Yakın Komşu yerine bir önceki hareket vektörüyle yapılan dönüş açısına
         `1 + w * (1 - cos(theta)) / 2` çarpanı uygulayan yön-koruyucu açgözlü tur kurucu.
+
+        Vektörel seçim: her adımda ziyaret edilmemiş tüm adayların maliyeti
+        NumPy ile tek seferde hesaplanır. Dönüş cezası yalnızca `cos(theta)`'ya
+        bağlıdır (`0.5 * (1 - cos(theta))`), bu yüzden skaler yolun `acos`
+        çağrısına gerek yoktur; `argmin` ilk minimumu seçerek skaler
+        `cost < best_cost` taramasıyla aynı eşitlik-bozma kuralını korur.
         """
         n = len(coords)
-        visited = [False] * n
+        pts = np.asarray(coords, dtype=np.float64)
+        visited = np.zeros(n, dtype=bool)
         tour = [start_idx]
         visited[start_idx] = True
 
         for _ in range(n - 1):
             curr = tour[-1]
-            best_next = -1
-            best_cost = float("inf")
-
-            has_prev = len(tour) >= 2
-            prev = tour[-2] if has_prev else curr
-
-            for cand in range(n):
-                if visited[cand]:
-                    continue
-                d = float(dist_matrix[curr, cand])
-                if has_prev and d > 1e-6:
-                    theta = _turn_angle_rad(coords[prev], coords[curr], coords[cand])
-                    # cos(theta) = 1 ise ceza 0; cos(theta) = -1 (180 derece dönüş) ise maksimum ceza
-                    turn_penalty = 0.5 * (1.0 - math.cos(theta))
-                    cost = d * (1.0 + self.angular_penalty_weight * turn_penalty)
+            dists = dist_matrix[curr]
+            if len(tour) >= 2:
+                prev = tour[-2]
+                v1 = pts[curr] - pts[prev]
+                len1 = math.hypot(float(v1[0]), float(v1[1]))
+                if len1 > 1e-9:
+                    v2 = pts - pts[curr]
+                    len2 = np.hypot(v2[:, 0], v2[:, 1])
+                    denom = len1 * len2
+                    # Skaler `_turn_angle_rad` ile aynı kural: `len2 < 1e-9`
+                    # ise açı 0 sayılır (ceza 0, `cost = d`).
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        cos_theta = np.where(
+                            len2 > 1e-9,
+                            (v2 @ v1) / np.where(len2 > 1e-9, denom, 1.0),
+                            1.0,
+                        )
+                    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+                    turn_penalty = 0.5 * (1.0 - cos_theta)
+                    # Skaler yol: `d <= 1e-6` ise ceza uygulanmaz (`cost = d`).
+                    cost = np.where(
+                        dists > 1e-6,
+                        dists * (1.0 + self.angular_penalty_weight * turn_penalty),
+                        dists,
+                    )
                 else:
-                    cost = d
+                    cost = np.array(dists, dtype=np.float64, copy=True)
+            else:
+                cost = np.array(dists, dtype=np.float64, copy=True)
 
-                if cost < best_cost:
-                    best_cost = cost
-                    best_next = cand
-
-            if best_next == -1:
-                for cand in range(n):
-                    if not visited[cand]:
-                        best_next = cand
-                        break
+            cost = np.where(visited, np.inf, cost)
+            best_next = int(np.argmin(cost))
+            if not np.isfinite(cost[best_next]):
+                # Savunma: ziyaret edilmemiş aday kalmadıysa (döngü değişmezi
+                # bunu engeller) ilk ziyaret edilmemiş düğümü al.
+                remaining = np.flatnonzero(~visited)
+                if remaining.size == 0:
+                    break
+                best_next = int(remaining[0])
             visited[best_next] = True
             tour.append(best_next)
 
@@ -1098,6 +1337,8 @@ class SequentialRoutePlanner:
             return list(tour)
 
         route = list(tour)
+        dm = dist_matrix
+        turn_cost = self._turn_cost
         improved = True
         iteration = 0
 
@@ -1107,14 +1348,22 @@ class SequentialRoutePlanner:
             for i in range(n - 1):
                 a = route[i]
                 b = route[(i + 1) % n]
+                # Açısal dalda `old_ang`'in `a` tarafındaki iki terimi yalnızca
+                # `i`'ye bağlıdır; `j` değiştikçe aynı kalır. Rota bir
+                # iyileştirmede ters çevrilirse `b_next` değişir ve anahtar
+                # bozulur, terimler yeniden hesaplanır. (Değerler saf
+                # fonksiyondur: aynı `(a_prev, a, b, b_next)` dörtlüsü her
+                # zaman aynı toplamı verir; davranış değişmez.)
+                cached_key: Optional[Tuple[int, int, int, int]] = None
+                cached_a_side = 0.0
                 for j in range(i + 2, n):
                     if i == 0 and j == n - 1:
                         continue
                     c = route[j]
                     d = route[(j + 1) % n]
 
-                    old_dist = float(dist_matrix[a, b] + dist_matrix[c, d])
-                    new_dist = float(dist_matrix[a, c] + dist_matrix[b, d])
+                    old_dist = dm[a, b] + dm[c, d]
+                    new_dist = dm[a, c] + dm[b, d]
 
                     if use_angular:
                         a_prev = route[(i - 1) % n]
@@ -1122,17 +1371,23 @@ class SequentialRoutePlanner:
                         b_next = route[(i + 2) % n]
                         c_prev = route[(j - 1) % n]
 
+                        key = (a_prev, a, b, b_next)
+                        if key != cached_key:
+                            cached_key = key
+                            cached_a_side = (
+                                turn_cost(coords[a_prev], coords[a], coords[b])
+                                + turn_cost(coords[a], coords[b], coords[b_next])
+                            )
                         old_ang = (
-                            self._turn_cost(coords[a_prev], coords[a], coords[b])
-                            + self._turn_cost(coords[a], coords[b], coords[b_next])
-                            + self._turn_cost(coords[c_prev], coords[c], coords[d])
-                            + self._turn_cost(coords[c], coords[d], coords[d_next])
+                            cached_a_side
+                            + turn_cost(coords[c_prev], coords[c], coords[d])
+                            + turn_cost(coords[c], coords[d], coords[d_next])
                         )
                         new_ang = (
-                            self._turn_cost(coords[a_prev], coords[a], coords[c])
-                            + self._turn_cost(coords[a], coords[c], coords[c_prev])
-                            + self._turn_cost(coords[b_next], coords[b], coords[d])
-                            + self._turn_cost(coords[b], coords[d], coords[d_next])
+                            turn_cost(coords[a_prev], coords[a], coords[c])
+                            + turn_cost(coords[a], coords[c], coords[c_prev])
+                            + turn_cost(coords[b_next], coords[b], coords[d])
+                            + turn_cost(coords[b], coords[d], coords[d_next])
                         )
                         mean_edge = 0.25 * (old_dist + new_dist)
                         old_total = old_dist + self.angular_penalty_weight * mean_edge * 0.25 * old_ang
@@ -1162,86 +1417,93 @@ class SequentialRoutePlanner:
             return list(tour)
 
         route = list(tour)
-        improved = True
-        iteration = 0
+        # Kapalı turda birleşim (seam) bölgesindeki zincirler doğrusal
+        # dilimde hiç ele alınmaz; turu yarım tur döndürüp ikinci
+        # geçiş yapmak seam zincirlerini iç bölgeye taşır.
+        for _rotation_pass in range(2):
+            improved = True
+            iteration = 0
 
-        while improved and iteration < self.max_opt_iterations:
-            improved = False
-            iteration += 1
-            for chain_len in (1, 2, 3):
-                if n <= chain_len + 2:
-                    continue
-                i = 0
-                while i < n:
-                    # Zincir: route[i ... i + chain_len - 1] (mod n yerine doğrusal dilim için rotayı kaydır)
-                    if i + chain_len >= n:
-                        break
-                    prev_i = route[i - 1]
-                    first_c = route[i]
-                    last_c = route[i + chain_len - 1]
-                    next_i = route[(i + chain_len) % n]
+            while improved and iteration < self.max_opt_iterations:
+                improved = False
+                iteration += 1
+                for chain_len in (1, 2, 3):
+                    if n <= chain_len + 2:
+                        continue
+                    i = 0
+                    while i < n:
+                        # Zincir: route[i ... i + chain_len - 1] (mod n yerine doğrusal dilim için rotayı kaydır)
+                        if i + chain_len >= n:
+                            break
+                        prev_i = route[i - 1]
+                        first_c = route[i]
+                        last_c = route[i + chain_len - 1]
+                        next_i = route[(i + chain_len) % n]
 
-                    # Zinciri mevcut yerinden çıkarmanın kazancı
-                    remove_gain = (
-                        float(dist_matrix[prev_i, first_c])
-                        + float(dist_matrix[last_c, next_i])
-                        - float(dist_matrix[prev_i, next_i])
-                    )
-
-                    best_delta = -1e-6
-                    best_pos = -1
-                    best_reverse = False
-                    chain_rev_delta = 0.0
-                    if chain_len == 2:
-                        # Ters çevirme mesafeyi değiştirmez (simetrik), sadece uçları değiştirir
-                        chain_rev_delta = 0.0
-
-                    for j in range(n):
-                        # Hedef kenar: (route[j], route[(j+1)%n])
-                        if i - 1 <= j < i + chain_len:
-                            continue
-                        u = route[j]
-                        v = route[(j + 1) % n]
-                        base_edge = float(dist_matrix[u, v])
-
-                        # Düz ekleme maliyeti
-                        insert_cost_fwd = (
-                            float(dist_matrix[u, first_c])
-                            + float(dist_matrix[last_c, v])
-                            - base_edge
+                        # Zinciri mevcut yerinden çıkarmanın kazancı
+                        remove_gain = (
+                            float(dist_matrix[prev_i, first_c])
+                            + float(dist_matrix[last_c, next_i])
+                            - float(dist_matrix[prev_i, next_i])
                         )
-                        delta_fwd = insert_cost_fwd - remove_gain
-                        if delta_fwd < best_delta:
-                            best_delta = delta_fwd
-                            best_pos = j
-                            best_reverse = False
 
-                        # Ters çevrilmiş zincir ekleme maliyeti
-                        if chain_len > 1:
-                            insert_cost_rev = (
-                                float(dist_matrix[u, last_c])
-                                + float(dist_matrix[first_c, v])
+                        best_delta = -1e-6
+                        best_pos = -1
+                        best_reverse = False
+                        chain_rev_delta = 0.0
+                        if chain_len == 2:
+                            # Ters çevirme mesafeyi değiştirmez (simetrik), sadece uçları değiştirir
+                            chain_rev_delta = 0.0
+
+                        for j in range(n):
+                            # Hedef kenar: (route[j], route[(j+1)%n])
+                            if i - 1 <= j < i + chain_len:
+                                continue
+                            u = route[j]
+                            v = route[(j + 1) % n]
+                            base_edge = float(dist_matrix[u, v])
+
+                            # Düz ekleme maliyeti
+                            insert_cost_fwd = (
+                                float(dist_matrix[u, first_c])
+                                + float(dist_matrix[last_c, v])
                                 - base_edge
-                                + chain_rev_delta
                             )
-                            delta_rev = insert_cost_rev - remove_gain
-                            if delta_rev < best_delta:
-                                best_delta = delta_rev
+                            delta_fwd = insert_cost_fwd - remove_gain
+                            if delta_fwd < best_delta:
+                                best_delta = delta_fwd
                                 best_pos = j
-                                best_reverse = True
+                                best_reverse = False
 
-                    if best_pos != -1:
-                        segment = route[i : i + chain_len]
-                        if best_reverse:
-                            segment.reverse()
-                        del route[i : i + chain_len]
-                        insert_idx = best_pos + 1 if best_pos < i else best_pos - chain_len + 1
-                        route[insert_idx:insert_idx] = segment
-                        improved = True
+                            # Ters çevrilmiş zincir ekleme maliyeti
+                            if chain_len > 1:
+                                insert_cost_rev = (
+                                    float(dist_matrix[u, last_c])
+                                    + float(dist_matrix[first_c, v])
+                                    - base_edge
+                                    + chain_rev_delta
+                                )
+                                delta_rev = insert_cost_rev - remove_gain
+                                if delta_rev < best_delta:
+                                    best_delta = delta_rev
+                                    best_pos = j
+                                    best_reverse = True
+
+                        if best_pos != -1:
+                            segment = route[i : i + chain_len]
+                            if best_reverse:
+                                segment.reverse()
+                            del route[i : i + chain_len]
+                            insert_idx = best_pos + 1 if best_pos < i else best_pos - chain_len + 1
+                            route[insert_idx:insert_idx] = segment
+                            improved = True
+                            break
+                        i += 1
+                    if improved:
                         break
-                    i += 1
-                if improved:
-                    break
+
+            if _rotation_pass == 0:
+                route = route[n // 2:] + route[: n // 2]
 
         return route
 
@@ -1300,15 +1562,36 @@ class SequentialRoutePlanner:
     def _turn_cost(self, p_prev: Point2D, p_curr: Point2D, p_next: Point2D) -> float:
         """
         Açısal kırılma cezası: `0.5 * (1 - cos(theta))` + keskin dönüş (`>90°`) ek cezası.
+
+        Hızlı yol: taban terim yalnızca `cos(theta)`'ya bağlıdır; `theta`'nın
+        kendisi (pahalı `acos`) yalnızca keskin dönüş cezasının devreye
+        girdiği `theta > 0.45 * pi` durumunda (`cos(theta) < cos(0.45 * pi)`)
+        hesaplanır. Pürüzsüz turdaki üçlülerin büyük çoğunluğu bu eşiğin
+        altında kalır, dolayısıyla sonuç bit-bit aynı formülle (en fazla
+        ~1 ulp farkla) çok daha az trigonometriyle bulunur.
         """
-        theta = _turn_angle_rad(p_prev, p_curr, p_next)
-        base = 0.5 * (1.0 - math.cos(theta))
-        if theta > (math.pi * 0.45):
+        v1x = p_curr[0] - p_prev[0]
+        v1y = p_curr[1] - p_prev[1]
+        v2x = p_next[0] - p_curr[0]
+        v2y = p_next[1] - p_curr[1]
+        len1 = math.hypot(v1x, v1y)
+        len2 = math.hypot(v2x, v2y)
+        if len1 < 1e-9 or len2 < 1e-9:
+            return 0.0
+        cos_theta = (v1x * v2x + v1y * v2y) / (len1 * len2)
+        if cos_theta > 1.0:
+            cos_theta = 1.0
+        elif cos_theta < -1.0:
+            cos_theta = -1.0
+        base = 0.5 * (1.0 - cos_theta)
+        if cos_theta < _COS_SHARP_TURN:
+            # theta > 0.45 * pi: keskin dönüş ek cezası için theta gerekir.
+            theta = math.acos(cos_theta)
             excess = (theta - math.pi * 0.45) / (math.pi * 0.55)
             base += 3.2 * (excess ** 2)
-        if theta > (math.pi * 0.5):
-            # 90 dereceden keskin dönüşlere (geri adım / zikzak) güçlü ceza uygula
-            base += 2.5
+            if cos_theta < 0.0:
+                # theta > 0.5 * pi: 90 dereceden keskin dönüşlere (geri adım / zikzak) güçlü ceza
+                base += 2.5
         return base
 
     def _tour_objective(
@@ -1513,7 +1796,9 @@ class SequentialRoutePlanner:
     ) -> List[int]:
         """
         Geometrik olarak kesişen tüm kenar çiftlerini (`_segments_intersect`)
-        2-Opt ters çevirme işlemiyle tamamen ortadan kaldırır (`crossings_count = 0`).
+        2-Opt ters çevirme işlemiyle ortadan kaldırır. Her geçişte en az bir
+        kesişim düzeltilir; geçiş bütçesi `max(40, n)`'dir. Bütçe bitiminde
+        kesişim kalırsa sessizce geçilmez — kalan sayı uyarı olarak loglanır.
         """
         n = len(order)
         if n < 4:
@@ -1521,7 +1806,7 @@ class SequentialRoutePlanner:
 
         route = list(order)
         num_edges = n if closed_loop else (n - 1)
-        for _ in range(min(40, n)):
+        for _ in range(max(40, n)):
             found_crossing = False
             for i in range(num_edges - 2):
                 a1 = coords[route[i]]
@@ -1539,7 +1824,36 @@ class SequentialRoutePlanner:
                     break
             if not found_crossing:
                 break
+        else:
+            remaining = self._count_crossings(route, coords, closed_loop)
+            if remaining > 0:
+                logger.warning(
+                    "_eliminate_crossings: %d kesişim giderilemedi (bütçe aşıldı).",
+                    remaining,
+                )
         return route
+
+    def _count_crossings(
+        self,
+        order: List[int],
+        coords: List[Point2D],
+        closed_loop: bool = True,
+    ) -> int:
+        """Verilen sıradaki kesişen kenar çifti sayısını döndürür."""
+        n = len(order)
+        if n < 4:
+            return 0
+        num_edges = n if closed_loop else (n - 1)
+        count = 0
+        for i in range(num_edges - 2):
+            a1 = coords[order[i]]
+            a2 = coords[order[(i + 1) % n]]
+            for j in range(i + 2, num_edges):
+                if closed_loop and i == 0 and j == num_edges - 1:
+                    continue
+                if _segments_intersect(a1, a2, coords[order[j]], coords[order[(j + 1) % n]]):
+                    count += 1
+        return count
 
     def _open_path_or_opt(
         self,
@@ -1627,9 +1941,20 @@ class SequentialRoutePlanner:
             return -1e9
 
         cand_node = nodes[cand_idx]
-        curr_xy = _extract_xy(nodes[curr_idx]) if 0 <= curr_idx < n else (0.0, 0.0)
-        cand_xy = _extract_xy(cand_node)
-        ref_xy = (float(player_pos[0]), float(player_pos[1])) if player_pos is not None else curr_xy
+        # P1-7 (K-20): koordinatsız aday skorlanamaz — (0,0)'a göre mesafe
+        # uydurulmaz, aday elenir (en düşük skor).
+        cand_xy = _extract_xy(cand_node, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
+        if cand_xy is None:
+            return -1e9
+        curr_xy = _extract_xy(nodes[curr_idx], fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT) if 0 <= curr_idx < n else None
+        if curr_xy is None and player_pos is None:
+            return -1e9
+        if player_pos is not None:
+            ref_xy = (float(player_pos[0]), float(player_pos[1]))
+        else:
+            ref_xy = curr_xy
+            if ref_xy is None:
+                return -1e9
         dist_px = _euclidean(ref_xy, cand_xy)
 
         # Monotonik sıra koruma terimi: step=1 her zaman step=2'den kesin olarak üstündür (sıfır ping-pong)
@@ -1707,14 +2032,22 @@ class SequentialRoutePlanner:
 
             if current_seq_pos is None and current_index is not None:
                 current_seq_pos = current_index
+            if current_seq_pos is None and self._current_seq_pos >= 0:
+                # Çağıran konum vermediyse planlayıcının hatırladığı
+                # son konum kullanılır (F-0492: `_current_seq_pos` artık okunuyor).
+                current_seq_pos = self._current_seq_pos
 
             win = max(1, min(n, int(forward_window)))
 
             # Ortalama adım uzunluğunu tie-breaker ölçeklemesi için hesapla
-            sample_steps = [
-                _euclidean(_extract_xy(node_list[i]), _extract_xy(node_list[(i + 1) % n]))
-                for i in range(min(n, 16))
-            ]
+            # P1-7 (K-20): koordinatsız düğüm çifti örnekten atlanır —
+            # (0,0) hayaleti ortalama adımı şişirmez.
+            sample_steps = []
+            for i in range(min(n, 16)):
+                _a = _extract_xy(node_list[i], fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
+                _b = _extract_xy(node_list[(i + 1) % n], fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
+                if _a is not None and _b is not None:
+                    sample_steps.append(_euclidean(_a, _b))
             avg_step_px = float(np.mean(sample_steps)) if sample_steps else 120.0
 
             # Seçilebilir (uçurum olmayan ve rakip tarafından tutulmayan) indeksler kümesi
@@ -1747,7 +2080,12 @@ class SequentialRoutePlanner:
                             rest_duration_sec=rest_duration_sec,
                             enable_predictive_prewalk=enable_predictive_prewalk,
                         ):
-                            cx, cy = _extract_xy(cand)
+                            # P1-7 (K-20): koordinatsız aday mesafesi
+                            # (0,0)'a göre ölçülmez — aday atlanır.
+                            _cand_xy = _extract_xy(cand, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
+                            if _cand_xy is None:
+                                continue
+                            cx, cy = _cand_xy
                             raw_dist = math.hypot(cx - px, cy - py)
                             tie_bonus = _stack_cluster_tiebreaker_bonus(cand, avg_step_px=avg_step_px)
                             effective_dist = max(0.0, raw_dist - tie_bonus)
@@ -1762,11 +2100,28 @@ class SequentialRoutePlanner:
                     all_candidates: List[Tuple[float, float, int]] = []
                     for idx in selectable_indices:
                         cand = node_list[idx]
-                        cx, cy = _extract_xy(cand)
+                        # P1-7 (K-20): koordinatsız aday (0,0)'a göre
+                        # ölçülmez — aday atlanır.
+                        _cand_xy = _extract_xy(cand, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
+                        if _cand_xy is None:
+                            continue
+                        cx, cy = _cand_xy
                         raw_dist = math.hypot(cx - px, cy - py)
                         tie_bonus = _stack_cluster_tiebreaker_bonus(cand, avg_step_px=avg_step_px)
                         effective_dist = max(0.0, raw_dist - tie_bonus)
                         all_candidates.append((effective_dist, -float(_extract_max_harvests(cand)), idx))
+
+                    if not all_candidates:
+                        # P1-7 (K-20): hiçbir adayın koordinatı yoksa
+                        # (0,0)'a en yakın diye biri seçilmez — mesafesiz
+                        # yedek yola düşülür (ilk seçilebilir düğüm).
+                        logger.warning(
+                            "get_next_node: koordinatlı aday kalmadı; "
+                            "mesafesiz yedek seçim yapılıyor."
+                        )
+                        first_sel = selectable_indices[0]
+                        self._current_seq_pos = first_sel
+                        return node_list[first_sel], first_sel
 
                     all_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
                     chosen_idx = all_candidates[0][2]
@@ -1804,7 +2159,10 @@ class SequentialRoutePlanner:
             #    düğümleri monotonik sıra düzenini (0 -> 1 -> 2 -> ... -> N-1) KESİN koruyarak puanla
             best_ready_idx = -1
             best_ready_score = -1e12
-            ref_pos = player_pos if player_pos is not None else _extract_xy(node_list[curr_idx])
+            # Oyuncu konumu yoksa pre-walk hesabına mevcut düğüm konumu
+            # verilmez: `None` olduğu gibi aktarılır; pre-walk zamanlayıcı
+            # konum yokken varsayılan yürüyüş süresiyle çalışır.
+            ref_pos = player_pos
             for step in range(1, win + 1):
                 cand_idx = curr_idx + step
                 if cand_idx >= n:
@@ -1860,8 +2218,10 @@ class SequentialRoutePlanner:
                     return candidate, cand_idx
 
             # 3. Aşama: Rotadaki TÜM düğümler uzun dinlenme süresindeyse,
-            #    asla geri gitme; ileri yöndeki ilk seçilebilir düğümü veya ileri penceredeki
-            #    en erken hazır olacak sıradaki düğümü (stack cluster tie-breaker ile) seç.
+            #    asla geri gitme; ileri yöndeki seçilebilir düğümler arasından
+            #    en erken hazır olacak (en küçük kalan dinlenme süreli)
+            #    düğümü seç. `allow_wrap=False` iken gerideki düğümler
+            #    aday olamaz; ileri aday yoksa mevcut düğümde beklenir.
             forward_selectables: List[int] = []
             for step in range(1, max_scan + 1):
                 c_idx = (curr_idx + step) % n
@@ -1870,25 +2230,33 @@ class SequentialRoutePlanner:
                 if c_idx in selectable_set:
                     forward_selectables.append(c_idx)
             if not forward_selectables:
-                forward_selectables = [c for c in selectable_indices if (n <= 1 or c != curr_idx)]
+                if allow_wrap:
+                    forward_selectables = [c for c in selectable_indices if (n <= 1 or c != curr_idx)]
+                    if not forward_selectables and curr_idx in selectable_set:
+                        # Seçilebilir tek düğüm mevcut düğümse orada beklenir.
+                        forward_selectables = [curr_idx]
+                elif curr_idx in selectable_set:
+                    # Geri gitmek yerine mevcut düğümde bekle.
+                    forward_selectables = [curr_idx]
             if not forward_selectables:
-                forward_selectables = list(selectable_indices)
+                return None, -1
 
+            # En erken hazır olacak düğümü TÜM ileri adaylar arasında,
+            # tek bir stack indirim tablosuyla seç.
             best_idx = forward_selectables[0]
-            next_max_h = _extract_max_harvests(node_list[best_idx])
-            next_stack_discount = 3.5 if next_max_h >= 6 else 0.0
             best_wait = _remaining_rest_seconds(
                 node_list[best_idx], now=check_time, rest_duration_sec=rest_duration_sec
-            ) - next_stack_discount
+            ) - _stack_wait_discount(_extract_max_harvests(node_list[best_idx]))
 
-            for cand_idx in forward_selectables[: min(len(forward_selectables), min(win, 4))]:
+            for cand_idx in forward_selectables:
+                if cand_idx == best_idx:
+                    continue
                 cand_max_h = _extract_max_harvests(node_list[cand_idx])
-                stack_discount = 4.5 if cand_max_h >= 9 else (3.5 if cand_max_h >= 6 else 0.0)
                 wait_sec = (
                     _remaining_rest_seconds(
                         node_list[cand_idx], now=check_time, rest_duration_sec=rest_duration_sec
                     )
-                    - stack_discount
+                    - _stack_wait_discount(cand_max_h)
                 )
                 if wait_sec + 5.0 < best_wait:
                     best_wait = wait_sec
@@ -1898,9 +2266,24 @@ class SequentialRoutePlanner:
             return node_list[best_idx], best_idx
         except Exception as exc:
             logger.error("select_next_sequential_node hatası: %s", exc)
+            # Hata yedeği de filtresiz düğüm döndürmez: yalnızca
+            # seçilebilir (uçurum/rakip filtresinden geçen) düğümler adaydır.
             if nodes:
-                fallback_idx = 0 if current_seq_pos is None else (int(current_seq_pos) + 1) % len(nodes)
-                return nodes[fallback_idx], fallback_idx
+                try:
+                    start = 0
+                    if current_seq_pos is not None:
+                        start = (int(current_seq_pos) + 1) % len(nodes)
+                except (TypeError, ValueError):
+                    start = 0
+                node_list = list(nodes)
+                for offset in range(len(node_list)):
+                    cand_idx = (start + offset) % len(node_list)
+                    try:
+                        if self._is_candidate_selectable(node_list[cand_idx]):
+                            self._current_seq_pos = cand_idx
+                            return node_list[cand_idx], cand_idx
+                    except Exception:
+                        continue
             return None, -1
 
     def get_next_in_sequence(
@@ -1912,6 +2295,7 @@ class SequentialRoutePlanner:
         allow_wrap: bool = True,
         now: Optional[float] = None,
         rest_duration_sec: Optional[int] = None,
+        current_index: Optional[int] = None,
         stay_on_partial_harvest: bool = True,
         is_flying: bool = False,
         player_altitude_band: Optional[str] = None,
@@ -1920,6 +2304,8 @@ class SequentialRoutePlanner:
     ) -> Tuple[Optional[Any], int]:
         """
         `select_next_sequential_node` ile tam uyumlu Anti-Ping-Pong sıradaki hedef seçici.
+        `current_index`, `select_next_sequential_node` ile aynı anlamda
+        `current_seq_pos` için alternatif addır.
         """
         return self.select_next_sequential_node(
             nodes=nodes,
@@ -1929,6 +2315,7 @@ class SequentialRoutePlanner:
             allow_wrap=allow_wrap,
             now=now,
             rest_duration_sec=rest_duration_sec,
+            current_index=current_index,
             stay_on_partial_harvest=stay_on_partial_harvest,
             is_flying=is_flying,
             player_altitude_band=player_altitude_band,
@@ -1957,6 +2344,35 @@ class SequentialRoutePlanner:
             current_list = list(ordered_nodes) if ordered_nodes else []
             n = len(current_list)
 
+            if new_node is None:
+                logger.warning("insert_node_in_sequence: None düğüm eklenemez.")
+                return current_list, -1
+
+            # Tekrar kontrolü: aynı nesne veya aynı kalıcı id zaten
+            # sıradaysa ekleme; mevcut konumunu döndür.
+            new_id = None
+            if isinstance(new_node, dict):
+                new_id = new_node.get("id")
+            else:
+                new_id = getattr(new_node, "id", None)
+            for existing_idx, existing in enumerate(current_list):
+                if existing is new_node:
+                    return current_list, existing_idx
+                if new_id is not None:
+                    existing_id = (
+                        existing.get("id")
+                        if isinstance(existing, dict)
+                        else getattr(existing, "id", None)
+                    )
+                    if existing_id is not None and existing_id == new_id:
+                        return current_list, existing_idx
+
+            # Koordinatsız düğüm (0, 0) hayaletine dönüşemez; eklenmez.
+            new_pt = _extract_xy_or_none(new_node, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
+            if new_pt is None:
+                logger.warning("insert_node_in_sequence: koordinatsız düğüm eklenemez.")
+                return current_list, -1
+
             if n == 0:
                 _set_seq_index(new_node, 1)
                 return [new_node], 0
@@ -1967,8 +2383,9 @@ class SequentialRoutePlanner:
                     _set_seq_index(item, idx)
                 return current_list, 1
 
-            new_pt = _extract_xy(new_node)
-            coords = [_extract_xy(item) for item in current_list]
+            # P1-7 (K-20): mevcut listedeki koordinatsız düğümün kenarı
+            # (0,0) hayaletiyle ölçülmez — o kenar ekleme hesabına girmez.
+            coords = [_extract_xy(item, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT) for item in current_list]
 
             best_cost = float("inf")
             best_insert_idx = n
@@ -1978,6 +2395,8 @@ class SequentialRoutePlanner:
                 j = (i + 1) % n
                 pi = coords[i]
                 pj = coords[j]
+                if pi is None or pj is None:
+                    continue
 
                 d_i_new = _euclidean(pi, new_pt)
                 d_new_j = _euclidean(new_pt, pj)
@@ -1997,13 +2416,16 @@ class SequentialRoutePlanner:
 
             if not closed_loop:
                 # Açık rotada başa veya sona ekleme maliyetini de kontrol et
-                cost_head = _euclidean(new_pt, coords[0])
-                cost_tail = _euclidean(coords[-1], new_pt)
-                if cost_head < best_cost:
-                    best_cost = cost_head
-                    best_insert_idx = 0
-                if cost_tail < best_cost:
-                    best_insert_idx = n
+                # P1-7 (K-20): uç koordinatsızsa o kenar ölçülmez.
+                if coords[0] is not None:
+                    cost_head = _euclidean(new_pt, coords[0])
+                    if cost_head < best_cost:
+                        best_cost = cost_head
+                        best_insert_idx = 0
+                if coords[-1] is not None:
+                    cost_tail = _euclidean(coords[-1], new_pt)
+                    if cost_tail < best_cost:
+                        best_insert_idx = n
 
             current_list.insert(best_insert_idx, new_node)
             for seq_idx, item in enumerate(current_list, start=1):
@@ -2019,6 +2441,8 @@ class SequentialRoutePlanner:
         except Exception as exc:
             logger.error("insert_node_in_sequence hatası: %s", exc)
             fallback = list(ordered_nodes) if ordered_nodes else []
+            if new_node is None:
+                return fallback, -1
             fallback.append(new_node)
             for seq_idx, item in enumerate(fallback, start=1):
                 _set_seq_index(item, seq_idx)
@@ -2062,7 +2486,9 @@ class SequentialRoutePlanner:
                     "smoothness_score": 100.0,
                 }
 
-            coords = [_extract_xy(item) for item in node_list]
+            # P1-7 (K-20): koordinatsız düğüm metriğe (0,0) hayaleti
+            # olarak girmez — o düğümün kenarları atlanır.
+            coords = [_extract_xy(item, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT) for item in node_list]
             steps: List[float] = []
             edges: List[Tuple[Point2D, Point2D]] = []
 
@@ -2070,6 +2496,8 @@ class SequentialRoutePlanner:
             for i in range(num_steps):
                 p1 = coords[i]
                 p2 = coords[(i + 1) % n]
+                if p1 is None or p2 is None:
+                    continue
                 d = _euclidean(p1, p2)
                 steps.append(d)
                 edges.append((p1, p2))
@@ -2181,7 +2609,9 @@ class SequentialRoutePlanner:
         Calculates standardized route metrics for cyclical and open routes.
         Compatible with test_map_and_radar_suite.py and cartography radar displays.
         """
-        scale = float(meters_per_pixel if meters_per_pixel is not None else 0.28)
+        scale = float(
+            meters_per_pixel if meters_per_pixel is not None else PIXEL_TO_METER_DEFAULT
+        )
         n = len(nodes or [])
         if n == 0:
             return {
@@ -2209,6 +2639,22 @@ class SequentialRoutePlanner:
         min_px = float(quality.get("min_step_px", 0.0))
         smooth_score = float(quality.get("smoothness_score", 100.0))
 
+        # P1-12 / v18: ping_pong_jumps TEK TANIM — yerel adımın çok üstündeki
+        # bağ sayısı (core.corridor_navigator.jump_length_threshold, radar
+        # ile aynı tanım). Eski kod buraya sharp_turns_count (> 90° dönüş
+        # sayısı) yazıyordu; keskin dönüş ayrı metriktir ve
+        # evaluate_sequence_quality'de zaten sharp_turns_count olarak döner.
+        # Adım listesi evaluate_sequence_quality ile aynı kuraldadır
+        # (kapalı döngüde n kenar, n <= 2'de n-1 kenar — 2 düğümde tek gidiş
+        # kenarı, kapanış kenarı sayılmaz; bkz. evaluate_sequence_quality).
+        _coords = [_extract_xy(item, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT) for item in nodes]
+        _num_steps = n if n > 2 else (n - 1)
+        _steps = [
+            _euclidean(_coords[i], _coords[(i + 1) % n]) for i in range(max(_num_steps, 0))
+        ]
+        _jump_threshold = jump_length_threshold(_steps)
+        ping_pong_jumps = sum(1 for _s in _steps if _s > _jump_threshold)
+
         return {
             "discovered_nodes": n,
             "node_count": n,
@@ -2223,7 +2669,7 @@ class SequentialRoutePlanner:
             "max_jump_px": max_px,
             "min_step_m": round(min_px * scale, 2),
             "min_step_px": min_px,
-            "ping_pong_jumps": int(quality.get("sharp_turns_count", 0)),
+            "ping_pong_jumps": int(ping_pong_jumps),
             "closed_loop": n >= 3,
         }
 
@@ -2262,7 +2708,21 @@ class SequentialRoutePlanner:
                 "active_node": None,
             }
         curr_node = nodes[current_index % len(nodes)]
-        waypoint_xy = _extract_xy(curr_node)
+        # P1-7 (K-20): hedef düğümün koordinatı yoksa (0,0) hayaletine
+        # yürünmez — varış yok sayılır, geçiş yapılmaz.
+        waypoint_xy = _extract_xy(curr_node, fallback_width=MAP_CANVAS_WIDTH, fallback_height=MAP_CANVAS_HEIGHT)
+        if waypoint_xy is None:
+            logger.warning(
+                "check_arrival_and_advance: koordinatsız düğüm (id=%r) "
+                "hedef olamaz; varış beklenmiyor.",
+                curr_node.get("id") if isinstance(curr_node, dict) else getattr(curr_node, "id", None),
+            )
+            return {
+                "arrived": False,
+                "transitioned": False,
+                "current_index": current_index,
+                "active_node": curr_node,
+            }
         transition = self.arrival_detector.check_and_transition(
             player_pos=player_pos,
             waypoint_pos=waypoint_xy,
@@ -2384,28 +2844,87 @@ class SequentialRoutePlanner:
         )
 
     def get_sequential_router_health_summary(self) -> dict:
-        try:
-            return {"sequential_router_ready": True}
-        except Exception as exc:
-            logger.error("get_sequential_router_health_summary error: %s", exc)
-            return {"sequential_router_ready": False}
+        ready = validate_sequential_router_contract()
+        return {"sequential_router_ready": bool(ready)}
 
     def get_sequential_router_ready_flag(self) -> dict:
-        return {"module": "sequential_router", "ready": True}
+        return {"module": "sequential_router", "ready": validate_sequential_router_contract()}
 
     def get_sequential_router_version_info(self) -> dict:
-        return {"module": "sequential_router", "version": "2.0.0", "ready": True}
+        return {
+            "module": "sequential_router",
+            "version": __version__,
+            "ready": validate_sequential_router_contract(),
+        }
 
     def get_sequential_router_diagnostic_snapshot(self) -> dict:
-        return {"module": "sequential_router", "status": "ok", "ready": True}
+        ready = validate_sequential_router_contract()
+        return {
+            "module": "sequential_router",
+            "status": "ok" if ready else "failed",
+            "ready": ready,
+        }
+
+
+def _run_sequential_router_self_check() -> bool:
+    """
+    Sözleşme doğrulaması için gerçek duman testi: küçük bir sentetik
+    rotayı sırala ve sıradaki hedefi seç; indeksler ve düğüm kimliği
+    tutarlıysa sözleşme geçerlidir. Yalnızca yetenek listesinin
+    boş olmamasına bakmak totolojidir.
+    """
+    try:
+        if not get_sequential_router_capabilities():
+            return False
+        planner = SequentialRoutePlanner()
+        nodes = [
+            {"id": 1, "map_x": 0.0, "map_y": 0.0},
+            {"id": 2, "map_x": 100.0, "map_y": 0.0},
+            {"id": 3, "map_x": 100.0, "map_y": 100.0},
+            {"id": 4, "map_x": 0.0, "map_y": 100.0},
+        ]
+        ordered = planner.build_sequential_order(nodes, mode="smooth_loop")
+        if len(ordered) != 4 or sorted(n["id"] for n in ordered) != [1, 2, 3, 4]:
+            return False
+        if [n.get("seq_index") for n in ordered] != [1, 2, 3, 4]:
+            return False
+        selected, idx = planner.select_next_sequential_node(
+            ordered, current_seq_pos=0, forward_window=2
+        )
+        if selected is None or not 0 <= idx < len(ordered):
+            return False
+        if ordered[idx] is not selected:
+            return False
+        quality = planner.evaluate_sequence_quality(ordered, closed_loop=True)
+        if quality.get("node_count") != 4 or quality.get("crossings_count", 1) != 0:
+            return False
+        return True
+    except Exception as exc:
+        logger.error("sequential_router self-check başarısız: %s", exc)
+        return False
 
 
 def get_sequential_router_capabilities() -> list:
     return ["sequential_router", "smooth_loop_routing", "diagnostic_snapshot"]
 
 
+# `validate_sequential_router_contract` önbelleği (`None` = henüz hesaplanmadı).
+_CONTRACT_VALID_CACHE: Optional[bool] = None
+
+
 def validate_sequential_router_contract() -> bool:
-    return bool(get_sequential_router_capabilities())
+    """
+    Sözleşme doğrulaması: yetenek listesi + gerçek duman testi.
+    Duman testi saf ve belirlidir (sabit 4 düğümlü sentetik rota), bu
+    yüzden sonucu ilk çağrıda hesaplanıp önbelleğe alınır: modüldeki
+    hazır/denetim/sertifika fonksiyonları her çağrıda aynı pahalı
+    kendi-kendini-denemeyi yeniden çalıştırıyordu (ölçüm: 12 ardışık
+    `validate_*` çağrısı 12 duman testi; önbellekle 1).
+    """
+    global _CONTRACT_VALID_CACHE
+    if _CONTRACT_VALID_CACHE is None:
+        _CONTRACT_VALID_CACHE = bool(get_sequential_router_capabilities()) and _run_sequential_router_self_check()
+    return _CONTRACT_VALID_CACHE
 
 
 def get_sequential_router_baseline_metrics() -> dict:

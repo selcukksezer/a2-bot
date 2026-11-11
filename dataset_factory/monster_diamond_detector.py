@@ -12,6 +12,14 @@ Detects yellow/olive monster nameplates in both normal and horizontally flipped
 
 Strictly excludes the center-screen player character zone (`0.42..0.58 X, 0.42..0.58 Y`)
 so player overlays, self-buffs, or character accessories are never misclassified as monsters.
+
+NOTE (F-1999/B1): this module is the SINGLE implementation of the Stage B2
+monster nameplate scan — `dataset_factory.yolo_auto_labeler._scan_3d_monsters`
+delegates its yellow-nameplate / diamond-tip / red-badge stage to
+`get_monster_diamond_detector().detect()` (the labeler's Stage B1 red-HP-bar
+scan is a different stage and stays inline). Confidence/trust follow the
+harmonized live contract: diamond tips 0.95 trusted (R07), red-badge-only
+0.55 weak (S-6001), untargeted yellow capped at 0.68 weak.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -28,6 +37,35 @@ import numpy as np
 from dataset_factory.class_taxonomy import CANONICAL_LABELS_TR, CANONICAL_NAMES, format_yolo_txt_line
 
 logger = logging.getLogger(__name__)
+
+# Shared threshold arrays / kernels (D56): cv2.inRange / morphologyEx never
+# mutate these, so one module-level copy replaces a fresh np.array(...) per
+# candidate call in _check_red_agro_badge_or_bar / inspect_nameplate_roi and
+# per dilate() call in _detect_single_pass.
+_RED_LOW1 = np.array([0, 125, 90], dtype=np.uint8)
+_RED_HIGH1 = np.array([10, 255, 255], dtype=np.uint8)
+_RED_LOW2 = np.array([168, 125, 90], dtype=np.uint8)
+_RED_HIGH2 = np.array([180, 255, 255], dtype=np.uint8)
+_KERNEL_3X3 = np.ones((3, 3), dtype=np.uint8)
+
+# Small cache for rectangular structuring elements: getStructuringElement
+# allocates a fresh array per call, but _detect_single_pass rebuilds the
+# same (th_sz, th_sz) / (kw, kh) elements on every frame. morphologyEx never
+# mutates its kernel, so cached elements are safe to reuse. Bounded by the
+# handful of (scale_x, scale_y) sizes a session actually sees.
+_STRUCT_ELEM_CACHE: Dict[Tuple[int, int], np.ndarray] = {}
+_STRUCT_ELEM_CACHE_LOCK = threading.Lock()
+
+
+def _rect_struct_elem(kw: int, kh: int) -> np.ndarray:
+    """Return the cached MORPH_RECT structuring element of size (kw, kh)."""
+    key = (int(kw), int(kh))
+    with _STRUCT_ELEM_CACHE_LOCK:
+        elem = _STRUCT_ELEM_CACHE.get(key)
+        if elem is None:
+            elem = cv2.getStructuringElement(cv2.MORPH_RECT, key)
+            _STRUCT_ELEM_CACHE[key] = elem
+        return elem
 
 MONSTER_CLASS_ID: int = 10
 MONSTER_CLASS_NAME: str = CANONICAL_NAMES.get(10, "monster_3d")
@@ -72,6 +110,22 @@ class DiamondTipMonsterDetector:
         )
         self.require_badge_or_tips: bool = bool(require_badge_or_tips)
         self.iou_dedup_threshold: float = float(iou_dedup_threshold)
+        # Precomputed cyan inRange bounds (D56): _check_flanking_diamond_tips
+        # and inspect_nameplate_roi used to build two fresh np.array bounds on
+        # every call. Derived from the constructor params only (no caller in
+        # the repo mutates the cyan_* attributes after construction).
+        self._cyan_low = np.array(
+            [self.cyan_hue_range[0], self.cyan_min_sat, self.cyan_min_val],
+            dtype=np.uint8,
+        )
+        self._cyan_high = np.array(
+            [self.cyan_hue_range[1], 255, 255], dtype=np.uint8
+        )
+        # B8: last single-pass scan summary (candidates examined vs emitted).
+        # The old code dropped candidates silently at every `continue` with
+        # no count anywhere, so a tuning session could not see which gate
+        # eliminated what. Updated by _detect_single_pass on every run.
+        self._last_single_pass_stats: Dict[str, int] = {"examined": 0, "emitted": 0}
 
     # ------------------------------------------------------------------
     # Coordinate, Masking & Exclusion Helpers
@@ -91,8 +145,30 @@ class DiamondTipMonsterDetector:
             return cv2.imdecode(raw, cv2.IMREAD_COLOR)
         if not isinstance(frame, np.ndarray) or frame.size == 0:
             return None
+        # F-2014: validate/normalize dtype first — a float or bool 3-channel
+        # array used to pass through unconverted and corrupt downstream HSV
+        # thresholds (which assume uint8 0-255). Reject exotic dtypes.
+        if frame.dtype == object or np.issubdtype(frame.dtype, np.complexfloating):
+            return None
+        if frame.dtype != np.uint8:
+            if np.issubdtype(frame.dtype, np.floating):
+                arr = np.asarray(frame, dtype=np.float64)
+                if arr.size and float(np.max(arr)) <= 1.0:
+                    arr = arr * 255.0
+                frame = np.clip(arr, 0, 255).astype(np.uint8)
+            elif np.issubdtype(frame.dtype, np.bool_):
+                frame = (np.asarray(frame) * 255).astype(np.uint8)
+            elif np.issubdtype(frame.dtype, np.integer):
+                # S-2502: clip before the uint8 cast — without it a uint16/int16
+                # value of 300 wrapped to 44 and silently broke the HSV
+                # thresholds (the float branch above already clips).
+                frame = np.clip(np.asarray(frame), 0, 255).astype(np.uint8)
+            else:
+                return None
         if frame.ndim == 2:
             return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        if frame.ndim == 3 and frame.shape[2] == 1:
+            return cv2.cvtColor(frame[:, :, 0], cv2.COLOR_GRAY2BGR)
         if frame.ndim == 3 and frame.shape[2] == 4:
             return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
         if frame.ndim == 3 and frame.shape[2] == 3:
@@ -279,8 +355,8 @@ class DiamondTipMonsterDetector:
         ty1 = max(0, y - pad_y)
         ty2 = min(img_h, y + ch + pad_y)
 
-        c_low = np.array([self.cyan_hue_range[0], self.cyan_min_sat, self.cyan_min_val], dtype=np.uint8)
-        c_high = np.array([self.cyan_hue_range[1], 255, 255], dtype=np.uint8)
+        c_low = self._cyan_low
+        c_high = self._cyan_high
 
         left_roi = hsv[ty1:ty2, lx1:lx2]
         right_roi = hsv[ty1:ty2, rx1:rx2]
@@ -319,8 +395,8 @@ class DiamondTipMonsterDetector:
         if below_hsv.size == 0:
             return False, 0
 
-        red1 = cv2.inRange(below_hsv, np.array([0, 125, 90], dtype=np.uint8), np.array([10, 255, 255], dtype=np.uint8))
-        red2 = cv2.inRange(below_hsv, np.array([168, 125, 90], dtype=np.uint8), np.array([180, 255, 255], dtype=np.uint8))
+        red1 = cv2.inRange(below_hsv, _RED_LOW1, _RED_HIGH1)
+        red2 = cv2.inRange(below_hsv, _RED_LOW2, _RED_HIGH2)
         red_px = int(np.count_nonzero(red1 | red2))
 
         min_red_px = max(18, int(round(40 * scale_x * scale_y)))
@@ -342,8 +418,10 @@ class DiamondTipMonsterDetector:
         on a single orientation (`frame_bgr`).
         """
         detections: List[Dict[str, Any]] = []
+        examined = 0  # B8: candidates that passed the size/aspect gates
         img_h, img_w = frame_bgr.shape[:2]
         if img_w < 320 or img_h < 200:
+            self._last_single_pass_stats = {"examined": 0, "emitted": 0}
             return detections
 
         scale_x = max(0.45, img_w / 2000.0)
@@ -354,7 +432,7 @@ class DiamondTipMonsterDetector:
         tophat = cv2.morphologyEx(
             gray,
             cv2.MORPH_TOPHAT,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (th_sz, th_sz)),
+            _rect_struct_elem(th_sz, th_sz),
         )
 
         # 2. Yellow / olive monster nameplate glyph stroke mask
@@ -380,7 +458,7 @@ class DiamondTipMonsterDetector:
         closed = cv2.morphologyEx(
             ym_u8,
             cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh)),
+            _rect_struct_elem(kw, kh),
         )
         cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -397,6 +475,8 @@ class DiamondTipMonsterDetector:
             aspect = float(cw) / float(max(1, ch))
             if aspect < 4.0:
                 continue
+
+            examined += 1
 
             # Check if the nameplate center itself falls inside the player exclusion zone
             np_cx_norm = (x + 0.5 * cw) / float(img_w)
@@ -428,6 +508,11 @@ class DiamondTipMonsterDetector:
                 scale_y=scale_y,
             )
             has_agro_badge = bool(has_diamond_tips or has_red_agro)
+            # B3 note: `has_agro_badge` is the COMBINED "corroborated by a
+            # badge or by diamond tips" gate used for the relaxed stroke
+            # thresholds and the extended body box below — it does NOT by
+            # itself mean a red agro badge was seen (see `has_red_agro`).
+            # Trust is decided separately below, on tips only.
 
             if self.require_badge_or_tips and not has_agro_badge:
                 continue
@@ -441,7 +526,7 @@ class DiamondTipMonsterDetector:
                 continue
 
             # Verify dark character outline halo around yellow strokes
-            dilated_stroke = cv2.dilate(sub_ym, np.ones((3, 3), dtype=np.uint8))
+            dilated_stroke = cv2.dilate(sub_ym, _KERNEL_3X3)
             border_ring = dilated_stroke - sub_ym
             ring_gray = gray[y : y + ch, x : x + cw][border_ring > 0]
             if ring_gray.size == 0:
@@ -456,7 +541,19 @@ class DiamondTipMonsterDetector:
                 final_y = max(0, y - int(round(8 * scale_y)))
                 final_w = min(img_w - final_x, cw + int(round(48 * scale_x)))
                 final_h = min(img_h - final_y, ch + int(round(105 * scale_y)))
-                conf = 0.96 if (has_diamond_tips and has_red_agro) else 0.95
+                # B1 (harmonized single-copy policy = the live labeler
+                # contract, R07/S-6001): the body box below the nameplate
+                # is an EXTRAPOLATED 105px extension, never a segmented
+                # body. Only the diamond tips themselves are directly
+                # segmented glyphs on both sides, so only tips may be
+                # trusted (0.95). A red badge alone proves the monster is
+                # targeted, not where its body is — conf 0.55, weak, never
+                # trusted. The old evidence-scaled 0.86+0.04+0.04 formula
+                # gave the same extrapolated box 0.90 trusted (B1/B2).
+                if has_diamond_tips:
+                    conf = 0.95
+                else:
+                    conf = 0.55
                 src = (
                     "diamond_tip_monster_detector"
                     if has_diamond_tips
@@ -467,7 +564,9 @@ class DiamondTipMonsterDetector:
                 final_y = max(0, y - int(round(4 * scale_y)))
                 final_w = min(img_w - final_x, cw + int(round(12 * scale_x)))
                 final_h = min(img_h - final_y, ch + int(round(8 * scale_y)))
-                conf = round(min(0.92, 0.78 + min(0.14, stroke_px / 900.0)), 4)
+                # B4: yellow text alone is the weakest evidence — cap it at
+                # the live labeler's 0.68 (was 0.92 here), always weak.
+                conf = round(min(0.68, 0.52 + min(0.16, stroke_px / 900.0)), 4)
                 src = "yellow_nameplate_monster_detector"
 
             cx_n, cy_n, w_n, h_n, px_xywh, px_xyxy = self._pixel_xywh_to_yolo_norm(
@@ -478,10 +577,17 @@ class DiamondTipMonsterDetector:
             if self.is_in_player_exclusion_zone(cx_n, cy_n):
                 continue
 
-            if any(self._compute_iou_xyxy(px_xyxy, pos_box) >= 0.25 for pos_box in existing_positive_boxes):
+            # F-2015: use the configured dedup threshold instead of a hardcoded
+            # 0.25 that contradicted iou_dedup_threshold (default 0.45).
+            if any(self._compute_iou_xyxy(px_xyxy, pos_box) >= self.iou_dedup_threshold for pos_box in existing_positive_boxes):
                 continue
 
-            is_trusted = bool(has_agro_badge and conf >= 0.85)
+            # B1/B5: trusted ONLY on diamond tips (directly segmented
+            # glyphs, R07). A red-badge-only box is extrapolated body and
+            # stays weak (S-6001, conf 0.55 above); the old rule trusted
+            # any badge at conf >= 0.85, so weak badge + weak stroke
+            # evidence inflated itself into "trusted".
+            is_trusted = bool(has_diamond_tips and conf >= 0.85)
             detections.append(
                 {
                     "class_id": MONSTER_CLASS_ID,
@@ -519,6 +625,7 @@ class DiamondTipMonsterDetector:
                 }
             )
 
+        self._last_single_pass_stats = {"examined": examined, "emitted": len(detections)}
         return detections
 
     # ------------------------------------------------------------------
@@ -583,6 +690,7 @@ class DiamondTipMonsterDetector:
             is_hflip=inferred_hflip,
             include_untargeted=include_untargeted,
         )
+        examined_total = int(self._last_single_pass_stats.get("examined", 0))
 
         if verify_with_hflip:
             flipped_bgr = cv2.flip(frame_bgr, 1)
@@ -600,12 +708,20 @@ class DiamondTipMonsterDetector:
                 is_hflip=not inferred_hflip,
                 include_untargeted=include_untargeted,
             )
+            examined_total += int(self._last_single_pass_stats.get("examined", 0))
             for mdet in mirror_dets:
                 unflipped = self.unflip_detection(mdet, img_w=img_w, img_h=img_h)
                 if not self.is_in_player_exclusion_zone(unflipped["cx"], unflipped["cy"]):
                     primary_dets.append(unflipped)
 
-        return self._deduplicate_detections(primary_dets)
+        out = self._deduplicate_detections(primary_dets)
+        # B8: per-scan summary so silent gate drops are visible in debug logs.
+        logger.debug(
+            "monster diamond scan: examined=%d candidates, emitted=%d detections",
+            examined_total,
+            len(out),
+        )
+        return out
 
     # Aliases for seamless integration across dataset_factory modules
     scan_monsters = detect
@@ -643,6 +759,10 @@ class DiamondTipMonsterDetector:
                 "bbox_xyxy": list(px_xyxy),
                 "left_diamond_px": int(detection.get("right_diamond_px", 0)),
                 "right_diamond_px": int(detection.get("left_diamond_px", 0)),
+                # F-2004: mirroring flips the orientation flag too; leaving
+                # is_hflip unchanged made the un-flipped detection lie about
+                # which coordinate frame it is in.
+                "is_hflip": not bool(detection.get("is_hflip", False)),
             }
         )
         if "nameplate_bbox_xyxy" in detection:
@@ -680,7 +800,7 @@ class DiamondTipMonsterDetector:
         th = cv2.morphologyEx(
             gray,
             cv2.MORPH_TOPHAT,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+            _rect_struct_elem(5, 5),
         )
         yellow_mask = (
             (hsv[:, :, 0] >= self.yellow_hue_range[0])
@@ -691,23 +811,56 @@ class DiamondTipMonsterDetector:
         )
         yellow_px = int(np.count_nonzero(yellow_mask))
 
-        c_low = np.array([self.cyan_hue_range[0], self.cyan_min_sat, self.cyan_min_val], dtype=np.uint8)
-        c_high = np.array([self.cyan_hue_range[1], 255, 255], dtype=np.uint8)
+        c_low = self._cyan_low
+        c_high = self._cyan_high
         cyan_mask = cv2.inRange(hsv, c_low, c_high)
 
-        left_band = cyan_mask[:, : max(1, int(rw * 0.25))]
-        right_band = cyan_mask[:, min(rw - 1, int(rw * 0.75)) :]
-        left_px = int(np.count_nonzero(left_band))
-        right_px = int(np.count_nonzero(right_band))
-        has_tips = bool(left_px >= 3 and right_px >= 3)
+        # F-2016: the old 25%/75% bands overlapped on tiny ROIs (rw <= 2 the
+        # right band started at column 0) and the ">= 3 px" tip threshold
+        # ignored ROI scale. Bands are now disjoint by construction and the
+        # thresholds scale with band/ROI area (with the old absolute floors).
+        band_w = max(1, int(rw * 0.25))
+        band_w = min(band_w, max(1, rw // 2))
+        if rw < 4:
+            left_px = 0
+            right_px = 0
+        else:
+            left_band = cyan_mask[:, :band_w]
+            right_band = cyan_mask[:, rw - band_w:]
+            left_px = int(np.count_nonzero(left_band))
+            right_px = int(np.count_nonzero(right_band))
+        min_tip_px = max(3, int(round(0.005 * band_w * rh)))
+        has_tips = bool(left_px >= min_tip_px and right_px >= min_tip_px)
 
-        red1 = cv2.inRange(hsv, np.array([0, 125, 90], dtype=np.uint8), np.array([10, 255, 255], dtype=np.uint8))
-        red2 = cv2.inRange(hsv, np.array([168, 125, 90], dtype=np.uint8), np.array([180, 255, 255], dtype=np.uint8))
+        red1 = cv2.inRange(hsv, _RED_LOW1, _RED_HIGH1)
+        red2 = cv2.inRange(hsv, _RED_LOW2, _RED_HIGH2)
         red_px = int(np.count_nonzero(red1 | red2))
-        has_agro = bool(has_tips or red_px >= 15)
+        min_red_px = max(10, int(round(0.002 * rw * rh)))
+        has_agro = bool(has_tips or red_px >= min_red_px)
 
         is_monster = bool(yellow_px >= 20 and (has_agro or yellow_px >= 35))
-        conf = 0.95 if (is_monster and has_agro) else (0.85 if is_monster else 0.0)
+        # F-2005 (same defect as the single-pass path): confidence scales
+        # with evidence strength instead of fixed 0.95/0.85.
+        # S-2505: confidence scales with evidence strength, mirroring the
+        # single-pass formula in _detect_single_pass (0.86 + 0.04 tips +
+        # 0.04 red + stroke term). The old 0.90 + red_px/1000 form gave a
+        # flat 0.90 whenever has_agro came only from the diamond tips
+        # (red_px == 0), regardless of tip/stroke evidence.
+        if is_monster and has_agro:
+            conf = round(
+                min(
+                    0.96,
+                    0.86
+                    + (0.04 if has_tips else 0.0)
+                    + (0.04 if red_px >= min_red_px else 0.0)
+                    + min(0.03, yellow_px / 900.0 * 0.03),
+                ),
+                4,
+            )
+        elif is_monster:
+            conf = round(min(0.90, 0.80 + min(0.10, yellow_px / 2000.0)), 4)
+        else:
+            conf = 0.0
         return {
             "is_monster_nameplate": is_monster,
             "has_diamond_tips": has_tips,
@@ -738,13 +891,20 @@ class DiamondTipMonsterDetector:
 
 
 _DEFAULT_DETECTOR: Optional[DiamondTipMonsterDetector] = None
+_DEFAULT_DETECTOR_LOCK = threading.Lock()
 
 
 def get_monster_diamond_detector() -> DiamondTipMonsterDetector:
-    """Return a shared singleton instance of `DiamondTipMonsterDetector`."""
+    """Return a shared singleton instance of `DiamondTipMonsterDetector`.
+
+    F-2013: double-checked locking — without the lock two racing threads
+    could each create an instance.
+    """
     global _DEFAULT_DETECTOR
     if _DEFAULT_DETECTOR is None:
-        _DEFAULT_DETECTOR = DiamondTipMonsterDetector()
+        with _DEFAULT_DETECTOR_LOCK:
+            if _DEFAULT_DETECTOR is None:
+                _DEFAULT_DETECTOR = DiamondTipMonsterDetector()
     return _DEFAULT_DETECTOR
 
 

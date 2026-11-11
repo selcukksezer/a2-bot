@@ -10,6 +10,13 @@ arka planda kesintisiz haritalandıran ve her kaynağın 3 kez toplanabilme
 (`max_harvests = 3 * stack_count`) kapasitesini takip eden AutoCartographer motoru.
 
 Çalışma Prensibi:
+CANLI YOL (H-sweep, dilim 13 Y5): üretimde çalışan tek kayıt yolu
+`process_frame_discoveries`'dir (explorer_mode.py:2851 çağırır).
+`record_from_minimap` / `record_from_3d_world` / `record_harvest_event` /
+`ingest_detections` üretimde çağrılmaz — yalnızca testler ve eski
+çağıranlar için korunan legacy giriş noktalarıdır; docstring'lerindeki
+"3-Kaynaklı" anlatım canlı mimariyi değil, bu legacy yolları anlatır.
+Bu dört fonksiyondaki düzeltmeler üretime etki etmez.
 1. Real-Time Minimap Odometry (`VisualOdometryTracker` — Dead-Reckoning + Minimap SLAM):
    - Sağ üstteki Minimap bölgesini (`Pilgrim's Ridge`, `x: 0.855..0.992, y: 0.065..0.255`)
      her karede izler.
@@ -64,10 +71,13 @@ import numpy as np
 from core.route_manager import (
     DEFAULT_REGION,
     DEFAULT_RESOURCE_TYPE,
+    DEFAULT_REST_SEC,
     DEFAULT_ROUTE,
+    KNOWN_CANONICAL_REGIONS,
     PATCH_SIZE,
     NodeData,
     RouteManager,
+    resolve_canonical_region,
 )
 from core.node_quality_gate import MODEL_CONF_MIN, evaluate_node_candidate
 from core.vision_filters import (
@@ -78,6 +88,7 @@ from core.vision_filters import (
     DynamicInteractionKeyReader,
     is_parchment_scroll_patch,
 )
+from version import __version__
 
 try:
     from dataset_factory.exemplar_memory import get_exemplar_memory
@@ -88,6 +99,74 @@ except Exception:
 MINIMAP_SPROUT_CONF_MIN: float = 0.68
 # 3D world detections below this without a harvest prompt are not persisted.
 WORLD_3D_CONF_MIN: float = 0.55
+# P1-3 (K-07): harvest_auto / radar_auto / unknown güven tabanı.
+# 3d_auto (0.55) ve minimap_auto (0.68) tabanları varken bu kaynaklar
+# kapısızdı — dış girdide 0.05'e kırpılmış güven bile düğüme dönerdi.
+# İçsel [F] istemi zaten 0.60+ üretir (F-0056), 3D tespit 0.55+
+# üretir; 0.55 tabanı gerçek üreticiyi geçirir, ölçülmemiş düşüğü eler.
+HARVEST_RADAR_CONF_MIN: float = 0.55
+# H-sweep (dilim 13 K3): türü bilinmeyen materyalin dürüst işareti.
+# "Gatherable Material" kod tabanında zaten jenerik sınıf etiketidir
+# (minimap filizleri, kapıdaki generic_names); spesifik bir cevher adı
+# ("Orichalcum Ore") asla varsayılan tür olarak yazılmaz.
+UNKNOWN_RESOURCE_TYPE: str = "Gatherable Material"
+
+# v20-targena-3dauto: jenerik kayıt adları. 3D'den gelen spesifik bir
+# materyal adı (Targena, Mela, Orichalcum Ore ...) asla bunlarla
+# ezilmez; 3d_auto adayda ad belirlenemediyse (bu listedeyse) düğüm
+# yazılmaz — yanlış jenerik kayıt yok.
+_GENERIC_RESOURCE_NAMES = frozenset(
+    {
+        "",
+        "unknown",
+        "resource",
+        "gatherable material",
+        "gatherable plant",
+        "gem",
+        "gemstone",
+        "world resource",
+        "3d crest",
+    }
+)
+
+
+def _is_generic_resource_name(name: Any) -> bool:
+    """Ad jenerik/belirsiz mi (spesifik materyal adı değil mi)?"""
+    if name is None:
+        return True
+    return str(name).strip().lower() in _GENERIC_RESOURCE_NAMES
+
+
+def _is_specific_resource_name(name: Any) -> bool:
+    """Ad spesifik bir materyal adı mı?"""
+    return not _is_generic_resource_name(name)
+
+
+def _resolve_mapped_resource_name(
+    parsed_name: Any, verified_name: Any, source_type: str
+) -> Tuple[str, bool]:
+    """Kayıt adı kararı (v20-targena-3dauto). Döner (final_name, drop).
+
+    - 3d_auto + spesifik parsed ad -> (parsed, False): kapının jenerik
+      doğrulaması ("Gem" vb.) 3D mesh'ten gelen spesifik adı ezemez.
+    - 3d_auto + jenerik parsed ad + spesifik verified -> (verified, False).
+    - 3d_auto + ad hâlâ jenerik/belirsiz -> (parsed, True): yanlış
+      jenerik kayıt yazılmaz, aday atılır.
+    - Diğer kaynaklar: eski davranış (verified varsa onu al).
+    """
+    parsed = str(parsed_name or "")
+    verified = str(verified_name or "") if verified_name else ""
+    if str(source_type or "").strip().lower() == "3d_auto":
+        if _is_specific_resource_name(parsed):
+            return parsed, False
+        if verified and _is_specific_resource_name(verified):
+            return verified, False
+        return parsed, True
+    if verified:
+        return verified, False
+    return parsed, False
+
+
 # Drift / time that sets needs_map_calibrate for a world-map fix.
 ODOMETRY_CALIBRATE_DRIFT_PX: float = 48.0
 ODOMETRY_CALIBRATE_INTERVAL_SEC: float = 90.0
@@ -105,13 +184,53 @@ if not logger.handlers:
 
 # Sağ üst minimap ROI: x: 0.855..0.992 (w=0.137), y: 0.065..0.255 (h=0.190)
 MINIMAP_NORM_RECT: Tuple[float, float, float, float] = (0.855, 0.065, 0.137, 0.190)
+# Minimap→harita ölçeği: minimap ROI harita genişliğinin ~0.137'si kadardır
+# (~263 px / 1920 px), yani 1 minimap pikseli ~7.30 harita pikselidir.
+# Varsayılan 1.0, göreli ofsetleri ~7 kat küçük hesaplayıp düğümleri oyuncu
+# etrafına yığıyordu (F-0003).
+DEFAULT_MINIMAP_TO_MAP_SCALE: float = 1.0 / MINIMAP_NORM_RECT[2]
+# Yakın-çekim (closeup) referans çerçevesinde minimap'in kapladığı göreli
+# dikdörtgen (x, y, w, h); eskiden _get_minimap_pixel_rect içine gömülüydü (F-0408).
+CLOSEUP_MINIMAP_NORM_RECT: Tuple[float, float, float, float] = (0.498, 0.200, 0.466, 0.712)
 DEFAULT_DEDUP_RADIUS_PX: float = 22.0
 DEDUP_RADIUS_MIN_PX: float = 15.0
 DEDUP_RADIUS_MAX_PX: float = 25.0
+# Kaynak güvenilirlik önceliği (cluster_detections): her çağrıda yeniden
+# kurulmaması için modül düzeyinde tek örnek (D02).
+CLUSTER_SOURCE_PRIORITY: Dict[str, int] = {
+    "harvest_auto": 4,
+    "minimap_auto": 3,
+    "3d_auto": 2,
+    "radar_auto": 1,
+}
 DEFAULT_EMA_ALPHA: float = 0.35
 REF_MAP_WIDTH: int = 1920
 REF_MAP_HEIGHT: int = 1080
 DEFAULT_MAX_HARVESTS: int = 3
+
+# Canlı bölge tespiti (Görev 4 / harita-istatistik).
+# - Minimap tespiti en fazla 5 sn'de bir çalışır (başlık şablon eşleşmesi pahalıdır).
+# - Açık dünya haritası (M) ORB eşleşmesi en fazla 30 sn'de bir çalışır.
+# - Güven eşiği: minimap başlık-eşleşmesinin "eşleşme sayılır" sınırı (0.45).
+REGION_DETECT_MIN_CONFIDENCE: float = 0.45
+REGION_DETECT_INTERVAL_SEC: float = 5.0
+REGION_WORLD_MAP_MATCH_INTERVAL_SEC: float = 30.0
+# Dünya haritası ORB kararı için asgari iyi eşleşme sayısı ve en iyi/ikinci
+# oran farkı. Canlı kareyle doğrulanmadı; eşik bilerek katı tutuldu.
+REGION_WORLD_MAP_MIN_GOOD_MATCHES: int = 15
+REGION_WORLD_MAP_MIN_MARGIN_RATIO: float = 2.0
+
+
+def _is_normalized_coord_pair(sx: float, sy: float) -> bool:
+    """`(sx, sy)` normalize (0..1) koordinat çifti mi?
+
+    0..1.5 aralığı piksel `(1, 1)` ile normalize `(1.0, 1.0)` ayrımını yapamaz
+    (F-0212): yalnızca kesirli 0..1 çiftleri normalize sayılır; tam sayı
+    çiftler (0/1) piksel koordinatıdır. `(0, 0)` her iki yorumda da aynıdır.
+    """
+    if not (0.0 <= float(sx) <= 1.0 and 0.0 <= float(sy) <= 1.0):
+        return False
+    return not (float(sx).is_integer() and float(sy).is_integer())
 
 
 @dataclass
@@ -125,13 +244,18 @@ class TrackedResourceNode:
     region: str = DEFAULT_REGION
     routes: List[str] = field(default_factory=list)
     resource_type: str = DEFAULT_RESOURCE_TYPE
-    map_x: float = 960.0
-    map_y: float = 540.0
-    norm_x: float = 0.5
-    norm_y: float = 0.5
+    # Ölçülmemiş düğüm merkez (960, 540) + güven 1.0 ile doğmuyor (F-0209):
+    # konum bilinmiyorsa (0, 0) ve güven 0.0; gerçek ölçümle dolar.
+    map_x: float = 0.0
+    map_y: float = 0.0
+    norm_x: float = 0.0
+    norm_y: float = 0.0
     in_air: bool = False
     sightings_count: int = 1
-    confidence: float = 1.0
+    confidence: float = 0.0
+    # Tüketim/dinlenme durumu (F-0061): "active" | "resting".
+    state: str = "active"
+    rest_started_timestamp: float = 0.0
     kalman_variance: float = 16.0
     kalman_variance_x: float = 16.0
     kalman_variance_y: float = 16.0
@@ -158,6 +282,8 @@ class TrackedResourceNode:
         self.current_harvests = max(0, int(self.current_harvests))
         self.source_type = str(self.source_type or "minimap_auto")
         self.node_type = str(self.node_type or "resource")
+        self.state = str(self.state or "active").strip().lower() or "active"
+        self.rest_started_timestamp = float(self.rest_started_timestamp or 0.0)
         if not hasattr(self, "kalman_variance_x"):
             self.kalman_variance_x = float(self.kalman_variance)
         if not hasattr(self, "kalman_variance_y"):
@@ -166,12 +292,14 @@ class TrackedResourceNode:
     @property
     def remaining_harvests(self) -> int:
         """Bu düğümden kalan toplanabilir materyal hakkını döndürür."""
+        if str(self.state) == "resting":
+            return 0
         return max(0, int(self.max_harvests) - int(self.current_harvests))
 
     @property
     def is_depleted(self) -> bool:
         """Düğümün 3x (veya `max_harvests`) toplama hakkının bitip bitmediğini döndürür."""
-        return int(self.current_harvests) >= int(self.max_harvests)
+        return str(self.state) == "resting" or int(self.current_harvests) >= int(self.max_harvests)
 
     def to_dict(self) -> Dict[str, Any]:
         """Düğüm bilgilerini sözlük olarak döndürür."""
@@ -201,6 +329,8 @@ class TrackedResourceNode:
             "current_harvests": int(self.current_harvests),
             "remaining_harvests": int(self.remaining_harvests),
             "is_depleted": bool(self.is_depleted),
+            "state": str(self.state),
+            "rest_started_timestamp": float(self.rest_started_timestamp),
             "source_type": str(self.source_type),
             "node_type": str(getattr(self, "node_type", "resource")),
             "connected_waypoints": list(getattr(self, "connected_waypoints", [])),
@@ -269,6 +399,10 @@ class RouteGraph:
         self.region: str = str(region or DEFAULT_REGION)
         self.waypoints: Dict[int, GraphWaypoint] = {}
         self.edges: List[GraphEdge] = []
+        # P1-6 (K-06): kenar dedup endeksi — build_route_graph her
+        # çağrıda aynı kenarı yeniden ekleyip total_distance'ı
+        # şişirmesin diye add_edge idempotent'tir.
+        self._edge_index: Dict[Tuple[Any, ...], GraphEdge] = {}
         self._next_wp_id: int = 1
         self._adjacency: Dict[Tuple[str, int], List[Tuple[str, int, float]]] = {}
 
@@ -279,6 +413,12 @@ class RouteGraph:
 
     @property
     def node_count(self) -> int:
+        """Çizgeye bağlı farklı kaynak düğümü sayısı (waypoint değil, F-0218)."""
+        return len({nid for wp in self.waypoints.values() for nid in wp.connected_node_ids})
+
+    @property
+    def waypoint_count(self) -> int:
+        """Çizgedeki yürüyüş ara noktası (waypoint) sayısı."""
         return len(self.waypoints)
 
     @property
@@ -325,7 +465,28 @@ class RouteGraph:
         heading_deg: float = 0.0,
         bidirectional: bool = True,
     ) -> GraphEdge:
-        """İki nokta arasında bağlantı kenarı ekler."""
+        """İki nokta arasında bağlantı kenarı ekler.
+
+        P1-6 (K-06): idempotent — aynı uç çiftine sahip kenar zaten
+        varsa mevcut kenar döndürülür, liste/bitişiklik/total_distance
+        değişmez. Çift yönlü kenarda uç sırası önemsizdir.
+        """
+        # Dedup anahtarı mesafeden bağımsızdır: aynı uç çifti aynı
+        # geometridir (waypoint/node koordinatları sabittir).
+        end_a = (str(from_type), int(from_id))
+        end_b = (str(to_type), int(to_id))
+        if bidirectional:
+            edge_key: Tuple[Any, ...] = (
+                "bidir",
+                end_a if end_a <= end_b else end_b,
+                end_b if end_a <= end_b else end_a,
+            )
+        else:
+            edge_key = ("dir", end_a, end_b)
+        existing = self._edge_index.get(edge_key)
+        if existing is not None:
+            return existing
+
         if distance_px is None:
             p1 = self.waypoints.get(from_id) if from_type == "waypoint" else None
             p2 = self.waypoints.get(to_id) if to_type == "waypoint" else None
@@ -347,6 +508,7 @@ class RouteGraph:
             bidirectional=bool(bidirectional),
         )
         self.edges.append(edge)
+        self._edge_index[edge_key] = edge
 
         k1 = (from_type, int(from_id))
         k2 = (to_type, int(to_id))
@@ -361,15 +523,21 @@ class RouteGraph:
         map_x: float,
         map_y: float,
     ) -> Tuple[Optional[GraphWaypoint], float]:
-        """`(map_x, map_y)` konumuna en yakın ara noktayı bulur."""
+        """`(map_x, map_y)` konumuna en yakın ara noktayı bulur.
+
+        Kare mesafe karşılaştırması yapılır (sıralama `math.hypot` ile aynı,
+        kareköksüz); tek `sqrt` yalnızca dönen mesafe için alınır (D02).
+        """
         best: Optional[GraphWaypoint] = None
-        best_dist = float("inf")
+        best_d2 = float("inf")
         for wp in self.waypoints.values():
-            d = math.hypot(wp.map_x - map_x, wp.map_y - map_y)
-            if d < best_dist:
-                best_dist = d
+            dx = wp.map_x - map_x
+            dy = wp.map_y - map_y
+            d2 = dx * dx + dy * dy
+            if d2 < best_d2:
+                best_d2 = d2
                 best = wp
-        return best, best_dist
+        return best, math.sqrt(best_d2) if best is not None else float("inf")
 
     def connect_node_to_nearest_waypoint(
         self,
@@ -410,6 +578,14 @@ class RouteGraph:
                     "node_id": nid,
                     "connected_from_wp": wp.waypoint_id,
                 })
+        # loop=True: rota son ara noktadan ilk ara noktaya kapanır (F-0218).
+        # Sıraya ek öğe konmaz; kapanış bilgisi son waypoint öğesine işaretlenir.
+        if loop and len(sorted_wps) >= 2:
+            for item in reversed(sequence):
+                if item.get("target_type") == "waypoint":
+                    item["loop_close"] = True
+                    item["loop_to_waypoint_id"] = int(sorted_wps[0].waypoint_id)
+                    break
         return sequence
 
     def to_dict(self) -> Dict[str, Any]:
@@ -470,6 +646,8 @@ class VisualOdometryTracker:
         initial_map_y: float = 540.0,
         map_width: int = REF_MAP_WIDTH,
         map_height: int = REF_MAP_HEIGHT,
+        # Doğrudan kurulumda harita uzayı varsayılır; AutoCartographer minimap
+        # ölçeğini (DEFAULT_MINIMAP_TO_MAP_SCALE) kendi dönüşümlerinde uygular (F-0003).
         minimap_to_map_scale: float = 1.0,
         max_trajectory_len: int = 10000,
     ) -> None:
@@ -562,8 +740,9 @@ class VisualOdometryTracker:
         if elapsed > 0:
             self.velocity_x = step_x / elapsed
             self.velocity_y = step_y / elapsed
-        self.dead_reckoning_dx = 0.0
-        self.dead_reckoning_dy = 0.0
+        # Dead-reckoning birikimi burada silinmez (F-0220): apply_dead_reckoning
+        # ile biriken değer, offset_to_world_coords tüketene kadar korunur;
+        # yalnızca reset()/set_position() sıfırlar.
         return step_x, step_y
 
     def apply_dead_reckoning(self, dt: Optional[float] = None) -> Tuple[float, float]:
@@ -602,15 +781,16 @@ class VisualOdometryTracker:
         self,
         dx: float,
         dy: float,
-        is_map_offset: Optional[bool] = None,
+        is_map_offset: bool = True,
         dead_reckoning_dx: float = 0.0,
         dead_reckoning_dy: float = 0.0,
     ) -> Tuple[float, float, float, float]:
         """
         Minimap veya radar merkezindeki oyuncu okuna göre `(dx, dy)` ofsetini
         dünya/harita koordinatlarına `(world_x, world_y, norm_x, norm_y)` dönüştürür.
-        `is_map_offset=True` ise `dx, dy` doğrudan harita piksel ofsetidir;
-        `is_map_offset=False` veya `None` ise minimap piksel ofsetidir ve `minimap_to_map_scale` ile çarpılır.
+        Varsayılan `is_map_offset=True` (AutoCartographer ile aynı, F-0221):
+        `dx, dy` doğrudan harita piksel ofsetidir; `is_map_offset=False` ise
+        minimap piksel ofsetidir ve `minimap_to_map_scale` ile çarpılır.
         Dead-reckoning yer değiştirmesi varsa ofsete dahil edilir.
         """
         scale = 1.0 if is_map_offset is True else self.minimap_to_map_scale
@@ -699,7 +879,7 @@ class AutoCartographer:
         initial_map_y: float = 540.0,
         map_width: int = REF_MAP_WIDTH,
         map_height: int = REF_MAP_HEIGHT,
-        minimap_to_map_scale: float = 1.0,
+        minimap_to_map_scale: float = DEFAULT_MINIMAP_TO_MAP_SCALE,
         max_trajectory_len: int = 10000,
         exemplar_memory: Optional[Any] = None,
     ) -> None:
@@ -722,13 +902,15 @@ class AutoCartographer:
         self.minimap_to_map_scale: float = float(minimap_to_map_scale)
         self.max_trajectory_len: int = max(100, int(max_trajectory_len))
 
-        # Görsel odometri takipçisi (VisualOdometryTracker)
+        # Görsel odometri takipçisi (VisualOdometryTracker) harita uzayında
+        # çalışır (ölçeği 1.0): minimap→harita dönüşümü AutoCartographer'ın
+        # kendi yollarında (tespit/odometri/ofset) self.minimap_to_map_scale
+        # ile yapılır; tracker'a ölçek geçirilmez (F-0003).
         self.odometry_tracker: VisualOdometryTracker = VisualOdometryTracker(
             initial_map_x=initial_map_x,
             initial_map_y=initial_map_y,
             map_width=self.map_width,
             map_height=self.map_height,
-            minimap_to_map_scale=self.minimap_to_map_scale,
             max_trajectory_len=self.max_trajectory_len,
         )
 
@@ -742,15 +924,31 @@ class AutoCartographer:
         self.walk_trajectory: List[Tuple[float, float, float]] = self.odometry_tracker.walk_trajectory
 
         # Görsel odometri iç durum değişkenleri
-        self._prev_minimap_gray: Optional[np.ndarray] = None
         self._prev_minimap_clean: Optional[np.ndarray] = None
         self._last_valid_minimap_bgr: Optional[np.ndarray] = None
-        self._last_world_map_bgr: Optional[np.ndarray] = None
         self._hann_window: Optional[np.ndarray] = None
         self._odometry_Search_orb: Optional[Any] = self.odometry_tracker._orb
+        # Yön açısı için tek MinimapScanner örneği (her karede yeniden kurulmaz, F-0411).
+        self._heading_scanner: Optional[Any] = None
+        # Canlı bölge tespiti (Görev 4): MinimapScanner örneği + son tespit.
+        # _detected_region yalnızca güvenilir tespitle dolar; boşken "bilinmiyor"
+        # demektir ve asla varsayılan bölge sayılmaz.
+        self._region_scanner: Optional[Any] = None
+        self._detected_region: Optional[Dict[str, Any]] = None
+        self._last_region_detect_ts: float = 0.0
+        self._last_world_map_region_ts: float = 0.0
+        self._world_map_orb_cache: Optional[Dict[str, Any]] = None
         self._is_calibrated_on_world_map: bool = False
         self._last_calibration_ts: float = 0.0
+        # H-sweep (dilim 13 Y7): kümülatif drift HİÇ ölçülmez — bu
+        # sayaç yalnızca sıfırlanır (F-0410: gerçek konum hatası
+        # ölçülmeden birikim yapılmaz). 0.0 değeri ölçüm değildir;
+        # raporlayanlar None + drift_not_measured döndürür. Alan
+        # geriye uyum için (sıfırlama çağrıları) korunur.
         self._cumulative_drift_px: float = 0.0
+        # H-sweep (dilim 13 O2): son kayma güveni (update_player_position
+        # ölçer); düşük güvende dead-reckoning durumu dışarı çıkar.
+        self._last_odometry_confidence: Optional[float] = None
 
         # Bölge bazlı takip edilen kaynak düğümleri: region -> List[TrackedResourceNode]
         self._tracked_nodes: Dict[str, List[TrackedResourceNode]] = {}
@@ -768,9 +966,12 @@ class AutoCartographer:
         self.route_graph: RouteGraph = self.get_route_graph(DEFAULT_REGION)
 
         # Kaynak bazlı haritalandırma istatistik sayaçları
+        # P1-6 (K-06): her kaynak türü yalnızca kendi sayacını artırır
+        # (tek kaynak); radar_auto'nun da kendi sayacı vardır.
         self.total_minimap_recorded: int = 0
         self.total_3d_recorded: int = 0
         self.total_harvest_recorded: int = 0
+        self.total_radar_recorded: int = 0
         # Envanter kapanış animasyonu boyunca materyal kaydını tut (saniye).
         self._inventory_block_until: float = 0.0
         self._orbit_rel_step_px: float = 36.0
@@ -860,7 +1061,12 @@ class AutoCartographer:
         return self._route_graphs[target_reg]
 
     def build_route_graph(self, region: Optional[str] = None) -> RouteGraph:
-        """Tüm kayıtlı düğümleri ve ara noktaları çizgeye entegre eder."""
+        """Tüm kayıtlı düğümleri ve ara noktaları çizgeye entegre eder.
+
+        P1-6 (K-06): idempotent — `RouteGraph.add_edge` aynı kenarı
+        ikinci kez eklemez, o yüzden tekrar çağrı `total_distance`'ı
+        şişirmez.
+        """
         target_reg = str(region or self.active_region or DEFAULT_REGION)
         rg = self.get_route_graph(target_reg)
         for tracked in self._tracked_nodes.get(target_reg, []):
@@ -892,6 +1098,11 @@ class AutoCartographer:
         """
         AUTO CARTOGRAPHY modundayken, oyuncu her `breadcrumb_interval_px`
         yürüdüğünde yeni bir navigasyon ara noktası (waypoint) oluşturur ve önceki noktayla kenar kurar.
+
+        H-sweep (dilim 13 O11): ilk breadcrumb kalibre edilmemiş köken
+        (harita merkezi 960, 540) olabilir — başlangıç konumu dünya
+        haritasıyla kalibre edilene kadar varsayılandır; last_mapped_info
+        bu yüzden 'calibrated' bayrağı taşır.
         """
         if not self.auto_cartography_enabled:
             return None
@@ -920,6 +1131,9 @@ class AutoCartographer:
                 "map_x": round(float(map_x), 2),
                 "map_y": round(float(map_y), 2),
                 "timestamp": ts,
+                # H-sweep (dilim 13 O11): hangi bölge + kalibre durumu.
+                "region": target_reg,
+                "calibrated": bool(self._is_calibrated_on_world_map),
             }
             return wp
 
@@ -953,6 +1167,9 @@ class AutoCartographer:
                 "map_x": round(float(map_x), 2),
                 "map_y": round(float(map_y), 2),
                 "timestamp": ts,
+                # H-sweep (dilim 13 O11): hangi bölge + kalibre durumu.
+                "region": target_reg,
+                "calibrated": bool(self._is_calibrated_on_world_map),
             }
             return wp
 
@@ -1076,7 +1293,13 @@ class AutoCartographer:
         dünya koordinatlarına `(world_x, world_y, norm_x, norm_y)` dönüştürür.
         Merkeze sabitlenmeyi (center-sticking) önlemek için odometri takipçisiyle
         tam senkronize çalışır ve dead-reckoning yer değiştirmesini hesaba katar.
+        `is_map_offset=False` ise ofset minimap pikselidir ve
+        `minimap_to_map_scale` ile harita pikseline çevrilir (F-0003).
         """
+        if not is_map_offset:
+            dx = float(dx) * self.minimap_to_map_scale
+            dy = float(dy) * self.minimap_to_map_scale
+            is_map_offset = True
         self.odometry_tracker.map_x = float(self.map_x)
         self.odometry_tracker.map_y = float(self.map_y)
         self.odometry_tracker.map_width = int(self.map_width)
@@ -1188,41 +1411,44 @@ class AutoCartographer:
         üst üste binen sahte düğüm ve mükerrer yığılma (duplicate piling) üretimini önler.
         """
         raw_r = cluster_radius if cluster_radius is not None else self.dedup_radius_px
-        radius = float(np.clip(raw_r, DEDUP_RADIUS_MIN_PX, DEDUP_RADIUS_MAX_PX))
+        # Skaler np.clip yerine min/max: np.clip skalerde dizi kurar (D02).
+        radius = min(DEDUP_RADIUS_MAX_PX, max(DEDUP_RADIUS_MIN_PX, float(raw_r)))
         if not parsed_items or len(parsed_items) <= 1:
             return list(parsed_items or [])
 
-        SOURCE_PRIORITY: Dict[str, int] = {
-            "harvest_auto": 4,
-            "minimap_auto": 3,
-            "3d_auto": 2,
-            "radar_auto": 1,
-        }
+        SOURCE_PRIORITY = CLUSTER_SOURCE_PRIORITY
 
         clusters: List[Dict[str, Any]] = []
+        # Küme merkezlerinin önbelleği: iç döngüde her karşılaştırmada
+        # dict.get + float() tekrarı yapılmaz (D02). Değerler sözlükteki
+        # yuvarlanmış değerlerle birebir aynı tutulur.
+        _cl_dx: List[float] = []
+        _cl_dy: List[float] = []
+        _cl_ex: List[Optional[float]] = []
+        _cl_ey: List[Optional[float]] = []
         for item in parsed_items:
             ix = float(item.get("rel_map_dx", 0.0))
             iy = float(item.get("rel_map_dy", 0.0))
             item_exact_x = item.get("exact_map_x")
             item_exact_y = item.get("exact_map_y")
-            item_conf = float(np.clip(float(item.get("confidence", 0.5)), 0.05, 1.0))
+            item_conf = min(1.0, max(0.05, float(item.get("confidence", 0.5))))
             item_source = str(item.get("source_type", "minimap_auto"))
 
             matched_cluster: Optional[Dict[str, Any]] = None
+            matched_idx: int = -1
             min_d = float("inf")
 
-            for cl in clusters:
-                cx = float(cl.get("rel_map_dx", 0.0))
-                cy = float(cl.get("rel_map_dy", 0.0))
+            for j, cl in enumerate(clusters):
                 # Mutlak koordinat varsa onu da uzamsal mesafede kullan
-                if item_exact_x is not None and cl.get("exact_map_x") is not None:
-                    d = math.hypot(float(item_exact_x) - float(cl["exact_map_x"]), float(item_exact_y) - float(cl["exact_map_y"]))
+                if item_exact_x is not None and _cl_ex[j] is not None:
+                    d = math.hypot(float(item_exact_x) - _cl_ex[j], float(item_exact_y) - _cl_ey[j])
                 else:
-                    d = math.hypot(ix - cx, iy - cy)
+                    d = math.hypot(ix - _cl_dx[j], iy - _cl_dy[j])
 
                 if d <= radius and d < min_d:
                     min_d = d
                     matched_cluster = cl
+                    matched_idx = j
 
             if matched_cluster is not None:
                 cnt = int(matched_cluster.get("_cluster_count", 1))
@@ -1230,7 +1456,7 @@ class AutoCartographer:
                 matched_cluster["_cluster_count"] = new_cnt
 
                 # Güven ağırlıklı merkez (confidence-weighted centroid)
-                cl_conf = float(np.clip(float(matched_cluster.get("confidence", 0.5)), 0.05, 1.0))
+                cl_conf = min(1.0, max(0.05, float(matched_cluster.get("confidence", 0.5))))
                 w_old = cl_conf * float(cnt)
                 w_new = item_conf
                 w_sum = max(0.001, w_old + w_new)
@@ -1241,6 +1467,8 @@ class AutoCartographer:
                 matched_cluster["rel_map_dy"] = round(
                     (w_old * float(matched_cluster["rel_map_dy"]) + w_new * iy) / w_sum, 3
                 )
+                _cl_dx[matched_idx] = float(matched_cluster["rel_map_dx"])
+                _cl_dy[matched_idx] = float(matched_cluster["rel_map_dy"])
 
                 if item_exact_x is not None and matched_cluster.get("exact_map_x") is not None:
                     matched_cluster["exact_map_x"] = round(
@@ -1249,6 +1477,8 @@ class AutoCartographer:
                     matched_cluster["exact_map_y"] = round(
                         (w_old * float(matched_cluster["exact_map_y"]) + w_new * float(item_exact_y)) / w_sum, 3
                     )
+                    _cl_ex[matched_idx] = float(matched_cluster["exact_map_x"])
+                    _cl_ey[matched_idx] = float(matched_cluster["exact_map_y"])
 
                 if "screen_x" in item and "screen_x" in matched_cluster:
                     matched_cluster["screen_x"] = int(round(
@@ -1286,6 +1516,14 @@ class AutoCartographer:
                 new_cl = dict(item)
                 new_cl["_cluster_count"] = 1
                 clusters.append(new_cl)
+                _cl_dx.append(float(new_cl.get("rel_map_dx", 0.0)))
+                _cl_dy.append(float(new_cl.get("rel_map_dy", 0.0)))
+                _cl_ex.append(
+                    float(new_cl["exact_map_x"]) if new_cl.get("exact_map_x") is not None else None
+                )
+                _cl_ey.append(
+                    float(new_cl["exact_map_y"]) if new_cl.get("exact_map_y") is not None else None
+                )
 
         return clusters
 
@@ -1344,9 +1582,12 @@ class AutoCartographer:
         """Set needs_map_calibrate when drift or wall-clock interval warrants a world-map fix."""
         now = time.time()
         stale = (now - float(self._last_calibration_ts or 0.0)) >= ODOMETRY_CALIBRATE_INTERVAL_SEC
-        drifted = float(self._cumulative_drift_px) >= ODOMETRY_CALIBRATE_DRIFT_PX
+        # H-sweep (dilim 13 Y7): drift dalı ÖLÜYDÜ — _cumulative_drift_px
+        # hiç artırılmadığı için her zaman 0.0'dı; bayrağa sahte bir
+        # 'drift yok' güvencesi katıyordu. Kaldırıldı; yalnızca kalibre
+        # yokluğu ve 90 sn zaman aşımı kalır.
         uncalibrated = not bool(self._is_calibrated_on_world_map)
-        self.needs_map_calibrate = bool(uncalibrated or stale or drifted)
+        self.needs_map_calibrate = bool(uncalibrated or stale)
 
     # ------------------------------------------------------------------
     # Yardımcı Görüntü & ROI Metodları
@@ -1374,15 +1615,18 @@ class AutoCartographer:
         Eğer verilen görüntü zaten kırpılmış bir minimap/yakın çekim ise uygun alt bölgeyi döndürür.
         """
         if frame_w < 800 and frame_h < 500:
-            # Yakın çekim (closeup) referans görüntüleri için destek
+            # Yakın çekim (closeup) çerçevelerinde minimap sağ yarıdadır;
+            # dikdörtgen CLOSEUP_MINIMAP_NORM_RECT ile tanımlanır (F-0408).
             if frame_w >= 600 and frame_h <= 420:
-                # minimap_filter_closeup.jpg (718x362): minimap sağ yarıda
-                return (
-                    int(round(frame_w * 0.498)),
-                    int(round(frame_h * 0.200)),
-                    int(round(frame_w * 0.964)),
-                    int(round(frame_h * 0.912)),
+                crx, cry, crw, crh = CLOSEUP_MINIMAP_NORM_RECT
+                rect = (
+                    int(round(frame_w * crx)),
+                    int(round(frame_h * cry)),
+                    int(round(frame_w * (crx + crw))),
+                    int(round(frame_h * (cry + crh))),
                 )
+                if rect[2] - rect[0] >= 32 and rect[3] - rect[1] >= 32:
+                    return rect
             return 0, 0, frame_w, frame_h
 
         nx, ny, nw, nh = self.minimap_norm_rect
@@ -1449,11 +1693,21 @@ class AutoCartographer:
             logger.debug("Minimap oyuncu oku merkezi hesaplanamadı: %s", exc)
             return default_cx, default_cy
 
-    def _is_world_map_open(self, frame_bgr: np.ndarray) -> bool:
-        """Dünya haritasının (`M`) açık olup olmadığını kontrol eder."""
+    def _is_world_map_open(self, frame_bgr: np.ndarray) -> Optional[bool]:
+        """Dünya haritasının (`M`) açık olup olmadığını kontrol eder.
+
+        Üç durumlu (H-sweep ek): True = açık, False = kapalı,
+        None = bilinmiyor. Vision açıkça None döndürürse bool() ile
+        False'a indirilmez, None yayılır; yerel sezgisel yedek yalnızca
+        vision'da is_map_open yoksa devreye girer. Hata da bilinmiyor
+        sayılır (eskiden False döner, fail-open olurdu).
+        """
         try:
             if self.vision_engine is not None and hasattr(self.vision_engine, "is_map_open"):
-                return bool(self.vision_engine.is_map_open(frame_bgr))
+                result = self.vision_engine.is_map_open(frame_bgr)
+                if result is None:
+                    return None
+                return bool(result)
 
             h, w = frame_bgr.shape[:2]
             if h < 120 or w < 160:
@@ -1498,7 +1752,8 @@ class AutoCartographer:
             )
         except Exception as exc:
             logger.debug("Dünya haritası kontrolünde hata: %s", exc)
-            return False
+            # Hata = bilinmiyor (None), kapalı (False) değil.
+            return None
 
     def _is_minimap_occluded(self, frame_bgr: np.ndarray, minimap_bgr: np.ndarray) -> bool:
         """
@@ -1516,12 +1771,20 @@ class AutoCartographer:
             mean_val = float(np.mean(hsv[:, :, 2]))
             std_val = float(np.std(hsv[:, :, 2]))
             # Sağ menü açıkken minimap bölgesi koyu düz bir panelle kaplanır (mean_val ~ 22-45)
-            if mean_val < 52.0 or std_val < 8.0:
+            # R14b: std eşiği 8.0, dümdüz ama geçerli bir minimap'i (tek renk
+            # zemin + küçük ikon: V std ~6.5) örtülü sayıyordu; patch çıkarma
+            # o zaman sıfır patch döndürüyor, sıfır patch de kapıda öğrenilmiş
+            # saf siyah negatif exemplare (benzerlik 1.0) takılıp gerçek
+            # tespiti düşürüyordu. Düz örtü panelleri std ~0-2 bandındadır;
+            # eşik 5.0 o korumayı korurken düz zeminli minimap'i geçirir.
+            if mean_val < 52.0 or std_val < 5.0:
                 return True
             return False
         except Exception as exc:
             logger.debug("Minimap kapanma kontrolü hatası: %s", exc)
-            return False
+            # Hata durumunda güvenli yön kapalı saymaktır (F-0210): şüpheli
+            # kare atlanır, kör odometri/düğüm yazılmaz.
+            return True
 
     @staticmethod
     def _clean_minimap_for_odometry(minimap_bgr: np.ndarray) -> np.ndarray:
@@ -1579,9 +1842,11 @@ class AutoCartographer:
                 return self.get_position()
 
             h, w = bgr.shape[:2]
-            self.map_width = w
-            self.map_height = h
-            self._last_world_map_bgr = bgr.copy()
+            # Harita uzayı korunur (F-0053): dünya haritası karesi (örn. 1280x720)
+            # harita uzayını (1920x1080) değiştirmez; oyuncu pikseli harita
+            # uzayına oranla çevrilir.
+            scale_to_map_x = float(self.map_width) / float(max(1, w))
+            scale_to_map_y = float(self.map_height) / float(max(1, h))
 
             player_x: Optional[float] = None
             player_y: Optional[float] = None
@@ -1642,20 +1907,28 @@ class AutoCartographer:
                     logger.debug("Dünya haritası üzerinde minimap şablon kalibrasyonu atlandı: %s", exc)
 
             if player_x is None or player_y is None:
-                player_x = float(w // 2)
-                player_y = float(h // 2)
+                # Kalibrasyon bulunamadı: ekran merkezi "sıfır hata" değildir
+                # (F-0001). Konum değiştirilmez, kalibre sayılmaz.
+                logger.warning(
+                    "Dünya haritası üzerinde oyuncu oku bulunamadı; kalibrasyon yapılmadı."
+                )
+                self._is_calibrated_on_world_map = False
+                self.needs_map_calibrate = True
+                return self.get_position()
 
-            self.map_x = float(np.clip(player_x, 0.0, float(w - 1)))
-            self.map_y = float(np.clip(player_y, 0.0, float(h - 1)))
-            self.norm_x = round(self.map_x / float(max(1, w)), 4)
-            self.norm_y = round(self.map_y / float(max(1, h)), 4)
+            self.map_x = float(
+                np.clip(player_x * scale_to_map_x, 0.0, float(self.map_width - 1))
+            )
+            self.map_y = float(
+                np.clip(player_y * scale_to_map_y, 0.0, float(self.map_height - 1))
+            )
+            self.norm_x = round(self.map_x / float(max(1, self.map_width)), 4)
+            self.norm_y = round(self.map_y / float(max(1, self.map_height)), 4)
 
             self.odometry_tracker.map_x = float(self.map_x)
             self.odometry_tracker.map_y = float(self.map_y)
             self.odometry_tracker.norm_x = float(self.norm_x)
             self.odometry_tracker.norm_y = float(self.norm_y)
-            self.odometry_tracker.map_width = int(w)
-            self.odometry_tracker.map_height = int(h)
             self.velocity_x = 0.0
             self.velocity_y = 0.0
             self.dead_reckoning_dx = 0.0
@@ -1687,6 +1960,15 @@ class AutoCartographer:
                     self.norm_x,
                     self.norm_y,
                 )
+
+            # Görev 4: açık dünya haritası hangi bölgeninse ORB ile tespit et
+            # (Verteron'u canlı doğrulayabilen tek yol); kısılmış (30 sn).
+            try:
+                if now_cal - float(self._last_world_map_region_ts or 0.0) >= REGION_WORLD_MAP_MATCH_INTERVAL_SEC:
+                    self._last_world_map_region_ts = now_cal
+                    self.identify_region_from_world_map(bgr)
+            except Exception as exc:
+                logger.debug("Dünya haritası bölge tespiti atlandı: %s", exc)
             return self.get_position()
         except Exception as exc:
             logger.error("calibrate_on_world_map hatası: %s", exc)
@@ -1818,19 +2100,29 @@ class AutoCartographer:
                 return self.get_position()
 
             h, w = bgr.shape[:2]
-            if not self._is_calibrated_on_world_map and self.map_width == REF_MAP_WIDTH and w >= 800:
-                scale_x = float(w) / float(self.map_width)
-                scale_y = float(h) / float(self.map_height)
-                self.map_x *= scale_x
-                self.map_y *= scale_y
-                self.map_width = w
-                self.map_height = h
-                self.odometry_tracker.map_width = w
-                self.odometry_tracker.map_height = h
+            # Harita uzayı kanoniktir (F-0053): ilk kare 1280x720 bile olsa
+            # harita uzayı 1920x1080'den 1280x720'ye döndürülmez; kare boyutu
+            # map_width/map_height'i ve map_x/map_y'yi değiştirmez.
+            # calibrate_on_world_map kare pikselini zaten harita uzayına
+            # oranla çevirir; eski blok scale_to_map_x'i 1.0 yapıp düğümleri
+            # ekran uzayında kaydettiriyordu.
 
-            # 1. Dünya haritası ('M') açıksa mutlak kalibrasyon yap
-            if w >= 800 and self._is_world_map_open(bgr):
-                return self.calibrate_on_world_map(bgr)
+            # 1. Dünya haritası ('M') açıksa mutlak kalibrasyon yap.
+            # Bilinmiyor (None) = açık say: kalibrasyon denemesi içeride
+            # korumalıdır (oyuncu oku bulunamazsa konum değişmez, F-0001);
+            # kapalı saymak odometriyi harita karesi üzerinde kör
+            # çalıştırırdı. Bedeli: bilinmiyor durumunda odometri zinciri
+            # bir kareliğine sıfırlanır (aşağıdaki _prev_minimap_clean).
+            if w >= 800 and self._is_world_map_open(bgr) is not False:
+                calibrated = self.calibrate_on_world_map(bgr)
+                # Dünya haritası karesinden önceki minimap dokusu bayattır (F-0054).
+                self._prev_minimap_clean = None
+                return calibrated
+
+            # 1b. Canlı bölge tespiti (Görev 4, kısılmış): minimap açıktayken
+            # oyuncu konumundan alt bölge/bölge çözümlenir; güvenilir tespit
+            # RouteManager'a iletilir (uyumsuzluk koruması).
+            self._maybe_detect_region(bgr)
 
             # 2. Sağ üst minimap bölgesini kırp
             minimap_bgr = self.extract_minimap_roi(bgr)
@@ -1854,6 +2146,10 @@ class AutoCartographer:
                     self._prev_minimap_clean,
                     curr_clean,
                 )
+                # H-sweep (dilim 13 O2): son kayma güveni izlenir;
+                # get_position_status() düşük güvende kör
+                # dead-reckoning'i 'lost' bayrağıyla dışarı çıkarır.
+                self._last_odometry_confidence = float(conf)
                 if conf >= 0.15:
                     player_dx = -dx_terrain * self.minimap_to_map_scale
                     player_dy = -dy_terrain * self.minimap_to_map_scale
@@ -1862,9 +2158,9 @@ class AutoCartographer:
                     self.map_y = float(np.clip(self.map_y + player_dy, 0.0, float(self.map_height - 1)))
                     self.norm_x = round(self.map_x / float(max(1, self.map_width)), 4)
                     self.norm_y = round(self.map_y / float(max(1, self.map_height)), 4)
-                    drift_inc = math.hypot(player_dx, player_dy) * 0.02
-                    self._cumulative_drift_px += drift_inc
-                    self.odometry_tracker.cumulative_drift_px = self._cumulative_drift_px
+                    # "Drift" hareketin %2'si sayılmaz (F-0410): gerçek konum
+                    # hatası ölçülmeden birikim yapılmaz; birikim yalnızca
+                    # kalibrasyonda sıfırlanır.
 
                     if dt > 0:
                         self.velocity_x = player_dx / dt
@@ -1895,18 +2191,19 @@ class AutoCartographer:
             self.odometry_tracker.dead_reckoning_dx = float(self.dead_reckoning_dx)
             self.odometry_tracker.dead_reckoning_dy = float(self.dead_reckoning_dy)
 
-            # Minimap üzerinden yön açısını güncelle
+            # Minimap üzerinden yön açısını güncelle (tek örnek yeniden kullanılır, F-0411)
             try:
                 from core.minimap_scanner import MinimapScanner
-                m_scanner = MinimapScanner()
-                ok_h, h_val = m_scanner.detect_player_heading(bgr)
+
+                if self._heading_scanner is None:
+                    self._heading_scanner = MinimapScanner()
+                ok_h, h_val = self._heading_scanner.detect_player_heading(bgr)
                 if ok_h:
                     self.player_heading_deg = float(h_val)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Minimap yön açısı okunamadı: %s", exc)
 
             self._prev_minimap_clean = curr_clean
-            self._prev_minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
             self._append_trajectory()
             self._refresh_calibration_flag()
             return self.get_position()
@@ -1929,6 +2226,242 @@ class AutoCartographer:
             float(self.norm_y),
         )
 
+    def get_position_status(self) -> Dict[str, Any]:
+        """Konum + odometri güven durumunu döndürür.
+
+        H-sweep (dilim 13 O2): düşük güvenli odometride kör
+        dead-reckoning dışarıdan görünür olsun diye. get_position()
+        tuple dönüşü korunur; bu metod yalnızca durum sözlüğü verir.
+        'lost': son kayma güveni 0.15'in altındaysa (odometri kapısı)
+        VE dead-reckoning birikimi sürüyorsa konum güvenilmez sayılır.
+        """
+        conf = self._last_odometry_confidence
+        dead_reckoning = bool(
+            abs(float(self.dead_reckoning_dx)) > 0.0 or abs(float(self.dead_reckoning_dy)) > 0.0
+        )
+        lost = bool(conf is not None and conf < 0.15 and dead_reckoning)
+        return {
+            "position": self.get_position(),
+            "odometry_confidence": conf,
+            "dead_reckoning": dead_reckoning,
+            "dead_reckoning_dx": float(self.dead_reckoning_dx),
+            "dead_reckoning_dy": float(self.dead_reckoning_dy),
+            "calibrated": bool(self._is_calibrated_on_world_map),
+            "needs_map_calibrate": bool(self.needs_map_calibrate),
+            "lost": lost,
+        }
+
+    # ------------------------------------------------------------------
+    # Canlı bölge tespiti (Görev 4 / harita-istatistik)
+    #
+    # İki kaynak vardır; ikisi de "bilinmiyor"u varsayılan bölgeye çevirmez:
+    # 1. Minimap: MinimapScanner.identify_subregion — SADECE "spatial_bbox"
+    #    kaynağı RouteManager'a iletilir. Başlık şablon listesi yalnızca
+    #    Altgard alt bölgelerini içerir (minimap_scanner.py kapsam dışı),
+    #    ayrıca Verteron alt bölgelerinin "bbox"u None'dur; yani başlık
+    #    eşleşmesi Verteron'u asla doğrulayamaz, yalnızca Altgard'ı
+    #    doğrulayabilir. Bu yüzden başlık sonucu yalnız görüntü amaçlıdır.
+    # 2. Açık dünya haritası (M): ORB ile assets/maps/*.png karşılaştırması.
+    #    Verteron'u canlı tespit edebilen tek yol budur; canlı kareyle
+    #    doğrulanmadı, eşik bilerek katı tutuldu (bkz. identify_region_from_world_map).
+    # ------------------------------------------------------------------
+    def get_detected_region(self) -> Optional[Dict[str, Any]]:
+        """Son güvenilir canlı bölge tespitinin kopyası; yoksa None."""
+        if not isinstance(self._detected_region, dict):
+            return None
+        return dict(self._detected_region)
+
+    def _forward_detected_region(self, detection: Dict[str, Any]) -> None:
+        """Tespiti RouteManager'a iletir (uyumsuzluk korumasını besler)."""
+        try:
+            rm = getattr(self, "route_manager", None)
+            note = getattr(rm, "note_detected_region", None) if rm is not None else None
+            if callable(note):
+                note(
+                    detection.get("canonical_region") or detection.get("region"),
+                    confidence=float(detection.get("confidence", 0.0) or 0.0),
+                    source=str(detection.get("source", "") or ""),
+                )
+        except Exception as exc:
+            logger.debug("Bölge tespiti RouteManager'a iletilemedi: %s", exc)
+
+    def detect_region_from_frame(
+        self,
+        frame_bgr: Optional[np.ndarray],
+        player_map_pos: Optional[Tuple[float, float]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Minimap karesinden canlı bölge tespiti yapar.
+
+        Yalnızca mekansal sınırlayıcı-kutu ("spatial_bbox") tespiti güvenilir
+        sayılır ve saklanır/iletilir; diğer kaynaklar None döndürür.
+        Dönüş: {"subregion", "canonical_region", "confidence", "source"} ya da None.
+        """
+        try:
+            bgr = self._ensure_bgr(frame_bgr)
+            if bgr is None:
+                return None
+            minimap_bgr = self.extract_minimap_roi(bgr)
+            if minimap_bgr is None or minimap_bgr.size == 0:
+                return None
+            if self._region_scanner is None:
+                from core.minimap_scanner import MinimapScanner
+
+                self._region_scanner = MinimapScanner()
+            pos = player_map_pos
+            if pos is None:
+                try:
+                    cur = self.get_position()
+                    pos = (float(cur[0]), float(cur[1]))
+                except Exception:
+                    pos = None
+            info = self._region_scanner.identify_subregion(minimap_bgr, pos)
+            if not isinstance(info, dict):
+                return None
+            # Yalnızca geometri tabanlı tespit RouteManager korumasını besler.
+            if str(info.get("source", "")) != "spatial_bbox":
+                return None
+            conf = float(info.get("confidence", 0.0) or 0.0)
+            if conf < REGION_DETECT_MIN_CONFIDENCE:
+                return None
+            canon = resolve_canonical_region(info.get("canonical_region"))
+            if canon not in KNOWN_CANONICAL_REGIONS:
+                return None
+            detection = {
+                "subregion": str(info.get("subregion", "") or ""),
+                "canonical_region": canon,
+                "confidence": conf,
+                "source": "spatial_bbox",
+            }
+            self._detected_region = dict(detection)
+            self._forward_detected_region(detection)
+            return dict(detection)
+        except Exception as exc:
+            logger.debug("Bölge tespiti hatası: %s", exc)
+            return None
+
+    def _maybe_detect_region(self, frame_bgr: Optional[np.ndarray]) -> None:
+        """Kısılmış (5 sn) minimap bölge tespiti; update_player_position çağırır."""
+        now = time.time()
+        if now - float(self._last_region_detect_ts or 0.0) < REGION_DETECT_INTERVAL_SEC:
+            return
+        self._last_region_detect_ts = now
+        try:
+            self.detect_region_from_frame(frame_bgr)
+        except Exception as exc:
+            logger.debug("Kısılmış bölge tespiti atlandı: %s", exc)
+
+    def identify_region_from_world_map(
+        self,
+        frame_bgr: Optional[np.ndarray],
+    ) -> Optional[Dict[str, Any]]:
+        """Açık dünya haritası karesini assets/maps/*.png ile ORB eşleştirir.
+
+        Ekrandaki harita hangi bölgeninse onu döndürür; karar için en iyi
+        bölgenin iyi eşleşme sayısı >= 15 VE ikinciye oranı >= 2 olmalıdır.
+        Karar verilemezse None döner (bilinmiyor — varsayılan bölge yok).
+        NOT: canlı oyun karesiyle doğrulanmadı; sentetik kırpma testleriyle
+        yalnızca eşleştirici mekaniği doğrulandı.
+        """
+        try:
+            bgr = self._ensure_bgr(frame_bgr)
+            if bgr is None or bgr.size == 0:
+                return None
+            if self._world_map_orb_cache is None:
+                self._world_map_orb_cache = self._build_world_map_orb_cache()
+            cache = self._world_map_orb_cache or {}
+            if not cache:
+                return None
+            orb = cv2.ORB_create(nfeatures=1000)
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+            if gray.shape[1] > 1280:
+                scale = 1280.0 / float(gray.shape[1])
+                gray = cv2.resize(
+                    gray,
+                    (1280, max(1, int(round(gray.shape[0] * scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            _, frame_des = orb.detectAndCompute(gray, None)
+            if frame_des is None or len(frame_des) < 8:
+                return None
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+            scores: Dict[str, int] = {}
+            for region, entry in cache.items():
+                ref_des = entry.get("descriptors")
+                if ref_des is None or len(ref_des) < 8:
+                    continue
+                try:
+                    knn = bf.knnMatch(frame_des, ref_des, k=2)
+                except Exception:
+                    continue
+                good = 0
+                for pair in knn:
+                    if len(pair) != 2:
+                        continue
+                    m, n = pair
+                    if m.distance < 0.75 * n.distance:
+                        good += 1
+                scores[str(region)] = int(good)
+            if not scores:
+                return None
+            ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+            best_region, best_good = ranked[0]
+            second_good = ranked[1][1] if len(ranked) > 1 else 0
+            if best_good < REGION_WORLD_MAP_MIN_GOOD_MATCHES:
+                return None
+            if second_good > 0 and best_good < REGION_WORLD_MAP_MIN_MARGIN_RATIO * second_good:
+                return None
+            # H-sweep (dilim 13 Y1): güven sabit 0.85 değil, eşleşmeden
+            # türetilir — taban 0.55 + iyi eşleşme sayısı (40'ta doyar) +
+            # ikinciye marj (4x'te doyar); üst sınır 0.95. Kapılar
+            # (>=15 eşleşme, >=2x marj) zaten geçildiği için en düşük
+            # güven ~0.72 çıkar. Formül canlı kareyle doğrulanmadı;
+            # yalnızca göreli ayrımı dürüst kılar.
+            match_term = min(int(best_good), 40) / 40.0
+            margin_term = min(float(best_good) / max(float(second_good), 1.0), 4.0) / 4.0
+            orb_confidence = round(min(0.95, 0.55 + 0.25 * match_term + 0.15 * margin_term), 3)
+            detection = {
+                "subregion": best_region,
+                "canonical_region": best_region,
+                "confidence": orb_confidence,
+                "source": "world_map_orb",
+                "good_matches": int(best_good),
+                "second_matches": int(second_good),
+            }
+            self._detected_region = dict(detection)
+            self._forward_detected_region(detection)
+            return dict(detection)
+        except Exception as exc:
+            logger.debug("Dünya haritası bölge eşleşmesi hatası: %s", exc)
+            return None
+
+    def _build_world_map_orb_cache(self) -> Dict[str, Any]:
+        """assets/maps/<bölge>.png dosyalarının ORB tanımlayıcılarını çıkarır (bir kez)."""
+        cache: Dict[str, Any] = {}
+        try:
+            orb = cv2.ORB_create(nfeatures=1000)
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            maps_dir = os.path.join(repo_root, "assets", "maps")
+            for region in sorted(KNOWN_CANONICAL_REGIONS):
+                path = os.path.join(maps_dir, f"{region.lower()}.png")
+                if not os.path.isfile(path):
+                    continue
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img is None or img.size == 0:
+                    continue
+                if img.shape[1] > 1280:
+                    scale = 1280.0 / float(img.shape[1])
+                    img = cv2.resize(
+                        img,
+                        (1280, max(1, int(round(img.shape[0] * scale)))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                _, des = orb.detectAndCompute(img, None)
+                if des is not None and len(des) >= 8:
+                    cache[region] = {"path": path, "descriptors": des}
+        except Exception as exc:
+            logger.debug("Dünya haritası ORB önbelleği kurulamadı: %s", exc)
+        return cache
+
     # ------------------------------------------------------------------
     # 2. Doğrudan Minimap Üzerinden 80x80 Temiz Harita Kesiti (Patch) Kırpma
     # ------------------------------------------------------------------
@@ -1945,7 +2478,11 @@ class AutoCartographer:
         """
         try:
             bgr = self._ensure_bgr(frame_bgr)
-            if bgr is not None and bgr.shape[1] >= 800 and self._is_world_map_open(bgr):
+            # Dünya haritası dalı yalnızca KESİN açıkken (is True):
+            # _extract_patch_from_world_map doğrulama yapmaz, oyun karesini
+            # de kör kırpar — bilinmiyor durumunda sahte harita kesiti
+            # üretilmesin diye None minimap yoluna düşer.
+            if bgr is not None and bgr.shape[1] >= 800 and self._is_world_map_open(bgr) is True:
                 target_x = int(round(self.map_x + rel_map_dx))
                 target_y = int(round(self.map_y + rel_map_dy))
                 return self._extract_patch_from_world_map(bgr, target_x, target_y)
@@ -2062,14 +2599,20 @@ class AutoCartographer:
             direct_simple = os.path.join(reg_dir, f"node_{int(node_id)}.png")
             patch_sub = os.path.join(patches_dir, f"node_{int(node_id)}.png")
 
+            ok = True
             for p in (direct_formatted, direct_simple, patch_sub):
-                cv2.imwrite(p, patch_img)
+                if not cv2.imwrite(p, patch_img):
+                    ok = False
+            if not ok:
+                # Yazım başarısızsa başarı yolu döndürülmez (F-0211).
+                logger.debug("Doğrudan node patch kaydı başarısız: %s", region)
+                return ""
 
             base_name = os.path.basename(os.path.normpath(base_dir)) or "routes"
             return f"{base_name}/{region}/node_{int(node_id):02d}.png".replace("\\", "/")
         except Exception as exc:
             logger.debug("Doğrudan node patch kaydı hatası: %s", exc)
-            return f"routes/{region}/patches/node_{int(node_id)}.png"
+            return ""
 
     # ------------------------------------------------------------------
     # 3. 3 Eşzamanlı Otomatik Tarayıcı (Minimap 3-Leaf Sprout + 3D Crest + F Gather)
@@ -2179,12 +2722,21 @@ class AutoCartographer:
                 except Exception as exc_vf:
                     logger.debug("vision_filters minimap safeguard skipped: %s", exc_vf)
 
-                # Yanında yeşil yığın rozeti ('2' veya '3') var mı kontrol et (H: 68..90, S >= 75, V >= 115)
+                # Yanında yeşil yığın rozeti ('2' veya '3') var mı kontrol et (H: 68..90, S >= 75, V >= 115).
+                # Çevredeki dağınık yeşil arazi pikselleri rozet sayılmaz (F-0055):
+                # yalnızca kompakt, rozet boyutunda yeşil bileşenler sayılır.
                 bx1, by1 = max(0, bx - 4), max(0, by - 4)
                 bx2, by2 = min(mw, bx + bw + 8), min(mh, by + bh + 6)
-                badge_px = int(
-                    np.count_nonzero(cv2.inRange(hsv[by1:by2, bx1:bx2], (68, 75, 115), (90, 255, 255)))
-                )
+                badge_mask = cv2.inRange(hsv[by1:by2, bx1:bx2], (68, 75, 115), (90, 255, 255))
+                badge_px = 0
+                num_b, _, stats_b, _ = cv2.connectedComponentsWithStats(badge_mask)
+                for b_idx in range(1, num_b):
+                    _bx, _by, _bw, _bh, _area = stats_b[b_idx]
+                    if _area < 8 or _bw < 3 or _bh < 3 or _bw > 24 or _bh > 24:
+                        continue
+                    if float(_area) / float(max(1, _bw * _bh)) < 0.30:
+                        continue
+                    badge_px += int(_area)
                 stack_count = 3 if badge_px >= 28 else (2 if badge_px >= 10 else 1)
 
                 rel_dx = (icx - arrow_cx) * self.minimap_to_map_scale
@@ -2238,8 +2790,9 @@ class AutoCartographer:
         sx = float(screen_x)
         sy = float(screen_y)
 
-        # Normalize koordinatları piksel koordinatlarına dönüştür (merkeze yapışmayı önler)
-        if 0.0 <= sx <= 1.5 and 0.0 <= sy <= 1.5 and fw > 10 and fh > 10:
+        # Normalize koordinatları piksel koordinatlarına dönüştür (merkeze yapışmayı önler).
+        # 0..1.5 aralığı piksel (1, 1) ile normalize (1.0, 1.0) ayrımını yapamaz (F-0212).
+        if _is_normalized_coord_pair(sx, sy) and fw > 10 and fh > 10:
             sx = sx * float(fw)
             sy = sy * float(fh)
 
@@ -2270,6 +2823,69 @@ class AutoCartographer:
             return float(round(rot_dx, 3)), float(round(rot_dy, 3))
 
         return float(round(base_dx, 3)), float(round(base_dy, 3))
+
+    def _mesh_matches_monster_negative(
+        self, mesh_bgr: np.ndarray
+    ) -> Optional[Tuple[str, float]]:
+        """3D mesh öğrenilmiş canavar/oyuncu negatif örneğine uyuyor mu?
+
+        v20-targena-3dauto: renk sınıflandırması (sarı+yeşil Targena
+        kuralı) mob gövdesini Targena sayabilir. v20 tarayıcı kapısı
+        (material_scanner._classify_3d_material, sim >= 0.82) bu yolda
+        hiç çalışmıyor — kartograf kendi 3D tespitinde mesh'i kendisi
+        kontrol eder. Eşleşme varsa (örnek_adı, sim) döner, yoksa None.
+        """
+        try:
+            mem = self._get_exemplar_memory()
+        except Exception:
+            return None
+        if mem is None or not hasattr(mem, "is_negative_patch"):
+            return None
+        try:
+            is_neg, neg_sim, neg_ex = mem.is_negative_patch(mesh_bgr, threshold=0.82)
+        except Exception:
+            return None
+        if not is_neg or neg_ex is None:
+            return None
+        neg_name = str(neg_ex.get("class_name", "") or "")
+        lowered = neg_name.lower()
+        if "monster" not in lowered and "player" not in lowered:
+            return None
+        return neg_name, float(neg_sim)
+
+    def _classify_3d_mesh(
+        self, mesh_bgr: np.ndarray, label_width_px: int
+    ) -> Optional[str]:
+        """3D mesh'i renk kurallarıyla sınıflandır; canavar mesh None döner.
+
+        Döner: materyal adı; sınıflandırılamazsa UNKNOWN_RESOURCE_TYPE;
+        mesh canavar/oyuncu negatif örneğine uyuyorsa None (aday
+        haritalanmaz — tek satır tanı logu burada basılır).
+        """
+        try:
+            from config.materials_db import classify_3d_material_patch
+
+            classified = classify_3d_material_patch(
+                mesh_bgr,
+                label_width_px=int(label_width_px),
+            )
+            name = str(classified.get("name") or "")
+        except Exception as classify_exc:
+            logger.debug("3B essence sınıfı okunamadı: %s", classify_exc)
+            return UNKNOWN_RESOURCE_TYPE
+        if not name or name == UNKNOWN_RESOURCE_TYPE:
+            return UNKNOWN_RESOURCE_TYPE
+        monster = self._mesh_matches_monster_negative(mesh_bgr)
+        if monster is not None:
+            neg_name, neg_sim = monster
+            logger.info(
+                "3d_auto %s adayı canavar filtresine takıldı (örnek=%s, sim=%.2f), haritalanmadı",
+                name,
+                neg_name,
+                neg_sim,
+            )
+            return None
+        return name
 
     def _detect_3d_world_gatherables(
         self,
@@ -2350,24 +2966,39 @@ class AutoCartographer:
                 mx2 = min(w, x + cw + int(round(28 * scale_x)))
                 mesh_hsv = hsv[my1:my2, mx1:mx2]
 
-                resource_type = DEFAULT_RESOURCE_TYPE
+                # H-sweep (dilim 13 K3): sınıflandırılamazsa tür jenerik
+                # kalır; "Orichalcum Ore" varsayılmaz.
+                resource_type = UNKNOWN_RESOURCE_TYPE
                 mesh_bgr = frame_bgr[my1:my2, mx1:mx2]
                 if mesh_bgr.size > 0:
-                    try:
-                        from config.materials_db import classify_3d_material_patch
-
-                        classified = classify_3d_material_patch(
-                            mesh_bgr,
-                            label_width_px=int(cw),
-                        )
-                        resource_type = str(classified.get("name") or resource_type)
-                    except Exception as classify_exc:
-                        logger.debug("3B essence sınıfı okunamadı: %s", classify_exc)
+                    # v20-targena-3dauto: canavar gövdesi renk kuralıyla
+                    # Targena sayılmasın — None dönerse aday atılır.
+                    classified_name = self._classify_3d_mesh(mesh_bgr, int(cw))
+                    if classified_name is None:
+                        continue
+                    resource_type = str(classified_name or resource_type)
 
                 node_sx = float(cx_mid)
                 node_sy = float(min(h - 1, y + ch + int(round(26 * scale_y))))
                 rel_dx, rel_dy = self._project_3d_screen_to_map_offset(node_sx, node_sy, w, h)
 
+                # Güven ölçümden türetilir (F-0056): arma beyaz piksel gücü +
+                # piramit doğrulaması; sabit 0.92 değil.
+                crest_strength = min(
+                    1.0, float(crest_white) / float(max(1, 2 * min_crest_px))
+                )
+                crest_confidence = round(
+                    float(
+                        np.clip(
+                            0.55
+                            + 0.35 * crest_strength
+                            + (0.05 if pyramid_detected else 0.0),
+                            0.55,
+                            0.95,
+                        )
+                    ),
+                    3,
+                )
                 detections.append(
                     {
                         "rel_map_dx": rel_dx,
@@ -2375,8 +3006,9 @@ class AutoCartographer:
                         "screen_x": int(round(node_sx)),
                         "screen_y": int(round(node_sy)),
                         "resource_type": resource_type,
-                        "in_air": bool(y < int(h * 0.22)),
-                        "confidence": 0.92,
+                        # Etiket yüksekliği irtifa kanıtı değildir (F-0412).
+                        "in_air": False,
+                        "confidence": crest_confidence,
                         "stack_count": 1,
                         "max_harvests": DEFAULT_MAX_HARVESTS,
                         "current_harvests": 0,
@@ -2423,7 +3055,25 @@ class AutoCartographer:
                                     frame_bgr, abs_sx, abs_sy
                                 ),
                                 "in_air": False,
-                                "confidence": 0.89,
+                                # Güven ölçümden türetilir (F-0056): beyaz çekirdek /
+                                # yeşil çerçeve / sıcak piksel güçleri.
+                                "confidence": round(
+                                    float(
+                                        np.clip(
+                                            0.55
+                                            + 0.35
+                                            * (
+                                                min(1.0, white_e / 45.0)
+                                                + min(1.0, green_frame / 400.0)
+                                                + min(1.0, warm_px / 150.0)
+                                            )
+                                            / 3.0,
+                                            0.55,
+                                            0.95,
+                                        )
+                                    ),
+                                    3,
+                                ),
                                 "stack_count": 1,
                                 "max_harvests": DEFAULT_MAX_HARVESTS,
                                 "current_harvests": 0,
@@ -2499,20 +3149,50 @@ class AutoCartographer:
                 if not (18.0 <= dark_mean <= 82.0):
                     continue
 
-                # Yakındaki 3D tespitten materyal adını ('Aria', 'Mela', vb.) miras al
-                resource_type = DEFAULT_RESOURCE_TYPE
+                # Yakındaki 3D tespitten materyal adını ('Aria', 'Mela', vb.) miras al.
+                # En yakın, oyuncuya en yakın olan değil, İSTEME ekranda en yakın
+                # olandır (F-0057): oyuncuya yakınlık yanlış düğüm kaydeder.
+                # H-sweep (dilim 13 K3): yakın 3D tespit yoksa / adı yoksa
+                # tür jenerik kalır, "Orichalcum Ore" varsayılmaz.
+                resource_type = UNKNOWN_RESOURCE_TYPE
                 rel_dx, rel_dy = 0.0, 0.0
+                prompt_cx = float(rx1 + fx + fcw // 2)
+                prompt_cy = float(ry1 + fy + fch // 2)
                 if world_3d_detections:
-                    nearest_3d = min(
-                        world_3d_detections,
-                        key=lambda d: math.hypot(
-                            float(d.get("rel_map_dx", 0.0)),
-                            float(d.get("rel_map_dy", 0.0)),
-                        ),
+                    def _prompt_screen_dist(d: Dict[str, Any]) -> float:
+                        dsx = d.get("screen_x")
+                        dsy = d.get("screen_y")
+                        if dsx is None or dsy is None:
+                            return math.hypot(
+                                float(d.get("rel_map_dx", 0.0)),
+                                float(d.get("rel_map_dy", 0.0)),
+                            )
+                        return math.hypot(float(dsx) - prompt_cx, float(dsy) - prompt_cy)
+
+                    nearest_3d = min(world_3d_detections, key=_prompt_screen_dist)
+                    resource_type = str(
+                        nearest_3d.get("resource_type") or UNKNOWN_RESOURCE_TYPE
                     )
-                    resource_type = str(nearest_3d.get("resource_type", DEFAULT_RESOURCE_TYPE))
                     rel_dx = float(nearest_3d.get("rel_map_dx", 0.0))
                     rel_dy = float(nearest_3d.get("rel_map_dy", 0.0))
+
+                # Güven ölçümden türetilir (F-0056): sol/sağ beyaz parça güçleri.
+                prompt_confidence = round(
+                    float(
+                        np.clip(
+                            0.60
+                            + 0.35
+                            * (
+                                min(1.0, left_white / max(1.0, 50.0 * scale_x * scale_y))
+                                + min(1.0, right_white / max(1.0, 50.0 * scale_x * scale_y))
+                            )
+                            / 2.0,
+                            0.60,
+                            0.97,
+                        )
+                    ),
+                    3,
+                )
 
                 prompts.append(
                     {
@@ -2522,7 +3202,7 @@ class AutoCartographer:
                         "screen_y": int(ry1 + fy + fch // 2),
                         "resource_type": resource_type,
                         "in_air": False,
-                        "confidence": 0.96,
+                        "confidence": prompt_confidence,
                         "stack_count": 1,
                         "max_harvests": DEFAULT_MAX_HARVESTS,
                         "current_harvests": 0,
@@ -2563,11 +3243,12 @@ class AutoCartographer:
                         max_h = int(getattr(n, "max_harvests", DEFAULT_MAX_HARVESTS) or DEFAULT_MAX_HARVESTS)
                         curr_h = int(getattr(n, "current_harvests", 0) or 0)
                         st_cnt = int(getattr(n, "stack_count", max(1, max_h // DEFAULT_MAX_HARVESTS)) or 1)
-                        src_t = str(getattr(n, "source_type", "minimap_auto") or "minimap_auto")
+                        src_t = str(getattr(n, "source_type", "unknown") or "unknown")
                         setattr(n, "max_harvests", max_h)
                         setattr(n, "current_harvests", curr_h)
                         setattr(n, "stack_count", st_cnt)
                         setattr(n, "source_type", src_t)
+                        rm_state = str(getattr(n, "state", "active") or "active")
                         tracked_list.append(
                             TrackedResourceNode(
                                 node_id=n.id,
@@ -2579,12 +3260,23 @@ class AutoCartographer:
                                 norm_x=float(n.norm_x),
                                 norm_y=float(n.norm_y),
                                 in_air=bool(n.in_air),
-                                sightings_count=max(1, int(n.gathered_count) or 1),
+                                # H-sweep (dilim 13 O7): gathered_count
+                                # hasat sayısıdır, görülme sayısı değil —
+                                # RouteManager verisinde görülme sayacı
+                                # yok; uydurma sayı (max(1, gathered))
+                                # yerine 1 yazılır.
+                                sightings_count=1,
                                 patch_path=n.patch_path,
                                 stack_count=st_cnt,
                                 max_harvests=max_h,
                                 current_harvests=curr_h,
                                 source_type=src_t,
+                                state=rm_state,
+                                rest_started_timestamp=(
+                                    float(getattr(n, "last_visited_timestamp", 0.0) or 0.0)
+                                    if rm_state == "resting"
+                                    else 0.0
+                                ),
                             )
                         )
         except Exception as exc:
@@ -2620,7 +3312,7 @@ class AutoCartographer:
                     raw = {
                         "rel_map_dx": float(item[0]),
                         "rel_map_dy": float(item[1]),
-                        "resource_type": str(item[2]) if len(item) >= 3 else DEFAULT_RESOURCE_TYPE,
+                        "resource_type": str(item[2]) if len(item) >= 3 else None,
                     }
                 else:
                     return None
@@ -2629,7 +3321,13 @@ class AutoCartographer:
 
             # Kaynak türü (minimap_auto, 3d_auto, harvest_auto, radar_auto) belirleme
             raw_source = str(raw.get("source_type") or raw.get("source") or "").strip().lower()
-            if raw_source in ("minimap", "minimap_auto", "yz_minimap"):
+            # F17: "minimap_material" içsel minimap tarayıcısının etiketidir
+            # (explorer_mode._scan_minimap_icons_internal /
+            # MaterialScanner serileştirmesi) — birinci taraf minimap
+            # üreticisidir, dış girdi değildir. Eskiden tanınmayıp
+            # "unknown"a düşüyor, güven 0.05'e kırpılıyor ve P1-3 kapısında
+            # (0.05 < 0.55) adım yolundaki filiz reddediliyordu.
+            if raw_source in ("minimap", "minimap_auto", "yz_minimap", "minimap_material"):
                 source_type = "minimap_auto"
             elif raw_source in ("gather_prompt", "harvest", "harvest_auto", "f_gather"):
                 source_type = "harvest_auto"
@@ -2638,7 +3336,9 @@ class AutoCartographer:
             elif raw_source in ("3d_world", "3d_auto", "3d", "world", "yz_3d"):
                 source_type = "3d_auto"
             else:
-                source_type = "minimap_auto"
+                # Bilinmeyen kaynak minimap sayılmaz (F-0058); koordinat
+                # kanıtı olan dallar aşağıda kaynağı yeniden sınıflandırır.
+                source_type = "unknown"
 
             rel_dx: Optional[float] = None
             rel_dy: Optional[float] = None
@@ -2742,8 +3442,8 @@ class AutoCartographer:
                     sy = (by1 + by2) / 2.0
 
                 if sx is not None and sy is not None:
-                    # Normalize koordinatları (0.0..1.0) piksele çevir (merkeze yapışmayı önler)
-                    if 0.0 <= sx <= 1.5 and 0.0 <= sy <= 1.5 and frame_w > 10 and frame_h > 10:
+                    # Normalize koordinatları (0.0..1.0) piksele çevir (merkeze yapışmayı önler, F-0212).
+                    if _is_normalized_coord_pair(sx, sy) and frame_w > 10 and frame_h > 10:
                         sx *= float(frame_w)
                         sy *= float(frame_h)
 
@@ -2763,7 +3463,7 @@ class AutoCartographer:
                         rel_dx, rel_dy = self._project_3d_screen_to_map_offset(
                             sx, sy, frame_w, frame_h, heading_deg=heading
                         )
-                        if source_type == "minimap_auto" and not raw_source:
+                        if source_type in ("minimap_auto", "unknown") and not raw_source:
                             source_type = "3d_auto"
 
             # 6. Dead-reckoning yer değiştirme ofsetini ekle
@@ -2771,11 +3471,11 @@ class AutoCartographer:
             dr_y = float(raw.get("dead_reckoning_dy", raw.get("dr_dy", 0.0)))
 
             if rel_dx is None or rel_dy is None:
-                if source_type == "harvest_auto":
-                    rel_dx, rel_dy = 0.0, 0.0
-                else:
-                    # Koordinat bilgisi olmayan tespitler merkeze yapışmasın diye elenir
-                    return None
+                # H-sweep (dilim 13 K3): koordinatsız tespit elenir —
+                # harvest_auto için bile oyuncu ayağına (0, 0) düğüm
+                # yazılmaz. İçsel [F] istemleri koordinatlarıyla
+                # üretilir ve _parse'a uğramaz, bu dal onları etkilemez.
+                return None
 
             rel_dx += dr_x
             rel_dy += dr_y
@@ -2784,16 +3484,20 @@ class AutoCartographer:
             if source_type == "3d_auto" and math.hypot(rel_dx, rel_dy) < 3.0:
                 return None
 
+            # H-sweep (dilim 13 K3): materyal adı yoksa spesifik cevher
+            # ("Orichalcum Ore") varsayılmaz; tür bilinmiyor diye jenerik
+            # işaret (UNKNOWN_RESOURCE_TYPE) yazılır, kapı sonra
+            # isimlendirebilir.
             resource_type = str(
                 raw.get("resource_type")
                 or raw.get("material_type")
                 or raw.get("name")
                 or raw.get("label")
                 or raw.get("category")
-                or DEFAULT_RESOURCE_TYPE
+                or UNKNOWN_RESOURCE_TYPE
             ).strip()
-            if not resource_type:
-                resource_type = DEFAULT_RESOURCE_TYPE
+            if not resource_type or resource_type == "None":
+                resource_type = UNKNOWN_RESOURCE_TYPE
 
             # Tüy (feather) ve kanat (wing) ikonlarını kesinlikle reddet ("tüy odyle değil tüy toplamayacağız")
             rt_lower = resource_type.lower()
@@ -2803,7 +3507,32 @@ class AutoCartographer:
                 return None
 
             in_air = bool(raw.get("in_air", False))
-            confidence = float(raw.get("confidence", raw.get("score", 1.0)))
+            # H-sweep (dilim 13 K3): güven yoksa 1.0 varsayılmaz.
+            # Ölçülmemiş güven "mükemmel" değildir — tespit elenir.
+            # İçsel dedektörler (minimap formülü, 3D arma, [F] istemi)
+            # her zaman ölçülmüş güven taşır; bu dal yalnızca dış
+            # girdileri etkiler.
+            conf_raw = raw.get("confidence")
+            if conf_raw is None:
+                conf_raw = raw.get("score")
+            if conf_raw is None:
+                logger.debug(
+                    "Materyal tespiti güveni yok, elendi (kaynak=%s)",
+                    source_type,
+                )
+                return None
+            try:
+                confidence = float(conf_raw)
+            except (TypeError, ValueError):
+                # P1-3 (K-07): ayrıştırılamayan güven 0.5 varsayılmaz —
+                # güveni yok/bozuk tespit bilinmiyor sayılır ve elenir
+                # (güvensiz tespit dalındaki `return None` ile aynı kural).
+                logger.debug(
+                    "Materyal tespiti güveni ayrıştırılamadı (%r), elendi (kaynak=%s)",
+                    conf_raw,
+                    source_type,
+                )
+                return None
             if confidence > 1.0:
                 confidence = confidence / 100.0
             confidence = float(np.clip(confidence, 0.05, 1.0))
@@ -2828,6 +3557,18 @@ class AutoCartographer:
                 "current_harvests": int(current_harvests),
                 "source_type": str(source_type),
             }
+            # F-1389/F-1390: dedektörün sınıf kimliğini koru — yoksa
+            # _register_parsed_detections bunu kalite kapısına model_verdict
+            # olarak iletemez ve canavar (11) tespiti kapıdan kaçardı.
+            for _cid_key in ("class_id", "cls", "class"):
+                if raw.get(_cid_key) is not None:
+                    try:
+                        _cid = int(raw[_cid_key])
+                    except (TypeError, ValueError):
+                        _cid = -1
+                    if _cid >= 0:
+                        parsed_res["class_id"] = _cid
+                    break
             if exact_map_x is not None and exact_map_y is not None:
                 parsed_res["exact_map_x"] = round(float(exact_map_x), 3)
                 parsed_res["exact_map_y"] = round(float(exact_map_y), 3)
@@ -2917,30 +3658,39 @@ class AutoCartographer:
             self._sync_existing_nodes_from_route_manager(self.route_manager, region=region)
             candidates = self._tracked_nodes.get(region, [])
 
-        effective_radius = float(np.clip(self.dedup_radius_px, DEDUP_RADIUS_MIN_PX, DEDUP_RADIUS_MAX_PX))
+        effective_radius = min(DEDUP_RADIUS_MAX_PX, max(DEDUP_RADIUS_MIN_PX, float(self.dedup_radius_px)))
         nearest: Optional[TrackedResourceNode] = None
         min_dist = float("inf")
+        # Sınır bölgesi (effective_radius..25px) adayı: eski kod ikinci tam
+        # taramada arıyordu; tek geçişte aynı anda izlenir (D02). İkinci
+        # tarama yalnızca ilkinde eşleşme yoksa çalışırdı, o yüzden sınır
+        # adayı yarıçap dışındaki düğümlerden seçilir — sonuç aynıdır.
+        border_best: Optional[TrackedResourceNode] = None
+        border_dist = float("inf")
+        border_applies = effective_radius < DEDUP_RADIUS_MAX_PX
 
         for tracked in candidates:
-            dist = math.hypot(float(node_map_x - tracked.map_x), float(node_map_y - tracked.map_y))
-            if dist <= effective_radius and dist < min_dist:
-                min_dist = dist
-                nearest = tracked
+            dx = float(node_map_x) - tracked.map_x
+            dy = float(node_map_y) - tracked.map_y
+            dist = math.hypot(dx, dy)
+            if dist <= effective_radius:
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest = tracked
+            elif border_applies and dist <= DEDUP_RADIUS_MAX_PX and dist < border_dist:
+                # Sınır bölgesinde yalnızca aynı tür tekilleştirilir (F-0213):
+                # az görülmüş olması farklı türü aynı düğüm saymaz.
+                if (
+                    resource_type is None
+                    or resource_type in (DEFAULT_RESOURCE_TYPE, "Gatherable Material")
+                    or tracked.resource_type == resource_type
+                ):
+                    border_dist = dist
+                    border_best = tracked
 
-        # Sınır bölgesi (effective_radius..25px) tekilleştirme koruması
-        if nearest is None and effective_radius < DEDUP_RADIUS_MAX_PX:
-            for tracked in candidates:
-                dist = math.hypot(float(node_map_x - tracked.map_x), float(node_map_y - tracked.map_y))
-                if dist <= DEDUP_RADIUS_MAX_PX and dist < min_dist:
-                    # Aynı materyal türü veya az sayıda görülmüş taze düğüm ise tekilleştir
-                    if (
-                        resource_type is None
-                        or resource_type in (DEFAULT_RESOURCE_TYPE, "Gatherable Material")
-                        or tracked.resource_type == resource_type
-                        or tracked.sightings_count <= 3
-                    ):
-                        min_dist = dist
-                        nearest = tracked
+        if nearest is None and border_best is not None:
+            nearest = border_best
+            min_dist = border_dist
 
         return nearest, min_dist
 
@@ -2990,8 +3740,9 @@ class AutoCartographer:
 
             # EMA ağırlığı ile Kalman kazancını birleştir
             ema_weight = self.ema_alpha / math.sqrt(max(1, tracked.sightings_count))
-            eff_weight_x = float(np.clip(0.5 * gain_x + 0.5 * ema_weight, 0.04, 0.55))
-            eff_weight_y = float(np.clip(0.5 * gain_y + 0.5 * ema_weight, 0.04, 0.55))
+            # Skaler np.clip yerine min/max (D02).
+            eff_weight_x = min(0.55, max(0.04, 0.5 * gain_x + 0.5 * ema_weight))
+            eff_weight_y = min(0.55, max(0.04, 0.5 * gain_y + 0.5 * ema_weight))
 
             tracked.map_x = (1.0 - eff_weight_x) * tracked.map_x + eff_weight_x * clamped_obs_x
             tracked.map_y = (1.0 - eff_weight_y) * tracked.map_y + eff_weight_y * clamped_obs_y
@@ -3002,8 +3753,21 @@ class AutoCartographer:
             tracked.kalman_variance_y = (1.0 - gain_y) * pred_var_y
             tracked.kalman_variance = round(0.5 * (tracked.kalman_variance_x + tracked.kalman_variance_y), 4)
 
+            # Güven tek yönlü şişirilmez (F-0059): gözlemlerin çalışan
+            # ortalamasıdır; her gözlem +0.02 ekleyip 1.0'a tırmandırmaz.
             tracked.confidence = round(
-                min(1.0, max(tracked.confidence, float(obs_confidence)) + 0.02),
+                min(
+                    1.0,
+                    max(
+                        0.0,
+                        (
+                            float(tracked.confidence)
+                            * max(0, tracked.sightings_count - 1)
+                            + float(obs_confidence)
+                        )
+                        / max(1, tracked.sightings_count),
+                    ),
+                ),
                 4,
             )
 
@@ -3015,23 +3779,36 @@ class AutoCartographer:
             if (
                 obs_resource_type
                 and obs_resource_type not in (DEFAULT_RESOURCE_TYPE, "Gatherable Material")
-                and tracked.resource_type in (DEFAULT_RESOURCE_TYPE, "Gatherable Material")
+                and tracked.resource_type in (DEFAULT_RESOURCE_TYPE, "Gatherable Material", "Gem")
             ):
                 tracked.resource_type = str(obs_resource_type)
 
             if route and route != DEFAULT_ROUTE and route not in tracked.routes:
                 tracked.routes.append(route)
 
-            if self.auto_cartography_enabled:
-                self.last_mapped_info = {
-                    "type": "node_update",
-                    "node_id": tracked.node_id,
-                    "resource_type": tracked.resource_type,
-                    "map_x": int(round(tracked.map_x)),
-                    "map_y": int(round(tracked.map_y)),
-                    "timestamp": time.time(),
-                    "sightings": tracked.sightings_count,
-                }
+            # H-sweep (dilim 13 O6): last_mapped_info son haritalamanın
+            # kaydıdır, AUTO modunun değil — AUTO kapalıyken yazılan
+            # düğüm de panelde görünür; bölge bilgisi de eklenir.
+            # P0-9 (K-15): buradaki bölge düğümün kendi bölgesidir
+            # (tracked.region) — bu fonksiyonda `target_region` diye bir
+            # isim yoktu; NameError her mevcut-düğüm iyileştirmesini
+            # patlatıp aşağıdaki except'e yutuyor, RouteManager
+            # senkronizasyonu + save_region hiç çalışmıyordu. Aynı
+            # değer iki satır aşağıda rm.get_node / rm.save_region
+            # çağrılarında zaten tracked.region olarak kullanılıyor;
+            # çağıranlar da düğümü bölge anahtarlı havuzdan bulur
+            # (_find_nearest_tracked_node), yani tracked.region
+            # çağıranın bölgesiyle aynıdır.
+            self.last_mapped_info = {
+                "type": "node_update",
+                "node_id": tracked.node_id,
+                "resource_type": tracked.resource_type,
+                "region": tracked.region,
+                "map_x": int(round(tracked.map_x)),
+                "map_y": int(round(tracked.map_y)),
+                "timestamp": time.time(),
+                "sightings": tracked.sightings_count,
+            }
 
             rm = route_manager or self.route_manager
             if rm is not None:
@@ -3049,6 +3826,12 @@ class AutoCartographer:
                     if route and route != DEFAULT_ROUTE and route not in node_obj.routes:
                         node_obj.routes.append(route)
                     rm.save_region(tracked.region)
+        except NameError:
+            # P0-9 (K-15): programlama hatası (tanımsız isim) yutulmaz —
+            # sessizce yutmak disk senkronizasyonunu her düğümde
+            # öldürüyordu. Logla ve fail-closed: yukarı fırlat.
+            logger.exception("Düğüm Kalman/EMA iyileştirmede tanımsız isim (P0-9):")
+            raise
         except Exception as exc:
             logger.error("Düğüm Kalman/EMA koordinat iyileştirme hatası: %s", exc)
 
@@ -3097,6 +3880,15 @@ class AutoCartographer:
         self.odometry_tracker.dead_reckoning_dy = float(self.dead_reckoning_dy)
 
         for parsed in clustered_items:
+            # H-sweep (dilim 13 K3): güveni/isimsiz-koordinatsız tespit
+            # kapıda elenir; float(None) / "None" adı rotaya girmez.
+            if parsed.get("confidence") is None or not parsed.get("resource_type"):
+                logger.info(
+                    "Tespit eksik güven/isim nedeniyle elendi (kaynak=%s)",
+                    parsed.get("source_type", "?"),
+                )
+                self.total_gate_rejected += 1
+                continue
             rel_dx = float(parsed["rel_map_dx"])
             rel_dy = float(parsed["rel_map_dy"])
             resource_type = str(parsed["resource_type"])
@@ -3151,12 +3943,54 @@ class AutoCartographer:
                 self.total_gate_rejected += 1
                 continue
 
+            # H-sweep (dilim 13 K3): minimap kapısı yoktu — 3D için
+            # WORLD_3D_CONF_MIN varken minimap_auto her güvenle
+            # yazılıyordu. İçsel minimap dedektörleri zaten >=0.68
+            # üretir (formül tabanı / MaterialScanner 0.78+); altı
+            # ölçülmemiş/uydurma güvendir.
+            if source_type == "minimap_auto" and confidence < MINIMAP_SPROUT_CONF_MIN:
+                logger.info(
+                    "Minimap aday düşük güven (%.2f < %.2f), düğüm yazılmadı (%s)",
+                    confidence,
+                    MINIMAP_SPROUT_CONF_MIN,
+                    resource_type,
+                )
+                self.total_gate_rejected += 1
+                continue
+
+            # P1-3 (K-07): harvest_auto / radar_auto / unknown kapısızdı —
+            # 3d_auto ve minimap_auto tabanları varken bu kaynaklar her
+            # güvenle kalite kapısına ulaşırdı. Dış girdide 0.05'e
+            # kırpılmış güven bile düğüme dönerdi. İçsel [F] istemi
+            # 0.60+ ürettiği için 0.55 tabanı gerçek istemi geçirir.
+            if source_type in ("harvest_auto", "radar_auto", "unknown") and confidence < HARVEST_RADAR_CONF_MIN:
+                logger.info(
+                    "Harvest/radar aday düşük güven (%.2f < %.2f), düğüm yazılmadı (%s, kaynak=%s)",
+                    confidence,
+                    HARVEST_RADAR_CONF_MIN,
+                    resource_type,
+                    source_type,
+                )
+                self.total_gate_rejected += 1
+                continue
+
+            # F-1389/F-1390 (R11): tespitin dedektör sınıfını model_verdict
+            # olarak kapıya ilet — yoksa kapı canavar sınıfını (11) bilemez
+            # ve canavar düğümü kabul ederdi.
+            model_verdict = None
+            try:
+                if parsed.get("class_id") is not None:
+                    model_verdict = (int(parsed["class_id"]), float(confidence))
+            except (TypeError, ValueError):
+                model_verdict = None
+
             gate = evaluate_node_candidate(
                 patch_80,
                 source_type=source_type,
                 resource_type=resource_type,
                 detector=self._get_quality_detector(),
                 conf_min=MODEL_CONF_MIN,
+                model_verdict=model_verdict,
                 check_feather=source_type.startswith("minimap"),
                 check_monster=source_type.startswith("minimap"),
                 check_terrain=False,
@@ -3176,10 +4010,25 @@ class AutoCartographer:
                 )
                 continue
 
-            if getattr(gate, "verified_resource_type", None):
-                resource_type = gate.verified_resource_type
-            if getattr(gate, "exemplar_sim", None):
-                confidence = max(confidence, float(gate.exemplar_sim))
+            verified = getattr(gate, "verified_resource_type", None)
+            # v20-targena-3dauto (R1+R2): 3D'den gelen spesifik ad
+            # (Targena vb.) kapının jenerik doğrulamasıyla ("Gem" vb.)
+            # ezilmez; 3D adayda ad belirlenemediyse yanlış jenerik
+            # kayıt yazılmaz — aday atılır.
+            resource_type, _drop_unnamed = _resolve_mapped_resource_name(
+                resource_type, verified, source_type
+            )
+            if _drop_unnamed:
+                logger.info(
+                    "3D aday adı belirlenemedi, düğüm yazılmadı (%s)",
+                    resource_type,
+                )
+                self.total_gate_rejected += 1
+                continue
+            # H-sweep (dilim 13 K4): güven yalnızca yukarı şişirilmez.
+            # exemplar_sim ayrı bir kanıttır; ölçülmüş güveni yükseltmez
+            # (düşük güvenli tespit exemplare benziyor diye yüksek güvenli
+            # sayılmaz). Benzerlik kapı kararında zaten kullanılır.
 
             existing_node, dist_px = self._find_nearest_tracked_node(
                 region=target_region,
@@ -3233,6 +4082,10 @@ class AutoCartographer:
             created_node: Optional[NodeData] = None
 
             if rm is not None:
+                # max_harvests/current_harvests/source_type add_node'a verilir:
+                # add_node içindeki save_region diske bunlarla yazar (F-0002).
+                # Sonradan setattr ile düzeltmek, AUTO kapalıyken diske hiç
+                # yansımıyordu.
                 created_node = rm.add_node(
                     region=target_region,
                     route=target_route,
@@ -3243,12 +4096,17 @@ class AutoCartographer:
                     norm_x=norm_x,
                     norm_y=norm_y,
                     resource_type=resource_type,
+                    max_harvests=int(max_harvests),
+                    current_harvests=int(current_harvests),
+                    source_type=str(source_type),
                 )
                 if created_node is not None:
                     setattr(created_node, "max_harvests", int(max_harvests))
                     setattr(created_node, "current_harvests", int(current_harvests))
                     setattr(created_node, "stack_count", int(stack_count))
                     setattr(created_node, "source_type", str(source_type))
+                    # Bellek üstü alanlar da diske yansısın.
+                    rm.save_region(target_region)
                     self._save_direct_region_node_patch(
                         base_dir=rm.base_dir,
                         region=target_region,
@@ -3256,24 +4114,32 @@ class AutoCartographer:
                         patch_img=patch_80,
                     )
 
+            # RouteManager yokken ID len()+1 ile çakışır (F-0214): en büyük
+            # mevcut ID + 1 kullanılır.
             assigned_id = (
                 int(created_node.id)
                 if created_node is not None
-                else len(self._tracked_nodes.get(target_region, [])) + 1
+                else max(
+                    [t.node_id for t in self._tracked_nodes.get(target_region, [])],
+                    default=0,
+                )
+                + 1
             )
-            if rm is None:
-                self._save_direct_region_node_patch(
-                    base_dir="routes",
+            if created_node is not None:
+                # RouteManager patch'i diske yazdı; gerçek yol kullanılır.
+                patch_path = created_node.patch_path
+            else:
+                # S-1101 (S-0503 deseni): add_node None döndüyse (kara liste
+                # reddi) veya RouteManager yoksa patch diske yazılmamıştır;
+                # yazılmamış dosya yolu kaydedilmez. Doğrudan yazım denenir;
+                # yazım başarısızsa _save_direct_region_node_patch "" döner
+                # (F-0211) ve patch_path boş kalır.
+                patch_path = self._save_direct_region_node_patch(
+                    base_dir=rm.base_dir if rm is not None else "routes",
                     region=target_region,
                     node_id=assigned_id,
                     patch_img=patch_80,
                 )
-
-            patch_path = (
-                created_node.patch_path
-                if created_node is not None
-                else f"routes/{target_region}/node_{assigned_id:02d}.png"
-            )
 
             tracked_new = TrackedResourceNode(
                 node_id=assigned_id,
@@ -3297,13 +4163,18 @@ class AutoCartographer:
             self._note_rel_track(tracked_new, rel_dx, rel_dy, count_sighting=False)
             self._tracked_nodes.setdefault(target_region, []).append(tracked_new)
 
+            # P1-6 (K-06): tek kaynak — her yeni düğüm yalnızca kendi
+            # türünün sayacını artırır. Eskiden harvest_auto hem kendi
+            # sayacını hem total_3d_recorded'ı artırıyor (çift sayım),
+            # radar_auto ise hiçbir sayaca girmiyordu.
             if source_type == "minimap_auto":
                 self.total_minimap_recorded += 1
             elif source_type == "3d_auto":
                 self.total_3d_recorded += 1
             elif source_type == "harvest_auto":
                 self.total_harvest_recorded += 1
-                self.total_3d_recorded += 1
+            elif source_type == "radar_auto":
+                self.total_radar_recorded += 1
 
             node_dict = tracked_new.to_dict()
             newly_discovered_nodes.append(node_dict)
@@ -3311,19 +4182,22 @@ class AutoCartographer:
 
             if self.auto_cartography_enabled:
                 self.auto_mapped_count += 1
-                self.last_mapped_info = {
-                    "type": "node",
-                    "node_id": assigned_id,
-                    "resource_type": resource_type,
-                    "map_x": int(round(node_map_x)),
-                    "map_y": int(round(node_map_y)),
-                    "timestamp": time.time(),
-                    "source_type": source_type,
-                    "confidence": round(confidence, 3),
-                }
                 rg = self.get_route_graph(target_region)
                 rg.connect_node_to_nearest_waypoint(assigned_id, node_map_x, node_map_y)
                 self.persist_to_region_data(target_region)
+            # H-sweep (dilim 13 O6): last_mapped_info AUTO'dan bağımsız
+            # güncellenir (yukarıdaki node_update dalıyla aynı kural).
+            self.last_mapped_info = {
+                "type": "node",
+                "node_id": assigned_id,
+                "resource_type": resource_type,
+                "region": target_region,
+                "map_x": int(round(node_map_x)),
+                "map_y": int(round(node_map_y)),
+                "timestamp": time.time(),
+                "source_type": source_type,
+                "confidence": round(confidence, 3),
+            }
 
             logger.info(
                 "Yeni materyal otomatik haritalandırıldı [%s]: Bölge=%s, Rota=%s, ID=#%d (%s) "
@@ -3356,9 +4230,14 @@ class AutoCartographer:
         """
         Sağ üstteki minimap ROI'sini (`Pilgrim's Ridge`, `x: 0.855..0.992, y: 0.065..0.255`)
         çıkartır, canavar noktalarını filtreleyerek toplanabilir materyal ikonlarını
-        (3 yapraklı filizler ve kanatlı Odyle/tüy ikonları + yeşil `2`/`3` yığın rozetleri)
-        tespit eder, `VisualOdometryTracker` ile dünya koordinatlarını hesaplar ve
+        (yalnızca 3 yapraklı filizler + yeşil `2`/`3` yığın rozetleri) tespit eder,
+        `VisualOdometryTracker` ile dünya koordinatlarını hesaplar ve
         80x80 görsel şablonunu kaydederek `max_harvests = 3 * stack_count` ile rotaya ekler.
+        Kanatlı Odyle/tüy ikonları tespit edilip eklenmez; kesin olarak reddedilir (F-0413).
+
+        LEGACY (H-sweep, dilim 13 Y5): üretimde çağrılmaz — canlı yol
+        `process_frame_discoveries`'dir (explorer_mode.py:2851). Bu
+        fonksiyon yalnızca testler / eski çağıranlar için korunur.
         """
         try:
             bgr = self._ensure_bgr(frame)
@@ -3407,11 +4286,16 @@ class AutoCartographer:
         route_manager: Optional[RouteManager] = None,
         region: Optional[str] = None,
         route: Optional[str] = None,
+        update_odometry: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Minimap'te görünmeyen ancak 3D oyun dünyasında beyaz kanatlı toplama arması (`Aria`, `Mela`)
         veya yüzen `[E]` ikonu ile görünen kaynakları oyuncu ayak konumuna `(w*0.5, h*0.54)` göre
         harita koordinatlarına izdüşürerek `source_type="3d_auto"` ve `max_harvests=3` ile kaydeder.
+
+        LEGACY (H-sweep, dilim 13 Y5): üretimde çağrılmaz — canlı yol
+        `process_frame_discoveries`'dir. Yalnızca testler / eski
+        çağıranlar için korunur.
         """
         try:
             bgr = self._ensure_bgr(frame)
@@ -3419,6 +4303,10 @@ class AutoCartographer:
                 return []
 
             frame_h, frame_w = bgr.shape[:2]
+            # record_from_minimap gibi odometri güncellenir (F-0060).
+            if update_odometry or not self.walk_trajectory:
+                self.update_player_position(bgr)
+
             parsed_list: List[Dict[str, Any]] = []
 
             auto_3d = self._detect_3d_world_gatherables(bgr)
@@ -3452,11 +4340,16 @@ class AutoCartographer:
         route_manager: Optional[RouteManager] = None,
         region: Optional[str] = None,
         route: Optional[str] = None,
+        update_odometry: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Oyuncu veya bot bir materyal üzerinde `[F Gather]` / `[E]` etkileşiminde bulunduğunda
         veya ekranda `[F Gather]` belirdiğinde, düğüm henüz rotada yoksa o konumu
         `source_type="harvest_auto"` ve `max_harvests=3` olarak kaydeder.
+
+        LEGACY (H-sweep, dilim 13 Y5): üretimde çağrılmaz — canlı yol
+        `process_frame_discoveries`'dir. Yalnızca testler / eski
+        çağıranlar için korunur.
         """
         try:
             bgr = self._ensure_bgr(frame)
@@ -3464,6 +4357,10 @@ class AutoCartographer:
                 return []
 
             frame_h, frame_w = bgr.shape[:2]
+            # record_from_minimap gibi odometri güncellenir (F-0060).
+            if update_odometry or not self.walk_trajectory:
+                self.update_player_position(bgr)
+
             world_3d = self._detect_3d_world_gatherables(bgr)
             prompts = self._detect_active_harvest_prompt(bgr, world_3d_detections=world_3d)
 
@@ -3471,20 +4368,8 @@ class AutoCartographer:
                 if prompts:
                     for p in prompts:
                         p["resource_type"] = str(material_type)
-                else:
-                    prompts.append(
-                        {
-                            "rel_map_dx": 0.0,
-                            "rel_map_dy": 0.0,
-                            "resource_type": str(material_type),
-                            "in_air": False,
-                            "confidence": 0.98,
-                            "stack_count": 1,
-                            "max_harvests": DEFAULT_MAX_HARVESTS,
-                            "current_harvests": 0,
-                            "source_type": "harvest_auto",
-                        }
-                    )
+                # İstem yokken oyuncu konumunda düğüm uydurulmaz (F-0215):
+                # [F Gather] görülmediyse kayıt yapılmaz.
 
             if detections:
                 for item in detections:
@@ -3522,6 +4407,10 @@ class AutoCartographer:
         Her 3 otomatik haritalandırma kaynağını (`minimap_auto`, `3d_auto`, `harvest_auto`)
         ve varsa dışarıdan verilen `detections` listesini tek geçişte birleştirerek
         aktif rotaya `max_harvests = 3 * stack_count` (`current_harvests = 0`) ile kaydeder.
+
+        LEGACY (H-sweep, dilim 13 Y5): üretimde çağrılmaz — canlı yol
+        `process_frame_discoveries`'dir. Yalnızca testler / eski
+        çağıranlar için korunur.
         """
         newly_discovered: List[Dict[str, Any]] = []
         try:
@@ -3647,7 +4536,12 @@ class AutoCartographer:
         in_air: bool = False,
         stack_count: int = 1,
         max_harvests: Optional[int] = None,
-        confidence: float = 0.95,
+        # H-sweep (dilim 13 K3/K4): varsayılan güven 0.95'ti — ölçülmemiş
+        # güven "neredeyse kesin" sayılıyordu. Varsayılan None'dur;
+        # güven verilmezse kayıt yapılmaz.
+        confidence: Optional[float] = None,
+        class_id: Optional[int] = None,
+        model_verdict: Optional[Tuple[int, float]] = None,
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
         """
@@ -3681,16 +4575,40 @@ class AutoCartographer:
                         rel_map_dy=0.0,
                     )
                 else:
-                    target_patch = np.full((80, 80, 3), 120, dtype=np.uint8)
+                    # Patch/frame verilmeden düz gri sahte patch ile düğüm
+                    # kaydedilmez (F-0216).
+                    logger.info(
+                        "AutoCartographer.record_node: patch/frame verilmedi, düğüm kaydedilmedi"
+                    )
+                    return None
 
             mem = exemplar_memory or self._get_exemplar_memory()
+
+            # H-sweep (dilim 13 K3): güven verilmediyse kayıt yok —
+            # 0.95 varsayımı kaldırıldı.
+            if confidence is None:
+                logger.info(
+                    "AutoCartographer.record_node: güven verilmedi, düğüm kaydedilmedi"
+                )
+                return None
+
+            # F-1389/F-1390: verilen dedektör sınıfını model_verdict olarak
+            # kapıya ilet (class_id -> (class_id, confidence)); yoksa kapı
+            # canavar sınıfını (11) bilemez.
+            record_model_verdict = model_verdict
+            if record_model_verdict is None and class_id is not None:
+                try:
+                    record_model_verdict = (int(class_id), float(confidence))
+                except (TypeError, ValueError):
+                    record_model_verdict = None
 
             gate = evaluate_node_candidate(
                 target_patch,
                 source_type=source_type,
-                resource_type=resource_type or DEFAULT_RESOURCE_TYPE,
+                resource_type=resource_type or UNKNOWN_RESOURCE_TYPE,
                 detector=self._get_quality_detector(),
                 conf_min=MODEL_CONF_MIN,
+                model_verdict=record_model_verdict,
                 exemplar_memory=mem,
                 check_feather=kwargs.get("check_feather", source_type.startswith("minimap")),
                 check_monster=kwargs.get("check_monster", source_type.startswith("minimap")),
@@ -3708,12 +4626,20 @@ class AutoCartographer:
                 )
                 return None
 
-            final_res = str(
-                gate.verified_resource_type
-                or resource_type
-                or DEFAULT_RESOURCE_TYPE
+            # v20-targena-3dauto (R1+R2): _register_parsed_detections
+            # ile aynı kural — spesifik 3D adı jenerik doğrulamayla
+            # ezilmez; 3D adayda ad belirlenemediyse kayıt yok.
+            final_res, _drop_unnamed = _resolve_mapped_resource_name(
+                resource_type, gate.verified_resource_type, source_type
             )
-            final_conf = max(float(confidence), float(gate.exemplar_sim or 0.0))
+            if _drop_unnamed:
+                logger.info(
+                    "AutoCartographer.record_node: 3D aday adı belirlenemedi, düğüm kaydedilmedi"
+                )
+                return None
+            final_res = str(final_res or UNKNOWN_RESOURCE_TYPE)
+            # H-sweep (dilim 13 K4): güven yalnızca yukarı şişirilmez.
+            final_conf = float(confidence)
             st_cnt = max(1, int(stack_count))
             max_h = max(DEFAULT_MAX_HARVESTS * st_cnt, int(max_harvests or (DEFAULT_MAX_HARVESTS * st_cnt)))
 
@@ -3734,8 +4660,18 @@ class AutoCartographer:
                         node_map_y,
                     )
                     return None
-            except Exception:
-                pass
+            except Exception as exc:
+                # S-1102: fail-open YOK — kara liste kontrolü hata verirse
+                # kayıt yapılmaz; hata yutulup kara listedeki konumun
+                # kaydedilmesine izin verilmez.
+                logger.warning(
+                    "[AutoCartographer] Kara liste kontrolü başarısız, kayıt reddedildi: %s (%.1f, %.1f): %s",
+                    target_region,
+                    node_map_x,
+                    node_map_y,
+                    exc,
+                )
+                return None
 
             if rm is not None:
                 self._sync_existing_nodes_from_route_manager(rm, region=target_region)
@@ -3767,6 +4703,8 @@ class AutoCartographer:
             created_node: Optional[NodeData] = None
 
             if rm is not None:
+                # Değerler add_node'a verilir; add_node içindeki save_region
+                # diske bunlarla yazar (F-0002).
                 created_node = rm.add_node(
                     region=target_region,
                     route=target_route,
@@ -3777,12 +4715,16 @@ class AutoCartographer:
                     norm_x=norm_x,
                     norm_y=norm_y,
                     resource_type=final_res,
+                    max_harvests=int(max_h),
+                    current_harvests=0,
+                    source_type=str(source_type),
                 )
                 if created_node is not None:
                     setattr(created_node, "max_harvests", int(max_h))
                     setattr(created_node, "current_harvests", 0)
                     setattr(created_node, "stack_count", int(st_cnt))
                     setattr(created_node, "source_type", str(source_type))
+                    rm.save_region(target_region)
                     self._save_direct_region_node_patch(
                         base_dir=rm.base_dir,
                         region=target_region,
@@ -3790,8 +4732,28 @@ class AutoCartographer:
                         patch_img=target_patch,
                     )
 
-            assigned_id = int(created_node.id) if created_node is not None else len(self._tracked_nodes.get(target_region, [])) + 1
-            patch_path = created_node.patch_path if created_node is not None else f"routes/{target_region}/node_{assigned_id:02d}.png"
+            assigned_id = (
+                int(created_node.id)
+                if created_node is not None
+                else max(
+                    [t.node_id for t in self._tracked_nodes.get(target_region, [])],
+                    default=0,
+                )
+                + 1
+            )
+            if created_node is not None:
+                patch_path = created_node.patch_path
+            else:
+                # RouteManager yokken / add_node başarısızken patch diske
+                # yazılmamıştır (S-0503): yazılmamış dosya yolu kaydedilmez;
+                # patch _register_parsed_detections'taki gibi doğrudan
+                # kaydedilir; yazım başarısızsa "" döner (F-0211).
+                patch_path = self._save_direct_region_node_patch(
+                    base_dir=rm.base_dir if rm is not None else "routes",
+                    region=target_region,
+                    node_id=assigned_id,
+                    patch_img=target_patch,
+                )
 
             tracked_new = TrackedResourceNode(
                 node_id=assigned_id,
@@ -3866,11 +4828,45 @@ class AutoCartographer:
                     )
                     return None
 
+            now_h = time.time()
+            # Dinlenmedeki düğüm süre dolmadan hasat sayılmaz (F-0061).
+            if target_node.state == "resting":
+                ready = False
+                rm_node = rm.get_node(target_node.node_id, region=target_region) if rm is not None else None
+                if rm_node is not None:
+                    ready = bool(rm_node.is_ready(now=now_h))
+                elif target_node.rest_started_timestamp > 0.0:
+                    ready = (now_h - target_node.rest_started_timestamp) >= float(DEFAULT_REST_SEC)
+                else:
+                    ready = True
+                if not ready:
+                    return target_node.to_dict()
+                target_node.state = "active"
+                target_node.current_harvests = 0
+                target_node.rest_started_timestamp = 0.0
+                if rm_node is not None:
+                    rm_node.state = "active"
+                    rm_node.current_harvests = 0
+
             target_node.current_harvests = min(
                 target_node.max_harvests,
                 target_node.current_harvests + 1,
             )
-            target_node.last_seen_timestamp = time.time()
+            target_node.last_seen_timestamp = now_h
+
+            # Tükenen düğüm sonsuza dek tükenmiş kalmaz (F-0061): dinlenmeye
+            # girer (state="resting"); süre dolunca yukarıdaki uyandırma
+            # yoluyla yeniden toplanabilir olur. Sayaç dinlenme boyunca
+            # max_harvests'ta KALIR (sıfırlanmaz): tükenmiş düğüm
+            # current_harvests=max, remaining_harvests=0, is_depleted=True
+            # olarak gözlenir. Sıfırlama yalnızca uyandırmada yapılır
+            # (yukarıdaki resting dalı): D10'un tükenme anındaki
+            # sıfırlaması sayacı gözlenemez yapıyordu (6/6 -> 0/6) ve
+            # remaining_harvests tutarlılığı için property'de
+            # resting kısa devresi gerektiriyordu.
+            if target_node.is_depleted:
+                target_node.state = "resting"
+                target_node.rest_started_timestamp = now_h
 
             if rm is not None:
                 node_obj = rm.get_node(target_node.node_id, region=target_region)
@@ -3878,8 +4874,9 @@ class AutoCartographer:
                     setattr(node_obj, "current_harvests", int(target_node.current_harvests))
                     setattr(node_obj, "max_harvests", int(target_node.max_harvests))
                     node_obj.gathered_count += 1
-                    if target_node.is_depleted:
-                        node_obj.last_visited_timestamp = time.time()
+                    if target_node.state == "resting":
+                        node_obj.state = "resting"
+                        node_obj.last_visited_timestamp = now_h
                         node_obj.consecutive_failures = 0
                     rm.save_region(target_region)
 
@@ -3892,24 +4889,53 @@ class AutoCartographer:
     # Durum ve İstatistik Sorgulama Metodları
     # ------------------------------------------------------------------
     def get_cartographer_health_summary(self) -> dict:
-        """Returns the cartographer health summary safely."""
+        """Gerçek durum kontrollerine dayanan sağlık özeti (F-0217; totoloji değil)."""
         try:
-            return {"cartographer_ready": True}
-        except Exception:
-            return {"cartographer_ready": False}
+            stats = self.get_cartography_stats()
+            checks = {
+                "odometry_tracker": self.odometry_tracker is not None,
+                "map_dimensions_valid": int(self.map_width) >= 160
+                and int(self.map_height) >= 120,
+                "dedup_radius_valid": DEDUP_RADIUS_MIN_PX
+                <= float(self.dedup_radius_px)
+                <= DEDUP_RADIUS_MAX_PX,
+                "scale_valid": float(self.minimap_to_map_scale) > 0.0,
+                "stats_ok": isinstance(stats, dict) and "total_nodes" in stats,
+            }
+            ready = bool(all(checks.values()))
+            return {
+                "cartographer_ready": ready,
+                "checks": checks,
+                "calibrated": bool(self._is_calibrated_on_world_map),
+                "needs_map_calibrate": bool(self.needs_map_calibrate),
+                "tracked_nodes": int(stats.get("total_nodes", 0)),
+                # H-sweep (dilim 13 Y7): drift ölçülmüyor — 0.0 raporlamak
+                # yalan olur; None + bayrak döndürülür.
+                "cumulative_drift_px": None,
+                "drift_not_measured": True,
+            }
+        except Exception as exc:
+            return {"cartographer_ready": False, "error": str(exc)}
 
     def get_cartography_stats(self, region: Optional[str] = None) -> Dict[str, Any]:
         """
         HUD ve Cartography Radar için haritalandırma istatistiklerini döndürür.
-        `total_minimap_recorded` ve `total_3d_recorded` sayaçlarını içerir.
+        `total_minimap_recorded`, `total_3d_recorded`,
+        `total_harvest_recorded` ve `total_radar_recorded` sayaçlarını içerir.
         """
         try:
             nodes = self.get_tracked_nodes(region=region)
             target_region = str(region or self.active_region or DEFAULT_REGION)
             rg = self.get_route_graph(target_region)
-            total_max_harvests = sum(int(n.get("max_harvests", DEFAULT_MAX_HARVESTS)) for n in nodes)
-            total_current_harvests = sum(int(n.get("current_harvests", 0)) for n in nodes)
-            total_available_harvests = sum(int(n.get("remaining_harvests", DEFAULT_MAX_HARVESTS)) for n in nodes)
+            # Üç ayrı sum() yerine tek geçiş (D02); toplamlar tam sayıdır,
+            # sıralama sonucu değiştirmez.
+            total_max_harvests = 0
+            total_current_harvests = 0
+            total_available_harvests = 0
+            for n in nodes:
+                total_max_harvests += int(n.get("max_harvests", DEFAULT_MAX_HARVESTS))
+                total_current_harvests += int(n.get("current_harvests", 0))
+                total_available_harvests += int(n.get("remaining_harvests", DEFAULT_MAX_HARVESTS))
             return {
                 "total_nodes": len(nodes),
                 "auto_mapped": int(self.auto_mapped_count),
@@ -3922,6 +4948,7 @@ class AutoCartographer:
                 "total_minimap_recorded": int(self.total_minimap_recorded),
                 "total_3d_recorded": int(self.total_3d_recorded),
                 "total_harvest_recorded": int(self.total_harvest_recorded),
+                "total_radar_recorded": int(self.total_radar_recorded),
                 "total_max_harvests": int(total_max_harvests),
                 "total_current_harvests": int(total_current_harvests),
                 "total_available_harvests": int(total_available_harvests),
@@ -3931,7 +4958,9 @@ class AutoCartographer:
                 "player_norm_y": float(self.norm_y),
                 "walk_trajectory_points": len(self.walk_trajectory),
                 "is_calibrated_on_world_map": bool(self._is_calibrated_on_world_map),
-                "cumulative_drift_px": round(float(self._cumulative_drift_px), 3),
+                # H-sweep (dilim 13 Y7): drift ölçülmüyor (bkz. readiness).
+                "cumulative_drift_px": None,
+                "drift_not_measured": True,
             }
         except Exception as exc:
             logger.error("get_cartography_stats hatası: %s", exc)
@@ -3947,6 +4976,7 @@ class AutoCartographer:
                 "total_minimap_recorded": int(self.total_minimap_recorded),
                 "total_3d_recorded": int(self.total_3d_recorded),
                 "total_harvest_recorded": int(self.total_harvest_recorded),
+                "total_radar_recorded": int(self.total_radar_recorded),
                 "total_max_harvests": 0,
                 "total_current_harvests": 0,
                 "total_available_harvests": 0,
@@ -3956,7 +4986,8 @@ class AutoCartographer:
                 "player_norm_y": float(self.norm_y),
                 "walk_trajectory_points": len(self.walk_trajectory),
                 "is_calibrated_on_world_map": bool(self._is_calibrated_on_world_map),
-                "cumulative_drift_px": 0.0,
+                "cumulative_drift_px": None,
+                "drift_not_measured": True,
             }
 
     def get_tracked_nodes(self, region: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -3989,23 +5020,45 @@ class AutoCartographer:
         self.norm_x = round(self.map_x / float(max(1, self.map_width)), 4)
         self.norm_y = round(self.map_y / float(max(1, self.map_height)), 4)
         self._prev_minimap_clean = None
-        self._prev_minimap_gray = None
         self._cumulative_drift_px = 0.0
+        # Kalibre bayrağı ve hız da sıfırlanır (F-0219): sıfırlanmış odometri
+        # kalibre sayılmaz.
+        self._is_calibrated_on_world_map = False
+        self._last_calibration_ts = 0.0
+        self.velocity_x = 0.0
+        self.velocity_y = 0.0
+        self.dead_reckoning_dx = 0.0
+        self.dead_reckoning_dy = 0.0
         self.odometry_tracker.reset(
             map_x=self.map_x,
             map_y=self.map_y,
             clear_trajectory=clear_trajectory,
         )
+        self._refresh_calibration_flag()
 
     def get_auto_cartographer_ready_flag(self) -> dict:
-        """Returns the auto cartographer ready flag."""
-        return {"module": "auto_cartographer", "ready": True}
+        """Returns the auto cartographer ready flag (gerçek sağlık özetinden, F-0217)."""
+        return {
+            "module": "auto_cartographer",
+            "ready": bool(self.get_cartographer_health_summary().get("cartographer_ready")),
+        }
 
     def get_auto_cartographer_version_info(self) -> dict:
-        return {"module": "auto_cartographer", "version": "2.0.0", "ready": True}
+        return {
+            "module": "auto_cartographer",
+            "version": __version__,
+            "ready": bool(self.get_cartographer_health_summary().get("cartographer_ready")),
+        }
 
     def get_auto_cartographer_diagnostic_snapshot(self) -> dict:
-        return {"module": "auto_cartographer", "status": "ok", "ready": True}
+        health = self.get_cartographer_health_summary()
+        ready = bool(health.get("cartographer_ready"))
+        return {
+            "module": "auto_cartographer",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+            "health": health,
+        }
 
 
 def get_auto_cartographer_capabilities() -> list:
@@ -4021,7 +5074,12 @@ def get_auto_cartographer_capabilities() -> list:
 
 
 def validate_auto_cartographer_contract() -> bool:
-    return bool(get_auto_cartographer_capabilities())
+    # Totoloji değil (F-0217): yetenek listesi + değişmez (invariant) kontrolleri.
+    return bool(get_auto_cartographer_capabilities()) and bool(
+        DEDUP_RADIUS_MIN_PX <= DEFAULT_DEDUP_RADIUS_PX <= DEDUP_RADIUS_MAX_PX
+        and DEFAULT_MINIMAP_TO_MAP_SCALE > 0.0
+        and 0.0 < MINIMAP_SPROUT_CONF_MIN <= 1.0
+    )
 
 
 def get_auto_cartographer_baseline_metrics() -> dict:

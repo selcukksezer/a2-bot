@@ -44,85 +44,108 @@ if _app is None:
     _app = QApplication(sys.argv)
 
 
-def test_tier1_confident_boxes_classified_as_green_22c55e() -> None:
-    """Verify >= 85% trusted boxes are classified as Confident ('confident') with Green (#22c55e)."""
-    for conf_val, expected_pct in ((0.85, 85), (0.92, 92), (0.99, 99), (88.0, 88), (100.0, 100)):
-        ann = {
-            "class_name": "herb_aria",
-            "conf": conf_val,
-            "trusted": True,
-        }
-        style = get_box_visual_style(ann)
-        assert classify_confidence_tier(ann) == TIER_CONFIDENT
-        assert style["tier"] == TIER_CONFIDENT
-        assert style["is_confident"] is True
-        assert style["is_suspicious"] is False
-        assert style["is_low_confidence"] is False
-        assert style["box_color"].lower() == "#22c55e"
-        assert style["line_color"].lower() == CONFIDENT_COLOR_HEX
-        assert style["badge_bg_color"].lower() == "#22c55e"
-        assert style["text_color"].upper() == CONFIDENT_TEXT_COLOR_HEX
-        assert style["line_style"] == "solid"
-        assert style["pen_style"] == "SolidLine"
-        assert style["line_width"] == pytest.approx(2.2)
-        assert style["badge_text"] == f"✓ herb_aria %{expected_pct}"
-        assert style["status_text"] == f"Emin · %{expected_pct} güven"
-        assert style["color_rgb"] == (34, 197, 94)
-        assert style["color_bgr"] == (94, 197, 34)
+@pytest.mark.parametrize(
+    "conf_val,expected_pct",
+    [(0.85, 85), (0.92, 92), (0.99, 99), (88.0, 88), (100.0, 100)],
+)
+def test_tier1_confident_boxes_classified_as_green_22c55e(conf_val: float, expected_pct: int) -> None:
+    """Verify >= 85% trusted boxes are classified as Confident ('confident') with Green (#22c55e).
+
+    Parametrized (was a for-loop inside one test): each confidence value is
+    now its own test case, so a failure at one value no longer masks the
+    remaining values and the failing value is named in the test id.
+    """
+    ann = {
+        "class_name": "herb_aria",
+        "conf": conf_val,
+        "trusted": True,
+    }
+    style = get_box_visual_style(ann)
+    assert classify_confidence_tier(ann) == TIER_CONFIDENT
+    assert style["tier"] == TIER_CONFIDENT
+    assert style["is_confident"] is True
+    assert style["is_suspicious"] is False
+    assert style["is_low_confidence"] is False
+    assert style["box_color"].lower() == "#22c55e"
+    assert style["line_color"].lower() == CONFIDENT_COLOR_HEX
+    assert style["badge_bg_color"].lower() == "#22c55e"
+    assert style["text_color"].upper() == CONFIDENT_TEXT_COLOR_HEX
+    assert style["line_style"] == "solid"
+    assert style["pen_style"] == "SolidLine"
+    assert style["line_width"] == pytest.approx(2.2)
+    assert style["badge_text"] == f"✓ herb_aria %{expected_pct}"
+    assert style["status_text"] == f"Emin · %{expected_pct} güven"
+    assert style["color_rgb"] == (34, 197, 94)
+    assert style["color_bgr"] == (94, 197, 34)
 
 
-def test_tier2_suspicious_70_to_84_classified_as_orange_fb923c() -> None:
-    """Verify 70%-84% boxes are classified as Suspicious ('suspicious') with Orange (#fb923c)."""
-    for conf_val, expected_pct in ((0.70, 70), (0.75, 75), (0.80, 80), (0.84, 84), (77.0, 77), (84.0, 84)):
-        ann = {
-            "class_name": "ore_orichalcum",
-            "confidence": conf_val,
-            "trusted": False,
-        }
-        style = get_box_visual_style(ann)
-        assert classify_confidence_tier(ann) == TIER_SUSPICIOUS
-        assert style["tier"] == TIER_SUSPICIOUS
-        assert style["is_confident"] is False
-        assert style["is_suspicious"] is True
-        assert style["is_low_confidence"] is False
-        assert style["box_color"].lower() == "#fb923c"
-        assert style["line_color"].lower() == SUSPICIOUS_COLOR_HEX
-        assert style["badge_bg_color"].lower() == "#fb923c"
-        assert style["text_color"].lower() == SUSPICIOUS_TEXT_COLOR_HEX
-        assert style["line_style"] == "dashed"
-        assert style["pen_style"] == "DashLine"
-        assert style["line_width"] == pytest.approx(1.8)
-        assert style["badge_text"] == f"🟠 şüpheli ore_orichalcum %{expected_pct}"
-        assert style["status_text"] == f"Şüpheli · %{expected_pct} güven"
-        assert style["color_rgb"] == (251, 146, 60)
-        assert style["color_bgr"] == (60, 146, 251)
+@pytest.mark.parametrize(
+    "conf_val,expected_pct",
+    [(0.70, 70), (0.75, 75), (0.80, 80), (0.84, 84), (77.0, 77), (84.0, 84)],
+)
+def test_tier2_suspicious_70_to_84_classified_as_orange_fb923c(conf_val: float, expected_pct: int) -> None:
+    """Verify 70%-84% boxes are classified as Suspicious ('suspicious') with Orange (#fb923c).
+
+    Parametrized (was a for-loop inside one test): same failure-isolation
+    reason as tier 1. Note the "confidence" key (not "conf") is kept
+    deliberately — both keys must resolve to the same tier.
+    """
+    ann = {
+        "class_name": "ore_orichalcum",
+        "confidence": conf_val,
+        "trusted": False,
+    }
+    style = get_box_visual_style(ann)
+    assert classify_confidence_tier(ann) == TIER_SUSPICIOUS
+    assert style["tier"] == TIER_SUSPICIOUS
+    assert style["is_confident"] is False
+    assert style["is_suspicious"] is True
+    assert style["is_low_confidence"] is False
+    assert style["box_color"].lower() == "#fb923c"
+    assert style["line_color"].lower() == SUSPICIOUS_COLOR_HEX
+    assert style["badge_bg_color"].lower() == "#fb923c"
+    assert style["text_color"].lower() == SUSPICIOUS_TEXT_COLOR_HEX
+    assert style["line_style"] == "dashed"
+    assert style["pen_style"] == "DashLine"
+    assert style["line_width"] == pytest.approx(1.8)
+    assert style["badge_text"] == f"🟠 şüpheli ore_orichalcum %{expected_pct}"
+    assert style["status_text"] == f"Şüpheli · %{expected_pct} güven"
+    assert style["color_rgb"] == (251, 146, 60)
+    assert style["color_bgr"] == (60, 146, 251)
 
 
-def test_tier3_low_confidence_below_70_classified_as_red_ef4444() -> None:
-    """Verify < 70% boxes are classified as Low Confidence ('low_confidence') with Red (#ef4444)."""
-    for conf_val, expected_pct in ((0.69, 69), (0.55, 55), (0.42, 42), (0.15, 15), (69.0, 69), (12.0, 12)):
-        ann = {
-            "class_name": "herb_mela",
-            "conf": conf_val,
-            "trusted": False,
-        }
-        style = get_box_visual_style(ann)
-        assert classify_confidence_tier(ann) == TIER_LOW_CONFIDENCE
-        assert style["tier"] == TIER_LOW_CONFIDENCE
-        assert style["is_confident"] is False
-        assert style["is_suspicious"] is False
-        assert style["is_low_confidence"] is True
-        assert style["box_color"].lower() == "#ef4444"
-        assert style["line_color"].lower() == LOW_CONFIDENCE_COLOR_HEX
-        assert style["badge_bg_color"].lower() == "#ef4444"
-        assert style["text_color"].lower() == LOW_CONFIDENCE_TEXT_COLOR_HEX
-        assert style["line_style"] == "dashed"
-        assert style["pen_style"] == "DashLine"
-        assert style["line_width"] == pytest.approx(1.8)
-        assert style["badge_text"] == f"şüpheli herb_mela %{expected_pct}"
-        assert style["status_text"] == f"Düşük Güven (Şüpheli) · %{expected_pct} güven"
-        assert style["color_rgb"] == (239, 68, 68)
-        assert style["color_bgr"] == (68, 68, 239)
+@pytest.mark.parametrize(
+    "conf_val,expected_pct",
+    [(0.69, 69), (0.55, 55), (0.42, 42), (0.15, 15), (69.0, 69), (12.0, 12)],
+)
+def test_tier3_low_confidence_below_70_classified_as_red_ef4444(conf_val: float, expected_pct: int) -> None:
+    """Verify < 70% boxes are classified as Low Confidence ('low_confidence') with Red (#ef4444).
+
+    Parametrized (was a for-loop inside one test): same failure-isolation
+    reason as tier 1.
+    """
+    ann = {
+        "class_name": "herb_mela",
+        "conf": conf_val,
+        "trusted": False,
+    }
+    style = get_box_visual_style(ann)
+    assert classify_confidence_tier(ann) == TIER_LOW_CONFIDENCE
+    assert style["tier"] == TIER_LOW_CONFIDENCE
+    assert style["is_confident"] is False
+    assert style["is_suspicious"] is False
+    assert style["is_low_confidence"] is True
+    assert style["box_color"].lower() == "#ef4444"
+    assert style["line_color"].lower() == LOW_CONFIDENCE_COLOR_HEX
+    assert style["badge_bg_color"].lower() == "#ef4444"
+    assert style["text_color"].lower() == LOW_CONFIDENCE_TEXT_COLOR_HEX
+    assert style["line_style"] == "dashed"
+    assert style["pen_style"] == "DashLine"
+    assert style["line_width"] == pytest.approx(1.8)
+    assert style["badge_text"] == f"şüpheli herb_mela %{expected_pct}"
+    assert style["status_text"] == f"Düşük Güven (Şüpheli) · %{expected_pct} güven"
+    assert style["color_rgb"] == (239, 68, 68)
+    assert style["color_bgr"] == (68, 68, 239)
 
 
 def test_exact_boundary_transitions_69_70_84_85() -> None:

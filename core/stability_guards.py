@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+from version import __version__
 
 logger = logging.getLogger("core.stability_guards")
 if not logger.handlers:
@@ -166,11 +167,16 @@ class SelfInputWhitelistWindow:
         0x26: "up",
         0x27: "right",
         0x28: "down",
+        0x30: "0",
         0x31: "1",
         0x32: "2",
         0x33: "3",
         0x34: "4",
         0x35: "5",
+        0x36: "6",
+        0x37: "7",
+        0x38: "8",
+        0x39: "9",
         0x77: "f8",
         0x78: "f9",
         0x79: "f10",
@@ -203,7 +209,10 @@ class SelfInputWhitelistWindow:
         if raw.startswith("0x"):
             try:
                 vk_parsed = int(raw, 16)
-                return cls.VK_TO_CANONICAL.get(vk_parsed, raw), vk_parsed
+                canonical = cls.VK_TO_CANONICAL.get(vk_parsed)
+                if canonical is None and 0x30 <= vk_parsed <= 0x5A:
+                    canonical = chr(vk_parsed).lower()
+                return (canonical if canonical is not None else f"vk_{vk_parsed:#x}"), vk_parsed
             except ValueError:
                 return raw, None
 
@@ -282,8 +291,21 @@ class SelfInputWhitelistWindow:
             self._key_timestamps.clear()
             self._vk_timestamps.clear()
 
+    def _ready_probe(self) -> bool:
+        # F-1741: hazır raporu gerçek yapılandırmaya bakar — koşulsuz True yok.
+        # Pencere süresi geçerli (>= 1 ms, __init__ zaten 1.0'a kelepçeler) ve
+        # tuş->VK tablosu boş değilse beyaz liste çalışabilir durumdadır.
+        try:
+            return bool(
+                float(self.default_window_ms) >= 1.0
+                and bool(self.KEY_TO_VK)
+                and self._lock is not None
+            )
+        except Exception:
+            return False
+
     def get_stability_guards_ready_flag(self) -> dict:
-        return {"module": "stability_guards", "ready": True}
+        return {"module": "stability_guards", "ready": bool(self._ready_probe())}
 
 
 # ============================================================================
@@ -320,6 +342,10 @@ class CameraLockExceptionRule:
         self._custom_centers: List[Tuple[int, int]] = [
             (int(cx), int(cy)) for cx, cy in (custom_centers or ())
         ]
+        # F-1759: OS çözünürlük merkezi önbelleği (GetSystemMetrics her çağrıda yok).
+        self._os_center_cache: Optional[Tuple[int, int]] = None
+        self._os_center_ts: float = 0.0
+        self._os_center_ttl_sec: float = 30.0
 
     def get_screen_centers(
         self,
@@ -337,11 +363,18 @@ class CameraLockExceptionRule:
             if explicit_center not in centers:
                 centers.append(explicit_center)
 
+        now = time.monotonic()
+        if self._os_center_cache is not None and (now - self._os_center_ts) < self._os_center_ttl_sec:
+            if self._os_center_cache not in centers:
+                centers.append(self._os_center_cache)
+            return centers
         try:
             sw = int(ctypes.windll.user32.GetSystemMetrics(0))
             sh = int(ctypes.windll.user32.GetSystemMetrics(1))
             if sw > 0 and sh > 0:
                 os_center = (sw // 2, sh // 2)
+                self._os_center_cache = os_center
+                self._os_center_ts = now
                 if os_center not in centers:
                     centers.append(os_center)
         except Exception as exc:
@@ -389,12 +422,12 @@ class CameraLockExceptionRule:
         screen_h: Optional[int] = None,
     ) -> Tuple[bool, str]:
         """
-        İmleç `(1280, 720)` / `(W/2, H/2)` merkezine kilitlendiyse veya gizli imleç
-        modundaysa `(True, "Oyun İmleç Kilidi")` döndürerek yanlış iptali önler.
+        İmleç `(1280, 720)` / `(W/2, H/2)` merkezine kilitlendiyse
+        `(True, "Oyun İmleç Kilidi")` döndürerek yanlış iptali önler.
+        Gizli imleç tek başına yoksayma nedeni değildir (F-1760: eskiden gizli
+        imleçte HER delta yoksayılıyordu) — yalnızca merkez kilidi yoksayılır.
         """
         if self.is_camera_lock_position(actual_x, actual_y, screen_w=screen_w, screen_h=screen_h):
-            return True, self.LOCK_CLASSIFICATION_LABEL
-        if cursor_visible is False:
             return True, self.LOCK_CLASSIFICATION_LABEL
         return False, ""
 
@@ -462,8 +495,20 @@ class CameraLockExceptionRule:
             "updated_anchor": (ax, ay),
         }
 
+    def _ready_probe(self) -> bool:
+        # F-1741: hazır raporu gerçek yapılandırmaya bakar — koşulsuz True yok.
+        # Tolerans geçerli (>= 1 px) ve bilinen kilit merkezleri tanımlıysa
+        # kamera kilidi sınıflandırması çalışabilir durumdadır.
+        try:
+            return bool(
+                float(self.tolerance_px) >= 1.0
+                and bool(self.KNOWN_LOCK_CENTERS)
+            )
+        except Exception:
+            return False
+
     def get_stability_guards_ready_flag(self) -> dict:
-        return {"module": "stability_guards", "ready": True}
+        return {"module": "stability_guards", "ready": bool(self._ready_probe())}
 
 
 # ============================================================================
@@ -519,10 +564,11 @@ class CursorVisibilityAutomator:
                 }
         except Exception as exc:
             logger.debug("GetCursorInfo Win32 hatasi: %s", exc)
+        # F-1740: sorgu başarısızsa imleç 'görünür' varsayılmaz (fail-closed).
         return {
             "ok": False,
-            "visible": True,
-            "flags": CURSOR_SHOWING,
+            "visible": False,
+            "flags": 0,
             "x": 0,
             "y": 0,
         }
@@ -589,13 +635,17 @@ class CursorVisibilityAutomator:
         return bool(info.get("visible", False))
 
     def _dispatch_toggle_key(self, key: str, input_ctrl: Any = None) -> bool:
-        """İmleç açma tuşunu (`'alt'`) beyaz listeye kaydedip gönderir."""
-        if self.whitelist is not None:
-            self.whitelist.record_self_key(key)
-
+        """
+        İmleç açma tuşunu (`'alt'`) gönderir; beyaz listeye SADECE gerçek
+        gönderimden sonra kaydedilir (F-1746: eskiden gönderimden önceydi).
+        Yumuşak Win32 keybd_event fallback'i YOKTUR (F-1739): soft girdi Aion 2'ye
+        ulaşmaz; donanım yolu yoksa fail-closed False döner.
+        """
         if self._key_presser is not None:
             try:
                 self._key_presser(key)
+                if self.whitelist is not None:
+                    self.whitelist.record_self_key(key)
                 return True
             except Exception as exc:
                 logger.debug("Ozel key_presser hatasi ('%s'): %s", key, exc)
@@ -606,20 +656,17 @@ class CursorVisibilityAutomator:
                 if callable(fn):
                     try:
                         fn(key)
+                        if self.whitelist is not None:
+                            self.whitelist.record_self_key(key)
                         return True
                     except Exception as exc:
                         logger.debug("input_ctrl.%s('%s') hatasi: %s", attr_name, key, exc)
 
-        # Fallback: Win32 keybd_event ile Alt (VK_MENU = 0x12) bas-çek
-        try:
-            vk = SelfInputWhitelistWindow.KEY_TO_VK.get(key.lower(), VK_MENU_ALT)
-            ctypes.windll.user32.keybd_event(int(vk), 0, 0, 0)
-            time.sleep(0.02)
-            ctypes.windll.user32.keybd_event(int(vk), 0, KEYEVENTF_KEYUP, 0)
-            return True
-        except Exception as exc:
-            logger.debug("Win32 keybd_event('%s') hatasi: %s", key, exc)
-            return False
+        logger.debug(
+            "Imlec acma tusu gonderilemedi ('%s'): donanim yolu yok, yumusak fallback yok.",
+            key,
+        )
+        return False
 
     def ensure_cursor_visible(
         self,
@@ -641,7 +688,11 @@ class CursorVisibilityAutomator:
             if self.is_cursor_visible():
                 return True
             dispatched = self._dispatch_toggle_key(key_to_use, input_ctrl=input_ctrl)
-            if dispatched:
+            if self.settle_delay_sec > 0.0:
+                time.sleep(self.settle_delay_sec)
+            # F-1746: reveal_count yalnızca doğrulanan açılışta artar — gönderim
+            # tek başına sayılmaz.
+            if dispatched and self.is_cursor_visible():
                 self.reveal_count += 1
                 self.last_revealed_ts = time.monotonic()
                 self.last_pressed_key = key_to_use
@@ -649,15 +700,27 @@ class CursorVisibilityAutomator:
                     "Gizli oyun imleci algilandi (GetCursorInfo=0); '%s' tusu ile imlec acildi.",
                     key_to_use,
                 )
-            if self.settle_delay_sec > 0.0:
-                time.sleep(self.settle_delay_sec)
-            if self.is_cursor_visible():
                 return True
 
         return self.is_cursor_visible()
 
+    def _ready_probe(self) -> bool:
+        # F-1741: hazır raporu gerçek yapılandırmaya bakar — koşulsuz True yok.
+        # Açma tuşu tanımlı ve bekleme süresi geçerliyse otomasyon
+        # çalışabilir durumdadır. (Bilerek Win32 probu YOK: hazır raporu
+        # Linux'ta da çalışır; imleç görünürlüğü ensure_cursor_visible'da
+        # anlık sorgulanır.)
+        try:
+            return bool(
+                str(self.toggle_key or "").strip()
+                and float(self.settle_delay_sec) >= 0.0
+                and (self.whitelist is None or isinstance(self.whitelist, SelfInputWhitelistWindow))
+            )
+        except Exception:
+            return False
+
     def get_stability_guards_ready_flag(self) -> dict:
-        return {"module": "stability_guards", "ready": True}
+        return {"module": "stability_guards", "ready": bool(self._ready_probe())}
 
 
 # ============================================================================
@@ -821,19 +884,27 @@ class FiveFrameDeathConfirmationGuard:
             "button_ratio": 0.0,
         }
 
-        has_revive = (
-            bool(revive_dialog)
-            if revive_dialog is not None
-            else bool(visuals["revive_dialog"])
-        )
-        has_gray = (
-            bool(grayscale_viewport)
-            if grayscale_viewport is not None
-            else bool(visuals["grayscale_viewport"])
-        )
+        # F-1757: kare verildiyse ÖLÇÜLEN görsel kazanır — çağrıcının açıkça
+        # verdiği revive/gray, ölçümle çelişen sözlük üretmez (örn. gri=True ama
+        # doygunluk 255). Açık parametreler yalnızca karesiz çağrıda geçerlidir.
+        if frame is not None:
+            has_revive = bool(visuals["revive_dialog"])
+            has_gray = bool(visuals["grayscale_viewport"])
+        else:
+            has_revive = (
+                bool(revive_dialog)
+                if revive_dialog is not None
+                else bool(visuals["revive_dialog"])
+            )
+            has_gray = (
+                bool(grayscale_viewport)
+                if grayscale_viewport is not None
+                else bool(visuals["grayscale_viewport"])
+            )
         eff_hp = float(hp_ratio) if hp_ratio is not None else 1.0
+        # F-1738: confirm_frames asla required_frames (5) altına inemez.
         req_frames = (
-            max(1, int(confirm_frames))
+            max(self.required_frames, max(1, int(confirm_frames)))
             if confirm_frames is not None
             else self.required_frames
         )
@@ -891,16 +962,30 @@ class FiveFrameDeathConfirmationGuard:
         frame: Optional[np.ndarray] = None,
         hp_ratio: Optional[float] = None,
         confirm_frames: Optional[int] = None,
+        revive_dialog: Optional[bool] = None,
+        grayscale_viewport: Optional[bool] = None,
     ) -> bool:
-        """`check_character_dead` için eş anlamlı yardımcı metod."""
+        """`check_character_dead` için eş anlamlı yardımcı metod (F-1738: artık
+        revive/gri parametresi de alır; kare verilmeden çağrılırken geçerlidir)."""
         return self.check_character_dead(
             frame=frame,
             hp_ratio=hp_ratio,
             confirm_frames=confirm_frames,
+            revive_dialog=revive_dialog,
+            grayscale_viewport=grayscale_viewport,
         )
 
+    def _ready_probe(self) -> bool:
+        # F-1741: hazır raporu gerçek yapılandırmaya bakar — koşulsuz True yok.
+        # Şartname Madde 13, gerçek ölüm için en az 5 ardışık kare ister;
+        # daha düşük eşikle kurulan koruma hazır sayılmaz.
+        try:
+            return bool(int(self.required_frames) >= 5)
+        except Exception:
+            return False
+
     def get_stability_guards_ready_flag(self) -> dict:
-        return {"module": "stability_guards", "ready": True}
+        return {"module": "stability_guards", "ready": bool(self._ready_probe())}
 
 
 # ============================================================================
@@ -923,6 +1008,16 @@ class MultiCriteriaMapVerifier:
 
     MIN_REQUIRED_CRITERIA: int = 2
 
+    # Şablon eşleştirme ölçekleri: yerel (1.0) ölçek önce, sonra en yakın
+    # komşular dışa doğru. Harita açıkken yerel ölçek genelde ilk denemede
+    # eşiği geçtiği için erken çıkışla 9 yerine ~1 matchTemplate çalışır.
+    # Boolean sonuç ölçek sırasından bağımsızdır: eşleşme, herhangi bir
+    # ölçeğin >= 0.68 vermesine bağlıdır.
+    TEMPLATE_SCALES: Tuple[float, ...] = (
+        1.0, 1.15, 0.85, 1.25, 0.75, 1.40, 0.65, 1.5625, 1.80,
+    )
+    TEMPLATE_MATCH_THRESHOLD: float = 0.68
+
     def __init__(
         self,
         map_header_template_path: str = "templates/map_header.png",
@@ -935,8 +1030,8 @@ class MultiCriteriaMapVerifier:
     def _load_header_template(self, rel_or_abs: str) -> None:
         try:
             candidates = [
-                "templates/legacy/map_header_video.png",
                 rel_or_abs,
+                "templates/legacy/map_header_video.png",
             ]
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             for c in list(candidates):
@@ -1013,9 +1108,9 @@ class MultiCriteriaMapVerifier:
         """
         Kriter 1: Sağ-Üst Kapatma (`X`) Butonu kontrolü (`x: 0.955..0.995, y: 0.015..0.068`).
         Koyu harita üst barı üzerinde parlak `X` sembolü arar.
+        Not (F-1748): hud_active artık bu kriteri tek başına kapatmaz; HUD
+        kanıtı yalnızca verify_map_state'te eşiği yükseltir.
         """
-        if hud_active:
-            return False, 0.0
 
         h, w = gray.shape[:2]
         x1, x2 = max(0, int(round(w * 0.955))), min(w, int(round(w * 0.995)))
@@ -1049,9 +1144,8 @@ class MultiCriteriaMapVerifier:
     ) -> Tuple[bool, float]:
         """
         Kriter 2: Sol-Üst / Üst Bölge Başlığı (`map_header` şablonu veya sol-üst başlık şeridi).
+        Not (F-1748): hud_active artık bu kriteri tek başına kapatmaz.
         """
-        if hud_active:
-            return False, 0.0
 
         h, w = gray.shape[:2]
         best_tmpl_score = 0.0
@@ -1059,7 +1153,7 @@ class MultiCriteriaMapVerifier:
         if self.map_header_template is not None:
             top_strip = gray[int(h * 0.02) : int(h * 0.14), int(w * 0.02) : int(w * 0.78)]
             th, tw = self.map_header_template.shape[:2]
-            for s in (0.65, 0.75, 0.85, 1.0, 1.15, 1.25, 1.40, 1.5625, 1.80):
+            for s in self.TEMPLATE_SCALES:
                 sw = max(10, int(round(tw * s)))
                 sh = max(6, int(round(th * s)))
                 if sh < top_strip.shape[0] and sw < top_strip.shape[1]:
@@ -1072,8 +1166,12 @@ class MultiCriteriaMapVerifier:
                     _, mv, _, _ = cv2.minMaxLoc(res)
                     if float(mv) > best_tmpl_score:
                         best_tmpl_score = float(mv)
+                    # Erken çıkış: eşik aşıldıysa boolean sonuç bellidir;
+                    # kalan ölçekler yalnızca tanı skorunu (max) büyütürdü.
+                    if best_tmpl_score >= self.TEMPLATE_MATCH_THRESHOLD:
+                        break
 
-        if best_tmpl_score >= 0.68:
+        if best_tmpl_score >= self.TEMPLATE_MATCH_THRESHOLD:
             return True, round(best_tmpl_score, 4)
 
         # Yapısal Sol-Üst / Üst Bölge Başlığı kontrolü (farklı bölge isimleri ve çözünürlükler için)
@@ -1091,7 +1189,13 @@ class MultiCriteriaMapVerifier:
             and 14.0 <= tl_val <= 58.0
             and tl_bright >= 0.018
         )
-        score = max(best_tmpl_score, 0.82 if matched else 0.0)
+        # F-1758: yapısal skor artık sabit 0.82 değil; ölçülen parlaklığa göre
+        # 0.55..0.95 arasında değişir.
+        if matched:
+            structural_score = round(min(0.95, 0.55 + min(0.40, tl_bright * 6.0)), 4)
+            score = max(best_tmpl_score, structural_score)
+        else:
+            score = best_tmpl_score
         return matched, round(score, 4)
 
     def check_filter_settings_icon(
@@ -1103,9 +1207,8 @@ class MultiCriteriaMapVerifier:
         """
         Kriter 3: Sol-Alt / Sol Kenar Filtre Ayarları İkonu ve Harita Sol Paneli
         (`x: 0.01..0.20, y: 0.22..0.96`).
+        Not (F-1748): hud_active artık bu kriteri tek başına kapatmaz.
         """
-        if hud_active:
-            return False, 0.0
 
         h, w = gray.shape[:2]
         side_gray = gray[int(h * 0.22) : int(h * 0.75), int(w * 0.01) : int(w * 0.18)]
@@ -1177,7 +1280,10 @@ class MultiCriteriaMapVerifier:
             "filter_settings_icon": bool(c3_ok),
         }
         matched_count = sum(1 for val in criteria.values() if val)
-        is_open = bool(matched_count >= self.min_criteria)
+        # F-1748: 3B HUD aktifken harita 'açık' sayılması için 3/3 gerekir
+        # (veto yerine yükseltilmiş eşik); HUD yokken min_criteria (2) yeterli.
+        required = 3 if hud_active else self.min_criteria
+        is_open = bool(matched_count >= required)
 
         return {
             "is_open": is_open,
@@ -1196,8 +1302,21 @@ class MultiCriteriaMapVerifier:
         res = self.verify_map_state(frame)
         return bool(res["is_open"])
 
+    def _ready_probe(self) -> bool:
+        # F-1741: hazır raporu gerçek yapılandırmaya bakar — koşulsuz True yok.
+        # En az 2/3 kriter eşiği (MIN_REQUIRED_CRITERIA) sağlanıyorsa doğrulayıcı
+        # çalışabilir durumdadır. Başlık şablonu isteğe bağlıdır (yoksa yapısal
+        # kriterler devrededir), hazır olma koşulu değildir.
+        try:
+            return bool(
+                2 <= int(self.min_criteria) <= 3
+                and int(self.MIN_REQUIRED_CRITERIA) >= 2
+            )
+        except Exception:
+            return False
+
     def get_stability_guards_ready_flag(self) -> dict:
-        return {"module": "stability_guards", "ready": True}
+        return {"module": "stability_guards", "ready": bool(self._ready_probe())}
 
 
 class StabilityGuards:
@@ -1210,29 +1329,107 @@ class StabilityGuards:
         self.death_guard = FiveFrameDeathConfirmationGuard()
         self.map_verifier = MultiCriteriaMapVerifier()
 
+    def _components_ok(self) -> bool:
+        # F-1741: hazır raporu gerçek bileşen durumuna bakar, koşulsuz True yok.
+        # Tek doğruluk kaynağı her bileşenin kendi _ready_probe()'udur.
+        try:
+            components = (
+                self.whitelist,
+                self.camera_lock_rule,
+                self.cursor_automator,
+                self.death_guard,
+                self.map_verifier,
+            )
+            return bool(
+                all(c is not None for c in components)
+                and all(
+                    bool(c.get_stability_guards_ready_flag().get("ready", False))
+                    for c in components
+                )
+            )
+        except Exception:
+            return False
+
     def get_stability_guards_ready_flag(self) -> dict:
-        return {"module": "stability_guards", "ready": True}
+        return {"module": "stability_guards", "ready": bool(self._components_ok())}
 
     def get_stability_guards_version_info(self) -> dict:
-        return {"module": "stability_guards", "version": "2.0.0", "ready": True}
+        return {"module": "stability_guards", "version": __version__, "ready": bool(self._components_ok())}
 
     def get_stability_guards_diagnostic_snapshot(self) -> dict:
-        return {"module": "stability_guards", "status": "ok", "ready": True}
+        ready = bool(self._components_ok())
+        return {
+            "module": "stability_guards",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+        }
 
 
 RuntimeStabilityGuard = StabilityGuards
 
 
+_SHARED_GUARDS: Optional["StabilityGuards"] = None
+_SHARED_GUARDS_LOCK = threading.Lock()
+
+
+def get_shared_stability_guards() -> "StabilityGuards":
+    """Paylaşılan StabilityGuards örneği (F-1741/F-0178: bileşik sınıf ve
+    MultiCriteriaMapVerifier üretim kod yolunda örneklendirilir — CombatRecovery
+    ölüm korumasını bu paylaşılan örnekten alır, bkz. core/combat_recovery.py)."""
+    global _SHARED_GUARDS
+    if _SHARED_GUARDS is None:
+        with _SHARED_GUARDS_LOCK:
+            if _SHARED_GUARDS is None:
+                _SHARED_GUARDS = StabilityGuards()
+    return _SHARED_GUARDS
+
+
+def get_shared_map_verifier() -> MultiCriteriaMapVerifier:
+    """Paylaşılan harita doğrulayıcı (üretim çağıranları için giriş noktası)."""
+    return get_shared_stability_guards().map_verifier
+
+
+def verify_map_open(frame: Optional[np.ndarray]) -> bool:
+    """Haritanın açık olup olmadığını paylaşılan doğrulayıcıyla döndürür."""
+    return bool(get_shared_map_verifier().is_map_open(frame))
+
+
 def get_stability_guards_ready_flag() -> dict:
-    return {"module": "stability_guards", "ready": True}
+    try:
+        return {
+            "module": "stability_guards",
+            "ready": bool(get_shared_stability_guards()._components_ok()),
+        }
+    except Exception as exc:
+        logger.debug("stability_guards ready kontrol hatasi: %s", exc)
+        return {"module": "stability_guards", "ready": False}
 
 
 def get_stability_health_report() -> dict:
     """Returns current process/GC health and stability guards readiness."""
-    return {
-        "gc_enabled": gc.isenabled(),
-        "stability_guards_ready": True,
-    }
+    try:
+        guards = get_shared_stability_guards()
+        components = {
+            # F-1741: yalnızca "nesne var" değil, her bileşenin gerçek hazır
+            # probu (koşulsuz True yok).
+            "whitelist": bool(guards.whitelist.get_stability_guards_ready_flag().get("ready", False)),
+            "camera_lock_rule": bool(guards.camera_lock_rule.get_stability_guards_ready_flag().get("ready", False)),
+            "cursor_automator": bool(guards.cursor_automator.get_stability_guards_ready_flag().get("ready", False)),
+            "death_guard": bool(guards.death_guard.get_stability_guards_ready_flag().get("ready", False)),
+            "map_verifier": bool(guards.map_verifier.get_stability_guards_ready_flag().get("ready", False)),
+        }
+        return {
+            "gc_enabled": gc.isenabled(),
+            "stability_guards_ready": bool(all(components.values())),
+            "components": components,
+        }
+    except Exception as exc:
+        logger.debug("stability_guards health rapor hatasi: %s", exc)
+        return {
+            "gc_enabled": gc.isenabled(),
+            "stability_guards_ready": False,
+            "components": {},
+        }
 
 
 __all__ = [
@@ -1244,6 +1441,9 @@ __all__ = [
     "RuntimeStabilityGuard",
     "SelfInputWhitelistWindow",
     "StabilityGuards",
+    "get_shared_stability_guards",
+    "get_shared_map_verifier",
+    "verify_map_open",
     "get_stability_guards_ready_flag",
     "get_stability_health_report",
     "get_stability_guards_capabilities",
@@ -1263,7 +1463,13 @@ def get_stability_guards_capabilities() -> list:
 
 
 def validate_stability_guards_contract() -> bool:
-    return bool(get_stability_guards_capabilities())
+    # F-1741: yalnızca yetenek listesi varlığına değil, gerçek hazır durumuna bakılır.
+    try:
+        if not get_stability_guards_capabilities():
+            return False
+        return bool(get_stability_guards_ready_flag().get("ready", False))
+    except Exception:
+        return False
 
 
 def get_stability_guards_baseline_metrics() -> dict:

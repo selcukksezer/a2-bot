@@ -91,6 +91,31 @@ def test_save_wrong_nodes_records_negative_exemplars(tmp_path: Path) -> None:
     assert is_neg_a and sim_a >= 0.95
     assert is_neg_b and sim_b >= 0.95
 
+    # Near-duplicate generalisation: the learned negative must still fire on
+    # the SAME visual patch seen again with small real-world perturbations
+    # (flip, 2px shift, slight brightening, shifted crop, 95% rescale) —
+    # querying only the byte-identical patch proves nothing about recall.
+    near_duplicates = {
+        "horizontal_flip": cv2.flip(patch_a, 1),
+        "shifted_2px": np.roll(patch_a, 2, axis=1),
+        "brighter_+8": np.clip(patch_a.astype(np.int16) + 8, 0, 255).astype(np.uint8),
+        "shifted_crop": patch_a[2:78, 2:78],
+        "resized_95pct": cv2.resize(patch_a, (76, 76), interpolation=cv2.INTER_AREA),
+    }
+    for name, variant in near_duplicates.items():
+        is_neg, sim, ex = mem.is_negative_patch(variant)
+        assert is_neg and sim >= 0.95, (
+            f"{name}: near-duplicate of the learned wrong patch must still "
+            f"match the negative exemplar (sim={sim})"
+        )
+        assert ex is not None and ex["class_id"] == 10
+
+    # Negative control: a visually different patch that was never taught as
+    # wrong must NOT be flagged as a negative exemplar.
+    unseen_patch = _make_distinct_patch(hue=60, sat=200, val=180, seed=999)
+    is_neg_unseen, sim_unseen, _ = mem.is_negative_patch(unseen_patch)
+    assert is_neg_unseen is False, f"Unseen patch must not match negatives (sim={sim_unseen})"
+
 
 def test_register_deleted_nodes_maps_reasons_to_canonical_negative_classes(tmp_path: Path) -> None:
     """2. register_deleted_nodes_as_negative_exemplars handles dicts/IDs and maps reasons to canonical classes."""
@@ -154,7 +179,11 @@ def test_purge_wrong_nodes_deletes_and_persists_negative_memory(tmp_path: Path) 
     is_neg, sim, ex = mem.is_negative_patch(patch_wrong)
     assert is_neg is True
     assert sim >= 0.95
-    assert ex is not None and ex["class_id"] == 7
+    # Merge-fix (O8): D42's add_negative_exemplar remaps rejected
+    # 3D-material classes to ground/terrain (class 7 is a material class,
+    # so the purged node is stored as path_ground/15, not as class 7).
+    assert ex is not None and ex["class_id"] == 15
+    assert ex["class_name"] == "path_ground"
 
 
 def test_purged_node_is_flagged_by_classify_wrong_nodes_on_rescan(tmp_path: Path) -> None:

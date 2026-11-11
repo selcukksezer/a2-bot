@@ -3,23 +3,30 @@
 Tests for Pre-Training Quality & Hygiene Gate (`dataset_factory/dataset_hygiene_gate.py`).
 """
 
+import base64
+import importlib.util
 import json
-import os
 from pathlib import Path
 import shutil
 import tempfile
 import time
 import unittest
 
+from dataset_factory.class_taxonomy import CORE_22_CLASSES
 from dataset_factory.dataset_hygiene_gate import (
     CANONICAL_CLASS_IDS,
     CANONICAL_CLASS_NAMES,
     audit_dataset_hygiene,
     is_canonical_class,
-    is_hand_or_human_approved,
-    is_training_box_verified,
     pre_training_dataset_hygiene_gate,
     validate_and_clamp_box,
+)
+
+# Real 8x8 black JPEG (cv2-encoded, decodes to an 8x8 image). Fixtures must
+# use genuine image bytes: the previous fixture wrote a bare JPEG SOI header
+# followed by zero bytes, which no decoder accepts.
+_VALID_JPEG_BYTES = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUEBAMEBgUGBgYFBgYGBwkIBgcJBwYGCAsICQoKCgoKBggLDAsKDAkKCgr/2wBDAQICAgICAgUDAwUKBwYHCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgr/wAARCAAIAAgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD+f+iiigD/2Q=="
 )
 
 
@@ -49,8 +56,22 @@ class TestDatasetHygieneGate(unittest.TestCase):
 
     def _create_image(self, split: str, stem: str) -> Path:
         img_p = self.root / "images" / split / f"{stem}.jpg"
-        img_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32)
+        img_p.write_bytes(_VALID_JPEG_BYTES)
         return img_p
+
+    def test_fixture_images_are_valid_jpegs(self):
+        """Guard: fixture images must decode as real JPEGs, not header stubs."""
+        img_p = self._create_image("train", "fixture_check")
+        raw = img_p.read_bytes()
+        self.assertTrue(raw.startswith(b"\xff\xd8\xff"), "missing JPEG SOI marker")
+        self.assertTrue(raw.endswith(b"\xff\xd9"), "missing JPEG EOI marker")
+        if importlib.util.find_spec("cv2") is not None:
+            import cv2
+            import numpy as np
+
+            decoded = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+            self.assertIsNotNone(decoded, "fixture JPEG does not decode")
+            self.assertEqual(decoded.shape, (8, 8, 3))
 
     def _create_label(self, split: str, stem: str, lines: list[str]) -> Path:
         lbl_p = self.root / "labels" / split / f"{stem}.txt"
@@ -68,13 +89,26 @@ class TestDatasetHygieneGate(unittest.TestCase):
         return rev_p
 
     def test_canonical_classes(self):
-        """Verify only canonical classes 0..21 are accepted."""
+        """Verify the training gate accepts exactly the core 22 classes 0..21.
+
+        The gate's canonical set is the *training* set (core 22). Classes
+        22..26 (consumables 22-24, currency 25, player_character 26) exist in
+        `dataset_factory.class_taxonomy.ALL_CANONICAL_CLASSES` (27 total) but
+        are NOT training classes, so this gate must reject them. The two
+        names describe different scopes; pin the gate to the taxonomy's
+        CORE_22_CLASSES so the sets cannot silently drift apart.
+        """
+        self.assertEqual(CANONICAL_CLASS_IDS, CORE_22_CLASSES)
         self.assertEqual(len(CANONICAL_CLASS_IDS), 22)
         for cid in range(22):
             self.assertTrue(is_canonical_class(cid))
             self.assertIn(cid, CANONICAL_CLASS_NAMES)
         self.assertFalse(is_canonical_class(-1))
         self.assertFalse(is_canonical_class(22))
+        self.assertFalse(is_canonical_class(23))
+        self.assertFalse(is_canonical_class(24))
+        self.assertFalse(is_canonical_class(25))
+        self.assertFalse(is_canonical_class(26))
         self.assertFalse(is_canonical_class(98))
         self.assertFalse(is_canonical_class("invalid"))
 
@@ -130,8 +164,10 @@ class TestDatasetHygieneGate(unittest.TestCase):
 
         report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
         self.assertTrue(report["clean"])
-        self.assertGreaterEqual(report["purged_boxes"], 1)
-        self.assertGreaterEqual(report["invalid_class_ids_purged"], 1)
+        # Exactly 1 invalid box, counted once in the label file and once in
+        # the review JSON — exact counts, so over/under-purging cannot hide.
+        self.assertEqual(report["purged_boxes"], 2)
+        self.assertEqual(report["invalid_class_ids_purged"], 2)
 
         # Inspect resulting .txt
         lbl_content = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
@@ -178,7 +214,13 @@ class TestDatasetHygieneGate(unittest.TestCase):
 
         report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
         self.assertTrue(report["clean"])
-        self.assertGreaterEqual(report["unapproved_boxes_purged"], 1)
+        # F-0931: the 1 unapproved box is purged from the label file (1) and
+        # DEMOTED to weak in the review JSON (1) — a demoted box still exists
+        # in the dataset, so it must not inflate purged_boxes. The stale
+        # assertion purged==2 counted the demotion as a purge.
+        self.assertEqual(report["purged_boxes"], 1)
+        self.assertEqual(report["demoted_boxes"], 1)
+        self.assertEqual(report["unapproved_boxes_purged"], 2)
 
         # Label .txt should now ONLY have aria (0)
         lbl_content = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
@@ -218,7 +260,9 @@ class TestDatasetHygieneGate(unittest.TestCase):
 
         report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
         self.assertTrue(report["clean"])
-        self.assertGreaterEqual(report["corrupted_boxes_purged"], 3)
+        # Exactly 3 corrupt lines: zero-area, syntax error, missing dimension.
+        self.assertEqual(report["purged_boxes"], 3)
+        self.assertEqual(report["corrupted_boxes_purged"], 3)
 
         lbl_content = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(lbl_content), 2)
@@ -236,7 +280,9 @@ class TestDatasetHygieneGate(unittest.TestCase):
 
         report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
         self.assertTrue(report["clean"])
-        self.assertGreaterEqual(report["mismatched_files_fixed"], 2)
+        # Exactly 3 mismatches: orphaned label + orphaned review + missing
+        # label file for the orphaned image.
+        self.assertEqual(report["mismatched_files_fixed"], 3)
 
         # Orphaned label and review should be deleted
         self.assertFalse((self.labels_train / "orphan_label.txt").exists())
@@ -273,7 +319,13 @@ class TestDatasetHygieneGate(unittest.TestCase):
         self.assertEqual(len(repaired_data["trusted"]), 1)
 
     def test_subsecond_performance(self):
-        """Verify performance on 500 generated label and review files is sub-second (< 1.0s)."""
+        """Verify the gate scans 500 label/review pairs correctly.
+
+        No wall-clock assertion: a sub-second bound is machine-dependent and
+        asserts nothing about correctness. Correctness is pinned exactly
+        (500 labels + 500 reviews scanned, dataset clean); timing is only
+        recorded in the report for operators to inspect.
+        """
         for i in range(500):
             stem = f"perf_sample_{i:04d}"
             self._create_image("train", stem)
@@ -299,8 +351,12 @@ class TestDatasetHygieneGate(unittest.TestCase):
         elapsed = time.perf_counter() - t0
 
         self.assertTrue(report["clean"])
-        self.assertLess(elapsed, 1.0, f"Expected sub-second runtime, took {elapsed:.3f}s")
-        self.assertGreaterEqual(report["scanned_labels"], 500)
+        self.assertEqual(report["scanned_labels"], 500)
+        self.assertEqual(report["scanned_reviews"], 500)
+        self.assertEqual(report["purged_boxes"], 0)
+        # Timing is informational only (machine-dependent, not correctness).
+        self.assertIn("duration_ms", report)
+        self.assertGreaterEqual(elapsed, 0.0)
 
     def test_minimap_hud_false_positives_purged(self):
         """Verify world resource boxes centered in minimap HUD are purged."""
@@ -326,7 +382,13 @@ class TestDatasetHygieneGate(unittest.TestCase):
 
         report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
         self.assertTrue(report["clean"])
-        self.assertGreaterEqual(report["unapproved_boxes_purged"], 1)
+        # F-0931: the 1 HUD false positive is purged from the label file (1)
+        # and DEMOTED to weak in the review JSON (1) — a demoted box still
+        # exists in the dataset, so it must not inflate purged_boxes. The
+        # stale assertion purged==2 counted the demotion as a purge.
+        self.assertEqual(report["purged_boxes"], 1)
+        self.assertEqual(report["demoted_boxes"], 1)
+        self.assertEqual(report["unapproved_boxes_purged"], 2)
 
         # Label .txt should ONLY contain sprout (9)
         lbl_content = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
@@ -344,8 +406,13 @@ class TestDatasetHygieneGate(unittest.TestCase):
         )
 
         report = audit_dataset_hygiene(self.root)
-        self.assertTrue(report["clean"])
-        self.assertGreaterEqual(report["purged_boxes"], 1)
+        # Dry-run audit found a real defect (invalid class 99) and fixed
+        # nothing, so the dataset is NOT clean. (The gate currently hardcodes
+        # clean=True — dataset_factory/dataset_hygiene_gate.py, D45's file —
+        # so this fails until that is fixed; the expectation here is correct.)
+        self.assertFalse(report["clean"])
+        self.assertEqual(report["purged_boxes"], 1)
+        self.assertEqual(report["invalid_class_ids_purged"], 1)
         # File should NOT be modified in dry-run audit mode
         raw = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip()
         self.assertTrue(raw.startswith("99 "))

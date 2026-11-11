@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -165,13 +166,15 @@ class TestCombatPositioner:
         config = CombatPositioningConfig(profile=EngagementProfile.MELEE, melee_min_norm_h=0.12)
         pos = CombatPositioner(config)
 
-        # Target too far (small bbox height: 8% screen height < 12%)
+        # Target too far: bh=86 -> norm_h 0.080 -> dist 0.96/0.080 = 12.1 m > 3.8 m
+        # (tek formül, P1-12; config'deki legacy norm_h eşiği artık okunmuyor).
         far_eval = pos.evaluate_target_range(target_bbox=(800, 300, 80, 86), screen_shape=(1080, 1920))
         assert far_eval.status == RangeStatus.TOO_FAR
         assert far_eval.recommended_action == "step_forward"
 
-        # Target in range (large bbox height: 25% screen height)
-        in_range_eval = pos.evaluate_target_range(target_bbox=(800, 300, 150, 270), screen_shape=(1080, 1920))
+        # Target in range: bh=360 -> norm_h 0.333 -> dist 0.96/0.333 = 2.9 m <= 3.8 m.
+        # (Eski bh=270, 3.84 m ile sınırın üstünde kalırdı — TOO_FAR.)
+        in_range_eval = pos.evaluate_target_range(target_bbox=(800, 300, 150, 360), screen_shape=(1080, 1920))
         assert in_range_eval.status == RangeStatus.IN_RANGE
         assert in_range_eval.recommended_action == "none"
 
@@ -195,17 +198,17 @@ class TestCombatPositioner:
         )
         pos = CombatPositioner(config)
 
-        # Target too far (> 25m, norm_h = 2% < 3.5%)
+        # Target too far: bh=25 -> norm_h 0.023 -> dist 41.5 m > 24 m (tek formül, P1-12).
         far_eval = pos.evaluate_target_range(target_bbox=(800, 300, 25, 25), screen_shape=(1080, 1920))
         assert far_eval.status == RangeStatus.TOO_FAR
         assert far_eval.recommended_action == "step_forward"
 
-        # Target in optimal standoff range (norm_h = 8%)
+        # Target in optimal standoff range: bh=90 -> norm_h 0.083 -> dist 11.5 m (6-24 m).
         in_range_eval = pos.evaluate_target_range(target_bbox=(800, 300, 80, 90), screen_shape=(1080, 1920))
         assert in_range_eval.status == RangeStatus.IN_RANGE
         assert in_range_eval.recommended_action == "none"
 
-        # Target too close / danger zone (norm_h = 25% > 16%) -> triggers kiting
+        # Target too close / danger zone: bh=270 -> norm_h 0.250 -> dist 3.8 m < 6 m -> kiting.
         close_eval = pos.evaluate_target_range(target_bbox=(800, 300, 200, 270), screen_shape=(1080, 1920))
         assert close_eval.status == RangeStatus.TOO_CLOSE
         assert close_eval.recommended_action == "backpedal"
@@ -263,6 +266,11 @@ class TestLineOfSightTracker:
         config = CombatPositioningConfig(damage_stagnation_threshold=3)
         tracker = LineOfSightTracker(config)
 
+        # S-1303: 1st reading is the baseline only — no verdict, counter stays 0
+        tracker.record_cast_outcome(target_hp_pct=100.0)
+        assert tracker.consecutive_stagnant_casts == 0
+        assert tracker.check_line_of_sight().has_los is True
+
         # 1st cast dealing no damage
         tracker.record_cast_outcome(target_hp_pct=100.0)
         assert tracker.consecutive_stagnant_casts == 1
@@ -284,9 +292,13 @@ class TestLineOfSightTracker:
         config = CombatPositioningConfig(damage_stagnation_threshold=3)
         tracker = LineOfSightTracker(config)
 
+        # S-1303: 1st reading is the baseline only — counter stays 0
         tracker.record_cast_outcome(target_hp_pct=100.0)
+        assert tracker.consecutive_stagnant_casts == 0
+
+        # 2nd cast dealing no damage -> stagnant = 1
         tracker.record_cast_outcome(target_hp_pct=100.0)
-        assert tracker.consecutive_stagnant_casts == 2
+        assert tracker.consecutive_stagnant_casts == 1
 
         # Target took 10% damage!
         dealt = tracker.record_cast_outcome(target_hp_pct=90.0)
@@ -337,11 +349,40 @@ class TestCombatSystemIntegration:
     """Tests for integrated CombatSystem positioning, LoS checking, and combat rotation."""
 
     def test_contract_and_capabilities(self):
+        # F-1359: validate_combat_contract() used to return True off a
+        # hardcoded list, so it could never fail. Prove the wiring instead:
+        # (1) the contract is False when the capability list is empty,
+        # (2) every advertised capability maps to a real implementation,
+        # (3) the health summary reflects live state (profile change visible).
+        import core.combat as combat_mod
+
+        with patch.object(combat_mod, "get_combat_capabilities", return_value=[]):
+            assert validate_combat_contract() is False
+        assert validate_combat_contract() is True
+
         caps = get_combat_capabilities()
         assert "engagement_range_optimization" in caps
         assert "line_of_sight_obstacle_check" in caps
         assert "adaptive_obstruction_recovery" in caps
-        assert validate_combat_contract() is True
+
+        combat = CombatSystem(profile=EngagementProfile.RANGED)
+        capability_impl = {
+            "engagement_range_optimization": combat.check_engagement_range,
+            "line_of_sight_obstacle_check": combat.check_line_of_sight,
+            "adaptive_obstruction_recovery": combat.recover_obstructed_target,
+            "geometric_ray_occlusion": segment_intersects_rect,
+            "damage_stagnation_detection": combat.los_tracker.record_cast_outcome,
+        }
+        for name, impl in capability_impl.items():
+            assert name in caps, f"capability {name!r} advertised but missing"
+            assert callable(impl), f"capability {name!r} has no implementation"
+
+        health = combat.get_combat_health_summary()
+        assert health["module"] == "combat"
+        assert health["ready"] is True
+        assert health["profile"] == "ranged"
+        combat.set_engagement_profile("melee")
+        assert combat.get_combat_health_summary()["profile"] == "melee"
 
     def test_profile_configuration(self):
         combat = CombatSystem(profile=EngagementProfile.RANGED)
@@ -371,7 +412,7 @@ class TestCombatSystemIntegration:
         hostile_frame = np.full((1080, 1920, 3), 40, dtype=np.uint8)
         cv2.rectangle(hostile_frame, (700, 40), (900, 70), (0, 0, 220), -1)
 
-        small_bbox = (900, 400, 40, 40)  # height=40 (3.7% screen height < 11% melee min)
+        small_bbox = (900, 400, 40, 40)  # bh=40 -> norm_h 0.037 -> dist 25.9 m > 3.8 m (tek formül, P1-12)
         result = combat.fight_back_step(
             input_ctrl=driver,
             frame=hostile_frame,
@@ -389,7 +430,8 @@ class TestCombatSystemIntegration:
         hostile_frame = np.full((1080, 1920, 3), 40, dtype=np.uint8)
         cv2.rectangle(hostile_frame, (700, 40), (900, 70), (0, 0, 220), -1)
 
-        huge_bbox = (800, 300, 300, 350)  # height=350 (32% screen height > 16% ranged max)
+        # bh=350 -> norm_h 0.324 -> dist 0.96/0.324 = 3.0 m < 6 m (tek formül, P1-12).
+        huge_bbox = (800, 300, 300, 350)
         result = combat.fight_back_step(
             input_ctrl=driver,
             frame=hostile_frame,
@@ -407,7 +449,11 @@ class TestCombatSystemIntegration:
         hostile_frame = np.full((1080, 1920, 3), 40, dtype=np.uint8)
         cv2.rectangle(hostile_frame, (700, 40), (900, 70), (0, 0, 220), -1)
 
-        target_bbox = (900, 350, 120, 150)  # in melee range
+        # Tek formül (P1-12): melee IN_RANGE için dist <= 3.8 m -> norm_h >= 0.253
+        # -> 1080p'de bh >= 273. bh=300 (norm_h 0.278 -> 3.5 m) menzildedir;
+        # merkez eski bbox ile aynı (960, 425) tutuldu, LoS yolu değişmez.
+        # (Eski bh=150, 6.9 m ile TOO_FAR'dı — LoS kurtarmasına hiç ulaşmazdı.)
+        target_bbox = (900, 275, 120, 300)  # in melee range
         obstacle_bbox = (920, 500, 100, 100)  # sits directly between player (960, 777) and target (960, 425)
 
         result = combat.fight_back_step(
@@ -428,20 +474,27 @@ class TestCombatSystemIntegration:
         hostile_frame = np.full((1080, 1920, 3), 40, dtype=np.uint8)
         cv2.rectangle(hostile_frame, (700, 40), (900, 70), (0, 0, 220), -1)
 
-        target_bbox = (900, 350, 150, 200)  # in melee range, no obstacles
-        result = combat.fight_back_step(
-            input_ctrl=driver,
-            frame=hostile_frame,
-            target_bbox=target_bbox,
-        )
+        # Tek formül (P1-12): melee IN_RANGE için bh >= 273 (1080p).
+        # bh=300 (norm_h 0.278 -> 3.5 m); merkez eski bbox ile aynı (975, 450).
+        # (Eski bh=200, 5.2 m ile TOO_FAR'dı — saldırı yoluna hiç ulaşmazdı.)
+        target_bbox = (900, 300, 150, 300)  # in melee range, no obstacles
+        # F-1464: the attack path never clicks — it presses exactly one skill
+        # key chosen at random. Pin the choice (first pool entry, 't') and
+        # assert the exact dispatch instead of `skill_key or click`.
+        with patch("core.combat.random.choice", side_effect=lambda pool: pool[0]):
+            result = combat.fight_back_step(
+                input_ctrl=driver,
+                frame=hostile_frame,
+                target_bbox=target_bbox,
+            )
         assert result is True
         assert combat.total_attacks == 1
-        # Either an attack skill key was pressed or a human click was performed
-        has_skill_key = any(k[0] in ("1", "2", "3", "4", "q", "e", "r") for k in driver.pressed_keys)
-        has_click = len(driver.clicked_buttons) > 0
-        assert has_skill_key or has_click
+        assert driver.pressed_keys == [("t", 0.05)]
+        assert driver.clicked_buttons == []
 
     def test_enemy_defeat_loot_and_tab_cycle(self):
+        # §7-A no 27 (loot tek F): ölüm dalında tek F+Tab v17 davranışıdır;
+        # P1-11/testupd-A çevirmesi geri alındı (F13).
         driver = MockInputDriver()
         combat = CombatSystem(driver=driver)
 

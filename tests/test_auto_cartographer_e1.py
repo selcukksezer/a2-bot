@@ -7,11 +7,10 @@ Tests for Autonomous Exploration Route Builder, RouteGraph Generator,
 Anti-Center-Sticking, and ExemplarMemory Integration in `core/auto_cartographer.py`.
 """
 
-import math
 import os
 import shutil
 import tempfile
-import time
+
 import cv2
 import numpy as np
 import pytest
@@ -19,15 +18,32 @@ import pytest
 from core.auto_cartographer import (
     AutoCartographer,
     RouteGraph,
-    GraphWaypoint,
-    GraphEdge,
     TrackedResourceNode,
-    DEFAULT_REGION,
-    DEFAULT_DEDUP_RADIUS_PX,
     DEDUP_RADIUS_MIN_PX,
     DEDUP_RADIUS_MAX_PX,
 )
-from core.route_manager import RouteManager, NodeData
+from core.route_manager import RouteManager
+
+
+def _frame_with_textured_minimap(frame: np.ndarray) -> np.ndarray:
+    """Tile a deterministic textured patch over the minimap ROI.
+
+    ingest_detections runs the real quality gate, which crops its 80x80
+    candidate patch from the minimap ROI; a flat gray ROI is rejected as a
+    negative exemplar, so the ROI needs real texture.
+    """
+    hsv = np.zeros((80, 80, 3), dtype=np.uint8)
+    hsv[:, :] = (140, 160, 190)
+    rng = np.random.default_rng(42)
+    noise = rng.integers(-15, 15, (80, 80, 3), dtype=np.int16)
+    aria = np.clip(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR).astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    x1, y1, x2, y2 = AutoCartographer()._get_minimap_pixel_rect(1280, 720)
+    for y in range(y1, y2, 80):
+        for x in range(x1, x2, 80):
+            h = min(80, y2 - y)
+            w = min(80, x2 - x)
+            frame[y:y + h, x:x + w] = aria[:h, :w]
+    return frame
 
 
 class TestRouteGraph:
@@ -190,12 +206,14 @@ class TestCenterStickingPrevention:
         assert parsed is None
 
     def test_harvest_auto_permitted_at_zero(self):
+        # H-sweep dilim 13 K3: koordinatsız tespit elenir — harvest_auto
+        # için bile oyuncu ayağına (0, 0) düğüm yazılmaz
+        # (core/auto_cartographer.py:3311). Eski "(0, 0)'a izin verilir"
+        # davranışı kalktı; güveni 1.0 olsa da koordinatsız girdi None döner.
         cart = AutoCartographer()
         raw = {"source_type": "harvest_auto", "resource_type": "Orichalcum Ore", "confidence": 1.0}
         parsed = cart._parse_material_detection(raw, frame_w=1280, frame_h=720)
-        assert parsed is not None
-        assert parsed["rel_map_dx"] == 0.0
-        assert parsed["rel_map_dy"] == 0.0
+        assert parsed is None
 
     def test_minimap_center_arrow_rejected(self):
         cart = AutoCartographer()
@@ -292,6 +310,9 @@ class TestDetectionIngestionAndExemplars:
             dummy_frame = np.ones((720, 1280, 3), dtype=np.uint8) * 120
             # Draw a simulated gatherable patch so CV filters don't reject it
             cv2.circle(dummy_frame, (700, 450), 25, (255, 255, 255), -1)
+            # Texture the minimap ROI: the real quality gate crops its
+            # candidate patch from there, and a flat ROI is rejected.
+            dummy_frame = _frame_with_textured_minimap(dummy_frame)
 
             detections_3d = [
                 {
@@ -304,15 +325,28 @@ class TestDetectionIngestionAndExemplars:
                 }
             ]
 
+            # All three ingestion sources run (3D + minimap + harvest
+            # prompt) and the ingestion result is verified, not assumed.
             discovered = cart.ingest_detections(
                 frame=dummy_frame,
                 detections=detections_3d,
                 route_manager=rm,
                 region="ExploreReg",
-                include_minimap=False,
-                include_3d=False,
-                include_harvest_prompt=False,
+                include_minimap=True,
+                include_3d=True,
+                include_harvest_prompt=True,
             )
+
+            assert len(discovered) >= 1
+            aria_nodes = [d for d in discovered if d["resource_type"] == "Aria"]
+            assert len(aria_nodes) == 1
+            assert aria_nodes[0]["map_x"] == pytest.approx(504.0, abs=1.0)
+            assert aria_nodes[0]["map_y"] == pytest.approx(306.0, abs=1.0)
+            # F-0053: eski beklenti (338, 206) hatalı ekran uzayıydı — ilk
+            # 1280x720 kare harita uzayını 1280x720'ye döndürüyordu. Kanonik
+            # 1920x1080 uzayında oyuncu (500, 300) + ofset = (504, 306).
+            assert aria_nodes[0]["max_harvests"] == 3
+            assert aria_nodes[0]["current_harvests"] == 0
 
             # Graph should now have the waypoint and connected resource node
             rg = cart.get_route_graph("ExploreReg")
@@ -322,6 +356,8 @@ class TestDetectionIngestionAndExemplars:
 
             # Stats check
             stats = cart.get_cartography_stats("ExploreReg")
+            assert stats["total_nodes"] >= 1
+            assert stats["total_3d_recorded"] >= 1
             assert stats["auto_mapped"] >= 1
             assert stats["graph_waypoints_count"] >= 1
         finally:
@@ -367,3 +403,41 @@ class TestDetectionIngestionAndExemplars:
         assert gate.verified_resource_type == "Aria"
         assert gate.exemplar_sim == pytest.approx(0.94)
 
+
+
+def test_f0053_update_player_position_keeps_canonical_map_space():
+    """F-0053: ilk kare 1280x720 bile olsa harita uzayı 1920x1080 kalır;
+    update_player_position map_width/map_height'i kare boyutuna döndürmez."""
+    cart = AutoCartographer()
+    cart.set_position(500.0, 300.0)
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    map_x, map_y, norm_x, norm_y = cart.update_player_position(frame)
+    assert cart.map_width == 1920
+    assert cart.map_height == 1080
+    assert map_x == pytest.approx(500.0)
+    assert map_y == pytest.approx(300.0)
+    assert norm_x == pytest.approx(500.0 / 1920, abs=1e-4)
+    assert norm_y == pytest.approx(300.0 / 1080, abs=1e-4)
+
+
+def test_s0503_record_node_without_route_manager_saves_patch(tmp_path, monkeypatch):
+    """S-0503: RouteManager yokken record_node, diske yazılmamış patch yolu
+    kaydetmez; patch doğrudan kaydedilir ve yalnızca gerçek yol döner.
+
+    H-sweep dilim 13 K3 güncellemesi: `record_node` artık güven
+    (confidence) verilmeden kayıt yapmıyor — güven verilmediyse None
+    döner (core/auto_cartographer.py:4366). Bu test güven vermeden
+    çağırdığı için beklenti None oldu; patch-yolu davranışı güven
+    verilen varyantta ayrıca doğrulanmalıdır.
+    """
+    monkeypatch.chdir(tmp_path)
+    cart = AutoCartographer()
+    cart.set_position(500.0, 300.0)
+    patch_img = np.ones((80, 80, 3), dtype=np.uint8) * 180
+    node = cart.record_node(
+        patch=patch_img,
+        map_x=500.0,
+        map_y=300.0,
+        source_type="minimap_auto",
+    )
+    assert node is None

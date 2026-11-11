@@ -229,11 +229,42 @@ class TestThreeStageHarvestCycle:
         assert node["state"] == "resting"
         assert node["current_harvests"] == 0
 
-    def test_reprompt_wait_interval_is_exact_400ms(self) -> None:
-        """Verifies that the default re-prompt wait duration is configured to 400ms."""
+    def test_reprompt_wait_interval_is_exact_400ms(self, mock_input: MockInputController) -> None:
+        """
+        Verifies that the 400ms re-prompt wait is not just configured but actually
+        exercised: after stage 1/3 completes and the prompt reappears, the
+        controller must really sleep 0.40s before pressing the gather key again.
+        """
         controller = ThreeStageHarvestController()
         assert controller.reprompt_wait_sec == 0.40
         assert controller.reprompt_wait_ms == 400
+
+        slept_intervals: List[float] = []
+        live = ThreeStageHarvestController(
+            input_controller=mock_input,
+            reprompt_wait_sec=0.40,
+            sleep_fn=lambda s: slept_intervals.append(s),
+            test_mode=True,
+        )
+        node = {"id": 101, "map_x": 100, "map_y": 100, "max_harvests": 3, "current_harvests": 0, "state": "active"}
+        live.start_node(node, max_harvests=3, gather_key="f")
+
+        res = live.on_cast_completed(
+            node_or_id=node,
+            prompt_reappeared=True,
+            gather_key="f",
+            auto_press_next_stage=True,
+        )
+
+        assert res["status"] == "CONTINUE_NEXT_STAGE"
+        assert res["current_harvests"] == 1
+        assert res["waited_sec"] == 0.40
+        # The 400ms wait must have really happened (recorded sleep call), not
+        # merely been stored as a config attribute.
+        assert slept_intervals == [0.40]
+        assert live.reprompt_waits_sec == [0.40]
+        assert live.last_reprompt_wait_sec == 0.40
+        assert "f" in mock_input.keys_pressed
 
     def test_partial_node_early_depletion_after_stage_one(
         self, mock_input: MockInputController, temp_routes_dir: str
@@ -436,17 +467,27 @@ class TestF8WaypointRecordingAndPersistence:
         assert img is not None
         assert img.shape == (80, 80), f"Expected 80x80 patch, got {img.shape}"
 
-    def test_f8_fallback_safety_never_returns_none(self, temp_routes_dir: str) -> None:
-        """Even with empty or blank inputs, record_current_node must return a valid NodeData."""
+    def test_f8_fallback_safety_returns_none_on_capture_failure(self, temp_routes_dir: str) -> None:
+        """
+        Capture failure must NOT fabricate a node (F-1617 [O3]).
+
+        record_current_node returns None when no frame can be captured
+        (no frame, no vision engine) — the old behaviour recorded a
+        synthetic viewport-center node from a blank frame and called it
+        a successful recording. No patch file is written for the
+        failed capture.
+        """
         rm = RouteManager(base_dir=temp_routes_dir)
         rm.create_region("Altgard")
 
         # Pass None input and None vision
         node = rm.record_current_node(input_ctrl=None, vision_engine=None, region="Altgard")
-        assert node is not None
-        assert isinstance(node, NodeData)
-        assert node.id == 1
-        assert node.max_harvests == 3
+        assert node is None
+
+        # No fabricated node was persisted and no black patch was saved.
+        assert rm.get_node(1, region="Altgard") is None
+        patch_path = os.path.join(temp_routes_dir, "Altgard", "patches", "node_1.png")
+        assert not os.path.isfile(patch_path)
 
     def test_route_persistence_save_load_roundtrip(self, temp_routes_dir: str) -> None:
         """
@@ -551,7 +592,13 @@ class TestTwoOptTSPRouteOptimization:
         assert stats["improvement_pct"] > 15.0
 
     def test_sequential_route_planner_smooth_loop(self) -> None:
-        """Verifies SequentialRoutePlanner builds a continuous smooth loop without jagged turns."""
+        """
+        Verifies SequentialRoutePlanner builds a continuous smooth loop without
+        jagged turns: the output must be a true permutation (no node dropped or
+        repeated), the closed-loop tour must be strictly shorter than the
+        scrambled input tour, no two tour edges may cross, and consecutive
+        legs must not reverse direction (smooth heading progression).
+        """
         coords = [
             (0.0, 0.0),
             (20.0, 5.0),
@@ -572,6 +619,48 @@ class TestTwoOptTSPRouteOptimization:
         assert len(ordered_nodes) == len(nodes)
         visited_ids = [n.id for n in ordered_nodes]
         assert set(visited_ids) == set(range(1, 9))
+        # Exact permutation: every id exactly once, and the order really changed.
+        assert sorted(visited_ids) == list(range(1, 9))
+        assert len(set(visited_ids)) == 8
+        assert visited_ids != [n.id for n in nodes]
+
+        def closed_tour_distance(pts: List[Tuple[float, float]]) -> float:
+            total = sum(
+                math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+                for i in range(len(pts) - 1)
+            )
+            return total + math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1])
+
+        ordered_pts = [(float(n.map_x), float(n.map_y)) for n in ordered_nodes]
+        scrambled_dist = closed_tour_distance([(float(x), float(y)) for x, y in scrambled_coords])
+        ordered_dist = closed_tour_distance(ordered_pts)
+        assert ordered_dist < scrambled_dist
+        assert ordered_dist < 0.7 * scrambled_dist
+
+        # No edge crossings in the closed loop (smooth loop must untangle).
+        def _segments_cross(a1, a2, b1, b2) -> bool:
+            def _ccw(a, b, c):
+                return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+
+            return _ccw(a1, b1, b2) != _ccw(a2, b1, b2) and _ccw(a1, a2, b1) != _ccw(a1, a2, b2)
+
+        n = len(ordered_pts)
+        crossings = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if len({i, (i + 1) % n, j, (j + 1) % n}) < 4:
+                    continue
+                if _segments_cross(ordered_pts[i], ordered_pts[(i + 1) % n], ordered_pts[j], ordered_pts[(j + 1) % n]):
+                    crossings += 1
+        assert crossings == 0, f"Smooth loop tour has {crossings} edge crossing(s)"
+
+        # Heading continuity: no leg reverses direction (max bearing change < 120°).
+        def _bearing(a, b) -> float:
+            return math.degrees(math.atan2(b[0] - a[0], -(b[1] - a[1]))) % 360.0
+
+        legs = [_bearing(ordered_pts[i], ordered_pts[(i + 1) % n]) for i in range(n)]
+        max_turn = max(abs((legs[(i + 1) % n] - legs[i] + 180.0) % 360.0 - 180.0) for i in range(n))
+        assert max_turn < 120.0, f"Jagged turn in smooth loop: max bearing change {max_turn:.1f}°"
 
     def test_sequential_route_planner_apply_to_route_manager(self, temp_routes_dir: str) -> None:
         """Verifies reordering is committed to RouteManager."""
@@ -581,10 +670,31 @@ class TestTwoOptTSPRouteOptimization:
         for i in range(1, 6):
             rm.add_node(region="Altgard", node_id=i, map_x=i * 50, map_y=i * 30)
 
+        # Expected order computed independently BEFORE apply mutates the manager.
+        pre_apply_nodes = rm.get_route_nodes(region_name="Altgard", route_name="All")
+        pre_apply_ids = [n.id for n in pre_apply_nodes]
+        assert pre_apply_ids == [1, 2, 3, 4, 5]
+
         planner = SequentialRoutePlanner()
+        expected_nodes = planner.build_sequential_order(list(pre_apply_nodes), mode="smooth_loop")
+        expected_ids = [n.id for n in expected_nodes]
+        assert len(expected_ids) == 5
+        assert set(expected_ids) == set(pre_apply_ids)
+        # The smooth loop must actually reorder this diagonal line, not echo it.
+        assert expected_ids != pre_apply_ids
+
         ordered_nodes = planner.apply_sequential_order_to_route(rm, region="Altgard", route="All", mode="smooth_loop")
 
         assert len(ordered_nodes) == 5
+        # Returned order matches the independently computed sequential order.
+        assert [n.id for n in ordered_nodes] == expected_ids
+        # seq_index is assigned 1..N in the returned order.
+        assert [n.seq_index for n in ordered_nodes] == [1, 2, 3, 4, 5]
+        # RouteManager reads back the new order (committed, not just returned).
+        assert [n.id for n in rm.get_route_nodes(region_name="Altgard", route_name="All")] == expected_ids
+        # ... and the order survives a reload from disk.
+        fresh_rm = RouteManager(base_dir=temp_routes_dir)
+        assert [n.id for n in fresh_rm.get_route_nodes(region_name="Altgard", route_name="All")] == expected_ids
 
 
 # ==============================================================================
@@ -717,6 +827,11 @@ class TestObstacleAvoidanceAndCorridorSteering:
         """
         When corridor evaluation suggests a turn offset (e.g. -15.0° left to avoid obstacle),
         steer_step must adjust target bearing accordingly.
+
+        A live obstacle detection in the center lane (class 14, cx=0.5) must
+        produce a real, non-zero offset: the adjusted bearing is the target
+        bearing shifted by exactly the recommended offset, and the resulting
+        turn command must steer left around the obstacle.
         """
         cnav = CorridorNavigator()
         frame = np.full((1080, 1920, 3), 50, dtype=np.uint8)
@@ -726,11 +841,32 @@ class TestObstacleAvoidanceAndCorridorSteering:
             target_pos=(500.0, 200.0),  # North (bearing 0.0°)
             player_heading=0.0,
             frame=frame,
+            yolo_detections=[
+                {"class_id": 14, "class_name": "obstacle", "confidence": 0.9, "cx": 0.5, "cy": 0.6}
+            ],
         )
 
         assert step["target_bearing"] == 0.0
         assert "adjusted_bearing" in step
         assert "corridor_eval" in step
+
+        corridor_eval = step["corridor_eval"]
+        assert corridor_eval["obstacle_detected"] is True
+        assert corridor_eval["steering_bias"] == "steer_left"
+        assert corridor_eval["recommended_turn_offset_deg"] == -18.0
+        # Center lane is blocked, side lanes stay clear.
+        assert corridor_eval["lane_scores"]["center"] < 0.42
+        assert corridor_eval["lane_scores"]["left"] > corridor_eval["lane_scores"]["center"]
+        assert corridor_eval["lane_scores"]["right"] > corridor_eval["lane_scores"]["center"]
+
+        # Offset is really applied: adjusted = (target + offset) mod 360.
+        expected_adjusted = (0.0 + corridor_eval["recommended_turn_offset_deg"] + 360.0) % 360.0
+        assert step["adjusted_bearing"] == expected_adjusted == 342.0
+        assert step["adjusted_bearing"] != step["target_bearing"]
+        # The damped turn follows the adjusted bearing, not the raw target.
+        assert step["angle_diff"] == -18.0
+        assert step["turn_direction"] == "left"
+        assert step["turn_needed"] is True
 
     def test_z_axis_cliff_filter_marks_unreachable_node(self) -> None:
         """
@@ -933,8 +1069,31 @@ class TestFullGatherWalkRouteIntegrationSuite:
             player_heading=0.0,
             frame=sample_game_frame,
         )
-        assert "target_bearing" in step_eval
-        assert "adjusted_bearing" in step_eval
+        # Target is straight North of the player (0, -Y): bearing must be 0.0,
+        # not just any number under the "target_bearing" key.
+        assert step_eval["target_bearing"] == 0.0
+        assert step_eval["player_heading"] == 0.0
+        # Synthetic frame has a clear corridor: no obstacle, no turn offset.
+        corridor_eval = step_eval["corridor_eval"]
+        assert corridor_eval is not None
+        assert corridor_eval["obstacle_detected"] is False
+        assert corridor_eval["recommended_turn_offset_deg"] == 0.0
+        # Adjusted bearing is the target bearing shifted by the corridor offset.
+        assert step_eval["adjusted_bearing"] == pytest.approx(
+            (step_eval["target_bearing"] + corridor_eval["recommended_turn_offset_deg"]) % 360.0
+        )
+        assert step_eval["adjusted_bearing"] == 0.0
+        # Heading 0.0 already points at the 0.0 target: zero angular error,
+        # inside the deadband, no turn needed, direction "straight".
+        assert step_eval["angle_diff"] == 0.0
+        assert step_eval["angle_diff"] == pytest.approx(
+            cor_nav.compute_angle_diff(step_eval["adjusted_bearing"], 0.0)
+        )
+        assert step_eval["abs_error"] == 0.0
+        assert step_eval["turn_direction"] == "straight"
+        assert step_eval["in_deadband"] is True
+        assert step_eval["turn_needed"] is False
+        assert step_eval["turn_duration_sec"] == 0.0
 
         # ------------------------------------------------------------------
         # Step 5: Unstick Recovery on Obstacle Collision

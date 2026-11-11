@@ -31,14 +31,16 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
 
 from core.minimap_scanner import MinimapScanner
 from core.ocr_distance import GameHUDReader
+from version import __version__
 
 DEFAULT_MAX_HARVESTS: int = 3
 DEFAULT_REST_SEC: int = 300
@@ -68,135 +70,40 @@ MOUNT_DISTANCE_THRESHOLD_M: float = 35.0  # > 35m otomatik binek (Madde 24)
 DISMOUNT_DISTANCE_THRESHOLD_M: float = 8.0  # <= 8m otomatik inme (Madde 24)
 MAPLESS_DISTANCE_THRESHOLD_M: float = 40.0  # < 40m haritasız mikro-navigasyon (Madde 25)
 
-DEFAULT_DEADBAND_DEG: float = 6.0
-MIN_DEADBAND_DEG: float = 5.0
-MAX_DEADBAND_DEG: float = 8.0
-DEFAULT_WAYPOINT_RADIUS_PX: float = 20.0
-DEFAULT_WAYPOINT_RADIUS_M: float = 3.0
 DEFAULT_STUCK_TIMEOUT_SEC: float = 3.0
+DEFAULT_MAX_HISTORY: int = 200  # history listeleri için üst sınır (sınırsız büyüme engeli)
 
 
-def compute_bearing(from_pos: Tuple[float, float], to_pos: Tuple[float, float]) -> float:
-    """
-    Minimap / pusula koordinatlarında (0° = Kuzey, 90° = Doğu, 180° = Güney, 270° = Batı)
-    hedef kerteriz açısını (bearing) hesaplar.
-    Ekran koordinatlarında Y aşağı doğru büyüdüğünden, Kuzey = -Y yönüdür.
-    Kartezyen (0° = Doğu) ile Minimap ok yönü (0° = Kuzey) arasındaki
-    180° terslik (inversion) hatasını tamamen ortadan kaldırır.
-    """
-    dx = float(to_pos[0]) - float(from_pos[0])
-    dy = float(to_pos[1]) - float(from_pos[1])
-    if abs(dx) <= 1e-6 and abs(dy) <= 1e-6:
-        return 0.0
-    angle = math.degrees(math.atan2(dx, -dy))
-    return round((angle + 360.0) % 360.0, 2)
-
-
-def compute_angle_diff(target_bearing: float, player_heading: float) -> float:
-    """
-    Oyuncu yönünden (player_heading) hedef kerteriz açısına (target_bearing)
-    en kısa dönüş yolunu (shortest rotational path) [-180.0°, +180.0°] aralığında hesaplar:
-        angle_diff = (target_bearing - player_heading + 180) % 360 - 180
-    Pozitif (+) değerler sağa (saat yönü), negatif (-) değerler sola dönüşü gösterir.
-    """
-    diff = (float(target_bearing) - float(player_heading) + 180.0) % 360.0 - 180.0
-    return round(diff, 2)
-
-
-def apply_turn_damping(
-    angle_diff: float,
-    deadband_deg: float = DEFAULT_DEADBAND_DEG,
-    min_turn_sec: float = 0.04,
-    max_turn_sec: float = 0.35,
-    max_error_deg: float = 180.0,
-) -> Dict[str, Any]:
-    """
-    Ölü bölge (deadband zone: ±5° ila ±8°) uygulayarak hedef kerterize yakınken
-    sağ-sol hızlı yalpalanmayı (oscillation) engeller. Açı hatasına göre dönüş
-    süresini pürüzsüz biçimde enterpole eder.
-    """
-    clamped_deadband = max(MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg)))
-    abs_err = abs(float(angle_diff))
-    in_deadband = bool(abs_err <= clamped_deadband)
-
-    if in_deadband:
-        return {
-            "angle_diff": round(float(angle_diff), 2),
-            "abs_error": round(abs_err, 2),
-            "in_deadband": True,
-            "turn_needed": False,
-            "turn_direction": "straight",
-            "turn_duration_sec": 0.0,
-            "deadband_deg": clamped_deadband,
-        }
-
-    direction = "right" if angle_diff > 0.0 else "left"
-    span = max(1.0, float(max_error_deg) - clamped_deadband)
-    norm = min(1.0, max(0.0, (abs_err - clamped_deadband) / span))
-    smooth_t = norm * norm * (3.0 - 2.0 * norm)
-    turn_duration = float(min_turn_sec) + smooth_t * (float(max_turn_sec) - float(min_turn_sec))
-
-    return {
-        "angle_diff": round(float(angle_diff), 2),
-        "abs_error": round(abs_err, 2),
-        "in_deadband": False,
-        "turn_needed": True,
-        "turn_direction": direction,
-        "turn_duration_sec": round(turn_duration, 4),
-        "deadband_deg": clamped_deadband,
-    }
-
-
-class TurnDampingController:
-    """
-    Yalpalanmayı önleyici durum denetleyicisi: ±5°..±8° ölü bölge uygular
-    ve dönüş sürelerini yumuşak enterpolasyonla sınırlar.
-    """
-    def __init__(
-        self,
-        deadband_deg: float = DEFAULT_DEADBAND_DEG,
-        min_turn_sec: float = 0.04,
-        max_turn_sec: float = 0.35,
-        reversal_cooldown_sec: float = 0.12,
-    ):
-        self.deadband_deg = max(MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg)))
-        self.min_turn_sec = float(min_turn_sec)
-        self.max_turn_sec = float(max_turn_sec)
-        self.reversal_cooldown_sec = float(reversal_cooldown_sec)
-        self.last_turn_direction: Optional[str] = None
-        self.last_turn_ts: float = 0.0
-
-    def calculate_turn(
-        self,
-        target_bearing: float,
-        player_heading: float,
-        now: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        curr_ts = time.time() if now is None else float(now)
-        diff = compute_angle_diff(target_bearing, player_heading)
-        res = apply_turn_damping(
-            angle_diff=diff,
-            deadband_deg=self.deadband_deg,
-            min_turn_sec=self.min_turn_sec,
-            max_turn_sec=self.max_turn_sec,
-        )
-        if res["turn_needed"]:
-            if (
-                self.last_turn_direction is not None
-                and self.last_turn_direction != res["turn_direction"]
-                and (curr_ts - self.last_turn_ts) < self.reversal_cooldown_sec
-            ):
-                res["turn_duration_sec"] = round(res["turn_duration_sec"] * 0.65, 4)
-                res["reversal_damped"] = True
-            else:
-                res["reversal_damped"] = False
-            self.last_turn_direction = res["turn_direction"]
-            self.last_turn_ts = curr_ts
-        else:
-            res["reversal_damped"] = False
-        return res
-
-
+# H-sweep (dilim 12 O-5): kerteriz / açı farkı / dönüş sönümleme
+# corridor_navigator.py'deki birebir kopyanın tekilleştirilmiş hâlidir.
+# İki ayrı tanım tutuluyordu; biri düzeltilince diğeri eski kalıyordu
+# (kanıt: F-0011/F-0012 corridor'da düzelmiş, buradaki kopyada duruyordu).
+# İsimler yeniden ihraç edilir; `from core.navigation_intel import
+# compute_bearing` çalışmaya devam eder.
+# P3-3: ölü-bölge sabitleri (6.0/5.0/8.0) de corridor_navigator tek
+# kaynağından gelir; aşağıdaki `__all__` girdileri aynen korunur.
+from core.corridor_navigator import (  # noqa: E402
+    DEFAULT_DEADBAND_DEG,
+    MAX_DEADBAND_DEG,
+    MINIMAP_METERS_PER_PX,
+    MIN_DEADBAND_DEG,
+    WORLD_MAP_METERS_PER_PX,
+    TurnDampingController,
+    apply_turn_damping,
+    compute_angle_diff,
+    compute_bearing,
+)
+# P3-3 v19: DEFAULT_WAYPOINT_RADIUS_PX/M tek tanımı `core/navigator.py`
+# dedir (20.0 px / 3.0 m); buradaki kopya silindi, adlar yeniden ihraç
+# edilir (`from core.navigation_intel import DEFAULT_WAYPOINT_RADIUS_PX`
+# ve aşağıdaki `__all__` girdileri çalışmaya devam eder). Döngüsel import
+# yoktur: navigator -> {corridor_navigator, input_driver, vision,
+# route_manager} zincirinin hiçbir halkası navigation_intel'i üst düzeyde
+# içe aktarmaz (route_manager yalnızca tembel içe aktarır).
+from core.navigator import (  # noqa: E402
+    DEFAULT_WAYPOINT_RADIUS_M,
+    DEFAULT_WAYPOINT_RADIUS_PX,
+)
 class RadarStuckDetector:
     """
     Radar Intel Tabanlı Takılma Tespiti ve Kurtarma:
@@ -210,11 +117,13 @@ class RadarStuckDetector:
         movement_threshold_px: float = 2.0,
         movement_threshold_m: float = 0.5,
         strafe_duration_sec: float = 1.0,
+        max_history: int = DEFAULT_MAX_HISTORY,
     ) -> None:
         self.stuck_timeout_sec: float = float(max(0.5, stuck_timeout_sec))
         self.movement_threshold_px: float = float(max(0.1, movement_threshold_px))
         self.movement_threshold_m: float = float(max(0.05, movement_threshold_m))
         self.strafe_duration_sec: float = float(max(0.1, strafe_duration_sec))
+        self.max_history: int = max(1, int(max_history))
 
         self.last_pos: Optional[Tuple[float, float]] = None
         self.last_pos_ts: Optional[float] = None
@@ -309,39 +218,46 @@ class RadarStuckDetector:
         """
         strafe_key = "a" if (self.stuck_count % 2 == 0) else "d"
         self.stuck_count += 1
-        wait_fn = sleep_fn if callable(sleep_fn) else (lambda s: None)
+        # H-sweep (dilim 12 Y-1 — F-0011/F-0012'nin bu dosyadaki kopyası):
+        # bekleme verilmezse gerçek bekleme (time.sleep) kullanılır; no-op
+        # varsayılan A+W strafe'i anında bas-bırak yapıyordu.
+        wait_fn = sleep_fn if callable(sleep_fn) else time.sleep
         actions: List[str] = []
+        attempted = False
 
-        actions.append("SPACE")
         if input_controller is not None:
+            actions.append("SPACE")
             if hasattr(input_controller, "tap_key") and callable(input_controller.tap_key):
                 input_controller.tap_key("space")
+                attempted = True
             elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
                 input_controller.press_key("space")
+                attempted = True
             elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
                 input_controller.key_down("space")
                 wait_fn(0.06)
                 input_controller.key_up("space")
+                attempted = True
 
         combo = f"{strafe_key.upper()}+W"
-        actions.append(combo)
         if input_controller is not None:
+            actions.append(combo)
             if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
                 input_controller.hold_keys([strafe_key, "w"], duration=self.strafe_duration_sec)
+                attempted = True
             elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
                 input_controller.key_down("w")
                 input_controller.key_down(strafe_key)
                 wait_fn(self.strafe_duration_sec)
                 input_controller.key_up(strafe_key)
                 input_controller.key_up("w")
+                attempted = True
             elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
                 input_controller.press_key(strafe_key)
                 input_controller.press_key("w")
                 wait_fn(self.strafe_duration_sec)
-        else:
-            wait_fn(self.strafe_duration_sec)
+                attempted = True
 
-        actions.append("REALIGN")
         angle_diff = 0.0
         damped = None
         if target_bearing is not None and player_heading is not None:
@@ -349,6 +265,7 @@ class RadarStuckDetector:
             damped = apply_turn_damping(angle_diff, deadband_deg=deadband_deg)
 
         if input_controller is not None:
+            actions.append("REALIGN")
             if damped is None or damped["turn_needed"]:
                 if hasattr(input_controller, "turn_by_angle") and callable(input_controller.turn_by_angle):
                     turn_dur = damped.get("turn_duration_sec") if damped else None
@@ -356,23 +273,31 @@ class RadarStuckDetector:
                         input_controller.turn_by_angle(angle_diff, duration=turn_dur)
                     except TypeError:
                         input_controller.turn_by_angle(angle_diff)
+                    attempted = True
                 elif hasattr(input_controller, "realign_to_target") and callable(input_controller.realign_to_target):
                     input_controller.realign_to_target(target_bearing)
+                    attempted = True
 
-        self.stuck_start_ts = None
-        self.is_stuck = False
-        self.last_pos = None
+        # H-sweep (dilim 12 Y-1): kontrolcü yokken hiçbir tuşa basılmadı;
+        # "executed: True" üst katmana manevra uygulandı yalanını söylerdi.
+        # executed yalnızca gerçekten bir girdi denendiyse True'dur.
+        executed = bool(attempted)
+        if executed:
+            self.stuck_start_ts = None
+            self.is_stuck = False
+            self.last_pos = None
 
         logger.info(
-            "[RadarStuckDetector] Kurtarma manevrası #%d uygulandı: %s (strafe=%.2fs, açı=%.1f°)",
+            "[RadarStuckDetector] Kurtarma manevrası #%d %s: %s (strafe=%.2fs, açı=%.1f°)",
             self.stuck_count,
-            " -> ".join(actions),
+            "uygulandı" if executed else "UYGULANAMADI (kontrolcü yok)",
+            " -> ".join(actions) if actions else "-",
             self.strafe_duration_sec,
             angle_diff,
         )
 
         res = {
-            "executed": True,
+            "executed": executed,
             "actions": actions,
             "sequence": actions,
             "strafe_key": strafe_key,
@@ -383,7 +308,7 @@ class RadarStuckDetector:
             "turn_needed": bool(damped.get("turn_needed", True)) if damped else True,
             "stuck_count": self.stuck_count,
         }
-        self.history.append(res)
+        _append_bounded(self.history, res, self.max_history)
         return res
 
 
@@ -396,11 +321,16 @@ class WaypointArrivalDetector:
         self,
         waypoint_radius_px: float = DEFAULT_WAYPOINT_RADIUS_PX,
         waypoint_radius_m: float = DEFAULT_WAYPOINT_RADIUS_M,
-        meters_per_px: float = 0.55,
+        # H-sweep (dilim 12 Y-3): ölçek corridor_navigator.MINIMAP_METERS_PER_PX
+        # tek kaynağından gelir (0.55); 0.65/0.28/0.25 değerleri başka
+        # uzaylara/modüllere aittir, buraya yazılmaz.
+        meters_per_px: float = MINIMAP_METERS_PER_PX,
+        max_history: int = DEFAULT_MAX_HISTORY,
     ) -> None:
         self.waypoint_radius_px: float = float(max(1.0, waypoint_radius_px))
         self.waypoint_radius_m: float = float(max(0.5, waypoint_radius_m))
         self.meters_per_px: float = float(max(0.05, meters_per_px))
+        self.max_history: int = max(1, int(max_history))
         self.transitions_count: int = 0
         self.history: List[Dict[str, Any]] = []
 
@@ -426,17 +356,29 @@ class WaypointArrivalDetector:
 
         if distance_m is not None:
             m_dist = float(distance_m)
+            distance_source = "measured"  # OCR / HUD'dan bağımsız ölçüm
         else:
             m_dist = px_dist * self.meters_per_px
+            distance_source = "derived_from_px"  # pikselden türetildi
 
         reached_px = px_dist <= self.waypoint_radius_px
         reached_m = m_dist <= self.waypoint_radius_m
-        arrived = bool(reached_px or reached_m)
+        # F-0324: varış için İKİ ölçümün de eşik içinde olması gerekir. OR
+        # mantığı 20px (≈11m) ile 3m arasındaki tutarsızlığı gizleyip
+        # 11m uzaktan "vardım" dedirtiyordu; AND ile iki ölçüm de
+        # doğrulanmadan varış sayılmaz.
+        # H-sweep (dilim 12 O-6): distance_m türetilmişse iki koşul aynı
+        # sayının iki yazımıdır — AND anlamsızlaşmaz ama bağlayıcı olan
+        # metre eşiğidir (px<=20 ⟺ m<=11 iken m<=3, yani px<=5.45).
+        # Davranış korunur (F-0324 koruması); yalnızca kaynak döndürülür
+        # ki çağıran iki bağımsız ölçüm var sanmasın.
+        arrived = bool(reached_px and reached_m)
 
         return {
             "arrived": arrived,
             "pixel_distance": round(px_dist, 3),
             "distance_m": round(m_dist, 2),
+            "distance_source": distance_source,
             "radius_px": self.waypoint_radius_px,
             "radius_m": self.waypoint_radius_m,
             "reached_px": reached_px,
@@ -529,7 +471,7 @@ class WaypointArrivalDetector:
             "next_node": next_node,
             **arrival_info,
         }
-        self.history.append(record)
+        _append_bounded(self.history, record, self.max_history)
         logger.info(
             "[WaypointArrival] Hedef düğüme ulaşıldı (mesafe=%.1fpx / %.2fm <= eşik %.1fpx / %.1fm) -> "
             "Sıradaki düğüme (#%d) geçildi.",
@@ -545,11 +487,62 @@ class WaypointArrivalDetector:
 # ==============================================================================
 # YARDIMCI FONKSİYONLAR
 # ==============================================================================
+def _probe_navigation_intel_ready(obj: Any) -> Tuple[bool, Dict[str, bool]]:
+    """
+    F-0478: NavigationIntel hazır olma probu — gerçek bileşen durumunu
+    yoklar; hazır bayrağı artık koşulsuz True değildir. Karar 3
+    (F-0208) gereği hazır bayrakları gerçek proba bağlanır.
+    """
+    checks: Dict[str, bool] = {}
+    try:
+        stuck = getattr(obj, "stuck_detector", None)
+        checks["stuck_detector"] = bool(
+            stuck is not None
+            and hasattr(stuck, "stuck_count")
+            and hasattr(stuck, "update_position")
+        )
+        waypoint = getattr(obj, "waypoint_detector", None)
+        checks["waypoint_detector"] = bool(
+            waypoint is not None
+            and hasattr(waypoint, "transitions_count")
+            and hasattr(waypoint, "is_arrival_reached")
+        )
+        damper = getattr(obj, "turn_damper", None)
+        checks["turn_damper"] = bool(
+            damper is not None and hasattr(damper, "calculate_turn")
+        )
+        micro = getattr(obj, "micro_navigator", None)
+        checks["micro_navigator"] = bool(micro is not None)
+        try:
+            deadband = float(getattr(obj, "deadband_deg"))
+            checks["deadband_in_range"] = MIN_DEADBAND_DEG <= deadband <= MAX_DEADBAND_DEG
+        except (TypeError, ValueError):
+            checks["deadband_in_range"] = False
+        try:
+            checks["waypoint_radius_valid"] = (
+                float(getattr(obj, "waypoint_radius_px")) > 0
+                and float(getattr(obj, "waypoint_radius_m")) > 0
+            )
+        except (TypeError, ValueError):
+            checks["waypoint_radius_valid"] = False
+        try:
+            checks["stuck_timeout_valid"] = float(getattr(obj, "stuck_timeout_sec")) > 0
+        except (TypeError, ValueError):
+            checks["stuck_timeout_valid"] = False
+    except Exception:
+        return False, checks
+    return bool(checks and all(checks.values())), checks
+
+
 def get_navigation_intel_summary(self) -> dict:
     try:
-        return {"intel_ready": True, "metrics": getattr(self, "__dict__", {})}
+        # F-0478: başarı yolu da proba bağlı — eskiden hata durumunda
+        # bile intel_ready=True dönüyordu, başarı yolunda ise koşulsuz
+        # True + ham __dict__ dönüyordu.
+        ready, checks = _probe_navigation_intel_ready(self)
+        return {"intel_ready": ready, "checks": checks, "metrics": getattr(self, "__dict__", {})}
     except Exception as e:
-        return {"intel_ready": True, "error": str(e)}
+        return {"intel_ready": False, "error": str(e)}
 
 
 def _send_key_via_controller(
@@ -563,7 +556,10 @@ def _send_key_via_controller(
     """
     clean_key = str(key or "f").strip().lower() or "f"
     if input_ctrl is None:
-        return bool(test_mode)
+        # F-0325: kontrolcü yokken hiçbir tuş basılmadı; test_mode
+        # True bile olsa başarı raporlanmaz (önceden bool(test_mode)
+        # dönüp basılmamış tuşu "basıldı" sayıyordu).
+        return False
 
     try:
         if clean_key == "f" and hasattr(input_ctrl, "send_gather_key") and not hasattr(input_ctrl, "press_key"):
@@ -588,6 +584,77 @@ def _send_key_via_controller(
         logger.error("Tuş gönderimi başarısız ('%s'): %s", clean_key, exc)
         return False
     return False
+
+
+# ==============================================================================
+# YEDEK (FALLBACK) GÖRSEL MOTORLAR — gecikmeli (lazy) paylaşılan örnekler
+# ==============================================================================
+# _detect_prompt_from_vision_or_frame / _detect_chat_alerts_unified, çağıran
+# kendi motorunu vermediğinde her çağrıda VisionEngine() (~1.0 sn) /
+# GameHUDReader() (~0.13-0.47 sn) kuruyordu; 50 ms poll döngüsünde bu,
+# doğrulama penceresini kat kat aşan gecikme demekti. Motorların detect_*
+# metotları yalnızca frame alır ve çağrılar arasında paylaşılabilir.
+# B-03 disiplini: paylaşılan yedek motorun durumu (özellikle
+# VisionEngine.last_detected_gather_key) HER yedek kullanım öncesi
+# sıfırlanır — önceki, alakasız kareden kalan F/E tuşu sonraki çağrıda
+# "tespit" olarak dönemez. Yedek kullanım debug-loglanır ve sohbet
+# uyarısı sonucu "source" ile etiketlenir (birincil mi yedek mi belli).
+# Kurulum başarısız olursa önbelleğe alınmaz: eski davranış gibi bir
+# sonraki çağrıda yeniden denenir.
+_FALLBACK_VISION_ENGINE: Optional[Any] = None
+_FALLBACK_HUD_READER: Optional[Any] = None
+# S081 (v19/P3-8): yedek motor singleton'ları kilitsiz kuruluyordu —
+# iki thread aynı anda VisionEngine() (~1 sn) kurup birini
+# ezebiliyordu; B-03 sıfırlamasıyla yarış da mümkündü. Çift
+# kontrollü kilit (stability_guards.py deseni).
+_FALLBACK_ENGINES_LOCK = threading.Lock()
+
+
+def _get_fallback_vision_engine() -> Optional[Any]:
+    """Paylaşılan yedek VisionEngine örneğini döndürür (ilk çağrıda kurar)."""
+    global _FALLBACK_VISION_ENGINE
+    if _FALLBACK_VISION_ENGINE is None:
+        with _FALLBACK_ENGINES_LOCK:
+            if _FALLBACK_VISION_ENGINE is None:
+                try:
+                    from core.vision import VisionEngine
+
+                    _FALLBACK_VISION_ENGINE = VisionEngine()
+                except Exception as exc:
+                    logger.debug("Yedek VisionEngine kurulamadı: %s", exc)
+                    return None
+    return _FALLBACK_VISION_ENGINE
+
+
+def _get_fallback_hud_reader() -> Optional[Any]:
+    """Paylaşılan yedek GameHUDReader örneğini döndürür (ilk çağrıda kurar)."""
+    global _FALLBACK_HUD_READER
+    if _FALLBACK_HUD_READER is None:
+        with _FALLBACK_ENGINES_LOCK:
+            if _FALLBACK_HUD_READER is None:
+                try:
+                    _FALLBACK_HUD_READER = GameHUDReader()
+                except Exception as exc:
+                    logger.debug("Yedek GameHUDReader kurulamadı: %s", exc)
+                    return None
+    return _FALLBACK_HUD_READER
+
+
+def _reset_fallback_vision_state(engine: Any, default_key: str = "f") -> None:
+    """Paylaşılan yedek motorun çağrılar-arası durumunu sıfırla (B-03).
+
+    VisionEngine.last_detected_gather_key önceki kareden kalmışsa bu
+    karede hiç tespit yapılmasa bile eski F/E tuşu "tespit" gibi okunur.
+    Yedek motor her kullanım öncesi varsayılan tuşa sıfırlanır; tespit
+    metodu bu karede bulursa anahtarı kendisi günceller.
+    """
+    if engine is None:
+        return
+    try:
+        if hasattr(engine, "last_detected_gather_key"):
+            setattr(engine, "last_detected_gather_key", str(default_key or "f").strip().lower() or "f")
+    except Exception as exc:
+        logger.debug("Yedek motor durumu sıfırlanamadı: %s", exc)
 
 
 def _detect_prompt_from_vision_or_frame(
@@ -634,10 +701,22 @@ def _detect_prompt_from_vision_or_frame(
                         return True, detected_key
 
             if hasattr(vision_engine, "detect_floating_resource_icon") and frame is not None:
-                icon_res = vision_engine.detect_floating_resource_icon(frame, close_range_only=True)
+                # F-0034: vision.detect_floating_resource_icon(frame, threshold,
+                # use_roi, roi_norm) imzası close_range_only kabul etmez; eski
+                # çağrı TypeError fırlatıp dış try'da sessizce yutuluyordu.
+                # Desteklenen imza ile çağır, 4'lü dönüşü (found, conf,
+                # center, key) doğrudan oku.
+                icon_res = vision_engine.detect_floating_resource_icon(frame)
                 if isinstance(icon_res, tuple) and len(icon_res) >= 1 and bool(icon_res[0]):
-                    last_k = str(getattr(vision_engine, "last_detected_gather_key", "e") or "e").strip().lower()
-                    return True, (last_k if last_k in ("f", "e") else "e")
+                    k_val = (
+                        str(icon_res[3]).strip().lower()
+                        if len(icon_res) >= 4 and isinstance(icon_res[3], str)
+                        else ""
+                    )
+                    if k_val not in ("f", "e"):
+                        last_k = str(getattr(vision_engine, "last_detected_gather_key", "e") or "e").strip().lower()
+                        k_val = last_k if last_k in ("f", "e") else "e"
+                    return True, k_val
                 if isinstance(icon_res, dict) and bool(icon_res.get("detected", icon_res.get("found", False))):
                     k_val = str(icon_res.get("key", icon_res.get("gather_key", "e"))).strip().lower()
                     return True, (k_val if k_val in ("f", "e") else "e")
@@ -646,8 +725,14 @@ def _detect_prompt_from_vision_or_frame(
 
     if frame is not None and isinstance(frame, np.ndarray) and frame.size > 0:
         try:
-            from core.vision import VisionEngine
-            temp_vision = VisionEngine()
+            temp_vision = _get_fallback_vision_engine()
+            if temp_vision is None:
+                return False, detected_key
+            # B-03: paylaşılan yedek motorun önceki kareden kalan
+            # last_detected_gather_key durumu bu kullanım öncesi sıfırlanır;
+            # aksi halde eski F/E tuşu bu karede "tespit" gibi dönerdi.
+            _reset_fallback_vision_state(temp_vision, detected_key)
+            logger.debug("Gather prompt yedek VisionEngine ile kontrol ediliyor (kaynak: fallback).")
             found, score, _ = temp_vision.detect_gather_prompt(frame)
             if found and score >= 0.65:
                 k_val = str(getattr(temp_vision, "last_detected_gather_key", detected_key) or detected_key).lower()
@@ -689,10 +774,18 @@ def _detect_chat_alerts_unified(
         if "cannot mount in current state" in lower_txt or "cannot mount" in lower_txt:
             cannot_mount = True
 
+    # B-03: sonucun kaynağı etiketlenir — çağıran kararın birincil
+    # motordan mı yedek motordan mı geldiğini ayırt edebilir.
+    source = "none"
+    if isinstance(chat_alerts, dict) and chat_alerts:
+        source = "chat_alerts"
+    if isinstance(chat_text, str) and chat_text.strip():
+        source = "chat_text"
     if frame is not None and isinstance(frame, np.ndarray) and frame.size > 0:
         try:
-            reader = hud_reader if hud_reader is not None else GameHUDReader()
-            if hasattr(reader, "detect_chat_system_alerts"):
+            reader = hud_reader if hud_reader is not None else _get_fallback_hud_reader()
+            if reader is not None and hasattr(reader, "detect_chat_system_alerts"):
+                source = "hud_reader" if hud_reader is not None else "fallback_hud_reader"
                 det = reader.detect_chat_system_alerts(frame)
                 if isinstance(det, dict):
                     extraction_failed = extraction_failed or bool(det.get("extraction_failed", False))
@@ -705,6 +798,7 @@ def _detect_chat_alerts_unified(
         "extraction_failed": bool(extraction_failed),
         "cannot_mount": bool(cannot_mount),
         "orange_warning_ratio": round(float(orange_ratio), 6),
+        "source": source,
     }
 
 
@@ -730,7 +824,11 @@ def _resolve_node_reference(
         return nid, nobj
 
     if isinstance(node_or_id, NodeData):
-        nid = int(node_or_id.id)
+        # F-0326: bozuk id çökmesin.
+        try:
+            nid = int(node_or_id.id)
+        except (TypeError, ValueError):
+            return None, node_or_id
         if route_mgr is not None and hasattr(route_mgr, "get_node"):
             rm_node = route_mgr.get_node(nid, region=region or node_or_id.region)
             if rm_node is not None:
@@ -738,14 +836,29 @@ def _resolve_node_reference(
         return nid, node_or_id
 
     if isinstance(node_or_id, dict):
-        nid = int(node_or_id.get("id", node_or_id.get("node_id", 1)))
+        # F-0152/F-0326: id'siz / bozuk id'li referans sessizce düğüm #1
+        # olmasın; çözülemezse (None, node_or_id) dön, çağıran karar versin.
+        raw_id = node_or_id.get("id", node_or_id.get("node_id"))
+        if raw_id is None:
+            return None, node_or_id
+        try:
+            nid = int(raw_id)
+        except (TypeError, ValueError):
+            return None, node_or_id
         if route_mgr is not None and hasattr(route_mgr, "get_node"):
             rm_node = route_mgr.get_node(nid, region=region or node_or_id.get("region"))
             if rm_node is not None:
                 return nid, rm_node
         return nid, node_or_id
 
-    nid = int(getattr(node_or_id, "id", 1))
+    # F-0326: bilinmeyen tipte nesnede korumasız int(...) çöküyordu.
+    raw_id = getattr(node_or_id, "id", None)
+    if raw_id is None:
+        return None, node_or_id
+    try:
+        nid = int(raw_id)
+    except (TypeError, ValueError):
+        return None, node_or_id
     return nid, node_or_id
 
 
@@ -794,8 +907,10 @@ def handle_extraction_failure(
         )
         is_failed = bool(alerts.get("extraction_failed", False))
     else:
-        # Doğrudan hata işleyici olarak çağrıldıysa True kabul et
-        is_failed = True
+        # F-0035: kanıt yokken (extraction_failed, chat_text, chat_alerts,
+        # frame hiçbiri verilmediyse) başarısız varsaymak yanlış; bilinmeyen
+        # durum "başarısız değil"dir, çağıran kanıtla çağırmalı.
+        is_failed = False
 
     # Mevcut hasat sayılarını oku (değiştirmeden koru!)
     if isinstance(node_obj, dict):
@@ -910,6 +1025,7 @@ class PartialNodeDetector:
         sleep_fn: Optional[Callable[[float], None]] = None,
         route_mgr: Optional[RouteManager] = None,
         vision: Any = None,
+        max_history: int = DEFAULT_MAX_HISTORY,
     ) -> None:
         self.route_manager: Optional[RouteManager] = route_manager or route_mgr
         self.vision_engine: Any = vision_engine or vision
@@ -917,6 +1033,7 @@ class PartialNodeDetector:
         self.verification_window_sec: float = max(self.reprompt_wait_sec, float(verification_window_sec))
         self.poll_interval_sec: float = max(0.005, float(poll_interval_sec))
         self.default_rest_minutes: float = max(0.1, float(default_rest_minutes))
+        self.max_history: int = max(1, int(max_history))
         self._sleep: Callable[[float], None] = sleep_fn if callable(sleep_fn) else time.sleep
 
         self.partial_nodes_detected: int = 0
@@ -944,16 +1061,58 @@ class PartialNodeDetector:
             self._sleep(self.reprompt_wait_sec)
             waited_sec += self.reprompt_wait_sec
 
-        if prompt_reappeared is not None:
-            return bool(prompt_reappeared), str(default_key or "f").lower(), round(waited_sec, 4)
+        # S076 (v19/P3-8) — 2 kare kuralı: tek karelik prompt kabulü,
+        # şablon parlamasında sahte F'e yol açıyordu. İlk olumlu tespit,
+        # taze kaynaktan (aynı prompt_detector / frame_provider) bir kez
+        # daha doğrulanır. Taze kaynak yoksa (yalnızca statik kare)
+        # ikinci kare üretilemez — tek kare kabul edilir (belgelendi).
+        # prompt_reappeared=True kısayolu (F-0036) çağıranın açık
+        # kanıtıdır, görsel tespit değildir; o etkilenmez.
+        def _second_positive(via: str) -> bool:
+            # Doğrulama, olumlu tespitin geldiği kaynaktan yapılır.
+            if via == "detector":
+                if not callable(prompt_detector):
+                    return True
+                try:
+                    res2 = prompt_detector()
+                except Exception:
+                    return False
+                if isinstance(res2, tuple):
+                    return bool(res2[0]) if len(res2) >= 1 else False
+                return bool(res2)
+            if not callable(frame_provider):
+                return True
+            try:
+                frame2 = frame_provider()
+            except Exception:
+                return False
+            found2, _ = _detect_prompt_from_vision_or_frame(
+                vision_engine=self.vision_engine,
+                frame=frame2,
+                default_key=default_key,
+            )
+            return bool(found2)
+
+        def _confirm_first_positive(via: str) -> bool:
+            nonlocal waited_sec
+            self._sleep(self.poll_interval_sec)
+            waited_sec += self.poll_interval_sec
+            return _second_positive(via)
+
+        # F-0036: prompt_reappeared=True olumlu kanıttır, kısayol sayılır;
+        # False ise görsel kontrol yapılmadan RESTING'e götüren kısayol
+        # OLAMAZ — False geldiğinde aşağıdaki gerçek görsel doğrulama
+        # çalışır, yalnızca o da bulamazsa False döner.
+        if prompt_reappeared is True:
+            return True, str(default_key or "f").lower(), round(waited_sec, 4)
 
         if callable(prompt_detector):
             res = prompt_detector()
             if isinstance(res, tuple) and len(res) >= 1:
                 k = str(res[1]).lower() if len(res) >= 2 and res[1] else default_key
-                if bool(res[0]):
+                if bool(res[0]) and _confirm_first_positive("detector"):
                     return True, k, round(waited_sec, 4)
-            elif bool(res):
+            elif bool(res) and _confirm_first_positive("detector"):
                 return True, default_key, round(waited_sec, 4)
 
         # İlk kontrol
@@ -963,11 +1122,13 @@ class PartialNodeDetector:
             frame=current_frame,
             default_key=default_key,
         )
-        if found:
+        if found and _confirm_first_positive("frame"):
             return True, det_key, round(waited_sec, 4)
 
-        # Eğer dinamik sağlayıcı varsa kalan doğrulama penceresi boyunca yokla
-        remaining_window = max(0.0, self.verification_window_sec - self.reprompt_wait_sec)
+        # F-0327: pencere, gerçekten beklenen süreden kısaltılır;
+        # wait_initial_400ms=False iken bekleme 0 olmasına rağmen eskiden
+        # her zaman 0.85 − 0.40 = 0.45 sn oluyordu.
+        remaining_window = max(0.0, self.verification_window_sec - waited_sec)
         if remaining_window > 0.0 and (callable(frame_provider) or callable(prompt_detector)):
             deadline = time.monotonic() + remaining_window
             while time.monotonic() < deadline:
@@ -977,9 +1138,11 @@ class PartialNodeDetector:
                     res = prompt_detector()
                     if isinstance(res, tuple) and len(res) >= 1 and bool(res[0]):
                         k = str(res[1]).lower() if len(res) >= 2 and res[1] else default_key
-                        return True, k, round(waited_sec, 4)
+                        if _confirm_first_positive("detector"):
+                            return True, k, round(waited_sec, 4)
                     if not isinstance(res, tuple) and bool(res):
-                        return True, default_key, round(waited_sec, 4)
+                        if _confirm_first_positive("detector"):
+                            return True, default_key, round(waited_sec, 4)
                 if callable(frame_provider):
                     polled_frame = frame_provider()
                     found, det_key = _detect_prompt_from_vision_or_frame(
@@ -987,7 +1150,7 @@ class PartialNodeDetector:
                         frame=polled_frame,
                         default_key=default_key,
                     )
-                    if found:
+                    if found and _confirm_first_positive("frame"):
                         return True, det_key, round(waited_sec, 4)
 
         return False, det_key, round(waited_sec, 4)
@@ -1016,7 +1179,22 @@ class PartialNodeDetector:
         """
         active_rm = route_mgr or self.route_manager
         node_id, node_obj = _resolve_node_reference(node_or_id, route_mgr=active_rm, region=region)
-        resolved_id = int(node_id if node_id is not None else 1)
+        # F-0152: çözülemeyen referans sessizce düğüm #1 olmasın; id yoksa
+        # hiçbir düğüm dinlendirilmez, çözümsüzlük raporlanır.
+        if node_id is None:
+            return {
+                "is_partial_node": False,
+                "depleted_early": False,
+                "node_id": None,
+                "completed_harvests": completed_harvests,
+                "max_harvests": max_harvests,
+                "missing_harvests": None,
+                "prompt_reappeared": prompt_reappeared,
+                "node_state": "unknown",
+                "rest_duration_sec": 0,
+                "action": "UNRESOLVED_NODE",
+            }
+        resolved_id = int(node_id)
 
         if completed_harvests is None:
             if isinstance(node_obj, dict):
@@ -1040,6 +1218,19 @@ class PartialNodeDetector:
 
         # Eğer zaten 3/3 (veya max_harvests) tamamlandıysa bu bir partial node değil, tam hasattır
         if comp_h >= target_h:
+            # F-0146: dal "resting" yazıp düğümü dinlendirmiyordu; tam
+            # hasat da gerçekten RESTING'e alınır (route_mgr + yerel nesne).
+            rest_sec = int(round(effective_rest * 60.0))
+            now_ts = time.time()
+            updated_node = None
+            if active_rm is not None and hasattr(active_rm, "mark_node_gathered"):
+                updated_node = active_rm.mark_node_gathered(
+                    resolved_id,
+                    rest_minutes=effective_rest,
+                    force_deplete=True,
+                    region=region,
+                )
+            _sync_resting_nodes(node_obj, node_or_id, updated_node, rest_sec, now_ts)
             return {
                 "is_partial_node": False,
                 "depleted_early": False,
@@ -1049,7 +1240,7 @@ class PartialNodeDetector:
                 "missing_harvests": 0,
                 "prompt_reappeared": False,
                 "node_state": "resting",
-                "rest_duration_sec": int(round(effective_rest * 60.0)),
+                "rest_duration_sec": rest_sec,
                 "action": "FULL_HARVEST_COMPLETED",
             }
 
@@ -1091,19 +1282,7 @@ class PartialNodeDetector:
         # Doğrudan geçirilen node_or_id nesnesini de senkronize et
         rest_sec = int(round(effective_rest * 60.0))
         now_ts = time.time()
-        for obj in (node_obj, node_or_id if isinstance(node_or_id, (NodeData, dict)) else None):
-            if obj is None or obj is updated_node:
-                continue
-            if isinstance(obj, dict):
-                obj["current_harvests"] = 0
-                obj["state"] = "resting"
-                obj["last_visited_timestamp"] = now_ts
-                obj["rest_duration_sec"] = rest_sec
-            else:
-                obj.current_harvests = 0
-                obj.state = "resting"
-                obj.last_visited_timestamp = now_ts
-                obj.rest_duration_sec = rest_sec
+        _sync_resting_nodes(node_obj, node_or_id, updated_node, rest_sec, now_ts)
 
         self.partial_nodes_detected += 1
         event = {
@@ -1120,7 +1299,7 @@ class PartialNodeDetector:
             "action": "MARKED_RESTING_FORCE_DEPLETE",
             "timestamp": now_ts,
         }
-        self.history.append(event)
+        _append_bounded(self.history, event, self.max_history)
         logger.info(
             "[PartialNodeDetector] Düğüm #%d kısmi hasat sonrasında tükendi (%d/%d tamamlandı, "
             "başka oyuncu tarafından yarım bırakılmış). 3. hasat beklenmeden RESTING (%d sn) durumuna alındı.",
@@ -1140,6 +1319,121 @@ class PartialNodeDetector:
 # ==============================================================================
 # MADDE 21 — 3 AŞAMALI (`1/3 ➔ 2/3 ➔ 3/3`) 400ms RE-PROMPT TOPLAMA DÖNGÜSÜ
 # ==============================================================================
+def _append_bounded(
+    history: List[Dict[str, Any]],
+    record: Dict[str, Any],
+    max_len: int,
+) -> None:
+    """
+    history listesine kayıt ekler; liste max_len'i aşarsa en eski kayıtları
+    atar. Uzun bot oturumlarında sınırsız büyüme (bellek sızıntısı) engellenir;
+    sayaçlar (stuck_count, transitions_count, partial_nodes_detected) ayrı
+    tutulduğundan kırpma hiçbir sayacı sıfırlamaz.
+    """
+    history.append(record)
+    cap = max(1, int(max_len))
+    excess = len(history) - cap
+    if excess > 0:
+        del history[:excess]
+
+
+def _apply_node_harvest_state(
+    node_obj: Any,
+    *,
+    current_harvests: int,
+    state: str,
+    rest_sec: int = 0,
+    now_ts: Optional[float] = None,
+    stamp_rest: bool = False,
+) -> None:
+    """
+    Tek düğüm nesnesine (dict veya NodeData) hasat sonrası durumu yazar.
+    dict/nesne ayrımı tek noktada yapılır; çağıranlar aynı yazımı 3 ayrı
+    yerde tekrarlamaz. stamp_rest=True ise dinlenme zaman damgası da yazılır
+    (tükenmeyen düğümde last_visited/rest_duration yazılmaz).
+    """
+    if node_obj is None:
+        return
+    if isinstance(node_obj, dict):
+        node_obj["current_harvests"] = int(current_harvests)
+        node_obj["state"] = str(state)
+        if stamp_rest:
+            node_obj["last_visited_timestamp"] = now_ts
+            node_obj["rest_duration_sec"] = int(rest_sec)
+    else:
+        node_obj.current_harvests = int(current_harvests)
+        node_obj.state = str(state)
+        if stamp_rest:
+            node_obj.last_visited_timestamp = now_ts
+            node_obj.rest_duration_sec = int(rest_sec)
+
+
+def _sync_resting_nodes(
+    node_obj: Any,
+    node_or_id: Any,
+    updated_node: Any,
+    rest_sec: int,
+    now_ts: float,
+) -> None:
+    """
+    route_mgr'in döndürdüğü (updated_node) dışındaki düğüm referanslarını
+    RESTING durumuna senkronize eder: current_harvests=0, state="resting",
+    dinlenme zaman damgası yazılır. PartialNodeDetector'ın tam-hasat ve
+    kısmi-hasat dallarındaki aynı döngünün tek kaynağıdır.
+    """
+    for obj in (node_obj, node_or_id if isinstance(node_or_id, (NodeData, dict)) else None):
+        if obj is None or obj is updated_node:
+            continue
+        _apply_node_harvest_state(
+            obj,
+            current_harvests=0,
+            state="resting",
+            rest_sec=rest_sec,
+            now_ts=now_ts,
+            stamp_rest=True,
+        )
+
+
+def _node_ready_for_fresh_cycle(node_obj: Any, now: Optional[float] = None) -> bool:
+    """
+    F-0320: tam hasatlı (current >= max) düğümde yeni döngüye başlamadan
+    önce hazır olma kontrolü. NodeData.is_ready() varsa onu, dict ise
+    state/last_visited_timestamp/rest_duration_sec ile aynı mantığı kullanır.
+    Bilgi yoksa hazır sayılır (eski davranış korunur).
+    """
+    if node_obj is None:
+        return True
+    if hasattr(node_obj, "is_ready") and callable(node_obj.is_ready):
+        try:
+            return bool(node_obj.is_ready(now=now))
+        except Exception:
+            return True
+    if isinstance(node_obj, dict):
+        state = str(node_obj.get("state", "active") or "active")
+        try:
+            curr = int(node_obj.get("current_harvests", 0) or 0)
+            max_h = max(1, int(node_obj.get("max_harvests", DEFAULT_MAX_HARVESTS) or DEFAULT_MAX_HARVESTS))
+        except (TypeError, ValueError):
+            return True
+        if state in ("active", "gathering") and 0 < curr < max_h:
+            return True
+        try:
+            last = float(node_obj.get("last_visited_timestamp", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        if last <= 0.0:
+            return state != "resting"
+        try:
+            duration = int(node_obj.get("rest_duration_sec", 0) or 0)
+        except (TypeError, ValueError):
+            return True
+        if duration <= 0:
+            return True
+        current_time = time.time() if now is None else float(now)
+        return (current_time - last) >= float(duration)
+    return True
+
+
 class ThreeStageHarvestController:
     """
     Madde 21 — 3 Aşamalı (`1/3 ➔ 2/3 ➔ 3/3`) Dinamik Toplama Döngüsü (`ThreeStageHarvestController`):
@@ -1249,7 +1543,21 @@ class ThreeStageHarvestController:
             route_mgr=self.route_manager,
             region=region,
         )
-        self.active_node_id = int(node_id if node_id is not None else 1)
+        # F-0152: çözülemeyen referans sessizce düğüm #1 olmasın.
+        if node_id is None:
+            return {
+                "node_id": None,
+                "state": self.state,
+                "is_anchored": False,
+                "current_harvests": self.current_harvests,
+                "max_harvests": self.max_harvests,
+                "target_stage": f"{self.current_harvests + 1}/{self.max_harvests}",
+                "gather_key": self.gather_key,
+                "key_pressed": False,
+                "not_ready": True,
+                "reason": "UNRESOLVED_NODE",
+            }
+        self.active_node_id = int(node_id)
         self.active_node = node_obj if node_obj is not None else (
             node_or_id if isinstance(node_or_id, (NodeData, dict)) else None
         )
@@ -1270,7 +1578,29 @@ class ThreeStageHarvestController:
         else:
             initial_curr = 0
 
+        # F-0320: tamamlanmış düğümde sayacı sıfırlayıp yeniden toplama;
+        # önce hazır mı kontrol edilir — dinlenmedeyse başlatılmaz.
         if initial_curr >= resolved_max:
+            ready_obj = node_obj
+            if ready_obj is None and self.route_manager is not None and hasattr(self.route_manager, "get_node"):
+                try:
+                    ready_obj = self.route_manager.get_node(int(node_id), region=region)
+                except Exception:
+                    ready_obj = None
+            if not _node_ready_for_fresh_cycle(ready_obj if ready_obj is not None else self.active_node):
+                self.active_node_id = int(node_id)
+                return {
+                    "node_id": int(node_id),
+                    "state": self.state,
+                    "is_anchored": False,
+                    "current_harvests": initial_curr,
+                    "max_harvests": resolved_max,
+                    "target_stage": f"{initial_curr + 1}/{resolved_max}",
+                    "gather_key": self.gather_key,
+                    "key_pressed": False,
+                    "not_ready": True,
+                    "reason": "NODE_NOT_READY",
+                }
             initial_curr = 0
 
         self.max_harvests = resolved_max
@@ -1325,6 +1655,9 @@ class ThreeStageHarvestController:
         ve aynı aşamayı (`1/3`, `2/3` veya `3/3`) anında yeniden başlatmak için `F` / `E` basar.
         """
         target_ref = node_or_id if node_or_id is not None else (self.active_node or self.active_node_id)
+        # F-0474: max_retries_per_stage artık doğrudan çağrı yolunda da
+        # uygulanır — kota dolunca yeniden basılmaz, aşama bırakılır.
+        retries_left = self.max_retries_per_stage - self.extraction_retries
         res = handle_extraction_failure(
             node_or_id=target_ref,
             route_mgr=self.route_manager,
@@ -1336,13 +1669,19 @@ class ThreeStageHarvestController:
             extraction_failed=extraction_failed,
             hud_reader=self.hud_reader,
             region=region,
-            retry_press=retry_press,
+            retry_press=bool(retry_press) and retries_left > 0,
             test_mode=self.test_mode,
         )
         if res.get("extraction_failed"):
             self.extraction_retries += 1
-            self.is_anchored = True
-            self.state = self.STATE_ANCHORED_GATHERING
+            if self.extraction_retries >= self.max_retries_per_stage:
+                # Kota doldu: düğümde çakılı kalma, sabiti bırak.
+                res["retries_exhausted"] = True
+                self.is_anchored = False
+                self.state = self.STATE_IDLE
+            else:
+                self.is_anchored = True
+                self.state = self.STATE_ANCHORED_GATHERING
         return res
 
     def on_cast_completed(
@@ -1373,11 +1712,41 @@ class ThreeStageHarvestController:
         4. `3/3` tamamlandıysa düğümü `RESTING` (5 dk) durumuna geçirir ve `is_anchored=False` yapar.
         """
         if node_or_id is not None and self.active_node_id is None:
-            self.start_node(node_or_id, gather_key=gather_key, region=region)
+            start_res = self.start_node(node_or_id, gather_key=gather_key, region=region)
+            if start_res.get("not_ready"):
+                return {
+                    "status": "NODE_NOT_READY",
+                    "node_id": start_res.get("node_id"),
+                    "current_harvests": self.current_harvests,
+                    "max_harvests": self.max_harvests,
+                    "stage": f"{self.current_harvests}/{self.max_harvests}",
+                    "extraction_failed": False,
+                    "re_pressed": False,
+                    "is_anchored": False,
+                    "node_depleted": False,
+                    "partial_node": False,
+                    "reason": start_res.get("reason", "NODE_NOT_READY"),
+                    "state": self.state,
+                }
 
         target_ref = node_or_id if node_or_id is not None else (self.active_node or self.active_node_id)
         node_id, node_obj = _resolve_node_reference(target_ref, route_mgr=self.route_manager, region=region)
-        resolved_id = int(node_id if node_id is not None else (self.active_node_id or 1))
+        # F-0152: çözülemeyen referans sessizce düğüm #1 olmasın.
+        if node_id is None and self.active_node_id is None:
+            return {
+                "status": "UNRESOLVED_NODE",
+                "node_id": None,
+                "current_harvests": self.current_harvests,
+                "max_harvests": self.max_harvests,
+                "stage": f"{self.current_harvests}/{self.max_harvests}",
+                "extraction_failed": False,
+                "re_pressed": False,
+                "is_anchored": self.is_anchored,
+                "node_depleted": False,
+                "partial_node": False,
+                "state": self.state,
+            }
+        resolved_id = int(node_id if node_id is not None else self.active_node_id)
         self.active_node_id = resolved_id
         if node_obj is not None:
             self.active_node = node_obj
@@ -1404,6 +1773,23 @@ class ThreeStageHarvestController:
                 retry_press=True,
             )
             if fail_res.get("extraction_failed"):
+                # F-0474: kota dolduysa RETRY_EXHAUSTED dön, çakılı kalma.
+                if fail_res.get("retries_exhausted"):
+                    return {
+                        "status": "RETRY_EXHAUSTED",
+                        "node_id": resolved_id,
+                        "current_harvests": self.current_harvests,
+                        "max_harvests": self.max_harvests,
+                        "stage": f"{self.current_harvests}/{self.max_harvests}",
+                        "retry_stage": fail_res["retry_stage"],
+                        "extraction_failed": True,
+                        "retries_exhausted": True,
+                        "re_pressed": fail_res["re_pressed"],
+                        "is_anchored": False,
+                        "node_depleted": False,
+                        "partial_node": False,
+                        "state": self.state,
+                    }
                 return {
                     "status": "RETRY_STAGE",
                     "node_id": resolved_id,
@@ -1433,15 +1819,25 @@ class ThreeStageHarvestController:
             else:
                 self.current_harvests = curr_h
                 self.max_harvests = max_h
+            # F-0474: aşama başarıyla ilerledi — retry sayacı sıfırlanır.
+            self.extraction_retries = 0
         else:
             self.current_harvests += 1
+            # F-0474: aşama başarıyla ilerledi — retry sayacı bu aşama için sıfırlanır.
+            self.extraction_retries = 0
             is_depleted = self.current_harvests >= self.max_harvests
-            if isinstance(self.active_node, dict):
-                self.active_node["current_harvests"] = 0 if is_depleted else self.current_harvests
-                self.active_node["state"] = "resting" if is_depleted else "active"
-            elif self.active_node is not None:
-                self.active_node.current_harvests = 0 if is_depleted else self.current_harvests
-                self.active_node.state = "resting" if is_depleted else "active"
+            # F-0147: yedek dalda tükenen düğüme dinlenme zaman damgası da
+            # yazılır; yoksa last_visited=0 kalıp düğüm kalıcı ölü olurdu.
+            rest_sec = int(round(self.rest_minutes * 60.0))
+            now_ts = time.time()
+            _apply_node_harvest_state(
+                self.active_node,
+                current_harvests=0 if is_depleted else self.current_harvests,
+                state="resting" if is_depleted else "active",
+                rest_sec=rest_sec,
+                now_ts=now_ts,
+                stamp_rest=bool(is_depleted),
+            )
 
         completed_stage_str = f"{self.current_harvests}/{self.max_harvests}"
         self.stage_history.append(completed_stage_str)
@@ -1572,6 +1968,11 @@ class ThreeStageHarvestController:
         gather_key: Optional[str] = None,
         max_harvests: Optional[int] = None,
         region: Optional[str] = None,
+        # H-sweep (dilim 12 O-3): cast bitimini görsel kanıtla bekleyen
+        # kanca. Verilmezse eski kör bekleme (cast_duration_sec) çalışır
+        # ama sonuç "cast_verified: False" diye işaretlenir — aşama
+        # sayacı "ölçüldü" sayılmaz.
+        cast_complete_detector: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """
         Bir düğümde baştan sona tam `1/3 -> 2/3 -> 3/3` dinamik toplama döngüsünü çalıştırır:
@@ -1581,13 +1982,30 @@ class ThreeStageHarvestController:
         - Yarım bırakılmış kaynak (Partial Node) ise 3. toplamayı beklemeden `RESTING` yapar,
         - `3/3` tamamlandığında düğümü `RESTING` durumuna geçirir ve özet sözlüğü döndürür.
         """
-        self.start_node(
+        start_res = self.start_node(
             node_or_id=node_or_id,
             max_harvests=max_harvests,
             gather_key=gather_key,
             region=region,
             press_initial_key=True,
         )
+        # F-0320: düğüm hazır değilse döngü hiç başlamaz.
+        if start_res.get("not_ready"):
+            return {
+                "status": start_res.get("reason", "NODE_NOT_READY"),
+                "node_id": start_res.get("node_id"),
+                "harvests_completed": 0,
+                "max_harvests": self.max_harvests,
+                "stages_completed": [],
+                "partial_node_detected": False,
+                "extraction_failure_retries": 0,
+                "reprompt_waits_sec": [],
+                "node_state": "unknown",
+                "is_anchored": False,
+                "state": self.state,
+                "gather_key": self.gather_key,
+                "cast_verified": False,
+            }
 
         reprompt_iter = iter(reprompt_sequence) if reprompt_sequence is not None else None
         fail_iter = iter(extraction_fail_sequence) if extraction_fail_sequence is not None else None
@@ -1595,11 +2013,27 @@ class ThreeStageHarvestController:
         total_casts = 0
         max_total_casts = self.max_harvests * (self.max_retries_per_stage + 1)
         last_step_result: Dict[str, Any] = {}
+        cast_verified = False
 
         while self.is_anchored and total_casts < max_total_casts:
             total_casts += 1
-            if self.cast_duration_sec > 0.0:
+            if callable(cast_complete_detector):
+                # Cast bitimi görsel kanıtla beklenir (en fazla 3x süre).
+                deadline = time.time() + max(self.cast_duration_sec * 3.0, 1.0)
+                verified = False
+                while time.time() < deadline:
+                    try:
+                        if bool(cast_complete_detector()):
+                            verified = True
+                            break
+                    except Exception as exc:
+                        logger.debug("cast_complete_detector hatası: %s", exc)
+                        break
+                    self._sleep(self.poll_interval_sec)
+                cast_verified = bool(verified)
+            elif self.cast_duration_sec > 0.0:
                 self._sleep(self.cast_duration_sec)
+                cast_verified = False
 
             curr_frame = frame_provider() if callable(frame_provider) else None
 
@@ -1630,15 +2064,10 @@ class ThreeStageHarvestController:
 
             if not will_fail and reprompt_iter is not None and (self.current_harvests + 1) < self.max_harvests:
                 reprompt_val = bool(next(reprompt_iter, True))
-            elif (
-                not will_fail
-                and reprompt_iter is None
-                and frame_provider is None
-                and prompt_detector is None
-                and self.vision_engine is None
-            ):
-                # Senkron birim testlerinde harici sağlayıcı verilmediyse varsayılan olarak 3/3'e ilerle
-                reprompt_val = True
+            # F-0148: sağlayıcı yokken re-prompt varsayılanı True kaldırıldı —
+            # görsel kanıt olmadan 3/3'e ilerlenmez; reprompt_val None kalır ve
+            # verify_reprompt_within_window gerçek görsel kontrolü yapar
+            # (kanıt yoksa False → partial-node yolu işletilir).
 
             last_step_result = self.on_cast_completed(
                 node_or_id=self.active_node or self.active_node_id,
@@ -1654,8 +2083,19 @@ class ThreeStageHarvestController:
                 auto_press_next_stage=True,
             )
 
-            if last_step_result.get("status") in ("COMPLETED", "PARTIAL_DEPLETED"):
+            if last_step_result.get("status") in ("COMPLETED", "PARTIAL_DEPLETED", "RETRY_EXHAUSTED", "NODE_NOT_READY", "UNRESOLVED_NODE"):
                 break
+
+        # F-0032: kota dolup döngü bittiyse bot düğüme çakılı kalmasın;
+        # status her durumda raporlanır.
+        loop_status = str(last_step_result.get("status", "") or "")
+        quota_hit = total_casts >= max_total_casts and self.is_anchored
+        if quota_hit:
+            self.is_anchored = False
+            self.state = self.STATE_IDLE
+            loop_status = "QUOTA_EXCEEDED"
+        elif not loop_status:
+            loop_status = "STOPPED"
 
         final_node_state = "resting" if not self.is_anchored else "active"
         if self.route_manager is not None and self.active_node_id is not None:
@@ -1664,6 +2104,7 @@ class ThreeStageHarvestController:
                 final_node_state = str(rm_node.state)
 
         return {
+            "status": loop_status,
             "node_id": self.active_node_id,
             "harvests_completed": len(self.stage_history),
             "max_harvests": self.max_harvests,
@@ -1675,6 +2116,9 @@ class ThreeStageHarvestController:
             "is_anchored": self.is_anchored,
             "state": self.state,
             "gather_key": self.gather_key,
+            # H-sweep (dilim 12 O-3): True yalnızca cast_complete_detector
+            # cast bitimini gördüyse; kör 1.80 sn beklemede False kalır.
+            "cast_verified": bool(cast_verified),
         }
 
     harvest_node = execute_harvest_loop
@@ -1684,6 +2128,15 @@ class ThreeStageHarvestController:
 # ==============================================================================
 # MADDE 24 — MESAFE BAZLI OTOMATİK BİNEK (`AutoMountManager`)
 # ==============================================================================
+# H-sweep (dilim 12 Y-4) — KAPANDI (Selçuk kararı, 2026-11-11): binek tuşu
+# "C"dir, "R" değil. R, sol-tık skill tuşudur (sağ tık -> T, sol tık -> R);
+# binek C olduğu için çakışma yoktur. Varsayılan buna göre "c"dir.
+MOUNT_KEY_DEFAULT: str = "c"
+# H-sweep (dilim 12 D-4): başarısız binek denemesi her tick'te
+# tekrarlanmasın diye varsayılan bekleme (eskiden 0.0 = spam engeli kapalı).
+MOUNT_COOLDOWN_DEFAULT_SEC: float = 5.0
+
+
 class AutoMountManager:
     """
     Madde 24 — Mesafe Bazlı Otomatik Binek (`AutoMountManager`):
@@ -1704,10 +2157,11 @@ class AutoMountManager:
         combat_recovery: Any = None,
         mount_distance_m: float = MOUNT_DISTANCE_THRESHOLD_M,
         dismount_distance_m: float = DISMOUNT_DISTANCE_THRESHOLD_M,
-        mount_key: str = "r",
+        mount_key: str = MOUNT_KEY_DEFAULT,
         gather_key: str = "f",
-        mount_cooldown_sec: float = 0.0,
+        mount_cooldown_sec: float = MOUNT_COOLDOWN_DEFAULT_SEC,
         cannot_mount_backoff_sec: float = 2.5,
+        gather_press_cooldown_sec: float = 1.0,
         test_mode: bool = False,
         input_ctrl: Any = None,
         input_driver: Any = None,
@@ -1720,10 +2174,13 @@ class AutoMountManager:
 
         self.mount_distance_m: float = float(mount_distance_m)
         self.dismount_distance_m: float = float(dismount_distance_m)
-        self.mount_key: str = str(mount_key or "r").strip().lower() or "r"
+        self.mount_key: str = str(mount_key or MOUNT_KEY_DEFAULT).strip().lower() or MOUNT_KEY_DEFAULT
         self.gather_key: str = str(gather_key or "f").strip().lower() or "f"
         self.mount_cooldown_sec: float = max(0.0, float(mount_cooldown_sec))
         self.cannot_mount_backoff_sec: float = max(0.0, float(cannot_mount_backoff_sec))
+        # F-0321: GATHER dalında her tick'te F basmayı engelleyen debounce.
+        self.gather_press_cooldown_sec: float = max(0.0, float(gather_press_cooldown_sec))
+        self._last_gather_press_ts: float = 0.0
         self.test_mode: bool = bool(test_mode)
 
         self.is_mounted: bool = False
@@ -1815,6 +2272,10 @@ class AutoMountManager:
         """Binek tuşuna (`self.mount_key`) basarak karakteri bineğe bindirir."""
         ctrl = input_ctrl or self.input_controller
         pressed = _send_key_via_controller(ctrl, self.mount_key, test_mode=self.test_mode)
+        # F-0149: tuş basımı başarısızsa binekli sayılmaz — eskiden
+        # pressed=False olsa bile is_mounted=True yapılıyordu.
+        if not pressed:
+            return False
         self.is_mounted = True
         self.last_mount_ts = time.time()
         self.mount_count += 1
@@ -1835,6 +2296,20 @@ class AutoMountManager:
         used_gather_key = str(gather_key or self.gather_key or "f").strip().lower() or "f"
 
         dismount_pressed = _send_key_via_controller(ctrl, self.mount_key, test_mode=self.test_mode)
+        # S-0402: tuş basımı başarısızsa (kontrolcü yok / gönderilemedi)
+        # binekten inilmiş sayılmaz — mount_up() için F-0149 ile
+        # düzeltilen hatanın dismount dalındaki karşılığı. Durum
+        # bayrakları ve sayaçlar yalnızca gerçek basımda güncellenir;
+        # toplama tuşuna da basılmaz (hâlâ binekli sayılır).
+        if not dismount_pressed:
+            return {
+                "dismounted": False,
+                "dismount_key_pressed": False,
+                "started_gathering": False,
+                "gather_key_pressed": False,
+                "gather_key": used_gather_key,
+                "is_mounted": self.is_mounted,
+            }
         self.is_mounted = False
         self.last_dismount_ts = time.time()
         self.dismount_count += 1
@@ -1851,7 +2326,11 @@ class AutoMountManager:
         return {
             "dismounted": True,
             "dismount_key_pressed": dismount_pressed,
-            "started_gathering": bool(start_gathering),
+            # S-2102: started_gathering toplama tuşunun gerçekten basılmasına
+            # bağlıdır — gather_pressed False iken start_gathering=True
+            # dönmek, basılamayan toplamayı başlamış gibi raporlardı
+            # (update() Durum 2'deki doğru desenle aynı).
+            "started_gathering": bool(gather_pressed),
             "gather_key_pressed": gather_pressed,
             "gather_key": used_gather_key,
             "is_mounted": self.is_mounted,
@@ -1895,7 +2374,12 @@ class AutoMountManager:
         if cannot_mount:
             self.cannot_mount_until_ts = curr_time + self.cannot_mount_backoff_sec
             if self.is_mounted:
-                self.is_mounted = False
+                # F-0150: binekli sanılırken "Cannot mount" geldiyse bayrak
+                # tek başına indirilmez; iniş tuşuna gerçekten basılır.
+                self.dismount(
+                    input_ctrl=input_ctrl or self.input_controller,
+                    start_gathering=False,
+                )
 
         # [F Gather] / [E] görünürlük kontrolü
         used_gather_key = str(gather_key or self.gather_key or "f").strip().lower() or "f"
@@ -1928,11 +2412,19 @@ class AutoMountManager:
                     start_gathering=should_gather_now,
                     gather_key=used_gather_key,
                 )
+                # S-0402: dismount() başarısızsa (tuş basılamadı) iniş
+                # raporlanmaz — eskiden burada da koşulsuz
+                # "dismounted": True dönülüyordu.
+                dismounted_ok = bool(dismount_res.get("dismounted", False))
                 return {
-                    "action": "DISMOUNT_AND_GATHER" if should_gather_now else "DISMOUNT",
-                    "mounted": False,
-                    "dismounted": True,
-                    "started_gathering": should_gather_now,
+                    "action": (
+                        ("DISMOUNT_AND_GATHER" if should_gather_now else "DISMOUNT")
+                        if dismounted_ok
+                        else "DISMOUNT_FAILED"
+                    ),
+                    "mounted": self.is_mounted,
+                    "dismounted": dismounted_ok,
+                    "started_gathering": bool(should_gather_now and dismounted_ok),
                     "gather_key": used_gather_key,
                     "is_mounted": self.is_mounted,
                     "distance_m": dist_val,
@@ -1944,7 +2436,8 @@ class AutoMountManager:
 
             return {
                 "action": "KEEP_RIDING",
-                "mounted": False,
+                # F-0150: biniliyor iken mounted False dönülemez.
+                "mounted": True,
                 "dismounted": False,
                 "started_gathering": False,
                 "gather_key": used_gather_key,
@@ -1957,12 +2450,18 @@ class AutoMountManager:
 
         # Durum 2: Karakter yaya ve [F Gather]/[E] aktif -> doğrudan toplamaya başla
         if prompt_vis and not combat_active:
-            _send_key_via_controller(ctrl, used_gather_key, test_mode=self.test_mode)
+            # F-0321: her tick'te F basılmaz; debounce aralığı beklenir.
+            gather_pressed = False
+            if (curr_time - self._last_gather_press_ts) >= self.gather_press_cooldown_sec:
+                gather_pressed = _send_key_via_controller(ctrl, used_gather_key, test_mode=self.test_mode)
+                if gather_pressed:
+                    self._last_gather_press_ts = curr_time
             return {
                 "action": "GATHER",
                 "mounted": False,
                 "dismounted": False,
-                "started_gathering": True,
+                "started_gathering": bool(gather_pressed),
+                "gather_key_pressed": bool(gather_pressed),
                 "gather_key": used_gather_key,
                 "is_mounted": self.is_mounted,
                 "distance_m": dist_val,
@@ -1979,10 +2478,11 @@ class AutoMountManager:
             gather_prompt_visible=prompt_vis,
             now=curr_time,
         ):
-            self.mount_up(input_ctrl=ctrl)
+            # F-0149: mount_up başarısızsa MOUNT raporlanmaz.
+            mounted_ok = self.mount_up(input_ctrl=ctrl)
             return {
-                "action": "MOUNT",
-                "mounted": True,
+                "action": "MOUNT" if mounted_ok else "MOUNT_FAILED",
+                "mounted": bool(mounted_ok),
                 "dismounted": False,
                 "started_gathering": False,
                 "mount_key": self.mount_key,
@@ -2010,6 +2510,15 @@ class AutoMountManager:
     manage_mount = update
 
 
+# H-sweep (dilim 12 Y-2 / dilim 13 O-9): hedef eşleşme sınırı. Beklenen
+# ofsetten bu kadar uzaktaki bir filiz "hedef" sayılmaz — gerçek hedef
+# minimap dışındaysa listedeki başka bir düğüme yönelmek yanlıştır.
+MAX_TARGET_OFFSET_DEVIATION_PX: float = 60.0
+# Yedek dalda parlak kontur, canavar noktasının bu yarıçapı içindeyse
+# hedef sayılmaz (beyaz canavar noktası parlak kontur olarak görünür).
+MONSTER_EXCLUSION_RADIUS_PX: float = 10.0
+
+
 # ==============================================================================
 # MADDE 25 — MİNİMAP ÜZERİNDEN DOĞRUDAN YÖNELİM (`MaplessMicroNavigator`)
 # ==============================================================================
@@ -2034,7 +2543,7 @@ class MaplessMicroNavigator:
         vision_engine: Any = None,
         max_micro_nav_distance_m: float = MAPLESS_DISTANCE_THRESHOLD_M,
         arrival_distance_m: float = DEFAULT_WAYPOINT_RADIUS_M,
-        meters_per_minimap_px: float = 0.55,
+        meters_per_minimap_px: float = MINIMAP_METERS_PER_PX,
         deadband_deg: float = DEFAULT_DEADBAND_DEG,
         waypoint_radius_px: float = DEFAULT_WAYPOINT_RADIUS_PX,
         screen_width: int = 1920,
@@ -2116,10 +2625,9 @@ class MaplessMicroNavigator:
         elif player_pos is not None and target_pos is not None:
             dx = float(target_pos[0]) - float(player_pos[0])
             dy = float(target_pos[1]) - float(player_pos[1])
-        elif target_pos is not None:
-            dx = float(target_pos[0])
-            dy = float(target_pos[1])
         else:
+            # F-0322: oyuncu konumu yokken mutlak harita koordinatı minimap
+            # ofseti sayılmaz; yön bilinmiyor demektir (0, 0).
             dx, dy = 0.0, 0.0
 
         pixel_dist = math.hypot(dx, dy)
@@ -2184,12 +2692,19 @@ class MaplessMicroNavigator:
             return None
 
         try:
-            # 1. MinimapScanner.scan_minimap mevcutsa toplanabilir filiz/materyal düğümlerini tara
-            if hasattr(self.minimap_scanner, "scan_minimap"):
-                scan_res = self.minimap_scanner.scan_minimap(frame)
+            # 1. MinimapScanner.scan_gatherable_materials ile toplanabilir
+            # filiz/materyal düğümlerini tara (F-0151: scan_minimap diye bir
+            # metot yok; bu dal ölü koddu).
+            # H-sweep (dilim 13 K2): canavar noktaları artık yalnızca radar
+            # çizimi için değil, hedef seçiminde de kullanılır — yedek dal
+            # canavar noktasını hedef saymaz, sonuçta sayısı döndürülür.
+            scan_res: Dict[str, Any] = {}
+            if hasattr(self.minimap_scanner, "scan_gatherable_materials"):
+                scan_res = self.minimap_scanner.scan_gatherable_materials(frame)
                 gatherable = scan_res.get("gatherable_nodes", []) if isinstance(scan_res, dict) else []
                 if gatherable:
                     # Eğer target_node ve player_map_pos verilmişse beklenen ofsete en yakın olanı seç
+                    deviation_px: Optional[float] = None
                     if target_node is not None and player_map_pos is not None:
                         tx = float(target_node["map_x"] if isinstance(target_node, dict) else getattr(target_node, "map_x", 0))
                         ty = float(target_node["map_y"] if isinstance(target_node, dict) else getattr(target_node, "map_y", 0))
@@ -2199,6 +2714,17 @@ class MaplessMicroNavigator:
                             gatherable,
                             key=lambda n: math.hypot(float(n.get("dx", 0.0)) - exp_dx, float(n.get("dy", 0.0)) - exp_dy),
                         )
+                        deviation_px = math.hypot(
+                            float(chosen.get("dx", 0.0)) - exp_dx,
+                            float(chosen.get("dy", 0.0)) - exp_dy,
+                        )
+                        # H-sweep (dilim 12 Y-2): maksimum sapma eşiği yoktu —
+                        # gerçek hedef minimap dışındaysa listedeki başka bir
+                        # düğüm hedef diye seçiliyordu. Eşik aşılırsa hedef
+                        # minimap'te görünmüyor demektir; yanlış düğüme
+                        # yönelmek yerine None dönülür.
+                        if deviation_px > MAX_TARGET_OFFSET_DEVIATION_PX:
+                            return None
                     else:
                         chosen = min(
                             gatherable,
@@ -2214,6 +2740,8 @@ class MaplessMicroNavigator:
                         "distance_m": round(dist_px * self.meters_per_minimap_px, 2),
                         "heading_angle_deg": self.compute_compass_heading_deg(dx, dy),
                         "player_heading_deg": scan_res.get("player_heading_deg") if isinstance(scan_res, dict) else None,
+                        "target_match_deviation_px": (round(deviation_px, 2) if deviation_px is not None else None),
+                        "nearby_monster_dots": len(scan_res.get("monster_dots", []) or []) + len(scan_res.get("hostile_dots", []) or []),
                     }
 
             # 2. Yedek: Minimap kesitinde parlak hedef ikonu / şablon araması
@@ -2234,11 +2762,48 @@ class MaplessMicroNavigator:
             cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             valid = [c for c in cnts if 4.0 <= cv2.contourArea(c) <= 180.0]
             if valid:
+                # H-sweep (dilim 13 O-9 + K2): yedek dal en parlak konturu
+                # hedef sayıyordu; beyaz canavar noktası da parlaktır ve
+                # bot canavara yönlendirilebilirdi. Canavar/düşman
+                # noktasına yakın konturlar elenir (konumlar kırpım
+                # koordinatındadır, kontur merkezleriyle aynı uzay).
+                monster_positions: List[Tuple[float, float]] = []
+                for _key in ("monster_dots", "hostile_dots"):
+                    for _dot in scan_res.get(_key, []) or []:
+                        _pos = _dot.get("pos") if isinstance(_dot, dict) else None
+                        if _pos and len(_pos) >= 2:
+                            monster_positions.append((float(_pos[0]), float(_pos[1])))
+                excluded = 0
+
+                def _contour_centroid(c: Any) -> Tuple[float, float]:
+                    m = cv2.moments(c)
+                    if m["m00"] > 1e-5:
+                        return float(m["m10"] / m["m00"]), float(m["m01"] / m["m00"])
+                    x, y, w, h = cv2.boundingRect(c)
+                    return float(x + w / 2.0), float(y + h / 2.0)
+
+                def _near_monster(c: Any) -> bool:
+                    cx, cy = _contour_centroid(c)
+                    return any(
+                        math.hypot(cx - mx, cy - my) <= MONSTER_EXCLUSION_RADIUS_PX
+                        for mx, my in monster_positions
+                    )
+
+                valid = [c for c in valid if not _near_monster(c)]
+                if not valid:
+                    logger.debug(
+                        "locate_node_on_minimap: yedek dalda yalnızca canavar "
+                        "noktası konturu bulundu, hedef yok sayıldı"
+                    )
+                    return None
+                # F-0475: en yakın kontur ağırlık merkeziyle (moments) seçilir;
+                # eskiden boundingRect sol-üst köşesiyle seçiliyordu.
+
                 best_c = min(
                     valid,
                     key=lambda c: math.hypot(
-                        float(cv2.boundingRect(c)[0]) - pcx,
-                        float(cv2.boundingRect(c)[1]) - pcy,
+                        _contour_centroid(c)[0] - pcx,
+                        _contour_centroid(c)[1] - pcy,
                     ),
                 )
                 m = cv2.moments(best_c)
@@ -2255,6 +2820,8 @@ class MaplessMicroNavigator:
                         "distance_m": round(dist_px * self.meters_per_minimap_px, 2),
                         "heading_angle_deg": self.compute_compass_heading_deg(dx, dy),
                         "player_heading_deg": None,
+                        "fallback_bright_contour": True,
+                        "nearby_monster_dots": len(monster_positions),
                     }
         except Exception as exc:
             logger.debug("Minimap üzerinde düğüm arama hatası: %s", exc)
@@ -2304,8 +2871,7 @@ class MaplessMicroNavigator:
                         float(target_node[0]) - float(player_map_pos[0]),
                         float(target_node[1]) - float(player_map_pos[1]),
                     )
-                else:
-                    minimap_offset = (float(target_node[0]), float(target_node[1]))
+                # F-0322: oyuncu konumu yokken mutlak (x, y) ofset sayılmaz.
             elif target_node is not None:
                 tx = float(
                     target_node.get("dx", target_node.get("rel_map_dx", target_node.get("map_x", 0.0)))
@@ -2321,8 +2887,26 @@ class MaplessMicroNavigator:
                     minimap_offset = (tx, ty)
                 elif player_map_pos is not None:
                     minimap_offset = (tx - float(player_map_pos[0]), ty - float(player_map_pos[1]))
-                else:
-                    minimap_offset = (tx, ty)
+                # F-0322: oyuncu konumu yokken mutlak map_x/map_y ofset sayılmaz.
+
+        # F-0033: yönelilecek ofset yoksa (hedefsiz navigasyon) "vardım"
+        # denemez; sıfır vektör varış sayılmaz.
+        if minimap_offset is None:
+            return {
+                "used_mapless": False,
+                "map_opened": False,
+                "reason": "NO_TARGET",
+                "distance_m": float(distance_m) if distance_m is not None else 0.0,
+                "max_micro_nav_distance_m": self.max_micro_nav_distance_m,
+                "visible_on_minimap": False,
+                "dx": 0.0,
+                "dy": 0.0,
+                "steering_vector": (0.0, 0.0),
+                "heading_angle_deg": 0.0,
+                "heading_deg": 0.0,
+                "steered": False,
+                "arrived": False,
+            }
 
         # Oyuncu yönü (heading) frame üzerinden okunabiliyorsa oku
         if player_heading_deg is None and frame is not None and hasattr(self.minimap_scanner, "detect_player_heading"):
@@ -2366,9 +2950,6 @@ class MaplessMicroNavigator:
             }
 
         # < 40m veya minimap üzerinde görünür -> 'M' haritasını AÇMADAN doğrudan yönel!
-        self.micro_nav_steps += 1
-        self.map_open_calls_avoided += 1
-
         steered = False
         ctrl = input_ctrl or self.input_controller
         sx, sy = steer_data["screen_steer_point"]
@@ -2386,11 +2967,16 @@ class MaplessMicroNavigator:
                         ctrl.press_key("w")
                         steered = True
                     else:
-                        steered = True
+                        # F-0323: tanınan girdi metodu yokken yönelindi sayılmaz.
+                        steered = False
                 except Exception as exc:
                     logger.debug("Haritasız mikro-navigasyon girdi hatası: %s", exc)
-            else:
-                steered = True
+            # F-0323: kontrolcü yokken girdi gönderilmedi; steered False kalır.
+
+        # F-0323: sayaçlar girdiden önce değil, başarılı yönelimden sonra artar.
+        if steered:
+            self.micro_nav_steps += 1
+            self.map_open_calls_avoided += 1
 
         result = {
             "used_mapless": True,
@@ -2415,7 +3001,9 @@ class MaplessMicroNavigator:
             "visible_on_minimap": is_vis,
             "screen_steer_point": (sx, sy),
             "steered": bool(steered),
-            "arrived": bool(effective_dist_m <= self.arrival_distance_m or steer_data["pixel_distance"] <= self.waypoint_radius_px),
+            # F-0033/F-0324: varış için hem metre hem piksel eşiği birlikte
+            # sağlanmalı (OR, 11m uzaktan "vardım" dedirtiyordu).
+            "arrived": bool(effective_dist_m <= self.arrival_distance_m and steer_data["pixel_distance"] <= self.waypoint_radius_px),
         }
         self.last_steering_result = result
         logger.debug(
@@ -2430,9 +3018,6 @@ class MaplessMicroNavigator:
     steer_to_node = navigate_to_node
     micro_navigate = navigate_to_node
     step = navigate_to_node
-
-
-from core.route_manager import NodeData, RouteManager  # noqa: E402,F401
 
 
 class NavigationIntel:
@@ -2452,6 +3037,14 @@ class NavigationIntel:
         vision_engine: Any = None,
         **kwargs: Any,
     ) -> None:
+        # H-sweep (dilim 12 D-2): **kwargs eskiden sessizce yutuluyordu —
+        # yanlış yazılmış / desteklenmeyen ayar adı çağırana hiç belli
+        # olmadan kayboluyordu. Bilinmeyen anahtar artık uyarıyla düşer.
+        if kwargs:
+            logger.warning(
+                "NavigationIntel: bilinmeyen ayar(lar) yok sayıldı: %s",
+                sorted(str(k) for k in kwargs),
+            )
         self.kwargs = kwargs
         self.input_controller = input_controller
         self.route_manager = route_manager
@@ -2634,13 +3227,21 @@ class NavigationIntel:
         )
 
         # 3. Bearing & Damped Steering
+        # Durum taşıyan TurnDampingController kullanılır: ham apply_turn_damping
+        # çağrısı hızlı yön tersine çevirmelerdeki reversal-damping'i (0.65x,
+        # 0.12 sn soğuma) hiç uygulamıyordu — __init__'te kurulan turn_damper
+        # bu döngüde ölüydü. deadband canlı öznitelikten senkronize edilir.
         bearing = None
         turn_data = None
         if player_pos is not None and waypoint_pos is not None:
             bearing = compute_bearing(player_pos, waypoint_pos)
             if player_heading is not None:
-                diff = compute_angle_diff(bearing, player_heading)
-                turn_data = apply_turn_damping(diff, deadband_deg=self.deadband_deg)
+                self.turn_damper.deadband_deg = max(
+                    MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(self.deadband_deg))
+                )
+                turn_data = self.turn_damper.calculate_turn(
+                    bearing, player_heading, now=curr_ts
+                )
 
         return {
             "stuck_detected": bool(stuck_info["is_stuck"]),
@@ -2654,22 +3255,41 @@ class NavigationIntel:
         }
 
     def get_navigation_intel_health_summary(self) -> dict:
-        return {"module": "navigation_intel", "ready": True}
+        # F-0478: hazır bayrağı gerçek proba bağlı — eskiden koşulsuz True.
+        ready, checks = _probe_navigation_intel_ready(self)
+        return {"module": "navigation_intel", "ready": ready, "checks": checks}
 
     def get_navigation_intel_ready_flag(self) -> dict:
-        return {"module": "navigation_intel", "ready": True}
+        # F-0478: hazır bayrağı gerçek proba bağlı — eskiden koşulsuz True.
+        ready, checks = _probe_navigation_intel_ready(self)
+        return {"module": "navigation_intel", "ready": ready, "checks": checks}
 
     def get_navigation_intel_version_info(self) -> dict:
-        return {"module": "navigation_intel", "version": "2.0.0", "ready": True}
-
-    def get_navigation_intel_diagnostic_snapshot(self) -> dict:
+        # F-0478: sürüm bilgisi sabit kalır ama ready proba bağlıdır.
+        ready, checks = _probe_navigation_intel_ready(self)
         return {
             "module": "navigation_intel",
-            "status": "ok",
-            "ready": True,
-            "stuck_count": self.stuck_detector.stuck_count,
-            "transitions_count": self.waypoint_detector.transitions_count,
-            "deadband_deg": self.deadband_deg,
+            "version": __version__,
+            "ready": ready,
+            "checks": checks,
+        }
+
+    def get_navigation_intel_diagnostic_snapshot(self) -> dict:
+        # F-0478: status/ready proba bağlı; sayaçlar gerçek durumdur.
+        # Prob başarısızken (bileşen eksikse) sayaç okuma çökmez.
+        ready, checks = _probe_navigation_intel_ready(self)
+        return {
+            "module": "navigation_intel",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+            "checks": checks,
+            "stuck_count": getattr(
+                getattr(self, "stuck_detector", None), "stuck_count", None
+            ),
+            "transitions_count": getattr(
+                getattr(self, "waypoint_detector", None), "transitions_count", None
+            ),
+            "deadband_deg": getattr(self, "deadband_deg", None),
         }
 
 
@@ -2686,6 +3306,8 @@ __all__ = [
     "DEFAULT_WAYPOINT_RADIUS_M",
     "DEFAULT_STUCK_TIMEOUT_SEC",
     "ThreeStageHarvestController",
+    "install_three_stage_harvest_controller",
+    "install_navigation_intel",
     "PartialNodeDetector",
     "handle_extraction_failure",
     "AutoMountManager",
@@ -2697,6 +3319,7 @@ __all__ = [
     "compute_bearing",
     "compute_angle_diff",
     "apply_turn_damping",
+    "get_navigation_intel_contract_checks",
     "get_navigation_intel_readiness_status",
     "get_navigation_intel_audit_record",
     "get_navigation_intel_operational_digest",
@@ -2712,43 +3335,153 @@ def get_navigation_intel_capabilities() -> list:
     return ["navigation_intel", "spatial_heuristics", "heading_alignment", "turn_damping", "stuck_detection", "waypoint_sequencing", "diagnostic_snapshot"]
 
 
+# S-2101: readiness zinciri koşulsuz True dönemez. Yukarıdaki capabilities()
+# listesi sabittir, `bool(...)` hiçbir zaman False olamazdı; readiness /
+# audit / seal / certificate fonksiyonları da gerçek durum yoklamıyordu.
+# Düzeltme: her yetenek adı bu modüldeki gerçek bir sembole bağlanır ve
+# kontrat doğrulaması o sembollerin tanımlı/çağrılabilir olduğunu yoklar.
+# Bir NavigationIntel örneği verilirse ayrıca canlı prob
+# (_probe_navigation_intel_ready, F-0478) çalışır; verilmezse sonuç
+# yalnızca modül-kontrat yoklamasına dayanır ve "instance_probed": False
+# ile işaretlenir — canlı durum yoklanmamışken yoklanmış gibi raporlanmaz.
+_NAVIGATION_INTEL_CAPABILITY_SYMBOLS: Dict[str, str] = {
+    "navigation_intel": "NavigationIntel",
+    "spatial_heuristics": "compute_bearing",
+    "heading_alignment": "compute_angle_diff",
+    "turn_damping": "TurnDampingController",
+    "stuck_detection": "RadarStuckDetector",
+    "waypoint_sequencing": "WaypointArrivalDetector",
+    "diagnostic_snapshot": "get_navigation_intel_summary",
+}
+
+
+def get_navigation_intel_contract_checks() -> Dict[str, bool]:
+    """Her yetenek için gerçek sembol yoklaması (True = sembol tanımlı ve çağrılabilir)."""
+    checks: Dict[str, bool] = {}
+    for capability, symbol in _NAVIGATION_INTEL_CAPABILITY_SYMBOLS.items():
+        obj = globals().get(symbol)
+        checks[capability] = obj is not None and callable(obj)
+    return checks
+
+
 def validate_navigation_intel_contract() -> bool:
-    return bool(get_navigation_intel_capabilities())
+    checks = get_navigation_intel_contract_checks()
+    return bool(checks) and all(checks.values())
+
+
+# H-sweep (dilim 12 K-1): üretim bağlantı bayrağı. Varsayılan False'dur;
+# yalnızca install_three_stage_harvest_controller() /
+# install_navigation_intel() True yapar. "ready/certified" bayrakları
+# modül öz-deneyidir; üretime bağlılık ayrı ölçülür.
+_PRODUCTION_WIRED: bool = False
+
+
+def install_three_stage_harvest_controller(
+    route_manager: Any = None,
+    input_controller: Any = None,
+    **kwargs: Any,
+) -> "ThreeStageHarvestController":
+    """`ThreeStageHarvestController` üretim kurulumu (C grubu işi).
+
+    state_machine.py tarafı bu yardımcıyı çağırıp dönen denetleyiciyi
+    toplama döngüsüne bağlamalıdır; çağrılmadığı sürece Harvest sayacı
+    üretimde ilerleyemez (dilim 12 K-1 — controller'ın kurulumu yoktu).
+    Kurulum bayrağını kaldırır, denetleyiciyi döndürür.
+    """
+    global _PRODUCTION_WIRED
+    controller = ThreeStageHarvestController(
+        route_manager=route_manager,
+        input_controller=input_controller,
+        **kwargs,
+    )
+    _PRODUCTION_WIRED = True
+    return controller
+
+
+def install_navigation_intel(**kwargs: Any) -> "NavigationIntel":
+    """`NavigationIntel` üretim kurulumu; bayrağı kaldırır, örneği döndürür."""
+    global _PRODUCTION_WIRED
+    intel = NavigationIntel(**kwargs)
+    _PRODUCTION_WIRED = True
+    return intel
+
+
+def _navigation_intel_verdict(intel: Any = None) -> Tuple[bool, Dict[str, bool], bool]:
+    """(verdict, checks, instance_probed): kontrat yoklaması her zaman çalışır;
+    örnek verilirse canlı prob da koşulur ve karar ikisinin VE'sidir.
+    "production_wired" kontrat kararı değildir — checks içinde ayrıca
+    taşınır, ölü modül "hazır" görünmesin diye.
+    """
+    checks = get_navigation_intel_contract_checks()
+    contract_ok = bool(checks) and all(checks.values())
+    if intel is None:
+        merged = dict(checks)
+        merged["production_wired"] = bool(_PRODUCTION_WIRED)
+        return contract_ok, merged, False
+    try:
+        ready, probe_checks = _probe_navigation_intel_ready(intel)
+    except Exception:
+        merged = dict(checks)
+        merged["instance_probe"] = False
+        merged["production_wired"] = bool(_PRODUCTION_WIRED)
+        return False, merged, True
+    merged = dict(checks)
+    merged.update({f"instance:{key}": value for key, value in probe_checks.items()})
+    merged["production_wired"] = bool(_PRODUCTION_WIRED)
+    return bool(contract_ok and ready), merged, True
 
 
 def get_navigation_intel_baseline_metrics() -> dict:
-    return {"module": "navigation_intel", "contract_valid": validate_navigation_intel_contract(), "capability_count": len(get_navigation_intel_capabilities())}
+    return {"module": "navigation_intel", "contract_valid": validate_navigation_intel_contract(), "capability_count": len(get_navigation_intel_capabilities()), "contract_checks": get_navigation_intel_contract_checks()}
 
 
-def get_navigation_intel_readiness_status() -> dict:
-    return {"module": "navigation_intel", "ready": validate_navigation_intel_contract(), "metrics": get_navigation_intel_baseline_metrics()}
+def get_navigation_intel_readiness_status(intel: Any = None) -> dict:
+    ready, checks, probed = _navigation_intel_verdict(intel)
+    return {"module": "navigation_intel", "ready": ready, "instance_probed": probed, "checks": checks, "metrics": get_navigation_intel_baseline_metrics()}
 
 
-def get_navigation_intel_audit_record() -> dict:
-    return {"module": "navigation_intel", "audit_passed": validate_navigation_intel_contract(), "readiness": get_navigation_intel_readiness_status()}
+def get_navigation_intel_audit_record(intel: Any = None) -> dict:
+    ready, checks, probed = _navigation_intel_verdict(intel)
+    return {"module": "navigation_intel", "audit_passed": ready, "instance_probed": probed, "checks": checks, "readiness": get_navigation_intel_readiness_status(intel)}
 
 
-def get_navigation_intel_operational_digest() -> dict:
-    return {"module": "navigation_intel", "operational": validate_navigation_intel_contract(), "audit": get_navigation_intel_audit_record()}
+def get_navigation_intel_operational_digest(intel: Any = None) -> dict:
+    ready, checks, probed = _navigation_intel_verdict(intel)
+    return {"module": "navigation_intel", "operational": ready, "instance_probed": probed, "checks": checks, "audit": get_navigation_intel_audit_record(intel)}
 
 
-def get_navigation_intel_telemetry_payload() -> dict:
-    return {"module": "navigation_intel", "payload": get_navigation_intel_operational_digest()}
+def get_navigation_intel_telemetry_payload(intel: Any = None) -> dict:
+    return {"module": "navigation_intel", "payload": get_navigation_intel_operational_digest(intel)}
 
 
-def get_navigation_intel_integrity_seal() -> dict:
-    return {"module": "navigation_intel", "sealed": validate_navigation_intel_contract(), "telemetry": get_navigation_intel_telemetry_payload()}
+def get_navigation_intel_integrity_seal(intel: Any = None) -> dict:
+    ready, checks, probed = _navigation_intel_verdict(intel)
+    return {"module": "navigation_intel", "sealed": ready, "instance_probed": probed, "checks": checks, "telemetry": get_navigation_intel_telemetry_payload(intel)}
 
 
-def get_navigation_intel_compliance_certificate() -> dict:
-    return {"module": "navigation_intel", "certified": validate_navigation_intel_contract(), "seal": get_navigation_intel_integrity_seal()}
+def get_navigation_intel_compliance_certificate(intel: Any = None) -> dict:
+    ready, checks, probed = _navigation_intel_verdict(intel)
+    return {"module": "navigation_intel", "certified": ready, "instance_probed": probed, "checks": checks, "seal": get_navigation_intel_integrity_seal(intel)}
 
 
-def get_navigation_intel_readiness_probe() -> dict:
-    return {"module": "navigation_intel", "ready": validate_navigation_intel_contract(), "certificate": get_navigation_intel_compliance_certificate()}
+def get_navigation_intel_readiness_probe(intel: Any = None) -> dict:
+    ready, checks, probed = _navigation_intel_verdict(intel)
+    return {"module": "navigation_intel", "ready": ready, "instance_probed": probed, "checks": checks, "certificate": get_navigation_intel_compliance_certificate(intel)}
 
 
-def get_navigation_intel_audit_summary() -> dict:
-    return {"module": "navigation_intel", "audit_passed": validate_navigation_intel_contract(), "probe": get_navigation_intel_readiness_probe()}
+def get_navigation_intel_audit_summary(intel: Any = None) -> dict:
+    ready, checks, probed = _navigation_intel_verdict(intel)
+    return {"module": "navigation_intel", "audit_passed": ready, "instance_probed": probed, "checks": checks, "probe": get_navigation_intel_readiness_probe(intel)}
+
+
+# F-0476: NodeData/RouteManager import'u dosya ortasından buraya (dosya
+# sonuna) taşındı. Dairesel import güvenliği: route_manager.py NodeData'yı
+# (satır 1243) ve RouteManager'ı (satır 1584) kendi 4703. satırındaki
+# `from core.navigation_intel import ...`tan ÖNCE tanımlar; bu modülün
+# route_manager'ın kullandığı adları (PartialNodeDetector,
+# handle_extraction_failure) ise bu satırdan önce tanımlanmıştır. Böylece
+# import sırası (önce navigation_intel ya da önce route_manager) fark
+# etmeksizin iki yön de çözülür; ortaya taşınırsa çöker.
+from core.route_manager import NodeData, RouteManager  # noqa: E402,F401
 
 

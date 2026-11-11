@@ -8,6 +8,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -25,8 +28,25 @@ from tools.recalibrate_dataset_trust import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cwd(tmp_path, monkeypatch):
+    """Redirect CWD-relative production writes into a throwaway dir.
+
+    ``recalibrate_entire_dataset_trust`` calls ``mark_model_stale``, which
+    writes ``models/stale_manifest.json`` relative to the current working
+    directory, so a run from the repo root rewrote a repo file. All dataset
+    paths in this file are absolute, so changing CWD is safe here.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
 def test_protected_box_immunity():
-    """Hand labels and human approved boxes must remain trusted and >= 0.90."""
+    """Hand labels and human approved boxes must remain trusted.
+
+    F-1212: protection keeps the box trusted, but the recorded confidence
+    is preserved as-is — a 0.70 protected box stays 0.70 and is NOT
+    inflated to 0.90.
+    """
     box = {
         "class_id": 0,
         "cx": 0.5,
@@ -44,7 +64,83 @@ def test_protected_box_immunity():
     assert action == "preserved_trusted"
     assert calibrated["trusted"] is True
     assert calibrated["weak"] is False
-    assert calibrated["confidence"] >= 0.90
+    assert calibrated["confidence"] == 0.70
+
+
+def test_protected_box_without_confidence_not_inflated():
+    """F-1212: a protected box with no recorded confidence stays 0.0."""
+    box = {
+        "class_id": 0,
+        "cx": 0.5,
+        "cy": 0.5,
+        "w": 0.2,
+        "h": 0.2,
+        "source": "hand_label",
+        "hand_label": True,
+        "trusted": True,
+        "weak": False,
+    }
+    calibrated, action = calibrate_single_box(box, stem="any_stem", emin_threshold=0.85)
+    assert calibrated is not None
+    assert action == "preserved_trusted"
+    assert calibrated["trusted"] is True
+    assert calibrated["weak"] is False
+    assert calibrated["confidence"] == 0.0
+
+
+def test_negative_class_id_purged():
+    """S-4801: cid=-1 (missing class_id default) must be purged, never trusted.
+
+    Even with high confidence and a verified source it must not reach
+    Rule 8 as preserved_trusted, and a negative class_id from a TXT line
+    must not be salvaged into the review JSON / label TXT.
+    """
+    box = {
+        "class_id": -1,
+        "cx": 0.5,
+        "cy": 0.5,
+        "w": 0.2,
+        "h": 0.2,
+        "confidence": 0.95,
+        "source": "material_scanner_minimap_sprout",
+        "trusted": True,
+    }
+    calibrated, action = calibrate_single_box(box, stem="any_stem", emin_threshold=0.85)
+    assert calibrated is None
+    assert action == "purged_unknown_class"
+
+    # Missing class_id key defaults to -1 -> same purge.
+    box_no_cid = dict(box)
+    del box_no_cid["class_id"]
+    calibrated2, action2 = calibrate_single_box(box_no_cid, stem="any_stem", emin_threshold=0.85)
+    assert calibrated2 is None
+    assert action2 == "purged_unknown_class"
+
+    # TXT salvage: a "-1 ..." line must not be written back.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "review" / "train").mkdir(parents=True)
+        (root / "labels" / "train").mkdir(parents=True)
+        (root / "images" / "train").mkdir(parents=True)
+        stem = "boot_100_aria_gather"
+        (root / "review" / "train" / f"{stem}.json").write_text(
+            json.dumps({"stem": stem, "split": "train", "trusted": [], "weak": []}),
+            encoding="utf-8",
+        )
+        (root / "labels" / "train" / f"{stem}.txt").write_text(
+            "-1 0.5 0.5 0.1 0.1\n0 0.5 0.5 0.1 0.1\n",
+            encoding="utf-8",
+        )
+        report = recalibrate_entire_dataset_trust(dataset_dir=root, dry_run=False)
+        assert report["metrics"]["purged_false_boxes"] == 0  # skipped at TXT parse, not counted as purge
+        updated = json.loads((root / "review" / "train" / f"{stem}.json").read_text(encoding="utf-8"))
+        all_cids = [b["class_id"] for b in updated["trusted"] + updated["weak"]]
+        assert -1 not in all_cids
+        assert all_cids == [0]
+        # The salvaged -1 line must not be written back to the label TXT
+        # (train_txt_boxes only emits trusted boxes, so the weak cid=0 box
+        # is not emitted either — the file must simply contain no "-1" line).
+        assert "-1" not in (root / "labels" / "train" / f"{stem}.txt").read_text(encoding="utf-8")
 
 
 def test_stem_gating_purges_path_on_gathering():
@@ -228,8 +324,17 @@ def test_recalibrate_entire_dataset_trust_end_to_end():
         (root / "images" / "val").mkdir(parents=True)
 
         stem = "boot_100_aria_gather"
-        # Create mock image
-        (root / "images" / "train" / f"{stem}.jpg").write_bytes(b"\x00")
+        # Create a REAL decodable JPEG fixture (not 1-byte garbage): the E2E
+        # dataset image must be a genuine image file that actually decodes.
+        img = np.zeros((64, 64, 3), dtype=np.uint8)
+        img[:] = (60, 120, 200)
+        ok, buf = cv2.imencode(".jpg", img)
+        assert ok, "fixture JPEG must encode"
+        image_path = root / "images" / "train" / f"{stem}.jpg"
+        image_path.write_bytes(buf.tobytes())
+        decoded = cv2.imread(str(image_path))
+        assert decoded is not None, "fixture image must decode as a real JPEG"
+        assert decoded.shape == (64, 64, 3)
 
         # Create review json with 1 genuine sprout, 1 out-of-context path_ground, 1 heuristic targena
         review_payload = {

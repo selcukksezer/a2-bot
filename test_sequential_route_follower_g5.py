@@ -329,7 +329,11 @@ class TestNearestWaypointResume:
     def test_resume_route_after_interrupt_snapping(self):
         """
         After being pushed away by combat or pausing, resume_route_after_interrupt
-        resumes from nearest waypoint.
+        resumes from the nearest waypoint.
+
+        Default (advance_if_reached=False): the player at (190, 195) is
+        ~11px from Node 2, so resume targets Node 2 itself (index 1),
+        not the following node.
         """
         nodes = [
             {"id": 1, "map_x": 100.0, "map_y": 100.0},
@@ -343,9 +347,34 @@ class TestNearestWaypointResume:
             last_index=0,
             waypoint_radius_px=20.0,
         )
-        # Because dist ~11px <= 20px threshold to Node 2, smoothly advances to next node (Node 3)
         assert resume_info["cyclical"] is True
-        assert resume_info["resumed_index"] in (1, 2)
+        assert resume_info["resumed_index"] == 1
+        assert resume_info["resumed_from"] == "nearest"
+        assert resume_info["active_node"]["id"] == 2
+        assert resume_info["distance_px"] <= 20.0
+
+    def test_resume_route_after_interrupt_advance_if_reached(self):
+        """
+        With advance_if_reached=True and the player already within the
+        waypoint radius of the nearest node, resume advances to the next
+        sequential node in cyclical order (Node 2 -> Node 3).
+        """
+        nodes = [
+            {"id": 1, "map_x": 100.0, "map_y": 100.0},
+            {"id": 2, "map_x": 200.0, "map_y": 200.0},
+            {"id": 3, "map_x": 300.0, "map_y": 100.0},
+        ]
+        resume_info = resume_route_after_interrupt(
+            player_pos=(190.0, 195.0),
+            nodes=nodes,
+            last_index=0,
+            waypoint_radius_px=20.0,
+            advance_if_reached=True,
+        )
+        assert resume_info["cyclical"] is True
+        assert resume_info["resumed_index"] == 2
+        assert resume_info["resumed_from"] == "advance_from_nearest"
+        assert resume_info["active_node"]["id"] == 3
 
     def test_planner_resume_after_interrupt(self):
         """Tests SequentialRoutePlanner.resume_after_interrupt updates internal seq pos."""
@@ -381,18 +410,28 @@ class TestPlannerAndNavigatorInteroperability:
         assert step_res["turn_needed"] is False
 
     def test_planner_calculate_route_metrics(self):
-        """Confirms calculate_route_metrics returns full suite of standardized metrics."""
+        """Confirms calculate_route_metrics returns full suite of standardized metrics.
+
+        Uses a genuinely closed route (rectangle returning to the start
+        edge): 300 + 400 + 300 + 400 = 1400px. An open L-shaped route must
+        NOT be asserted as closed here — production still reports
+        closed_loop for any route with >= 3 nodes (see
+        SequentialRoutePlanner.calculate_route_metrics in
+        core/sequential_router.py); fixing that heuristic is outside this
+        test slice.
+        """
         planner = SequentialRoutePlanner()
         pts = [
             {"map_x": 0.0, "map_y": 0.0},
             {"map_x": 300.0, "map_y": 0.0},
             {"map_x": 300.0, "map_y": 400.0},
+            {"map_x": 0.0, "map_y": 400.0},
         ]
         metrics = planner.calculate_route_metrics(pts)
-        assert metrics["node_count"] == 3
-        assert metrics["discovered_nodes"] == 3
+        assert metrics["node_count"] == 4
+        assert metrics["discovered_nodes"] == 4
         assert metrics["closed_loop"] is True
-        assert abs(metrics["total_distance_px"] - 1200.0) < 1.0
+        assert abs(metrics["total_distance_px"] - 1400.0) < 1.0
         assert 0.0 <= metrics["smoothness_score"] <= 100.0
 
     def test_advance_cyclical_sequence_on_planner(self):

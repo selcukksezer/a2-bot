@@ -15,10 +15,15 @@ import logging
 import math
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+from version import __version__
+
+# P1-7 (K-20): minimap metre/piksel ölçeğinin tek kaynağı.
+from core.corridor_navigator import MINIMAP_METERS_PER_PX
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +37,8 @@ class MaterialDiscriminationResult:
     class_name: str
     category: str
     calibrated_confidence: float
+    # Canonical class id of the chosen material (-1 = not assigned / unknown).
+    class_id: int = -1
     rejection_reason: str = ""
     color_histogram_score: float = 0.0
     edge_density: float = 0.0
@@ -47,6 +54,7 @@ class MaterialDiscriminationResult:
             "class_name": self.class_name,
             "category": self.category,
             "calibrated_confidence": self.calibrated_confidence,
+            "class_id": self.class_id,
             "rejection_reason": self.rejection_reason,
             "color_histogram_score": self.color_histogram_score,
             "edge_density": self.edge_density,
@@ -109,7 +117,9 @@ MAIN_MATERIALS_6: dict[str, dict[str, Any]] = {
         "name_tr": "Obsidyen Cevheri (Koyu Mor/Siyah Kristal)",
         "category": "Ores & Metals",
         "description": "dark violet/black glassy rock vein",
-        "class_id": 3,
+        # Canonical class id (dataset_factory/class_taxonomy.py: ore_obsidian=8).
+        # Was 3, colliding with ore_orichalcum=3 so both resolved to Orichalcum.
+        "class_id": 8,
         "nameplate_width_range": (70, 150),
         "typical_aspect_ratio": (3.8, 8.0),
         "rarity_tier": 4,
@@ -348,7 +358,9 @@ def compute_nameplate_width_score(
 ) -> float:
     """Evaluate nameplate text width against canonical material label geometry."""
     if nameplate_width_px <= 0:
-        return 0.50  # Neutral score when nameplate is not detected
+        # No nameplate detected: zero evidence, not a neutral 0.50 that
+        # inflates the total score by 0.15 * 0.50 = 0.075.
+        return 0.0
     scale = max(0.4, float(ref_scale))
     scaled_w = float(nameplate_width_px) / scale
     min_w, max_w = target_width_range
@@ -415,7 +427,10 @@ def compute_color_histogram_scores(hsv: np.ndarray) -> dict[str, float]:
     mask_red1 = cv2.inRange(hsv, (0, 125, 75), (10, 255, 255))
     mask_red2 = cv2.inRange(hsv, (168, 125, 75), (180, 255, 255))
     mask_green = cv2.inRange(hsv, (35, 60, 50), (82, 240, 220))
-    green_ratio = float(np.count_nonzero(mask_green)) / total_px
+    # Counted once and reused below (blood green veto, mela, targena);
+    # previously the same mask was counted three times.
+    green_px = float(np.count_nonzero(mask_green))
+    green_ratio = green_px / total_px
     if green_ratio > 0.08:
         blood_score = 0.0
     else:
@@ -425,11 +440,11 @@ def compute_color_histogram_scores(hsv: np.ndarray) -> dict[str, float]:
     # Additional catalog classes: Mela, Targena
     mask_mela_red = cv2.inRange(hsv, (0, 110, 85), (12, 255, 255)) | cv2.inRange(hsv, (168, 110, 85), (180, 255, 255))
     mela_red_px = float(np.count_nonzero(mask_mela_red))
-    green_px = float(np.count_nonzero(mask_green))
     mela_score = min(1.0, (mela_red_px * 1.2 + green_px * 0.8) / total_px) if (mela_red_px > 0 and green_px > 0) else 0.0
 
     mask_targena = cv2.inRange(hsv, (26, 110, 110), (38, 255, 255))
-    targena_score = min(1.0, (float(np.count_nonzero(mask_targena)) * 1.1 + green_px * 0.5) / total_px) if np.count_nonzero(mask_targena) > 0 else 0.0
+    targena_px = float(np.count_nonzero(mask_targena))
+    targena_score = min(1.0, (targena_px * 1.1 + green_px * 0.5) / total_px) if targena_px > 0 else 0.0
 
     # Background terrain ratios
     mask_dirt = cv2.inRange(hsv, (12, 15, 35), (28, 65, 125))
@@ -465,6 +480,7 @@ def discriminate_3d_material(
     exemplar_memory: Optional[Any] = None,
     aspect_ratio: Optional[float] = None,
     ref_scale: float = 1.0,
+    precomputed_exemplar: Optional[PrecomputedExemplarVerdict] = None,
 ) -> MaterialDiscriminationResult:
     """Multi-layered discrimination between the 6 main game materials and background terrain.
 
@@ -510,7 +526,14 @@ def discriminate_3d_material(
     pos_cid = None
     pos_cname = ""
     pos_sim = 0.0
-    if mem is not None and hasattr(mem, "classify_patch"):
+    if precomputed_exemplar is not None and precomputed_exemplar.positive is not None:
+        # Same call the caller already made on this exact crop
+        # (classify_patch with min_sim=0.70); reuse it instead of paying
+        # for the same feature extraction a second time.
+        pos_cid, pos_cname, pos_sim = precomputed_exemplar.positive
+        if pos_cid is not None and float(pos_sim) >= 0.70:
+            has_pos_exemplar = True
+    elif mem is not None and hasattr(mem, "classify_patch"):
         try:
             pos_cid, pos_cname, pos_sim = mem.classify_patch(patch_bgr, min_sim=0.70)
             if pos_cid is not None and float(pos_sim) >= 0.70:
@@ -518,58 +541,60 @@ def discriminate_3d_material(
         except Exception:
             pass
 
-    # 1. Check ExemplarMemory negative match (learned false patches)
-    if not has_pos_exemplar and mem is not None and hasattr(mem, "is_negative_patch"):
+    # 1. Check ExemplarMemory negative match (learned false patches).
+    # A positive exemplar match does NOT exempt a patch from this gate.
+    _neg_verdict: Optional[tuple[bool, float, Optional[dict[str, Any]]]] = None
+    if precomputed_exemplar is not None and precomputed_exemplar.negative is not None:
+        _neg_verdict = precomputed_exemplar.negative
+    elif mem is not None and hasattr(mem, "is_negative_patch"):
         try:
-            is_neg, neg_sim, neg_ex = mem.is_negative_patch(patch_bgr)
-            if is_neg:
-                cname = neg_ex.get("class_name", "negative") if neg_ex else "negative"
-                return MaterialDiscriminationResult(
-                    is_authentic_node=False,
-                    material_type="Negative Terrain",
-                    class_name="negative",
-                    category="",
-                    calibrated_confidence=round(max(0.05, 1.0 - float(neg_sim)), 3),
-                    rejection_reason=f"learned_negative:{cname}",
-                )
+            _neg_verdict = mem.is_negative_patch(patch_bgr)
         except Exception:
-            pass
+            _neg_verdict = None
+    if _neg_verdict is not None:
+        is_neg, neg_sim, neg_ex = _neg_verdict
+        if is_neg:
+            cname = neg_ex.get("class_name", "negative") if neg_ex else "negative"
+            return MaterialDiscriminationResult(
+                is_authentic_node=False,
+                material_type="Negative Terrain",
+                class_name="negative",
+                category="",
+                calibrated_confidence=round(max(0.05, 1.0 - float(neg_sim)), 3),
+                rejection_reason=f"learned_negative:{cname}",
+            )
 
-    # 1b. Check node quality gate for barren rock / empty ground
-    if not has_pos_exemplar:
+    # 1b. Check node quality gate for barren rock / empty ground.
+    # A positive exemplar match does NOT exempt a patch from this gate.
+    _fake_verdict: Optional[tuple[bool, float, str]] = None
+    if precomputed_exemplar is not None and precomputed_exemplar.fake_gate is not None:
+        _fake_verdict = precomputed_exemplar.fake_gate
+    else:
         try:
             from core.node_quality_gate import is_fake_gray_rock_or_ground
-            is_fake, fake_conf, fake_reason = is_fake_gray_rock_or_ground(patch_bgr, exemplar_memory=mem)
-            if is_fake:
-                return MaterialDiscriminationResult(
-                    is_authentic_node=False,
-                    material_type="Fake Rock/Ground",
-                    class_name="negative",
-                    category="",
-                    calibrated_confidence=round(max(0.05, 1.0 - float(fake_conf)), 3),
-                    rejection_reason=f"fake_terrain:{fake_reason}",
-                )
+            _fake_verdict = is_fake_gray_rock_or_ground(patch_bgr, exemplar_memory=mem)
         except Exception:
-            pass
+            _fake_verdict = None
+    if _fake_verdict is not None:
+        is_fake, fake_conf, fake_reason = _fake_verdict
+        if is_fake:
+            return MaterialDiscriminationResult(
+                is_authentic_node=False,
+                material_type="Fake Rock/Ground",
+                class_name="negative",
+                category="",
+                calibrated_confidence=round(max(0.05, 1.0 - float(fake_conf)), 3),
+                rejection_reason=f"fake_terrain:{fake_reason}",
+            )
 
     # 2. Edge Density & Texture Variance
     edge_density, lap_var, edge_score = compute_edge_density_and_texture(gray)
 
-    # Featureless flat ground/sky check (guarded by positive exemplar immunity shield)
+    # Featureless flat ground/sky check (no exemplar immunity: applies to
+    # every patch). It runs after the colour histogram below so a patch
+    # with strong material colour evidence is not called "featureless".
     std_v = float(np.std(hsv[:, :, 2]))
     std_s = float(np.std(hsv[:, :, 1]))
-    if not has_pos_exemplar and not has_specular_crest:
-        if std_v < 6.5 and std_s < 6.0 and lap_var < 20.0:
-            return MaterialDiscriminationResult(
-                is_authentic_node=False,
-                material_type="Flat Terrain",
-                class_name="negative",
-                category="",
-                calibrated_confidence=0.08,
-                rejection_reason="flat_featureless_terrain",
-                edge_density=edge_density,
-                laplacian_variance=lap_var,
-            )
 
     # 3. Specular Crest & Facet Highlight
     specular_score = compute_specular_crest_score(
@@ -578,6 +603,38 @@ def discriminate_3d_material(
 
     # 4. Color Histogram & Chromatic Scores
     color_scores = compute_color_histogram_scores(hsv)
+
+    _flat_mat_ratio = max(
+        color_scores.get("herb_aria", 0),
+        color_scores.get("herb_edana", 0),
+        color_scores.get("herb_lumina", 0),
+        color_scores.get("ore_orichalcum", 0),
+        color_scores.get("ore_obsidian", 0),
+        color_scores.get("crystal_blood", 0),
+    )
+    # A textureless patch is "featureless terrain" UNLESS it carries vivid
+    # material colour (strong material ratio AND high mean saturation):
+    # a solid purple Aria / solid green herb patch is colour evidence, while
+    # a muted flat brown/grey patch (dirt, S ~ 90) is terrain.
+    _mean_saturation = float(np.mean(hsv[:, :, 1]))
+    _vivid_material = _flat_mat_ratio >= 0.05 and _mean_saturation >= 150.0
+    if (
+        not has_specular_crest
+        and not _vivid_material
+        and std_v < 6.5
+        and std_s < 6.0
+        and lap_var < 20.0
+    ):
+        return MaterialDiscriminationResult(
+            is_authentic_node=False,
+            material_type="Flat Terrain",
+            class_name="negative",
+            category="",
+            calibrated_confidence=0.08,
+            rejection_reason="flat_featureless_terrain",
+            edge_density=edge_density,
+            laplacian_variance=lap_var,
+        )
 
     # 5. Background Terrain Rejection
     max_mat_ratio = max(
@@ -589,7 +646,7 @@ def discriminate_3d_material(
         color_scores.get("crystal_blood", 0),
     )
 
-    if not has_pos_exemplar and specular_score < 0.35:
+    if specular_score < 0.35:
         if color_scores.get("barren_gray_rock_ratio", 0) >= 0.65 and max_mat_ratio < 0.05:
             return MaterialDiscriminationResult(
                 is_authentic_node=False,
@@ -634,7 +691,7 @@ def discriminate_3d_material(
     best_mat_key = "ore_orichalcum"
     best_mat_score = -1.0
     best_color_score = 0.0
-    best_nameplate_score = 0.50
+    best_nameplate_score = 0.0
 
     for mat_key, mat_info in MAIN_MATERIALS_6.items():
         c_score = color_scores.get(mat_key, 0.0)
@@ -642,6 +699,14 @@ def discriminate_3d_material(
             nameplate_width_px, mat_info["nameplate_width_range"], ref_scale=ref_scale
         )
         total_score = 0.40 * c_score + 0.25 * edge_score + 0.20 * specular_score + 0.15 * np_score
+        # Aspect-ratio evidence: reward a matching nameplate shape, penalise
+        # a wildly different one (was an unused parameter).
+        if aspect_ratio is not None:
+            ar_lo, ar_hi = mat_info["typical_aspect_ratio"]
+            if ar_lo <= aspect_ratio <= ar_hi:
+                total_score += 0.05
+            elif aspect_ratio < ar_lo * 0.6 or aspect_ratio > ar_hi * 1.6:
+                total_score -= 0.05
         if total_score > best_mat_score:
             best_mat_score = total_score
             best_mat_key = mat_key
@@ -697,15 +762,16 @@ def discriminate_3d_material(
                 chosen_cat = "Herbs"
                 best_mat_key = "herb_targena"
 
-    # 8. Calibration of Confidence
+    # 8. Calibration of Confidence. A positive exemplar may confirm the
+    # measured score but never floors confidence at 0.85 on its own.
     if has_pos_exemplar:
-        calibrated_conf = min(0.99, max(0.85, float(pos_sim)))
+        calibrated_conf = min(0.99, max(best_mat_score, float(pos_sim)))
     elif specular_score >= 0.75:
         calibrated_conf = max(best_mat_score, 0.86)
     else:
         calibrated_conf = best_mat_score
 
-    if not has_pos_exemplar and best_color_score < 0.04 and specular_score < 0.30 and edge_score < 0.30:
+    if best_color_score < 0.04 and specular_score < 0.30 and edge_score < 0.30:
         return MaterialDiscriminationResult(
             is_authentic_node=False,
             material_type=chosen_name,
@@ -713,6 +779,7 @@ def discriminate_3d_material(
             category=chosen_cat,
             calibrated_confidence=round(min(0.20, max(0.05, calibrated_conf * 0.25)), 3),
             rejection_reason="insufficient_material_evidence",
+            class_id=chosen_cid,
             color_histogram_score=round(best_color_score, 3),
             edge_density=edge_density,
             laplacian_variance=lap_var,
@@ -721,7 +788,9 @@ def discriminate_3d_material(
             color_ratios=color_scores,
         )
 
-    calibrated_conf = round(float(np.clip(calibrated_conf, 0.50, 0.98)), 3)
+    # Weak evidence keeps a low confidence; the old 0.50 floor reported
+    # barely-evidenced patches as real nodes at >= 0.50 confidence.
+    calibrated_conf = round(float(np.clip(calibrated_conf, 0.05, 0.98)), 3)
 
     return MaterialDiscriminationResult(
         is_authentic_node=True,
@@ -730,6 +799,7 @@ def discriminate_3d_material(
         category=chosen_cat,
         calibrated_confidence=calibrated_conf,
         rejection_reason="",
+        class_id=chosen_cid,
         color_histogram_score=round(best_color_score, 3),
         edge_density=edge_density,
         laplacian_variance=lap_var,
@@ -737,6 +807,18 @@ def discriminate_3d_material(
         nameplate_width_score=best_nameplate_score,
         color_ratios=color_scores,
     )
+
+
+def _measured_max(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    """max() over measured values only; None when neither side measured."""
+    vals = [v for v in (a, b) if v is not None]
+    return max(vals) if vals else None
+
+
+def _measured_min(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    """min() over measured values only; None when neither side measured."""
+    vals = [v for v in (a, b) if v is not None]
+    return min(vals) if vals else None
 
 
 @dataclass
@@ -753,15 +835,105 @@ class DetectedMaterial:
     estimated_distance_m: float
     confidence: float
     in_air: bool = False
-    stack_count: int = 1
-    harvests_remaining: int = 3
+    # NOTE: no scanner measures these. None = unmeasured / unknown; never
+    # fabricate stack_count=1 / harvests_remaining=3. Callers must treat
+    # None as "unknown" (priority assumes a fresh node, is_depleted is False).
+    stack_count: Optional[int] = None
+    harvests_remaining: Optional[int] = None
     priority_score: float = 0.0
     rarity_tier: int = 1
 
     @property
     def is_depleted(self) -> bool:
-        """Returns True if the node has zero harvests remaining."""
-        return self.harvests_remaining <= 0
+        """True only when a measured harvest count reached zero.
+
+        An unmeasured (None) count is unknown, not depleted.
+        """
+        return self.harvests_remaining is not None and self.harvests_remaining <= 0
+
+
+@dataclass(frozen=True)
+class PrecomputedExemplarVerdict:
+    """Exemplar verdicts already measured for one crop, handed to
+    discriminate_3d_material so it does not pay for the same feature
+    extraction twice.
+
+    A caller that already ran is_negative_patch / classify_patch /
+    is_fake_gray_rock_or_ground on the exact same crop with the exact same
+    memory (same arguments, same defaults) passes the measured results
+    here. Each field is a plain measured result; a None field means "not
+    precomputed — measure it inside discriminate_3d_material" (the old
+    behaviour). No verdict is ever fabricated: only results returned by
+    the real exemplar calls may be stored here.
+    """
+
+    positive: Optional[tuple[Optional[int], Optional[str], float]] = None
+    negative: Optional[tuple[bool, float, Optional[dict[str, Any]]]] = None
+    fake_gate: Optional[tuple[bool, float, str]] = None
+
+
+# Precompiled patterns for normalize_material_name (same patterns as the
+# inline re.sub calls used before; compiled once at import, not per call).
+_EMOJI_ASTRAL_RE = re.compile(r"[\U00010000-\U0010ffff]")
+_SYMBOL_RE = re.compile(r"[\u2600-\u27ff]")
+_VARIATION_SELECTOR_RE = re.compile(r"[\ufe00-\ufe0f]")
+_SEPARATOR_RE = re.compile(r"[_\-/\\]+")
+_PUNCT_RE = re.compile(r"[^\w\s]")
+_WHITESPACE_RE = re.compile(r"\s+")
+_TURKISH_MAP = str.maketrans("çğıöşü", "cgiosu")
+
+# Canonical alias groups for match_material_names. Built once at import;
+# previously rebuilt (dict + set literals) on every single call.
+_MATERIAL_NAME_ALIASES: dict[str, tuple[str, ...]] = {
+    "orichalcum": ("orichalcum", "ore orichalcum", "orichalcum ore", "orichalcum cevheri"),
+    "aria": ("aria", "herb aria", "fresh aria", "taze aria"),
+    "edana": ("edana", "herb edana", "fresh edana", "taze edana"),
+    "lumina": ("lumina", "herb lumina", "fresh lumina", "taze lumina"),
+    "obsidian": ("obsidian", "ore obsidian", "obsidian ore", "obsidyen", "obsidyen cevheri"),
+    "blood_crystal": (
+        "blood crystal",
+        "crystal blood",
+        "blood",
+        "kan kristali",
+        "kan kristal",
+        "blood gemstone",
+    ),
+    "mela": ("mela", "herb mela", "fresh mela", "taze mela"),
+    "targena": ("targena", "herb targena", "fresh targena", "taze targena"),
+    "gem": (
+        "gem",
+        "gemstone",
+        "gem crystal",
+        "diamond gemstone",
+        "diamond",
+        "sapphire",
+        "ruby",
+        "emerald",
+        "amethyst",
+        "topaz",
+        "odyle",
+        "aether",
+        "gem odyle",
+    ),
+    "tree": (
+        "tree",
+        "log",
+        "tree log",
+        "yggdrasil",
+        "yggdrasil log",
+        "agac",
+        "kereste",
+        "odun",
+        "wood",
+        "agac kereste",
+    ),
+}
+
+# Words shared by many different materials; they must not match two names
+# on their own ("crystal" alone must not match Blood Crystal to Sapphire).
+_MATERIAL_NAME_GENERIC_WORDS: frozenset[str] = frozenset(
+    {"ore", "herb", "fresh", "taze", "mor", "kristal", "bitki", "cevheri", "crystal", "gem", "gemstone"}
+)
 
 
 def normalize_material_name(name: str) -> str:
@@ -770,20 +942,67 @@ def normalize_material_name(name: str) -> str:
         return ""
     text = str(name)
     # Remove emojis and special Unicode symbols (e.g. ⛏️, 🌸, 🍒, 🌿, 💎, 🪵, 🎯, 🧭, etc.)
-    text = re.sub(r"[\U00010000-\U0010ffff]", "", text)
-    text = re.sub(r"[\u2600-\u27ff]", "", text)
-    text = re.sub(r"[\ufe00-\ufe0f]", "", text)
+    text = _EMOJI_ASTRAL_RE.sub("", text)
+    text = _SYMBOL_RE.sub("", text)
+    text = _VARIATION_SELECTOR_RE.sub("", text)
     text = text.lower().strip()
     # Normalize Turkish characters for robust matching
-    tr_map = str.maketrans("çğıöşü", "cgiosu")
-    text = text.translate(tr_map)
+    text = text.translate(_TURKISH_MAP)
     # Normalize underscores, dashes, slashes to single spaces
-    text = re.sub(r"[_\-/\\]+", " ", text)
+    text = _SEPARATOR_RE.sub(" ", text)
     # Remove parentheses, brackets and non-word characters except spaces
-    text = re.sub(r"[^\w\s]", " ", text)
+    text = _PUNCT_RE.sub(" ", text)
     # Collapse multiple whitespaces
-    text = re.sub(r"\s+", " ", text).strip()
+    text = _WHITESPACE_RE.sub(" ", text).strip()
     return text
+
+
+# Canonical material-name alias groups for match_material_names.
+# Module-level (was: rebuilt as a fresh dict literal on every call).
+_MATERIAL_NAME_ALIASES: dict[str, list[str]] = {
+    "orichalcum": ["orichalcum", "ore orichalcum", "orichalcum ore", "orichalcum cevheri"],
+    "aria": ["aria", "herb aria", "fresh aria", "taze aria"],
+    "edana": ["edana", "herb edana", "fresh edana", "taze edana"],
+    "lumina": ["lumina", "herb lumina", "fresh lumina", "taze lumina"],
+    "obsidian": ["obsidian", "ore obsidian", "obsidian ore", "obsidyen", "obsidyen cevheri"],
+    "blood_crystal": [
+        "blood crystal",
+        "crystal blood",
+        "blood",
+        "kan kristali",
+        "kan kristal",
+        "blood gemstone",
+    ],
+    "mela": ["mela", "herb mela", "fresh mela", "taze mela"],
+    "targena": ["targena", "herb targena", "fresh targena", "taze targena"],
+    "gem": [
+        "gem",
+        "gemstone",
+        "gem crystal",
+        "diamond gemstone",
+        "diamond",
+        "sapphire",
+        "ruby",
+        "emerald",
+        "amethyst",
+        "topaz",
+        "odyle",
+        "aether",
+        "gem odyle",
+    ],
+    "tree": [
+        "tree",
+        "log",
+        "tree log",
+        "yggdrasil",
+        "yggdrasil log",
+        "agac",
+        "kereste",
+        "odun",
+        "wood",
+        "agac kereste",
+    ],
+}
 
 
 def match_material_names(target: str, candidate: str) -> bool:
@@ -802,55 +1021,8 @@ def match_material_names(target: str, candidate: str) -> bool:
     if t == c:
         return True
 
-    # 2. Canonical alias dictionary
-    ALIASES: dict[str, list[str]] = {
-        "orichalcum": ["orichalcum", "ore orichalcum", "orichalcum ore", "orichalcum cevheri"],
-        "aria": ["aria", "herb aria", "fresh aria", "taze aria"],
-        "edana": ["edana", "herb edana", "fresh edana", "taze edana"],
-        "lumina": ["lumina", "herb lumina", "fresh lumina", "taze lumina"],
-        "obsidian": ["obsidian", "ore obsidian", "obsidian ore", "obsidyen", "obsidyen cevheri"],
-        "blood_crystal": [
-            "blood crystal",
-            "crystal blood",
-            "blood",
-            "kan kristali",
-            "kan kristal",
-            "blood gemstone",
-        ],
-        "mela": ["mela", "herb mela", "fresh mela", "taze mela"],
-        "targena": ["targena", "herb targena", "fresh targena", "taze targena"],
-        "gem": [
-            "gem",
-            "gemstone",
-            "gem crystal",
-            "crystal",
-            "kristal",
-            "diamond gemstone",
-            "diamond",
-            "sapphire",
-            "ruby",
-            "emerald",
-            "amethyst",
-            "topaz",
-            "odyle",
-            "aether",
-            "gem odyle",
-        ],
-        "tree": [
-            "tree",
-            "log",
-            "tree log",
-            "yggdrasil",
-            "yggdrasil log",
-            "agac",
-            "kereste",
-            "odun",
-            "wood",
-            "agac kereste",
-        ],
-    }
-
-    for group_key, group_items in ALIASES.items():
+    # 2. Canonical alias dictionary (module-level _MATERIAL_NAME_ALIASES)
+    for group_key, group_items in _MATERIAL_NAME_ALIASES.items():
         t_match = any(item == t or item in t or t in item for item in group_items)
         c_match = any(item == c or item in c or c in item for item in group_items)
         if t_match and c_match:
@@ -859,9 +1031,11 @@ def match_material_names(target: str, candidate: str) -> bool:
     # 3. Word token intersection
     t_words = set(t.split())
     c_words = set(c.split())
-    GENERIC_WORDS = {"ore", "herb", "fresh", "taze", "mor", "kristal", "bitki", "cevheri"}
-    distinct_t = t_words - GENERIC_WORDS
-    distinct_c = c_words - GENERIC_WORDS
+    # "crystal"/"kristal"/"gem"/"gemstone" are shared by many different
+    # materials (Blood Crystal vs Sapphire/Ruby/Diamond) and must not match
+    # two names on their own.
+    distinct_t = t_words - _MATERIAL_NAME_GENERIC_WORDS
+    distinct_c = c_words - _MATERIAL_NAME_GENERIC_WORDS
     if distinct_t and distinct_c and (distinct_t & distinct_c):
         return True
 
@@ -923,14 +1097,79 @@ class MaterialScanner:
                 return True
         return False
 
+    def _probe_hybrid_scoring(self) -> bool:
+        """Functional probe (S-0301): fuse one template + one YOLO candidate
+        at the same screen position; real fusion must yield a `hybrid_3d`
+        detection with confidence boosted above both inputs."""
+        try:
+            tpl = DetectedMaterial(
+                material_type="Orichalcum Ore",
+                source="3d_world",
+                screen_x=640,
+                screen_y=400,
+                bbox=(620, 380, 40, 40),
+                rel_map_dx=2.5,
+                rel_map_dy=5.0,
+                estimated_distance_m=5.6,
+                confidence=0.88,
+                harvests_remaining=3,
+            )
+            yolo = DetectedMaterial(
+                material_type="ore_vein",
+                source="3d_world",
+                screen_x=640,
+                screen_y=400,
+                bbox=(620, 380, 40, 40),
+                rel_map_dx=2.5,
+                rel_map_dy=5.0,
+                estimated_distance_m=5.6,
+                confidence=0.82,
+                harvests_remaining=3,
+            )
+            fused = self._fuse_hybrid_detections([tpl], [yolo])
+            return any(
+                getattr(f, "source", None) == "hybrid_3d"
+                and float(getattr(f, "confidence", 0.0)) > 0.88
+                for f in fused
+            )
+        except Exception:
+            return False
+
+    def _probe_prioritization(self) -> bool:
+        """Functional probe (S-0301): rank one synthetic candidate; real
+        prioritization must return it with a score in [0.0, 1.0]."""
+        try:
+            cand = DetectedMaterial(
+                material_type="Orichalcum Ore",
+                source="3d_world",
+                screen_x=640,
+                screen_y=400,
+                bbox=(620, 380, 40, 40),
+                rel_map_dx=2.5,
+                rel_map_dy=5.0,
+                estimated_distance_m=5.6,
+                confidence=0.88,
+                harvests_remaining=3,
+            )
+            ranked = self.prioritize_candidates([cand])
+            if len(ranked) != 1:
+                return False
+            score = float(ranked[0].priority_score)
+            return 0.0 <= score <= 1.0 and int(ranked[0].rarity_tier) >= 1
+        except Exception:
+            return False
+
     def get_material_scanner_health_summary(self) -> dict:
+        # S-0301: every flag is probed for real — the contract validator
+        # checks the taxonomy/entry points, the fusion and prioritization
+        # probes execute the real code paths on a synthetic candidate.
         try:
             detector = getattr(self, "yolo_detector", None)
             return {
-                "material_scanner_ready": True,
+                "material_scanner_ready": bool(validate_material_scanner_contract()),
                 "yolo_detector_ready": bool(detector is not None),
-                "hybrid_scoring_ready": True,
-                "prioritization_ready": True,
+                "hybrid_scoring_ready": bool(self._probe_hybrid_scoring()),
+                "prioritization_ready": bool(self._probe_prioritization()),
             }
         except Exception:
             return {"material_scanner_ready": False}
@@ -984,18 +1223,6 @@ class MaterialScanner:
         h, w = frame_bgr.shape[:2]
         refined: list[DetectedMaterial] = []
 
-        CLASS_ID_TO_MATERIAL: dict[int, str] = {
-            0: "Aria",
-            1: "Mela",
-            2: "Targena",
-            3: "Orichalcum Ore",
-            4: "Diamond Gemstone",
-            5: "Yggdrasil Log",
-            6: "3D Crest",
-            9: "Sprout",
-            12: "World Resource",
-        }
-
         for mat in candidates:
             # Determine crop bounding box
             if hasattr(mat, "bbox") and len(mat.bbox) == 4 and mat.bbox[2] > 2 and mat.bbox[3] > 2:
@@ -1036,9 +1263,11 @@ class MaterialScanner:
                 continue
 
             # 1b. Empty terrain / barren gray rock check
+            _fake_gate: Optional[tuple[bool, float, str]] = None
             try:
                 from core.node_quality_gate import is_fake_gray_rock_or_ground
                 is_fake, fake_conf, fake_reason = is_fake_gray_rock_or_ground(crop, exemplar_memory=mem)
+                _fake_gate = (bool(is_fake), float(fake_conf), str(fake_reason))
                 if is_fake:
                     logger.info(
                         "MaterialScanner filtered candidate '%s' @ (%d, %d): matched empty terrain/gray rock '%s' (conf=%.2f)",
@@ -1051,11 +1280,57 @@ class MaterialScanner:
                     continue
             except Exception as exc_fake:
                 logger.debug("is_fake_gray_rock_or_ground check error: %s", exc_fake)
+                _fake_gate = None
+
+            # Candidate family id (name → class) locks positive refine to the
+            # same material family (herbs/ores/gems/trees). Without this lock,
+            # classify_patch could remap Targena → Orichalcum/Mela via a
+            # strong cross-family exemplar (live sim 0.71–0.91).
+            cand_family_cid = self._resolve_material_family_cid(mat.material_type)
+            family_allowed = self._family_allowed_classes(cand_family_cid)
+
+            # 1b2. Learned positive identity: a patch that strongly matches a
+            # taught positive exemplar (sim >= 0.70) is direct learned
+            # evidence for that node, so it may skip the discrimination
+            # drop below (step 2 still refines its class/confidence from
+            # the same match). The classifier itself has no exemplar shield
+            # anymore; this rescue lives only in the exemplar gate, whose
+            # job is exactly to apply learned identities. A negative
+            # exemplar match (step 1) still wins over a positive one.
+            # The verdict is measured ONCE here and reused by step 1c
+            # (via PrecomputedExemplarVerdict) and step 2 below, instead
+            # of running the same feature extraction three times per crop.
+            # Only if this call raised do we retry in step 2, preserving
+            # the old fallback behaviour.
+            pos_match = False
+            _pos_result: Optional[tuple[Optional[int], Optional[str], float]] = None
+            try:
+                if hasattr(mem, "classify_patch"):
+                    if family_allowed is not None:
+                        _pos_result = mem.classify_patch(
+                            crop, min_sim=0.70, allowed_classes=family_allowed
+                        )
+                    else:
+                        _pos_result = mem.classify_patch(crop, min_sim=0.70)
+                    _pcid, _pcname, _psim = _pos_result
+                    pos_match = _pcid is not None and float(_psim) >= 0.70
+            except Exception:
+                pos_match = False
+                _pos_result = None
 
             # 1c. Multi-layered 3D material discrimination & background terrain rejection
+            disc_res = None
             if mat.source in {"3d_world", "3d_yolo", "3d_floating_icon"}:
-                disc_res = discriminate_3d_material(crop, exemplar_memory=mem)
-                if not disc_res.is_authentic_node:
+                disc_res = discriminate_3d_material(
+                    crop,
+                    exemplar_memory=mem,
+                    precomputed_exemplar=PrecomputedExemplarVerdict(
+                        positive=_pos_result,
+                        negative=(is_neg, neg_sim, neg_ex),
+                        fake_gate=_fake_gate,
+                    ),
+                )
+                if not disc_res.is_authentic_node and not pos_match:
                     logger.info(
                         "MaterialScanner filtered candidate '%s' @ (%d, %d): rejected non-matching background terrain '%s'",
                         mat.material_type,
@@ -1065,19 +1340,13 @@ class MaterialScanner:
                     )
                     continue
 
-                generic_names = {
-                    "3d crest",
-                    "3d_crest",
-                    "gatherable_node",
-                    "world resource",
-                    "world_resource",
-                    "raw_node",
-                    "unknown",
-                    "3d_world",
-                    "resource",
-                }
-                if str(mat.material_type).strip().lower() in generic_names and disc_res.material_type:
+                if str(mat.material_type).strip().lower() in self._GENERIC_3D_NAMES and disc_res.material_type:
                     mat.material_type = disc_res.material_type
+                    # Discrimination may have named the node; refresh family lock.
+                    cand_family_cid = self._resolve_material_family_cid(mat.material_type)
+                    if cand_family_cid is None and int(getattr(disc_res, "class_id", -1) or -1) >= 0:
+                        cand_family_cid = int(disc_res.class_id)
+                    family_allowed = self._family_allowed_classes(cand_family_cid)
 
                 if disc_res.calibrated_confidence > 0:
                     mat.confidence = round(
@@ -1085,10 +1354,48 @@ class MaterialScanner:
                         3,
                     )
 
+            if cand_family_cid is None and disc_res is not None:
+                try:
+                    _dcid = int(getattr(disc_res, "class_id", -1) or -1)
+                except (TypeError, ValueError):
+                    _dcid = -1
+                if _dcid >= 0:
+                    cand_family_cid = _dcid
+                    family_allowed = self._family_allowed_classes(cand_family_cid)
+
             # 2. Positive Exemplar Check (Aria, Edana, Lumina, Orichalcum, Obsidian, Blood Crystal, etc.)
+            # Reuses the step-1b2 verdict measured above (no second
+            # classify_patch call on the same crop); retries only if 1b2
+            # raised and left no verdict, preserving the old fallback.
             if hasattr(mem, "classify_patch"):
                 try:
-                    pos_cid, pos_cname, pos_sim = mem.classify_patch(crop, min_sim=0.70)
+                    if _pos_result is not None:
+                        pos_cid, pos_cname, pos_sim = _pos_result
+                    elif family_allowed is not None:
+                        pos_cid, pos_cname, pos_sim = mem.classify_patch(
+                            crop, min_sim=0.70, allowed_classes=family_allowed
+                        )
+                    else:
+                        pos_cid, pos_cname, pos_sim = mem.classify_patch(crop, min_sim=0.70)
+
+                    # Hard family gate even if classify_patch was unrestricted
+                    # (generic / unknown candidate name): never remap across families.
+                    if (
+                        pos_cid is not None
+                        and cand_family_cid is not None
+                        and not self._is_same_material_family(cand_family_cid, pos_cid)
+                    ):
+                        logger.info(
+                            "MaterialScanner blocked cross-family exemplar refine "
+                            "'%s' (cid=%s) <- exemplar cid=%s/%s (sim=%.2f)",
+                            mat.material_type,
+                            cand_family_cid,
+                            pos_cid,
+                            pos_cname,
+                            pos_sim,
+                        )
+                        pos_cid, pos_cname = None, None
+
                     if pos_cid is not None or pos_cname:
                         # Elevate / boost confidence score
                         old_conf = float(mat.confidence)
@@ -1096,8 +1403,8 @@ class MaterialScanner:
                         mat.confidence = round(float(np.clip(max(old_conf + boost, float(pos_sim)), old_conf, 0.99)), 4)
                         # Refine material class if known
                         new_mat_name = None
-                        if pos_cid is not None and pos_cid in CLASS_ID_TO_MATERIAL:
-                            new_mat_name = CLASS_ID_TO_MATERIAL[pos_cid]
+                        if pos_cid is not None and pos_cid in self._EXEMPLAR_CLASS_ID_TO_MATERIAL:
+                            new_mat_name = self._EXEMPLAR_CLASS_ID_TO_MATERIAL[pos_cid]
                         elif pos_cname:
                             cn = str(pos_cname).lower()
                             if "aria" in cn:
@@ -1122,20 +1429,224 @@ class MaterialScanner:
                                 new_mat_name = "Yggdrasil Log"
 
                         if new_mat_name and mat.material_type != new_mat_name:
-                            logger.info(
-                                "MaterialScanner refined material '%s' -> '%s' via learned positive exemplar (cid=%s, sim=%.2f)",
-                                mat.material_type,
-                                new_mat_name,
-                                pos_cid,
-                                pos_sim,
-                            )
-                            mat.material_type = new_mat_name
+                            new_cid = self._resolve_material_family_cid(new_mat_name)
+                            if (
+                                cand_family_cid is not None
+                                and new_cid is not None
+                                and not self._is_same_material_family(cand_family_cid, new_cid)
+                            ):
+                                logger.info(
+                                    "MaterialScanner blocked cross-family name refine "
+                                    "'%s' -> '%s' (cand_cid=%s, new_cid=%s, sim=%.2f)",
+                                    mat.material_type,
+                                    new_mat_name,
+                                    cand_family_cid,
+                                    new_cid,
+                                    pos_sim,
+                                )
+                            else:
+                                logger.info(
+                                    "MaterialScanner refined material '%s' -> '%s' via learned positive exemplar (cid=%s, sim=%.2f)",
+                                    mat.material_type,
+                                    new_mat_name,
+                                    pos_cid,
+                                    pos_sim,
+                                )
+                                mat.material_type = new_mat_name
                 except Exception as exc_pos:
                     logger.debug("classify_patch check error in MaterialScanner: %s", exc_pos)
 
             refined.append(mat)
 
         return refined
+
+    # Exemplar class id -> canonical material name (used by the refine
+    # gate to translate a positive exemplar match). Class-level: it was
+    # rebuilt as a fresh dict on every _refine_candidates_with_exemplars
+    # call; contents never change.
+    _EXEMPLAR_CLASS_ID_TO_MATERIAL: dict[int, str] = {
+        0: "Aria",
+        1: "Mela",
+        2: "Targena",
+        3: "Orichalcum Ore",
+        4: "Diamond Gemstone",
+        8: "Obsidian Ore",
+        5: "Yggdrasil Log",
+        6: "3D Crest",
+        9: "Sprout",
+        12: "World Resource",
+    }
+
+    @classmethod
+    def _resolve_material_family_cid(cls, material_type: Any) -> Optional[int]:
+        """Map a material display/name string to a family class id (0..8,12).
+
+        Used by the refine family lock so 'Targena' never remaps to an ore
+        exemplar. Returns None for unknown/generic names (no family lock).
+        """
+        if material_type is None:
+            return None
+        raw = str(material_type).strip()
+        if not raw:
+            return None
+        low = raw.lower()
+        # Exact reverse of the refine map first.
+        for cid, name in cls._EXEMPLAR_CLASS_ID_TO_MATERIAL.items():
+            if low == str(name).lower():
+                return int(cid)
+        # Substring aliases (order matters: more specific first).
+        if "targena" in low:
+            return 2
+        if "mela" in low:
+            return 1
+        if "aria" in low:
+            return 0
+        if "edana" in low or "lumina" in low:
+            # Non-canonical herb names still lock to the herb family (0..2,6,7).
+            return 0
+        if "orichalcum" in low:
+            return 3
+        if "obsidian" in low or "obsidyen" in low:
+            return 8
+        if any(g in low for g in ("gem", "sapphire", "ruby", "diamond")) or "blood" in low:
+            return 4
+        if any(t in low for t in ("tree", "log", "wood", "yggdrasil")):
+            return 5
+        if "crest" in low:
+            return 6
+        return None
+
+    @staticmethod
+    def _family_allowed_classes(cand_cid: Optional[int]) -> Optional[frozenset]:
+        """Return the material-family class set for cand_cid, or None if unlocked."""
+        if cand_cid is None:
+            return None
+        try:
+            from dataset_factory.class_taxonomy import MATERIAL_FAMILIES, MATERIAL_3D_CLASSES
+        except Exception:
+            return None
+        try:
+            cid = int(cand_cid)
+        except (TypeError, ValueError):
+            return None
+        if cid not in MATERIAL_3D_CLASSES:
+            return None
+        for family in MATERIAL_FAMILIES:
+            if cid in family:
+                return frozenset(family)
+        return None
+
+    @staticmethod
+    def _is_same_material_family(a: Any, b: Any) -> bool:
+        try:
+            from dataset_factory.class_taxonomy import is_same_material_family
+        except Exception:
+            return True
+        return bool(is_same_material_family(a, b))
+
+    # Generic (unresolved) material names, per use site. Membership is
+    # checked per candidate / per fused pair, so these live at class level
+    # instead of being rebuilt as fresh set literals each time.
+    _GENERIC_3D_NAMES: frozenset[str] = frozenset(
+        {
+            "3d crest",
+            "3d_crest",
+            "gatherable_node",
+            "world resource",
+            "world_resource",
+            "raw_node",
+            "unknown",
+            "3d_world",
+            "resource",
+        }
+    )
+    _GENERIC_FUSE_NAMES: frozenset[str] = frozenset(
+        {
+            "3d crest",
+            "3d_crest",
+            "crest",
+            "gatherable_node",
+            "raw_node",
+            "world resource",
+            "world_resource",
+            "ore_vein",
+            "herb_flora",
+            "unknown",
+        }
+    )
+    _GENERIC_SELECTIVE_NAMES: frozenset[str] = frozenset(
+        {
+            "gatherable_node",
+            "world resource",
+            "3d crest",
+            "gatherable material",
+            "sprout",
+            "3d_world",
+        }
+    )
+
+    # YOLO detector output -> canonical material name. Rebuilt on every
+    # scan_3d_yolo_materials call (i.e. every frame) before; contents are
+    # fixed, so they live at class level now.
+    _YOLO_CLASS_NAME_MAP: dict[str, str] = {
+        "herb_aria": "Aria",
+        "aria": "Aria",
+        "herb_edana": "Herb Edana",
+        "edana": "Herb Edana",
+        "herb_lumina": "Herb Lumina",
+        "lumina": "Herb Lumina",
+        "herb_mela": "Mela",
+        "mela": "Mela",
+        "herb_targena": "Targena",
+        "targena": "Targena",
+        "herb_flora": "Aria",
+        "ore_orichalcum": "Orichalcum Ore",
+        "orichalcum": "Orichalcum Ore",
+        "ore_vein": "Orichalcum Ore",
+        "ore_obsidian": "Obsidian Ore",
+        "obsidian": "Obsidian Ore",
+        "crystal_blood": "Blood Crystal",
+        "blood_crystal": "Blood Crystal",
+        "blood": "Blood Crystal",
+        "gem_crystal": "Diamond Gemstone",
+        "gem": "Diamond Gemstone",
+        "tree_log": "Yggdrasil Log",
+        "tree": "Yggdrasil Log",
+        "world_resource_mesh": "Orichalcum Ore",
+        "gatherable_node": "gatherable_node",
+    }
+
+    # Coarse YOLO class names mapped to canonical class ids
+    # (-1 = no specific material id; generic bucket only).
+    _COARSE_YOLO_CLASSES: dict[str, int] = {
+        "herb_flora": 0,
+        "ore_vein": 3,
+        "world_resource_mesh": 12,
+        "gatherable_node": -1,
+        "resource": -1,
+        "ore": 3,
+        "herb": 0,
+        "gem": 4,
+        "tree": 5,
+    }
+
+    _YOLO_NON_RESOURCE_KEYWORDS: frozenset[str] = frozenset(
+        {
+            "monster",
+            "threat",
+            "approaching_monster",
+            "hostile",
+            "mob",
+            "agro",
+            "player",
+            "npc",
+            "party",
+            "ally",
+            "target_hp",
+            "skill",
+            "path",
+        }
+    )
 
     # Reference resolution for normalized coordinate and perspective calculations
     REF_WIDTH: int = 1280
@@ -1242,7 +1753,7 @@ class MaterialScanner:
         self,
         perspective_scale_x: float = 0.085,
         perspective_scale_y: float = 0.115,
-        meters_per_map_pixel: float = 0.65,
+        meters_per_map_pixel: float = MINIMAP_METERS_PER_PX,
         templates_dir: str = "templates",
         yolo_detector: Optional[Any] = None,
     ) -> None:
@@ -1251,7 +1762,11 @@ class MaterialScanner:
         Args:
             perspective_scale_x: Horizontal conversion scale from 3D screen offset to map pixels.
             perspective_scale_y: Vertical conversion scale from 3D screen offset to map pixels.
-            meters_per_map_pixel: Conversion factor from relative map pixels to estimated meters.
+            meters_per_map_pixel: Conversion factor from relative MINIMAP pixels to
+                estimated meters. P1-7 (K-20): tek kaynak
+                `core.corridor_navigator.MINIMAP_METERS_PER_PX` (0.55); eski
+                0.65 varsayılanı kaldırıldı. Değer canlı ölçümle kalibre
+                edilmedi — karar gerekçesi corridor_navigator.py başlığında.
             templates_dir: Directory containing optional PNG templates.
             yolo_detector: Optional YOLO 3D detector instance.
         """
@@ -1261,6 +1776,11 @@ class MaterialScanner:
         self.templates_dir = templates_dir
         self.yolo_detector = yolo_detector
         self._yolo_detector_attempted: bool = False
+        # S068 (v19/P3-8): başarısız başlatma kalıcı kilitleniyordu
+        # (bir kez True olunca bir daha denenmiyordu). Son başarısız
+        # deneme zamanı tutulur; 60 sn sonra yeniden deneme yapılır
+        # (her taramada ağır model yükü denenmez).
+        self._yolo_detector_failed_at: float = 0.0
 
         self._crest_template_mask = self._build_crest_template_mask()
         self._sprout_12_tpl = np.array(self._SPROUT_12X12_V, dtype=np.uint8)
@@ -1276,6 +1796,7 @@ class MaterialScanner:
             "minimap_sprout.png"
         )
         self._selected_materials: list[str] = []
+        self._price_scanner: Optional[Any] = None
 
     def _build_crest_template_mask(self) -> np.ndarray:
         """Unpack the 28x29 canonical binary mask for the 3D white winged gather crest."""
@@ -1298,26 +1819,42 @@ class MaterialScanner:
         return None
 
     def estimate_material_kinah_value(self, material_name: str, count: int = 1) -> int:
-        """Estimate the Kinah value for a given material and count by querying EconomyBroker."""
+        """Estimate the Kinah value for a given material and count by querying EconomyBroker.
+
+        Returns 0 when no price is known for the material: a fabricated
+        12000-kinah default used to be returned (and multiplied) here.
+        The price scanner is created once and reused instead of once per call.
+        """
         try:
-            from core.economy_broker import TradeBrokerPriceScanner
-            scanner = TradeBrokerPriceScanner(auto_save=False)
-            unit_price = scanner.get_price(material_name, default=12000)
+            if self._price_scanner is None:
+                from core.economy_broker import TradeBrokerPriceScanner
+                self._price_scanner = TradeBrokerPriceScanner(auto_save=False)
+            unit_price = self._price_scanner.get_price(material_name, default=0)
             return int(unit_price * max(1, int(count)))
         except Exception as exc:
             logger.warning("Failed to estimate material kinah value for %s: %s", material_name, exc)
-            return int(12000 * max(1, int(count)))
+            return 0
 
     def get_yolo_detector(self) -> Optional[Any]:
-        """Return the current YOLO detector or lazily instantiate ONNXYolo3DDetector."""
+        """Return the current YOLO detector or lazily instantiate ONNXYolo3DDetector.
+
+        S068 (v19/P3-8): başlatma hatası kalıcı değildi artık — başarısız
+        denemeden 60 sn sonra yeniden denenir (model dosyası sonradan
+        gelmiş / geçici yükleme hatası olabilir).
+        """
         if self.yolo_detector is not None:
             return self.yolo_detector
-        if not self._yolo_detector_attempted:
+        if not self._yolo_detector_attempted or (
+            self._yolo_detector_failed_at
+            and time.monotonic() - self._yolo_detector_failed_at >= 60.0
+        ):
             self._yolo_detector_attempted = True
             try:
                 from core.neural_audio_perception import ONNXYolo3DDetector
                 self.yolo_detector = ONNXYolo3DDetector()
+                self._yolo_detector_failed_at = 0.0
             except Exception as exc:
+                self._yolo_detector_failed_at = time.monotonic()
                 logger.debug("Could not initialize default ONNXYolo3DDetector: %s", exc)
         return self.yolo_detector
 
@@ -1358,42 +1895,11 @@ class MaterialScanner:
             if not raw_dets:
                 return detections
 
-            CLASS_NAME_MAP = {
-                "herb_aria": "Aria",
-                "aria": "Aria",
-                "herb_edana": "Herb Edana",
-                "edana": "Herb Edana",
-                "herb_lumina": "Herb Lumina",
-                "lumina": "Herb Lumina",
-                "herb_mela": "Mela",
-                "mela": "Mela",
-                "herb_targena": "Targena",
-                "targena": "Targena",
-                "herb_flora": "Aria",
-                "ore_orichalcum": "Orichalcum Ore",
-                "orichalcum": "Orichalcum Ore",
-                "ore_vein": "Orichalcum Ore",
-                "ore_obsidian": "Obsidian Ore",
-                "obsidian": "Obsidian Ore",
-                "crystal_blood": "Blood Crystal",
-                "blood_crystal": "Blood Crystal",
-                "blood": "Blood Crystal",
-                "gem_crystal": "Diamond Gemstone",
-                "gem": "Diamond Gemstone",
-                "tree_log": "Yggdrasil Log",
-                "tree": "Yggdrasil Log",
-                "world_resource_mesh": "Orichalcum Ore",
-                "gatherable_node": "gatherable_node",
-            }
-
-            NON_RESOURCE_KEYWORDS = {
-                "monster", "threat", "approaching_monster", "hostile", "mob", "agro",
-                "player", "npc", "party", "ally", "target_hp", "skill", "path"
-            }
-
+            # Lookup tables are class-level (_YOLO_CLASS_NAME_MAP etc.);
+            # they were rebuilt as fresh dicts on every frame before.
             for det in raw_dets:
                 cname = str(det.get("class_name", "") or det.get("label", "")).strip().lower()
-                if any(kw in cname for kw in NON_RESOURCE_KEYWORDS):
+                if any(kw in cname for kw in self._YOLO_NON_RESOURCE_KEYWORDS):
                     continue
 
                 conf = float(det.get("confidence", 0.5) or 0.5)
@@ -1425,36 +1931,51 @@ class MaterialScanner:
                 y2 = max(y1 + 2, min(h, by + bh))
                 crop = frame_bgr[y1:y2, x1:x2]
 
-                mapped_name = CLASS_NAME_MAP.get(cname, "")
+                mapped_name = self._YOLO_CLASS_NAME_MAP.get(cname, "")
                 in_air = bool(cy < int(h * 0.22))
 
                 # Multi-layer discrimination verification & background terrain rejection
                 disc_res = discriminate_3d_material(crop, ref_scale=w / float(self.REF_WIDTH))
-                if not disc_res.is_authentic_node and conf < 0.65:
-                    continue  # Reject non-matching background ground/dirt/bushes/rocks
-
-                COARSE_YOLO_CLASSES = {
-                    "herb_flora", "ore_vein", "world_resource_mesh", "gatherable_node",
-                    "resource", "ore", "herb", "gem", "tree"
-                }
 
                 if disc_res.is_authentic_node:
-                    if cname in COARSE_YOLO_CLASSES or not mapped_name:
+                    if cname in self._COARSE_YOLO_CLASSES or not mapped_name:
                         mapped_name = disc_res.material_type
                     conf = max(conf, disc_res.calibrated_confidence)
-                elif cname in COARSE_YOLO_CLASSES or not mapped_name:
+                else:
+                    # Discrimination said "terrain, not a node". A high YOLO
+                    # confidence alone must NOT override that rejection
+                    # (previously conf >= 0.65 silently kept the detection).
+                    # F-1327 (R19): the rescue below is only attempted for a
+                    # strong YOLO detection (confidence >= 0.65). A
+                    # low-confidence detection on a featureless crop must
+                    # not be rescued by the patch classifier alone: the
+                    # uniform-gray crop classifies as Orichalcum Ore at
+                    # ~0.87 on dark-rock evidence, so without this gate
+                    # every low-confidence false positive would pass.
+                    if conf < 0.65:
+                        continue
+                    # Only a strong INDEPENDENT patch classification (>= 0.70)
+                    # rescues it, and a specific YOLO-mapped name is kept
+                    # over the patch classifier's name.
+                    rescued = False
                     try:
                         from config.materials_db import classify_3d_material_patch
                         patch_info = classify_3d_material_patch(crop)
                         if patch_info and patch_info.get("confidence", 0) >= 0.70:
                             p_name = patch_info.get("name")
                             if p_name and patch_info.get("color_ratios"):
-                                mapped_name = p_name
+                                if cname in self._COARSE_YOLO_CLASSES or not mapped_name:
+                                    mapped_name = p_name
+                                rescued = True
                     except Exception:
                         pass
+                    if not rescued:
+                        continue  # Reject non-matching background ground/dirt/bushes/rocks
 
                 if not mapped_name:
-                    mapped_name = "Orichalcum Ore"
+                    # Never fabricate a material: an unclassifiable node is
+                    # reported as Unknown, not as Orichalcum Ore.
+                    mapped_name = "Unknown"
 
                 rel_dx, rel_dy, dist_m = self._project_3d_to_map_offset(cx, cy, w, h)
 
@@ -1470,8 +1991,6 @@ class MaterialScanner:
                         estimated_distance_m=dist_m,
                         confidence=round(conf, 3),
                         in_air=in_air,
-                        stack_count=1,
-                        harvests_remaining=3,
                     )
                 )
 
@@ -1546,20 +2065,8 @@ class MaterialScanner:
 
                 fused_conf = round(min(0.99, max(tpl.confidence, yolo.confidence) + 0.08), 3)
 
-                generic_names = {
-                    "3d crest",
-                    "3d_crest",
-                    "crest",
-                    "gatherable_node",
-                    "raw_node",
-                    "world resource",
-                    "world_resource",
-                    "ore_vein",
-                    "herb_flora",
-                    "unknown",
-                }
-                tpl_is_generic = str(tpl.material_type or "").strip().lower() in generic_names
-                yolo_is_generic = str(yolo.material_type or "").strip().lower() in generic_names
+                tpl_is_generic = str(tpl.material_type or "").strip().lower() in self._GENERIC_FUSE_NAMES
+                yolo_is_generic = str(yolo.material_type or "").strip().lower() in self._GENERIC_FUSE_NAMES
                 if not tpl_is_generic and yolo_is_generic:
                     mat_type = tpl.material_type
                 elif not yolo_is_generic:
@@ -1579,8 +2086,10 @@ class MaterialScanner:
                         estimated_distance_m=round(min(tpl.estimated_distance_m, yolo.estimated_distance_m), 2),
                         confidence=fused_conf,
                         in_air=tpl.in_air or yolo.in_air,
-                        stack_count=max(tpl.stack_count, yolo.stack_count),
-                        harvests_remaining=min(tpl.harvests_remaining, yolo.harvests_remaining),
+                        stack_count=_measured_max(tpl.stack_count, yolo.stack_count),
+                        harvests_remaining=_measured_min(
+                            tpl.harvests_remaining, yolo.harvests_remaining
+                        ),
                     )
                 )
 
@@ -1609,7 +2118,10 @@ class MaterialScanner:
         if candidate is None:
             return 0.0
 
-        harvests = int(getattr(candidate, "harvests_remaining", 3))
+        _harvests_raw = getattr(candidate, "harvests_remaining", None)
+        # Unmeasured harvest count: assume a fresh node for ranking only;
+        # the stored value stays None (unknown), it is not fabricated.
+        harvests = 3 if _harvests_raw is None else int(_harvests_raw)
         if harvests <= 0:
             candidate.priority_score = round(0.01 * float(candidate.confidence), 4)
             candidate.rarity_tier = 1
@@ -1775,7 +2287,8 @@ class MaterialScanner:
 
         scored: list[DetectedMaterial] = []
         for c in candidates:
-            if filter_depleted and getattr(c, "harvests_remaining", 3) <= 0:
+            _hr = getattr(c, "harvests_remaining", None)
+            if filter_depleted and _hr is not None and _hr <= 0:
                 continue
             self.compute_candidate_priority(c, current_player_pos=current_player_pos)
             scored.append(c)
@@ -1794,6 +2307,33 @@ class MaterialScanner:
             candidates, current_player_pos=current_player_pos, filter_depleted=filter_depleted
         )
         return prioritized[0] if prioritized else None
+
+    @staticmethod
+    def _dedupe_detections(
+        detections: list["DetectedMaterial"], frame_w: int = 1280
+    ) -> list["DetectedMaterial"]:
+        """Drop duplicate reports of the same physical node from different scanners.
+
+        Two reports whose centres lie within ~48 px (at 1280 px reference
+        width, scaled with the frame) are the same node; the
+        highest-confidence one wins.
+        """
+        if len(detections) < 2:
+            return list(detections)
+        radius = 48.0 * max(0.25, frame_w / 1280.0)
+        ordered = sorted(detections, key=lambda d: float(d.confidence), reverse=True)
+        kept: list["DetectedMaterial"] = []
+        for det in ordered:
+            duplicate = False
+            for other in kept:
+                dx = float(det.screen_x) - float(other.screen_x)
+                dy = float(det.screen_y) - float(other.screen_y)
+                if dx * dx + dy * dy <= radius * radius:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(det)
+        return kept
 
     def scan_frame_for_materials(
         self,
@@ -1834,8 +2374,9 @@ class MaterialScanner:
             hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
             h, w = frame_bgr.shape[:2]
 
-            # If frame is a minimap closeup crop (w < 1000), only run minimap material scanning
-            if w < 1000:
+            # Only a narrow crop (w < 500) is treated as a minimap closeup.
+            # A 960x540 frame is a real game frame and must get the full 3D scan.
+            if w < 500:
                 minimap_nodes = self.scan_minimap_materials(frame_bgr, hsv)
                 minimap_nodes = self._refine_candidates_with_exemplars(
                     frame_bgr, minimap_nodes, exemplar_memory=exemplar_memory
@@ -1875,6 +2416,11 @@ class MaterialScanner:
             minimap_nodes = self.scan_minimap_materials(frame_bgr, hsv)
             results.extend(minimap_nodes)
 
+            # 6b. Cross-source dedup: the same physical node was reported by
+            # several scanners (world / floating box / gather prompt / YOLO /
+            # minimap). Keep only the highest-confidence report per location.
+            results = self._dedupe_detections(results, frame_w=w)
+
             # 7. Pass candidates through ExemplarMemory gate:
             # - Drop candidates that match learned negative exemplars (empty rocks, terrain, UI chrome)
             # - Elevate confidence score and refine material class for learned positive exemplars
@@ -1892,7 +2438,7 @@ class MaterialScanner:
                     mtype = getattr(c, "material_type", "")
                     if self.is_material_selected(mtype):
                         filtered.append(c)
-                    elif str(mtype).lower() in ("gatherable_node", "world resource", "3d crest", "gatherable material", "sprout", "3d_world"):
+                    elif str(mtype).lower() in self._GENERIC_SELECTIVE_NAMES:
                         # Attempt patch classification if frame_bgr is available
                         if frame_bgr is not None and frame_bgr.size > 0:
                             try:
@@ -2070,6 +2616,11 @@ class MaterialScanner:
                     ty2 - ty1,
                 )
 
+                # v20 (MADDE 8): boş materyal adı = mesh learned-negative
+                # reddi (canavar/oyuncu) — tespit üretilmez.
+                if not material_type:
+                    continue
+
                 node_screen_x = int(abs_x + cw // 2)
                 node_screen_y = int(
                     min(h - 1, abs_label_y2 + int(round(24 * (h / float(self.REF_HEIGHT)))))
@@ -2084,7 +2635,7 @@ class MaterialScanner:
                 rel_dx, rel_dy, dist_m = self._project_3d_to_map_offset(
                     node_screen_x, node_screen_y, w, h
                 )
-                conf = round(min(0.99, 0.84 + 0.12 * score + 0.03 * sym_ratio), 3)
+                conf = round(min(0.99, 0.15 + 0.70 * score + 0.05 * sym_ratio), 3)
 
                 detections.append(
                     DetectedMaterial(
@@ -2098,8 +2649,6 @@ class MaterialScanner:
                         estimated_distance_m=dist_m,
                         confidence=conf,
                         in_air=in_air,
-                        stack_count=1,
-                        harvests_remaining=3,
                     )
                 )
 
@@ -2304,6 +2853,11 @@ class MaterialScanner:
                     frame_bgr, hsv, x, y, cw, ch
                 )
 
+                # v20 (MADDE 8): boş materyal adı = mesh learned-negative
+                # reddi (canavar/oyuncu) — tespit üretilmez.
+                if not material_type:
+                    continue
+
                 # Target node position on the ground right below the nameplate
                 node_screen_x = int(cx)
                 node_screen_y = int(min(h - 1, y + ch + int(round(28 * scale_y))))
@@ -2335,8 +2889,6 @@ class MaterialScanner:
                         estimated_distance_m=dist_m,
                         confidence=confidence,
                         in_air=in_air,
-                        stack_count=1,
-                        harvests_remaining=3,
                     )
                 )
 
@@ -2532,8 +3084,6 @@ class MaterialScanner:
                         estimated_distance_m=dist_m,
                         confidence=round(float(conf), 3),
                         in_air=False,
-                        stack_count=1,
-                        harvests_remaining=3,
                     )
                 )
 
@@ -2627,22 +3177,30 @@ class MaterialScanner:
                 cx = abs_x + fcw // 2
                 cy = abs_y + fch // 2
 
-                # Inherit material_type from nearby 3D nameplate if present, else default to Orichalcum Ore
-                mat_type = "Orichalcum Ore"
+                # Inherit material_type only from a NEARBY 3D nameplate.
+                # Without a close neighbour the type is Unknown (never a
+                # default Orichalcum Ore inherited from an arbitrarily far node).
+                mat_type = "Unknown"
                 in_air = False
                 if world_detections:
                     nearest = min(
                         world_detections,
                         key=lambda d: math.hypot(d.screen_x - cx, d.screen_y - cy),
                     )
-                    mat_type = nearest.material_type
-                    in_air = nearest.in_air
+                    nearest_dist = math.hypot(nearest.screen_x - cx, nearest.screen_y - cy)
+                    max_inherit_px = 200.0 * (w / float(self.REF_WIDTH))
+                    if nearest_dist <= max_inherit_px:
+                        mat_type = nearest.material_type
+                        in_air = nearest.in_air
 
                 rel_dx, rel_dy, dist_m = self._project_3d_to_map_offset(cx, cy, w, h)
                 # When "F Gather" is visible, the player is within interaction range (~1.5m - 2.5m)
                 dist_m = round(min(dist_m, 2.2), 2)
 
-                conf = 0.94 if total_white >= 130 else 0.86
+                # Confidence from the RELATIVE white fraction of the prompt
+                # box, not from an absolute pixel count (which grows with box size).
+                white_ratio = total_white / max(1, fcw * fch)
+                conf = 0.94 if white_ratio >= 0.20 else 0.86
                 prompts.append(
                     DetectedMaterial(
                         material_type=mat_type,
@@ -2655,8 +3213,6 @@ class MaterialScanner:
                         estimated_distance_m=dist_m,
                         confidence=conf,
                         in_air=in_air,
-                        stack_count=1,
-                        harvests_remaining=3,
                     )
                 )
 
@@ -2713,10 +3269,16 @@ class MaterialScanner:
                             )
                         )
             elif w > 500:
-                mx1, my1, mx2, my2 = 359, 108, min(w, 690), min(h, 329)
+                # ROI as fractions of the frame (old fixed pixels assumed
+                # 1920x1080); scales to any resolution.
+                mx1, my1 = int(round(w * 0.187)), int(round(h * 0.100))
+                mx2, my2 = min(w, int(round(w * 0.359))), min(h, int(round(h * 0.305)))
                 templates = [self._sprout_17_tpl]
             else:
-                mx1, my1, mx2, my2 = 8, 68, min(w, 339), min(h, 289)
+                # Small closeup crop: fractions of the frame (old fixed pixels
+                # assumed ~960x540).
+                mx1, my1 = int(round(w * 0.008)), int(round(h * 0.126))
+                mx2, my2 = min(w, int(round(w * 0.353))), min(h, int(round(h * 0.535)))
                 templates = [self._sprout_17_tpl]
 
             if self._disk_sprout_tpl is not None:
@@ -2818,8 +3380,6 @@ class MaterialScanner:
                         estimated_distance_m=dist_m,
                         confidence=conf,
                         in_air=False,
-                        stack_count=1,
-                        harvests_remaining=3,
                     )
                 )
 
@@ -2875,6 +3435,7 @@ class MaterialScanner:
         has_specular_crest: Optional[bool] = None,
         crest_patch_bgr: Optional[np.ndarray] = None,
         exemplar_memory: Optional[Any] = None,
+        precomputed_exemplar: Optional[PrecomputedExemplarVerdict] = None,
     ) -> MaterialDiscriminationResult:
         """Expose multi-layered 3D material discrimination through MaterialScanner."""
         return discriminate_3d_material(
@@ -2885,6 +3446,7 @@ class MaterialScanner:
             crest_patch_bgr=crest_patch_bgr,
             exemplar_memory=exemplar_memory,
             ref_scale=1.0,
+            precomputed_exemplar=precomputed_exemplar,
         )
 
     def _classify_3d_material(
@@ -2920,15 +3482,32 @@ class MaterialScanner:
             mesh_hsv = hsv[mesh_y1:mesh_y2, mesh_x1:mesh_x2]
 
             # Primary: multi-layer discrimination (Color Histogram + Edge Density + Specular + Nameplate Width)
+            # has_specular_crest is deliberately NOT passed as True here:
+            # asserting it made compute_specular_crest_score return 0.95
+            # without measuring anything. Let it measure the mesh crop.
             disc_res = discriminate_3d_material(
                 mesh_crop,
                 hsv=mesh_hsv,
                 nameplate_width_px=cw,
-                has_specular_crest=True,
                 ref_scale=w / float(self.REF_WIDTH),
             )
             if disc_res.is_authentic_node and disc_res.material_type:
                 return disc_res.material_type, in_air
+
+            # v20 (MADDE 8 — Targena yanlış algı): learned-negative kararı
+            # kesindir. İsim etiketinin altındaki mesh, öğrenilmiş negatif
+            # örneğe uydu (monster_3d_negative / player_character,
+            # sim >= 0.82 — discriminate_3d_material adım 1). Aşağıdaki
+            # saf-renk yedek kurallar bu yamayı yeniden etiketleyemez:
+            # bir mob gövdesi sarı+yeşil Targena kuralını (kural 4)
+            # kolayca geçer ve mob "Targena" diye haritalanırdı.
+            # Boş materyal adı = reddedildi; çağıranlar tespiti atlar.
+            if (disc_res.rejection_reason or "").startswith("learned_negative:"):
+                logger.info(
+                    "MaterialScanner _classify_3d_material: mesh %s reddi, renk yedeği yok",
+                    disc_res.rejection_reason,
+                )
+                return "", in_air
 
             # 1. Purple/violet crystal foliage signature for Aria
             aria_purple_mask = cv2.inRange(mesh_hsv, (125, 65, 70), (164, 255, 255))
@@ -2985,7 +3564,9 @@ class MaterialScanner:
         if in_air:
             return "Odyle", True
 
-        return "Orichalcum Ore", in_air
+        # No colour/geometry evidence matched any material: report Unknown
+        # instead of fabricating Orichalcum Ore.
+        return "Unknown", in_air
 
     def _is_fullscreen_modal_open(
         self, frame_bgr: np.ndarray, hsv: np.ndarray
@@ -3002,16 +3583,20 @@ class MaterialScanner:
         slate_ratio = float(np.count_nonzero(slate_mask)) / float(
             max(1, center_hsv.shape[0] * center_hsv.shape[1])
         )
-        return slate_ratio > 0.52
+        # A merely dark scene (cave / ore region) can exceed 0.52 slate
+        # coverage; only a near-total slate centre is a fullscreen modal.
+        return slate_ratio > 0.80
 
     def get_material_scanner_ready_flag(self) -> dict:
-        return {"module": "material_scanner", "ready": True}
+        # S-0301: bound to the real contract validator, not a constant True.
+        return {"module": "material_scanner", "ready": bool(validate_material_scanner_contract())}
 
     def get_material_scanner_version_info(self) -> dict:
-        return {"module": "material_scanner", "version": "2.0.0", "ready": True}
+        return {"module": "material_scanner", "version": __version__, "ready": bool(validate_material_scanner_contract())}
 
     def get_material_scanner_diagnostic_snapshot(self) -> dict:
-        return {"module": "material_scanner", "status": "ok", "ready": True}
+        _ok = bool(validate_material_scanner_contract())
+        return {"module": "material_scanner", "status": "ok" if _ok else "degraded", "ready": _ok}
 
 
 def get_material_scanner_capabilities() -> list:
@@ -3019,7 +3604,35 @@ def get_material_scanner_capabilities() -> list:
 
 
 def validate_material_scanner_contract() -> bool:
-    return bool(get_material_scanner_capabilities())
+    """Real contract checks (not a tautology): taxonomy ids unique, every
+    main material has a canonical name and a nameplate range, the public
+    discrimination/classification entry points exist, and capabilities are
+    non-empty. Returns False if any check fails.
+    """
+    try:
+        class_ids = [info["class_id"] for info in MAIN_MATERIALS_6.values()]
+        if len(set(class_ids)) != len(class_ids):
+            return False
+        for key, info in MAIN_MATERIALS_6.items():
+            if not key or not info.get("canonical_name"):
+                return False
+            lo, hi = info["nameplate_width_range"]
+            if not (0 < lo <= hi):
+                return False
+            lo_ar, hi_ar = info["typical_aspect_ratio"]
+            if not (0 < lo_ar <= hi_ar):
+                return False
+        if not callable(discriminate_3d_material):
+            return False
+        if not callable(compute_nameplate_width_score):
+            return False
+        if not callable(compute_specular_crest_score):
+            return False
+        if not get_material_scanner_capabilities():
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def get_material_scanner_baseline_metrics() -> dict:

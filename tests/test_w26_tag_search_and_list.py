@@ -11,6 +11,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -25,77 +27,85 @@ from dataset_factory.manual_tag_search import (
 
 
 def test_tag_list_full_canonical_catalog_and_combobox_items() -> None:
-    """Verify the tag list returns all 25 canonical classes (0..24) with exact class_id and class_name."""
+    """Verify aggregate sizes: 27 canonical classes, 24 core-only, 27 combobox items."""
     registry = SearchableTagRegistry()
     all_classes = registry.get_all_classes(include_consumables=True)
-    assert len(all_classes) == 25
-
-    for idx, entry in enumerate(all_classes):
-        assert entry["class_id"] == idx
-        assert entry["id"] == idx
-        assert entry["class_name"] == CANONICAL_NAMES[idx]
-        assert entry["key"] == CANONICAL_NAMES[idx]
-        assert f"{idx}:" in entry["display_label"]
-        assert CANONICAL_NAMES[idx] in entry["display_label"]
+    assert len(all_classes) == 27
+    assert len(CANONICAL_NAMES) == 27
 
     core_only = registry.get_all_classes(include_consumables=False)
-    assert len(core_only) == 22
-    assert [c["class_id"] for c in core_only] == list(range(22))
+    assert len(core_only) == 24
+    assert [c["class_id"] for c in core_only] == list(range(22)) + [25, 26]
 
     combo_items = registry.get_combobox_items()
-    assert len(combo_items) == 25
-    assert combo_items[0][0] == 0 and "herb_aria" in combo_items[0][1]
-    assert combo_items[3][0] == 3 and "ore_orichalcum" in combo_items[3][1]
-    assert combo_items[9][0] == 9 and "minimap_sprout" in combo_items[9][1]
-    assert combo_items[22][0] == 22 and "hp_potion" in combo_items[22][1]
-    assert combo_items[23][0] == 23 and "mp_potion" in combo_items[23][1]
-    assert combo_items[24][0] == 24 and "buff_scroll" in combo_items[24][1]
+    assert len(combo_items) == 27
 
 
-def test_search_gather_materials_aria_and_orichalcum() -> None:
+@pytest.mark.parametrize("class_id", range(27))
+def test_tag_list_entry_matches_canonical_catalog(class_id: int) -> None:
+    """Verify each single catalog entry (id, name, key, display label, combobox item).
+
+    Eskiden 27 girdilik tek döngüydü: ilk hatalı girdide döngü kırılır,
+    kalan girdiler hiç denetlenmezdi. Parametreli hali her girdiyi ayrı
+    test vakası yapar; bir girdideki hata diğer 26'sını gizlemez.
+    """
+    registry = SearchableTagRegistry()
+    all_classes = registry.get_all_classes(include_consumables=True)
+    entry = all_classes[class_id]
+    assert entry["class_id"] == class_id
+    assert entry["id"] == class_id
+    assert entry["class_name"] == CANONICAL_NAMES[class_id]
+    assert entry["key"] == CANONICAL_NAMES[class_id]
+    assert f"{class_id}:" in entry["display_label"]
+    assert CANONICAL_NAMES[class_id] in entry["display_label"]
+
+    combo_items = registry.get_combobox_items()
+    assert combo_items[class_id][0] == class_id
+    assert CANONICAL_NAMES[class_id] in combo_items[class_id][1]
+
+
+@pytest.mark.parametrize(
+    "query,expected_id,expected_name",
+    [("aria", 0, "herb_aria"), ("orichalcum", 3, "ore_orichalcum")],
+)
+def test_search_gather_materials_aria_and_orichalcum(query: str, expected_id: int, expected_name: str) -> None:
     """Verify 'aria' and 'orichalcum' queries return (0, 'herb_aria') and (3, 'ore_orichalcum')."""
-    aria_results = search_label_classes("aria")
-    assert len(aria_results) >= 1
-    assert aria_results[0]["class_id"] == 0
-    assert aria_results[0]["class_name"] == "herb_aria"
-
-    orichalcum_results = search_label_classes("orichalcum")
-    assert len(orichalcum_results) >= 1
-    assert orichalcum_results[0]["class_id"] == 3
-    assert orichalcum_results[0]["class_name"] == "ore_orichalcum"
+    results = search_label_classes(query)
+    assert len(results) >= 1
+    assert results[0]["class_id"] == expected_id
+    assert results[0]["class_name"] == expected_name
 
     registry = get_tag_registry()
-    assert registry.resolve_class_id("aria") == 0
-    assert registry.resolve_class_id("orichalcum") == 3
+    assert registry.resolve_class_id(query) == expected_id
 
 
-def test_search_potions_pot_and_iksir() -> None:
+@pytest.mark.parametrize("query", ["pot", "iksir"])
+def test_search_potions_pot_and_iksir(query: str) -> None:
     """Verify 'pot' and 'iksir' queries return hp_potion (22) and mp_potion (23) with exact class_id and class_name."""
-    for query in ("pot", "iksir"):
-        results = search_label_classes(query)
-        assert len(results) >= 2
-        top_two_pairs = [(r["class_id"], r["class_name"]) for r in results[:2]]
-        assert (22, "hp_potion") in top_two_pairs
-        assert (23, "mp_potion") in top_two_pairs
-        assert results[0]["class_id"] == 22
-        assert results[0]["class_name"] == "hp_potion"
-        assert results[1]["class_id"] == 23
-        assert results[1]["class_name"] == "mp_potion"
+    results = search_label_classes(query)
+    assert len(results) >= 2
+    top_two_pairs = [(r["class_id"], r["class_name"]) for r in results[:2]]
+    assert (22, "hp_potion") in top_two_pairs
+    assert (23, "mp_potion") in top_two_pairs
+    assert results[0]["class_id"] == 22
+    assert results[0]["class_name"] == "hp_potion"
+    assert results[1]["class_id"] == 23
+    assert results[1]["class_name"] == "mp_potion"
 
 
-def test_search_scrolls_scroll_and_parsomen() -> None:
+@pytest.mark.parametrize("query", ["scroll", "parşömen"])
+def test_search_scrolls_scroll_and_parsomen(query: str) -> None:
     """Verify 'scroll' and 'parşömen' queries return (24, 'buff_scroll')."""
-    for query in ("scroll", "parşömen"):
-        results = search_label_classes(query)
-        assert len(results) >= 1
-        assert results[0]["class_id"] == 24
-        assert results[0]["class_name"] == "buff_scroll"
+    results = search_label_classes(query)
+    assert len(results) >= 1
+    assert results[0]["class_id"] == 24
+    assert results[0]["class_name"] == "buff_scroll"
 
-        box = create_manual_annotation_box(query, 0.5, 0.5, 0.1, 0.1)
-        assert box["class_id"] == 24
-        assert box["class_name"] == "buff_scroll"
-        assert box["trusted"] is True
-        assert box["hand_label"] is True
+    box = create_manual_annotation_box(query, 0.5, 0.5, 0.1, 0.1)
+    assert box["class_id"] == 24
+    assert box["class_name"] == "buff_scroll"
+    assert box["trusted"] is True
+    assert box["hand_label"] is True
 
 
 def test_search_canavar_and_filiz_matches() -> None:
@@ -115,8 +125,8 @@ def test_search_canavar_and_filiz_matches() -> None:
     assert filiz_results[0]["class_name"] == "minimap_sprout"
 
 
-def test_search_skill_classes_and_all_nine_queries_end_to_end() -> None:
-    """Verify 'skill' returns all canonical skill classes (13, 19, 20, 21) and validate all 9 target queries."""
+def test_search_skill_classes() -> None:
+    """Verify 'skill' returns all canonical skill classes (13, 19, 20, 21)."""
     skill_results = search_label_classes("skill")
     skill_pairs = {(r["class_id"], r["class_name"]) for r in skill_results}
     expected_skill_pairs = {
@@ -127,17 +137,26 @@ def test_search_skill_classes_and_all_nine_queries_end_to_end() -> None:
     }
     assert expected_skill_pairs.issubset(skill_pairs)
 
-    expected_top_matches = {
-        "aria": (0, "herb_aria"),
-        "orichalcum": (3, "ore_orichalcum"),
-        "pot": (22, "hp_potion"),
-        "iksir": (22, "hp_potion"),
-        "scroll": (24, "buff_scroll"),
-        "parşömen": (24, "buff_scroll"),
-        "canavar": (10, "monster_3d"),
-        "filiz": (9, "minimap_sprout"),
-    }
-    for query, (exp_id, exp_name) in expected_top_matches.items():
-        res = search_label_classes(query)
-        assert res, f"Query {query!r} returned empty results"
-        assert (res[0]["class_id"], res[0]["class_name"]) == (exp_id, exp_name)
+
+@pytest.mark.parametrize(
+    "query,expected_id,expected_name",
+    [
+        ("aria", 0, "herb_aria"),
+        ("orichalcum", 3, "ore_orichalcum"),
+        ("pot", 22, "hp_potion"),
+        ("iksir", 22, "hp_potion"),
+        ("scroll", 24, "buff_scroll"),
+        ("parşömen", 24, "buff_scroll"),
+        ("canavar", 10, "monster_3d"),
+        ("filiz", 9, "minimap_sprout"),
+    ],
+)
+def test_search_all_target_queries_end_to_end(query: str, expected_id: int, expected_name: str) -> None:
+    """Validate all 8 target queries end to end: each query's top match is exact.
+
+    Eskiden tek testteki döngüydü: ilk hatalı sorguda kalan sorgular hiç
+    koşmazdı. Parametreli hali her sorguyu ayrı vaka yapar.
+    """
+    res = search_label_classes(query)
+    assert res, f"Query {query!r} returned empty results"
+    assert (res[0]["class_id"], res[0]["class_name"]) == (expected_id, expected_name)

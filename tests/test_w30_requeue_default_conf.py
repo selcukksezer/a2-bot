@@ -20,6 +20,28 @@ from dataset_factory.label_trust import (
 )
 
 
+def _assert_weak_box(box, expected_conf: float = 0.58) -> None:
+    """Shared contract for a requeued weak box: the expected confidence
+    (0.58 by default, 0.68 when forced against the heuristic cap), never the
+    old 0.90 default, never above the 0.68 cap, trusted=False, weak=True."""
+    assert box["confidence"] == pytest.approx(expected_conf)
+    assert box["confidence"] != pytest.approx(0.90)
+    assert box["confidence"] <= 0.68
+    assert box["trusted"] is False
+    assert box["weak"] is True
+
+
+def _write_labeled_frame(root: Path, split: str, img_name: str, txt_text: str) -> None:
+    """Write one image + its YOLO .txt label under <root>/images|labels/<split>/."""
+    img_dir = root / "images" / split
+    lbl_dir = root / "labels" / split
+    img_dir.mkdir(parents=True, exist_ok=True)
+    lbl_dir.mkdir(parents=True, exist_ok=True)
+    img_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32 if img_name.endswith(".png") else b"\xff\xd8\xff\xe0" + b"\x00" * 32
+    (img_dir / img_name).write_bytes(img_bytes)
+    (lbl_dir / f"{Path(img_name).stem}.txt").write_text(txt_text, encoding="utf-8")
+
+
 def test_w30_01_signature_default_conf_is_058_not_090() -> None:
     """Both _normalize_requeue_box and requeue_labeled_dataset_for_review must default to 0.58 (not 0.90)."""
     sig_norm = inspect.signature(_normalize_requeue_box)
@@ -46,10 +68,7 @@ def test_w30_02_normalize_requeue_box_unscored_txt_gets_058_and_weak() -> None:
     }
     normalized = _normalize_requeue_box(raw_box, stem="sample_frame_01")
     assert normalized is not None
-    assert normalized["confidence"] == pytest.approx(0.58)
-    assert normalized["confidence"] != pytest.approx(0.90)
-    assert normalized["trusted"] is False
-    assert normalized["weak"] is True
+    _assert_weak_box(normalized)
     assert normalized["requeued"] is True
 
 
@@ -64,71 +83,82 @@ def test_w30_03_legacy_txt_5_column_parsed_and_normalized_to_058_weak(tmp_path: 
 
     normalized = _normalize_requeue_box(parsed[0], stem="unscored_frame")
     assert normalized is not None
-    assert normalized["confidence"] == pytest.approx(0.58)
-    assert normalized["confidence"] != pytest.approx(0.90)
-    assert normalized["trusted"] is False
-    assert normalized["weak"] is True
+    _assert_weak_box(normalized)
 
 
 def test_w30_04_requeue_labeled_dataset_train_txt_without_conf_creates_weak_058(tmp_path: Path) -> None:
-    """requeue_labeled_dataset_for_review puts unscored train .txt boxes into weak list with 0.58 confidence."""
-    img_dir = tmp_path / "images" / "train"
-    lbl_dir = tmp_path / "labels" / "train"
-    img_dir.mkdir(parents=True, exist_ok=True)
-    lbl_dir.mkdir(parents=True, exist_ok=True)
+    """Unscored train .txt boxes keep the 0.58 default as weak — but only
+    on the direct normalize path now.
 
-    (img_dir / "frame_train_01.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32)
-    (lbl_dir / "frame_train_01.txt").write_text(
+    §7 P0-8 requeue kararı: TXT-only kare requeue'da hand_label damgası
+    alır (diskteki 5-alanlı TXT satırı el etiketiyle ayırt edilemez) ve
+    damgalı kare korumalı sayılır — kare düzeyinde atlanır, review JSON
+    yazılmaz. Uçtan uca requeue artık bu kareyi kuyruğa almaz; 0.58 weak
+    sözleşmesi damgasız ham kutunun doğrudan _normalize_requeue_box
+    geçişiyle denetlenir.
+    """
+    _write_labeled_frame(
+        tmp_path,
+        "train",
+        "frame_train_01.jpg",
         "0 0.50 0.50 0.10 0.10\n1 0.30 0.40 0.08 0.08\n",
-        encoding="utf-8",
     )
 
     stats = requeue_labeled_dataset_for_review(tmp_path)
     assert stats["ok"] is True
-    assert stats["samples"] == 1
-    assert stats["boxes"] == 2
+    assert stats["samples"] == 0
+    assert stats["boxes"] == 0
     assert stats["trusted_boxes"] == 0
-    assert stats["weak_boxes"] == 2
+    assert stats["weak_boxes"] == 0
+    assert stats["skipped_protected"] == 1
+    assert stats["default_conf"] == 0.58
 
     review_path = tmp_path / "review" / "train" / "frame_train_01.json"
-    assert review_path.is_file()
-    payload = json.loads(review_path.read_text(encoding="utf-8"))
-    assert payload["trusted"] == []
-    assert len(payload["weak"]) == 2
-    for box in payload["weak"]:
-        assert box["confidence"] == pytest.approx(0.58)
-        assert box["confidence"] != pytest.approx(0.90)
-        assert box["trusted"] is False
-        assert box["weak"] is True
+    assert not review_path.is_file()
+
+    # Damgasız ham kutu doğrudan normalize'da 0.58 weak kalır (§7: kanıtsız
+    # kutu requeue'da bile trusted olmaz).
+    raw_box = {
+        "class_id": 0, "cx": 0.50, "cy": 0.50, "w": 0.10, "h": 0.10,
+        "has_explicit_conf": False, "confidence": 0.0,
+    }
+    normalized = _normalize_requeue_box(raw_box, stem="frame_train_01")
+    assert normalized is not None
+    _assert_weak_box(normalized)
 
 
 def test_w30_05_requeue_labeled_dataset_val_split_even_with_high_default_conf_stays_weak(tmp_path: Path) -> None:
-    """Unscored .txt boxes in val split get 0.58 by default and stay trusted=False, weak=True even if default_conf=0.90."""
-    img_dir = tmp_path / "images" / "val"
-    lbl_dir = tmp_path / "labels" / "val"
-    img_dir.mkdir(parents=True, exist_ok=True)
-    lbl_dir.mkdir(parents=True, exist_ok=True)
+    """Unscored .txt boxes in val split get 0.58 by default; the direct _normalize_requeue_box path stays trusted=False, weak=True even if default_conf=0.90.
 
-    (img_dir / "frame_val_01.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
-    (lbl_dir / "frame_val_01.txt").write_text("2 0.60 0.60 0.15 0.15\n", encoding="utf-8")
+    §7 P0-8 requeue kararı: TXT-only kare requeue'da hand_label damgası
+    alır (diskteki 5-alanlı TXT satırı el etiketiyle ayırt edilemez) ve
+    damgalı kare korumalı sayılır — kare düzeyinde atlanır, review JSON
+    yazılmaz. Uçtan uca requeue artık bu kareyi kuyruğa almaz.
+    Damgasız ham kutunun doğrudan _normalize_requeue_box'tan geçişi
+    ise aşağıda aynen weak kalır.
+    """
+    _write_labeled_frame(
+        tmp_path,
+        "val",
+        "frame_val_01.png",
+        "2 0.60 0.60 0.15 0.15\n",
+    )
 
-    # Default call: must assign 0.58 and weak=True, trusted=False
+    # §7 P0-8: TXT-only kare korumalı atlanır — kuyruğa girmez.
     stats = requeue_labeled_dataset_for_review(tmp_path)
+    assert stats["ok"] is True
+    assert stats["samples"] == 0
     assert stats["trusted_boxes"] == 0
-    assert stats["weak_boxes"] == 1
+    assert stats["weak_boxes"] == 0
+    assert stats["skipped_protected"] == 1
 
     review_path = tmp_path / "review" / "val" / "frame_val_01.json"
-    payload = json.loads(review_path.read_text(encoding="utf-8"))
-    assert len(payload["trusted"]) == 0
-    assert len(payload["weak"]) == 1
-    box = payload["weak"][0]
-    assert box["confidence"] == pytest.approx(0.58)
-    assert box["trusted"] is False
-    assert box["weak"] is True
+    assert not review_path.is_file()
 
     # Even if an unverified raw .txt box is passed with default_conf=0.90, it still cannot become trusted
     raw_unverified = {"class_id": 2, "cx": 0.6, "cy": 0.6, "w": 0.15, "h": 0.15, "has_explicit_conf": False}
     norm_forced = _normalize_requeue_box(raw_unverified, default_conf=0.90, stem="frame_val_01")
     assert norm_forced is not None
-    assert norm_forced["trusted"] is False
-    assert norm_forced["weak"] is True
+    # Güven üst sınırı: doğrulanmamış kutu 0.90 ile zorlansa bile sezgisel-kaynak
+    # cap'i (0.68) aşamaz — 0.90 olduğu gibi geçmemeli.
+    _assert_weak_box(norm_forced, expected_conf=0.68)

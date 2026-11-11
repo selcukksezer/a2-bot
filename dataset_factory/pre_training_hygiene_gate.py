@@ -1,13 +1,40 @@
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+from dataset_factory.class_taxonomy import resolve_canonical_max_class_id
 
 logger = logging.getLogger(__name__)
+
+
+# Standard capture resolutions. In the dims-less pixel branch of
+# `_validate_pixel_or_norm_bbox` the frame size is unknown, so a true
+# area-ratio check (cf. `max_box_area_ratio` in `validate_normalized_box`)
+# is impossible. A box anchored at the origin whose size exactly equals a
+# standard capture resolution IS the whole frame, i.e. full-frame spam
+# (F-0985: `[0, 0, 1920, 1080]` used to pass). Such boxes are rejected as
+# poisoned. Boxes that merely start at the origin but do not match a known
+# frame size still pass: without dims they cannot be proven full-frame.
+KNOWN_FRAME_SIZES = frozenset(
+    {
+        (640, 480),
+        (800, 600),
+        (1024, 768),
+        (1280, 720),
+        (1366, 768),
+        (1600, 900),
+        (1920, 1080),
+        (2560, 1080),
+        (2560, 1440),
+        (3840, 2160),
+    }
+)
 
 
 @dataclass
@@ -56,7 +83,10 @@ class PreTrainingHygieneGate:
     before YOLO training begins.
 
     Removes:
-    - Invalid class IDs (`< 0` or `> 24` by default).
+    - Invalid class IDs (`< 0` or `> 26` by default — the canonical ceiling,
+      resolved from ``dataset/data.yaml`` via
+      ``dataset_factory.class_taxonomy.resolve_canonical_max_class_id``;
+      explicit ``max_class_id=`` still overrides it).
     - Corrupted bounding boxes (NaN/Inf, non-positive width/height, out-of-range coordinates).
     - Poisoned labels (extreme aspect ratios, degenerate micro-boxes, full-frame spam boxes,
       duplicate overlapping poison entries, or malformed tokens).
@@ -65,18 +95,33 @@ class PreTrainingHygieneGate:
     def __init__(
         self,
         min_class_id: int = 0,
-        max_class_id: int = 24,
-        min_box_Side: float = 1e-4,
+        max_class_id: Optional[int] = None,
+        min_box_side: float = 1e-4,
         max_box_area_ratio: float = 0.995,
         min_box_area_ratio: float = 1e-6,
         max_aspect_ratio: float = 100.0,
         clamp_tolerance: float = 1e-3,
         in_place: bool = True,
         remove_empty_files: bool = False,
+        **kwargs: Any,
     ) -> None:
+        # Backwards-compatible alias: the parameter was previously spelled
+        # `min_box_Side` (capital S); the natural `min_box_side=` spelling
+        # used to raise TypeError.
+        if "min_box_Side" in kwargs:
+            min_box_side = kwargs.pop("min_box_Side")
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected keyword argument(s): {unexpected}")
         self.min_class_id = min_class_id
-        self.max_class_id = max_class_id
-        self.min_box_side = min_box_Side
+        # P0-3 (v18): varsayilan ust sinir artik 24 degil; tek kaynaktan
+        # (dataset/data.yaml, nc-1; okunamazsa taksonomi yedegi 26) okunur.
+        # Acikca verilen max_class_id= degeri aynen korunur (W65 testi
+        # max_class_id=24 ile dar aralikli gate kurar — davranisi degismez).
+        self.max_class_id = (
+            resolve_canonical_max_class_id() if max_class_id is None else max_class_id
+        )
+        self.min_box_side = min_box_side
         self.max_box_area_ratio = max_box_area_ratio
         self.min_box_area_ratio = min_box_area_ratio
         self.max_aspect_ratio = max_aspect_ratio
@@ -116,6 +161,43 @@ class PreTrainingHygieneGate:
             (is_valid, reason_category, sanitized_box)
             reason_category is one of: 'ok', 'corrupted', 'poisoned'
         """
+        # D52/I5 fast path: the common case — plain floats, box fully
+        # inside [0, 1] with no drift to clamp. It replicates the slow
+        # path's float arithmetic bit-for-bit (same ops, same order), so
+        # the returned box is identical; only the isinstance / tolerance
+        # / min-max clamp work is skipped. Anything outside the fast
+        # region (ints, NaN/Inf, out-of-tolerance drift, edge-touching
+        # boxes needing a clip) falls through to the slow path below.
+        if (
+            type(cx) is float
+            and type(cy) is float
+            and type(w) is float
+            and type(h) is float
+            and 0.0 <= cx <= 1.0
+            and 0.0 <= cy <= 1.0
+            and 0.0 < w <= 1.0
+            and 0.0 < h <= 1.0
+        ):
+            x1 = cx - w / 2.0
+            y1 = cy - h / 2.0
+            x2 = cx + w / 2.0
+            y2 = cy + h / 2.0
+            if 0.0 <= x1 and 0.0 <= y1 and x2 <= 1.0 and y2 <= 1.0:
+                w = x2 - x1
+                h = y2 - y1
+                if w <= 0.0 or h <= 0.0:
+                    return False, "corrupted", None
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                area = w * h
+                if w < self.min_box_side or h < self.min_box_side:
+                    return False, "poisoned", None
+                if area < self.min_box_area_ratio or area > self.max_box_area_ratio:
+                    return False, "poisoned", None
+                if max(w / h, h / w) > self.max_aspect_ratio:
+                    return False, "poisoned", None
+                return True, "ok", (cx, cy, w, h)
+
         for val in (cx, cy, w, h):
             if not isinstance(val, (int, float)) or not math.isfinite(val):
                 return False, "corrupted", None
@@ -212,6 +294,40 @@ class PreTrainingHygieneGate:
 
         return True, "ok", sanitized
 
+    @staticmethod
+    def _quarantine_file(path: Path, report: HygieneReport) -> bool:
+        """Move a file out of the dataset instead of deleting it.
+
+        "Quarantine" used to `unlink()` the file with no copy and no way
+        back; renaming to `<name>.quarantined` keeps it recoverable.
+        Returns True when the file was moved.
+        """
+        target = path.with_name(path.name + ".quarantined")
+        counter = 1
+        while target.exists():
+            counter += 1
+            target = path.with_name(f"{path.name}.{counter}.quarantined")
+        try:
+            path.rename(target)
+        except Exception as exc:
+            report.errors.append(f"Failed to quarantine {path}: {exc}")
+            return False
+        report.quarantined_files += 1
+        return True
+
+    @staticmethod
+    def _lookup_image_dims(
+        image_dims: Dict[Any, Tuple[float, float]], img_id: Any
+    ) -> Optional[Tuple[float, float]]:
+        """Look up image dims tolerating str/int id mismatches."""
+        for key in (img_id, str(img_id)):
+            if key in image_dims:
+                return image_dims[key]
+        try:
+            return image_dims[int(str(img_id).strip())]
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def sanitize_txt_file(
         self, file_path: Union[str, Path], report: Optional[HygieneReport] = None
     ) -> HygieneReport:
@@ -228,14 +344,21 @@ class PreTrainingHygieneGate:
             report.errors.append(f"Failed to read {path}: {exc}")
             return report
 
+        modified = False
         if "\x00" in raw_text:
             report.removed_poisoned_labels += 1
             raw_text = raw_text.replace("\x00", "")
+            # The NUL bytes change the file content, so the file must be
+            # rewritten; without this the removal was only counted, never saved.
+            # (F-0885: `modified` used to be reset to False below, so a file
+            # containing only NUL bytes was counted as cleaned but never
+            # rewritten. `modified` is initialised here, before this branch,
+            # and never reset afterwards.)
+            modified = True
 
         lines = raw_text.splitlines()
         valid_lines: List[str] = []
         seen_signatures = set()
-        modified = False
 
         for line in lines:
             stripped = line.strip()
@@ -265,7 +388,13 @@ class PreTrainingHygieneGate:
                 modified = True
                 continue
 
-            if len(coords) == 4:
+            if len(coords) in (4, 5):
+                # S235 (v19/P3-8): 6 token'lı satır (kutu + güven
+                # skoru) eskiden poligon dalına düşüp bütün olarak
+                # siliniyordu — 5 koordinat tek sayıda, poligon
+                # geçersiz sayılırdı. 5. değer güven skorudur; ilk 4
+                # kutu olarak doğrulanır, güven atılıp 5-alanlı
+                # yazılır (label_trust.py'nin okuma kuralıyla aynı).
                 ok, reason, box = self.validate_normalized_box(
                     coords[0], coords[1], coords[2], coords[3]
                 )
@@ -322,8 +451,7 @@ class PreTrainingHygieneGate:
         if modified and self.in_place:
             try:
                 if not valid_lines and self.remove_empty_files:
-                    path.unlink(missing_ok=True)
-                    report.quarantined_files += 1
+                    self._quarantine_file(path, report)
                 else:
                     new_content = "\n".join(valid_lines) + ("\n" if valid_lines else "")
                     path.write_text(new_content, encoding="utf-8")
@@ -372,14 +500,36 @@ class PreTrainingHygieneGate:
 
         # If dimensions unknown, detect whether normalized [0, 1] or pixel coordinates
         if max(abs(x), abs(y), w, h) <= 1.0 + self.clamp_tolerance:
-            ok, reason, norm_box = self.validate_normalized_box(x, y, w, h)
+            # COCO bbox is [x, y, w, h] with a TOP-LEFT origin, while
+            # validate_normalized_box expects center (cx, cy, w, h).
+            # Passing top-left coordinates as a center rejected valid boxes
+            # (e.g. [0, 0, 0.5, 0.5]) and accepted invalid ones
+            # (e.g. [0.95, 0, 0.1, 0.1] whose true right edge is 1.05).
+            cx, cy = x + w / 2.0, y + h / 2.0
+            ok, reason, norm_box = self.validate_normalized_box(cx, cy, w, h)
             if not ok or norm_box is None:
                 return False, reason, None
-            return True, "ok", list(norm_box)
+            ncx, ncy, nw, nh = norm_box
+            return True, "ok", [ncx - nw / 2.0, ncy - nh / 2.0, nw, nh]
 
         # Unbounded pixel coordinates without image size metadata
         if x < 0.0 or y < 0.0 or w < 1.0 or h < 1.0:
             return False, "corrupted", None
+
+        # No frame size is known, so a full-frame area check is impossible
+        # in this branch (it runs via validate_normalized_box when dims are
+        # known). Apply absolute sanity caps instead: no real frame side
+        # exceeds 64K px, so absurd spam boxes can no longer pass.
+        if w > 65535.0 or h > 65535.0:
+            return False, "corrupted", None
+
+        # F-0985: full-frame spam check. A box anchored at the origin whose
+        # size exactly equals a standard capture resolution covers the whole
+        # frame (e.g. [0, 0, 1920, 1080]); the dims-known path rejects such
+        # boxes via max_box_area_ratio, so this branch must too.
+        if x == 0.0 and y == 0.0 and w.is_integer() and h.is_integer():
+            if (int(w), int(h)) in KNOWN_FRAME_SIZES:
+                return False, "poisoned", None
 
         aspect = max(w / h, h / w)
         if aspect > self.max_aspect_ratio:
@@ -402,13 +552,20 @@ class PreTrainingHygieneGate:
             data = json.loads(raw_text)
         except Exception as exc:
             report.errors.append(f"Invalid JSON in {path}: {exc}")
-            report.removed_poisoned_labels += 1
+            # The file was previously counted as "removed" while nothing was
+            # done to it. Actually remove it from the dataset by quarantining
+            # (recoverable rename), and count it as quarantined, not removed.
+            if self.in_place:
+                self._quarantine_file(path, report)
             return report
 
         modified = False
 
         if isinstance(data, dict):
-            # Map image dimensions if COCO `images` list exists
+            # Map image dimensions if COCO `images` list exists. Keys are
+            # stored under the raw id as well as its str/int forms: image
+            # ids may be ints while annotations carry str image_ids (or the
+            # reverse), and a plain dict lookup then silently missed the dims.
             image_dims: Dict[Any, Tuple[float, float]] = {}
             if isinstance(data.get("images"), list):
                 for img in data["images"]:
@@ -416,7 +573,13 @@ class PreTrainingHygieneGate:
                         iw = img.get("width")
                         ih = img.get("height")
                         if isinstance(iw, (int, float)) and isinstance(ih, (int, float)):
-                            image_dims[img["id"]] = (float(iw), float(ih))
+                            dims_pair = (float(iw), float(ih))
+                            image_dims[img["id"]] = dims_pair
+                            image_dims[str(img["id"])] = dims_pair
+                            try:
+                                image_dims[int(str(img["id"]).strip())] = dims_pair
+                            except (TypeError, ValueError):
+                                pass
 
             # Clean categories if present
             if isinstance(data.get("categories"), list):
@@ -458,13 +621,17 @@ class PreTrainingHygieneGate:
 
                         int_cid = int(cid)
                         for key_name in ("category_id", "class_id", "class", "label_id"):
-                            if key_name in ann:
+                            if key_name in ann and ann[key_name] != int_cid:
+                                # S-5301: in-place normalisation (e.g. "3" -> 3)
+                                # changes the record; without modified=True
+                                # the write gate below never persists it.
                                 ann[key_name] = int_cid
+                                modified = True
 
                         # Check bounding box if present
                         if "bbox" in ann:
                             img_id = ann.get("image_id")
-                            dims = image_dims.get(img_id) if img_id is not None else None
+                            dims = self._lookup_image_dims(image_dims, img_id) if img_id is not None else None
                             iw = dims[0] if dims else ann.get("image_width")
                             ih = dims[1] if dims else ann.get("image_height")
                             ok, reason, clean_bbox = self._validate_pixel_or_norm_bbox(
@@ -477,6 +644,17 @@ class PreTrainingHygieneGate:
                                     report.removed_poisoned_labels += 1
                                 modified = True
                                 continue
+                            # S-5301: a cleaned bbox used to be lost on disk.
+                            # The annotation is mutated in place, the list
+                            # length does not change, and nothing set
+                            # modified=True, so the write gate below never
+                            # opened. Mark the file modified when the cleaned
+                            # box actually differs from the stored one.
+                            if (
+                                not isinstance(ann["bbox"], (list, tuple))
+                                or list(ann["bbox"]) != clean_bbox
+                            ):
+                                modified = True
                             ann["bbox"] = clean_bbox
                             sig = (
                                 ann.get("image_id"),
@@ -502,7 +680,11 @@ class PreTrainingHygieneGate:
                 cid = data.get("class_id", data.get("category_id"))
                 if not self.is_valid_class_id(cid):
                     report.removed_invalid_class_id += 1
-                    data["poisoned"] = True
+                    # Remove the poisoned label itself; merely flagging
+                    # data["poisoned"] = True left the toxic record in the
+                    # file (and in training).
+                    for _key in ("class_id", "category_id", "class", "label_id", "bbox", "poisoned"):
+                        data.pop(_key, None)
                     modified = True
                 else:
                     ok, reason, clean_bbox = self._validate_pixel_or_norm_bbox(
@@ -515,10 +697,21 @@ class PreTrainingHygieneGate:
                             report.removed_corrupted_boxes += 1
                         else:
                             report.removed_poisoned_labels += 1
-                        data["poisoned"] = True
+                        for _key in ("class_id", "category_id", "class", "label_id", "bbox", "poisoned"):
+                            data.pop(_key, None)
                         modified = True
                     else:
+                        # S-5301: same lost-write as the annotations list:
+                        # mark modified when the bbox was actually cleaned
+                        # or a stale "poisoned" flag is dropped.
+                        if (
+                            "poisoned" in data
+                            or not isinstance(data["bbox"], (list, tuple))
+                            or list(data["bbox"]) != clean_bbox
+                        ):
+                            modified = True
                         data["bbox"] = clean_bbox
+                        data.pop("poisoned", None)
                         report.valid_annotations_kept += 1
 
         elif isinstance(data, list):
@@ -552,6 +745,14 @@ class PreTrainingHygieneGate:
                             report.removed_poisoned_labels += 1
                         modified = True
                         continue
+                    # S-5301: in-place bbox clean (see annotations list
+                    # above): without modified=True the write gate below
+                    # never opens and the cleaned box is lost on disk.
+                    if (
+                        not isinstance(item["bbox"], (list, tuple))
+                        or list(item["bbox"]) != clean_bbox
+                    ):
+                        modified = True
                     item["bbox"] = clean_bbox
 
                 clean_list.append(item)
@@ -584,7 +785,8 @@ class PreTrainingHygieneGate:
         ),
     ) -> HygieneReport:
         """Recursively scans all `.txt` and `.json` files under `dataset_root`
-        and cleans invalid class IDs (`<0` or `>24`), corrupted boxes, and poisoned labels.
+        and cleans invalid class IDs (`<min_class_id` or `>max_class_id`,
+        default 0..26 canonical), corrupted boxes, and poisoned labels.
         """
         root = Path(dataset_root)
         report = HygieneReport()
@@ -613,16 +815,105 @@ class PreTrainingHygieneGate:
             elif suffix == ".json":
                 self.sanitize_json_file(file_path, report)
 
-        logger.info(
-            "PreTrainingHygieneGate completed on %s: scanned=%d txt / %d json, "
-            "kept=%d, removed=%d (invalid_cls=%d, corrupted_box=%d, poisoned=%d)",
-            root,
-            report.scanned_txt_files,
-            report.scanned_json_files,
-            report.valid_annotations_kept,
-            report.total_removed,
-            report.removed_invalid_class_id,
-            report.removed_corrupted_boxes,
-            report.removed_poisoned_labels,
-        )
+        if report.errors:
+            logger.warning(
+                "PreTrainingHygieneGate completed WITH %d error(s) on %s: scanned=%d txt / %d json, "
+                "kept=%d, removed=%d (invalid_cls=%d, corrupted_box=%d, poisoned=%d)",
+                len(report.errors),
+                root,
+                report.scanned_txt_files,
+                report.scanned_json_files,
+                report.valid_annotations_kept,
+                report.total_removed,
+                report.removed_invalid_class_id,
+                report.removed_corrupted_boxes,
+                report.removed_poisoned_labels,
+            )
+        else:
+            logger.info(
+                "PreTrainingHygieneGate completed on %s: scanned=%d txt / %d json, "
+                "kept=%d, removed=%d (invalid_cls=%d, corrupted_box=%d, poisoned=%d)",
+                root,
+                report.scanned_txt_files,
+                report.scanned_json_files,
+                report.valid_annotations_kept,
+                report.total_removed,
+                report.removed_invalid_class_id,
+                report.removed_corrupted_boxes,
+                report.removed_poisoned_labels,
+            )
         return report
+
+
+# F-0886 (P3-4: "trainer entegrasyonu bekliyor" kısmı bayattı — v17'de
+# geldi): scan_and_clean() eskiden yalnızca testlerden erişilebiliyordu;
+# artık eğitim öncesi kapı dataset_factory/rtx_trainer_engine.py'de
+# bağlı (PreTrainingHygieneGate(max_class_id=26, in_place=False) —
+# TARAMA kipi: bulgular raporlanır, hatalar eğitimi durdurur, bozuk
+# kutular dosyadan SİLİNMEZ; temizlik Adım 2/3'e bırakılır). Kapı
+# ayrıca iki operatör yolundan da çalışır — bu helper (importable
+# one-liner) ve aşağıdaki CLI (`python -m
+# dataset_factory.pre_training_hygiene_gate <root>`) — aynı
+# operator-as-caller deseni (dataset_factory/clean_dataset.py, F-0919).
+# Not: tarama raporu (v18) bu notu dataset_validator.py'ye atfetmişti;
+# yorum bu dosyadadır (pre_training_hygiene_gate.py).
+__all__ = [
+    "HygieneReport",
+    "PreTrainingHygieneGate",
+    "run_pre_training_hygiene_gate",
+    "main",
+]
+
+
+def run_pre_training_hygiene_gate(
+    dataset_root: Union[str, Path],
+    *,
+    in_place: bool = True,
+    min_class_id: int = 0,
+    max_class_id: Optional[int] = None,
+) -> HygieneReport:
+    """Production entry point: run the hygiene gate over ``dataset_root``.
+
+    Recursively scans ``.txt`` (YOLO) and ``.json`` (COCO/metadata) label
+    files, removes invalid class IDs / corrupted boxes / poisoned labels,
+    and — when ``in_place`` is True (default) — writes the cleaned files
+    back. Returns the :class:`HygieneReport`; ``report.errors`` is non-empty
+    when a file could not be read or written. With ``in_place=False`` the
+    scan is a dry run: nothing is written or quarantined.
+    """
+    gate = PreTrainingHygieneGate(
+        min_class_id=min_class_id,
+        max_class_id=max_class_id,
+        in_place=in_place,
+    )
+    return gate.scan_and_clean(dataset_root)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Operator CLI: ``python -m dataset_factory.pre_training_hygiene_gate <dataset_root> [--dry-run]``.
+
+    Prints the hygiene report as JSON. Exit code 1 when any file errored.
+    """
+    parser = argparse.ArgumentParser(
+        description="Run the pre-training hygiene gate over a dataset root.",
+    )
+    parser.add_argument(
+        "dataset_root",
+        help="Dataset root directory (or a single .txt/.json label file).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scan and report only; do not modify, quarantine, or rewrite files.",
+    )
+    args = parser.parse_args(argv)
+    report = run_pre_training_hygiene_gate(
+        args.dataset_root,
+        in_place=not args.dry_run,
+    )
+    print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+    return 1 if report.errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

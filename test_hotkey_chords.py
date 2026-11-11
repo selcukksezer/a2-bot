@@ -2,6 +2,8 @@
 """Bare F8/F9/F10 must not call bot handlers. Ctrl+Alt chords must."""
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from config.schema import (
     DEFAULT_MENU_CHORD,
@@ -90,6 +92,51 @@ class HotkeyChordTests(unittest.TestCase):
         self.assertEqual(NativeWin32HotkeyManager.chord_binding("f8"), (0, 0))
         self.assertEqual(NativeWin32HotkeyManager.chord_binding("f9"), (0, 0))
         self.assertEqual(NativeWin32HotkeyManager.chord_binding("f10"), (0, 0))
+
+    def test_register_and_unregister_do_not_raise(self) -> None:
+        # Exercises the real register()/unregister() hook-install path
+        # (returns False when the `keyboard` module is unavailable, True
+        # when a hook was actually installed) and always cleans up.
+        result = self.listener.register()
+        self.assertIsInstance(result, bool)
+        self.listener.unregister()
+        self.assertIsNone(self.listener._hook_handle)
+        self.assertIsNone(self.listener._release_hook_handle)
+        self.listener.unregister()  # double unregister must stay safe
+
+    def test_hook_callback_dispatches_bare_keys_without_handlers(self) -> None:
+        # _on_key_event is the real keyboard-hook callback: a bare F8/F9/F10
+        # arriving through the hook must not call any bot handler.
+        for key in ("f8", "f9", "f10"):
+            self.listener._on_key_event(SimpleNamespace(name=key, scan_code=0))
+        self.assertEqual(self.hits, [])
+        self.assertEqual(self.controller.freed, 0)
+        self.assertEqual(self.controller.released, 0)
+
+    def test_hook_callback_dispatches_ctrl_alt_chord(self) -> None:
+        # Same real hook callback, but with Ctrl+Alt held. Only the OS
+        # modifier query is stubbed (keyboard.is_pressed has no real keys
+        # in CI); dispatch, debounce, accept and invoke are all real.
+        with mock.patch.object(
+            HotkeyListener, "_held_modifiers", return_value={"ctrl", "alt"}
+        ):
+            for key in ("f8", "f9", "f10"):
+                self.listener._on_key_event(SimpleNamespace(name=key, scan_code=0))
+        self.assertEqual(self.hits, ["f8", "f9", "f10"])
+
+    def test_hook_callback_scan_code_fallback_names_key(self) -> None:
+        # Windows sometimes delivers F10 without a name; the hook must
+        # recover it from the scan code (0x44) instead of dropping it.
+        self.assertEqual(
+            HotkeyListener._normalize_hotkey_name(
+                SimpleNamespace(name=None, scan_code=0x44)
+            ),
+            "f10",
+        )
+        self.listener._on_key_event(SimpleNamespace(name=None, scan_code=0x44))
+        self.assertEqual(self.hits, [])  # bare (no modifiers) -> ignored
+        self.listener._on_key_release(SimpleNamespace(name="f10", scan_code=0x44))
+        self.assertFalse(self.listener._f10_physically_down)
 
 
 if __name__ == "__main__":

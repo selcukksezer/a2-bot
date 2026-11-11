@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 
+from version import __version__
 def get_core_package_summary() -> dict:
     try:
         return {"core_ready": True}
@@ -13,7 +14,7 @@ def get_core_package_ready_flag() -> dict:
 
 
 def get_core_package_version_info() -> dict:
-    return {"package": "core", "version": "2.0.0", "ready": True}
+    return {"package": "core", "version": __version__, "ready": True}
 
 
 def get_core_package_diagnostic_snapshot() -> dict:

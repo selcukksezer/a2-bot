@@ -24,6 +24,29 @@ _MONITOR_LOCK = threading.Lock()
 _CACHED_SNAPSHOT: Optional[Dict[str, Any]] = None
 _LAST_SAMPLE_TS: float = 0.0
 _CACHE_TTL_SEC: float = 0.5  # 500ms caching to prevent excessive polling overhead
+_CPU_PRIMED: bool = False
+
+
+def _prime_cpu_percent() -> None:
+    """Prime psutil's cpu_percent baseline once (F-0394).
+
+    psutil.cpu_percent(interval=None) returns a meaningless 0.0 on its very
+    first call. Priming at import makes the first real snapshot measure CPU
+    use over the time since import instead of reporting 0.0.
+    """
+    global _CPU_PRIMED
+    if _CPU_PRIMED:
+        return
+    try:
+        import psutil
+
+        psutil.cpu_percent(interval=None)
+        _CPU_PRIMED = True
+    except Exception as exc:  # pragma: no cover - psutil absent
+        logger.debug("Could not prime psutil cpu_percent: %s", exc)
+
+
+_prime_cpu_percent()
 
 
 def _init_nvml_if_needed() -> bool:
@@ -51,20 +74,42 @@ def _init_nvml_if_needed() -> bool:
         return False
 
 
+def _gpu_unavailable() -> Dict[str, Any]:
+    """Fresh 'no usable GPU' fallback dict (D25: was an identical 11-line
+    literal duplicated in _query_gpu_metrics' NVML-missing and query-error
+    paths). A new dict per call, so no caller can mutate a shared one."""
+    return {
+        "name": "GPU · Entegre/Bilinmiyor",
+        "raw_name": "Integrated/Unknown",
+        "pct": 0,
+        "temp": 0,
+        "temp_str": "—°C",
+        "mem_used_gb": 0.0,
+        "mem_total_gb": 0.0,
+        "label_str": "0% · —°C · 0.0/0.0 GB",
+        "available": False,
+    }
+
+
+def _copy_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Caller-owned copy of a cached snapshot.
+
+    Every section (gpu/cpu/capture) is a flat dict of scalars plus a float
+    timestamp, so copying each section dict isolates the caller from the
+    cache exactly as deepcopy did here, at a fraction of the cost (D25,
+    measured on this VM: cached-path get_snapshot min 98.3us/call with
+    deepcopy -> min 14.7us/call with this copy). If a section
+    ever gains a nested value, this must go back to deepcopy — the
+    flat-structure assumption is locked by test_d25 (section values must
+    all be scalars).
+    """
+    return {key: (dict(value) if isinstance(value, dict) else value) for key, value in snapshot.items()}
+
+
 def _query_gpu_metrics() -> Dict[str, Any]:
     """Queries NVIDIA GPU load, temperature, and VRAM via pynvml or returns clean idle fallback."""
     if not _init_nvml_if_needed():
-        return {
-            "name": "GPU · Entegre/Bilinmiyor",
-            "raw_name": "Integrated/Unknown",
-            "pct": 0,
-            "temp": 0,
-            "temp_str": "—°C",
-            "mem_used_gb": 0.0,
-            "mem_total_gb": 0.0,
-            "label_str": "0% · —°C · 0.0/0.0 GB",
-            "available": False,
-        }
+        return _gpu_unavailable()
 
     try:
         import pynvml
@@ -116,54 +161,62 @@ def _query_gpu_metrics() -> Dict[str, Any]:
         }
     except Exception as exc:
         logger.debug("NVML query error: %s", exc)
-        return {
-            "name": "GPU · Entegre/Bilinmiyor",
-            "raw_name": "Integrated/Unknown",
-            "pct": 0,
-            "temp": 0,
-            "temp_str": "—°C",
-            "mem_used_gb": 0.0,
-            "mem_total_gb": 0.0,
-            "label_str": "0% · —°C · 0.0/0.0 GB",
-            "available": False,
-        }
+        return _gpu_unavailable()
 
 
 def _query_cpu_metrics() -> Dict[str, Any]:
-    """Queries CPU utilization, core count, and clock frequency via psutil."""
+    """Queries CPU utilization, core count, and clock frequency via psutil.
+
+    Unknown values are reported as ``None`` with an ``available: False`` flag
+    and a "—" placeholder in the label (F-0200): no invented 2.4 GHz / 4-core
+    fallback is ever presented as a real measurement.
+    """
+    _prime_cpu_percent()
     try:
         import psutil
-        cores = psutil.cpu_count(logical=True) or 4
-        # interval=None provides instantaneous load without blocking the calling thread
+        cores_raw = psutil.cpu_count(logical=True)
+        cores = int(cores_raw) if cores_raw else None
         pct = int(psutil.cpu_percent(interval=None))
         freq_info = psutil.cpu_freq()
         if freq_info and getattr(freq_info, "current", None):
-            freq_ghz = round(freq_info.current / 1000.0, 1)
+            freq_ghz: Optional[float] = round(freq_info.current / 1000.0, 1)
         else:
-            freq_ghz = 2.4
-        label_str = f"{pct}% · {freq_ghz:.1f} GHz"
+            freq_ghz = None
+        freq_str = f"{freq_ghz:.1f} GHz" if freq_ghz is not None else "— GHz"
+        cores_str = f"{cores} Çekirdek" if cores is not None else "Bilinmiyor"
+        label_str = f"{pct}% · {freq_str}"
         return {
-            "name": f"CPU · {cores} Çekirdek",
+            "name": f"CPU · {cores_str}",
             "cores": cores,
             "pct": max(0, min(100, pct)),
             "freq_ghz": freq_ghz,
             "label_str": label_str,
+            "available": freq_ghz is not None and cores is not None,
         }
     except Exception as exc:
         logger.debug("psutil query error: %s", exc)
         return {
-            "name": "CPU · 4 Çekirdek",
-            "cores": 4,
+            "name": "CPU · Bilinmiyor",
+            "cores": None,
             "pct": 0,
-            "freq_ghz": 2.4,
-            "label_str": "0% · 2.4 GHz",
+            "freq_ghz": None,
+            "label_str": "0% · — GHz",
+            "available": False,
         }
 
 
 def _query_capture_metrics(capture_instance: Optional[Any] = None) -> Dict[str, Any]:
-    """Extracts screen capture FPS and latency from the provided or cached capture instance."""
+    """Extracts screen capture FPS and latency from the provided capture instance.
+
+    Latency is reported only when the capture instance actually measures it
+    (``last_latency_ms`` / ``latency_ms`` / ``frame_latency_ms`` /
+    ``last_frame_time_ms`` / ``frame_time_ms``) — it is never derived from FPS
+    as ``1000/fps`` (F-0395). ``latency_ms`` stays numeric (0.0) for callers
+    that do arithmetic on it; ``latency_measured`` tells whether it is real.
+    """
     fps = 0.0
     latency_ms = 0.0
+    latency_measured = False
 
     try:
         if capture_instance is not None:
@@ -177,19 +230,41 @@ def _query_capture_metrics(capture_instance: Optional[Any] = None) -> Dict[str, 
                         fps = 0.0
                 except (ValueError, TypeError):
                     fps = 0.0
+            for attr in (
+                "last_latency_ms",
+                "latency_ms",
+                "frame_latency_ms",
+                "last_frame_time_ms",
+                "frame_time_ms",
+            ):
+                raw_lat = getattr(capture_instance, attr, None)
+                if raw_lat is None:
+                    continue
+                try:
+                    lat = float(raw_lat)
+                except (ValueError, TypeError):
+                    continue
+                if math.isfinite(lat) and lat >= 0.0:
+                    latency_ms = round(lat, 1)
+                    latency_measured = True
+                    break
 
         if math.isfinite(fps) and fps > 0.0:
-            latency_ms = round(1000.0 / fps, 1)
-            label_str = f"{fps:.0f} FPS · {latency_ms:.1f} ms"
+            lat_str = f"{latency_ms:.1f} ms" if latency_measured else "— ms"
+            label_str = f"{fps:.0f} FPS · {lat_str}"
             pct = min(100, max(0, int(round(fps * 100.0 / 60.0))))
         else:
-            label_str = "0 FPS · 0.0 ms"
+            # S-0902: fps<=0 iken gecikme olculmemistir (latency_measured=False),
+            # o yuzden "0.0 ms" iddia edilmez; fps>0 dali gibi "— ms" yazilir.
+            label_str = "0 FPS · — ms"
             pct = 0
             latency_ms = 0.0
+            latency_measured = False
 
         return {
             "fps": fps,
             "latency_ms": latency_ms,
+            "latency_measured": latency_measured,
             "pct": pct,
             "label_str": label_str,
         }
@@ -198,8 +273,9 @@ def _query_capture_metrics(capture_instance: Optional[Any] = None) -> Dict[str, 
         return {
             "fps": 0.0,
             "latency_ms": 0.0,
+            "latency_measured": False,
             "pct": 0,
-            "label_str": "0 FPS · 0.0 ms",
+            "label_str": "0 FPS · — ms",
         }
 
 
@@ -223,7 +299,9 @@ class SystemMonitor:
                 # If a specific capture instance is supplied, update capture metrics dynamically
                 if capture_instance is not None:
                     _CACHED_SNAPSHOT["capture"] = _query_capture_metrics(capture_instance)
-                return _CACHED_SNAPSHOT
+                # Return a copy: callers must never mutate the cache
+                # (F-0396) or observe later refreshes through an old handle.
+                return _copy_snapshot(_CACHED_SNAPSHOT)
 
             gpu_data = _query_gpu_metrics()
             cpu_data = _query_cpu_metrics()
@@ -236,7 +314,7 @@ class SystemMonitor:
                 "timestamp": now,
             }
             _LAST_SAMPLE_TS = now
-            return _CACHED_SNAPSHOT
+            return _copy_snapshot(_CACHED_SNAPSHOT)
 
     @classmethod
     def reset_cache(cls) -> None:

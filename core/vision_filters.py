@@ -28,6 +28,7 @@ Implements Items 1 to 5:
 """
 
 from __future__ import annotations
+from version import __version__
 
 import logging
 import math
@@ -38,6 +39,11 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# D35: the 5x5 erode kernel used by NameplateHSVIsolator on every call.
+# Hoisted to module level so isolate_gatherable_nameplate no longer
+# allocates it per ROI (same kernel, same erode result).
+_ERODE_KERNEL_5X5 = np.ones((5, 5), dtype=np.uint8)
 
 
 def is_parchment_scroll_patch(patch: Optional[np.ndarray]) -> bool:
@@ -76,7 +82,11 @@ def is_parchment_scroll_patch(patch: Optional[np.ndarray]) -> bool:
             above = g[max(0, y - 5) : y]
             bar = g[y : y2 + 1]
             if above.size and float(bar.mean()) - float(above.mean()) >= 55.0:
-                if float(np.mean(above < 90)) >= 0.35:
+                # D35: np.mean() on a boolean array upcasts the whole mask
+                # to float64 first; count_nonzero/size is the identical
+                # fraction (verified equal) at ~1.6x the speed here
+                # (paired median: 0.89-1.02 -> 0.52-0.63 ms/call).
+                if float(np.count_nonzero(above < 90)) / above.size >= 0.35:
                     roller = (y, y2)
                     break
         y = y2 + 1
@@ -87,8 +97,10 @@ def is_parchment_scroll_patch(patch: Optional[np.ndarray]) -> bool:
     sheet = g[y2 + 2 : min(80, y2 + 38), 6:74]
     if sheet.size < 180 or sheet.shape[0] < 8:
         return False
-    pale = float(np.mean((sheet >= 100) & (sheet <= 210)))
-    ink = float(np.mean(sheet < 78))
+    # D35: same fractions as np.mean() on the boolean masks, without the
+    # float64 upcast (count_nonzero/size, verified identical values).
+    pale = float(np.count_nonzero((sheet >= 100) & (sheet <= 210))) / sheet.size
+    ink = float(np.count_nonzero(sheet < 78)) / sheet.size
     if pale < 0.22 or ink < 0.035:
         return False
 
@@ -103,7 +115,11 @@ def is_parchment_scroll_patch(patch: Optional[np.ndarray]) -> bool:
         return False
 
     side = np.concatenate([g[:, :5].ravel(), g[:, -5:].ravel()])
-    if float(np.mean(side < 80)) < 0.28 and float(np.mean(g < 55)) < 0.18:
+    # D35: count_nonzero/size instead of np.mean() on boolean masks
+    # (identical fractions, no float64 upcast of the mask).
+    if float(np.count_nonzero(side < 80)) / side.size < 0.28 and float(
+        np.count_nonzero(g < 55)
+    ) / g.size < 0.18:
         return False
     return True
 
@@ -200,8 +216,11 @@ def _extract_primary_contour(
         return arr.reshape((-1, 1, 2)).astype(np.int32), None
 
     if arr.ndim == 2 and arr.shape[1] == 2 and arr.dtype == np.uint8 and arr.shape[0] > 4:
-        # Distinguish a 2-column image from an (N, 2) contour
-        return arr.reshape((-1, 1, 2)).astype(np.int32), None
+        # F-0512: a real 2-pixel-wide grayscale image was misread as an
+        # (N, 2) contour here and reshape()d into one. A uint8 (N, 2)
+        # array is ambiguous, so it is now treated as an image below
+        # instead of silently becoming a contour.
+        pass
 
     # Otherwise treat as an image patch (BGR or Grayscale)
     gray = _coerce_image(arr, grayscale=True)
@@ -291,6 +310,13 @@ class FeatherNegativeFilter:
 
         if self.feather_contour is None:
             # Deterministic synthetic diagonal feather contour fallback if file is missing
+            # F-0397: this used to engage silently (no logger call in the
+            # whole file). A synthetic template is not a measurement — log it.
+            logger.warning(
+                "Tüy şablonu bulunamadı (%s) — sentetik yedek şablon kullanılıyor, "
+                "eşleşme güvenilirliği düşüktür.",
+                self.feather_template_path,
+            )
             synth = np.zeros((34, 29), dtype=np.uint8)
             pts = np.array([[5, 28], [9, 16], [19, 4], [24, 6], [18, 19], [8, 29]], dtype=np.int32)
             cv2.fillPoly(synth, [pts], 255)
@@ -312,6 +338,14 @@ class FeatherNegativeFilter:
                     sp_cnts, _ = cv2.findContours(sp_bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if sp_cnts:
                         self.sprout_contours.append(max(sp_cnts, key=cv2.contourArea))
+        if not self.sprout_templates:
+            # F-0397: no sprout reference at all — the sprout-vs-feather
+            # comparison below then runs one-sided; say so out loud.
+            logger.warning(
+                "Filiz referans şablonu bulunamadı (%s) — tüy/filiz karşılaştırması "
+                "tek taraflı çalışıyor.",
+                self.DEFAULT_SPROUT_PATHS,
+            )
 
     def analyze_candidate(
         self,
@@ -337,7 +371,14 @@ class FeatherNegativeFilter:
         }
 
         # 1. Negative template matching score if an image patch is provided
-        if gray_patch is not None and self.feather_template is not None:
+        # A (near-)constant patch has no texture to correlate: TM_CCOEFF_NORMED
+        # is undefined for a zero-variance patch and OpenCV returns NCC 1.0,
+        # which made every candidate on a blank minimap region classify as a
+        # feather. Skip template evidence when the patch carries no variance.
+        patch_has_variance = (
+            gray_patch is not None and float(np.std(gray_patch)) >= 1.0
+        )
+        if gray_patch is not None and self.feather_template is not None and patch_has_variance:
             ph, pw = gray_patch.shape[:2]
             fh, fw = self.feather_template.shape[:2]
             best_f_ncc = 0.0
@@ -475,14 +516,36 @@ class FeatherNegativeFilter:
         """
         gray = _coerce_image(minimap_bgr_or_gray, grayscale=True)
         if gray is None or gray.size == 0:
-            return list(candidates)
+            # F-0398: an unreadable minimap used to let every candidate
+            # through unfiltered while the caller believed filtering ran.
+            # Fail closed: without a minimap there is nothing to check
+            # against, so no candidate is trusted.
+            logger.warning("Minimap okunamadı — adaylar filtresiz geçirilmiyor, hepsi elendi.")
+            return []
 
         h, w = gray.shape[:2]
         kept: List[Dict[str, Any]] = []
         r = max(10, int(patch_radius))
         for cand in candidates:
-            cx = int(cand.get("x", cand.get("center", (0, 0))[0]))
-            cy = int(cand.get("y", cand.get("center", (0, 0))[1]))
+            # F-0399: {'center': None} or {'x': None} used to crash the
+            # whole filter with TypeError. Unparseable coordinates keep
+            # the candidate (it cannot be feather-checked) instead of
+            # crashing, and the problem is logged.
+            try:
+                cx_raw = cand.get("x", None)
+                if cx_raw is None:
+                    center = cand.get("center", (0, 0))
+                    cx_raw = center[0] if center is not None else None
+                cy_raw = cand.get("y", None)
+                if cy_raw is None:
+                    center = cand.get("center", (0, 0))
+                    cy_raw = center[1] if center is not None else None
+                cx = int(cx_raw)  # type: ignore[arg-type]
+                cy = int(cy_raw)  # type: ignore[arg-type]
+            except (TypeError, ValueError, IndexError) as exc:
+                logger.debug("Koordinatsız aday filtrelenmeden bırakıldı (%s): %s", cand, exc)
+                kept.append(cand)
+                continue
             x1, x2 = max(0, cx - r), min(w, cx + r)
             y1, y2 = max(0, cy - r), min(h, cy + r)
             patch = gray[y1:y2, x1:x2]
@@ -550,6 +613,12 @@ class Pyramid3DCrestDetector:
 
         if self.base_template is None:
             # Synthetic winged \Y/ crest fallback
+            # F-0397: silent synthetic fallback — log it.
+            logger.warning(
+                "3B arma şablonu bulunamadı (%s) — sentetik yedek şablon kullanılıyor, "
+                "tespit güvenilirliği düşüktür.",
+                self.template_path,
+            )
             synth = np.zeros((35, 33), dtype=np.uint8)
             cv2.line(synth, (5, 8), (16, 20), 240, 2)
             cv2.line(synth, (27, 8), (16, 20), 240, 2)
@@ -580,6 +649,13 @@ class Pyramid3DCrestDetector:
         s = max(0.35, float(scale))
         # Inverse perspective projection relationship: dist ~ ref_dist / (scale^1.65)
         raw_dist = self.ref_dist_m_at_scale_1 / (s ** 1.65)
+        # F-0513: `score` was accepted and ignored — the estimate was
+        # identical for a 0.99 match and a 0.72 match. A weak template
+        # match means the scale reading itself is less trustworthy, so the
+        # estimate is pushed outward (the crest is more likely farther
+        # than the nominal scale suggests); score 1.0 leaves it unchanged.
+        score_factor = 1.0 / max(0.55, 0.55 + 0.45 * float(score))
+        raw_dist = raw_dist * score_factor
         return round(float(np.clip(raw_dist, 5.0, 40.0)), 2)
 
     def detect(
@@ -724,6 +800,16 @@ class DynamicInteractionKeyReader:
                 im = _imread_unicode(resolved, cv2.IMREAD_GRAYSCALE)
                 if im is not None and im.size > 0:
                     self.e_templates.append(im)
+        # F-0204: with no templates at all, decide_interaction_key has no
+        # evidence to work from — log it at load time instead of failing
+        # silently per frame.
+        if not self.f_templates and not self.e_templates:
+            logger.warning(
+                "Etkileşim tuşu şablonu bulunamadı (F: %s, E: %s) — "
+                "decide_interaction_key şablon kanıtı olmadan karar veremez.",
+                self.F_TEMPLATE_PATHS,
+                self.E_TEMPLATE_PATHS,
+            )
 
     @staticmethod
     def analyze_glyph_bars(glyph_gray: np.ndarray) -> Dict[str, Any]:
@@ -798,7 +884,9 @@ class DynamicInteractionKeyReader:
         gray = _coerce_image(patch_bgr, grayscale=True)
         bgr = _coerce_image(patch_bgr, grayscale=False)
         if gray is None or bgr is None or gray.size == 0:
-            return {"key": "f", "confidence": 0.0, "reason": "empty_patch"}
+            # F-0204: an empty patch used to silently report 'f'. There is
+            # no glyph to read, so say so instead of inventing a key.
+            raise ValueError("inspect_prompt_patch: boş yama — tuş kararı verilemez")
 
         h, w = gray.shape[:2]
         aspect = float(w) / max(1.0, float(h))
@@ -806,10 +894,19 @@ class DynamicInteractionKeyReader:
         # Extract the character glyph ROI depending on patch geometry:
         # Case A: Wide '[F Gather]' prompt or pill (aspect >= 1.75)
         if aspect >= 1.75:
-            # In full 130x36 (`f_gather_aria.png`) or 86x23 (`f_gather.png`), 'F' is at x ~ 0.40..0.48.
-            # In tight pill 56x17 (`f_gather_pill.png`), 'F' is at x ~ 0.12..0.28.
-            left_dark_ratio = float(np.mean(gray[:, : max(2, int(w * 0.25))] < 50))
-            if left_dark_ratio > 0.55 and w <= 75:
+            # Ölçülmüş şablon geometrileri (v19-smoke): 130x36
+            # (`f_gather_aria.png`, `f_gather.png`) ve 79x23
+            # (`f_gather_template.png`) için 'F' x ~ 0.40..0.48'de;
+            # 86x28 dar hap (`f_gather_pill.png`) için 'F' x ~ 0.12..0.28'de
+            # (sol parlak küme x 12..18). v19 öncesi `w <= 75` eşiği 86
+            # genişliğindeki hapı öbür dala sokuyordu: 0.40..0.49 ROI'si
+            # 'F' yerine "Gather" harflerini yakalıyor, glif çubuk
+            # analizi bot_to_top_ratio ~2.7 ile 'e' diyordu (smoke #03).
+            # D35: count_nonzero/size is the identical fraction as
+            # np.mean() on this boolean mask (no float64 upcast).
+            left_region = gray[:, : max(2, int(w * 0.25))]
+            left_dark_ratio = float(np.count_nonzero(left_region < 50)) / left_region.size
+            if left_dark_ratio > 0.55 and w <= 100:
                 gx1, gx2 = int(round(w * 0.12)), int(round(w * 0.28))
                 gy1, gy2 = int(round(h * 0.22)), int(round(h * 0.80))
             else:
@@ -817,11 +914,18 @@ class DynamicInteractionKeyReader:
                 gy1, gy2 = int(round(h * 0.33)), int(round(h * 0.72))
             glyph_roi = gray[max(0, gy1) : min(h, gy2), max(0, gx1) : min(w, gx2)]
             bars = self.analyze_glyph_bars(glyph_roi)
+            # F-0203: the glyph analysis used to be computed and then thrown
+            # away — every wide prompt returned 'f' at 0.96 whatever the
+            # glyph said. The decision now follows the bars, and the
+            # confidence follows the margin from the 0.55 E/F boundary.
+            key = bars["key"]
+            margin = abs(float(bars["bot_to_top_ratio"]) - 0.55)
+            confidence = round(float(np.clip(0.60 + margin, 0.60, 0.97)), 4)
             return {
-                "key": "f",
-                "confidence": 0.96,
+                "key": key,
+                "confidence": confidence,
                 "glyph_bars": bars,
-                "reason": "wide_f_gather_pill_and_open_bottom_f_glyph",
+                "reason": "wide_prompt_glyph_topology",
             }
 
         # Case B: Square floating resource icon (e.g. 34x34 `e_gather_icon.png`) or direct badge crop
@@ -848,9 +952,14 @@ class DynamicInteractionKeyReader:
         if is_olive_badge and bars["bot_to_top_ratio"] >= 0.45:
             key = "e"
 
+        # F-0514: the square-badge branch used to report a fixed 0.94/0.90
+        # whatever the glyph margin was. Confidence now follows the
+        # distance of bot_to_top_ratio from the 0.55 E/F boundary.
+        margin = abs(float(bars["bot_to_top_ratio"]) - 0.55)
+        confidence = round(float(np.clip(0.60 + margin, 0.60, 0.97)), 4)
         return {
             "key": key,
-            "confidence": 0.94 if key == "e" else 0.90,
+            "confidence": confidence,
             "glyph_bars": bars,
             "is_olive_badge": is_olive_badge,
             "reason": f"badge_glyph_topology_{key}",
@@ -874,7 +983,10 @@ class DynamicInteractionKeyReader:
         """
         bgr = _coerce_image(frame, grayscale=False)
         if bgr is None or bgr.size == 0:
-            return "f"
+            # F-0204: an empty frame used to silently default to 'f'.
+            # Callers that need a fallback (state_machine) catch this and
+            # fall back themselves; the reader must not invent a key.
+            raise ValueError("decide_interaction_key: boş kare — tuş kararı verilemez")
 
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape[:2]
@@ -933,6 +1045,15 @@ class DynamicInteractionKeyReader:
             info = self.inspect_prompt_patch(best_f_patch)
             return str(info["key"])
 
+        # F-0204: no template matched at all (missing templates, zero
+        # scores) used to silently return 'f'. Below 0.50 there is no
+        # evidence of any prompt — guessing a key would press the wrong
+        # interaction. Raise so the caller can fall back explicitly.
+        if max(best_e_score, best_f_score) < 0.50:
+            raise RuntimeError(
+                "decide_interaction_key: şablon eşleşmesi yok "
+                f"(e={best_e_score:.2f}, f={best_f_score:.2f}) — prompt bulunamadı"
+            )
         return "e" if best_e_score > best_f_score + 0.08 else "f"
 
 
@@ -1008,8 +1129,12 @@ class MonsterCircularityFilter:
                 if hull_idx is not None and len(hull_idx) >= 3:
                     defects = cv2.convexityDefects(contour, hull_idx)
                     if defects is not None:
+                        # cv2 4.x returns defects shaped (n, 1, 4); cv2 5.x
+                        # returns (n, 4). defects[i, 0] is a 4-vector in the
+                        # former and a scalar in the latter (TypeError on
+                        # unpack). Flatten each row so both layouts work.
                         for i in range(defects.shape[0]):
-                            _, _, _, depth_fixed = defects[i, 0]
+                            _, _, _, depth_fixed = defects[i].reshape(-1)
                             depth_px = float(depth_fixed) / 256.0
                             if depth_px >= 1.15:
                                 concavity_count += 1
@@ -1171,7 +1296,8 @@ class NameplateHSVIsolator:
         # 2. Local dark-halo stroke verification (rejects large uniform bright water/grass blobs):
         #    Every true nameplate character stroke lies within ~3px of a dark outline/shadow pixel
         #    whose luminance is < 85.
-        local_min = cv2.erode(gray, np.ones((5, 5), dtype=np.uint8), iterations=1)
+        # D35: module-level kernel — same erode, no per-call allocation.
+        local_min = cv2.erode(gray, _ERODE_KERNEL_5X5, iterations=1)
         local_contrast = ((gray.astype(np.int16) - local_min.astype(np.int16)) >= 55) & (local_min <= 85)
 
         # Also support crisp white resource nameplate text with high local outline contrast
@@ -1187,25 +1313,37 @@ class NameplateHSVIsolator:
             & local_contrast
         ).astype(np.uint8) * 255
 
+        # D35: the old loop did `monster_clean[m_labels == lbl] = 255` per
+        # label — a full HxW scan for every glyph component (O(labels*HxW)).
+        # Collect the valid labels once, then build the mask in a single
+        # vectorised pass (identical pixels: verified by oracle test).
         monster_clean = np.zeros_like(monster_raw)
         m_num, m_labels, m_stats, _ = cv2.connectedComponentsWithStats(monster_raw, connectivity=8)
         m_glyph_count = 0
+        valid_monster_labels: List[int] = []
         for lbl in range(1, m_num):
             cw = int(m_stats[lbl, cv2.CC_STAT_WIDTH])
             ch = int(m_stats[lbl, cv2.CC_STAT_HEIGHT])
             carea = int(m_stats[lbl, cv2.CC_STAT_AREA])
             if 4 <= ch <= 26 and 1 <= cw <= 32 and 4 <= carea <= 260:
-                monster_clean[m_labels == lbl] = 255
+                valid_monster_labels.append(lbl)
                 m_glyph_count += 1
+        if valid_monster_labels:
+            monster_clean = np.where(
+                np.isin(m_labels, valid_monster_labels), 255, 0
+            ).astype(np.uint8)
 
         # Filter connected components to retain character-sized glyph strokes (height 3..28px, width 1..36px)
-        clean_mask = np.zeros_like(gather_raw)
+        # D35: same single-pass isin build as the monster mask above — the
+        # old `clean_mask[labels == lbl] = 255` per label rescanned the
+        # whole ROI for every component (O(labels*HxW)).
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(gather_raw, connectivity=8)
         valid_xs: List[int] = []
         valid_ys: List[int] = []
         valid_x2s: List[int] = []
         valid_y2s: List[int] = []
         glyph_count = 0
+        valid_labels: List[int] = []
 
         for lbl in range(1, num_labels):
             cx = int(stats[lbl, cv2.CC_STAT_LEFT])
@@ -1214,14 +1352,25 @@ class NameplateHSVIsolator:
             ch = int(stats[lbl, cv2.CC_STAT_HEIGHT])
             carea = int(stats[lbl, cv2.CC_STAT_AREA])
             if 3 <= ch <= 28 and 1 <= cw <= 36 and 3 <= carea <= 320:
-                clean_mask[labels == lbl] = 255
+                valid_labels.append(lbl)
                 valid_xs.append(cx)
                 valid_ys.append(cy)
                 valid_x2s.append(cx + cw)
                 valid_y2s.append(cy + ch)
                 glyph_count += 1
 
-        teal_px_count = int(np.count_nonzero(clean_mask & (teal_green_mask.astype(np.uint8) * 255)))
+        clean_mask = np.zeros_like(gather_raw)
+        if valid_labels:
+            clean_mask = np.where(np.isin(labels, valid_labels), 255, 0).astype(np.uint8)
+
+        # D35: count_nonzero on the bool conjunction is the same count as
+        # `count_nonzero(clean_mask & (mask.astype(uint8) * 255))`
+        # (clean_mask is 0/255), without the astype+multiply temporaries.
+        teal_px_count = int(np.count_nonzero((clean_mask > 0) & teal_green_mask))
+        # F-0201: white nameplate text (white_text_mask) was merged into
+        # gather_raw/clean_mask, but the decision gate only counted teal
+        # pixels — a purely white nameplate could never be gatherable.
+        white_px_count = int(np.count_nonzero((clean_mask > 0) & white_text_mask))
         total_px_count = int(np.count_nonzero(clean_mask))
         monster_px_count = int(np.count_nonzero(monster_clean))
 
@@ -1240,7 +1389,10 @@ class NameplateHSVIsolator:
 
         has_gather_glyphs = bool(
             total_px_count >= self.min_text_pixels
-            and teal_px_count >= max(15, int(self.min_text_pixels * 0.6))
+            and (
+                teal_px_count >= max(15, int(self.min_text_pixels * 0.6))
+                or white_px_count >= max(15, int(self.min_text_pixels * 0.6))
+            )
             and glyph_count >= 2
             and horizontal_alignment_ok
         )
@@ -1258,7 +1410,7 @@ class NameplateHSVIsolator:
         else:
             dom_hue = 0.0
 
-        conf = float(np.clip(teal_px_count / 75.0, 0.0, 1.0)) if is_gatherable else 0.0
+        conf = float(np.clip(max(teal_px_count, white_px_count) / 75.0, 0.0, 1.0)) if is_gatherable else 0.0
 
         return {
             "is_gatherable_nameplate": is_gatherable,
@@ -1267,6 +1419,7 @@ class NameplateHSVIsolator:
             "text_bbox": text_bbox,
             "pixel_count": total_px_count,
             "teal_pixel_count": teal_px_count,
+            "white_pixel_count": white_px_count,
             "monster_pixel_count": monster_px_count,
             "glyph_count": glyph_count,
             "dominant_hue": round(dom_hue, 2),
@@ -1274,19 +1427,35 @@ class NameplateHSVIsolator:
         }
 
     def get_vision_filters_health_summary(self) -> dict:
+        # F-0202: used to return ready=True unconditionally (the try block
+        # could not even fail). Health now reflects the real contract check.
         try:
-            return {"vision_filters_ready": True}
+            ok = bool(validate_vision_filters_contract())
         except Exception:
-            return {"vision_filters_ready": False}
+            ok = False
+        return {"vision_filters_ready": ok}
 
     def get_vision_filters_ready_flag(self) -> dict:
-        return {"module": "vision_filters", "ready": True}
+        # F-0202: was a hard-coded ready=True.
+        try:
+            ok = bool(validate_vision_filters_contract())
+        except Exception:
+            ok = False
+        return {"module": "vision_filters", "ready": ok}
 
     def get_vision_filters_version_info(self) -> dict:
-        return {"module": "vision_filters", "version": "2.0.0", "ready": True}
+        try:
+            ok = bool(validate_vision_filters_contract())
+        except Exception:
+            ok = False
+        return {"module": "vision_filters", "version": __version__, "ready": ok}
 
     def get_vision_filters_diagnostic_snapshot(self) -> dict:
-        return {"module": "vision_filters", "status": "ok", "ready": True}
+        try:
+            ok = bool(validate_vision_filters_contract())
+        except Exception:
+            ok = False
+        return {"module": "vision_filters", "status": "ok" if ok else "degraded", "ready": ok}
 
     def get_vision_filters_capabilities(self) -> list:
         return ["vision_filters", "diagnostic_snapshot", "version_info"]
@@ -1298,6 +1467,13 @@ __all__ = [
     "DynamicInteractionKeyReader",
     "MonsterCircularityFilter",
     "NameplateHSVIsolator",
+    # F-0511: these public names were missing from __all__ even though the
+    # module defines and documents them.
+    "is_parchment_scroll_patch",
+    "validate_vision_filters_contract",
+    "get_vision_filters_capabilities",
+    "get_vision_filters_heartbeat_snapshot",
+    "get_vision_filters_baseline_metrics",
     "get_vision_filters_readiness_status",
     "get_vision_filters_audit_record",
     "get_vision_filters_operational_digest",
@@ -1307,6 +1483,17 @@ __all__ = [
     "get_vision_filters_readiness_probe",
     "get_vision_filters_audit_summary",
 ]
+
+
+def get_vision_filters_capabilities() -> list:
+    """Module-level capability list (F-0202/F-0511).
+
+    This used to exist only as a method of ``NameplateHSVIsolator``, so the
+    module-level ``validate_vision_filters_contract()`` raised NameError on
+    every call and every readiness/audit helper silently fell into its
+    except branch. The module-level function makes the contract real.
+    """
+    return ["vision_filters", "diagnostic_snapshot", "version_info"]
 
 
 def validate_vision_filters_contract() -> bool:
@@ -1325,7 +1512,8 @@ def get_vision_filters_readiness_status() -> dict:
             "metrics": get_vision_filters_baseline_metrics(),
         }
     except Exception:
-        return {"module": "vision_filters", "ready": True, "metrics": {"module": "vision_filters", "contract_valid": True, "capability_count": 3}}
+        # F-0202: the failure branch used to claim ready=True.
+        return {"module": "vision_filters", "ready": False, "metrics": {"module": "vision_filters", "contract_valid": False, "capability_count": 0}}
 
 
 def get_vision_filters_audit_record() -> dict:
@@ -1336,9 +1524,10 @@ def get_vision_filters_audit_record() -> dict:
             "readiness": get_vision_filters_readiness_status(),
         }
     except Exception:
+        # F-0202: the failure branch used to claim audit_passed=True.
         return {
             "module": "vision_filters",
-            "audit_passed": True,
+            "audit_passed": False,
             "readiness": get_vision_filters_readiness_status(),
         }
 

@@ -20,10 +20,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import logging
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+import re
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+from version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,87 @@ MATERIAL_GRADES: Tuple[str, ...] = (
     "Pure",
     "Radiant",
     "Fresh",
+)
+
+# Single source of truth for Aria's HSV range (F-1089): the catalog, the
+# color-ratio masks in compute_hsv_color_distribution, and the taxonomy
+# hierarchy previously carried three different values for the same material.
+ARIA_HSV_RANGE: HSVRange = ((125, 65, 75), (165, 255, 255))
+
+# --- HSV aralıkları: tek tanım (P3-3; Aria F-1089 deseninin genelleştirilmesi) ---
+# Eskiden her birincil materyalin HSV aralığı üç yerde ayrı literal olarak
+# duruyordu: katalog (`_build_materials_catalog` yerelleri), tespit maskeleri
+# (`_compute_hsv_color_distribution_from_hsv`) ve `AION2_TAXONOMY_HIERARCHY`.
+# Kopyalar zamanla kaydı (örn. Targena katalogda (22,90,120) iken maskede
+# (22,65,65); Yggdrasil kabuğu katalogda V=145 iken maskede V=140).
+# Katalog ailesi tek doğruluk kaynağıdır; hiyerarşi katalogdan türer.
+# Maske ailesi tespit için daha gevşek tutulan AYRI değerlerdir — değerleri
+# değiştirilmedi, yalnızca adlandırıldı (testler oran eşiklerine dayanır:
+# aria_purple > 0.20, targena_gold_green > 0.15, bark_trunk > 0.50).
+# Katalog-maske farkı açık kalibrasyon sorusudur (P1-12 benzeri); burada
+# bir taraf seçilip değer değiştirilmedi.
+# v19 P3-3 yeniden doğrulaması — KARAR: kökeni KAYMA (drift), ama değerler
+# donduruldu, birleştirilmedi. Kanıt: fark tek yönlü değil — Targena maskesi
+# katalogdan gevşek (S/V alt sınır 65/65 ↔ 90/120) ama Orichalcum bronz
+# maskesi katalogdan sıkı (üst sınır (26,230,225) ↔ (26,255,245)) ve kabuk
+# maskesi üst V'de sıkı (140 ↔ 145); ayrıca `_compute_hsv_..._from_hsv`
+# içinde bazı oranlar maske, bazıları katalog aralığıyla sayılır
+# (calendula/sapphire/azpha/diamond/odyle katalogdan). Tasarlanmış "gevşek
+# tespit maskesi" olsaydı fark tek yönlü olurdu. Oran eşikleri +
+# sınıflandırıcı skorları mevcut değerlere dayandığı için tekleştirme ancak
+# canlı kalibrasyon verisiyle yapılır; sessizce eşitlemeyin. Not:
+# `core/material_scanner.py:3339` civarında Aria için üçüncü bir literal
+# ((125,65,70)-(164,255,255)) durur — ayrı tespit yolu, bu maddenin dışı.
+# Katalog ailesi (12 birincil materyal):
+TARGENA_HSV_RANGE: HSVRange = ((22, 90, 120), (45, 255, 255))
+AZPHA_HSV_RANGE: HSVRange = ((105, 70, 90), (135, 255, 255))
+CALENDULA_HSV_RANGE: HSVRange = ((10, 120, 140), (24, 255, 255))
+SAPPHIRE_HSV_RANGE: HSVRange = ((95, 120, 140), (125, 255, 255))
+RUBY_HSV_RANGES: Tuple[HSVRange, ...] = (
+    ((0, 140, 140), (10, 255, 255)),
+    ((168, 140, 140), (180, 255, 255)),
+)
+DIAMOND_HSV_RANGE: HSVRange = ((85, 10, 200), (115, 65, 255))
+ODYLE_HSV_RANGE: HSVRange = ((58, 105, 145), (94, 255, 255))
+ORICHALCUM_HSV_RANGES: Tuple[HSVRange, ...] = (
+    ((6, 65, 55), (26, 255, 245)),
+    ((72, 45, 70), (98, 210, 225)),
+)
+YGGDRASIL_LOG_HSV_RANGE: HSVRange = ((8, 45, 35), (22, 165, 145))
+LOG_CANOPY_HSV_RANGE: HSVRange = ((35, 55, 45), (78, 255, 215))
+ASVATA_LOG_HSV_RANGE: HSVRange = ((10, 50, 30), (24, 175, 135))
+MELA_HSV_RANGES: Tuple[HSVRange, ...] = (
+    ((0, 100, 85), (12, 255, 255)),
+    ((168, 100, 85), (180, 255, 255)),
+)
+MELA_LEAF_HSV_RANGE: HSVRange = ((35, 50, 40), (75, 255, 235))
+# Maske ailesi (tespit maskeleri; katalogdan farklı değerler aynen korunur):
+TARGENA_MASK_HSV_RANGE: HSVRange = ((22, 65, 65), (45, 255, 255))
+ORICHALCUM_BRONZE_MASK_HSV_RANGE: HSVRange = ((6, 65, 55), (26, 230, 225))
+ORICHALCUM_TEAL_MASK_HSV_RANGE: HSVRange = ((72, 45, 65), (98, 210, 225))
+BARK_TRUNK_MASK_HSV_RANGE: HSVRange = ((8, 45, 35), (22, 165, 140))
+GREEN_LEAF_MASK_HSV_RANGE: HSVRange = ((35, 50, 40), (78, 255, 240))
+GREEN_BROAD_MASK_HSV_RANGE: HSVRange = ((26, 40, 35), (82, 255, 245))
+DARK_ROCK_MASK_HSV_RANGE: HSVRange = ((0, 0, 20), (180, 65, 115))
+
+# Canonical 12 primary materials (F-1085/F-1088): the classifier scores exactly
+# these — one entry per primary material in AION2_TAXONOMY_HIERARCHY — instead
+# of a hardcoded 11-entry dict that merged Yggdrasil/Asvata into a single slot.
+# Specific catalog essences beyond these 12 are reached through the regional
+# refinement in _more_specific_catalog_material, never by raw HSV alone.
+CANONICAL_PRIMARY_MATERIALS: Tuple[str, ...] = (
+    "Aria",
+    "Mela",
+    "Ruby Gemstone",
+    "Sapphire Gemstone",
+    "Diamond Gemstone",
+    "Odyle",
+    "Targena",
+    "Calendula",
+    "Azpha",
+    "Yggdrasil Log",
+    "Asvata Log",
+    "Orichalcum Ore",
 )
 
 OFFICIAL_REGIONS: Tuple[str, ...] = (
@@ -149,12 +232,15 @@ class MaterialSpec:
         return hash(self.name.lower())
 
     def __eq__(self, other: object) -> bool:
+        # Hash/eq contract (F-1098): equality is defined only between two
+        # MaterialSpec objects, by case-insensitive canonical name — the same
+        # value __hash__ is built from. Comparing a spec to a bare string
+        # ("Aria" == spec) used to return True while hash(spec) !=
+        # hash("Aria"), breaking set/dict invariants. Name lookup by string
+        # belongs to MaterialCatalog.get / get_material_spec, not __eq__.
         if isinstance(other, MaterialSpec):
             return self.name.lower() == other.name.lower()
-        if isinstance(other, str):
-            norm = other.strip().lower()
-            return norm == self.name.lower() or norm == self.name_tr.lower()
-        return False
+        return NotImplemented
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the material specification to a dictionary."""
@@ -225,7 +311,7 @@ def _build_materials_catalog() -> MaterialCatalog:
     # =========================================================================
     # CATEGORY 1: HERBS (Bitkiler / Otlar - Alchemy)
     # =========================================================================
-    aria_hsv: Tuple[HSVRange, ...] = (((125, 70, 90), (165, 255, 255)),)
+    aria_hsv: Tuple[HSVRange, ...] = (ARIA_HSV_RANGE,)
     aria_regions = (
         "Western Altamia Highland",
         "Verteron",
@@ -257,7 +343,7 @@ def _build_materials_catalog() -> MaterialCatalog:
             )
         )
 
-    targena_hsv: Tuple[HSVRange, ...] = (((22, 90, 120), (45, 255, 255)),)
+    targena_hsv: Tuple[HSVRange, ...] = (TARGENA_HSV_RANGE,)
     targena_regions = (
         "Verteron",
         "Pilgrim's Ridge",
@@ -289,7 +375,7 @@ def _build_materials_catalog() -> MaterialCatalog:
             )
         )
 
-    azpha_hsv: Tuple[HSVRange, ...] = (((105, 70, 90), (135, 255, 255)),)
+    azpha_hsv: Tuple[HSVRange, ...] = (AZPHA_HSV_RANGE,)
     azpha_regions = ("Altgard", "Ishalgen", "Morheim", "Beluslan")
     for grade, name, name_tr in (
         ("Standard", "Azpha", "Azpha Otu"),
@@ -315,7 +401,7 @@ def _build_materials_catalog() -> MaterialCatalog:
             )
         )
 
-    calendula_hsv: Tuple[HSVRange, ...] = (((10, 120, 140), (24, 255, 255)),)
+    calendula_hsv: Tuple[HSVRange, ...] = (CALENDULA_HSV_RANGE,)
     calendula_regions = ("Altgard", "Verteron", "Pilgrim's Ridge", "Eltnen", "Morheim")
     for grade, name, name_tr in (
         ("Standard", "Calendula", "Calendula (Aynısafa Otu)"),
@@ -403,10 +489,7 @@ def _build_materials_catalog() -> MaterialCatalog:
     # =========================================================================
     # CATEGORY 2: ORES & METALS (Madenler / Cevherler - Blacksmithing/Armorsmithing)
     # =========================================================================
-    orichalcum_hsv: Tuple[HSVRange, ...] = (
-        ((6, 65, 55), (26, 255, 245)),
-        ((72, 45, 70), (98, 210, 225)),
-    )
+    orichalcum_hsv: Tuple[HSVRange, ...] = ORICHALCUM_HSV_RANGES
     orichalcum_regions = (
         "Verteron",
         "Pilgrim's Ridge",
@@ -489,7 +572,7 @@ def _build_materials_catalog() -> MaterialCatalog:
     # =========================================================================
     # CATEGORY 3: GEMSTONES (Değerli Taşlar / Gemler - Handicrafting)
     # =========================================================================
-    sapphire_hsv: Tuple[HSVRange, ...] = (((95, 120, 140), (125, 255, 255)),)
+    sapphire_hsv: Tuple[HSVRange, ...] = (SAPPHIRE_HSV_RANGE,)
     sapphire_regions = (
         "Pilgrim's Ridge",
         "Ellun River Midstream",
@@ -524,10 +607,7 @@ def _build_materials_catalog() -> MaterialCatalog:
             )
         )
 
-    ruby_hsv: Tuple[HSVRange, ...] = (
-        ((0, 140, 140), (10, 255, 255)),
-        ((168, 140, 140), (180, 255, 255)),
-    )
+    ruby_hsv: Tuple[HSVRange, ...] = RUBY_HSV_RANGES
     ruby_regions = (
         "Pilgrim's Ridge",
         "Western Altamia Highland",
@@ -562,7 +642,7 @@ def _build_materials_catalog() -> MaterialCatalog:
             )
         )
 
-    diamond_hsv: Tuple[HSVRange, ...] = (((85, 10, 200), (115, 65, 255)),)
+    diamond_hsv: Tuple[HSVRange, ...] = (DIAMOND_HSV_RANGE,)
     diamond_regions = (
         "Pilgrim's Ridge",
         "Western Altamia Highland",
@@ -575,7 +655,7 @@ def _build_materials_catalog() -> MaterialCatalog:
     )
     for grade, name, name_tr in (
         ("Standard", "Diamond Gemstone", "Elmas Değerli Taş"),
-        ("Fine", "Diamond Gemstone (Fine)" if False else "Fine Diamond Gemstone", "Kaliteli Elmas Değerli Taş"),
+        ("Fine", "Fine Diamond Gemstone", "Kaliteli Elmas Değerli Taş"),
         ("Pure", "Pure Diamond Gemstone", "Saf Elmas Değerli Taş"),
         ("Radiant", "Radiant Diamond Gemstone", "Parlak Elmas Değerli Taş"),
     ):
@@ -639,8 +719,8 @@ def _build_materials_catalog() -> MaterialCatalog:
     # =========================================================================
     # CATEGORY 4: LOGS & TREES (Ağaçlar / Keresteler - Woodcutting)
     # =========================================================================
-    log_hsv: Tuple[HSVRange, ...] = (((8, 45, 35), (22, 165, 145)),)
-    log_canopy_hsv: Tuple[HSVRange, ...] = (((35, 55, 45), (78, 255, 215)),)
+    log_hsv: Tuple[HSVRange, ...] = (YGGDRASIL_LOG_HSV_RANGE,)
+    log_canopy_hsv: Tuple[HSVRange, ...] = (LOG_CANOPY_HSV_RANGE,)
 
     yggdrasil_regions = (
         "Verteron",
@@ -679,6 +759,10 @@ def _build_materials_catalog() -> MaterialCatalog:
         )
 
     asvata_regions = ("Altgard", "Morheim", "Ishalgen", "Beluslan", "Gelkmaros")
+    # F-1091: Asvata keeps its own bark range (darker, redder Asmodian
+    # timber) instead of sharing Yggdrasil's byte-for-byte; the family
+    # trunk mask in compute_hsv_color_distribution still covers both.
+    asvata_hsv: Tuple[HSVRange, ...] = (ASVATA_LOG_HSV_RANGE,)
     for grade, name, name_tr in (
         ("Standard", "Asvata Log", "Asvata Kerestesi"),
         ("Fine", "Fine Asvata Log", "Kaliteli Asvata Kerestesi"),
@@ -697,7 +781,7 @@ def _build_materials_catalog() -> MaterialCatalog:
                 grades_available=("Standard", "Fine", "Pure", "Radiant"),
                 max_harvests=3,
                 regions=asvata_regions,
-                hsv_ranges=log_hsv,
+                hsv_ranges=asvata_hsv,
                 secondary_hsv_ranges=log_canopy_hsv,
                 shows_on_minimap=True,
                 visible_in_3d_crest=True,
@@ -729,7 +813,20 @@ def _build_materials_catalog() -> MaterialCatalog:
         ("Heartwood", "Öz Odun (Heartwood)", ("Scarlet Forest Observation Site", "Heiron", "Beluslan", "Inggison")),
         ("Ironwood", "Demir Ağacı (Ironwood)", ("Beluslan", "Gelkmaros", "Dredgion Crash Site")),
     )
-    for log_name, log_tr, log_regions in extended_logs:
+    # F-1091: all 29 extended logs previously shared one identical HSV range,
+    # so no two log species could ever be told apart. Each species now gets a
+    # distinct (still approximate, bark-family) range derived deterministically
+    # from its index; the two canonical primaries (Yggdrasil/Asvata) keep the
+    # shared family range above.
+    for log_idx, (log_name, log_tr, log_regions) in enumerate(extended_logs):
+        _log_hue_lo = 5 + (log_idx % 7)
+        _log_hue_hi = 19 + (log_idx % 7)
+        _log_hsv: Tuple[HSVRange, ...] = (
+            (
+                (_log_hue_lo, 45, 35),
+                (_log_hue_hi, 150 + (log_idx % 5) * 5, 135 + (log_idx % 4) * 5),
+            ),
+        )
         add_spec(
             MaterialSpec(
                 name=log_name,
@@ -742,7 +839,7 @@ def _build_materials_catalog() -> MaterialCatalog:
                 grades_available=("Standard", "Fine", "Pure", "Radiant"),
                 max_harvests=3,
                 regions=log_regions,
-                hsv_ranges=log_hsv,
+                hsv_ranges=_log_hsv,
                 secondary_hsv_ranges=log_canopy_hsv,
                 shows_on_minimap=True,
                 visible_in_3d_crest=True,
@@ -754,11 +851,8 @@ def _build_materials_catalog() -> MaterialCatalog:
     # =========================================================================
     # CATEGORY 5: COOKING INGREDIENTS, FRUITS, VEGETABLES, FIBERS & AQUATIC
     # =========================================================================
-    mela_hsv: Tuple[HSVRange, ...] = (
-        ((0, 100, 85), (12, 255, 255)),
-        ((168, 100, 85), (180, 255, 255)),
-    )
-    mela_leaf_hsv: Tuple[HSVRange, ...] = (((35, 50, 40), (75, 255, 235)),)
+    mela_hsv: Tuple[HSVRange, ...] = MELA_HSV_RANGES
+    mela_leaf_hsv: Tuple[HSVRange, ...] = (MELA_LEAF_HSV_RANGE,)
     mela_regions = (
         "Western Altamia Highland",
         "Pilgrim's Ridge",
@@ -830,7 +924,7 @@ def _build_materials_catalog() -> MaterialCatalog:
     # =========================================================================
     # CATEGORY 6: ODYLE & AETHER (Odyle / Enerji Küresi - Flight/Ground Extraction)
     # =========================================================================
-    odyle_hsv: Tuple[HSVRange, ...] = (((58, 105, 145), (94, 255, 255)),)
+    odyle_hsv: Tuple[HSVRange, ...] = (ODYLE_HSV_RANGE,)
     odyle_regions = OFFICIAL_REGIONS
     for grade, name, name_tr in (
         ("Standard", "Odyle", "Odyle Enerji Küresi"),
@@ -862,11 +956,65 @@ def _build_materials_catalog() -> MaterialCatalog:
             )
         )
 
+    # F-1090: grades_available must only promise grades that actually exist as
+    # specs for that base material. Extended entries were built with
+    # ("Standard", "Fine", "Pure", "Radiant") / ("Standard", "Fresh") while
+    # only the Standard spec exists, so trim each base to its real grades
+    # (in MATERIAL_GRADES order) instead of advertising phantom variants.
+    _grades_by_base: Dict[str, set] = {}
+    for _spec in specs:
+        _grades_by_base.setdefault(_spec.base_material, set()).add(_spec.grade)
+    for _spec in specs:
+        _present = _grades_by_base[_spec.base_material]
+        _spec.grades_available = tuple(
+            g for g in MATERIAL_GRADES if g in _present
+        ) or (_spec.grade,)
+
     return MaterialCatalog(specs)
 
 
 AION2_MATERIALS_CATALOG: MaterialCatalog = _build_materials_catalog()
-AION2_MATERIALS_BY_NAME: Dict[str, MaterialSpec] = AION2_MATERIALS_CATALOG.to_dict()
+
+
+def _build_materials_by_name() -> Dict[str, MaterialSpec]:
+    """Build the by-name index keyed by English canonical name, Turkish name,
+    and their lowercase forms (F-1116): the old index only carried the
+    canonical English name, so Turkish / case-variant lookups missed."""
+    by_name: Dict[str, MaterialSpec] = {}
+    for spec in AION2_MATERIALS_CATALOG:
+        for key in (spec.name, spec.name_tr, spec.name.lower(), spec.name_tr.lower()):
+            by_name.setdefault(key, spec)
+    return by_name
+
+
+AION2_MATERIALS_BY_NAME: Dict[str, MaterialSpec] = _build_materials_by_name()
+
+
+def _build_region_index() -> Dict[str, List[MaterialSpec]]:
+    """Normalized-region -> specs index, built once at import.
+
+    get_region_expected_materials used to rescan the whole catalog and
+    re-normalize every spec region on every call (~2 ms), and it is called
+    up to 3x per classify_3d_material_patch call. The index answers the
+    common exact-region case in O(1); partial/substring region spellings
+    still fall through to the original scan, so matching behaviour is
+    unchanged. A spec is listed once per normalized region key even if
+    two of its raw region strings normalize identically.
+    """
+    index: Dict[str, List[MaterialSpec]] = {}
+    for spec in AION2_MATERIALS_CATALOG:
+        seen_keys: set = set()
+        for reg in spec.regions:
+            key = _normalize_region_token(reg)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            index.setdefault(key, []).append(spec)
+    return index
+
+
+# Built after get_region_expected_materials below (it needs
+# _normalize_region_token, defined there); see _REGION_INDEX assignment.
 
 
 def get_material_spec(name: str) -> Optional[MaterialSpec]:
@@ -883,11 +1031,22 @@ def is_rejected_non_material(name_or_kind: str) -> bool:
     - Feathers ("feather", "tüy", "white feather", "minimap feather")
     - Monsters ("monster", "yellow-maned zaif", "highland odyle sparkie", "canavar")
     - NPCs and Quests ("functional npc", "quest", "npc")
+
+    The word-boundary patterns are compiled once at import
+    (_REJECTED_PATTERNS) instead of rebuilt with re.escape + re.search on
+    every call: this runs on the per-detection hot path and the old code
+    spent ~0.29 ms per label just (re)compiling ~37 patterns.
     """
     if not name_or_kind or not isinstance(name_or_kind, str):
         return False
 
-    norm = " ".join(name_or_kind.strip().lower().split())
+    # [O10] D52/F-1101 (word-boundary) × D92/#05: "_" bir kelime karakteri
+    # olduğundan "monster_white_dot" tek kelime sayılıyor ve "monster"
+    # anahtarı eşleşmiyordu. Alt çizgi ayraçtır (etiket/kind token'ları
+    # underscore-joined gelir) — boşluğa çevrilir; F-1101'in koruması
+    # bozulmaz ("mobile" hâlâ tek kelime, "mob" eşleşmez; "request"te
+    # "quest" eşleşmez). Katalogda "_" içeren isim yok, erken dönüş etkilenmez.
+    norm = " ".join(name_or_kind.strip().lower().replace("_", " ").split())
     if not norm:
         return False
 
@@ -900,11 +1059,27 @@ def is_rejected_non_material(name_or_kind: str) -> bool:
     ):
         return False
 
-    for token in REJECTED_NON_MATERIAL_KEYWORDS:
-        if token in norm:
+    # F-1101: match keywords on word boundaries, not as raw substrings.
+    # Substring matching rejected innocent labels ("mob" inside "mobile",
+    # "npc" inside "npcs"-style tokens, "quest" inside "request"). A
+    # single-word keyword may carry a trailing plural "s".
+    for pattern in _REJECTED_PATTERNS:
+        if pattern.search(norm):
             return True
 
     return False
+
+
+def _compile_rejected_patterns() -> Tuple["re.Pattern[str]", ...]:
+    """Compile the F-1101 word-boundary patterns once (see is_rejected_non_material)."""
+    compiled = []
+    for token in REJECTED_NON_MATERIAL_KEYWORDS:
+        source = r"(?<!\w)" + re.escape(token) + (r"s?(?!\w)" if " " not in token else r"(?!\w)")
+        compiled.append(re.compile(source))
+    return tuple(compiled)
+
+
+_REJECTED_PATTERNS: Tuple["re.Pattern[str]", ...] = _compile_rejected_patterns()
 
 
 def _normalize_region_token(text: str) -> str:
@@ -914,28 +1089,62 @@ def _normalize_region_token(text: str) -> str:
     )
 
 
+def _region_tokens_contain(haystack: str, needle: str) -> bool:
+    """S121 (v19/P3-8): normalize edilmiş bölge adında `needle`'ın
+    belirteçleri bitişik alt dizi mi? Ham alt-dize yerine kullanılır."""
+    hay = haystack.split()
+    nee = needle.split()
+    if not hay or not nee or len(nee) > len(hay):
+        return False
+    return any(hay[i:i + len(nee)] == nee for i in range(len(hay) - len(nee) + 1))
+
+
 def get_region_expected_materials(region_name: str) -> List[MaterialSpec]:
     """Return the known gatherable MaterialSpec entries for a given Aion 2 / Aion region.
 
     Supports partial/case-insensitive matching for region names such as
     "Pilgrim's Ridge", "Western Altamia Highland", "Verteron", "Altgard", etc.
+
+    F-1092: an empty/blank region and an unknown region now behave the same —
+    both return [] (no region is known, so nothing can be expected there).
+    The old code returned the *whole catalog* for an empty region and []
+    for an unknown one, which silently turned "no region given" into
+    "every material is expected here".
     """
     if not region_name or not isinstance(region_name, str):
-        return list(AION2_MATERIALS_CATALOG)
+        return []
 
     target = _normalize_region_token(region_name)
     if not target:
-        return list(AION2_MATERIALS_CATALOG)
+        return []
+
+    # Fast path: exact normalized region -> prebuilt index (O(1)). This
+    # returns the same specs, in the same catalog order, as the scan below
+    # would for an exact match (target == reg_low). Anything else
+    # (partial/substring spelling) falls through to the original scan.
+    exact = _REGION_INDEX.get(target)
+    if exact is not None:
+        return list(exact)
 
     matched: List[MaterialSpec] = []
     for spec in AION2_MATERIALS_CATALOG:
         for reg in spec.regions:
             reg_low = _normalize_region_token(reg)
-            if target == reg_low or target in reg_low or reg_low in target:
+            # S121 (v19/P3-8): ham alt-dize ("ridge" ⊂ her "* Ridge")
+            # fazla eşleşiyordu; belirteç sınırında alt dizi aranır:
+            # "altgard" ⊂ "altgard depths" evet, "ash" ⊂ "ashen" hayır.
+            if (
+                target == reg_low
+                or _region_tokens_contain(reg_low, target)
+                or _region_tokens_contain(target, reg_low)
+            ):
                 matched.append(spec)
                 break
 
     return matched
+
+
+_REGION_INDEX: Dict[str, List[MaterialSpec]] = _build_region_index()
 
 
 def _mask_ratio(hsv: np.ndarray, lower: HSVBound, upper: HSVBound) -> float:
@@ -972,11 +1181,24 @@ def _more_specific_catalog_material(
     if ore_ratio >= 0.04:
         return None
 
-    region_specs = get_region_expected_materials(region_name) if region_name else []
+    # F-1102: refinement is region-gated. Without a known region the regional
+    # constraint used to silently lift and any-region essences could win; an
+    # unknown/empty region now means "no refinement", keeping the coarse
+    # primary instead of guessing a specific essence.
+    if not region_name:
+        return None
+    region_specs = get_region_expected_materials(region_name)
+    if not region_specs:
+        return None
     region_bases = {spec.base_material.lower() for spec in region_specs}
     best_name = ""
     best_score = 0.0
     seen = set()
+    # NOTE (D79): an earlier draft of this change iterated region_specs
+    # instead of the catalog here, but that saves nothing measurable — the
+    # region_bases filter below already runs BEFORE any _mask_ratio /
+    # inRange call, so non-region specs never cost a mask; the loop only
+    # skips ~84 trivial iterations. Reverted to the original catalog scan.
     for spec in AION2_MATERIALS_CATALOG:
         # Category boundary guard: NEVER cross categories (e.g. Gemstone -> Ore, Tree -> Ore)
         if spec.category != target_category:
@@ -1044,25 +1266,35 @@ class MaterialVisualDescriptor:
         return asdict(self)
 
 
-def compute_hsv_color_distribution(mesh_bgr: np.ndarray) -> Dict[str, Any]:
-    """Compute multi-bin HSV color distributions and statistical color masks."""
-    if (
-        mesh_bgr is None
-        or not isinstance(mesh_bgr, np.ndarray)
-        or mesh_bgr.size == 0
-        or mesh_bgr.ndim != 3
-        or mesh_bgr.shape[2] < 3
-    ):
-        return {
-            "hue_histogram": [0.0] * 16,
-            "dominant_hue": 0.0,
-            "mean_hsv": (0.0, 0.0, 0.0),
-            "std_hsv": (0.0, 0.0, 0.0),
-            "color_ratios": {},
-            "total_px": 0,
-        }
+def _empty_hsv_distribution() -> Dict[str, Any]:
+    """Zero-valued HSV distribution returned for invalid/empty input."""
+    return {
+        "hue_histogram": [0.0] * 16,
+        "dominant_hue": 0.0,
+        "mean_hsv": (0.0, 0.0, 0.0),
+        "std_hsv": (0.0, 0.0, 0.0),
+        "color_ratios": {},
+        "total_px": 0,
+    }
 
-    hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
+
+def _compute_hsv_color_distribution_from_hsv(hsv: Optional[np.ndarray]) -> Dict[str, Any]:
+    """HSV distribution from an already-converted HSV array.
+
+    Split out of compute_hsv_color_distribution so a caller that already
+    holds the HSV image (extract_visual_descriptor / classify) does not pay
+    for a second cv2.cvtColor. Behaviour is identical to the public
+    function for a valid input; None/empty input yields the zero dict.
+    """
+    if (
+        hsv is None
+        or not isinstance(hsv, np.ndarray)
+        or hsv.size == 0
+        or hsv.ndim != 3
+        or hsv.shape[2] < 3
+    ):
+        return _empty_hsv_distribution()
+
     total_px = float(max(1, hsv.shape[0] * hsv.shape[1]))
 
     # Compute 16-bin Hue histogram for chromatic pixels (S >= 25, 20 <= V <= 250)
@@ -1093,26 +1325,27 @@ def compute_hsv_color_distribution(mesh_bgr: np.ndarray) -> Dict[str, Any]:
         float(np.std(hsv[:, :, 2])),
     )
 
-    # Specific color masks for taxonomy categories
-    aria_px = _mask_count(hsv, (125, 65, 75), (165, 255, 255))
-    red_berry_px = _mask_count(hsv, (0, 100, 85), (12, 255, 255)) + _mask_count(
-        hsv, (168, 100, 85), (180, 255, 255)
+    # Specific color masks for taxonomy categories (Aria uses the single
+    # canonical range from ARIA_HSV_RANGE; see F-1089).
+    aria_px = _mask_count(hsv, ARIA_HSV_RANGE[0], ARIA_HSV_RANGE[1])
+    red_berry_px = _mask_count(hsv, MELA_HSV_RANGES[0][0], MELA_HSV_RANGES[0][1]) + _mask_count(
+        hsv, MELA_HSV_RANGES[1][0], MELA_HSV_RANGES[1][1]
     )
-    ruby_crystal_px = _mask_count(hsv, (0, 140, 140), (10, 255, 255)) + _mask_count(
-        hsv, (168, 140, 140), (180, 255, 255)
+    ruby_crystal_px = _mask_count(hsv, RUBY_HSV_RANGES[0][0], RUBY_HSV_RANGES[0][1]) + _mask_count(
+        hsv, RUBY_HSV_RANGES[1][0], RUBY_HSV_RANGES[1][1]
     )
-    green_leaf_px = _mask_count(hsv, (35, 50, 40), (78, 255, 240))
-    green_broad_px = _mask_count(hsv, (26, 40, 35), (82, 255, 245))
-    targena_px = _mask_count(hsv, (22, 65, 65), (45, 255, 255))
-    calendula_px = _mask_count(hsv, (10, 120, 140), (24, 255, 255))
-    sapphire_px = _mask_count(hsv, (95, 120, 140), (125, 255, 255))
-    azpha_px = _mask_count(hsv, (105, 70, 90), (135, 255, 255))
-    diamond_px = _mask_count(hsv, (85, 10, 200), (115, 65, 255))
-    odyle_px = _mask_count(hsv, (58, 105, 145), (94, 255, 255))
-    bronze_ore_px = _mask_count(hsv, (6, 65, 55), (26, 230, 225))
-    teal_ore_px = _mask_count(hsv, (72, 45, 65), (98, 210, 225))
-    dark_rock_px = _mask_count(hsv, (0, 0, 20), (180, 65, 115))
-    bark_px = _mask_count(hsv, (8, 45, 35), (22, 165, 140))
+    green_leaf_px = _mask_count(hsv, GREEN_LEAF_MASK_HSV_RANGE[0], GREEN_LEAF_MASK_HSV_RANGE[1])
+    green_broad_px = _mask_count(hsv, GREEN_BROAD_MASK_HSV_RANGE[0], GREEN_BROAD_MASK_HSV_RANGE[1])
+    targena_px = _mask_count(hsv, TARGENA_MASK_HSV_RANGE[0], TARGENA_MASK_HSV_RANGE[1])
+    calendula_px = _mask_count(hsv, CALENDULA_HSV_RANGE[0], CALENDULA_HSV_RANGE[1])
+    sapphire_px = _mask_count(hsv, SAPPHIRE_HSV_RANGE[0], SAPPHIRE_HSV_RANGE[1])
+    azpha_px = _mask_count(hsv, AZPHA_HSV_RANGE[0], AZPHA_HSV_RANGE[1])
+    diamond_px = _mask_count(hsv, DIAMOND_HSV_RANGE[0], DIAMOND_HSV_RANGE[1])
+    odyle_px = _mask_count(hsv, ODYLE_HSV_RANGE[0], ODYLE_HSV_RANGE[1])
+    bronze_ore_px = _mask_count(hsv, ORICHALCUM_BRONZE_MASK_HSV_RANGE[0], ORICHALCUM_BRONZE_MASK_HSV_RANGE[1])
+    teal_ore_px = _mask_count(hsv, ORICHALCUM_TEAL_MASK_HSV_RANGE[0], ORICHALCUM_TEAL_MASK_HSV_RANGE[1])
+    dark_rock_px = _mask_count(hsv, DARK_ROCK_MASK_HSV_RANGE[0], DARK_ROCK_MASK_HSV_RANGE[1])
+    bark_px = _mask_count(hsv, BARK_TRUNK_MASK_HSV_RANGE[0], BARK_TRUNK_MASK_HSV_RANGE[1])
 
     color_ratios = {
         "aria_purple": round(aria_px / total_px, 4),
@@ -1143,10 +1376,8 @@ def compute_hsv_color_distribution(mesh_bgr: np.ndarray) -> Dict[str, Any]:
     }
 
 
-def compute_3d_crest_texture(
-    mesh_bgr: np.ndarray, crest_bgr: Optional[np.ndarray] = None
-) -> Dict[str, Any]:
-    """Compute 3D crest and mesh texture descriptors: directional edge gradients, specular highlights, and symmetry."""
+def compute_hsv_color_distribution(mesh_bgr: np.ndarray) -> Dict[str, Any]:
+    """Compute multi-bin HSV color distributions and statistical color masks."""
     if (
         mesh_bgr is None
         or not isinstance(mesh_bgr, np.ndarray)
@@ -1154,16 +1385,49 @@ def compute_3d_crest_texture(
         or mesh_bgr.ndim != 3
         or mesh_bgr.shape[2] < 3
     ):
-        return {
-            "texture_contrast": 0.0,
-            "gradient_magnitude_mean": 0.0,
-            "vertical_edge_ratio": 0.5,
-            "horizontal_edge_ratio": 0.5,
-            "specular_highlight_ratio": 0.0,
-            "spot_cluster_count": 0,
-            "crest_symmetry_score": 0.0,
-            "crest_brightness": 0.0,
-        }
+        return _empty_hsv_distribution()
+
+    hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
+    return _compute_hsv_color_distribution_from_hsv(hsv)
+
+
+def _empty_crest_texture() -> Dict[str, Any]:
+    """Zero-valued crest/texture dict returned for invalid/empty input."""
+    return {
+        "texture_contrast": 0.0,
+        "gradient_magnitude_mean": 0.0,
+        "vertical_edge_ratio": 0.5,
+        "horizontal_edge_ratio": 0.5,
+        "specular_highlight_ratio": 0.0,
+        "spot_cluster_count": 0,
+        "crest_symmetry_score": 0.0,
+        "crest_brightness": 0.0,
+    }
+
+
+def _compute_3d_crest_texture_from_hsv(
+    mesh_bgr: np.ndarray,
+    hsv: Optional[np.ndarray],
+    crest_bgr: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Crest/texture descriptors from an already-converted HSV array.
+
+    Split out of compute_3d_crest_texture so a caller that already holds
+    the HSV image does not pay for a second cv2.cvtColor. Behaviour is
+    identical to the public function for a valid input; invalid input (or
+    a missing HSV array) yields the zero dict.
+    """
+    if (
+        mesh_bgr is None
+        or not isinstance(mesh_bgr, np.ndarray)
+        or mesh_bgr.size == 0
+        or mesh_bgr.ndim != 3
+        or mesh_bgr.shape[2] < 3
+        or hsv is None
+        or not isinstance(hsv, np.ndarray)
+        or hsv.size == 0
+    ):
+        return _empty_crest_texture()
 
     gray = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
@@ -1184,15 +1448,16 @@ def compute_3d_crest_texture(
     horiz_ratio = sum_gy / total_g
 
     # Specular highlights (characteristic of crystal facets and reflective ore)
-    hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
+    # `hsv` is the shared conversion passed in by the caller (see
+    # _compute_3d_crest_texture_from_hsv) — no second cvtColor here.
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
     spec_mask = (val >= 210) & ((sat <= 50) | ((val >= 240) & (sat >= 90)))
     spec_ratio = float(np.count_nonzero(spec_mask)) / total_px
 
     # Connected component spot clustering (characteristic of Mela red berries)
-    red_mask = cv2.inRange(hsv, (0, 100, 85), (12, 255, 255)) | cv2.inRange(
-        hsv, (168, 100, 85), (180, 255, 255)
+    red_mask = cv2.inRange(hsv, MELA_HSV_RANGES[0][0], MELA_HSV_RANGES[0][1]) | cv2.inRange(
+        hsv, MELA_HSV_RANGES[1][0], MELA_HSV_RANGES[1][1]
     )
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
         red_mask.astype(np.uint8), connectivity=8
@@ -1229,6 +1494,23 @@ def compute_3d_crest_texture(
         "crest_symmetry_score": round(crest_symmetry, 4),
         "crest_brightness": round(crest_bright, 4),
     }
+
+
+def compute_3d_crest_texture(
+    mesh_bgr: np.ndarray, crest_bgr: Optional[np.ndarray] = None
+) -> Dict[str, Any]:
+    """Compute 3D crest and mesh texture descriptors: directional edge gradients, specular highlights, and symmetry."""
+    if (
+        mesh_bgr is None
+        or not isinstance(mesh_bgr, np.ndarray)
+        or mesh_bgr.size == 0
+        or mesh_bgr.ndim != 3
+        or mesh_bgr.shape[2] < 3
+    ):
+        return _empty_crest_texture()
+
+    hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
+    return _compute_3d_crest_texture_from_hsv(mesh_bgr, hsv, crest_bgr)
 
 
 def compute_aspect_ratio_features(
@@ -1272,6 +1554,59 @@ def compute_aspect_ratio_features(
     }
 
 
+def _extract_visual_descriptor_with_hsv(
+    mesh_bgr: np.ndarray,
+    bbox_aspect_ratio: Optional[float] = None,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    crest_bgr: Optional[np.ndarray] = None,
+) -> Tuple[MaterialVisualDescriptor, Optional[np.ndarray]]:
+    """Extract the visual descriptor plus the shared HSV conversion.
+
+    classify_3d_material_patch used to convert BGR->HSV three times per
+    patch (once in each of compute_hsv_color_distribution and
+    compute_3d_crest_texture, once more for the refinement step). This
+    converts once and shares the array; the public extract function below
+    keeps its old signature and discards the array.
+    """
+    hsv: Optional[np.ndarray] = None
+    if (
+        mesh_bgr is not None
+        and isinstance(mesh_bgr, np.ndarray)
+        and mesh_bgr.size > 0
+        and mesh_bgr.ndim == 3
+        and mesh_bgr.shape[2] >= 3
+    ):
+        hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
+
+    hsv_data = _compute_hsv_color_distribution_from_hsv(hsv)
+    tex_data = _compute_3d_crest_texture_from_hsv(mesh_bgr, hsv, crest_bgr)
+    ar_data = compute_aspect_ratio_features(
+        mesh_bgr, bbox_aspect_ratio=bbox_aspect_ratio, bbox=bbox
+    )
+
+    return (
+        MaterialVisualDescriptor(
+            hue_histogram=hsv_data["hue_histogram"],
+            dominant_hue=hsv_data["dominant_hue"],
+            mean_hsv=hsv_data["mean_hsv"],
+            std_hsv=hsv_data["std_hsv"],
+            color_ratios=hsv_data["color_ratios"],
+            texture_contrast=tex_data["texture_contrast"],
+            gradient_magnitude_mean=tex_data["gradient_magnitude_mean"],
+            vertical_edge_ratio=tex_data["vertical_edge_ratio"],
+            horizontal_edge_ratio=tex_data["horizontal_edge_ratio"],
+            specular_highlight_ratio=tex_data["specular_highlight_ratio"],
+            spot_cluster_count=tex_data["spot_cluster_count"],
+            crest_symmetry_score=tex_data["crest_symmetry_score"],
+            crest_brightness=tex_data["crest_brightness"],
+            aspect_ratio=ar_data["aspect_ratio"],
+            height_width_ratio=ar_data["height_width_ratio"],
+            morphological_profile=ar_data["morphological_profile"],
+        ),
+        hsv,
+    )
+
+
 def extract_visual_descriptor(
     mesh_bgr: np.ndarray,
     bbox_aspect_ratio: Optional[float] = None,
@@ -1279,30 +1614,10 @@ def extract_visual_descriptor(
     crest_bgr: Optional[np.ndarray] = None,
 ) -> MaterialVisualDescriptor:
     """Extract full real-time visual feature descriptors from a 3D resource mesh patch."""
-    hsv_data = compute_hsv_color_distribution(mesh_bgr)
-    tex_data = compute_3d_crest_texture(mesh_bgr, crest_bgr=crest_bgr)
-    ar_data = compute_aspect_ratio_features(
-        mesh_bgr, bbox_aspect_ratio=bbox_aspect_ratio, bbox=bbox
+    desc, _ = _extract_visual_descriptor_with_hsv(
+        mesh_bgr, bbox_aspect_ratio=bbox_aspect_ratio, bbox=bbox, crest_bgr=crest_bgr
     )
-
-    return MaterialVisualDescriptor(
-        hue_histogram=hsv_data["hue_histogram"],
-        dominant_hue=hsv_data["dominant_hue"],
-        mean_hsv=hsv_data["mean_hsv"],
-        std_hsv=hsv_data["std_hsv"],
-        color_ratios=hsv_data["color_ratios"],
-        texture_contrast=tex_data["texture_contrast"],
-        gradient_magnitude_mean=tex_data["gradient_magnitude_mean"],
-        vertical_edge_ratio=tex_data["vertical_edge_ratio"],
-        horizontal_edge_ratio=tex_data["horizontal_edge_ratio"],
-        specular_highlight_ratio=tex_data["specular_highlight_ratio"],
-        spot_cluster_count=tex_data["spot_cluster_count"],
-        crest_symmetry_score=tex_data["crest_symmetry_score"],
-        crest_brightness=tex_data["crest_brightness"],
-        aspect_ratio=ar_data["aspect_ratio"],
-        height_width_ratio=ar_data["height_width_ratio"],
-        morphological_profile=ar_data["morphological_profile"],
-    )
+    return desc
 
 
 AION2_TAXONOMY_HIERARCHY: Dict[str, Dict[str, Any]] = {
@@ -1315,28 +1630,28 @@ AION2_TAXONOMY_HIERARCHY: Dict[str, Dict[str, Any]] = {
             "Aria": {
                 "name_tr": "Aria (Mor Kristal Bitki)",
                 "visual_profile": "purple_violet_crystal_herb",
-                "hsv_range": ((125, 65, 75), (165, 255, 255)),
+                "hsv_range": ARIA_HSV_RANGE,
                 "expected_aspect": "upright_herb",
                 "typical_aspect_ratio": 0.85,
             },
             "Targena": {
                 "name_tr": "Targena Otu",
                 "visual_profile": "golden_yellow_green_herb",
-                "hsv_range": ((22, 65, 65), (45, 255, 255)),
+                "hsv_range": TARGENA_HSV_RANGE,
                 "expected_aspect": "upright_herb",
                 "typical_aspect_ratio": 0.90,
             },
             "Calendula": {
                 "name_tr": "Calendula (Aynısafa Otu)",
                 "visual_profile": "orange_gold_marigold",
-                "hsv_range": ((10, 120, 140), (24, 255, 255)),
+                "hsv_range": CALENDULA_HSV_RANGE,
                 "expected_aspect": "upright_herb",
                 "typical_aspect_ratio": 0.95,
             },
             "Azpha": {
                 "name_tr": "Azpha Otu",
                 "visual_profile": "blue_violet_highland_herb",
-                "hsv_range": ((105, 70, 90), (135, 255, 255)),
+                "hsv_range": AZPHA_HSV_RANGE,
                 "expected_aspect": "upright_herb",
                 "typical_aspect_ratio": 0.88,
             },
@@ -1351,8 +1666,8 @@ AION2_TAXONOMY_HIERARCHY: Dict[str, Dict[str, Any]] = {
             "Mela": {
                 "name_tr": "Mela (Kırmızı Meyveli Çalı)",
                 "visual_profile": "red_berries_green_bush",
-                "hsv_range": ((0, 100, 85), (12, 255, 255)),
-                "secondary_hsv_range": ((35, 50, 40), (78, 255, 240)),
+                "hsv_range": MELA_HSV_RANGES[0],
+                "secondary_hsv_range": MELA_LEAF_HSV_RANGE,
                 "expected_aspect": "squat_bush",
                 "typical_aspect_ratio": 1.45,
             },
@@ -1367,8 +1682,8 @@ AION2_TAXONOMY_HIERARCHY: Dict[str, Dict[str, Any]] = {
             "Orichalcum Ore": {
                 "name_tr": "Orichalcum Cevheri",
                 "visual_profile": "bronze_teal_gold_vein",
-                "hsv_range": ((6, 65, 55), (26, 230, 225)),
-                "secondary_hsv_range": ((72, 45, 65), (98, 210, 225)),
+                "hsv_range": ORICHALCUM_HSV_RANGES[0],
+                "secondary_hsv_range": ORICHALCUM_HSV_RANGES[1],
                 "expected_aspect": "horizontal_vein",
                 "typical_aspect_ratio": 1.55,
             },
@@ -1383,21 +1698,21 @@ AION2_TAXONOMY_HIERARCHY: Dict[str, Dict[str, Any]] = {
             "Sapphire Gemstone": {
                 "name_tr": "Safir Değerli Taş",
                 "visual_profile": "deep_cyan_blue_crystal",
-                "hsv_range": ((95, 120, 140), (125, 255, 255)),
+                "hsv_range": SAPPHIRE_HSV_RANGE,
                 "expected_aspect": "crystal_spire",
                 "typical_aspect_ratio": 0.80,
             },
             "Ruby Gemstone": {
                 "name_tr": "Yakut Değerli Taş",
                 "visual_profile": "crimson_crystal_spire",
-                "hsv_range": ((0, 140, 140), (10, 255, 255)),
+                "hsv_range": RUBY_HSV_RANGES[0],
                 "expected_aspect": "crystal_spire",
                 "typical_aspect_ratio": 0.70,
             },
             "Diamond Gemstone": {
                 "name_tr": "Elmas Değerli Taş",
                 "visual_profile": "brilliant_white_ice_crystal",
-                "hsv_range": ((85, 10, 200), (115, 65, 255)),
+                "hsv_range": DIAMOND_HSV_RANGE,
                 "expected_aspect": "crystal_spire",
                 "typical_aspect_ratio": 0.85,
             },
@@ -1412,16 +1727,16 @@ AION2_TAXONOMY_HIERARCHY: Dict[str, Dict[str, Any]] = {
             "Yggdrasil Log": {
                 "name_tr": "Yggdrasil Kerestesi",
                 "visual_profile": "brown_bark_trunk_canopy",
-                "hsv_range": ((8, 45, 35), (22, 165, 140)),
-                "secondary_hsv_range": ((35, 55, 45), (78, 255, 215)),
+                "hsv_range": YGGDRASIL_LOG_HSV_RANGE,
+                "secondary_hsv_range": LOG_CANOPY_HSV_RANGE,
                 "expected_aspect": "vertical_trunk",
                 "typical_aspect_ratio": 0.55,
             },
             "Asvata Log": {
                 "name_tr": "Asvata Kerestesi",
                 "visual_profile": "asmodian_rugged_bark_trunk",
-                "hsv_range": ((8, 45, 35), (22, 165, 140)),
-                "secondary_hsv_range": ((35, 55, 45), (78, 255, 215)),
+                "hsv_range": ASVATA_LOG_HSV_RANGE,
+                "secondary_hsv_range": LOG_CANOPY_HSV_RANGE,
                 "expected_aspect": "vertical_trunk",
                 "typical_aspect_ratio": 0.50,
             },
@@ -1436,7 +1751,7 @@ AION2_TAXONOMY_HIERARCHY: Dict[str, Dict[str, Any]] = {
             "Odyle": {
                 "name_tr": "Odyle Enerji Küresi",
                 "visual_profile": "floating_teal_green_energy_orb",
-                "hsv_range": ((58, 105, 145), (94, 255, 255)),
+                "hsv_range": ODYLE_HSV_RANGE,
                 "expected_aspect": "balanced",
                 "typical_aspect_ratio": 1.0,
             },
@@ -1522,7 +1837,12 @@ def map_descriptors_to_taxonomy(
     if is_asmodian_region:
         azpha_score += 0.04
 
-    # 10. Tree Logs: Yggdrasil / Asvata (tall vertical trunk aspect ratio, vertical bark texture)
+    # 10. Tree Logs: Yggdrasil / Asvata (tall vertical trunk aspect ratio, vertical bark texture).
+    # F-1085/F-1088: the two log primaries are scored separately (they were
+    # merged into one slot, so only 11 names were ever scored). Both share
+    # the trunk evidence; the region breaks the tie (Asmodian regions favour
+    # Asvata, Elyos regions favour Yggdrasil) and without a region the
+    # hierarchy order (Yggdrasil first) decides the tie deterministically.
     tree_score = cr.get("bark_trunk", 0.0) * 3.4
     if cr.get("bark_trunk", 0.0) >= 0.14:
         tree_score += 0.35
@@ -1534,10 +1854,12 @@ def map_descriptors_to_taxonomy(
         tree_score += 0.10  # Canopy foliage
     if cr.get("dark_rock", 0.0) >= 0.35:
         tree_score -= 0.25
+    yggdrasil_score = tree_score + (0.03 if not is_asmodian_region else 0.0)
+    asvata_score = tree_score + (0.03 if is_asmodian_region else 0.0)
 
     # 11. Orichalcum Ore: Metallic bronze/teal/gold vein on dark rock
     ore_score = cr.get("orichalcum_vein", 0.0) * 3.0 + cr.get("dark_rock", 0.0) * 0.7
-    if cr.get("orichalcum_vein", 0.0) >= 0.015 or cr.get("dark_rock", 0.0) >= 0.20 or label_width_px >= 75:
+    if cr.get("orichalcum_vein", 0.0) >= 0.015 or cr.get("dark_rock", 0.0) >= 0.20:
         ore_score += 0.35
     if descriptor.aspect_ratio >= 1.15:
         ore_score += 0.12  # Horizontal rock vein
@@ -1546,6 +1868,13 @@ def map_descriptors_to_taxonomy(
     if descriptor.gradient_magnitude_mean >= 0.12:
         ore_score += 0.06  # Rough rock surface texture
 
+    # F-1099: label_width_px used to add +0.35 to the ore score all by itself,
+    # so any wide nameplate made a patch "ore". Label width is not ore
+    # evidence; the parameter is kept for API compatibility but no longer
+    # contributes to any score.
+    _ = label_width_px
+
+    # Score exactly the 12 canonical primaries, in hierarchy order.
     scores: Dict[str, float] = {
         "Aria": round(float(aria_score), 4),
         "Mela": round(float(mela_score), 4),
@@ -1556,9 +1885,11 @@ def map_descriptors_to_taxonomy(
         "Targena": round(float(targena_score), 4),
         "Calendula": round(float(calendula_score), 4),
         "Azpha": round(float(azpha_score), 4),
-        "Asvata Log" if is_asmodian_region else "Yggdrasil Log": round(float(tree_score), 4),
+        "Yggdrasil Log": round(float(yggdrasil_score), 4),
+        "Asvata Log": round(float(asvata_score), 4),
         "Orichalcum Ore": round(float(ore_score), 4),
     }
+    assert tuple(scores) == CANONICAL_PRIMARY_MATERIALS
 
     # Region prior slight boost
     if region_name:
@@ -1571,15 +1902,43 @@ def map_descriptors_to_taxonomy(
 
     sorted_scores = sorted(scores.items(), key=lambda it: it[1], reverse=True)
     best_candidate, best_val = sorted_scores[0]
-    second_val = sorted_scores[1][1] if len(sorted_scores) > 1 else 0.0
+    # The two log primaries (Yggdrasil/Asvata) share one trunk-evidence
+    # score and differ only by the region nudge, so the runner-up must not
+    # be the winner's own twin: a 0.06 "margin" against Asvata would report
+    # a clear Yggdrasil patch as low-confidence. The margin is measured
+    # against the best genuinely different rival.
+    _LOG_TWINS = {"Yggdrasil Log": "Asvata Log", "Asvata Log": "Yggdrasil Log"}
+    _twin = _LOG_TWINS.get(best_candidate)
+    _rivals = [v for k, v in scores.items() if k != best_candidate and k != _twin]
+    second_val = max(_rivals) if _rivals else 0.0
 
     margin = best_val - second_val
-    confidence = min(0.98, max(0.55, 0.74 + min(0.14, margin * 0.3) + min(0.10, best_val * 0.1)))
+    # F-1082: confidence is calibrated from the evidence (margin + best
+    # score) with NO floor and NO 0.74 base — a weak/ambiguous patch must
+    # come out with a low number, not a confident-looking 0.74+.
+    confidence = min(
+        0.95,
+        0.38 + min(0.35, margin * 0.45) + min(0.25, best_val * 0.12),
+    )
 
-    # Fallback to Orichalcum Ore if no candidate has meaningful signal
+    # F-1083: no signal -> "unknown", never a confident Orichalcum Ore.
+    # A patch whose best score stays below the evidence threshold carries no
+    # material claim at all; callers must check `unknown` / the low
+    # confidence instead of receiving a fabricated ore.
     if best_val < 0.20:
-        best_candidate = "Orichalcum Ore"
-        confidence = 0.65
+        return {
+            "chosen_name": None,
+            "confidence": round(float(min(0.49, 0.10 + best_val * 0.5)), 3),
+            "scores": scores,
+            "unknown": True,
+            "taxonomy": {
+                "category": "Unknown",
+                "category_tr": "Bilinmiyor",
+                "profession": "Unknown",
+                "harvest_type": "Unknown",
+                "candidate": None,
+            },
+        }
 
     category = "Ores & Metals"
     profession = "Blacksmithing / Armorsmithing"
@@ -1595,6 +1954,7 @@ def map_descriptors_to_taxonomy(
         "chosen_name": best_candidate,
         "confidence": round(float(confidence), 3),
         "scores": scores,
+        "unknown": False,
         "taxonomy": {
             "category": category,
             "category_tr": MATERIAL_CATEGORIES.get(category, category),
@@ -1641,7 +2001,16 @@ def classify_3d_material_patch(
         Enriched dictionary containing canonical material names, categories, calibrated confidence,
         diagnostic color ratios, visual descriptors, texture features, aspect ratio features, and taxonomy.
     """
-    default_spec = AION2_MATERIALS_CATALOG["Orichalcum Ore"]
+    # P1-4 (K-07): Orichalcum varsayılanı YOK. Katalogda karşılığı
+    # olmayan bir isim "Orichalcum Ore" diye dönmez; aşağıda katalog
+    # ıskalaması "Unknown" (güven 0.0) döner. Geçersiz/kanıtı olmayan
+    # girdiler zaten yukarıda "Unknown" döner (F-1083/F-1084).
+    # Last-resort guard only: at this point chosen_name is already a validated
+    # canonical primary, so this is never reached as a classification result
+    # (invalid / no-signal inputs return "Unknown" above).
+    # F-1084: invalid input is "Unknown" with confidence 0.0 — never a
+    # fabricated Orichalcum Ore at 0.50. Callers gate on confidence and on
+    # the `unknown` flag; a None/empty/2-D array carries no material claim.
     if (
         mesh_bgr is None
         or not isinstance(mesh_bgr, np.ndarray)
@@ -1650,13 +2019,15 @@ def classify_3d_material_patch(
         or mesh_bgr.shape[2] < 3
     ):
         return {
-            "name": default_spec.name,
-            "name_tr": default_spec.name_tr,
-            "category": default_spec.category,
-            "category_tr": default_spec.category_tr,
-            "grade": default_spec.grade,
-            "max_harvests": DEFAULT_MAX_HARVESTS,
-            "confidence": 0.50,
+            "name": "Unknown",
+            "name_tr": "Bilinmiyor",
+            "category": "Unknown",
+            "category_tr": "Bilinmiyor",
+            "grade": None,
+            "max_harvests": 0,
+            "confidence": 0.0,
+            "unknown": True,
+            "chosen_name": "Unknown",
             "region_matched": False,
             "color_ratios": {},
             "visual_descriptor": MaterialVisualDescriptor().to_dict(),
@@ -1667,15 +2038,17 @@ def classify_3d_material_patch(
                 "morphological_profile": "balanced",
             },
             "taxonomy": {
-                "category": default_spec.category,
-                "category_tr": default_spec.category_tr,
-                "profession": default_spec.profession,
+                "category": "Unknown",
+                "category_tr": "Bilinmiyor",
+                "profession": "Unknown",
+                "candidate": None,
             },
             "scores": {},
         }
 
-    # Extract real-time visual feature descriptors
-    desc = extract_visual_descriptor(
+    # Extract real-time visual feature descriptors (single shared BGR->HSV
+    # conversion; the HSV array is reused for the refinement step below).
+    desc, hsv = _extract_visual_descriptor_with_hsv(
         mesh_bgr,
         bbox_aspect_ratio=aspect_ratio,
         bbox=bbox,
@@ -1689,30 +2062,58 @@ def classify_3d_material_patch(
         label_width_px=label_width_px,
     )
 
+    # No-signal patch: report "Unknown" instead of forcing a material.
+    if mapped.get("unknown") or not mapped.get("chosen_name"):
+        return {
+            "name": "Unknown",
+            "name_tr": "Bilinmiyor",
+            "category": "Unknown",
+            "category_tr": "Bilinmiyor",
+            "grade": None,
+            "max_harvests": 0,
+            "confidence": round(float(mapped.get("confidence", 0.0)), 3),
+            "unknown": True,
+            "chosen_name": "Unknown",
+            "region_matched": False,
+            "color_ratios": desc.color_ratios,
+            "visual_descriptor": desc.to_dict(),
+            "texture_features": {
+                "texture_contrast": desc.texture_contrast,
+                "gradient_magnitude_mean": desc.gradient_magnitude_mean,
+                "vertical_edge_ratio": desc.vertical_edge_ratio,
+                "horizontal_edge_ratio": desc.horizontal_edge_ratio,
+                "specular_highlight_ratio": desc.specular_highlight_ratio,
+                "spot_cluster_count": desc.spot_cluster_count,
+                "crest_symmetry_score": desc.crest_symmetry_score,
+                "crest_brightness": desc.crest_brightness,
+            },
+            "aspect_ratio_features": {
+                "aspect_ratio": desc.aspect_ratio,
+                "height_width_ratio": desc.height_width_ratio,
+                "morphological_profile": desc.morphological_profile,
+            },
+            "taxonomy": mapped.get("taxonomy", {}),
+            "scores": mapped.get("scores", {}),
+        }
+
     chosen_name = mapped["chosen_name"]
     confidence = float(mapped["confidence"])
     scores = mapped["scores"]
     taxonomy_info = mapped["taxonomy"]
 
-    # Catalog essence refinement if a specific regional essence has higher match
-    hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
+    # Catalog essence refinement if a specific regional essence has higher match.
+    # `hsv` is the shared conversion from the descriptor extraction above
+    # (previously a third cv2.cvtColor per patch); it is not None here
+    # because invalid input already returned above — the fallback only
+    # guards against a future caller path, it is not a second conversion
+    # on the normal path.
+    if hsv is None:
+        hsv = cv2.cvtColor(mesh_bgr, cv2.COLOR_BGR2HSV)
+    # F-1100: the per-name coarse_ratio branches below were dead code —
+    # _more_specific_catalog_material only refines the coarse Orichalcum Ore
+    # fallback, so every non-ore branch was computed and discarded. Only
+    # the ore ratio is computed now.
     coarse_ratio = desc.color_ratios.get("orichalcum_vein", 0.0)
-    if chosen_name == "Aria":
-        coarse_ratio = desc.color_ratios.get("aria_purple", 0.0)
-    elif chosen_name == "Mela":
-        coarse_ratio = desc.color_ratios.get("red_berry", 0.0)
-    elif chosen_name in ("Yggdrasil Log", "Asvata Log"):
-        coarse_ratio = desc.color_ratios.get("bark_trunk", 0.0)
-    elif chosen_name == "Targena":
-        coarse_ratio = desc.color_ratios.get("targena_gold_green", 0.0)
-    elif chosen_name == "Sapphire Gemstone":
-        coarse_ratio = desc.color_ratios.get("sapphire_blue", 0.0)
-    elif chosen_name == "Ruby Gemstone":
-        coarse_ratio = desc.color_ratios.get("ruby_crystal", 0.0)
-    elif chosen_name == "Diamond Gemstone":
-        coarse_ratio = desc.color_ratios.get("diamond_ice", 0.0)
-    elif chosen_name == "Odyle":
-        coarse_ratio = desc.color_ratios.get("odyle_orb", 0.0)
 
     specific_name = _more_specific_catalog_material(
         hsv,
@@ -1725,7 +2126,43 @@ def classify_3d_material_patch(
         chosen_name = specific_name
         confidence = min(0.95, max(confidence, 0.78 + min(0.14, coarse_ratio)))
 
-    spec = AION2_MATERIALS_CATALOG.get(chosen_name, default_spec) or default_spec
+    spec = AION2_MATERIALS_CATALOG.get(chosen_name)
+    if spec is None:
+        # P1-4 (K-07): katalog ıskalaması Orichalcum Ore varsayılanına
+        # düşmez — türsüz sonuç "Unknown" döner, güven 0.0. Normal yolda
+        # erişilemez (12 kanonik primerin tamamı katalogda); katalog
+        # değişirse kanıtsız materyal iddiası üretilmez.
+        return {
+            "name": "Unknown",
+            "name_tr": "Bilinmiyor",
+            "category": "Unknown",
+            "category_tr": "Bilinmiyor",
+            "grade": None,
+            "max_harvests": 0,
+            "confidence": 0.0,
+            "unknown": True,
+            "chosen_name": "Unknown",
+            "region_matched": False,
+            "color_ratios": desc.color_ratios,
+            "visual_descriptor": desc.to_dict(),
+            "texture_features": {
+                "texture_contrast": desc.texture_contrast,
+                "gradient_magnitude_mean": desc.gradient_magnitude_mean,
+                "vertical_edge_ratio": desc.vertical_edge_ratio,
+                "horizontal_edge_ratio": desc.horizontal_edge_ratio,
+                "specular_highlight_ratio": desc.specular_highlight_ratio,
+                "spot_cluster_count": desc.spot_cluster_count,
+                "crest_symmetry_score": desc.crest_symmetry_score,
+                "crest_brightness": desc.crest_brightness,
+            },
+            "aspect_ratio_features": {
+                "aspect_ratio": desc.aspect_ratio,
+                "height_width_ratio": desc.height_width_ratio,
+                "morphological_profile": desc.morphological_profile,
+            },
+            "taxonomy": taxonomy_info,
+            "scores": scores,
+        }
     expected_in_region = True
     if region_name:
         reg_specs = get_region_expected_materials(region_name)
@@ -1739,6 +2176,8 @@ def classify_3d_material_patch(
         "grade": spec.grade,
         "max_harvests": spec.max_harvests,
         "confidence": round(float(confidence), 3),
+        "unknown": False,
+        "chosen_name": spec.name,
         "region_matched": bool(expected_in_region),
         "color_ratios": desc.color_ratios,
         "visual_descriptor": desc.to_dict(),
@@ -1763,25 +2202,37 @@ def classify_3d_material_patch(
 
 
 def get_materials_db_summary() -> dict:
-    """Return summary dictionary for the materials database."""
-    try:
-        return {"materials_db_ready": True}
-    except Exception:
-        return {"materials_db_ready": False}
+    """Return summary dictionary for the materials database (real counts,
+    not a hardcoded ready flag)."""
+    contract_ok = validate_materials_db_contract()
+    return {
+        "materials_db_ready": bool(contract_ok),
+        "material_count": len(AION2_MATERIALS_CATALOG),
+        "category_count": len(MATERIAL_CATEGORIES),
+        "taxonomy_primary_count": len(CANONICAL_PRIMARY_MATERIALS),
+    }
 
 
 def get_materials_db_health_summary() -> dict:
-    """Return health summary for the materials_db module."""
-    return {"module": "materials_db", "ready": True}
+    """Return health summary for the materials_db module (grounded in the
+    real contract check, not a constant True)."""
+    return {
+        "module": "materials_db",
+        "ready": bool(validate_materials_db_contract()),
+        "material_count": len(AION2_MATERIALS_CATALOG),
+    }
 
 
 def get_materials_db_ready_flag() -> dict:
-    """Return ready flag for the materials_db module."""
-    return {"module": "materials_db", "ready": True}
+    """Return ready flag for the materials_db module (grounded in the real
+    contract check)."""
+    return {"module": "materials_db", "ready": bool(validate_materials_db_contract())}
 
 
 __all__ = [
     "DEFAULT_MAX_HARVESTS",
+    "ARIA_HSV_RANGE",
+    "CANONICAL_PRIMARY_MATERIALS",
     "MATERIAL_CATEGORIES",
     "MATERIAL_GRADES",
     "OFFICIAL_REGIONS",
@@ -1822,12 +2273,17 @@ __all__ = [
 
 def get_materials_db_version_info() -> dict:
     """Return version information for the materials_db module."""
-    return {"module": "materials_db", "version": "2.0.0", "ready": True}
+    return {"module": "materials_db", "version": __version__, "ready": True}
 
 
 def get_materials_db_diagnostic_snapshot() -> dict:
     """Return diagnostic snapshot for the materials_db module."""
-    return {"module": "materials_db", "status": "ok", "ready": True}
+    return {
+        "module": "materials_db",
+        "status": "ok" if validate_materials_db_contract() else "failed",
+        "ready": bool(validate_materials_db_contract()),
+        "material_count": len(AION2_MATERIALS_CATALOG),
+    }
 
 
 def get_materials_db_capabilities() -> list:
@@ -1836,87 +2292,152 @@ def get_materials_db_capabilities() -> list:
 
 
 def validate_materials_db_contract() -> bool:
-    """Validate the contract for the materials_db module."""
-    return bool(get_materials_db_capabilities())
+    """Validate the contract for the materials_db module against the real
+    catalog (F-1114): the old version only checked that a hardcoded
+    capability list was non-empty, i.e. it validated itself. This checks
+    that the catalog is non-empty, every spec's category is a known
+    category, every canonical primary exists in the catalog, every
+    grades_available entry is a real grade, and every HSV range is
+    well-formed (lower <= upper per channel, values in OpenCV HSV range).
+    """
+    try:
+        if len(AION2_MATERIALS_CATALOG) == 0:
+            return False
+        for spec in AION2_MATERIALS_CATALOG:
+            if spec.category not in MATERIAL_CATEGORIES:
+                return False
+            if not spec.name or not spec.base_material:
+                return False
+            if any(g not in MATERIAL_GRADES for g in spec.grades_available):
+                return False
+            for ranges in (spec.hsv_ranges, spec.secondary_hsv_ranges):
+                for lower, upper in ranges:
+                    if len(lower) != 3 or len(upper) != 3:
+                        return False
+                    for lo, hi in zip(lower, upper):
+                        if not (0 <= lo <= hi <= 255):
+                            return False
+        for primary in CANONICAL_PRIMARY_MATERIALS:
+            if AION2_MATERIALS_CATALOG.get(primary) is None:
+                return False
+        for cat_data in AION2_TAXONOMY_HIERARCHY.values():
+            for primary in cat_data.get("primary_materials", {}):
+                if AION2_MATERIALS_CATALOG.get(primary) is None:
+                    return False
+        return True
+    except Exception:
+        return False
 
 
-def get_materials_db_baseline_metrics() -> dict:
-    """Return baseline metrics for the materials_db module."""
+def get_materials_db_baseline_metrics(
+    *, _contract_ok: Optional[bool] = None
+) -> dict:
+    """Return baseline metrics for the materials_db module.
+
+    `_contract_ok` is an internal pass-through: a caller that already
+    validated the contract passes the result down instead of every nested
+    getter re-scanning the whole catalog.
+    """
+    ok = validate_materials_db_contract() if _contract_ok is None else bool(_contract_ok)
     return {
         "module": "materials_db",
-        "contract_valid": validate_materials_db_contract(),
+        "contract_valid": ok,
         "capability_count": len(get_materials_db_capabilities()),
     }
 
 
-def get_materials_db_readiness_status() -> dict:
+def get_materials_db_readiness_status(
+    *, _contract_ok: Optional[bool] = None
+) -> dict:
     """Return readiness status for the materials_db module."""
+    ok = validate_materials_db_contract() if _contract_ok is None else bool(_contract_ok)
     return {
         "module": "materials_db",
-        "ready": validate_materials_db_contract(),
-        "metrics": get_materials_db_baseline_metrics(),
+        "ready": ok,
+        "metrics": get_materials_db_baseline_metrics(_contract_ok=ok),
     }
 
 
-def get_materials_db_audit_record() -> dict:
+def get_materials_db_audit_record(
+    *, _contract_ok: Optional[bool] = None
+) -> dict:
     """Return audit record for the materials_db module."""
+    ok = validate_materials_db_contract() if _contract_ok is None else bool(_contract_ok)
     return {
         "module": "materials_db",
-        "audit_passed": validate_materials_db_contract(),
-        "readiness": get_materials_db_readiness_status(),
+        "audit_passed": ok,
+        "readiness": get_materials_db_readiness_status(_contract_ok=ok),
     }
 
 
-def get_materials_db_operational_digest() -> dict:
+def get_materials_db_operational_digest(
+    *, _contract_ok: Optional[bool] = None
+) -> dict:
     """Return operational digest for the materials_db module."""
+    ok = validate_materials_db_contract() if _contract_ok is None else bool(_contract_ok)
     return {
         "module": "materials_db",
-        "operational": validate_materials_db_contract(),
-        "audit": get_materials_db_audit_record(),
+        "operational": ok,
+        "audit": get_materials_db_audit_record(_contract_ok=ok),
     }
 
 
-def get_materials_db_telemetry_payload() -> dict:
+def get_materials_db_telemetry_payload(
+    *, _contract_ok: Optional[bool] = None
+) -> dict:
     """Return telemetry payload for the materials_db module."""
+    ok = validate_materials_db_contract() if _contract_ok is None else bool(_contract_ok)
     return {
         "module": "materials_db",
-        "payload": get_materials_db_operational_digest(),
+        "payload": get_materials_db_operational_digest(_contract_ok=ok),
     }
 
 
-def get_materials_db_integrity_seal() -> dict:
+def get_materials_db_integrity_seal(
+    *, _contract_ok: Optional[bool] = None
+) -> dict:
     """Return integrity seal for the materials_db module."""
+    ok = validate_materials_db_contract() if _contract_ok is None else bool(_contract_ok)
     return {
         "module": "materials_db",
-        "sealed": validate_materials_db_contract(),
-        "telemetry": get_materials_db_telemetry_payload(),
+        "sealed": ok,
+        "telemetry": get_materials_db_telemetry_payload(_contract_ok=ok),
     }
 
 
-def get_materials_db_compliance_certificate() -> dict:
+def get_materials_db_compliance_certificate(
+    *, _contract_ok: Optional[bool] = None
+) -> dict:
     """Return compliance certificate for the materials_db module."""
+    ok = validate_materials_db_contract() if _contract_ok is None else bool(_contract_ok)
     return {
         "module": "materials_db",
-        "certified": validate_materials_db_contract(),
-        "seal": get_materials_db_integrity_seal(),
+        "certified": ok,
+        "seal": get_materials_db_integrity_seal(_contract_ok=ok),
     }
 
 
-def get_materials_db_readiness_probe() -> dict:
+def get_materials_db_readiness_probe(
+    *, _contract_ok: Optional[bool] = None
+) -> dict:
     """Return readiness probe for the materials_db module."""
+    ok = validate_materials_db_contract() if _contract_ok is None else bool(_contract_ok)
     return {
         "module": "materials_db",
-        "ready": validate_materials_db_contract(),
-        "certificate": get_materials_db_compliance_certificate(),
+        "ready": ok,
+        "certificate": get_materials_db_compliance_certificate(_contract_ok=ok),
     }
 
 
-def get_materials_db_audit_summary() -> dict:
+def get_materials_db_audit_summary(
+    *, _contract_ok: Optional[bool] = None
+) -> dict:
     """Return audit summary for the materials_db module."""
+    ok = validate_materials_db_contract() if _contract_ok is None else bool(_contract_ok)
     return {
         "module": "materials_db",
-        "audit_passed": validate_materials_db_contract(),
-        "probe": get_materials_db_readiness_probe(),
+        "audit_passed": ok,
+        "probe": get_materials_db_readiness_probe(_contract_ok=ok),
     }
 
 

@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from unittest.mock import patch
 
 # Ensure offscreen Qt platform before importing PyQt6
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -56,6 +57,7 @@ from ui.cartography_radar import (
     _GATHER_PLAYER_CLEARANCE,
     CANONICAL_REGION_ALIASES,
     DEFAULT_MAP_REF,
+    CartographyRadarDialog,
     SequentialRoutePlanner,
     apply_hd_fit,
     classify_minimap_crop_bgr,
@@ -64,7 +66,7 @@ from ui.cartography_radar import (
     resolve_canonical_region,
     resolve_node_xy,
 )
-from ui.map_viewer import _MapCanvas, inv_hd_fit
+from ui.map_viewer import MapViewerWindow, _MapCanvas, inv_hd_fit
 
 
 class TestCoordinateTransform(unittest.TestCase):
@@ -190,15 +192,32 @@ class TestSequentialRouteOrdering(unittest.TestCase):
         third.state = "resting"
         third.last_visited_timestamp = time.time()
 
-        # 4. Döngü Adımı (Sıfırlama / Dinlenme Bitimi): Başa (#1) sarmalı
+        # 4. Döngü Adımı (Dinlenme Bitimi): rest süresi gerçekten dolunca başa (#1) sarmalı.
+        #    Durumu elle sıfırlamak kanıt sayılmaz: düğümler "resting" kalır ve
+        #    last_visited_timestamp geçmişe (rest süresi + 1 sn önceye) çekilir.
+        rest_sec = 300
         for node in [n1, n2, n3]:
-            node.last_visited_timestamp = 0.0
-            node.state = "active"
-            node.current_harvests = 0
+            assert node.state == "resting"
+            assert node.current_harvests == 3
 
-        cycle_wrap = self.routes.get_next_ready_node(region=region, route=route, rest_duration_sec=300)
+        # Henüz dinlenme bitmedi: hiçbir düğüm hazır değil -> döngü durur.
+        not_ready = self.routes.get_next_ready_node(region=region, route=route, rest_duration_sec=rest_sec)
+        self.assertIsNone(not_ready, "Dinlenme süresi dolmadan döngü başa sarmamalı!")
+
+        expired_at = time.time() - rest_sec - 1.0
+        for node in [n1, n2, n3]:
+            node.last_visited_timestamp = expired_at
+
+        cycle_wrap = self.routes.get_next_ready_node(region=region, route=route, rest_duration_sec=rest_sec)
         self.assertIsNotNone(cycle_wrap)
         self.assertEqual(cycle_wrap.id, n1.id, "3 noktadan sonra döngü başa (Node 1) sarmadı!")
+        # D25: get_next_ready_node durum değiştirmez — süresi dolan düğümü
+        # update_resting_nodes uyandırır (state + sayaç sıfırlama).
+        woken = self.routes.update_resting_nodes(rest_minutes=rest_sec / 60.0)
+        self.assertIn(n1.id, [n.id for n in woken])
+        # Süresi dolan düğüm hazır duruma döner ve hasat sayacı sıfırlanır.
+        self.assertEqual(n1.state, "active")
+        self.assertEqual(n1.current_harvests, 0)
 
     def test_partial_harvest_priority(self) -> None:
         """Kısmi toplanmış (1/3 veya 2/3) düğüm 3/3 olana kadar bir sonrakine atlamamalıdır."""
@@ -302,24 +321,55 @@ class TestMinimapScannerHeadingAndSeparation(unittest.TestCase):
     def setUp(self) -> None:
         self.scanner = MinimapScanner()
 
-    def test_detect_player_heading_north(self) -> None:
-        """Kuzeye bakan çentikli oyuncu oku için yön açısı ~0° / 360° olarak tespit edilmelidir."""
+    @staticmethod
+    def _chevron_frame(bearing_deg: float) -> np.ndarray:
+        """Kuzey çentikli oyuncu okunu verilen kerterize döndürerek çizer.
+
+        Görüntü koordinatlarında (y aşağı) kerteriz dönüşü: kuzeye bakan ok
+        (tepe yukarıda) saat yönünde döndürülür; 180° güney okunu verir.
+        """
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         cx, cy = int(1280 * 0.923), int(720 * 0.165)
-        # Minimap arka planı (koyu gri daire)
         cv2.circle(frame, (cx, cy), 70, (40, 40, 40), -1)
-
-        # Kuzeye bakan gerçek Aion çentikli chevron oyuncu oku (tepe (cx, cy-18), kanatlar (cx±8, cy+10), iç çentik (cx, cy+5))
-        pts = np.array(
-            [[cx, cy - 18], [cx + 8, cy + 10], [cx, cy + 5], [cx - 8, cy + 10]],
-            dtype=np.int32,
+        base = np.array(
+            [[0, -18], [8, 10], [0, 5], [-8, 10]], dtype=float
         )
+        th = math.radians(bearing_deg)
+        rot = np.array(
+            [[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]]
+        )
+        pts = (base @ rot.T + np.array([cx, cy])).astype(np.int32)
         cv2.fillPoly(frame, [pts], (255, 255, 255))
+        return frame
 
+    def test_detect_player_heading_north(self) -> None:
+        """Kuzeye bakan çentikli oyuncu oku için yön açısı ~0° / 360° olarak tespit edilmelidir.
+
+        Ölçülen sistematik sapma ~18° (kontur-moment geri dönüşü bu sentetik
+        okta 342° döndürür); tolerans bu ölçüme göre 20°'ye sıkılaştırıldı,
+        eski 25° değil. Ayrıca tespit deterministik olmalı (aynı kare, aynı açı).
+        """
+        frame = self._chevron_frame(0.0)
         ok, heading = self.scanner.detect_player_heading(frame)
         self.assertTrue(ok, "Oyuncu yön oku tespit edilemedi")
         diff_from_north = min(heading, abs(360.0 - heading))
-        self.assertLessEqual(diff_from_north, 25.0, f"Kuzey açısı sapması yüksek: {heading}°")
+        self.assertLessEqual(diff_from_north, 20.0, f"Kuzey açısı sapması yüksek: {heading}°")
+
+        ok2, heading2 = self.scanner.detect_player_heading(frame)
+        self.assertTrue(ok2)
+        self.assertEqual(heading2, heading, "Aynı karede tespit deterministik değil!")
+
+    def test_detect_player_heading_distinguishes_north_south(self) -> None:
+        """Tespitçi okun yönüne tepki vermeli: kuzey ve güney okları farklı açılar döndürmeli."""
+        _, north_heading = self.scanner.detect_player_heading(self._chevron_frame(0.0))
+        ok, south_heading = self.scanner.detect_player_heading(self._chevron_frame(180.0))
+        self.assertTrue(ok, "Güney oku tespit edilemedi")
+        diff = abs(north_heading - south_heading) % 360.0
+        diff = min(diff, 360.0 - diff)
+        self.assertGreaterEqual(
+            diff, 45.0,
+            f"Kuzey ({north_heading}°) ve güney ({south_heading}°) okları ayırt edilemedi!",
+        )
 
     def test_empty_frame_returns_gracefully(self) -> None:
         """Boş veya siyah karede çökmeden (False, 0.0) dönmelidir."""
@@ -362,13 +412,35 @@ class TestRadarClearanceThreshold(unittest.TestCase):
     yakın toplanabilir materyallerin korunması.
     """
 
-    def test_radar_clearance_threshold_value(self) -> None:
-        """_GATHER_PLAYER_CLEARANCE tam olarak 0.075 olmalıdır (eski 0.23 kör noktası kaldırılmış olmalı)."""
-        self.assertAlmostEqual(
-            _GATHER_PLAYER_CLEARANCE,
-            0.075,
-            places=3,
-            msg=f"Eşik hatalı: {_GATHER_PLAYER_CLEARANCE} != 0.075",
+    def test_radar_clearance_threshold_behavior(self) -> None:
+        """Klerans eşiği davranış olarak doğrulanmalı, sabit değer pinlenerek değil.
+
+        Eşik (_GATHER_PLAYER_CLEARANCE) ne olursa olsun: eşiğin hemen
+        dışındaki düşük güvenli filiz krom sayılmaz, eşiğin içindeki düşük
+        güvenli filiz krom sayılır, yüksek güvenli filiz ise içeride bile
+        korunur. Eşik değerinin kendisi ayrıca makul aralıkta olmalı.
+        """
+        clearance = _GATHER_PLAYER_CLEARANCE
+        self.assertGreater(clearance, 0.0, "Klerans eşiği pozitif olmalı")
+        self.assertLess(clearance, 0.15, "Klerans eşiği eski 0.23 kör noktasına dönmemeli")
+        player_cx, player_cy = MinimapScanner.PLAYER_CENTER_REL
+
+        # Eşiğin hemen dışı (1.2x) -> korunur
+        outer_ny = player_cy + clearance * 1.2
+        self.assertFalse(
+            minimap_norm_is_hud_chrome(player_cx, outer_ny, confidence=0.50),
+            "Eşik dışındaki filiz krom sayıldı!",
+        )
+        # Eşiğin içi (0.5x), düşük güven -> krom sayılır
+        inner_ny = player_cy + clearance * 0.5
+        self.assertTrue(
+            minimap_norm_is_hud_chrome(player_cx, inner_ny, confidence=0.50),
+            "Eşik içindeki düşük güvenli filiz krom sayılmadı!",
+        )
+        # Eşiğin içi ama yüksek güven (>= 0.72) -> korunur
+        self.assertFalse(
+            minimap_norm_is_hud_chrome(player_cx, inner_ny, confidence=0.75),
+            "Yüksek güvenli filiz eşik içinde elendi!",
         )
 
     def test_near_player_harvest_nodes_kept(self) -> None:
@@ -546,38 +618,151 @@ class TestMapCanvasInteraction(unittest.TestCase):
         self.assertIsNone(self.canvas._find_node_at_widget_pos(far_pt, hit_radius=10.0))
 
     def test_node_interaction_signal_emission(self) -> None:
-        """Düğüm taşıma, silme ve ekleme sinyalleri veri kaybı olmadan iletilmelidir."""
+        """Düğüm taşıma ve ekleme sinyalleri gerçek fare olaylarıyla, veri kaybı olmadan iletilmelidir."""
+        from PyQt6.QtGui import QMouseEvent
+
         moved_records: List[Tuple[int, float, float]] = []
         added_records: List[Tuple[int, float, float]] = []
 
         self.canvas.node_moved.connect(lambda nid, x, y: moved_records.append((nid, x, y)))
         self.canvas.on_canvas_add_node_signal.connect(lambda nid, x, y: added_records.append((nid, x, y)))
 
-        # Taşıma sinyalini test et
-        self.canvas.node_moved.emit(42, 650.0, 850.0)
-        self.assertEqual(len(moved_records), 1)
-        self.assertEqual(moved_records[0], (42, 650.0, 850.0))
+        # 1. Taşıma: düğüm 42'nin üzerine bas, sürükle, bırak -> node_moved ateşlenmeli.
+        node = {
+            "id": 42,
+            "map_x": 600.0,
+            "map_y": 800.0,
+            "norm_x": 600.0 / 2258.0,
+            "norm_y": 800.0 / 2400.0,
+        }
+        self.canvas.set_nodes_data([node], [42])
+        start_pt = self.canvas._map_to_widget(self.canvas._node_to_map_coords(
+            600.0, 800.0, norm_x=node["norm_x"], norm_y=node["norm_y"], node=node,
+        ))
+        self.assertEqual(self.canvas._find_node_at_widget_pos(start_pt, hit_radius=13.0), 42)
+        target_pt = self.canvas._map_to_widget(self.canvas._node_to_map_coords(650.0, 850.0))
 
-        # Ekleme sinyalini test et
-        self.canvas.on_canvas_add_node_signal.emit(43, 700.0, 900.0)
-        self.assertEqual(len(added_records), 1)
-        self.assertEqual(added_records[0], (43, 700.0, 900.0))
+        self.canvas.mousePressEvent(QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress, start_pt,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        ))
+        self.canvas.mouseMoveEvent(QMouseEvent(
+            QMouseEvent.Type.MouseMove, target_pt,
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        ))
+        self.canvas.mouseReleaseEvent(QMouseEvent(
+            QMouseEvent.Type.MouseButtonRelease, target_pt,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        ))
+
+        self.assertGreaterEqual(len(moved_records), 1, "Sürükleme node_moved sinyali üretmedi!")
+        self.assertEqual(moved_records[-1][0], 42)
+        # Beklenen koordinat: bırakılan widget noktasının tuvalin kendi
+        # dönüşümünden geçen değeri (sürükleme yolu bunu üretir).
+        exp_move_x, exp_move_y, _, _ = self.canvas._widget_to_node_coords(target_pt)
+        self.assertAlmostEqual(moved_records[-1][1], float(exp_move_x), delta=1.0)
+        self.assertAlmostEqual(moved_records[-1][2], float(exp_move_y), delta=1.0)
+        moved_node = next(n for n in self.canvas._nodes if n["id"] == 42)
+        self.assertEqual(moved_node["map_x"], exp_move_x)
+        self.assertEqual(moved_node["map_y"], exp_move_y)
+        self.assertNotEqual((moved_node["map_x"], moved_node["map_y"]), (600, 800))
+
+        # 2. Ekleme: boş alana gerçek tıklama -> on_canvas_add_node_signal ateşlenmeli.
+        w, h = float(self.canvas.width()), float(self.canvas.height())
+        click_pos = None
+        for candidate in (QPointF(0.12 * w, 0.85 * h), QPointF(0.85 * w, 0.15 * h)):
+            if self.canvas._find_node_at_widget_pos(candidate, hit_radius=13.0) is None:
+                click_pos = candidate
+                break
+        self.assertIsNotNone(click_pos, "Boş tıklama noktası bulunamadı")
+        exp_x, exp_y, _, _ = self.canvas._widget_to_node_coords(click_pos)
+        self.canvas.mousePressEvent(QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress, click_pos,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        ))
+        self.canvas.mouseReleaseEvent(QMouseEvent(
+            QMouseEvent.Type.MouseButtonRelease, click_pos,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        ))
+        self.assertEqual(len(added_records), 1, "Boş alana tıklama ekleme sinyali üretmedi!")
+        self.assertEqual(added_records[0][0], 43)
+        self.assertAlmostEqual(added_records[0][1], float(exp_x), delta=1.0)
+        self.assertAlmostEqual(added_records[0][2], float(exp_y), delta=1.0)
 
 
 class TestAppShellTabSwitchingAndSignalSync(unittest.TestCase):
     """
     Test 8: AppShell sekme geçişleri ve sinyal senkronizasyonu.
+
+    One shared GatherionShell for the whole class: constructing a shell
+    costs ~20-40 s (it mounts every page and loads the HD map), and each
+    test only switches tabs / reads synced state. setUp() returns the
+    shell to the home tab, so every test still starts from the exact
+    state a freshly constructed shell would have; no test mutates
+    shell-level state that another test depends on (the signal-sync test
+    dirties the map page region and restores it via _sync_map_from_settings
+    inside the test itself).
+
+    The shell's map/radar pages also reload the 2258x2400 HD map on every
+    tab switch (MapViewerWindow._load_region_map_pixmap and
+    CartographyRadarDialog._load_region_map_pixmap, ~1.3 s per load, 8
+    loads per tab-switching test). These tests assert page presence, tab
+    transitions and region/route string sync — never the background
+    pixmap — so both loaders are stubbed to a 64x64 stand-in honouring
+    each real return contract (2-tuple for the viewer, 3-tuple with the
+    map ref for the dialog). The full reload path still runs on every
+    switch, only with a smaller base pixmap.
     """
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._pixmap_patchers = [
+            patch.object(
+                MapViewerWindow,
+                "_load_region_map_pixmap",
+                lambda self, nodes: (QPixmap(64, 64), (0, 0)),
+            ),
+            patch.object(
+                CartographyRadarDialog,
+                "_load_region_map_pixmap",
+                lambda self, nodes: (QPixmap(64, 64), (0, 0), (64.0, 64.0)),
+            ),
+        ]
+        for patcher in cls._pixmap_patchers:
+            patcher.start()
+        cls.shell = GatherionShell()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.shell.close()
+        for patcher in cls._pixmap_patchers:
+            patcher.stop()
+        super().tearDownClass()
+
     def setUp(self) -> None:
-        self.shell = GatherionShell()
+        self.shell = type(self).shell
+        self.shell.open_tool("home")
 
     def test_app_shell_pages_and_initial_state(self) -> None:
-        """AppShell harita, radar ve ayarlar sekmelerini barındırmalı ve ana sayfada başlamalıdır."""
+        """AppShell ana sayfada başlamalı; harita/radar/ayarlar lazy sayfalar ilk açılışta oluşmalı (v14: startup lazy pages)."""
         self.assertIn("home", self.shell.pages)
-        self.assertIn("map", self.shell.pages)
-        self.assertIn("radar", self.shell.pages)
-        self.assertIn("settings", self.shell.pages)
+        self.assertEqual(self.shell.current_key(), "home")
+        # Lazy sayfalar açılışta placeholder'dır: pages'te yok, slotları ayrılmıştır.
+        for key in ("map", "radar", "settings"):
+            self.assertNotIn(key, self.shell.pages)
+            self.assertIn(key, self.shell._lazy_placeholders)
+        # İlk açılışta gerçek sayfa oluşur ve pages'e kaydolur.
+        for key in ("map", "radar", "settings"):
+            self.shell.open_tool(key)
+            self.assertIn(key, self.shell.pages)
+            self.assertEqual(self.shell.current_key(), key)
+        self.shell.open_tool("home")
         self.assertEqual(self.shell.current_key(), "home")
 
     def test_tab_switching_navigation(self) -> None:
@@ -607,6 +792,26 @@ class TestAppShellTabSwitchingAndSignalSync(unittest.TestCase):
         # Senkronizasyon metodlarının varlığını doğrula
         self.assertTrue(hasattr(self.shell, "_sync_map_from_settings"))
         self.assertTrue(hasattr(self.shell, "_after_page"))
+
+        # Davranış kanıtı: harita sayfasının bölge/rota durumu shell ayarlarından
+        # saparsa, _sync_map_from_settings() onu shell'in aktif değerlerine geri döndürmeli.
+        active_region = self.shell.get_active_region()
+        active_route = self.shell.get_active_route()
+        map_page._region_name = "Morheim"
+        map_page._route_name = "Stale Route"
+        if hasattr(map_page, "lbl_region_value"):
+            map_page.lbl_region_value.setText("Morheim")
+        if hasattr(map_page, "lbl_route_value"):
+            map_page.lbl_route_value.setText("Stale Route")
+
+        self.shell._sync_map_from_settings()
+
+        self.assertEqual(map_page._region_name, active_region)
+        self.assertEqual(map_page._route_name, active_route)
+        if hasattr(map_page, "lbl_region_value"):
+            self.assertEqual(map_page.lbl_region_value.text(), active_region)
+        if hasattr(map_page, "lbl_route_value"):
+            self.assertEqual(map_page.lbl_route_value.text(), active_route)
 
 
 def main() -> None:

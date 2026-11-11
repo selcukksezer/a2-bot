@@ -126,6 +126,19 @@ def test_w32_01_center_level_45_emblem_spatial_exclusion() -> None:
     assert classifier.is_center_level_emblem(0.439, 0.90) is False
     assert classifier.is_center_level_emblem(0.561, 0.90) is False
 
+    # Y boundaries of the emblem band (0.85..0.95, inclusive — D89 coverage):
+    # previously only in-band Y (0.86/0.90/0.94) was exercised, so an
+    # off-by-one on the Y edge would have passed silently.
+    assert classifier.is_center_level_emblem(0.50, 0.85) is True
+    assert classifier.is_center_level_emblem(0.50, 0.95) is True
+    assert classifier.is_center_level_emblem(0.50, 0.849) is False
+    assert classifier.is_center_level_emblem(0.50, 0.951) is False
+
+    # An emblem-looking crop just above the band is NOT the center emblem.
+    res_above = classifier.classify_slot(emblem_crop, norm_cx=0.50, norm_cy=0.849)
+    assert res_above.is_center_emblem is False
+    assert res_above.category != "center_emblem"
+
 
 def test_w32_02_empty_f8_slot_low_saturation_and_contrast_exclusion() -> None:
     """
@@ -253,7 +266,18 @@ def test_w32_05_yolo_auto_labeler_scan_hud_and_skills_excludes_emblem_and_empty_
             f"YOLOAutoLabeler must exclude empty F8 slot, got: {ann}"
         )
 
-    # Ensure valid HP potion (18) and combat skill slot (21) are present
-    emitted_ids = {int(ann["class_id"]) for ann in hud_anns}
-    assert 18 in emitted_ids, f"Expected class 18 (hp_potion) in {hud_anns}"
-    assert 21 in emitted_ids, f"Expected class 21 (skill_slot) in {hud_anns}"
+    # Ensure valid HP potion and combat skill slot are present. Assert by
+    # class NAME, not by hard-coded class id (D89/F-2065): the labeler emits
+    # the canonical ids 22 (hp_potion) / 20 (skill_slot_ready), which do NOT
+    # match the legacy HUD ids 18/21 (dataset_factory/class_taxonomy.py:
+    # 18 = target_hp_bar, 20 = skill_slot_ready, 21 = skill_slot_cooldown,
+    # 22 = hp_potion). Pinning 18/21 here would lock in the legacy scheme;
+    # the id alignment belongs to the labeler (D43).
+    # NOTE: the name check reads `material_name`, not `class_name` — the
+    # canonical taxonomy name for id 20 is "skill_slot_ready"
+    # (YOLO_CLASSES[20]), while the slot's material_name is "skill_slot".
+    # `class_name` would therefore never contain "skill_slot" even though
+    # the skill slot IS emitted (with canonical id 20).
+    emitted_names = {str(ann["material_name"]) for ann in hud_anns}
+    assert "hp_potion" in emitted_names, f"Expected hp_potion in {hud_anns}"
+    assert "skill_slot" in emitted_names, f"Expected skill_slot in {hud_anns}"

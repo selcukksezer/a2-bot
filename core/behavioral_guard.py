@@ -24,9 +24,10 @@ Bu modül oyun içi davranış doğallığını ve anti-ban güvenlik kuralları
      kaynağın gerçekten orada olup olmadığını kontrol eder; kaynak orada yoksa
      boşuna havaya uçup şüphe çekmemek için uçuşu iptal eder ve sıradaki kaynağa geçer.
 5. Doğal Savaş Rotasyonu (`NaturalCombatRotation`):
-   - Saldırıya uğradığında saniyede 10 kez sol tık spam'lemek yerine, `1`, `2`, `3`, `4`
-     tuşlarındaki yeteneklerin kendi dolum sürelerini (`cooldowns = {'1': 2.5, '2': 6.0, '3': 10.0, '4': 15.0}`)
-     takip ederek ve araya Ex-Gaussian gecikmeli normal saldırı katarak insani bir kombo uygular.
+   - Saldırıya uğradığında saniyede 10 kez sol tık spam'lemek yerine, `1`, `2`, `3`, `4`, `5`,
+     `Q`, `E` tuşlarındaki yeteneklerin kendi dolum sürelerini takip ederek ve araya
+     Ex-Gaussian gecikmeli normal saldırı (sol tık karşılığı **`R`** tuşu, Interception
+     üzerinden; fare tıklaması ASLA kullanılmaz) katarak insani bir kombo uygular.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from core.minimap_scanner import MinimapScanner
+from version import __version__
 
 logger = logging.getLogger("BehavioralGuard")
 if not logger.handlers:
@@ -77,12 +79,74 @@ def _extract_node_id(node: Any) -> Optional[int]:
         return None
 
 
+# B-01 (sweep-slice30): norm_x/norm_y HARİTA KANVASI (1280x720) uzayında
+# tanımlıdır (kanonik değer core/route_manager.py MAP_CANVAS_*).
+# Eski sessiz 1920x1080 varsayılanı kaldırıldı.
+MAP_CANVAS_WIDTH = 1280.0
+MAP_CANVAS_HEIGHT = 720.0
+_NORM_CANVAS_FALLBACK_WARNED = False
+
+
+def _warn_norm_canvas_fallback_once() -> None:
+    """Norm dalı boyutsuz çağrıldı: kanvas varsayıldı — süreçte bir kez uyar."""
+    global _NORM_CANVAS_FALLBACK_WARNED
+    if not _NORM_CANVAS_FALLBACK_WARNED:
+        _NORM_CANVAS_FALLBACK_WARNED = True
+        logger.warning(
+            "Norm-koordinat dönüşümünde boyut verilmedi; harita kanvası "
+            "1280x720 varsayıldı (eski sessiz 1920x1080 yanlış ölçekti). "
+            "Çağıran gerçek boyutu geçirmeli."
+        )
+
+
+def _norm_xy_to_px(
+    nx: Any,
+    ny: Any,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
+) -> Optional[Tuple[float, float]]:
+    """norm_x/norm_y -> piksel. Boyut yoksa kanvas varsayılır (bir kez uyarılır).
+
+    (0.5, 0.5) yer tutucu merkezdir, gerçek koordinat değil — reddedilir
+    (None döner). Ölçülemeyen norm da None döner.
+    """
+    if nx is None or ny is None:
+        return None
+    try:
+        fx = float(nx)
+        fy = float(ny)
+    except (TypeError, ValueError):
+        return None
+    if fx == 0.5 and fy == 0.5:
+        return None
+    if fallback_width is None or fallback_height is None:
+        _warn_norm_canvas_fallback_once()
+    width = MAP_CANVAS_WIDTH if fallback_width is None else float(fallback_width)
+    height = MAP_CANVAS_HEIGHT if fallback_height is None else float(fallback_height)
+    return fx * width, fy * height
+
+
 def _extract_node_xy(
     node: Any,
-    fallback_width: float = 1920.0,
-    fallback_height: float = 1080.0,
+    fallback_width: float = MAP_CANVAS_WIDTH,
+    fallback_height: float = MAP_CANVAS_HEIGHT,
+    frame_size: Optional[Tuple[float, float]] = None,
 ) -> Tuple[float, float]:
-    """Bir düğümden 2B harita koordinatını `(x, y)` piksel cinsinden güvenli biçimde çıkarır."""
+    """Bir düğümden 2B harita koordinatını `(x, y)` piksel cinsinden güvenli biçimde çıkarır.
+
+    `frame_size=(width, height)` verilirse norm-koordinat dönüşümü o boyuta göre
+    yapılır; verilmezse harita kanvası 1280x720 kullanılır (B-01: eski sessiz
+    1920x1080 varsayılanı kaldırıldı) ve norm dalına düşülürse bir kez uyarı
+    loglanır. (0.5, 0.5) norm yer tutucusu reddedilir.
+    """
+    if frame_size is not None:
+        width = float(frame_size[0])
+        height = float(frame_size[1])
+        explicit_size = True
+    else:
+        width = float(fallback_width)
+        height = float(fallback_height)
+        explicit_size = False
     try:
         if node is None:
             return 0.0, 0.0
@@ -92,19 +156,25 @@ def _extract_node_xy(
             mx = node.get("map_x", node.get("x", 0.0))
             my = node.get("map_y", node.get("y", 0.0))
             if (mx is None or float(mx) == 0.0) and (my is None or float(my) == 0.0):
-                nx = node.get("norm_x")
-                ny = node.get("norm_y")
-                if nx is not None and ny is not None:
-                    return float(nx) * fallback_width, float(ny) * fallback_height
+                px = _norm_xy_to_px(
+                    node.get("norm_x"), node.get("norm_y"),
+                    width if explicit_size else None,
+                    height if explicit_size else None,
+                )
+                if px is not None:
+                    return px
             return float(mx or 0.0), float(my or 0.0)
 
         mx = getattr(node, "map_x", getattr(node, "x", 0.0))
         my = getattr(node, "map_y", getattr(node, "y", 0.0))
         if (mx is None or float(mx) == 0.0) and (my is None or float(my) == 0.0):
-            nx = getattr(node, "norm_x", None)
-            ny = getattr(node, "norm_y", None)
-            if nx is not None and ny is not None:
-                return float(nx) * fallback_width, float(ny) * fallback_height
+            px = _norm_xy_to_px(
+                getattr(node, "norm_x", None), getattr(node, "norm_y", None),
+                width if explicit_size else None,
+                height if explicit_size else None,
+            )
+            if px is not None:
+                return px
         return float(mx or 0.0), float(my or 0.0)
     except Exception as exc:
         logger.debug("Düğüm koordinatı çıkarılamadı (%r): %s", node, exc)
@@ -184,11 +254,84 @@ class NodeQuarantineManager:
         self,
         default_max_failures: int = 2,
         default_quarantine_minutes: int = 30,
+        max_tracked_nodes: int = 1000,
     ) -> None:
         self._lock = threading.RLock()
         self.default_max_failures: int = max(1, int(default_max_failures))
         self.default_quarantine_minutes: int = max(1, int(default_quarantine_minutes))
+        # İzlenen düğüm kaydı üst sınırı: uzun süre çalışan botta `_entries`
+        # sonsuz büyümesin diye cap aşılınca bayat kayıtlar budanır.
+        self.max_tracked_nodes: int = max(1, int(max_tracked_nodes))
         self._entries: Dict[int, QuarantineEntry] = {}
+
+    @property
+    def tracked_node_count(self) -> int:
+        """Şu an izlenen (karantinada veya hata sayaçlı) düğüm sayısı."""
+        with self._lock:
+            return len(self._entries)
+
+    def get_quarantined_node_ids(self, now: Optional[float] = None) -> List[int]:
+        """Şu an aktif karantinada olan düğüm kimliklerini döndürür."""
+        current_time = time.monotonic() if now is None else float(now)
+        with self._lock:
+            return [
+                nid
+                for nid, entry in self._entries.items()
+                if entry.quarantine_until > current_time
+            ]
+
+    def prune_stale_entries(
+        self,
+        now: Optional[float] = None,
+        max_idle_sec: Optional[float] = None,
+    ) -> int:
+        """
+        Aktif karantinada olmayan ve son denemesi `max_idle_sec` (varsayılan:
+        `default_quarantine_minutes` kadar, örn. 30 dk) öncesinde kalmış
+        kayıtları siler; silinen kayıt sayısını döndürür.
+
+        Gerekçe: "ardışık hata" sayacı saatler önceki tek bir hatayı sonsuza
+        dek taşımamalı — 30 dk sessiz kalan düğümün eski hatası, yeni bir
+        başarısızlıkta karantina sayacına eklenmez. Aktif karantinalar asla
+        budanmaz.
+        """
+        current_time = time.monotonic() if now is None else float(now)
+        idle_limit = (
+            float(max_idle_sec)
+            if max_idle_sec is not None
+            else float(self.default_quarantine_minutes) * 60.0
+        )
+        with self._lock:
+            stale = [
+                nid
+                for nid, entry in self._entries.items()
+                if entry.quarantine_until <= current_time
+                and (current_time - entry.last_attempt_at) > idle_limit
+            ]
+            for nid in stale:
+                del self._entries[nid]
+            return len(stale)
+
+    def _enforce_tracked_cap(self, now: float) -> None:
+        """Kayıt sayısı cap'i aşarsa önce bayatları budar, yetmezse aktif
+        karantinada olmayan en eski kayıtları çıkarır. Aktif karantinalar
+        korunur (cap bu durumda yumuşak sınırdır)."""
+        if len(self._entries) <= self.max_tracked_nodes:
+            return
+        self.prune_stale_entries(now=now)
+        if len(self._entries) <= self.max_tracked_nodes:
+            return
+        idle = sorted(
+            (
+                (entry.last_attempt_at, nid)
+                for nid, entry in self._entries.items()
+                if entry.quarantine_until <= now
+            ),
+            key=lambda item: item[0],
+        )
+        overflow = len(self._entries) - self.max_tracked_nodes
+        for _, nid in idle[:overflow]:
+            del self._entries[nid]
 
     def record_node_attempt(
         self,
@@ -207,10 +350,12 @@ class NodeQuarantineManager:
           (örn. 2 veya 3) değerine ulaştığında düğümü `quarantine_minutes` dakika boyunca
           karantinaya alır, loga `"Node #X quarantined after N failures"` yazar ve
           `True` (karantinaya alındı) döndürür.
+        - Zaman damgaları monotonik saattendir (`now` verilmezse `time.monotonic()`):
+          duvar saati sıçramaları (NTP) karantina süresini kısaltıp uzatamaz.
         """
         try:
             nid = int(node_id)
-            current_time = time.time() if now is None else float(now)
+            current_time = time.monotonic() if now is None else float(now)
             threshold = max(1, int(max_failures)) if max_failures is not None else self.default_max_failures
             q_minutes = (
                 max(1, int(quarantine_minutes))
@@ -230,6 +375,7 @@ class NodeQuarantineManager:
                     entry.failure_count = 0
                     entry.quarantined_at = 0.0
                     entry.quarantine_until = 0.0
+                    self._enforce_tracked_cap(current_time)
                     return False
 
                 entry.failure_count += 1
@@ -243,6 +389,7 @@ class NodeQuarantineManager:
                         entry.failure_count,
                         q_minutes,
                     )
+                    self._enforce_tracked_cap(current_time)
                     return True
 
                 logger.info(
@@ -251,6 +398,7 @@ class NodeQuarantineManager:
                     entry.failure_count,
                     threshold,
                 )
+                self._enforce_tracked_cap(current_time)
                 return False
         except Exception as exc:
             logger.error("record_node_attempt hatası (node_id=%r): %s", node_id, exc)
@@ -266,7 +414,7 @@ class NodeQuarantineManager:
             if nid is None:
                 return False
 
-            current_time = time.time() if now is None else float(now)
+            current_time = time.monotonic() if now is None else float(now)
             with self._lock:
                 entry = self._entries.get(nid)
                 if entry is None or entry.quarantine_until <= 0.0:
@@ -305,7 +453,7 @@ class NodeQuarantineManager:
             nid = _extract_node_id(node_id)
             if nid is None:
                 return 0.0
-            current_time = time.time() if now is None else float(now)
+            current_time = time.monotonic() if now is None else float(now)
             with self._lock:
                 entry = self._entries.get(nid)
                 if entry is None or entry.quarantine_until <= current_time:
@@ -343,8 +491,10 @@ class NodeQuarantineManager:
                 return []
             return [n for n in nodes if not self.is_quarantined(n, now=now)]
         except Exception as exc:
+            # Fail-closed: hata dalında karantinadaki düğüm sızmasın diye
+            # hiçbir düğüm "kullanılabilir" sayılmaz.
             logger.error("filter_available_nodes hatası: %s", exc)
-            return list(nodes) if nodes else []
+            return []
 
 
 # ============================================================================
@@ -356,23 +506,40 @@ class NaturalCombatRotation:
     """
     Doğal Savaş Rotasyonu Yöneticisi.
 
-    Saldırıya uğradığında saniyede 10 kez sol tık spam'lemek yerine,
-    `1`, `2`, `3`, `4` tuşlarındaki yeteneklerin kendi dolum sürelerini
-    (`cooldowns = {'1': 2.5, '2': 6.0, '3': 10.0, '4': 15.0}`) takip ederek
-    ve araya Ex-Gaussian gecikmeli normal saldırı katarak insani bir kombo uygular.
+    Saldırıya uğradığında saniyede 10 kez sol tık spam'lemek yerine, rotasyon
+    alt kümesinin (`1`, `2`, `3`, `4`, `5`, `Q`, `E` — `SkillBarReader.SKILL_SLOTS`
+    artık 12'li: 1-8, Q, E, R, T; `R`/`T` hariç: `R` sol-tık karşılığı temel
+    saldırı, `T` sağ-tık karşılığıdır; 6/7/8 şu anda boş ve cooldown verisi yok)
+    yeteneklerinin kendi dolum sürelerini takip ederek ve araya Ex-Gaussian
+    gecikmeli normal saldırı katarak insani bir kombo uygular.
     """
 
+    # Rotasyon alt kumesi: 1-5 + Q + E (SKILL_SLOTS 12'li oldu, G2; bu liste
+    # bilincli olarak alt kume). R/T disarida: fare karsiligi temel saldiri
+    # tuslari (sol tik -> R, sag tik -> T). 6/7/8 rotasyona dahil degil
+    # (su anda bos + cooldown verisi yok — Selcuk karariyla eklenir).
     DEFAULT_COOLDOWNS: Dict[str, float] = {
         "1": 2.5,
         "2": 6.0,
         "3": 10.0,
         "4": 15.0,
+        "5": 20.0,
+        "Q": 8.0,
+        "E": 12.0,
     }
+
+    # Sol tık karşılığı temel saldırı tuşu (R/T kuralı: sol tık -> R).
+    BASIC_ATTACK_KEY: str = "R"
+
+    @staticmethod
+    def _normalize_skill_key(key: Any) -> str:
+        k = str(key)
+        return k.upper() if len(k) == 1 and k.isalpha() else k
 
     def __init__(
         self,
         cooldowns: Optional[Dict[str, float]] = None,
-        basic_attack_key: str = "left_click",
+        basic_attack_key: str = "R",
         ex_gauss_mu: float = 0.28,
         ex_gauss_sigma: float = 0.045,
         ex_gauss_tau: float = 0.095,
@@ -382,9 +549,13 @@ class NaturalCombatRotation:
         self.cooldowns: Dict[str, float] = dict(self.DEFAULT_COOLDOWNS)
         if cooldowns:
             for k, v in cooldowns.items():
-                self.cooldowns[str(k)] = max(0.1, float(v))
+                self.cooldowns[self._normalize_skill_key(k)] = max(0.1, float(v))
 
-        self.basic_attack_key: str = str(basic_attack_key or "left_click")
+        # Eski "left_click"/"right_click" değerleri R/T kuralına çevrilir.
+        _legacy_mouse_keys = {"left_click": "R", "left": "R", "right_click": "T", "right": "T"}
+        self.basic_attack_key: str = _legacy_mouse_keys.get(
+            str(basic_attack_key or "R").lower(), str(basic_attack_key or "R")
+        )
         self.ex_gauss_mu: float = float(ex_gauss_mu)
         self.ex_gauss_sigma: float = float(ex_gauss_sigma)
         self.ex_gauss_tau: float = float(ex_gauss_tau)
@@ -410,8 +581,8 @@ class NaturalCombatRotation:
     def is_skill_ready(self, key: str, now: Optional[float] = None) -> bool:
         """Belirtilen yetenek tuşunun (`'1'`, `'2'`, `'3'`, `'4'`) dolum süresinin bitip bitmediğini döndürür."""
         try:
-            k = str(key)
-            current_time = time.time() if now is None else float(now)
+            k = self._normalize_skill_key(key)
+            current_time = time.monotonic() if now is None else float(now)
             with self._lock:
                 cd = self.cooldowns.get(k)
                 if cd is None:
@@ -427,8 +598,8 @@ class NaturalCombatRotation:
     def get_remaining_cooldown(self, key: str, now: Optional[float] = None) -> float:
         """Yeteneğin tekrar hazır olmasına kalan saniyeyi döndürür (hazırsa 0.0)."""
         try:
-            k = str(key)
-            current_time = time.time() if now is None else float(now)
+            k = self._normalize_skill_key(key)
+            current_time = time.monotonic() if now is None else float(now)
             with self._lock:
                 cd = self.cooldowns.get(k, 0.0)
                 last_t = self._last_used_at.get(k, 0.0)
@@ -442,7 +613,7 @@ class NaturalCombatRotation:
 
     def get_ready_skills(self, now: Optional[float] = None) -> List[str]:
         """Şu an dolum süresi tamamlanmış tüm yetenek tuşlarının listesini döndürür."""
-        current_time = time.time() if now is None else float(now)
+        current_time = time.monotonic() if now is None else float(now)
         with self._lock:
             return [k for k in self.cooldowns if self.is_skill_ready(k, now=current_time)]
 
@@ -470,8 +641,8 @@ class NaturalCombatRotation:
         ```python
         {
             "action_type": "skill" | "basic_attack",
-            "key": "1" | "2" | "3" | "4" | "left_click",
-            "button": "left" | None,
+            "key": "1" | "2" | "3" | "4" | "5" | "Q" | "E" | "R",
+            "button": None,  # Tuşla gönderilir; fare düğmesi kullanılmaz.
             "delay_sec": float,          # Ex-Gaussian insani bekleme süresi
             "cooldown_sec": float,       # Seçilen yeteneğin toplam CD süresi (basic için 0.0)
             "combo_step": int,           # Kombo adım sayacı
@@ -481,8 +652,22 @@ class NaturalCombatRotation:
         ```
         """
         try:
-            current_time = time.time() if now is None else float(now)
+            current_time = time.monotonic() if now is None else float(now)
             with self._lock:
+                # Hız sınırı: bir önceki aksiyonun gecikmesi dolmadan yeni
+                # aksiyon üretilmez; çağıran beklemelidir.
+                if current_time < self._next_allowed_action_at:
+                    remaining = round(self._next_allowed_action_at - current_time, 3)
+                    return {
+                        "action_type": "wait",
+                        "key": None,
+                        "button": None,
+                        "delay_sec": remaining,
+                        "cooldown_sec": 0.0,
+                        "combo_step": self._combo_step,
+                        "ready_skills_before": self.get_ready_skills(now=current_time),
+                        "timestamp": current_time,
+                    }
                 ready_skills = self.get_ready_skills(now=current_time)
                 delay_sec = self.sample_reaction_delay()
 
@@ -535,7 +720,7 @@ class NaturalCombatRotation:
                 return {
                     "action_type": "basic_attack",
                     "key": self.basic_attack_key,
-                    "button": "left",
+                    "button": None,
                     "delay_sec": delay_sec,
                     "cooldown_sec": 0.0,
                     "combo_step": self._combo_step,
@@ -547,12 +732,12 @@ class NaturalCombatRotation:
             return {
                 "action_type": "basic_attack",
                 "key": self.basic_attack_key,
-                "button": "left",
+                "button": None,
                 "delay_sec": 0.30,
                 "cooldown_sec": 0.0,
                 "combo_step": 1,
                 "ready_skills_before": [],
-                "timestamp": time.time() if now is None else float(now),
+                "timestamp": time.monotonic() if now is None else float(now),
             }
 
 
@@ -570,6 +755,11 @@ class BehavioralStealthGuard:
     PROMPT_STUCK_PAUSE_MESSAGE: str = (
         "Paused: gather prompt stuck for 10s (Inventory full or level requirement not met)"
     )
+
+    # P2-10 (dilim-073 O-3c): minimap isabet kapısı — 260 px; eskiden
+    # yorum "~210px" derken kod 260 uyguluyordu, çelişki tek değere
+    # indirildi (uygulanan 260 px kapısı; yorum ona eşitlendi).
+    MAX_MINIMAP_HIT_DIST_PX: float = 260.0
 
     def __init__(
         self,
@@ -607,6 +797,7 @@ class BehavioralStealthGuard:
         ready_nodes: list,
         sequential_candidates: list,
         player_pos: Optional[Tuple[float, float]] = None,
+        frame_size: Optional[Tuple[float, float]] = None,
     ) -> Optional[object]:
         """
         Ağırlıklı İleri Koridor Seçimi (`select_natural_next_node`).
@@ -660,7 +851,7 @@ class BehavioralStealthGuard:
                 forward_window = corridor_pool[: min(5, len(corridor_pool))]
                 scored_window: List[Tuple[float, int, Any]] = []
                 for rank_idx, node in enumerate(forward_window):
-                    nx, ny = _extract_node_xy(node)
+                    nx, ny = _extract_node_xy(node, frame_size=frame_size)
                     dist = math.hypot(nx - px, ny - py)
                     # Sıra koruma faktörü: ileri koridorda çok uzaktaki düğümün önüne geçmesini önler
                     effective_dist = dist * (1.0 + 0.12 * float(rank_idx))
@@ -670,10 +861,10 @@ class BehavioralStealthGuard:
                 candidates_k = [item[:2] + (item[2],) for item in scored_window[:top_k]]
             else:
                 # Oyuncu pozisyonu verilmemişse ilk aday referans alınarak veya sıra indeksine göre mesafe hesaplanır
-                anchor_x, anchor_y = _extract_node_xy(corridor_pool[0])
+                anchor_x, anchor_y = _extract_node_xy(corridor_pool[0], frame_size=frame_size)
                 candidates_k = []
                 for rank_idx, node in enumerate(corridor_pool[:top_k]):
-                    nx, ny = _extract_node_xy(node)
+                    nx, ny = _extract_node_xy(node, frame_size=frame_size)
                     base_d = math.hypot(nx - anchor_x, ny - anchor_y) if rank_idx > 0 else 0.0
                     effective_dist = base_d + float(rank_idx + 1) * 25.0
                     candidates_k.append((effective_dist, rank_idx, node))
@@ -711,11 +902,9 @@ class BehavioralStealthGuard:
             return chosen_node
 
         except Exception as exc:
+            # Fail-closed: hata dalında karantina kontrolünden geçmemiş
+            # ilk adayı döndürmek karantinayı baypas eder; None dönülür.
             logger.error("select_natural_next_node hatası: %s", exc)
-            if sequential_candidates:
-                return sequential_candidates[0]
-            if ready_nodes:
-                return ready_nodes[0]
             return None
 
     # ------------------------------------------------------------------
@@ -761,9 +950,19 @@ class BehavioralStealthGuard:
         döndürerek botu güvenli şekilde durdurur!
         """
         try:
-            current_time = time.time() if now is None else float(now)
+            current_time = time.monotonic() if now is None else float(now)
             threshold_sec = max(0.5, float(max_stuck_sec))
             nid = _extract_node_id(current_node_id)
+
+            if nid is None:
+                # Düğüm kimliği yokken hangi düğümde takıldığı bilinemez;
+                # kimliksiz prompt bir önceki düğüme mal edilemez. Sayacı
+                # sıfırla ve takılma kararı verme.
+                with self._lock:
+                    self._prompt_visible_since = None
+                    self._prompt_stuck_node_id = None
+                    self._prompt_stuck_triggered = False
+                return False, ""
 
             with self._lock:
                 if not is_prompt_visible:
@@ -858,22 +1057,66 @@ class BehavioralStealthGuard:
                 if isinstance(raw_res, list):
                     detections = raw_res
 
-            # Minimap tespitleri içinde Odyle halkası/tüyü veya parlak kaynak ikonu var mı?
-            odyle_or_resource_hits = [
+            # Minimap tespitleri içinde GERÇEK Odyle kanıtı var mı?
+            # P2-10 (dilim-073 O-3a): uçuş izni yalnızca Odyle'a özgü
+            # kanıtla verilir — `is_odyle=True` veya `type`/`category`
+            # `"odyle_air"`. Jenerik `"resource"` / `"resource_icon"`
+            # isabeti (yer kaynağı filizi) artık Odyle kanıtı sayılmaz;
+            # minimapta Odyle yokken yer kaynağı isabeti uçuşu
+            # onaylamaz.
+            odyle_hits = [
                 d
                 for d in detections
                 if isinstance(d, dict)
                 and not bool(d.get("is_hostile", False))
                 and (
                     bool(d.get("is_odyle", False))
-                    or d.get("type") in ("odyle_air", "resource")
-                    or d.get("category") in ("odyle_air", "resource_icon")
+                    or d.get("type") == "odyle_air"
+                    or d.get("category") == "odyle_air"
                 )
             ]
 
-            if odyle_or_resource_hits:
-                best_hit = odyle_or_resource_hits[0]
-                dist_px = float(best_hit.get("dist_px", 0.0))
+            if odyle_hits:
+                # Liste sırasına güvenme: Odyle işaretli isabet önce, sonra
+                # oyuncuya en yakın isabet kazanır.
+                def _hit_rank(hit: Dict[str, Any]) -> Tuple[int, float]:
+                    try:
+                        dist_val = float(hit.get("dist_px", 9999.0))
+                    except (TypeError, ValueError):
+                        dist_val = 9999.0
+                    if not math.isfinite(dist_val):
+                        dist_val = 9999.0
+                    return (
+                        0 if bool(hit.get("is_odyle", False)) else 1,
+                        dist_val,
+                    )
+
+                best_hit = min(odyle_hits, key=_hit_rank)
+                # P2-10 (dilim-073 O-3b): mesafe bilgisi yoksa / sayı
+                # değilse isabet reddedilir — bilinmeyen mesafe eskiden
+                # 0.0 varsayılıp "oyuncunun dibinde" sayılıyor, 260 px
+                # kapısını baypas ediyordu.
+                try:
+                    dist_px = float(best_hit.get("dist_px"))
+                except (TypeError, ValueError):
+                    dist_px = float("nan")
+                if not math.isfinite(dist_px):
+                    no_dist_msg = (
+                        f"Cancelled flight to {node_label}: nearest Odyle hit "
+                        f"has no usable distance (dist_px missing/invalid)"
+                    )
+                    logger.info(no_dist_msg)
+                    return False, no_dist_msg
+                # Minimap yarıçapı (merkezden en fazla
+                # MAX_MINIMAP_HIT_DIST_PX) dışında bir isabet bu düğümün
+                # kanıtı sayılmaz.
+                if dist_px > self.MAX_MINIMAP_HIT_DIST_PX:
+                    far_msg = (
+                        f"Cancelled flight to {node_label}: nearest minimap hit "
+                        f"is {dist_px:.1f}px away (outside minimap range)"
+                    )
+                    logger.info(far_msg)
+                    return False, far_msg
                 hit_type = str(best_hit.get("type", "odyle_air"))
                 msg = (
                     f"Verified {node_label} on minimap ({hit_type} at {dist_px:.1f}px); "
@@ -904,9 +1147,13 @@ class BehavioralStealthGuard:
         """Davranışsal güvenlik durumu ve temel metrikleri döndürür."""
         try:
             with self._lock:
+                active_ids = self.quarantine_manager.get_quarantined_node_ids()
                 return {
                     "guard_active": True,
-                    "quarantined_nodes_count": len(getattr(self.quarantine_manager, "_entries", {})),
+                    # Yalnızca süresi dolmamış aktif karantinalar sayılır;
+                    # süresi dolmuş/serbest bırakılmış kayıtlar sayılmaz.
+                    "quarantined_nodes_count": len(active_ids),
+                    "quarantined_nodes_total_tracked": self.quarantine_manager.tracked_node_count,
                     "corridor_top_k": getattr(self, "corridor_top_k", 3),
                 }
         except Exception as exc:
@@ -914,14 +1161,32 @@ class BehavioralStealthGuard:
             return {"guard_active": True, "error": str(exc)}
 
     def get_behavioral_guard_health_summary(self) -> dict:
-        try: return {"behavioral_guard_ready": True}
-        except Exception: return {"behavioral_guard_ready": False}
+        try:
+            rotation_ok = bool(
+                self.combat_rotation is not None
+                and getattr(self.combat_rotation, "cooldowns", None)
+                and str(getattr(self.combat_rotation, "basic_attack_key", "")) not in ("left_click", "right_click", "")
+            )
+            ready = bool(
+                self.quarantine_manager is not None
+                and rotation_ok
+                and self.minimap_scanner is not None
+            )
+            return {
+                "behavioral_guard_ready": ready,
+                "basic_attack_key": getattr(self.combat_rotation, "basic_attack_key", None),
+                "skill_keys": sorted(getattr(self.combat_rotation, "cooldowns", {}).keys()),
+                "quarantine_manager_ready": self.quarantine_manager is not None,
+                "minimap_scanner_ready": self.minimap_scanner is not None,
+            }
+        except Exception as exc:
+            return {"behavioral_guard_ready": False, "error": str(exc)}
 
     def get_behavioral_guard_ready_flag(self) -> dict:
         return {"module": "behavioral_guard", "ready": True}
 
     def get_behavioral_guard_version_info(self) -> dict:
-        return {"module": "behavioral_guard", "version": "2.0.0", "ready": True}
+        return {"module": "behavioral_guard", "version": __version__, "ready": True}
 
     def get_behavioral_guard_diagnostic_snapshot(self) -> dict:
         return {"module": "behavioral_guard", "status": "ok", "ready": True}
@@ -931,19 +1196,46 @@ class BehavioralStealthGuard:
 # MODÜL SEVİYESİ KISA YOL FONKSİYONLARI (DOĞRUDAN İMPORT UYUMLULUĞU İÇİN)
 # ============================================================================
 
-_DEFAULT_GUARD = BehavioralStealthGuard()
+_DEFAULT_GUARD: Optional[BehavioralStealthGuard] = None
+_DEFAULT_GUARD_LOCK = threading.Lock()
+
+
+def _get_default_guard() -> BehavioralStealthGuard:
+    """Modül singleton'ını ilk kullanımda kurar (import anında kurulmaz)."""
+    global _DEFAULT_GUARD
+    if _DEFAULT_GUARD is None:
+        with _DEFAULT_GUARD_LOCK:
+            if _DEFAULT_GUARD is None:
+                _DEFAULT_GUARD = BehavioralStealthGuard()
+    return _DEFAULT_GUARD
+
+
+def __getattr__(name: str) -> Any:
+    # Geriye dönük uyumluluk: `from core.behavioral_guard import _DEFAULT_GUARD`
+    # hâlâ çalışır ama kurulum ilk erişimde olur.
+    if name == "_DEFAULT_GUARD":
+        return _get_default_guard()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def select_natural_next_node(
     ready_nodes: list,
     sequential_candidates: list,
     player_pos: Optional[Tuple[float, float]] = None,
+    frame_size: Optional[Tuple[float, float]] = None,
 ) -> Optional[object]:
-    """Modül seviyesi ağırlıklı ileri koridor düğüm seçici."""
-    return _DEFAULT_GUARD.select_natural_next_node(
+    """Modül seviyesi ağırlıklı ileri koridor düğüm seçici.
+
+    `frame_size=(width, height)` verilirse norm-koordinat dönüşümü o boyuta
+    göre yapılır (F-1807: önceden sarmalayıcı bu parametreyi hiç almıyor/
+    geçirmiyor, varsayılan çağrı yolu hep 1920x1080 kullanıyordu).
+    Verilmezse harita kanvası 1280x720 kullanılır (B-01).
+    """
+    return _get_default_guard().select_natural_next_node(
         ready_nodes=ready_nodes,
         sequential_candidates=sequential_candidates,
         player_pos=player_pos,
+        frame_size=frame_size,
     )
 
 
@@ -954,7 +1246,7 @@ def check_prompt_stuck(
     now: Optional[float] = None,
 ) -> Tuple[bool, str]:
     """Modül seviyesi 10s takılı prompt ("F Gather") kontrolcüsü."""
-    return _DEFAULT_GUARD.check_prompt_stuck(
+    return _get_default_guard().check_prompt_stuck(
         is_prompt_visible=is_prompt_visible,
         current_node_id=current_node_id,
         max_stuck_sec=max_stuck_sec,
@@ -968,7 +1260,7 @@ def should_fly_to_odyle_node(
     minimap_scanner: Optional[Any] = None,
 ) -> Tuple[bool, str]:
     """Modül seviyesi Odyle uçuş öncesi minimap doğrulayıcısı."""
-    return _DEFAULT_GUARD.should_fly_to_odyle_node(
+    return _get_default_guard().should_fly_to_odyle_node(
         node=node,
         frame_bgr=frame_bgr,
         minimap_scanner=minimap_scanner,
@@ -980,7 +1272,13 @@ def get_behavioral_guard_capabilities() -> list:
 
 
 def validate_behavioral_guard_contract() -> bool:
-    return bool(get_behavioral_guard_capabilities())
+    # Gerçek kontrol: varsayılan guard kurulabilmeli ve sağlık özeti
+    # "ready" demeli; yalnızca yetenek listesinin dolu olması yetmez.
+    try:
+        summary = _get_default_guard().get_behavioral_guard_health_summary()
+        return bool(summary.get("behavioral_guard_ready", False))
+    except Exception:
+        return False
 
 
 def get_behavioral_guard_baseline_metrics() -> dict:

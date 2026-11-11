@@ -47,6 +47,27 @@ def qapp():
     return app
 
 
+@pytest.fixture
+def tiny_map_pixmap(monkeypatch):
+    """Replace the 2258x2400 HD map load with a 64x64 stand-in.
+
+    MapViewerWindow.__init__ (via reload_map_and_nodes) loads the Altgard
+    HD map and grayscale-converts it twice (~2.6 s per window). These
+    interaction tests assert click/drag/delete mechanics and the signals
+    they emit — never the background pixmap — so they run through the
+    same reload path with a smaller base pixmap. Expected coordinates are
+    computed through the canvas's own transforms in each test, so they
+    stay self-consistent. HD-fit behaviour itself is covered separately
+    by TestHDTransformsAndEdgeSticking, which keeps real 2258x2400
+    pixmaps on the canvas.
+    """
+    monkeypatch.setattr(
+        MapViewerWindow,
+        "_load_region_map_pixmap",
+        lambda self, nodes: (QPixmap(64, 64), (0, 0)),
+    )
+
+
 class MockRouteManager:
     """Mock RouteManager supporting node queries, add_node, move_node, and delete_node."""
     def __init__(self, region: str = "Altgard"):
@@ -241,7 +262,7 @@ class TestHDTransformsAndEdgeSticking:
 class TestInteractiveRouteEditing:
     """Tests click-to-add, drag-to-move, and right-click delete on map canvas."""
 
-    def test_click_to_add_node(self, qapp):
+    def test_click_to_add_node(self, qapp, tiny_map_pixmap):
         """Clicking empty space on canvas creates a node and emits node_added."""
         mock_rm = MockRouteManager()
         win = MapViewerWindow(mock_rm, region="Altgard", route="All")
@@ -252,16 +273,43 @@ class TestInteractiveRouteEditing:
         added_nodes = []
         canvas.node_added.connect(lambda n: added_nodes.append(n))
 
-        # Create node at specific coordinates
-        new_id = canvas._create_node_at_coords(500.0, 350.0, 0.39, 0.48)
+        # Pick a widget point that is really empty (no node within hit radius).
+        w, h = float(canvas.width()), float(canvas.height())
+        click_pos = None
+        for candidate in (
+            QPointF(0.15 * w, 0.85 * h),
+            QPointF(0.85 * w, 0.85 * h),
+            QPointF(0.15 * w, 0.20 * h),
+        ):
+            if canvas._find_node_at_widget_pos(candidate, hit_radius=13.0) is None:
+                click_pos = candidate
+                break
+        assert click_pos is not None, "No empty canvas point found for the click"
+        exp_map_x, exp_map_y, _, _ = canvas._widget_to_node_coords(click_pos)
+
+        canvas.mousePressEvent(QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress, click_pos,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        ))
+        canvas.mouseReleaseEvent(QMouseEvent(
+            QMouseEvent.Type.MouseButtonRelease, click_pos,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        ))
+
+        assert len(canvas._nodes) == initial_count + 1
+        new_id = canvas._nodes[-1]["id"]
         assert new_id is not None
         assert len(added_nodes) == 1
         assert added_nodes[0]["id"] == new_id
         assert added_nodes[0]["seq_index"] == initial_count + 1
         assert "patches/node_" in added_nodes[0]["patch_path"]
+        assert abs(added_nodes[0]["map_x"] - exp_map_x) <= 1
+        assert abs(added_nodes[0]["map_y"] - exp_map_y) <= 1
         assert mock_rm.save_called
 
-    def test_drag_to_move_node(self, qapp):
+    def test_drag_to_move_node(self, qapp, tiny_map_pixmap):
         """Dragging an existing node updates its coordinates live and saves upon release."""
         mock_rm = MockRouteManager()
         win = MapViewerWindow(mock_rm, region="Altgard", route="All")
@@ -302,8 +350,8 @@ class TestInteractiveRouteEditing:
         assert canvas._dragging_node_id is None
         assert mock_rm.save_called
 
-    def test_right_click_delete_node(self, qapp):
-        """Right-clicking with Shift or calling delete_node removes node and re-sequences route."""
+    def test_right_click_delete_node(self, qapp, tiny_map_pixmap):
+        """Shift+Right-clicking a node removes it and re-sequences the route."""
         mock_rm = MockRouteManager()
         win = MapViewerWindow(mock_rm, region="Altgard", route="All")
         canvas = win._canvas
@@ -312,8 +360,20 @@ class TestInteractiveRouteEditing:
         canvas.node_deleted.connect(lambda nid: deleted_signals.append(nid))
 
         assert any(n.get("id") == 2 for n in canvas._nodes)
-        success = canvas.delete_node(2)
-        assert success is True
+        node2 = next(n for n in canvas._nodes if n.get("id") == 2)
+        node_pt = canvas._map_to_widget(canvas._node_to_map_coords(
+            node2["map_x"], node2["map_y"],
+            norm_x=node2.get("norm_x"), norm_y=node2.get("norm_y"), node=node2,
+        ))
+        assert canvas._find_node_at_widget_pos(node_pt, hit_radius=13.0) == 2
+
+        # A real Shift+Right-click press on node 2 (the canvas's delete path).
+        canvas.mousePressEvent(QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress, node_pt,
+            Qt.MouseButton.RightButton, Qt.MouseButton.RightButton,
+            Qt.KeyboardModifier.ShiftModifier,
+        ))
+
         assert 2 in deleted_signals
         assert 2 in mock_rm.deleted_ids
         assert not any(n.get("id") == 2 for n in canvas._nodes)
@@ -422,7 +482,25 @@ class TestDirectionalArrowsAndPreviewCard:
         canvas._draw_node_patch_preview_card(painter, node, QPointF(400.0, 300.0))
         painter.end()
 
-        # Verify pixels were rendered in the card area
-        pixel_sample = img.pixelColor(420, 250)
-        # Card background should be dark slate #0f172a with opacity
-        assert pixel_sample.alpha() > 0
+        # The card body is dark slate #0f172a (15, 23, 42) at alpha 240 over the
+        # black background -> rendered ~(14, 22, 40). A bare alpha check would
+        # pass on the untouched black fill too (alpha 255), so assert the
+        # actual card colour at several interior points instead.
+        # card_y = pin_y - card_h - 10 with card_h 92 (design D15 raised it
+        # from 86; the old 204.0 row now falls inside the 64px thumbnail,
+        # whose top edge is at card_y + 11 = 209). Sample row card_y + 6
+        # stays above both the thumbnail and the title text (baseline
+        # card_y + 18), so it reads pure card body.
+        card_x, card_y = 418.0, 198.0  # pin + 18px right, card_h 92 above pin
+        for sample in (
+            (card_x + 12.0, card_y + 6.0),
+            (card_x + 82.0, card_y + 6.0),
+            (card_x + 182.0, card_y + 6.0),
+        ):
+            pixel_sample = img.pixelColor(int(sample[0]), int(sample[1]))
+            assert abs(pixel_sample.red() - 15) <= 5, f"Card red off at {sample}: {pixel_sample.red()}"
+            assert abs(pixel_sample.green() - 23) <= 5, f"Card green off at {sample}: {pixel_sample.green()}"
+            assert abs(pixel_sample.blue() - 42) <= 5, f"Card blue off at {sample}: {pixel_sample.blue()}"
+        # Control: outside the card the image must still be untouched black.
+        outside = img.pixelColor(100, 100)
+        assert (outside.red(), outside.green(), outside.blue()) == (0, 0, 0)

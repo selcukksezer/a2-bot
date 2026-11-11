@@ -18,11 +18,13 @@ düğüm (node) kaydedilmesini engeller.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
 import os
 import shutil
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -95,15 +97,31 @@ class BlacklistEntry:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "BlacklistEntry":
+        # F-1932: a corrupt record (e.g. map_x="abc") must not raise — the
+        # field falls back to its default instead of killing the whole load.
         return cls(
             id=str(data.get("id", f"bl_{int(time.time()*1000)}")),
             region=str(data.get("region", "Altgard")),
-            map_x=int(data.get("map_x", 0)),
-            map_y=int(data.get("map_y", 0)),
-            norm_x=float(data.get("norm_x", 0.0)),
-            norm_y=float(data.get("norm_y", 0.0)),
+            map_x=cls._safe_int(data.get("map_x", 0), 0),
+            map_y=cls._safe_int(data.get("map_y", 0), 0),
+            norm_x=cls._safe_float(data.get("norm_x", 0.0), 0.0),
+            norm_y=cls._safe_float(data.get("norm_y", 0.0), 0.0),
             reason=str(data.get("reason", "")),
             ai_verdict=str(data.get("ai_verdict", "")),
             created_at=str(data.get("created_at", "")),
@@ -131,7 +149,25 @@ class BlacklistManager:
             else os.path.join(root, settings_file or DEFAULT_SETTINGS_FILE)
         )
         self._entries: List[BlacklistEntry] = []
+        # I1 (dev/D006): region-partitioned index over _entries. Lookups
+        # (is_blacklisted, called per candidate node) used to scan every
+        # entry; they now scan only the queried region's entries.
+        # _entries stays the source of truth; _by_region is rebuilt after
+        # every mutation that can change region membership.
+        self._by_region: Dict[str, List[BlacklistEntry]] = {}
+        # S272 (v19/P3-8): UI thread'i (settings_window) ile toplama
+        # thread'leri (route_manager, auto_cartographer) aynı anda
+        # erişiyordu; kilitsiz singleton + kilitsiz mutasyon vardı.
+        # RLock: iç içe çağrılar (add_entry -> is_blacklisted -> save)
+        # için yeniden girişli olmalı.
+        self._lock = threading.RLock()
         self.load()
+
+    def _rebuild_index(self) -> None:
+        index: Dict[str, List[BlacklistEntry]] = {}
+        for entry in self._entries:
+            index.setdefault(entry.region, []).append(entry)
+        self._by_region = index
 
     def load(self) -> List[BlacklistEntry]:
         """Kara liste kayıtlarını diskten yükler (`config/blacklist.json` veya `settings.json`)."""
@@ -146,14 +182,24 @@ class BlacklistManager:
                 if isinstance(data, list):
                     for item in data:
                         if isinstance(item, dict):
-                            entry = BlacklistEntry.from_dict(item)
+                            # F-1932: one corrupt record must not swallow
+                            # the rest of the file.
+                            try:
+                                entry = BlacklistEntry.from_dict(item)
+                            except Exception as exc:
+                                logger.warning("Bozuk kara liste kaydı atlandı: %s (%s)", item, exc)
+                                continue
                             if entry.id not in seen_ids:
                                 seen_ids.add(entry.id)
                                 loaded.append(entry)
                 elif isinstance(data, dict) and "blacklist" in data:
                     for item in data.get("blacklist", []):
                         if isinstance(item, dict):
-                            entry = BlacklistEntry.from_dict(item)
+                            try:
+                                entry = BlacklistEntry.from_dict(item)
+                            except Exception as exc:
+                                logger.warning("Bozuk kara liste kaydı atlandı: %s (%s)", item, exc)
+                                continue
                             if entry.id not in seen_ids:
                                 seen_ids.add(entry.id)
                                 loaded.append(entry)
@@ -168,20 +214,27 @@ class BlacklistManager:
                 if isinstance(sdata, dict) and "blacklist" in sdata:
                     for item in sdata.get("blacklist", []):
                         if isinstance(item, dict):
-                            entry = BlacklistEntry.from_dict(item)
+                            try:
+                                entry = BlacklistEntry.from_dict(item)
+                            except Exception as exc:
+                                logger.warning("Bozuk kara liste kaydı atlandı (settings): %s (%s)", item, exc)
+                                continue
                             if entry.id not in seen_ids:
                                 seen_ids.add(entry.id)
                                 loaded.append(entry)
             except Exception as exc:
                 logger.debug("settings.json kara liste okuma hatası: %s", exc)
 
-        self._entries = loaded
-        logger.info("Kara liste yüklendi: %d kayıt mevcut.", len(self._entries))
-        return self._entries
+        with self._lock:
+            self._entries = loaded
+            self._rebuild_index()
+            logger.info("Kara liste yüklendi: %d kayıt mevcut.", len(self._entries))
+            return [copy.copy(e) for e in self._entries]
 
     def save(self) -> bool:
         """Kara listeyi hem `config/blacklist.json` hem de `config/settings.json` dosyalarına güvenli yazar."""
-        raw_list = [e.to_dict() for e in self._entries]
+        with self._lock:
+            raw_list = [e.to_dict() for e in self._entries]
         success = True
 
         # 1. config/blacklist.json kaydı (Atomic save)
@@ -207,9 +260,41 @@ class BlacklistManager:
                         json.dump(settings_data, f, indent=4, ensure_ascii=False)
                     os.replace(tmp_sett, self.settings_file)
             except Exception as exc:
-                logger.debug("settings.json blacklist senkronizasyon hatası: %s", exc)
+                # F-1933: a failed settings sync must not still report True.
+                logger.error("settings.json blacklist senkronizasyon hatası: %s", exc)
+                success = False
 
         return success
+
+    def _matches(
+        self,
+        entry: BlacklistEntry,
+        canon_reg: str,
+        mx: float,
+        my: float,
+        norm_x: Optional[float] = None,
+        norm_y: Optional[float] = None,
+        threshold_px: float = DEFAULT_THRESHOLD_PX,
+        viewport_width: float = 1920.0,
+    ) -> bool:
+        """Shared proximity test for is_blacklisted / remove_by_coordinate."""
+        if entry.region != canon_reg:
+            return False
+        if math.hypot(mx - entry.map_x, my - entry.map_y) <= threshold_px:
+            return True
+        if (
+            norm_x is not None
+            and norm_y is not None
+            and entry.norm_x > 0.0
+            and entry.norm_y > 0.0
+        ):
+            norm_dist = math.hypot(float(norm_x) - entry.norm_x, float(norm_y) - entry.norm_y)
+            # F-1942: the old code hard-coded a 1920 px viewport. The
+            # caller can now pass the real viewport width.
+            width = float(viewport_width) if viewport_width else 1920.0
+            if norm_dist <= (threshold_px / width):
+                return True
+        return False
 
     def is_blacklisted(
         self,
@@ -219,43 +304,34 @@ class BlacklistManager:
         norm_x: Optional[float] = None,
         norm_y: Optional[float] = None,
         threshold_px: float = DEFAULT_THRESHOLD_PX,
+        viewport_width: float = 1920.0,
     ) -> Tuple[bool, Optional[BlacklistEntry]]:
         """
         Verilen koordinatların kara listede olup olmadığını kontrol eder.
-        
+
         Parametreler:
             region: Bölge adı (örn: "Altgard")
             map_x, map_y: Piksel koordinatları
             norm_x, norm_y: İsteğe bağlı normalize (0..1) koordinatlar
             threshold_px: Piksel cinsinden yakınlık toleransı (varsayılan 25px)
+            viewport_width: Normalize eşik için gerçek görünüm genişliği
+                (varsayılan 1920; F-1942 — eskiden sabit 1920 varsayılıyordu)
 
         Döner:
             (is_blacklisted: bool, matching_entry: Optional[BlacklistEntry])
         """
         canon_reg = _resolve_canonical_region(region)
-        mx = float(map_x)
-        my = float(map_y)
+        # P3-8 (S-274): sayı-dışı koordinat ValueError ile çağırana yayılırdı.
+        try:
+            mx = float(map_x)
+            my = float(map_y)
+        except (TypeError, ValueError):
+            return False, None
 
-        for entry in self._entries:
-            if entry.region != canon_reg:
-                continue
-
-            # Piksel koordinatı mesafesi kontrolü
-            dist_px = math.hypot(mx - entry.map_x, my - entry.map_y)
-            if dist_px <= threshold_px:
-                return True, entry
-
-            # Normalize koordinat mesafesi kontrolü (eğer verilmişse ve entry norm coords varsa)
-            if (
-                norm_x is not None
-                and norm_y is not None
-                and entry.norm_x > 0.0
-                and entry.norm_y > 0.0
-            ):
-                norm_dist = math.hypot(float(norm_x) - entry.norm_x, float(norm_y) - entry.norm_y)
-                # 25px yaklaşık 1920 viewport'ta ~0.013 normalize birimdir
-                if norm_dist <= (threshold_px / 1920.0):
-                    return True, entry
+        with self._lock:
+            for entry in self._by_region.get(canon_reg, ()):
+                if self._matches(entry, canon_reg, mx, my, norm_x, norm_y, threshold_px, viewport_width):
+                    return True, copy.copy(entry)
 
         return False, None
 
@@ -279,20 +355,34 @@ class BlacklistManager:
         mx = int(round(float(map_x)))
         my = int(round(float(map_y)))
 
+        with self._lock:
+            return self._add_entry_locked(
+                canon_reg, mx, my, norm_x, norm_y, reason, ai_verdict,
+                source_node_id, threshold_px,
+            )
+
+    def _add_entry_locked(
+        self, canon_reg, mx, my, norm_x, norm_y, reason, ai_verdict,
+        source_node_id, threshold_px,
+    ) -> BlacklistEntry:
+        # S272: is_blacklisted artık kopya döner — güncelleme dalı canlı
+        # kaydı id ile yeniden çözer, kopyayı değil.
         is_already, existing = self.is_blacklisted(
             canon_reg, mx, my, norm_x=norm_x, norm_y=norm_y, threshold_px=threshold_px
         )
         if is_already and existing is not None:
-            # Mevcut kaydı güncelle
+            live = next((e for e in self._entries if e.id == existing.id), None)
+            if live is None:
+                return existing
             if reason:
-                existing.reason = reason
+                live.reason = reason
             if ai_verdict:
-                existing.ai_verdict = ai_verdict
+                live.ai_verdict = ai_verdict
             if source_node_id is not None:
-                existing.source_node_id = source_node_id
+                live.source_node_id = source_node_id
             self.save()
-            logger.info("Kara liste kaydı güncellendi: #%s (%s: %d, %d)", existing.id, canon_reg, mx, my)
-            return existing
+            logger.info("Kara liste kaydı güncellendi: #%s (%s: %d, %d)", live.id, canon_reg, mx, my)
+            return copy.copy(live)
 
         entry_id = f"bl_{int(time.time()*1000)}_{len(self._entries)+1}"
         entry = BlacklistEntry(
@@ -308,6 +398,7 @@ class BlacklistManager:
             created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
         )
         self._entries.append(entry)
+        self._by_region.setdefault(entry.region, []).append(entry)
         self.save()
         logger.warning(
             "⛔ [KARA LİSTE] Yeni koordinat engellendi: %s (%d, %d) [Neden: %s | YZ Teşhis: %s]",
@@ -317,18 +408,20 @@ class BlacklistManager:
             entry.reason,
             entry.ai_verdict,
         )
-        return entry
+        return copy.copy(entry)
 
     def remove_entry(self, entry_id: str) -> bool:
         """Belirtilen ID'ye sahip kara liste kaydını kaldırır."""
-        target_id = str(entry_id).strip()
-        before_len = len(self._entries)
-        self._entries = [e for e in self._entries if e.id != target_id]
-        if len(self._entries) < before_len:
-            self.save()
-            logger.info("Kara listeden kayıt kaldırıldı: #%s", target_id)
-            return True
-        return False
+        with self._lock:
+            target_id = str(entry_id).strip()
+            before_len = len(self._entries)
+            self._entries = [e for e in self._entries if e.id != target_id]
+            if len(self._entries) < before_len:
+                self._rebuild_index()
+                self.save()
+                logger.info("Kara listeden kayıt kaldırıldı: #%s", target_id)
+                return True
+            return False
 
     def remove_by_coordinate(
         self,
@@ -336,57 +429,108 @@ class BlacklistManager:
         map_x: Union[int, float],
         map_y: Union[int, float],
         threshold_px: float = DEFAULT_THRESHOLD_PX,
+        viewport_width: float = 1920.0,
     ) -> int:
-        """Belirli koordinata yakın kara liste kayıtlarını siler."""
-        is_bl, entry = self.is_blacklisted(region, map_x, map_y, threshold_px=threshold_px)
-        if is_bl and entry is not None:
-            self.remove_entry(entry.id)
-            return 1
-        return 0
+        """Belirli koordinata yakın kara liste kayıtlarını siler.
+
+        F-1942: eskiden yalnızca ilk eşleşme silinirdi; artık eşleşen
+        TÜM kayıtlar silinir ve silinen sayısı döner.
+        """
+        canon_reg = _resolve_canonical_region(region)
+        # P3-8 (S-274 ailesi): sayı-dışı koordinat ValueError verirdi.
+        try:
+            mx = float(map_x)
+            my = float(map_y)
+        except (TypeError, ValueError):
+            return 0
+        with self._lock:
+            doomed = [
+                e.id
+                for e in self._by_region.get(canon_reg, ())
+                if self._matches(e, canon_reg, mx, my, None, None, threshold_px, viewport_width)
+            ]
+            if not doomed:
+                return 0
+            doomed_set = set(doomed)
+            self._entries = [e for e in self._entries if e.id not in doomed_set]
+            self._rebuild_index()
+            self.save()
+            logger.info("Kara listeden %d kayıt kaldırıldı (%s: %d, %d)", len(doomed), canon_reg, mx, my)
+            return len(doomed)
 
     def clear_all(self, region: Optional[str] = None) -> int:
-        """Tüm kara listeyi veya belirtilen bölgedeki tüm kayıtları temizler."""
+        """Tüm kara listeyi veya belirtilen bölgedeki tüm kayıtları temizler.
+
+        S022 (v19/P3-8): save() atomik (tmp+replace) ama yedeksizdi —
+        toplu silme geri alınamıyordu. Silmeden önce tek nesil `.bak`
+        yazılır (repo içi yerleşik desen: approved_pool P0-6).
+        """
+        # Yedek: mevcut dosya varsa .bak'a kopyala (best-effort).
+        try:
+            if os.path.isfile(self.blacklist_file):
+                shutil.copy2(self.blacklist_file, f"{self.blacklist_file}.bak")
+        except Exception as exc:
+            logger.error("Kara liste .bak yedeği yazılamadı (%s): %s", self.blacklist_file, exc)
+        with self._lock:
+            return self._clear_all_locked(region)
+
+    def _clear_all_locked(self, region: Optional[str] = None) -> int:
         if region:
             canon = _resolve_canonical_region(region)
             before = len(self._entries)
             self._entries = [e for e in self._entries if e.region != canon]
             removed = before - len(self._entries)
+            self._rebuild_index()
             self.save()
             logger.info("'%s' bölgesine ait %d kara liste kaydı temizlendi.", canon, removed)
             return removed
         else:
             count = len(self._entries)
             self._entries.clear()
+            self._by_region.clear()
             self.save()
             logger.info("Tüm kara liste temizlendi (%d kayıt).", count)
             return count
 
     def get_entries(self, region: Optional[str] = None) -> List[BlacklistEntry]:
-        """Kayıtların listesini döndürür (bölgeye göre filtrelenebilir)."""
-        if region:
-            canon = _resolve_canonical_region(region)
-            return [e for e in self._entries if e.region == canon]
-        return list(self._entries)
+        """Kayıtların listesini döndürür (bölgeye göre filtrelenebilir).
+
+        S273 (v19/P3-8): eskiden canlı nesneler dönüyordu — dışarıdan
+        `entry.region` değişimi `_by_region` indeksini bozuyordu.
+        Artık sığ kopyalar döner; tek okuyucu (settings_window) yalnızca
+        görüntüler, kopya davranışını değiştirmez.
+        """
+        with self._lock:
+            if region:
+                canon = _resolve_canonical_region(region)
+                return [copy.copy(e) for e in self._entries if e.region == canon]
+            return [copy.copy(e) for e in self._entries]
 
     def count(self, region: Optional[str] = None) -> int:
         return len(self.get_entries(region))
 
     def to_list(self) -> List[Dict[str, Any]]:
-        return [e.to_dict() for e in self._entries]
+        with self._lock:
+            return [e.to_dict() for e in self._entries]
 
     def from_list(self, items: Sequence[Dict[str, Any]]) -> None:
-        self._entries = [BlacklistEntry.from_dict(item) for item in items if isinstance(item, dict)]
-        self.save()
+        with self._lock:
+            self._entries = [BlacklistEntry.from_dict(item) for item in items if isinstance(item, dict)]
+            self._rebuild_index()
+            self.save()
 
 
 _GLOBAL_BLACKLIST_MANAGER: Optional[BlacklistManager] = None
+_GLOBAL_BLACKLIST_MANAGER_LOCK = threading.Lock()
 
 
 def get_blacklist_manager() -> BlacklistManager:
-    """Singleton BlacklistManager erişimi."""
+    """Singleton BlacklistManager erişimi (S272: çift-kontrollü kilit)."""
     global _GLOBAL_BLACKLIST_MANAGER
     if _GLOBAL_BLACKLIST_MANAGER is None:
-        _GLOBAL_BLACKLIST_MANAGER = BlacklistManager()
+        with _GLOBAL_BLACKLIST_MANAGER_LOCK:
+            if _GLOBAL_BLACKLIST_MANAGER is None:
+                _GLOBAL_BLACKLIST_MANAGER = BlacklistManager()
     return _GLOBAL_BLACKLIST_MANAGER
 
 

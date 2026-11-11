@@ -22,6 +22,28 @@ import numpy as np
 from core.skill_bar_reader import SkillBarReader, _SkillBarRoiDescriptor
 from dataset_factory.exemplar_memory import ExemplarMemory
 
+# Synthetic frames are half-resolution (540x960): inspect_skill_bar() and
+# slot_center_px() work on relative (fractional) ROIs, so the production
+# path and every assertion below are identical to full-HD input — only
+# the pixel count (and the per-call cv2 cost) drops.
+_FRAME_H = 540
+_FRAME_W = 960
+
+
+def _textured_patch(base_bgr, shape, seed=0, amp=12):
+    """Deterministic textured patch: base colour + seeded luminance noise.
+
+    K-3 (dataset_factory/exemplar_memory.py) rejects flat single-colour
+    crops as degenerate ("flat crop, no texture"), so exemplar fixtures
+    must carry real texture. The noise is luminance-only (the same offset
+    on all three channels), so hue is preserved and a grey patch stays
+    grey through any BGR->grey conversion on the way to the matcher.
+    """
+    rng = np.random.default_rng(seed)
+    base = np.full(shape, base_bgr, dtype=np.int16)
+    noise = rng.integers(-amp, amp + 1, size=(shape[0], shape[1], 1), dtype=np.int16)
+    return np.clip(base + noise, 0, 255).astype(np.uint8)
+
 
 class TestSkillBarCalibratedExemplar(unittest.TestCase):
     def setUp(self):
@@ -37,11 +59,16 @@ class TestSkillBarCalibratedExemplar(unittest.TestCase):
             pass
 
     def test_default_skill_bar_roi_when_file_missing(self):
-        """When calibrated_rois.json does not exist, defaults to (0.355, 0.905, 0.655, 0.955)."""
+        """When calibrated_rois.json does not exist, defaults to (0.345, 0.940, 0.645, 0.985).
+
+        D03 (726d2ee) moved the default down from (0.355, 0.905, 0.655, 0.955):
+        the old band overlapped the HP/MP bars (y 0.880..0.915) and the
+        consumable row (ends y=0.938); the bar now sits strictly below both.
+        """
         reader = SkillBarReader(calibrated_rois_path=self.calibrated_rois_path)
         self.assertEqual(reader.current_skill_bar_roi, reader.DEFAULT_SKILL_BAR_ROI)
         self.assertEqual(reader.SKILL_BAR_ROI, reader.DEFAULT_SKILL_BAR_ROI)
-        self.assertEqual(reader.SKILL_BAR_ROI[1], 0.905)
+        self.assertEqual(reader.SKILL_BAR_ROI[1], 0.940)
 
     def test_dynamic_reload_on_mtime_change(self):
         """When config/calibrated_rois.json is modified on disk, reader automatically updates ROI."""
@@ -125,7 +152,7 @@ class TestSkillBarCalibratedExemplar(unittest.TestCase):
             calibrated_rois_path=self.calibrated_rois_path,
             exemplar_memory=mem,
         )
-        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        frame = np.zeros((_FRAME_H, _FRAME_W, 3), dtype=np.uint8)
         roi = reader.current_skill_bar_roi
         fh, fw = frame.shape[:2]
         x1 = int(roi[0] * fw)
@@ -164,7 +191,7 @@ class TestSkillBarCalibratedExemplar(unittest.TestCase):
             exemplar_memory=mem,
             min_brightness_ready=30.0,  # Lower threshold so only exemplar suppresses it
         )
-        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        frame = np.zeros((_FRAME_H, _FRAME_W, 3), dtype=np.uint8)
         roi = reader.current_skill_bar_roi
         fh, fw = frame.shape[:2]
         x1 = int(roi[0] * fw)
@@ -191,15 +218,15 @@ class TestSkillBarCalibratedExemplar(unittest.TestCase):
         """When an empty/corrupted slot matches a negative exemplar, it is suppressed as not ready."""
         mem = ExemplarMemory(json_path=self.exemplar_json_path)
 
-        corrupt_crop = np.zeros((48, 48, 3), dtype=np.uint8)
-        corrupt_crop[:, :] = (128, 128, 128)  # Flat gray noise
+        # Textured gray (a flat patch is rejected by the K-3 degenerate gate)
+        corrupt_crop = _textured_patch((128, 128, 128), (48, 48, 3), seed=11)
         mem.add_negative_exemplar(corrupt_crop, class_id=20, class_name="false_slot_rejection")
 
         reader = SkillBarReader(
             calibrated_rois_path=self.calibrated_rois_path,
             exemplar_memory=mem,
         )
-        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        frame = np.zeros((_FRAME_H, _FRAME_W, 3), dtype=np.uint8)
         roi = reader.current_skill_bar_roi
         fh, fw = frame.shape[:2]
         x1 = int(roi[0] * fw)
@@ -224,7 +251,7 @@ class TestSkillBarCalibratedExemplar(unittest.TestCase):
         )
         # Create textured active frame (with brightness, saturation, and contrast)
         rng = np.random.RandomState(42)
-        frame = rng.randint(60, 220, (1080, 1920, 3), dtype=np.uint8)
+        frame = rng.randint(60, 220, (_FRAME_H, _FRAME_W, 3), dtype=np.uint8)
         res_before = reader.inspect_skill_bar(frame)
         self.assertTrue(res_before["1"]["ready"])
         self.assertEqual(res_before["1"]["lockout_remaining_sec"], 0.0)
@@ -236,9 +263,14 @@ class TestSkillBarCalibratedExemplar(unittest.TestCase):
         self.assertTrue(res_locked["1"]["recently_pressed"])
         self.assertGreater(res_locked["1"]["lockout_remaining_sec"], 0.0)
 
-        # Wait for lockout expiration
-        time.sleep(0.22)
+        # Wait for lockout expiration. Poll instead of a fixed sleep: the
+        # lockout is 0.20 s, so a fixed 0.22 s sleep left only 20 ms of
+        # margin and flaked under load. Poll until ready (max 2 s).
+        deadline = time.monotonic() + 2.0
         res_after = reader.inspect_skill_bar(frame)
+        while not res_after["1"]["ready"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+            res_after = reader.inspect_skill_bar(frame)
         self.assertTrue(res_after["1"]["ready"])
         self.assertFalse(res_after["1"]["recently_pressed"])
         self.assertEqual(res_after["1"]["lockout_remaining_sec"], 0.0)
@@ -246,7 +278,7 @@ class TestSkillBarCalibratedExemplar(unittest.TestCase):
     def test_backward_compatibility_descriptor_and_slot_center(self):
         """SKILL_BAR_ROI tuple indexing, slot_center_px, and diagnostics snapshot remain backward-compatible."""
         reader = SkillBarReader(calibrated_rois_path=self.calibrated_rois_path)
-        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        frame = np.zeros((_FRAME_H, _FRAME_W, 3), dtype=np.uint8)
 
         # 1. Tuple indexing on instance and class
         self.assertIsInstance(reader.SKILL_BAR_ROI, tuple)
@@ -259,8 +291,8 @@ class TestSkillBarCalibratedExemplar(unittest.TestCase):
         self.assertIsNotNone(p1)
         self.assertIsNotNone(pr)
         self.assertLess(p1[0], pr[0])
-        self.assertGreaterEqual(p1[1], int(1080 * reader.SKILL_BAR_ROI[1]))
-        self.assertLessEqual(p1[1], int(1080 * reader.SKILL_BAR_ROI[3]))
+        self.assertGreaterEqual(p1[1], int(_FRAME_H * reader.SKILL_BAR_ROI[1]))
+        self.assertLessEqual(p1[1], int(_FRAME_H * reader.SKILL_BAR_ROI[3]))
 
         # 3. Diagnostic snapshot
         snapshot = reader.get_skill_bar_reader_diagnostic_snapshot()

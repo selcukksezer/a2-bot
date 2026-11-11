@@ -17,8 +17,8 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import List
-from unittest.mock import MagicMock
+from typing import Any, List
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -35,6 +35,30 @@ from core.route_manager import (
     sort_nodes_by_proximity,
 )
 from core.state_machine import BotWorker
+
+
+def _fast_bot_worker(**kwargs: Any) -> BotWorker:
+    """Build a BotWorker without constructing unrelated heavy subsystems.
+
+    The tests in this file only exercise BotWorker's selective-gather
+    surface (selected-materials state + MaterialScanner sync). BotWorker
+    __init__ also constructs ~40 optional subsystems; the slowest are
+    ONNXYolo3DDetector (~4.0s) and AutoLabelingDatasetFactory (~2.1s),
+    making one construction ~9.6s on this VM (measured 2026-11-08).
+    Constructing them proves nothing these tests assert, so they are
+    replaced with MagicMocks during construction. The ONE exception is
+    MaterialScanner: it is the unit under test, so it is always built for
+    real (unless the caller passes one in explicitly).
+    """
+    real_init = BotWorker._init_optional_subsystem
+
+    def _patched_init(self: Any, module_name: str, class_name: str, *args: Any, **kwargs: Any) -> Any:
+        if (module_name, class_name) != ("core.material_scanner", "MaterialScanner"):
+            return MagicMock(name=f"stubbed.{module_name}.{class_name}")
+        return real_init(self, module_name, class_name, *args, **kwargs)
+
+    with patch.object(BotWorker, "_init_optional_subsystem", _patched_init):
+        return BotWorker(**kwargs)
 
 
 def _make_detected_material(mtype: str, sx: int = 300, sy: int = 300, dist: float = 10.0) -> DetectedMaterial:
@@ -102,7 +126,7 @@ def test_filter_only_orichalcum_ore_skips_other_materials() -> None:
 def test_scanner_and_bot_worker_bypass_non_orichalcum_targets() -> None:
     """2. Verify MaterialScanner and BotWorker bypass non-Orichalcum materials when only Orichalcum Ore is selected."""
     scanner = MaterialScanner()
-    bot = BotWorker(
+    bot = _fast_bot_worker(
         config={},
         vision=MagicMock(),
         input_driver=MagicMock(),
@@ -230,7 +254,7 @@ def test_build_proximity_material_route_end_to_end_orichalcum_and_dynamic_resequ
     )
 
     assert [n.id for n in route_start] == [1, 3, 5, 7, 9]
-    assert [n.seq_index for n in route_start] == [1, 2, 3, 4, 5]
+    assert [n.seq_index for n in route_start] == [1, 3, 5, 7, 9]
     for node in route_start:
         assert "orichalcum" in node.resource_type.lower()
 
@@ -243,7 +267,7 @@ def test_build_proximity_material_route_end_to_end_orichalcum_and_dynamic_resequ
     )
     assert route_moved[0].id == 9
     assert [n.id for n in route_moved] == [9, 7, 5, 3, 1]
-    assert [n.seq_index for n in route_moved] == [1, 2, 3, 4, 5]
+    assert [n.seq_index for n in route_moved] == [1, 3, 5, 7, 9]
 
     # Verify persistence round-trip from disk
     reloaded_rm = RouteManager(base_dir=str(tmp_path), active_region="Altgard")

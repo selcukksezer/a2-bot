@@ -5,7 +5,7 @@ Aion 2 Autonomous Dataset Factory - Dataset Curator, `data.yaml` Generator & Boo
 Manages the on-disk Ultralytics YOLOv8/v11 dataset directory (`dataset/`), generates
 `dataset/data.yaml`, persists Unicode-safe image + `.txt` label pairs and annotated
 bounding-box previews (`dataset/previews/`), maintains real-time `dataset/manifest_stats.json`
-telemetry toward the 5,000-image target goal, and bootstraps the initial training/validation
+telemetry toward the 100,000-image target goal, and bootstraps the initial training/validation
 dataset directly from `reference_screenshots/*.jpg` and `video_frames/*.jpg`.
 
 Exclusive Owner: Dataset Factory Sub-Agent 5 (`dataset_factory/dataset_curator.py`)
@@ -14,10 +14,12 @@ Exclusive Owner: Dataset Factory Sub-Agent 5 (`dataset_factory/dataset_curator.p
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import copy
 import errno
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -46,10 +48,20 @@ if not logger.handlers:
 
 
 # =============================================================================
-# Canonical 12-Class YOLO Taxonomy for Aion 2 Resource Nodes
+# Canonical 27-Class YOLO Taxonomy for Aion 2 Resource Nodes
 # =============================================================================
+# NOTE (D37/F-0793, F-0843): the historical name `YOLO_12_CLASS_NAMES` is kept
+# for backward compatibility, but it does NOT hold 12 classes. The canonical
+# taxonomy is 27 classes (0..26), identical to
+# `dataset_factory.class_taxonomy.CANONICAL_NAMES`. The literal below is the
+# full canonical table -- it is never mutated at import time, so labels stored
+# on disk keep their meaning across imports.
 
 TARGET_DATASET_GOAL: int = 100000
+
+# Image extensions counted by rebuild_manifest_stats() -- shared with the
+# incremental manifest fingerprint so both count exactly the same files.
+MANIFEST_IMAGE_EXTS: frozenset = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp"})
 
 YOLO_12_CLASS_NAMES: Dict[int, str] = {
     0: "herb_aria",
@@ -57,84 +69,92 @@ YOLO_12_CLASS_NAMES: Dict[int, str] = {
     2: "herb_targena",
     3: "ore_orichalcum",
     4: "gem_crystal",
-    5: "wood_tree",
-    6: "world_gather_crest",
-    7: "f_gather_prompt",
-    8: "combo_skill_prompt",
+    5: "tree_log",
+    6: "herb_edana",
+    7: "herb_lumina",
+    8: "ore_obsidian",
     9: "minimap_sprout",
     10: "monster_3d",
     11: "minimap_monster_dot",
-    12: "world_material",
+    12: "crystal_blood",
     13: "skill_ui_prompt",
     14: "obstacle",
     15: "path_ground",
+    16: "player_hp_bar",
+    17: "player_mp_bar",
+    18: "target_hp_bar",
+    19: "skill_bar",
+    20: "skill_slot_ready",
+    21: "skill_slot_cooldown",
+    22: "hp_potion",
+    23: "mp_potion",
+    24: "buff_scroll",
+    25: "kinah",
+    26: "player_character",
 }
 
-# Old curator aliases used a different 12-id layout. Translate those ids onto the
-# stable train ids. Integer ids already stored in txt files are not translated.
-_LEGACY_MATERIAL_ID_TO_STABLE: Dict[int, int] = {
-    0: 0,
-    1: 1,
-    2: 2,
-    3: 2,
-    4: 3,
-    5: 3,
-    6: 4,
-    7: 4,
-    8: 4,
-    9: 4,
-    10: 5,
-    11: 4,
-}
+# Canonical alias for the same 27-class table (the `YOLO_12_` name is legacy).
+YOLO_CLASS_NAMES: Dict[int, str] = YOLO_12_CLASS_NAMES
 
 CLASS_NAME_TO_ID: Dict[str, int] = {name: cid for cid, name in YOLO_12_CLASS_NAMES.items()}
 
-try:
-    from dataset_factory.class_taxonomy import dataset_class_names as _taxonomy_class_names
-
-    _expanded_names = _taxonomy_class_names()
-except Exception:
-    _expanded_names = {}
-if _expanded_names:
-    YOLO_12_CLASS_NAMES.clear()
-    YOLO_12_CLASS_NAMES.update(_expanded_names)
-    CLASS_NAME_TO_ID.clear()
-    CLASS_NAME_TO_ID.update({name: cid for cid, name in YOLO_12_CLASS_NAMES.items()})
-
-# High-contrast BGR colors for preview bounding boxes per class ID
+# High-contrast BGR colors for preview bounding boxes per class ID.
+# Covers all 27 canonical classes (D37/F-0923); ids 12-26 used to fall back
+# to a single default green.
 CLASS_PREVIEW_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
     0: (235, 110, 215),   # herb_aria: violet/purple crystal
     1: (65, 75, 245),     # herb_mela: crimson berry bush
     2: (40, 225, 245),    # herb_targena: golden-yellow herb
-    3: (30, 165, 255),    # herb_calendula: marigold orange
-    4: (60, 185, 230),    # ore_orichalcum: bronze/amber vein
-    5: (195, 195, 210),   # ore_iron_silver: metallic silver
-    6: (255, 175, 45),    # gem_sapphire: deep cyan-blue
-    7: (50, 40, 235),     # gem_ruby: glowing ruby red
-    8: (250, 245, 220),   # gem_diamond: ice diamond white
-    9: (220, 140, 250),   # gem_crystal: rose quartz / amethyst
-    10: (55, 145, 95),    # log_yggdrasil: forest timber green-brown
-    11: (245, 235, 90),   # aether_odyle: glowing cyan-aether
+    3: (30, 165, 255),    # ore_orichalcum: bronze/amber vein
+    4: (250, 245, 220),   # gem_crystal: ice diamond white
+    5: (55, 145, 95),     # tree_log: forest timber green-brown
+    6: (200, 90, 180),    # herb_edana: deep magenta herb
+    7: (120, 200, 255),   # herb_lumina: pale luminous gold
+    8: (60, 60, 70),      # ore_obsidian: near-black volcanic ore
+    9: (90, 230, 90),     # minimap_sprout: bright sprout green
+    10: (40, 40, 200),    # monster_3d: dark red monster
+    11: (30, 30, 160),    # minimap_monster_dot: deep red dot
+    12: (150, 40, 180),   # crystal_blood: blood-crystal purple-red
+    13: (255, 220, 0),    # skill_ui_prompt: bright cyan-blue
+    14: (140, 140, 140),  # obstacle: neutral grey
+    15: (180, 200, 120),  # path_ground: pale ground khaki
+    16: (0, 60, 220),     # player_hp_bar: red HP bar
+    17: (220, 120, 0),    # player_mp_bar: blue MP bar
+    18: (0, 90, 200),     # target_hp_bar: orange-red target HP
+    19: (255, 180, 60),   # skill_bar: light blue skill bar
+    20: (0, 200, 0),      # skill_slot_ready: green ready slot
+    21: (90, 90, 90),     # skill_slot_cooldown: dark grey cooldown
+    22: (60, 60, 230),    # hp_potion: red potion
+    23: (230, 120, 30),   # mp_potion: blue potion
+    24: (0, 200, 220),    # buff_scroll: yellow scroll
+    25: (0, 215, 255),    # kinah: gold currency
+    26: (240, 240, 240),  # player_character: near-white player
 }
 
+# NOTE (D37/F-0791): values are CANONICAL 27-class ids directly -- the old
+# table held ids from a retired 12-id layout and a legacy translation map
+# then remapped them, which systematically mislabelled materials
+# (e.g. "herb_calendula" -> targena, "aether_odyle" -> gem_crystal).
+# Values here match `dataset_factory.class_taxonomy.class_id_for_material_text`
+# wherever that function resolves the alias.
 MATERIAL_ALIAS_TO_CLASS_ID: Dict[str, int] = {
-    # Canonical 12 names
+    # Canonical names
     "herb_aria": 0,
     "herb_mela": 1,
     "fruit_mela": 1,
     "herb_targena": 2,
-    "herb_calendula": 3,
-    "herb_azpha": 3,
-    "ore_orichalcum": 4,
-    "ore_iron_silver": 5,
-    "ore_iron_copper": 5,
-    "gem_sapphire": 6,
-    "gem_ruby": 7,
-    "gem_diamond": 8,
-    "gem_crystal": 9,
-    "log_yggdrasil": 10,
-    "log_timber": 10,
-    "aether_odyle": 11,
+    "herb_calendula": 2,
+    "herb_azpha": 2,
+    "ore_orichalcum": 3,
+    "ore_iron_silver": 3,
+    "ore_iron_copper": 3,
+    "gem_sapphire": 4,
+    "gem_ruby": 4,
+    "gem_diamond": 4,
+    "gem_crystal": 4,
+    "log_yggdrasil": 5,
+    "log_timber": 5,
+    "aether_odyle": 4,
     # Direct material names from AION2_MATERIALS_CATALOG and MaterialScanner
     "aria": 0,
     "fresh aria": 0,
@@ -145,75 +165,82 @@ MATERIAL_ALIAS_TO_CLASS_ID: Dict[str, int] = {
     "targena": 2,
     "fresh targena": 2,
     "targena otu": 2,
-    "calendula": 3,
-    "fresh calendula": 3,
-    "azpha": 3,
-    "fresh azpha": 3,
+    "calendula": 2,
+    "fresh calendula": 2,
+    "azpha": 2,
+    "fresh azpha": 2,
     "lura": 2,
-    "orichalcum": 4,
-    "orichalcum ore": 4,
-    "fine orichalcum ore": 4,
-    "pure orichalcum ore": 4,
-    "radiant orichalcum ore": 4,
-    "pure_aether_ore": 4,
-    "iron ore": 5,
-    "copper ore": 5,
-    "silver ore": 5,
-    "gold ore": 5,
-    "titanium ore": 5,
-    "mithril ore": 5,
-    "adamantium": 5,
-    "sapphire": 6,
-    "sapphire gemstone": 6,
-    "fine sapphire gemstone": 6,
-    "pure sapphire gemstone": 6,
-    "radiant sapphire gemstone": 6,
-    "aquamarine": 6,
-    "ruby": 7,
-    "ruby gemstone": 7,
-    "fine ruby gemstone": 7,
-    "pure ruby gemstone": 7,
-    "radiant ruby gemstone": 7,
-    "garnet": 7,
-    "diamond": 8,
-    "diamond gemstone": 8,
-    "fine diamond gemstone": 8,
-    "pure diamond gemstone": 8,
-    "radiant diamond gemstone": 8,
-    "crystal": 9,
-    "rose quartz": 9,
-    "amethyst": 9,
-    "topaz": 9,
-    "emerald": 9,
-    "opal": 9,
-    "yggdrasil log": 10,
-    "fine yggdrasil log": 10,
-    "pure yggdrasil log": 10,
-    "radiant yggdrasil log": 10,
-    "asvata log": 10,
-    "pine log": 10,
-    "oak log": 10,
-    "maple log": 10,
-    "cedar log": 10,
-    "odyle": 11,
-    "aether": 11,
-    "gatherable material": 11,
-    "gatherable_node": 11,
-    "gather_prompt": 11,
-    "minimap_sprout": 11,
+    "orichalcum": 3,
+    "orichalcum ore": 3,
+    "fine orichalcum ore": 3,
+    "pure orichalcum ore": 3,
+    "radiant orichalcum ore": 3,
+    "pure_aether_ore": 3,
+    "iron ore": 3,
+    "copper ore": 3,
+    "silver ore": 3,
+    "gold ore": 3,
+    "titanium ore": 3,
+    "mithril ore": 3,
+    "adamantium": 3,
+    "sapphire": 4,
+    "sapphire gemstone": 4,
+    "fine sapphire gemstone": 4,
+    "pure sapphire gemstone": 4,
+    "radiant sapphire gemstone": 4,
+    "aquamarine": 4,
+    "ruby": 4,
+    "ruby gemstone": 4,
+    "fine ruby gemstone": 4,
+    "pure ruby gemstone": 4,
+    "radiant ruby gemstone": 4,
+    "garnet": 4,
+    "diamond": 4,
+    "diamond gemstone": 4,
+    "fine diamond gemstone": 4,
+    "pure diamond gemstone": 4,
+    "radiant diamond gemstone": 4,
+    "crystal": 4,
+    "rose quartz": 4,
+    "amethyst": 4,
+    "topaz": 4,
+    "emerald": 4,
+    "opal": 4,
+    "yggdrasil log": 5,
+    "fine yggdrasil log": 5,
+    "pure yggdrasil log": 5,
+    "radiant yggdrasil log": 5,
+    "asvata log": 5,
+    "pine log": 5,
+    "oak log": 5,
+    "maple log": 5,
+    "cedar log": 5,
+    "odyle": 4,
+    "aether": 4,
+    "gatherable material": 12,
+    "gatherable_node": 12,
+    "gather_prompt": 13,
+    "minimap_sprout": 9,
 }
 
 
 def resolve_yolo_class_id_and_name(raw_value: Union[int, str, None]) -> Tuple[int, str]:
     """
     Resolve an integer class ID, YOLO class key, or Aion 2 material name into
-    a canonical `(class_id, class_name)` pair. Ids 0..11 stay stable; 12..15 are appended.
+    a canonical `(class_id, class_name)` pair over the 27-class taxonomy (0..26).
+
+    Raises `ValueError` for an integer id outside 0..26 instead of silently
+    clipping it onto a different class (D37/F-0790). Unknown text falls back
+    to the generic `crystal_blood` (12) world-material class only after the
+    taxonomy lookup, the alias table, and the substring rules all miss.
     """
     if raw_value is None:
         return 0, YOLO_12_CLASS_NAMES[0]
 
     if isinstance(raw_value, (int, np.integer)):
-        cid = int(np.clip(int(raw_value), 0, len(YOLO_12_CLASS_NAMES) - 1))
+        cid = int(raw_value)
+        if cid not in YOLO_12_CLASS_NAMES:
+            raise ValueError(f"class id {cid} is outside the canonical 0..26 taxonomy")
         return cid, YOLO_12_CLASS_NAMES[cid]
 
     text = str(raw_value).strip()
@@ -221,7 +248,9 @@ def resolve_yolo_class_id_and_name(raw_value: Union[int, str, None]) -> Tuple[in
         return 0, YOLO_12_CLASS_NAMES[0]
 
     if text.isdigit():
-        cid = int(np.clip(int(text), 0, len(YOLO_12_CLASS_NAMES) - 1))
+        cid = int(text)
+        if cid not in YOLO_12_CLASS_NAMES:
+            raise ValueError(f"class id {cid} is outside the canonical 0..26 taxonomy")
         return cid, YOLO_12_CLASS_NAMES[cid]
 
     lowered = text.lower()
@@ -252,16 +281,21 @@ def resolve_yolo_class_id_and_name(raw_value: Union[int, str, None]) -> Tuple[in
         return 11, YOLO_12_CLASS_NAMES[11]
     if "monster" in lowered or "canavar" in lowered:
         return 10, YOLO_12_CLASS_NAMES[10]
+    # Gather crests / [F]/[E] prompts are UI prompts in the 27-class taxonomy
+    # (13); the old code returned 6/7/8, which are now herb_edana,
+    # herb_lumina and ore_obsidian (D37/F-0791).
     if "crest" in lowered or "amblem" in lowered:
-        return 6, YOLO_12_CLASS_NAMES[6]
+        return 13, YOLO_12_CLASS_NAMES[13]
     if "f_gather" in lowered or "f gather" in lowered:
-        return 7, YOLO_12_CLASS_NAMES[7]
+        return 13, YOLO_12_CLASS_NAMES[13]
     if "e_gather" in lowered or "e_floating" in lowered or "floating" in lowered:
-        return 8, YOLO_12_CLASS_NAMES[8]
+        return 13, YOLO_12_CLASS_NAMES[13]
 
+    # Alias table values are canonical ids already -- no legacy remapping
+    # (D37/F-0791: the retired `_LEGACY_MATERIAL_ID_TO_STABLE` translation
+    # systematically mislabelled materials, so it was deleted).
     if lowered in MATERIAL_ALIAS_TO_CLASS_ID:
-        legacy = int(MATERIAL_ALIAS_TO_CLASS_ID[lowered])
-        cid = _LEGACY_MATERIAL_ID_TO_STABLE.get(legacy, 12)
+        cid = int(MATERIAL_ALIAS_TO_CLASS_ID[lowered])
         return cid, YOLO_12_CLASS_NAMES[cid]
 
     if "aria" in lowered:
@@ -349,8 +383,10 @@ def calibrate_box_trust(
         or b.get("confirmed") is True
         or any(tok in source for tok in ("hand", "manual", "human"))
         or source.startswith("gather_crest")
-        or (cid == 7 and any(tok in source for tok in ("f_gather", "gather_prompt", "f_template")))
-        or (cid == 8 and any(tok in source for tok in ("e_gather", "floating", "e_template")))
+        # F/E gather prompts are class 13 (skill_ui_prompt) in the 27-class
+        # taxonomy; the old code used 7/8, now herb_lumina / ore_obsidian.
+        or (cid == 13 and any(tok in source for tok in ("f_gather", "gather_prompt", "f_template")))
+        or (cid == 13 and any(tok in source for tok in ("e_gather", "floating", "e_template")))
     )
 
     if is_immune:
@@ -388,23 +424,27 @@ def calibrate_box_trust(
         b["weak"] = True
         return b
 
-    # 4. Stem-based material mismatch penalty
+    # 4. Stem-based material mismatch penalty. Material names map to the
+    # canonical 27-class ids (D37/F-0842); the old table used the retired
+    # 12-id layout (e.g. orichalcum=4, sapphire=6), which no longer matches
+    # the taxonomy and mis-penalised correct boxes.
     stem_lower = str(stem or "").lower()
     canonical_materials = {
-        0: "aria",
-        1: "mela",
-        2: "targena",
-        3: "calendula",
-        4: "orichalcum",
-        5: "iron",
-        6: "sapphire",
-        7: "ruby",
-        8: "diamond",
-        9: "crystal",
+        0: ("aria",),
+        1: ("mela",),
+        2: ("targena", "calendula", "azpha", "lura"),
+        3: ("orichalcum", "iron", "copper", "silver", "gold"),
+        4: ("sapphire", "ruby", "diamond", "crystal", "gem"),
+        5: ("tree", "log", "wood", "yggdrasil"),
+        6: ("edana",),
+        7: ("lumina",),
+        8: ("obsidian",),
+        9: ("sprout",),
+        12: ("crystal_blood", "blood_crystal"),
     }
     stem_mat_cid = None
-    for mcid, mname in canonical_materials.items():
-        if mname in stem_lower:
+    for mcid, mnames in canonical_materials.items():
+        if any(mname in stem_lower for mname in mnames):
             stem_mat_cid = mcid
             break
 
@@ -421,6 +461,45 @@ def calibrate_box_trust(
     b["trusted"] = bool(is_emin)
     b["weak"] = not bool(is_emin)
     return b
+
+
+def _classify_material_patch(
+    patch: Any, min_confidence: float = 0.15
+) -> Optional[Tuple[int, str, float]]:
+    """
+    Call `config.materials_db.classify_3d_material_patch` with its real
+    signature (D37/F-0788). It takes `mesh_bgr` (not `bgr_patch`) and
+    returns a single dict with `name` / `confidence` (not a list of
+    matches with `score` / `top_k` / `min_score`). The old call passed the
+    wrong keywords and indexed the returned dict like a list, so every
+    call raised and was swallowed -- the classifier never ran.
+
+    Returns `(class_id, class_name, confidence)` or `None` when the patch
+    is empty, the call fails, or confidence is below `min_confidence`.
+    """
+    if patch is None or not isinstance(patch, np.ndarray) or patch.size == 0:
+        return None
+    try:
+        result = classify_3d_material_patch(
+            mesh_bgr=patch,
+            region_name="Pilgrim's Ridge",
+        )
+    except Exception as exc:
+        logger.debug("classify_3d_material_patch failed: %s", exc)
+        return None
+    if not isinstance(result, dict):
+        return None
+    try:
+        conf = float(result.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if conf < float(min_confidence):
+        return None
+    name = result.get("name") or result.get("base_material")
+    if not name:
+        return None
+    cid, cname = resolve_yolo_class_id_and_name(str(name))
+    return cid, cname, float(np.clip(conf, 0.05, 0.99))
 
 
 # =============================================================================
@@ -613,6 +692,90 @@ def imwrite_unicode(
 # DatasetCurator Implementation
 # =============================================================================
 
+def _count_files_with_exts(directory: Path, exts: frozenset) -> Optional[int]:
+    """Count regular files in `directory` whose suffix is in `exts` (case-insensitive).
+
+    Missing directory counts as 0 (mirrors rebuild_manifest_stats); any
+    other scan error returns None so the caller falls back to a full rebuild.
+    """
+    try:
+        with os.scandir(directory) as it:
+            return sum(
+                1
+                for entry in it
+                if entry.is_file()
+                and os.path.splitext(entry.name)[1].lower() in exts
+            )
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+
+
+def _labels_dir_fingerprint(directory: Path) -> Optional[Tuple[int, int, int]]:
+    """`(count, total_size, max_mtime_ns)` of `*.txt` files in `directory`."""
+    count = 0
+    total_size = 0
+    max_mtime_ns = 0
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith(".txt"):
+                    st = entry.stat()
+                    count += 1
+                    total_size += st.st_size
+                    if st.st_mtime_ns > max_mtime_ns:
+                        max_mtime_ns = st.st_mtime_ns
+    except FileNotFoundError:
+        return (0, 0, 0)
+    except OSError:
+        return None
+    return (count, total_size, max_mtime_ns)
+
+
+def _is_hand_box(b: Dict[str, Any]) -> bool:
+    """El etiketi kutusu mu? (P1-17 / K-06: canlı yol deseni.)
+
+    ``ui/yolo_factory_dialog.py::_relabel_single_item`` ile aynı predikat:
+    ``hand_label is True`` veya ``source == "manual_draw"``. TXT
+    uzlaştırması (`label_trust._load_state`) 5 alanlı TXT satırlarını
+    ``hand_label=True`` + ``source="hand_label_txt"`` ile trusted'a taşıdığı
+    için TXT-only el etiketleri de bu predikatla yakalanır.
+    """
+    return (
+        isinstance(b, dict)
+        and (b.get("hand_label") is True or b.get("source") == "manual_draw")
+    )
+
+
+def _turbo_box_identity_match(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Aynı kutu mu? (P1-17 / K-06: canlı yol deseni.)
+
+    ``ui/yolo_factory_dialog.py::_box_identity_match`` ile birebir aynı
+    kural: aynı ``class_id`` + ``cx/cy/w/h`` 0.02 tolerans içinde. P1-13
+    (K-33) bunu tek ``same_box()`` tanımında birleştirecek; o güne kadar
+    iki kopya bilerek aynı tutulur.
+    """
+    if a is b:
+        return True
+    try:
+        cid_a = int(a.get("class_id", -2))
+        cid_b = int(b.get("class_id", -3))
+        if cid_a != cid_b:
+            return False
+    except (TypeError, ValueError):
+        pass
+    for key in ("cx", "cy", "w", "h"):
+        if key not in a or key not in b:
+            continue
+        try:
+            if abs(float(a[key]) - float(b[key])) > 0.02:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 class DatasetCurator:
     """
     Manages the `dataset/` directory hierarchy, writes Ultralytics `dataset/data.yaml`,
@@ -664,6 +827,12 @@ class DatasetCurator:
         self._augmentor = augmentor
         self._quality_gate = quality_gate
         self._scanner: Optional[MaterialScanner] = None
+        # Incremental manifest state (D47): last exact manifest written by
+        # rebuild_manifest_stats() plus the on-disk fingerprint it matches.
+        # None until the first full rebuild -- the first save then rebuilds
+        # once and every later save applies the O(1) delta instead.
+        self._manifest_cache: Optional[Dict[str, Any]] = None
+        self._manifest_fingerprint: Optional[Tuple[Any, ...]] = None
 
         self.ensure_dataset_structure()
 
@@ -689,7 +858,29 @@ class DatasetCurator:
             self.previews_dir.mkdir(parents=True, exist_ok=True)
 
             yaml_content = self._build_data_yaml_text()
-            self.data_yaml_path.write_text(yaml_content, encoding="utf-8")
+            # P0-5 (K-29) — TEK YAZICI KURALI: curator artık `data.yaml`'ı
+            # "içerik farklıysa yaz" (eski D2 kuralı) ile EZMEZ. Dialog
+            # `_ensure_data_yaml` mutlak yollu yaml'ı zaten yazar; curator
+            # her örneklenmede / her `prepare_one_click_dataset` çağrısında
+            # aynı dosyayı yeniden yazarsa dialog'un doğrusu ile curator'un
+            # kopyası çekişir ve son yazan kazanır — 21:27 hatasının
+            # kökeni buydu. Yeni kural: yaml YOKSA oluştur, mevcut
+            # yaml'ın `path:`'i göreli / eksik / başka dizinse MUTLAK
+            # yola çevirerek onar; `path:` bu dataset'in MUTLAK yoluysa
+            # dosyaya DOKUNMA (başlık/nc/names farkı bile ezme sebebi
+            # değildir — içerik dialog'un sorumluluğundadır).
+            # Gerekçe (seçim): "curator hiç yaml yazmasın" seçilmedi —
+            # curator dialogsuz da kullanılır (factory_controller
+            # bootstrap, __init__), taze datasette yaml'ı birinin
+            # oluşturması gerekir. "Mutlak yola çevir" tek başına da
+            # yetmezdi — 0d727f6 zaten mutlak yazıyor, sorun EZME'ydi.
+            # Bu kural ikisini birleştirir: oluştur + onar, asla ezme.
+            try:
+                existing = self.data_yaml_path.read_text(encoding="utf-8")
+            except OSError:
+                existing = None
+            if existing is None or not self._existing_yaml_path_is_current_dataset(existing):
+                self.data_yaml_path.write_text(yaml_content, encoding="utf-8")
 
             if not self.manifest_stats_path.exists():
                 self.rebuild_manifest_stats()
@@ -707,15 +898,50 @@ class DatasetCurator:
                 "names": dict(self.class_names),
             }
 
+    @staticmethod
+    def _yaml_path_value(yaml_text: str) -> Optional[str]:
+        """Return the raw value of the top-level `path:` line, if any."""
+        match = re.search(r"(?m)^path:\s*(.+?)\s*$", yaml_text or "")
+        return match.group(1).strip().strip("'\"") if match else None
+
+    def _existing_yaml_path_is_current_dataset(self, yaml_text: str) -> bool:
+        """True iff the existing yaml's `path:` is THIS dataset's ABSOLUTE dir.
+
+        P0-5 (K-29): only then does `ensure_dataset_structure` leave the
+        file untouched. A relative `path:` (the old `path: .` yaml), a
+        missing `path:` line, or an absolute path pointing elsewhere all
+        return False, so the caller repairs the file with an absolute path.
+        """
+        raw = self._yaml_path_value(yaml_text)
+        if raw is None or raw == "":
+            return False
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            return False
+        try:
+            return candidate.resolve() == self.dataset_dir.resolve()
+        except OSError:
+            return False
+
     def _build_data_yaml_text(self) -> str:
         """
         Build standard Ultralytics YOLOv8/v11 `data.yaml` content with forward-slash
-        paths, `train: images/train`, `val: images/val`, `nc: 12`, and `names: {0: herb_aria, 1: herb_mela, ...}`.
+        paths, `train: images/train`, `val: images/val`, a dynamic `nc:` equal to
+        the number of canonical classes (27), and `names:` from `self.class_names`.
         """
-        dataset_posix = self.dataset_dir.as_posix()
         lines: List[str] = [
             "# Ultralytics YOLOv8 / YOLOv11 Dataset Configuration - Aion 2 Autonomous Dataset Factory",
-            f"path: {dataset_posix}",
+            # B-09 DÜZELTME (2026-11-10, canlı kanıt): `path:` MUTLAK
+            # yol yazar — eski göreli `.` YANLIŞTI. Ultralytics göreli
+            # path'i yaml'ın dizinine göre DEĞİL, eğitim sürecinin
+            # çalışma klasörüne (CWD, PC'de proje kökü) göre çözer;
+            # `.` yazılınca eğitim proje kökü/images/val'i arar ve
+            # düşer. Bu yaml da model.train(data=...) ile aynı
+            # süreçte, proje kökünden tüketildiği için aynı hataya
+            # düşerdi. Taşınabilirlik doğruluk karşısında ikincildir;
+            # yaml her kurulumda yeniden üretilir. as_posix ile
+            # Windows uyumlu forward-slash yazılır.
+            f"path: {self.dataset_dir.as_posix()}",
             "train: images/train",
             "val: images/val",
             f"nc: {len(self.class_names)}",
@@ -748,65 +974,91 @@ class DatasetCurator:
         normalized_list: List[Dict[str, Any]] = []
 
         for item in annotations:
-            if isinstance(item, DetectedMaterial):
-                bx, by, bw_px, bh_px = item.bbox
-                # Expand tight nameplate/crest box downward slightly to cover the 3D resource mesh
-                if item.source == "3d_world":
-                    mesh_extra_h = int(round(bh_px * 0.85))
-                    pad_x = int(round(bw_px * 0.12))
-                    x1_px = max(0, bx - pad_x)
-                    y1_px = max(0, by)
-                    x2_px = min(img_w, bx + bw_px + pad_x)
-                    y2_px = min(img_h, by + bh_px + mesh_extra_h)
+            try:
+                if isinstance(item, DetectedMaterial):
+                    # O10: reddedilen-materyal filtresi eskiden yalnızca dict
+                    # dalında vardı; tuple/DetectedMaterial yoluyla gelen
+                    # aynı kirli girdi engellenmeden etiketleniyordu.
+                    if item.material_type and is_rejected_non_material(
+                        str(item.material_type)
+                    ):
+                        continue
+                    bx, by, bw_px, bh_px = item.bbox
+                    # Expand tight nameplate/crest box downward slightly to cover the 3D resource mesh
+                    if item.source == "3d_world":
+                        mesh_extra_h = int(round(bh_px * 0.85))
+                        pad_x = int(round(bw_px * 0.12))
+                        x1_px = max(0, bx - pad_x)
+                        y1_px = max(0, by)
+                        x2_px = min(img_w, bx + bw_px + pad_x)
+                        y2_px = min(img_h, by + bh_px + mesh_extra_h)
+                    else:
+                        x1_px = max(0, bx)
+                        y1_px = max(0, by)
+                        x2_px = min(img_w, bx + max(4, bw_px))
+                        y2_px = min(img_h, by + max(4, bh_px))
+
+                    cx = ((x1_px + x2_px) * 0.5) / float(img_w)
+                    cy = ((y1_px + y2_px) * 0.5) / float(img_h)
+                    w = max(4.0, float(x2_px - x1_px)) / float(img_w)
+                    h = max(4.0, float(y2_px - y1_px)) / float(img_h)
+                    cid, cname = resolve_yolo_class_id_and_name(item.material_type or default_material_hint)
+                    conf = float(item.confidence)
+                    source = str(item.source)
+
+                elif isinstance(item, (list, tuple)) and len(item) >= 5:
+                    if isinstance(item[0], str) and is_rejected_non_material(item[0]):
+                        continue
+                    cid, cname = resolve_yolo_class_id_and_name(item[0])
+                    cx = float(item[1])
+                    cy = float(item[2])
+                    w = float(item[3])
+                    h = float(item[4])
+                    conf = float(item[5]) if len(item) >= 6 else 0.0
+                    source = "tuple_yolo"
+
+                elif isinstance(item, dict):
+                    raw_label = (
+                        item.get("class_name")
+                        or item.get("material_type")
+                        or item.get("material_name")
+                        or item.get("name")
+                        or item.get("label")
+                    )
+                    if raw_label and is_rejected_non_material(str(raw_label)):
+                        continue
+
+                    if "class_id" in item and item["class_id"] is not None:
+                        # D37/F-0790: the class_id field must be numeric --
+                        # a non-numeric string here (e.g. "abc") used to
+                        # resolve to the generic class 12 instead of being
+                        # rejected. Names belong in class_name/material_type.
+                        _raw_cid = item["class_id"]
+                        if isinstance(_raw_cid, str) and not _raw_cid.strip().isdigit():
+                            raise ValueError(f"class_id must be an integer, got {_raw_cid!r}")
+                        cid, cname = resolve_yolo_class_id_and_name(_raw_cid)
+                        if raw_label:
+                            _, alias_name = resolve_yolo_class_id_and_name(raw_label)
+                            if cid == 0 and alias_name != YOLO_12_CLASS_NAMES[0]:
+                                cid, cname = resolve_yolo_class_id_and_name(raw_label)
+                    elif "cls" in item and item["cls"] is not None:
+                        _raw_cls = item["cls"]
+                        if isinstance(_raw_cls, str) and not _raw_cls.strip().isdigit():
+                            raise ValueError(f"cls must be an integer, got {_raw_cls!r}")
+                        cid, cname = resolve_yolo_class_id_and_name(_raw_cls)
+                    else:
+                        cid, cname = resolve_yolo_class_id_and_name(raw_label or default_material_hint)
+
+                    cx, cy, w, h = self._extract_dict_cxcywh(item, img_w=img_w, img_h=img_h)
+                    conf = float(item.get("confidence", item.get("conf", item.get("score", 0.0))))
+                    source = str(item.get("source", "auto_labeler"))
                 else:
-                    x1_px = max(0, bx)
-                    y1_px = max(0, by)
-                    x2_px = min(img_w, bx + max(4, bw_px))
-                    y2_px = min(img_h, by + max(4, bh_px))
-
-                cx = ((x1_px + x2_px) * 0.5) / float(img_w)
-                cy = ((y1_px + y2_px) * 0.5) / float(img_h)
-                w = max(4.0, float(x2_px - x1_px)) / float(img_w)
-                h = max(4.0, float(y2_px - y1_px)) / float(img_h)
-                cid, cname = resolve_yolo_class_id_and_name(item.material_type or default_material_hint)
-                conf = float(item.confidence)
-                source = str(item.source)
-
-            elif isinstance(item, (list, tuple)) and len(item) >= 5:
-                cid, cname = resolve_yolo_class_id_and_name(item[0])
-                cx = float(item[1])
-                cy = float(item[2])
-                w = float(item[3])
-                h = float(item[4])
-                conf = float(item[5]) if len(item) >= 6 else 0.92
-                source = "tuple_yolo"
-
-            elif isinstance(item, dict):
-                raw_label = (
-                    item.get("class_name")
-                    or item.get("material_type")
-                    or item.get("material_name")
-                    or item.get("name")
-                    or item.get("label")
-                )
-                if raw_label and is_rejected_non_material(str(raw_label)):
                     continue
 
-                if "class_id" in item and item["class_id"] is not None:
-                    cid, cname = resolve_yolo_class_id_and_name(item["class_id"])
-                    if raw_label:
-                        _, alias_name = resolve_yolo_class_id_and_name(raw_label)
-                        if cid == 0 and alias_name != YOLO_12_CLASS_NAMES[0]:
-                            cid, cname = resolve_yolo_class_id_and_name(raw_label)
-                elif "cls" in item and item["cls"] is not None:
-                    cid, cname = resolve_yolo_class_id_and_name(item["cls"])
-                else:
-                    cid, cname = resolve_yolo_class_id_and_name(raw_label or default_material_hint)
-
-                cx, cy, w, h = self._extract_dict_cxcywh(item, img_w=img_w, img_h=img_h)
-                conf = float(item.get("confidence", item.get("conf", item.get("score", 0.92))))
-                source = str(item.get("source", "auto_labeler"))
-            else:
+            except (TypeError, ValueError) as _item_exc:
+                # D37/F-0930: one broken confidence/coordinate must not
+                # abort the whole normalize_annotations call -- skip it.
+                logger.debug("Skipping broken annotation %r: %s", item, _item_exc)
                 continue
 
             if not (math.isfinite(cx) and math.isfinite(cy) and math.isfinite(w) and math.isfinite(h)):
@@ -906,14 +1158,26 @@ class DatasetCurator:
             h = b3 / float(img_h)
             return cx, cy, w, h
 
-        return 0.50, 0.54, 0.12, 0.14
+        # D37/F-0792: no coordinates at all -- raise instead of inventing a
+        # fake centre box (0.50, 0.54, 0.12, 0.14). Callers skip such items.
+        raise ValueError(f"Annotation dictionary has no recognizable YOLO coordinates: {ann}")
 
     @staticmethod
     def _apply_class_aware_nms(
         annotations: List[Dict[str, Any]],
         iou_threshold: float = 0.65,
     ) -> List[Dict[str, Any]]:
-        """Deduplicate overlapping boxes of the same class using Non-Maximum Suppression."""
+        """Deduplicate overlapping boxes of the same class using Non-Maximum Suppression.
+
+        Greedy NMS with the exact semantics of the previous O(n^2) Python
+        loop: candidates are visited in (confidence desc, area desc) order
+        (ties keep input order) and a candidate is dropped when its IoU
+        with any already-kept box of the same class is strictly greater
+        than ``iou_threshold``. The IoU matrix is built with one NumPy
+        broadcast pass (up to 800 boxes per class) instead of ~n^2/2
+        Python-level IoU evaluations; larger classes fall back to the
+        same greedy order with one vectorized IoU row per kept box.
+        """
         if len(annotations) <= 1:
             return annotations
 
@@ -923,39 +1187,73 @@ class DatasetCurator:
 
         kept: List[Dict[str, Any]] = []
         for cid in sorted(by_class.keys()):
-            candidates = sorted(
-                by_class[cid],
-                key=lambda a: (float(a.get("confidence", 0.9)), float(a["w"] * a["h"])),
-                reverse=True,
+            cands = by_class[cid]
+            if len(cands) == 1:
+                kept.extend(cands)
+                continue
+
+            cx = np.array([float(a["cx"]) for a in cands], dtype=np.float64)
+            cy = np.array([float(a["cy"]) for a in cands], dtype=np.float64)
+            w = np.array([float(a["w"]) for a in cands], dtype=np.float64)
+            h = np.array([float(a["h"]) for a in cands], dtype=np.float64)
+            conf = np.array(
+                [float(a.get("confidence", 0.9)) for a in cands], dtype=np.float64
             )
-            kept_cls: List[Dict[str, Any]] = []
-            for cand in candidates:
-                ax1 = cand["cx"] - 0.5 * cand["w"]
-                ay1 = cand["cy"] - 0.5 * cand["h"]
-                ax2 = cand["cx"] + 0.5 * cand["w"]
-                ay2 = cand["cy"] + 0.5 * cand["h"]
-                area_a = max(1e-9, (ax2 - ax1) * (ay2 - ay1))
+            x1 = cx - 0.5 * w
+            y1 = cy - 0.5 * h
+            x2 = cx + 0.5 * w
+            y2 = cy + 0.5 * h
+            areas = np.maximum((x2 - x1) * (y2 - y1), 1e-9)
 
-                is_dup = False
-                for ex in kept_cls:
-                    bx1 = ex["cx"] - 0.5 * ex["w"]
-                    by1 = ex["cy"] - 0.5 * ex["h"]
-                    bx2 = ex["cx"] + 0.5 * ex["w"]
-                    by2 = ex["cy"] + 0.5 * ex["h"]
-                    area_b = max(1e-9, (bx2 - bx1) * (by2 - by1))
+            # (confidence desc, area desc); np.lexsort is stable, so full
+            # ties keep input order -- same order as the old sorted() call.
+            order = np.lexsort((-areas, -conf))
+            thr = float(iou_threshold)
+            n = len(cands)
 
-                    ix1 = max(ax1, bx1)
-                    iy1 = max(ay1, by1)
-                    ix2 = min(ax2, bx2)
-                    iy2 = min(ay2, by2)
-                    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-                    iou = inter / (area_a + area_b - inter + 1e-9)
-                    if iou > iou_threshold:
-                        is_dup = True
-                        break
-                if not is_dup:
-                    kept_cls.append(cand)
-            kept.extend(kept_cls)
+            if n <= 800:
+                # Full IoU matrix in one broadcast pass; the greedy loop
+                # then costs one boolean-vector op per candidate.
+                xs1, ys1, xs2, ys2 = x1[order], y1[order], x2[order], y2[order]
+                ar = areas[order]
+                inter_w = np.maximum(
+                    0.0, np.minimum(xs2[:, None], xs2[None, :])
+                    - np.maximum(xs1[:, None], xs1[None, :])
+                )
+                inter_h = np.maximum(
+                    0.0, np.minimum(ys2[:, None], ys2[None, :])
+                    - np.maximum(ys1[:, None], ys1[None, :])
+                )
+                inter = inter_w * inter_h
+                iou = inter / (ar[:, None] + ar[None, :] - inter + 1e-9)
+                suppressed = np.zeros(n, dtype=bool)
+                kept_idx: List[int] = []
+                for idx in range(n):
+                    if suppressed[idx]:
+                        continue
+                    kept_idx.append(idx)
+                    suppressed |= iou[idx] > thr
+                kept.extend(cands[int(order[i])] for i in kept_idx)
+                continue
+
+            # Large class: same greedy order, one vectorized IoU row per
+            # kept box (avoids an n^2 float64 matrix).
+            remaining = order
+            kept_idx = []
+            while remaining.size:
+                i = int(remaining[0])
+                kept_idx.append(i)
+                if remaining.size == 1:
+                    break
+                rest = remaining[1:]
+                ix1 = np.maximum(x1[i], x1[rest])
+                iy1 = np.maximum(y1[i], y1[rest])
+                ix2 = np.minimum(x2[i], x2[rest])
+                iy2 = np.minimum(y2[i], y2[rest])
+                inter = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+                iou = inter / (areas[i] + areas[rest] - inter + 1e-9)
+                remaining = rest[iou <= thr]
+            kept.extend(cands[i] for i in kept_idx)
         return kept
 
     # -------------------------------------------------------------------------
@@ -974,13 +1272,19 @@ class DatasetCurator:
         h, w = preview.shape[:2]
 
         for ann in annotations:
-            cid = int(ann.get("class_id", 0))
-            cname = str(ann.get("class_name", self.class_names.get(cid, f"class_{cid}")))
-            conf = float(ann.get("confidence", 0.95))
-            cx = float(ann["cx"])
-            cy = float(ann["cy"])
-            bw = float(ann["w"])
-            bh = float(ann["h"])
+            # D37/F-1036: a raw dict missing cx/cy/w/h (or with non-numeric
+            # values) must not crash the whole preview -- skip that box.
+            try:
+                cid = int(ann.get("class_id", 0))
+                cname = str(ann.get("class_name", self.class_names.get(cid, f"class_{cid}")))
+                conf = float(ann.get("confidence", 0.95))
+                cx = float(ann["cx"])
+                cy = float(ann["cy"])
+                bw = float(ann["w"])
+                bh = float(ann["h"])
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.debug("Skipping unrenderable annotation %r: %s", ann, exc)
+                continue
 
             x1 = max(0, int(round((cx - 0.5 * bw) * w)))
             y1 = max(0, int(round((cy - 0.5 * bh) * h)))
@@ -1027,6 +1331,11 @@ class DatasetCurator:
         sample_name: Optional[str] = None,
         jpeg_quality: int = 95,
         update_manifest: bool = True,
+        # O4: boş etiketle kayıt varsayılan olarak reddedilir — boş .txt,
+        # YOLO eğitiminde "bu karede hiçbir şey yok" negatifi sayılır,
+        # oysa gerçekte etiketleyici bulamamış olabilir. Bilinçli negatif
+        # örnek için çağıran allow_empty=True geçmelidir.
+        allow_empty: bool = False,
     ) -> Dict[str, Any]:
         """
         Save a single labeled sample pair (`dataset/images/<split>/<name>.jpg` and
@@ -1056,11 +1365,39 @@ class DatasetCurator:
 
             split_norm = str(split or "train").strip().lower()
             if split_norm not in ("train", "val"):
-                # Deterministic 85/15 split schedule
-                split_norm = "val" if (seq_num % 7 == 0) else "train"
+                # One deterministic schedule for the whole factory
+                # (D37/F-0924): DatasetQualityGate.choose_split (Bresenham),
+                # the same schedule bootstrap and the quality gate use.
+                split_norm = self._choose_split(seq_num, val_ratio=self.val_ratio)
 
             img_h, img_w = frame.shape[:2]
+            # O3: düşen kutu sayısı artık dönüşte raporlanır — eskiden
+            # bozuk kutu sessizce atlanıyor, "kaydedildi" sayısı ile
+            # "alınan" sayı arasındaki fark hiçbir yerde görünmüyordu.
+            input_box_count = len(annotations) if annotations else 0
             norm_anns = self.normalize_annotations(annotations, img_w=img_w, img_h=img_h)
+            dropped_box_count = max(0, input_box_count - len(norm_anns))
+
+            # S-6202: run the normalized annotations through the quality
+            # gate so the label flow actually enforces it (_get_quality_gate
+            # was dead code: no caller). Degenerate/tiny boxes and
+            # same-class duplicates (IoU > 0.65) are dropped before the
+            # label file is written. Gate unavailable -> keep annotations
+            # unchanged (fail-open; the load failure is logged by
+            # _get_quality_gate) so a save is never lost to the gate.
+            gate = self._get_quality_gate()
+            if gate is not None and norm_anns:
+                gated_anns = gate.validate_yolo_annotations(
+                    [dict(a) for a in norm_anns]
+                )
+                if len(gated_anns) != len(norm_anns):
+                    dropped_box_count += len(norm_anns) - len(gated_anns)
+                    logger.debug(
+                        "Quality gate dropped %d of %d annotations",
+                        len(norm_anns) - len(gated_anns),
+                        len(norm_anns),
+                    )
+                norm_anns = gated_anns
 
             if sample_name:
                 clean_stem = re.sub(r"[^A-Za-z0-9_\-\.]", "_", str(sample_name).strip())
@@ -1069,6 +1406,40 @@ class DatasetCurator:
                 ts_ms = int(time.time() * 1000)
                 clean_stem = f"{clean_prefix}_{ts_ms}_{seq_num:05d}"
 
+            # Y1: kalibrasyon eskiden yalnızca toplu yeniden etiketlemede
+            # (relabel) çalışıyordu; ana kayıt yolu kalibrasyonsuz
+            # akıyordu. Artık her kayıt kalibre edilir: ölçülmemiş
+            # sezgisel kutunun güveni cap'lenir, insan onayı dokunulmazlığı
+            # korunur (calibrate_box_trust içinde).
+            norm_anns = [
+                calibrate_box_trust(dict(a), stem=clean_stem) for a in norm_anns
+            ]
+
+            # O4: etiketsiz kare boş .txt ile dataset'e girmez.
+            if not norm_anns and not allow_empty:
+                logger.warning(
+                    "save_labeled_sample reddedildi (stem=%s): etiket yok — "
+                    "boş .txt YOLO'da sahte negatif sayılır.",
+                    clean_stem,
+                )
+                return {
+                    "saved": False,
+                    "reason": "empty_annotations",
+                    "sample_name": clean_stem,
+                    "split": split_norm,
+                    "image_path": "",
+                    "label_path": "",
+                    "preview_path": None,
+                    "box_count": 0,
+                    "weak_box_count": 0,
+                    "input_box_count": input_box_count,
+                    "dropped_box_count": dropped_box_count,
+                    "annotations": [],
+                    "weak_annotations": [],
+                    "has_trusted_seed": False,
+                    "manifest_stats": self.get_manifest_stats(),
+                }
+
             images_dir = self.images_val_dir if split_norm == "val" else self.images_train_dir
             labels_dir = self.labels_val_dir if split_norm == "val" else self.labels_train_dir
 
@@ -1076,12 +1447,16 @@ class DatasetCurator:
             label_path = labels_dir / f"{clean_stem}.txt"
             preview_path = self.previews_dir / f"{clean_stem}_preview.jpg"
 
-            ok_img = imwrite_unicode(image_path, frame, jpeg_quality=jpeg_quality)
-            if not ok_img:
-                raise RuntimeError(f"Failed to write dataset image to {image_path}")
+            # D47: the incremental manifest path only applies to brand-new
+            # files. Overwriting a pre-existing stem changes the old label's
+            # box counts, so that save always takes the full rebuild.
+            allow_incremental = not (image_path.exists() or label_path.exists())
 
             from dataset_factory.label_trust import commit_split_labels
 
+            # D37/F-0836: commit labels BEFORE writing the image. If the
+            # image write then fails, the label/review files are removed
+            # again so no orphan label (or orphan image) is left behind.
             trust_info = commit_split_labels(
                 dataset_dir=self.dataset_dir,
                 split=split_norm,
@@ -1089,16 +1464,62 @@ class DatasetCurator:
                 label_path=label_path,
                 annotations=norm_anns,
             )
+
+            ok_img = imwrite_unicode(image_path, frame, jpeg_quality=jpeg_quality)
+            if not ok_img:
+                for _stale in (label_path, Path(str(trust_info.get("review_path", "")))):
+                    try:
+                        if str(_stale):
+                            _stale.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise RuntimeError(f"Failed to write dataset image to {image_path}")
             trusted_anns = list(trust_info.get("trusted", []))
             weak_anns = list(trust_info.get("weak", []))
 
             saved_preview_path: Optional[str] = None
             if save_preview:
+                preview_existed = preview_path.exists()
                 preview_img = self.render_annotated_preview(frame, norm_anns)
                 if imwrite_unicode(preview_path, preview_img, jpeg_quality=90):
                     saved_preview_path = str(preview_path)
+                    if preview_existed:
+                        allow_incremental = False
+                else:
+                    # D3: önizleme yazılamazsa eskiden sessizce yok
+                    # sayılıyordu; Adım 2 insan denetimi eksik kalıyordu.
+                    logger.warning(
+                        "save_labeled_sample önizleme yazılamadı (stem=%s): %s",
+                        clean_stem,
+                        preview_path,
+                    )
 
-            manifest = self.rebuild_manifest_stats() if update_manifest else self.get_manifest_stats()
+            # D47: incremental refresh (delta on the cached manifest) when
+            # the fingerprint proves nothing else changed on disk; otherwise
+            # the exact full rebuild. Bulk callers already pass
+            # update_manifest=False and rebuild once at the end.
+            manifest = (
+                self._refresh_manifest_after_save(
+                    split=split_norm,
+                    image_path=image_path,
+                    label_path=label_path,
+                    preview_path=preview_path if saved_preview_path is not None else None,
+                    allow_incremental=allow_incremental,
+                )
+                if update_manifest
+                else self.get_manifest_stats()
+            )
+
+            # P2-21 (F061-K4): commit 0 kutu yazdıysa bunu logla — kare
+            # diske/review'a kaydedildi ama train TXT boş; `saved=True`
+            # karenin persist edildiğini söyler, eğitime girdiğini değil.
+            if int(trust_info.get("train_box_count", 0) or 0) <= 0:
+                logger.warning(
+                    "save_labeled_sample: commit 0 kutu yazdı (stem=%s, dropped=%s) — "
+                    "kare review'a kaydedildi ama train TXT'ye kutu girmedi",
+                    clean_stem,
+                    trust_info.get("dropped"),
+                )
 
             return {
                 "saved": True,
@@ -1109,6 +1530,17 @@ class DatasetCurator:
                 "preview_path": saved_preview_path,
                 "box_count": len(trusted_anns),
                 "weak_box_count": len(weak_anns),
+                # P2-21 (F061-K4 / K-07): commit'in train TXT'ye yazdığı
+                # gerçek kutu sayısı okunur — 0 ise kare review'a
+                # kaydedildi ama eğitime 0 kutu girdi; çağıran bunu
+                # görür (factory_controller sayacı `saved`'e bakar;
+                # 0-kutu kare orada ayrıca sayılmaz — bkz. açık nokta).
+                "train_box_count": int(trust_info.get("train_box_count", 0) or 0),
+                "commit_dropped": int(trust_info.get("dropped", 0) or 0),
+                "commit_trusted_in": int(trust_info.get("trusted_in", 0) or 0),
+                "commit_trusted_out": int(trust_info.get("trusted_out", 0) or 0),
+                "input_box_count": input_box_count,
+                "dropped_box_count": dropped_box_count,
                 "annotations": trusted_anns,
                 "weak_annotations": weak_anns,
                 "has_trusted_seed": bool(trust_info.get("has_trusted_seed")),
@@ -1125,7 +1557,7 @@ class DatasetCurator:
         up-to-date `dataset/manifest_stats.json`.
         """
         with self._lock:
-            valid_img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            valid_img_exts = MANIFEST_IMAGE_EXTS
 
             train_images = (
                 sorted(
@@ -1183,8 +1615,15 @@ class DatasetCurator:
                         parts = line.strip().split()
                         if len(parts) < 5:
                             continue
+                        # A23: strict integer class token, consistent with
+                        # dataset_validator.validate_yolo_file (F-0851).
+                        # int(float(...)) silently truncated "1.9" -> 1, so
+                        # an invalid line was counted as a real class-1 box
+                        # in the manifest while the validator rejected it.
+                        if not re.fullmatch(r"[+-]?\d+", parts[0].strip()):
+                            continue
                         try:
-                            cid = int(float(parts[0]))
+                            cid = int(parts[0])
                         except ValueError:
                             continue
                         cname = self.class_names.get(cid, f"class_{cid}")
@@ -1225,7 +1664,173 @@ class DatasetCurator:
                 json.dumps(stats_payload, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
+            # D47: remember the exact manifest + the disk state it matches,
+            # so save_labeled_sample() can refresh it incrementally.
+            self._manifest_cache = copy.deepcopy(stats_payload)
+            self._manifest_fingerprint = self._compute_manifest_fingerprint()
             return stats_payload
+
+    # -------------------------------------------------------------------------
+    # Incremental manifest refresh (D47)
+    # -------------------------------------------------------------------------
+    def _compute_manifest_fingerprint(self) -> Optional[Tuple[Any, ...]]:
+        """
+        Cheap on-disk fingerprint of exactly the files `rebuild_manifest_stats`
+        counts: per-split image counts, per-split label (count, total size,
+        max mtime_ns), preview count. `stat` on label files (not content
+        reads) is what keeps this ~8x cheaper than a full rebuild, and it
+        still catches in-place label edits (size/mtime change) that a
+        count-only scan would miss. Returns None when the disk cannot be
+        scanned -- callers then fall back to a full rebuild.
+        """
+        try:
+            img_train = _count_files_with_exts(self.images_train_dir, MANIFEST_IMAGE_EXTS)
+            img_val = _count_files_with_exts(self.images_val_dir, MANIFEST_IMAGE_EXTS)
+            lbl_train = _labels_dir_fingerprint(self.labels_train_dir)
+            lbl_val = _labels_dir_fingerprint(self.labels_val_dir)
+            prev = _count_files_with_exts(self.previews_dir, MANIFEST_IMAGE_EXTS)
+        except OSError:
+            return None
+        if None in (img_train, img_val, lbl_train, lbl_val, prev):
+            return None
+        return (img_train, img_val, lbl_train, lbl_val, prev)
+
+    @staticmethod
+    def _count_label_file_boxes(label_path: Path) -> Optional[List[int]]:
+        """Parse one label txt exactly like rebuild_manifest_stats() does."""
+        try:
+            raw_text = label_path.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            return None
+        cids: List[int] = []
+        if not raw_text:
+            return cids
+        for line in raw_text.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            # Y5: artımlı sayım eskiden `int(float(...))` kullanıyordu —
+            # "1.9" → 1 sayılıyordu; tam rebuild katı regex kullanır.
+            # İki sayım aynı kuralı kullanır artık.
+            if not re.fullmatch(r"[+-]?\d+", parts[0].strip()):
+                continue
+            try:
+                cids.append(int(parts[0]))
+            except ValueError:
+                continue
+        return cids
+
+    def _refresh_manifest_after_save(
+        self,
+        *,
+        split: str,
+        image_path: Path,
+        label_path: Path,
+        preview_path: Optional[Path],
+        allow_incremental: bool,
+    ) -> Dict[str, Any]:
+        """
+        Refresh `manifest_stats.json` after one `save_labeled_sample`.
+
+        Fast path: when the cached manifest is known to match disk and the
+        fingerprint after this save is exactly the cached fingerprint plus
+        this one new image/label/preview, apply the delta (counts read back
+        from the label file just written) and rewrite the JSON -- no full
+        rescan. Any deviation (no cache, a pre-existing file overwritten,
+        an external add/delete/edit, an unscannable directory) falls back
+        to the exact `rebuild_manifest_stats()`.
+
+        Exactness note: the fingerprint covers label size+mtime, so an
+        out-of-band in-place label edit is detected and triggers a rebuild.
+        The residual blind spot is an external process concurrently adding
+        AND removing label files whose total size and max mtime net out to
+        the same values inside one save window; that combination is not
+        detected and the manifest then needs a manual rebuild. The live
+        factory writers (this curator, relabel_dataset_batch) all end with
+        a full rebuild, which re-syncs the cache.
+        """
+        with self._lock:
+            if (
+                not allow_incremental
+                or self._manifest_cache is None
+                or self._manifest_fingerprint is None
+            ):
+                return self.rebuild_manifest_stats()
+
+            try:
+                image_path.stat()
+                label_stat = label_path.stat()
+                preview_stat = preview_path.stat() if preview_path is not None else None
+            except OSError:
+                return self.rebuild_manifest_stats()
+
+            cached = self._manifest_fingerprint
+            img_train, img_val, lbl_train, lbl_val, prev = cached
+            preview_delta = 1 if preview_stat is not None else 0
+            if split == "val":
+                expected = (
+                    img_train,
+                    img_val + 1,
+                    lbl_train,
+                    (
+                        lbl_val[0] + 1,
+                        lbl_val[1] + label_stat.st_size,
+                        max(lbl_val[2], label_stat.st_mtime_ns),
+                    ),
+                    prev + preview_delta,
+                )
+            else:
+                expected = (
+                    img_train + 1,
+                    img_val,
+                    (
+                        lbl_train[0] + 1,
+                        lbl_train[1] + label_stat.st_size,
+                        max(lbl_train[2], label_stat.st_mtime_ns),
+                    ),
+                    lbl_val,
+                    prev + preview_delta,
+                )
+
+            actual = self._compute_manifest_fingerprint()
+            if actual is None or actual != expected:
+                return self.rebuild_manifest_stats()
+
+            new_cids = self._count_label_file_boxes(label_path)
+            if new_cids is None:
+                return self.rebuild_manifest_stats()
+
+            stats = copy.deepcopy(self._manifest_cache)
+            if split == "val":
+                stats["val_count"] = int(stats.get("val_count", 0)) + 1
+            else:
+                stats["train_count"] = int(stats.get("train_count", 0)) + 1
+            stats["total_images"] = int(stats.get("total_images", 0)) + 1
+            for cid in new_cids:
+                cname = self.class_names.get(cid, f"class_{cid}")
+                stats["class_counts"][cname] = stats["class_counts"].get(cname, 0) + 1
+                stats["class_id_counts"][str(cid)] = stats["class_id_counts"].get(str(cid), 0) + 1
+                stats["total_boxes"] = int(stats.get("total_boxes", 0)) + 1
+                if split == "val":
+                    stats["val_boxes"] = int(stats.get("val_boxes", 0)) + 1
+                else:
+                    stats["train_boxes"] = int(stats.get("train_boxes", 0)) + 1
+            if preview_stat is not None:
+                stats["preview_count"] = int(stats.get("preview_count", 0)) + 1
+            stats["progress_pct"] = round(
+                min(100.0, (int(stats["total_images"]) / float(self.target_goal)) * 100.0), 2
+            )
+            stats["updated_at_epoch"] = round(time.time(), 3)
+            stats["updated_at_iso"] = datetime.now(timezone.utc).isoformat()
+
+            self.manifest_stats_path.parent.mkdir(parents=True, exist_ok=True)
+            self.manifest_stats_path.write_text(
+                json.dumps(stats, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self._manifest_cache = copy.deepcopy(stats)
+            self._manifest_fingerprint = actual
+            return stats
 
     def get_manifest_stats(self) -> Dict[str, Any]:
         """Return the current dataset manifest statistics, rebuilding if missing."""
@@ -1240,11 +1845,36 @@ class DatasetCurator:
     # -------------------------------------------------------------------------
     # Auto-Labeling Helper (External `YOLOAutoLabeler` + Built-in Multi-Stage Fallback)
     # -------------------------------------------------------------------------
+    def _choose_split(self, sample_index: int, val_ratio: Optional[float] = None) -> str:
+        """
+        Single deterministic train/val schedule for the whole factory
+        (D37/F-0924): `DatasetQualityGate.choose_split` (Bresenham), so
+        `save_labeled_sample`, `bootstrap_from_existing_frames` and the
+        quality gate no longer run three different split calendars.
+        """
+        ratio = self.val_ratio if val_ratio is None else float(val_ratio)
+        try:
+            from dataset_factory.quality_dedup_gate import DatasetQualityGate
+
+            return DatasetQualityGate.choose_split(int(sample_index), val_ratio=ratio)
+        except Exception:
+            # O6/B-12: yedek takvim eskiden sessizce devreye giriyordu
+            # (log yok, %14,3 val — ana takvim %15'ten farklı). Artık
+            # uyarı bırakır; aynı kare farklı koşularda farklı split'e
+            # düşerse sebebi logda görünür.
+            logger.warning(
+                "DatasetQualityGate yüklenemedi; split yedek takvime "
+                "(%%7) düştü — ana Bresenham takviminden farklı oran verir."
+            )
+            return "val" if (max(0, int(sample_index)) % 7 == 0) else "train"
+
     def _get_material_scanner(self) -> MaterialScanner:
         if self._scanner is None:
-            rel_tpl = Path("templates")
-            templates_dir = "templates" if rel_tpl.is_dir() else str(self.project_root / "templates")
-            self._scanner = MaterialScanner(templates_dir=templates_dir)
+            # D37/F-0925: never resolve templates relative to the CWD; the
+            # scanner always uses <project_root>/templates.
+            self._scanner = MaterialScanner(
+                templates_dir=str(self.project_root / "templates")
+            )
         return self._scanner
 
     def _get_auto_labeler(self) -> Optional[Any]:
@@ -1269,23 +1899,29 @@ class DatasetCurator:
 
             self._augmentor = SyntheticYOLOAugmentor(seed=42)
             return self._augmentor
-        except Exception:
+        except Exception as exc:
+            # D37/F-0926: a failed lazy load must be visible; silently
+            # returning None used to drop the pipeline to a fallback
+            # without anyone noticing.
+            logger.warning("Failed to initialize SyntheticYOLOAugmentor: %s", exc)
             return None
 
     def _get_quality_gate(self) -> Optional[Any]:
-        """Lazily load `DatasetQualityGate` from `dataset_factory.quality_dedup_gate`."""
+        """Lazily load `QualityGate` from `dataset_factory.quality_gate`."""
         if self._quality_gate is not None:
             return self._quality_gate
         try:
-            from dataset_factory.quality_dedup_gate import DatasetQualityGate
+            from dataset_factory.quality_gate import QualityGate
 
-            self._quality_gate = DatasetQualityGate(
+            self._quality_gate = QualityGate(
                 min_hamming_distance=3,
                 min_sharpness_threshold=15.0,
                 val_ratio=self.val_ratio,
             )
             return self._quality_gate
-        except Exception:
+        except Exception as exc:
+            # D37/F-0926: see _get_augmentor -- log, don't swallow.
+            logger.warning("Failed to initialize QualityGate: %s", exc)
             return None
 
     def auto_label_frame(
@@ -1293,6 +1929,7 @@ class DatasetCurator:
         frame: np.ndarray,
         source_path: Optional[Union[str, Path]] = None,
         fast_mode: bool = False,
+        full_scan: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Auto-label a gameplay screenshot or video frame into normalized YOLO annotations.
@@ -1305,6 +1942,10 @@ class DatasetCurator:
           3. Apply filename & visual patch classification (`classify_3d_material_patch`) so
              screenshots like `aria_*.jpg`, `mela_*.jpg`, `pilgrims_ridge_*.jpg`, and
              `video_frames/*.jpg` always produce accurate, high-confidence bounding boxes.
+
+        ``full_scan=True`` Stage C (HUD) / Stage D (yol/engel) stem kapısını
+        atlar — YOLOAutoLabeler'a geçirilir. Yalnızca öğrenme / yeniden
+        etiketleme bağlamları geçirir; varsayılan False (W29 kilidi korunur).
         """
         if frame is None or frame.size == 0:
             return []
@@ -1329,7 +1970,10 @@ class DatasetCurator:
         elif "diamond" in stem_lower:
             material_hint = "gem_diamond"
         elif "sprout" in stem_lower or "minimap" in stem_lower:
-            material_hint = "aether_odyle"
+            # Y2 (dilim 03): eskiden "aether_odyle" (sınıf 4, gem_crystal)
+            # yazılıyordu — minimap filizi (doğru sınıf 9, minimap_sprout)
+            # sistematik olarak kristal diye etiketleniyordu.
+            material_hint = "minimap_sprout"
         elif "orichalcum" in stem_lower:
             material_hint = "ore_orichalcum"
 
@@ -1344,6 +1988,7 @@ class DatasetCurator:
                         frame,
                         fast_mode=fast_mode,
                         source_path=source_path,
+                        full_scan=full_scan,
                     )
                 elif hasattr(labeler, "label_frame"):
                     ext_res = labeler.label_frame(frame)
@@ -1376,33 +2021,15 @@ class DatasetCurator:
                 scanner = self._get_material_scanner()
                 scanner_dets = scanner.scan_frame_for_materials(frame)
                 if scanner_dets:
+                    # D37/F-0837: the detector's own classification stands.
+                    # The old code let a filename hint ("herb_aria" /
+                    # "herb_mela") overwrite the detector finding and force
+                    # a wrong class; the hint is only a fallback for
+                    # annotations that carry no material of their own.
                     for det in scanner_dets:
-                        if material_hint in ("herb_aria", "herb_mela") and det.source in (
-                            "3d_world",
-                            "gather_prompt",
-                            "3d_floating_icon",
-                        ):
-                            det_copy = DetectedMaterial(
-                                material_type=material_hint,
-                                source=det.source,
-                                screen_x=det.screen_x,
-                                screen_y=det.screen_y,
-                                bbox=det.bbox,
-                                rel_map_dx=det.rel_map_dx,
-                                rel_map_dy=det.rel_map_dy,
-                                estimated_distance_m=det.estimated_distance_m,
-                                confidence=det.confidence,
-                                in_air=det.in_air,
-                                stack_count=det.stack_count,
-                                harvests_remaining=det.harvests_remaining,
-                            )
-                            collected.extend(
-                                self.normalize_annotations([det_copy], img_w=img_w, img_h=img_h)
-                            )
-                        else:
-                            collected.extend(
-                                self.normalize_annotations([det], img_w=img_w, img_h=img_h)
-                            )
+                        collected.extend(
+                            self.normalize_annotations([det], img_w=img_w, img_h=img_h)
+                        )
             except Exception as exc:
                 logger.debug("MaterialScanner fallback failed on %s: %s", stem_lower, exc)
 
@@ -1451,22 +2078,9 @@ class DatasetCurator:
         if material_hint:
             resolved_cid, resolved_cname = resolve_yolo_class_id_and_name(material_hint)
         else:
-            try:
-                matches = classify_3d_material_patch(
-                    bgr_patch=roi_bgr,
-                    region_name="Pilgrim's Ridge",
-                    top_k=1,
-                    min_score=0.15,
-                )
-                if matches and float(matches[0].get("score", 0.0)) >= 0.05:
-                    best = matches[0]
-                    resolved_cid, resolved_cname = resolve_yolo_class_id_and_name(
-                        best.get("base_material") or best.get("name")
-                    )
-                    raw_score = float(best.get("score", 0.2))
-                    resolved_conf = float(np.clip(raw_score, 0.05, 0.99))
-            except Exception:
-                pass
+            classified = _classify_material_patch(roi_bgr, min_confidence=0.15)
+            if classified is not None:
+                resolved_cid, resolved_cname, resolved_conf = classified
 
         # If no verified material is found via hint or classification, do not generate fake boxes
         if resolved_cid is None:
@@ -1509,21 +2123,11 @@ class DatasetCurator:
             sub_patch = frame[abs_y : abs_y + bh, abs_x : abs_x + bw]
             sub_cid, sub_cname = resolved_cid, resolved_cname
             if not material_hint and sub_patch.size > 0:
-                try:
-                    sub_matches = classify_3d_material_patch(
-                        bgr_patch=sub_patch,
-                        region_name="Pilgrim's Ridge",
-                        top_k=1,
-                        min_score=0.15,
-                    )
-                    if sub_matches and float(sub_matches[0].get("score", 0.0)) >= 0.15:
-                        sub_cid, sub_cname = resolve_yolo_class_id_and_name(
-                            sub_matches[0].get("base_material") or sub_matches[0].get("name")
-                        )
-                    else:
-                        continue  # Skip unverified patch
-                except Exception:
-                    continue
+                classified = _classify_material_patch(sub_patch, min_confidence=0.15)
+                if classified is not None:
+                    sub_cid, sub_cname = classified[0], classified[1]
+                else:
+                    continue  # Skip unverified patch
 
             cx = float(np.clip((abs_x + 0.5 * bw) / float(img_w), 0.05, 0.95))
             cy = float(np.clip((abs_y + 0.5 * bh) / float(img_h), 0.05, 0.95))
@@ -1538,7 +2142,11 @@ class DatasetCurator:
                     "cy": round(cy, 6),
                     "w": round(nw, 6),
                     "h": round(nh, 6),
-                    "confidence": round(max(0.75, resolved_conf - 0.04 * idx), 4),
+                    # D37/F-0838: HSV chromaticity is an unverified heuristic,
+                    # so its boxes are capped at 0.68 (the same cap
+                    # calibrate_box_trust applies) instead of being floored
+                    # at 0.75-0.86 as if they were verified detections.
+                    "confidence": round(min(0.68, resolved_conf - 0.04 * idx), 4),
                     "source": "hsv_3d_patch_fallback",
                 }
             )
@@ -1636,19 +2244,27 @@ class DatasetCurator:
         augment_factor: int = 3,
         save_base_previews: bool = True,
         save_variant_previews: bool = False,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """
-        Scan `reference_screenshots/*.jpg` and `video_frames/*.jpg`, auto-label every
+        Scan `reference_screenshots/*` and `video_frames/*` (jpg, jpeg, png, webp, bmp), auto-label every
         valid frame (using `YOLOAutoLabeler` or the built-in `MaterialScanner` + HSV 3D
         patch classifier fallback), generate `augment_factor` synthetic variants per frame,
         and populate `dataset/images/train`, `dataset/images/val`, `dataset/labels/train`,
         `dataset/labels/val`, `dataset/previews`, `dataset/data.yaml`, and
         `dataset/manifest_stats.json`.
 
+        P2-8 (DF.9): `should_stop` verilirse tarama kare/varyant
+        sınırında durur; o ana kadar kaydedilen örnekler diskte kalır
+        (kısmi sonuç geçerlidir), özet `cancelled: True` taşır.
+        İptal yarım örnek yazmaz — kontrol yalnızca sınırda yapılır.
+
         Args:
             augment_factor: Number of augmented variants to generate per source image (default `3`).
             save_base_previews: Save bounding-box preview images for base screenshots.
             save_variant_previews: Save bounding-box preview images for augmented variants.
+            should_stop: Optional zero-arg callable; True dönerse tarama
+                bir sonraki kare/varyant sınırında durur.
 
         Returns:
             Summary dictionary with counts of scanned, base, augmented, train, and val samples,
@@ -1656,130 +2272,174 @@ class DatasetCurator:
         """
         # Do not hold `_lock` across image decode. A multi-minute lock stalls BotWorker
         # heartbeats and the Qt refresh that rebuilds the manifest. Each save locks itself.
-        if True:
-            self.ensure_dataset_structure()
-            augment_factor = max(0, int(augment_factor))
+        self.ensure_dataset_structure()
+        augment_factor = max(0, int(augment_factor))
 
-            ref_dir = self.project_root / "reference_screenshots"
-            vid_dir = self.project_root / "video_frames"
+        ref_dir = self.project_root / "reference_screenshots"
+        vid_dir = self.project_root / "video_frames"
 
-            source_files: List[Tuple[str, Path]] = []
-            if ref_dir.is_dir():
-                for p in sorted(ref_dir.glob("*.jpg")):
+        # D37/F-0927: scan every supported image extension, not just *.jpg.
+        image_exts = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp")
+        source_files: List[Tuple[str, Path]] = []
+        for src_tag, src_dir in (("ref", ref_dir), ("vid", vid_dir)):
+            if not src_dir.is_dir():
+                continue
+            for pattern in image_exts:
+                for p in sorted(src_dir.glob(pattern)):
                     if p.is_file():
-                        source_files.append(("ref", p))
-            if vid_dir.is_dir():
-                for p in sorted(vid_dir.glob("*.jpg")):
-                    if p.is_file():
-                        source_files.append(("vid", p))
+                        source_files.append((src_tag, p))
+        source_files.sort(key=lambda item: (item[0], item[1].name))
 
-            base_saved = 0
-            augmented_saved = 0
-            skipped_files = 0
-            sample_counter = 0
-            qgate = self._get_quality_gate()
+        base_saved = 0
+        augmented_saved = 0
+        # O8: eskiden bozuk görüntü ve etiketsiz kare tek sayaca
+        # yazılıyordu; etiketleyicinin kör kaldığı kareler bozuk dosya
+        # sanılıp gözden kaçıyordu. Artık ayrı sayılır.
+        skipped_unreadable = 0
+        skipped_unlabeled = 0
+        sample_counter = 0
+        # P2-8: iptal bayrağı — kare/varyant sınırında kontrol edilir.
+        cancelled = False
 
-            for src_tag, img_path in source_files:
-                frame = imread_unicode(img_path, cv2.IMREAD_COLOR)
-                if frame is None or frame.size == 0:
-                    skipped_files += 1
-                    continue
+        def _stop_requested() -> bool:
+            if should_stop is None:
+                return False
+            try:
+                return bool(should_stop())
+            except Exception:
+                return False
 
-                img_h, img_w = frame.shape[:2]
-                annotations = self.auto_label_frame(frame, source_path=img_path)
-                if not annotations:
-                    skipped_files += 1
-                    continue
+        for _src_idx, (src_tag, img_path) in enumerate(source_files):
+            # P2-8: iptal yalnızca kare sınırında — yarım örnek yazılmaz.
+            if _stop_requested():
+                cancelled = True
+                logger.info(
+                    "Dataset bootstrap iptal edildi (%d/%d kaynak işlendi).",
+                    _src_idx,
+                    len(source_files),
+                )
+                break
+            frame = imread_unicode(img_path, cv2.IMREAD_COLOR)
+            if frame is None or frame.size == 0:
+                skipped_unreadable += 1
+                continue
 
-                # Determine deterministic train/val split (~85% train, ~15% val)
-                if qgate is not None and hasattr(qgate, "choose_split"):
-                    base_split = str(qgate.choose_split(sample_counter, val_ratio=self.val_ratio))
-                else:
-                    base_split = "val" if (sample_counter % 6 == 0) else "train"
-                sample_counter += 1
+            img_h, img_w = frame.shape[:2]
+            annotations = self.auto_label_frame(frame, source_path=img_path)
+            if not annotations:
+                skipped_unlabeled += 1
+                continue
 
-                base_stem = f"{src_tag}_{img_path.stem}"
-                self.save_labeled_sample(
+            # Deterministic train/val split (~85% train, ~15% val) from
+            # the single factory schedule (D37/F-0924).
+            base_split = self._choose_split(sample_counter, val_ratio=self.val_ratio)
+            sample_counter += 1
+
+            base_stem = f"{src_tag}_{img_path.stem}"
+            self.save_labeled_sample(
+                frame=frame,
+                annotations=annotations,
+                split=base_split,
+                prefix=src_tag,
+                save_preview=save_base_previews,
+                sample_name=base_stem,
+                update_manifest=False,
+            )
+            base_saved += 1
+
+            # Generate `augment_factor` synthetic variants
+            if augment_factor > 0:
+                variants = self._generate_variants_with_fallback(
                     frame=frame,
                     annotations=annotations,
-                    split=base_split,
-                    prefix=src_tag,
-                    save_preview=save_base_previews,
-                    sample_name=base_stem,
-                    update_manifest=False,
+                    augment_factor=augment_factor,
                 )
-                base_saved += 1
-
-                # Generate `augment_factor` synthetic variants
-                if augment_factor > 0:
-                    variants = self._generate_variants_with_fallback(
-                        frame=frame,
-                        annotations=annotations,
-                        augment_factor=augment_factor,
+                for suffix, aug_frame, aug_anns in variants:
+                    # P2-8: iptal varyant sınırında da kontrol edilir.
+                    if _stop_requested():
+                        cancelled = True
+                        break
+                    valid_aug_anns = self.normalize_annotations(
+                        aug_anns, img_w=img_w, img_h=img_h
                     )
-                    for suffix, aug_frame, aug_anns in variants:
-                        valid_aug_anns = self.normalize_annotations(
-                            aug_anns, img_w=img_w, img_h=img_h
-                        )
-                        if not valid_aug_anns:
-                            continue
+                    if not valid_aug_anns:
+                        continue
 
-                        if qgate is not None and hasattr(qgate, "choose_split"):
-                            var_split = str(
-                                qgate.choose_split(sample_counter, val_ratio=self.val_ratio)
-                            )
-                        else:
-                            var_split = "val" if (sample_counter % 6 == 0) else "train"
-                        sample_counter += 1
+                    # K2 (dilim 03): varyant ana kareyle AYNI split'e
+                    # gider — eskiden sayaç artırılıp ayrı `_choose_split`
+                    # çağrılıyordu; ana kare train'deyken varyantı val'e
+                    # düşebiliyor, val train'in kopyasını ölçüyordu.
+                    var_split = base_split
 
-                        var_stem = f"{base_stem}_{suffix}"
-                        self.save_labeled_sample(
-                            frame=aug_frame,
-                            annotations=valid_aug_anns,
-                            split=var_split,
-                            prefix=src_tag,
-                            save_preview=save_variant_previews,
-                            sample_name=var_stem,
-                            update_manifest=False,
-                        )
-                        augmented_saved += 1
+                    var_stem = f"{base_stem}_{suffix}"
+                    self.save_labeled_sample(
+                        frame=aug_frame,
+                        annotations=valid_aug_anns,
+                        split=var_split,
+                        prefix=src_tag,
+                        save_preview=save_variant_previews,
+                        sample_name=var_stem,
+                        update_manifest=False,
+                    )
+                    augmented_saved += 1
 
-            # Ensure all 12 canonical resource classes have representative exemplars in both
-            # train and val splits so downstream 12-class YOLO / Prototype training has full coverage
+        # Ensure all 27 canonical classes have representative exemplars in both
+        # train and val splits so downstream YOLO training has full coverage
+        # (seeding itself is disabled -- see _seed_missing_class_exemplars).
+        # P2-8: iptalde tohumlama atlanır — kısmi manifest olduğu gibi kalır.
+        seeded_exemplars = 0
+        if not cancelled:
             seeded_exemplars = self._seed_missing_class_exemplars(
                 source_files=source_files,
                 sample_counter_start=sample_counter,
             )
 
-            manifest = self.rebuild_manifest_stats()
+        manifest = self.rebuild_manifest_stats()
 
-            summary: Dict[str, Any] = {
-                "bootstrapped": True,
-                "source_images_found": len(source_files),
-                "source_images_skipped": skipped_files,
-                "base_samples_saved": base_saved,
-                "augmented_samples_saved": augmented_saved,
-                "class_coverage_exemplars_saved": seeded_exemplars,
-                "total_samples_saved": base_saved + augmented_saved + seeded_exemplars,
-                "train_count": manifest["train_count"],
-                "val_count": manifest["val_count"],
-                "total_images": manifest["total_images"],
-                "target_goal": manifest["target_goal"],
-                "total_boxes": manifest["total_boxes"],
-                "class_counts": manifest["class_counts"],
-                "data_yaml_path": str(self.data_yaml_path),
-                "manifest_stats_path": str(self.manifest_stats_path),
-                "manifest_stats": manifest,
-            }
-            logger.info(
-                "Dataset bootstrap complete: %d total images (train=%d, val=%d), %d bounding boxes across %d classes.",
-                manifest["total_images"],
-                manifest["train_count"],
-                manifest["val_count"],
-                manifest["total_boxes"],
-                len(self.class_names),
-            )
-            return summary
+        total_saved = base_saved + augmented_saved + seeded_exemplars
+        classes_covered = sum(
+            1 for count in manifest["class_counts"].values() if count > 0
+        )
+        summary: Dict[str, Any] = {
+            # D37/F-0839: "bootstrapped" is only True when at least one sample
+            # was actually saved; with zero sources/samples the old code
+            # still reported True. Coverage is measured from the manifest
+            # (the exemplar seeder is a deliberate no-op stub -- see
+            # _seed_missing_class_exemplars -- so it must not be reported
+            # as coverage).
+            "bootstrapped": bool(total_saved > 0),
+            # P2-8: kısmi (iptal edilmiş) tarama açıkça işaretlenir.
+            "cancelled": bool(cancelled),
+            "interrupted": bool(cancelled),
+            "source_images_found": len(source_files),
+            "source_images_skipped": skipped_unreadable + skipped_unlabeled,
+            "source_images_skipped_unreadable": skipped_unreadable,
+            "source_images_skipped_unlabeled": skipped_unlabeled,
+            "base_samples_saved": base_saved,
+            "augmented_samples_saved": augmented_saved,
+            "class_coverage_exemplars_saved": seeded_exemplars,
+            "total_samples_saved": total_saved,
+            "classes_covered": classes_covered,
+            "class_coverage_complete": classes_covered >= len(self.class_names),
+            "train_count": manifest["train_count"],
+            "val_count": manifest["val_count"],
+            "total_images": manifest["total_images"],
+            "target_goal": manifest["target_goal"],
+            "total_boxes": manifest["total_boxes"],
+            "class_counts": manifest["class_counts"],
+            "data_yaml_path": str(self.data_yaml_path),
+            "manifest_stats_path": str(self.manifest_stats_path),
+            "manifest_stats": manifest,
+        }
+        logger.info(
+            "Dataset bootstrap complete: %d total images (train=%d, val=%d), %d bounding boxes across %d classes.",
+            manifest["total_images"],
+            manifest["train_count"],
+            manifest["val_count"],
+            manifest["total_boxes"],
+            len(self.class_names),
+        )
+        return summary
 
     def _seed_missing_class_exemplars(
         self,
@@ -1794,20 +2454,46 @@ class DatasetCurator:
         return 0
 
     def get_curator_health_summary(self) -> dict:
-        """Return DatasetCurator health and Unicode I/O readiness summary."""
+        """
+        Return DatasetCurator health and Unicode I/O readiness summary.
+
+        D37/F-0928: this used to return `True` unconditionally. It now
+        actually checks: the dataset directories exist, `data.yaml` lists
+        the full canonical class table, and a Unicode-named image survives
+        an imwrite/imread round-trip.
+        """
+        checks: Dict[str, bool] = {
+            "dataset_dirs": False,
+            "data_yaml_classes": False,
+            "unicode_io": False,
+        }
         try:
-            return {"curator_ready": True, "unicode_io": True}
-        except Exception:
-            return {"curator_ready": False, "unicode_io": False}
+            checks["dataset_dirs"] = bool(
+                self.images_train_dir.is_dir()
+                and self.images_val_dir.is_dir()
+                and self.labels_train_dir.is_dir()
+                and self.labels_val_dir.is_dir()
+            )
+            if self.data_yaml_path.is_file():
+                yaml_text = self.data_yaml_path.read_text(encoding="utf-8")
+                checks["data_yaml_classes"] = all(
+                    f"  {cid}: {name}" in yaml_text
+                    for cid, name in sorted(self.class_names.items())
+                )
+            import tempfile
 
-    def get_dataset_curator_ready_flag(self) -> dict:
-        return {"module": "dataset_curator", "ready": True}
+            probe = np.zeros((8, 8, 3), dtype=np.uint8)
+            probe[:, :] = (10, 120, 200)
+            with tempfile.TemporaryDirectory() as tmp:
+                probe_path = Path(tmp) / "sağlık_probesi_çerçeve.jpg"
+                if imwrite_unicode(probe_path, probe):
+                    back = imread_unicode(probe_path)
+                    checks["unicode_io"] = back is not None and back.shape == probe.shape
+        except Exception as exc:
+            logger.debug("Curator health check failed: %s", exc)
+        ready = all(checks.values())
+        return {"curator_ready": ready, **checks}
 
-    def get_dataset_curator_version_info(self) -> dict:
-        return {"module": "dataset_curator", "version": "2.0.0", "ready": True}
-
-    def get_dataset_curator_diagnostic_snapshot(self) -> dict:
-        return {"module": "dataset_curator", "status": "ok", "ready": True}
 
     @property
     def label_cache_path(self) -> Path:
@@ -1817,7 +2503,10 @@ class DatasetCurator:
         if self.label_cache_path.is_file():
             try:
                 return json.loads(self.label_cache_path.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as exc:
+                # D4: bozuk cache eskiden sessizce boş sayılıyordu;
+                # tekrarlayan bozulma fark edilmiyordu.
+                logger.warning("Bozuk etiket cache'i yoksayıldı (%s): %s", self.label_cache_path, exc)
                 return {}
         return {}
 
@@ -1874,6 +2563,8 @@ class DatasetCurator:
                 "processed": 0,
                 "labeled": 0,
                 "skipped": 0,
+                "errors": 0,
+                "error_stems": [],
                 "total_boxes": 0,
                 "fps": 0.0,
                 "elapsed_seconds": 0.0,
@@ -1902,7 +2593,11 @@ class DatasetCurator:
                 _tls.labeler = YOLOAutoLabeler()
             return _tls.labeler
 
-        from dataset_factory.label_trust import train_txt_boxes, _rewrite_label_txt
+        from dataset_factory.label_trust import (
+            _load_state,
+            train_txt_boxes,
+            write_review_pair,
+        )
 
         def _process_one(img_p: Path) -> Dict[str, Any]:
             frame = None
@@ -1911,13 +2606,22 @@ class DatasetCurator:
             try:
                 st = img_p.stat()
                 stem = img_p.stem
-                is_val = ("val" in img_p.parts) or (img_p.parent.name == "val")
+                # D37/F-1034: the split is decided by the exact split
+                # directory the image lives in, not by a "val" membership
+                # test over path parts.
+                try:
+                    is_val = img_p.resolve().parent == self.images_val_dir.resolve()
+                except OSError:
+                    is_val = img_p.parent.name == "val"
                 split = "val" if is_val else "train"
 
                 review_file = self.dataset_dir / "review" / split / f"{stem}.json"
                 label_file = self.dataset_dir / "labels" / split / f"{stem}.txt"
 
-                cache_key = img_p.name
+                # D37/F-0840: the cache key is the full resolved path, not
+                # just the filename -- train/0001.jpg and val/0001.jpg used
+                # to collide, and a weak-boxed file was skipped forever.
+                cache_key = str(img_p.resolve())
                 c_entry = cache.get(cache_key)
 
                 # Incremental skip check: only skip if genuinely has boxes (>0) and matching stat
@@ -1941,6 +2645,56 @@ class DatasetCurator:
                             "key": cache_key,
                         }
 
+                # P1-17 / K-06: turbo eski review/TXT'yi hiç okumadan
+                # eziyordu — el etiketleri sessizce kayboluyordu (iki
+                # aşamalı kayıp: review ezilir, sonraki commit TXT'yi
+                # de götürür). Önce mevcut durumu oku: _load_state
+                # review JSON + TXT'yi uzlaştırır (TXT-only el etiketi
+                # trusted'a taşınır, K-01/K-03) ve bozuk review'u
+                # meta'da bildirir. Bozuk review fail-closed: içeriği
+                # bilinmeyen kare üzerine yazılmaz (P1-16/K-05).
+                existing_hand_trusted: List[Dict[str, Any]] = []
+                existing_hand_weak: List[Dict[str, Any]] = []
+                try:
+                    prev_trusted, prev_weak, prev_meta = _load_state(
+                        self.dataset_dir, split, stem, label_file,
+                        return_meta=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Turbo: mevcut durum okunamadı, %s atlanıyor: %s",
+                        stem, exc,
+                    )
+                    return {
+                        "stem": stem,
+                        "status": "error",
+                        "boxes": 0,
+                        "error": "existing_state_unreadable",
+                        "key": cache_key,
+                    }
+                if prev_meta.get("review_corrupt"):
+                    logger.warning(
+                        "Turbo: bozuk review JSON, %s üzerine yazılmıyor "
+                        "(el etiketi kaybı engellendi).",
+                        stem,
+                    )
+                    return {
+                        "stem": stem,
+                        "status": "error",
+                        "boxes": 0,
+                        "error": "review_corrupt",
+                        "key": cache_key,
+                    }
+                for b in prev_trusted:
+                    if _is_hand_box(b):
+                        existing_hand_trusted.append(dict(b))
+                for b in prev_weak:
+                    # Weak'teki el kutusu şüpheliye ayrılmış el
+                    # etiketidir (demote): trusted'a terfi ettirilmez,
+                    # weak'te korunur — kullanıcı kararı korunur.
+                    if _is_hand_box(b) or b.get("demoted_by_user") is True:
+                        existing_hand_weak.append(dict(b))
+
                 frame = imread_unicode(img_p, cv2.IMREAD_COLOR)
                 if frame is None or frame.size == 0:
                     return {
@@ -1952,7 +2706,14 @@ class DatasetCurator:
                     }
 
                 labeler = _get_worker_labeler()
-                raw_anns = labeler.auto_label_frame(frame, fast_mode=True, source_path=img_p)
+                # V20-YZ-ETİKET: yeniden etiketleme karedeki HER ŞEYİ etiketler
+                # (full_scan=True). Stem learn_monsters_* olsa bile HUD (16-24)
+                # ve yol/engel (14/15) kutuları üretilir; yoksa relabel yalnızca
+                # canavar + materyal + minimap kutusu üretebilirdi. Kutular
+                # zayıf-cap'lidir, incelemeye düşer, onaysız TXT'ye girmez.
+                raw_anns = labeler.auto_label_frame(
+                    frame, fast_mode=True, source_path=img_p, full_scan=True
+                )
                 norm_anns = self.normalize_annotations(
                     raw_anns, img_w=frame.shape[1], img_h=frame.shape[0]
                 )
@@ -1966,30 +2727,101 @@ class DatasetCurator:
                     else:
                         weak_list.append(b_cal)
 
-                # Persist review json (skip preview image generation to maximize batch throughput)
+                # P1-17 / K-06: canlı yol deseni
+                # (ui/yolo_factory_dialog.py::_relabel_single_item):
+                # el etiketleri model çıktısıyla değiştirilmez — önce
+                # korunur, model kutuları yalnızca çakışmayanlar
+                # eklenir. Trusted kökenli el kutusu trusted'ta,
+                # weak'teki el kutusu weak'te kalır (terfi yok).
+                # Bu birleştirme olmadan 0-kutu bulan model bile
+                # review'u boşaltıp el etiketini yok ediyordu
+                # (F-0789 yalnızca TXT'yi koruyordu, review'u değil).
+                existing_hand_all = existing_hand_trusted + existing_hand_weak
+                merged_trusted: List[Dict[str, Any]] = list(existing_hand_trusted)
+                for b in trusted_list:
+                    if not any(
+                        _turbo_box_identity_match(b, h) for h in existing_hand_all
+                    ):
+                        merged_trusted.append(b)
+                merged_weak: List[Dict[str, Any]] = list(existing_hand_weak)
+                for b in weak_list:
+                    if not any(
+                        _turbo_box_identity_match(b, h) for h in existing_hand_all
+                    ):
+                        merged_weak.append(b)
+
+                # Persist review json + label txt through the single
+                # writer (P3-26): the old hand-rolled `write_text` for
+                # the JSON was non-atomic, and a JSON-empty/TXT-old
+                # divergence was possible (F026-03). The pair writer
+                # computes the TXT emit with the canonical rule and
+                # writes both files atomically (.tmp + os.replace,
+                # .bak before overwrite).
                 rev_payload = {
                     "stem": stem,
                     "image_path": str(img_p),
-                    "trusted": trusted_list,
-                    "weak": weak_list,
+                    "trusted": merged_trusted,
+                    "weak": merged_weak,
                     "requeued_at": time.time(),
                 }
-                review_file.write_text(
-                    json.dumps(rev_payload, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
-
-                # Persist label txt
                 emit_boxes = train_txt_boxes(
-                    trusted_list, weak_list, stem=stem, floor=conf_floor
+                    merged_trusted, merged_weak, stem=stem, floor=conf_floor
                 )
-                _rewrite_label_txt(label_file, emit_boxes)
+                # D37/F-0789: when the auto-labeler finds nothing, do NOT
+                # blank an existing non-empty label file -- the pair
+                # writer refuses an empty emit over a non-empty TXT (P0-1)
+                # and reports it via txt_written=False; the previous
+                # labels are kept and recorded below.
+                pair = write_review_pair(
+                    review_path=review_file,
+                    label_path=label_file,
+                    review_payload=rev_payload,
+                    stem=stem,
+                    floor=conf_floor,
+                    emit_boxes=emit_boxes,
+                )
+                kept_existing_labels = not pair["txt_written"]
+
+                # O9: özet/cache eskiden normalize edilmiş ham kutu sayısını
+                # (`len(norm_anns)`) yazıyordu — eşik-altı/zayıf kutular
+                # txt'ye girmese bile "kutu var" sayılıyordu; txt'si boş ama
+                # box_count>0 olan dosya sonsuza dek atlanıyordu. Artık
+                # txt'ye GERÇEKTEN yazılan kutu sayılır.
+                if kept_existing_labels:
+                    try:
+                        written_boxes = sum(
+                            1
+                            for _ln in label_file.read_text(
+                                encoding="utf-8", errors="ignore"
+                            ).splitlines()
+                            if _ln.strip()
+                        )
+                    except OSError:
+                        written_boxes = 0
+                else:
+                    written_boxes = len(emit_boxes)
 
                 return {
                     "stem": stem,
                     "status": "labeled",
-                    "boxes": len(norm_anns),
-                    "trusted": len(trusted_list),
-                    "weak": len(weak_list),
+                    "boxes": written_boxes,
+                    # O9/E-07 ayrımı: "boxes" txt'ye GERÇEKTEN yazılanı
+                    # sayar (total_boxes özeti için — W44 pin'i). Cache'in
+                    # "box_count"u ise ayrı bir soruyu yanıtlar: "bu kare
+                    # etiketlendi mi?" — review JSON'a kalıcı yazılan
+                    # (trusted+weak) kutu sayısı. E-07 sonrası relabel
+                    # weak-only üretebilir (txt boş kalır) ama kare
+                    # etiketlenmiştir: atlama kararı onu saymazsa Work
+                    # Package F'in artımlı önbelleği hiç atlamaz. 0-box
+                    # koruması aynen durur: labeler hiç kutu bulamadıysa
+                    # labeled_boxes=0 olur ve kare asla atlanmaz.
+                    # P1-17: merged listeler sayılır — el etiketleri de
+                    # review'a kalıcı yazılan kutudur.
+                    "labeled_boxes": len(merged_trusted) + len(merged_weak),
+                    "trusted": len(merged_trusted),
+                    "weak": len(merged_weak),
+                    "hand_preserved": len(existing_hand_all),
+                    "kept_existing_labels": kept_existing_labels,
                     "mtime_ns": st.st_mtime_ns,
                     "size": st.st_size,
                     "exemplar_rev": ex_rev,
@@ -2001,7 +2833,7 @@ class DatasetCurator:
                     "status": "error",
                     "boxes": 0,
                     "error": str(exc),
-                    "key": img_p.name,
+                    "key": str(img_p.resolve()),
                 }
             finally:
                 # Explicit cleanup to ensure immediate memory freeing without leaks
@@ -2014,6 +2846,10 @@ class DatasetCurator:
         labeled_count = 0
         skipped_count = 0
         total_boxes = 0
+        # D37/F-0841: per-image errors used to be swallowed -- the summary
+        # reported no error count at all. Count them and keep the stems.
+        error_count = 0
+        error_stems: List[str] = []
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_process_one, p) for p in target_paths]
@@ -2026,14 +2862,21 @@ class DatasetCurator:
 
                 if status == "skipped":
                     skipped_count += 1
+                elif status == "error":
+                    error_count += 1
+                    if len(error_stems) < 20:
+                        error_stems.append(str(res.get("stem", "?")))
                 elif status == "labeled":
                     labeled_count += 1
                     cache_key = res.get("key")
                     if cache_key:
+                        # Cache box_count = review'a yazılan kutu (bkz.
+                        # yukarıdaki O9/E-07 ayrımı); "boxes" (txt'ye
+                        # yazılan) yalnızca total_boxes özetine girer.
                         cache[cache_key] = {
                             "mtime_ns": res.get("mtime_ns"),
                             "size": res.get("size"),
-                            "box_count": boxes,
+                            "box_count": res.get("labeled_boxes", boxes),
                             "exemplar_rev": res.get("exemplar_rev"),
                             "updated_at": time.time(),
                         }
@@ -2073,6 +2916,8 @@ class DatasetCurator:
             "processed": processed,
             "labeled": labeled_count,
             "skipped": skipped_count,
+            "errors": error_count,
+            "error_stems": error_stems,
             "total_boxes": total_boxes,
             "fps": batch_fps,
             "elapsed_seconds": round(batch_duration, 2),
@@ -2093,6 +2938,7 @@ def relabel_dataset_batch(
 __all__ = [
     "TARGET_DATASET_GOAL",
     "YOLO_12_CLASS_NAMES",
+    "YOLO_CLASS_NAMES",
     "CLASS_NAME_TO_ID",
     "DatasetCurator",
     "relabel_dataset_batch",
@@ -2101,14 +2947,6 @@ __all__ = [
     "imwrite_unicode",
     "UNVERIFIED_HEURISTIC_SOURCES",
     "calibrate_box_trust",
-    "get_dataset_curator_baseline_metrics",
-    "get_dataset_curator_readiness_status",
-    "get_dataset_curator_audit_record",
-    "get_dataset_curator_operational_digest",
-    "get_dataset_curator_telemetry_payload",
-    "get_dataset_curator_integrity_seal",
-    "get_dataset_curator_compliance_certificate",
-    "get_dataset_curator_readiness_probe",
 ]
 
 
@@ -2117,47 +2955,4 @@ if __name__ == "__main__":
     result = curator.bootstrap_from_existing_frames(augment_factor=3)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
-
-def get_dataset_curator_capabilities() -> list:
-    return ["dataset_curator", "class_balancing", "diagnostic_snapshot"]
-
-
-def validate_dataset_curator_contract() -> bool:
-    return bool(get_dataset_curator_capabilities())
-
-
-def get_dataset_curator_baseline_metrics() -> dict:
-    return {"module": "dataset_curator", "contract_valid": validate_dataset_curator_contract(), "curator_ready": True}
-
-
-def get_dataset_curator_readiness_status() -> dict:
-    return {"module": "dataset_curator", "ready": validate_dataset_curator_contract(), "metrics": get_dataset_curator_baseline_metrics()}
-
-
-def get_dataset_curator_audit_record() -> dict:
-    return {"module": "dataset_curator", "audit_passed": validate_dataset_curator_contract(), "readiness": get_dataset_curator_readiness_status()}
-
-
-def get_dataset_curator_operational_digest() -> dict:
-    return {"module": "dataset_curator", "operational": validate_dataset_curator_contract(), "audit": get_dataset_curator_audit_record()}
-
-
-def get_dataset_curator_telemetry_payload() -> dict:
-    return {"module": "dataset_curator", "payload": get_dataset_curator_operational_digest()}
-
-
-def get_dataset_curator_integrity_seal() -> dict:
-    return {"module": "dataset_curator", "sealed": validate_dataset_curator_contract(), "telemetry": get_dataset_curator_telemetry_payload()}
-
-
-def get_dataset_curator_compliance_certificate() -> dict:
-    return {"module": "dataset_curator", "certified": validate_dataset_curator_contract(), "seal": get_dataset_curator_integrity_seal()}
-
-
-def get_dataset_curator_readiness_probe() -> dict:
-    return {"module": "dataset_curator", "ready": validate_dataset_curator_contract(), "certificate": get_dataset_curator_compliance_certificate()}
-
-
-def get_dataset_curator_audit_summary() -> dict:
-    return {"module": "dataset_curator", "audit_passed": validate_dataset_curator_contract(), "probe": get_dataset_curator_readiness_probe()}
 

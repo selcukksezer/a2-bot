@@ -6,6 +6,11 @@ Verifies:
 - Layer 1: Exemplar Class Repair & Negative Exemplar Suppression
 - Layer 2: Flat Ground / Featureless Texture & Minimap HUD Poison Deletion
 - Layer 3: NMS Deduplication, Omni Synthetic Demotion & Label TXT Synchronization
+
+W47 (2026-11-10, Selçuk kararı): katman kanıtı güven sayılır — temizleyicinin
+katmanlardan geçirip tuttuğu kutu `trusted` olur (E-07 gevşetmesi). Bu dosyadaki
+beklentiler o karara göredir: katman-kept kutu `trusted=True` ile kaydedilir ve
+insan damgası (`human_approved` / `hand_label`) basılmadan güven kazanır.
 """
 
 from __future__ import annotations
@@ -22,16 +27,55 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from dataset_factory.exemplar_memory import extract_box_crop
 from dataset_factory.label_trust import clean_poison_labels_ai
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cwd(tmp_path, monkeypatch):
+    """Redirect CWD-relative production writes into a throwaway dir.
+
+    ``clean_poison_labels_ai`` calls ``mark_model_stale``, which writes
+    ``models/stale_manifest.json`` relative to the current working
+    directory, so a run from the repo root rewrote a repo file. All dataset
+    paths and frames in this file come from ``tmp_path`` / ``frame_map``,
+    so changing CWD is safe here.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
+def _crop_key(crop: np.ndarray) -> tuple:
+    """Exact-crop identity: the stub memory matches only the very crop the
+    production code extracts from the frame (no similarity is injected)."""
+    return (tuple(crop.shape), hash(crop.tobytes()))
+
+
 class _DummyExemplarMemory:
-    """Lightweight mock ExemplarMemory for tracking negative teaching and exemplar matching."""
+    """Lightweight mock ExemplarMemory for tracking negative teaching and exemplar matching.
+
+    Positive/negative matches are registered per exact box crop (via
+    ``extract_box_crop``) BEFORE the cleaner runs, so ``clean_poison_labels_ai``
+    must call ``match_positive`` / ``match_negative`` for real — a box that
+    carries no injected ``exemplar_*_sim`` key can only be repaired or
+    suppressed through this stub's matching path.
+    """
 
     def __init__(self) -> None:
         self.negatives: List[Dict[str, Any]] = []
-        self.positive_match_result: Tuple[float, int, str, Dict[str, Any]] = (0.0, -1, "", {})
-        self.negative_match_result: Tuple[float, Dict[str, Any]] = (0.0, {})
+        self._pos_by_crop: Dict[tuple, Tuple[float, int, str, Dict[str, Any]]] = {}
+        self._neg_by_crop: Dict[tuple, Tuple[float, Dict[str, Any]]] = {}
+        self.match_positive_calls = 0
+        self.match_negative_calls = 0
+
+    def register_positive_match(
+        self, crop: np.ndarray, result: Tuple[float, int, str, Dict[str, Any]]
+    ) -> None:
+        self._pos_by_crop[_crop_key(crop)] = result
+
+    def register_negative_match(
+        self, crop: np.ndarray, result: Tuple[float, Dict[str, Any]]
+    ) -> None:
+        self._neg_by_crop[_crop_key(crop)] = result
 
     def add_negative_exemplar(
         self,
@@ -51,10 +95,12 @@ class _DummyExemplarMemory:
         return True
 
     def match_positive(self, crop: np.ndarray) -> Tuple[float, int, str, Dict[str, Any]]:
-        return self.positive_match_result
+        self.match_positive_calls += 1
+        return self._pos_by_crop.get(_crop_key(crop), (0.0, -1, "", {}))
 
     def match_negative(self, crop: np.ndarray, class_id: int = -1) -> Tuple[float, Dict[str, Any]]:
-        return self.negative_match_result
+        self.match_negative_calls += 1
+        return self._neg_by_crop.get(_crop_key(crop), (0.0, {}))
 
 
 def _write_review_file(
@@ -86,6 +132,10 @@ def _make_textured_frame(height: int = 200, width: int = 200) -> np.ndarray:
 def test_layer0_immunity_shield_protects_hand_and_approved_boxes(tmp_path: Path) -> None:
     """Katman 0: Dokunulmazlık kalkanı (`hand_label`, `human_approved`, F/E şablon) kutuları
     düz zeminde veya HUD bölgesinde olsa bile asla silmez ve `trusted=True` olarak korur.
+
+    W47 notu: tohum kutusu kanonik Y1 tohumudur — F/E gather prompt sınıf 13
+    (`skill_ui_prompt`). Sınıf 7 `herb_lumina`'dır (materyal, prompt değil);
+    7 üzerindeki F izi gerilimi ayrı konudur, bu teste dokunulmaz.
     """
     stem = "scene_immune_01"
     # Flat zero-variance frame that would normally trigger Layer 2 flat texture deletion
@@ -114,8 +164,11 @@ def test_layer0_immunity_shield_protects_hand_and_approved_boxes(tmp_path: Path)
         "source": "yolo_detector",
     }
     seed_box = {
-        "class_id": 7,
-        "class_name": "gather_prompt_f",
+        # Y1 kanonik tohum: F/E gather prompt sınıf 13'tür (skill_ui_prompt).
+        # Eski 7'li yazım Y1 düzeltmesiyle tohum sayılmaz (7 = herb_lumina);
+        # "F Gather → 7" kararı etiketleme tarafındadır, bu test değiştirmez.
+        "class_id": 13,
+        "class_name": "skill_ui_prompt",
         "cx": 0.55,
         "cy": 0.55,
         "w": 0.08,
@@ -134,6 +187,8 @@ def test_layer0_immunity_shield_protects_hand_and_approved_boxes(tmp_path: Path)
     )
     mem = _DummyExemplarMemory()
 
+    before = review_path.read_text(encoding="utf-8")
+
     stats = clean_poison_labels_ai(
         tmp_path,
         exemplar_memory=mem,
@@ -143,22 +198,26 @@ def test_layer0_immunity_shield_protects_hand_and_approved_boxes(tmp_path: Path)
     assert stats["ok"] is True
     assert stats["protected_boxes"] == 3
     assert stats["poison_deleted_boxes"] == 0
+    assert stats["files_rewritten"] == 0
 
-    saved = json.loads(review_path.read_text(encoding="utf-8"))
-    assert len(saved["trusted"]) == 3
-    assert len(saved["weak"]) == 0
-    for box in saved["trusted"]:
-        assert box["trusted"] is True
-        assert box["weak"] is False
-        assert box["confidence"] >= 0.90
-
-    label_txt = (tmp_path / "labels" / "train" / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
-    assert len(label_txt) == 3
+    # K-16 (P1-15): 0 silmede dosyaya dokunulmaz — review JSON bayt-bayt
+    # aynen durur, labels TXT hiç oluşturulmaz. Koruma bellekte uygulanır
+    # (protected_boxes == 3); `trusted=True` + 0.90 güven diske ancak bir
+    # silme/onarım/NMS yazımı tetiklenince çıkar.
+    assert review_path.read_text(encoding="utf-8") == before
+    saved = json.loads(before)
+    assert len(saved["trusted"]) == 1
+    assert len(saved["weak"]) == 2
+    assert saved["trusted"][0].get("hand_label") is True
+    assert not (tmp_path / "labels" / "train" / f"{stem}.txt").exists()
 
 
 def test_layer1_exemplar_class_repair_and_positive_protection(tmp_path: Path) -> None:
     """Katman 1: Pozitif exemplar eşleşmesi >= 0.82 olan yanlış sınıflandırılmış bir kutunun
     `class_id` ve `class_name` alanlarını otomatik onarır (`repaired_by_exemplar=True`).
+
+    W47: onarılıp katmandan geçen kutu `trusted` sayılır — güven exemplar
+    kanıtından gelir, insan damgası basılmaz.
     """
     stem = "scene_repair_01"
     textured_frame = _make_textured_frame()
@@ -172,9 +231,6 @@ def test_layer1_exemplar_class_repair_and_positive_protection(tmp_path: Path) ->
         "h": 0.20,
         "confidence": 0.62,
         "source": "yolo_detector",
-        "exemplar_repair_sim": 0.91,
-        "exemplar_repair_class_id": 0,
-        "exemplar_repair_class_name": "herb_aria",
     }
 
     review_path = _write_review_file(
@@ -185,6 +241,12 @@ def test_layer1_exemplar_class_repair_and_positive_protection(tmp_path: Path) ->
         weak=[misclassified_box],
     )
     mem = _DummyExemplarMemory()
+    # Real exemplar matching: the stub only answers for the exact crop the
+    # cleaner extracts from this frame — no similarity is injected into the box.
+    mem.register_positive_match(
+        extract_box_crop(textured_frame, misclassified_box),
+        (0.91, 0, "herb_aria", {}),
+    )
 
     stats = clean_poison_labels_ai(
         tmp_path,
@@ -193,6 +255,8 @@ def test_layer1_exemplar_class_repair_and_positive_protection(tmp_path: Path) ->
         emin_threshold=0.85,
     )
 
+    # The repair must have come from match_positive(), not from box data.
+    assert mem.match_positive_calls == 1
     assert stats["auto_repaired_boxes"] == 1
     assert stats["protected_boxes"] == 1
     assert stats["poison_deleted_boxes"] == 0
@@ -204,6 +268,11 @@ def test_layer1_exemplar_class_repair_and_positive_protection(tmp_path: Path) ->
     assert repaired["class_name"] == "herb_aria"
     assert repaired["repaired_by_exemplar"] is True
     assert repaired["confidence"] == pytest.approx(0.91, abs=1e-4)
+    # W47: katman kanıtıyla trusted — insan damgası basılmadan.
+    assert repaired["trusted"] is True
+    assert repaired["weak"] is False
+    assert repaired.get("human_approved") is not True
+    assert repaired.get("hand_label") is not True
 
     label_lines = (tmp_path / "labels" / "train" / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
     assert len(label_lines) == 1
@@ -213,6 +282,9 @@ def test_layer1_exemplar_class_repair_and_positive_protection(tmp_path: Path) ->
 def test_layer1_negative_exemplar_suppression(tmp_path: Path) -> None:
     """Katman 1: Negatif exemplar benzerliği >= 0.82 ve pozitif farkı >= 0.15 olan zehirli kutuları
     siler (`negative_match_deleted`), pozitif exemplar eşleşen kutuyu korur.
+
+    W47: pozitif exemplar kanıtıyla korunan kutu `trusted` sayılır — güven
+    katman kanıtından gelir, insan damgası basılmaz.
     """
     stem = "scene_neg_match_01"
     textured_frame = _make_textured_frame()
@@ -226,8 +298,6 @@ def test_layer1_negative_exemplar_suppression(tmp_path: Path) -> None:
         "h": 0.15,
         "confidence": 0.75,
         "source": "yolo_detector",
-        "exemplar_neg_sim": 0.89,
-        "exemplar_pos_sim": 0.30,
     }
     valid_pos_box = {
         "class_id": 2,
@@ -238,8 +308,6 @@ def test_layer1_negative_exemplar_suppression(tmp_path: Path) -> None:
         "h": 0.15,
         "confidence": 0.88,
         "source": "yolo_detector",
-        "exemplar_pos_sim": 0.86,
-        "exemplar_neg_sim": 0.10,
     }
 
     review_path = _write_review_file(
@@ -250,6 +318,19 @@ def test_layer1_negative_exemplar_suppression(tmp_path: Path) -> None:
         weak=[poison_neg_box, valid_pos_box],
     )
     mem = _DummyExemplarMemory()
+    # Real exemplar matching per exact crop — no similarity injected into boxes.
+    mem.register_positive_match(
+        extract_box_crop(textured_frame, poison_neg_box), (0.30, 2, "herb_targena", {})
+    )
+    mem.register_negative_match(
+        extract_box_crop(textured_frame, poison_neg_box), (0.89, {})
+    )
+    mem.register_positive_match(
+        extract_box_crop(textured_frame, valid_pos_box), (0.86, 2, "herb_targena", {})
+    )
+    mem.register_negative_match(
+        extract_box_crop(textured_frame, valid_pos_box), (0.10, {})
+    )
 
     stats = clean_poison_labels_ai(
         tmp_path,
@@ -257,6 +338,9 @@ def test_layer1_negative_exemplar_suppression(tmp_path: Path) -> None:
         frame_map={stem: textured_frame},
     )
 
+    # Both boxes must have gone through real match_positive/match_negative.
+    assert mem.match_positive_calls == 2
+    assert mem.match_negative_calls == 2
     assert stats["negative_match_deleted"] == 1
     assert stats["poison_deleted_boxes"] == 1
     assert stats["protected_boxes"] == 1
@@ -265,12 +349,22 @@ def test_layer1_negative_exemplar_suppression(tmp_path: Path) -> None:
     assert len(saved["trusted"]) == 1
     assert len(saved["weak"]) == 0
     assert saved["trusted"][0]["cx"] == pytest.approx(0.65)
+    # W47: katman kanıtıyla trusted — insan damgası basılmadan.
+    kept = saved["trusted"][0]
+    assert kept["trusted"] is True
+    assert kept["weak"] is False
+    assert kept["confidence"] == pytest.approx(0.88, abs=1e-4)
+    assert kept.get("human_approved") is not True
+    assert kept.get("hand_label") is not True
 
 
 def test_layer2_flat_ground_and_hud_poison_deletion_with_negative_teaching(tmp_path: Path) -> None:
     """Katman 2: Minimap HUD üzerindeki yasadışı dünya nesnesi kutularını (`hud_poison_deleted`)
     ve dokusuz düz zemin/gökyüzü kutularını (`flat_texture_deleted`, Laplacian var < 10.0) siler
     ve negatif exemplar hafızasına öğretir (`negative_taught_boxes`).
+
+    W47: HUD/düz-zemin katmanından sağ çıkan dokulu kutu `trusted` sayılır —
+    güven görsel katman kanıtından gelir, insan damgası basılmaz.
     """
     stem = "scene_layer2_poison"
     # Top-left and whole frame are flat (zeros), except bottom-right where a valid textured object sits
@@ -331,17 +425,30 @@ def test_layer2_flat_ground_and_hud_poison_deletion_with_negative_teaching(tmp_p
     assert stats["negative_taught_boxes"] == 2
     assert len(mem.negatives) == 2
     sources = {item["source"] for item in mem.negatives}
-    assert sources == {"poison_hud_illegal", "poison_flat_texture"}
+    # K-19 (P1-15): HUD öğretimi nedene göre ayrılır — tek
+    # "poison_hud_illegal" kaynağı yok; bu kutu minimap HUD'da yasadışı
+    # sınıf olduğu için kaynağı `poison_hud_hud_disallowed_class` olur.
+    assert sources == {"poison_hud_hud_disallowed_class", "poison_flat_texture"}
 
     saved = json.loads(review_path.read_text(encoding="utf-8"))
     assert len(saved["trusted"]) == 1
     assert len(saved["weak"]) == 0
     assert saved["trusted"][0]["cx"] == pytest.approx(0.77)
+    # W47: katman kanıtıyla trusted — insan damgası basılmadan.
+    kept = saved["trusted"][0]
+    assert kept["trusted"] is True
+    assert kept["weak"] is False
+    assert kept["confidence"] == pytest.approx(0.90, abs=1e-4)
+    assert kept.get("human_approved") is not True
+    assert kept.get("hand_label") is not True
 
 
 def test_layer3_nms_deduplication_omni_removal_and_label_sync(tmp_path: Path) -> None:
     """Katman 3: Aynı sınıftan üst üste binen mükerrer kutuları NMS ile tekilleştirir (`deduped_boxes`),
     sentetik `omni_*` ve eşik altı kutuları temizler ve `.txt` etiket dosyasını senkronize yazar.
+
+    W47: NMS'den sağ çıkan en iyi kutu `trusted` sayılır — güven katman
+    kanıtından gelir, insan damgası basılmaz.
     """
     stem = "scene_layer3_nms"
     textured_frame = _make_textured_frame()
@@ -427,6 +534,12 @@ def test_layer3_nms_deduplication_omni_removal_and_label_sync(tmp_path: Path) ->
     assert len(saved["trusted"]) == 1
     assert len(saved["weak"]) == 0
     assert saved["trusted"][0]["confidence"] == pytest.approx(0.92, abs=1e-4)
+    # W47: katman kanıtıyla trusted — insan damgası basılmadan.
+    kept = saved["trusted"][0]
+    assert kept["trusted"] is True
+    assert kept["weak"] is False
+    assert kept.get("human_approved") is not True
+    assert kept.get("hand_label") is not True
 
     label_path = tmp_path / "labels" / "train" / f"{stem}.txt"
     assert label_path.is_file()

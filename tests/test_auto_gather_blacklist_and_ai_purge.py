@@ -15,20 +15,17 @@ Verifies:
    - Blacklist UI section, table display, filter, and settings dictionary persistence ("ayarlarda blacklist kısmı olsun").
 """
 
-import json
 import os
 import shutil
 import tempfile
 import time
 import unittest
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 
-from core.blacklist_manager import BlacklistEntry, BlacklistManager, get_blacklist_manager
-from core.route_manager import NodeData, RouteManager
-from core.wrong_node_scan import verify_and_blacklist_node
+from core.blacklist_manager import BlacklistManager
+from core.route_manager import RouteManager
 
 
 class TestBlacklistManager(unittest.TestCase):
@@ -207,25 +204,26 @@ class TestRouteManagerGatherFailureAndBlacklist(unittest.TestCase):
         )
         self.assertIsNone(rejected_near)
 
-        # 3. F8 record_current_node ile eklemeyi dene -> Engellenmeli
+        # 3. F8 record_current_node ile eklemeyi dene -> Engellenmeli.
+        # Ilk F8 cagrisi henuz kara listede olmayan merkez (960, 540)
+        # konumunu kaydeder; sonucu kosulsuz dogrulanir.
         dummy_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        # F8 koordinatını 800, 850'ye denk getirelim
         f8_res = self.rm.record_current_node(
             input_ctrl=dummy_frame,
             region="Altgard",
             route="TestRoute",
         )
-        # Varsayılan merkez (960, 540) kara listede değilse başarılı olabilir ama kara listedeki 800, 850 verilirse engellenmeli
-        is_bl_center, _ = self.bl_mgr.is_blacklisted("Altgard", 960, 540)
-        if not is_bl_center:
-            # 960, 540'ı kara listeye alalım
-            self.bl_mgr.add_entry("Altgard", 960, 540)
-            f8_rejected = self.rm.record_current_node(
-                input_ctrl=dummy_frame,
-                region="Altgard",
-                route="TestRoute",
-            )
-            self.assertIsNone(f8_rejected)
+        self.assertIsNotNone(f8_res)
+        self.assertEqual((f8_res.map_x, f8_res.map_y), (960, 540))
+
+        # Merkez kara listeye alindiktan sonra ikinci F8 cagrisi engellenmeli.
+        self.bl_mgr.add_entry("Altgard", 960, 540)
+        f8_rejected = self.rm.record_current_node(
+            input_ctrl=dummy_frame,
+            region="Altgard",
+            route="TestRoute",
+        )
+        self.assertIsNone(f8_rejected)
 
 
 class TestSettingsWindowBlacklistUI(unittest.TestCase):
@@ -290,7 +288,7 @@ class TestSettingsWindowBlacklistUI(unittest.TestCase):
 
 class TestBotWorkerAutoGatherBlacklistIntegration(unittest.TestCase):
     def setUp(self):
-        from core.state_machine import BotMode, BotState, BotWorker
+        from core.state_machine import BotMode, BotWorker
 
         self.temp_dir = tempfile.mkdtemp()
         self.routes_dir = os.path.join(self.temp_dir, "routes")
@@ -332,7 +330,7 @@ class TestBotWorkerAutoGatherBlacklistIntegration(unittest.TestCase):
 
         # --- 1. Geliş: Kaynak bulamadı ---
         self.worker.active_node = self.rm.get_node(node_id, region="Altgard")
-        self.worker.active_node_distance_m = 2  # Hedefe ulaştı
+        self.worker._set_active_node_distance(2)  # Hedefe ulasti; Sweep-C 16/2: varis karari yalnizca TAZE mesafeye bakar — setter tazelik damgasini basar
         now = time.time()
         self.worker._walk_start_time = now - 10.0
 
@@ -351,7 +349,7 @@ class TestBotWorkerAutoGatherBlacklistIntegration(unittest.TestCase):
 
         # --- 2. Geliş: Tekrar kaynak bulamadı ---
         self.worker.active_node = n_after_1
-        self.worker.active_node_distance_m = 2
+        self.worker._set_active_node_distance(2)  # Sweep-C 16/2: varis karari yalnizca TAZE mesafeye bakar — setter tazelik damgasini basar
         now = time.time()
         self.worker._walk_start_time = now - 5.0
         self.worker._arrival_at_node_ts = 0.0
@@ -366,7 +364,7 @@ class TestBotWorkerAutoGatherBlacklistIntegration(unittest.TestCase):
 
         # --- 3. Geliş: 3. kez kaynak bulamadı -> YZ Kontrolü + Silme + Kara Liste ---
         self.worker.active_node = n_after_2
-        self.worker.active_node_distance_m = 2
+        self.worker._set_active_node_distance(2)  # Sweep-C 16/2: varis karari yalnizca TAZE mesafeye bakar — setter tazelik damgasini basar
         now = time.time()
         self.worker._walk_start_time = now - 5.0
         self.worker._arrival_at_node_ts = 0.0

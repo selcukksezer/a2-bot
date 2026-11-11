@@ -1,5 +1,32 @@
 {
   "rois": {
+    "minimap": {
+      "key": "minimap",
+      "target": "Minimap Bolgesi (sag ust) — kod varsayilani (0.855, 0.065, 0.137, 0.190); kalibrasyon sihirbazi ile olculmedi, tohum deger",
+      "normalized_roi": [
+        0.855,
+        0.065,
+        0.137,
+        0.19
+      ],
+      "norm_x": 0.855,
+      "norm_y": 0.065,
+      "norm_w": 0.137,
+      "norm_h": 0.19,
+      "bbox_px": [
+        1642,
+        70,
+        263,
+        205
+      ],
+      "resolution": [
+        1920,
+        1080
+      ],
+      "yolo_class_id": null,
+      "class_name": "minimap",
+      "updated_at": "2026-11-09T20:37:32Z"
+    },
     "minimap_arrow": {
       "key": "minimap_arrow",
       "target": "Minimap Oyuncu Oku Şablonu Kes",
@@ -189,6 +216,62 @@
       "class_name": "player_hp_bar",
       "updated_at": "2026-11-07T18:53:55Z"
     },
+    "player_mp_bar": {
+      "key": "player_mp_bar",
+      "target": "Oyuncu Mana (MP) Barı Kes",
+      "normalized_roi": [
+        0.515,
+        0.88,
+        0.14,
+        0.035
+      ],
+      "norm_x": 0.515,
+      "norm_y": 0.88,
+      "norm_w": 0.14,
+      "norm_h": 0.035,
+      "bbox_px": [
+        1030,
+        863,
+        280,
+        34
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": 17,
+      "class_name": "player_mp_bar",
+      "source": "fallback_roi (vision.py / skill_bar_reader.py ortak yedek geometri; sihirbaz olcumu degil, yeniden kalibre edilmeli)",
+      "updated_at": "2026-11-09T20:18:56Z"
+    },
+    "target_hp_bar": {
+      "key": "target_hp_bar",
+      "target": "Hedef Can (HP) Barı Kes",
+      "normalized_roi": [
+        0.35,
+        0.03,
+        0.3,
+        0.045
+      ],
+      "norm_x": 0.35,
+      "norm_y": 0.03,
+      "norm_w": 0.3,
+      "norm_h": 0.045,
+      "bbox_px": [
+        700,
+        29,
+        600,
+        44
+      ],
+      "resolution": [
+        2000,
+        981
+      ],
+      "yolo_class_id": 18,
+      "class_name": "target_hp_bar",
+      "source": "fallback_roi (vision.py / skill_bar_reader.py ortak yedek geometri; sihirbaz olcumu degil, yeniden kalibre edilmeli)",
+      "updated_at": "2026-11-09T20:18:56Z"
+    },
     "skill_slot": {
       "key": "skill_slot",
       "target": "Yetenek / Skill Bar Yuvası Kes",
@@ -215,6 +298,34 @@
       "yolo_class_id": 13,
       "class_name": "skill_ui_prompt",
       "updated_at": "2026-11-07T18:53:55Z"
+    },
+    "skill_bar": {
+      "key": "skill_bar",
+      "target": "Yetenek Cubugu (skill_bar) — 12 slot (1-8,Q,E,R,T); olcum skill_bar_reader.DEFAULT_SKILL_BAR_ROI (etiketli kare + piksel)",
+      "normalized_roi": [
+        0.345,
+        0.94,
+        0.315,
+        0.051
+      ],
+      "norm_x": 0.345,
+      "norm_y": 0.94,
+      "norm_w": 0.315,
+      "norm_h": 0.051,
+      "bbox_px": [
+        662,
+        1015,
+        605,
+        55
+      ],
+      "resolution": [
+        1920,
+        1080
+      ],
+      "yolo_class_id": 19,
+      "class_name": "skill_bar",
+      "source": "measured_default_12slot (core/skill_bar_reader.py DEFAULT_SKILL_BAR_ROI; sihirbaz yeniden olcebilir)",
+      "updated_at": "2026-11-11T16:32:02Z"
     }
   },
   "minimap_arrow": {
@@ -407,6 +518,62 @@
     "class_name": "player_hp_bar",
     "updated_at": "2026-11-07T18:53:55Z"
   },
+  "player_mp_bar": {
+    "key": "player_mp_bar",
+    "target": "Oyuncu Mana (MP) Barı Kes",
+    "normalized_roi": [
+      0.515,
+      0.88,
+      0.14,
+      0.035
+    ],
+    "norm_x": 0.515,
+    "norm_y": 0.88,
+    "norm_w": 0.14,
+    "norm_h": 0.035,
+    "bbox_px": [
+      1030,
+      863,
+      280,
+      34
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": 17,
+    "class_name": "player_mp_bar",
+    "source": "fallback_roi (vision.py / skill_bar_reader.py ortak yedek geometri; sihirbaz olcumu degil, yeniden kalibre edilmeli)",
+    "updated_at": "2026-11-09T20:18:56Z"
+  },
+  "target_hp_bar": {
+    "key": "target_hp_bar",
+    "target": "Hedef Can (HP) Barı Kes",
+    "normalized_roi": [
+      0.35,
+      0.03,
+      0.3,
+      0.045
+    ],
+    "norm_x": 0.35,
+    "norm_y": 0.03,
+    "norm_w": 0.3,
+    "norm_h": 0.045,
+    "bbox_px": [
+      700,
+      29,
+      600,
+      44
+    ],
+    "resolution": [
+      2000,
+      981
+    ],
+    "yolo_class_id": 18,
+    "class_name": "target_hp_bar",
+    "source": "fallback_roi (vision.py / skill_bar_reader.py ortak yedek geometri; sihirbaz olcumu degil, yeniden kalibre edilmeli)",
+    "updated_at": "2026-11-09T20:18:56Z"
+  },
   "skill_slot": {
     "key": "skill_slot",
     "target": "Yetenek / Skill Bar Yuvası Kes",
@@ -433,5 +600,60 @@
     "yolo_class_id": 13,
     "class_name": "skill_ui_prompt",
     "updated_at": "2026-11-07T18:53:55Z"
+  },
+  "minimap": {
+    "key": "minimap",
+    "target": "Minimap Bolgesi (sag ust) — kod varsayilani (0.855, 0.065, 0.137, 0.190); kalibrasyon sihirbazi ile olculmedi, tohum deger",
+    "normalized_roi": [
+      0.855,
+      0.065,
+      0.137,
+      0.19
+    ],
+    "norm_x": 0.855,
+    "norm_y": 0.065,
+    "norm_w": 0.137,
+    "norm_h": 0.19,
+    "bbox_px": [
+      1642,
+      70,
+      263,
+      205
+    ],
+    "resolution": [
+      1920,
+      1080
+    ],
+    "yolo_class_id": null,
+    "class_name": "minimap",
+    "updated_at": "2026-11-09T20:37:32Z"
+  },
+  "skill_bar": {
+    "key": "skill_bar",
+    "target": "Yetenek Cubugu (skill_bar) — 12 slot (1-8,Q,E,R,T); olcum skill_bar_reader.DEFAULT_SKILL_BAR_ROI (etiketli kare + piksel)",
+    "normalized_roi": [
+      0.345,
+      0.94,
+      0.315,
+      0.051
+    ],
+    "norm_x": 0.345,
+    "norm_y": 0.94,
+    "norm_w": 0.315,
+    "norm_h": 0.051,
+    "bbox_px": [
+      662,
+      1015,
+      605,
+      55
+    ],
+    "resolution": [
+      1920,
+      1080
+    ],
+    "yolo_class_id": 19,
+    "class_name": "skill_bar",
+    "source": "measured_default_12slot (core/skill_bar_reader.py DEFAULT_SKILL_BAR_ROI; sihirbaz yeniden olcebilir)",
+    "updated_at": "2026-11-11T16:32:02Z"
   }
 }

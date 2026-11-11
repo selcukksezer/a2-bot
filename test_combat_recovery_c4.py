@@ -11,7 +11,7 @@ Covers:
 
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import numpy as np
 import cv2
 
@@ -21,12 +21,15 @@ from core.combat_recovery import CombatRecovery
 class MockInputController:
     """Mock input controller capturing key presses and mouse clicks."""
 
-    def __init__(self, test_mode: bool = False):
+    def __init__(self, test_mode: bool = False, fail_press: bool = False):
         self.pressed = []
         self.clicks = []
         self.test_mode = test_mode
+        self.fail_press = fail_press
 
     def press_key(self, key, min_hold=0.045, max_hold=0.095):
+        if self.fail_press:
+            raise RuntimeError("simulated input failure")
         self.pressed.append(str(key).lower())
         return True
 
@@ -118,6 +121,25 @@ def create_synthetic_frame(
     return frame
 
 
+_distinct_tick = [0]
+
+
+def _distinct_synthetic_frame(**kwargs) -> np.ndarray:
+    """create_synthetic_frame + 1 piksel farkı: gerçekten FARKLI içerikli kare.
+
+    İçerik parmak izi (_frame_fingerprint: 16'şar piksel strided örnek +
+    CRC32) aynı pikselli `.copy()`'yi / yeniden üretilmiş özdeş kareyi
+    "aynı kare" sayar; ardışık 2 karede doğrulama bekleyen testlerde
+    ikinci kare bu yardımcı ile üretilir ve değişkende tutulur.
+    (0, 0) pikseli parmak izi örneklemesindedir (16'lık ızgara) ama hiçbir
+    tespit ROI'sinde değildir — yalnızca parmak izini değiştirir.
+    """
+    frame = create_synthetic_frame(**kwargs)
+    _distinct_tick[0] += 1
+    frame[0, 0] = (_distinct_tick[0] % 250 + 1, 0, 0)
+    return frame
+
+
 class TestCombatRecoveryAgentC4(unittest.TestCase):
     """Rigorous tests for Agent C4 features."""
 
@@ -148,15 +170,33 @@ class TestCombatRecoveryAgentC4(unittest.TestCase):
         self.assertTrue(pressed_forced)
         self.assertEqual(len(self.input_ctrl.pressed), 2)
 
-    def test_fast_tab_cycle_test_mode_acceleration(self):
-        """When input_ctrl.test_mode=True, fast_tab_cycle accelerates interval for headless tests."""
-        test_ctrl = MockInputController(test_mode=True)
+    def test_fast_tab_cycle_explicit_interval_honored(self):
+        """fast_tab_cycle honors an explicit min_interval_sec through its public
+        parameter — no test-mode shortcut involved.
+
+        F-1319: the old test verified the production test_mode shortcut
+        (input_ctrl.test_mode shrinks the interval). That shortcut still lives
+        in core/combat_recovery.py (D12 scope to remove); this test no longer
+        exercises or endorses it.
+        """
+        ctrl = MockInputController(test_mode=False)
+        assert ctrl.test_mode is False
         self.cr.last_tab_time = 0.0
-        self.assertTrue(self.cr.fast_tab_cycle(test_ctrl))
-        # After 0.06s in test mode, next cycle is allowed
+        self.assertTrue(self.cr.fast_tab_cycle(ctrl, min_interval_sec=0.05))
+        # After 0.06s with a 0.05s interval, the next cycle is allowed.
         self.cr.last_tab_time = time.monotonic() - 0.06
-        self.assertTrue(self.cr.fast_tab_cycle(test_ctrl))
-        self.assertEqual(len(test_ctrl.pressed), 2)
+        self.assertTrue(self.cr.fast_tab_cycle(ctrl, min_interval_sec=0.05))
+        self.assertEqual(len(ctrl.pressed), 2)
+
+    def test_fast_tab_cycle_press_failure_does_not_advance(self):
+        """F-1531: when the key press itself fails, fast_tab_cycle returns
+        False and neither the counter nor last_tab_time advances."""
+        failing = MockInputController(fail_press=True)
+        self.cr.last_tab_time = 0.0
+        before = self.cr.tab_cycle_count
+        self.assertFalse(self.cr.fast_tab_cycle(failing, force=True))
+        self.assertEqual(self.cr.tab_cycle_count, before)
+        self.assertEqual(self.cr.last_tab_time, 0.0)
 
     def test_fast_tab_counter_increments(self):
         """tab_cycle_count increments accurately on every successful TAB press."""
@@ -219,35 +259,44 @@ class TestCombatRecoveryAgentC4(unittest.TestCase):
     def test_single_frame_flicker_grace_sustains_combat(self):
         """
         Verify 1-frame targeting flicker grace:
-        Tick 1: Target present -> True
-        Tick 2: Target dropped for 1 frame -> sustained as True via flicker grace!
-        Tick 3: Target restored -> True, grace counter reset to 0
+        Tick 1: Target present on a single frame -> NOT yet a confirmed lock
+          (2-frame entry confirmation: a 1-frame bar flicker must not enter combat).
+        Tick 2: Target present on the 2nd consecutive frame -> lock confirmed.
+        Tick 3: Target dropped for 1 frame -> sustained as True via flicker grace!
+        Tick 4: Target restored -> True, grace counter reset to 0
+        Each tick passes a FRESH frame copy: production grabs a new frame per
+        tick, and the entry confirmation counts distinct frames, not calls.
         """
-        frame_present = create_synthetic_frame(olive_bar=True)
-        frame_empty = create_synthetic_frame(olive_bar=False)
-
         self.cr.reset_flicker_grace()
         self.cr.in_combat = True
 
-        # Tick 1: Target present
-        t1 = self.cr._detect_enemy_target_bar(frame_present)
+        # Tick 1: Target present once -> unconfirmed, no combat entry yet
+        t0 = self.cr._detect_enemy_target_bar(create_synthetic_frame(olive_bar=True))
+        self.assertFalse(t0)
+        self.assertFalse(self.cr.is_targeting_flicker_grace())
+        self.assertEqual(self.cr._flicker_grace_counter, 0)
+
+        # Tick 2: Target present on the 2nd consecutive frame -> lock confirmed.
+        # İkinci kare gerçekten farklı içerikli olmalı — özdeş yeniden üretim
+        # içerik parmak iziyle "aynı kare" sayılır.
+        frame_tick2 = _distinct_synthetic_frame(olive_bar=True)
+        t1 = self.cr._detect_enemy_target_bar(frame_tick2)
         self.assertTrue(t1)
         self.assertFalse(self.cr.is_targeting_flicker_grace())
         self.assertEqual(self.cr._flicker_grace_counter, 0)
 
-        # Advance timestamp slightly so tick is distinct
-        time.sleep(0.09)
+        # No sleep: flicker grace is frame-count based, not wall-clock.
 
-        # Tick 2: Target flicker (missing for 1 frame)
-        t2 = self.cr._detect_enemy_target_bar(frame_empty)
+        # Tick 3: Target flicker (missing for 1 frame)
+        t2 = self.cr._detect_enemy_target_bar(create_synthetic_frame(olive_bar=False))
         self.assertTrue(t2, "1-frame targeting flicker must be sustained via grace tick")
         self.assertTrue(self.cr.is_targeting_flicker_grace())
         self.assertEqual(self.cr._flicker_grace_counter, 1)
 
-        time.sleep(0.09)
 
-        # Tick 3: Target restored
-        t3 = self.cr._detect_enemy_target_bar(frame_present)
+        # Tick 4: Target restored (yeni kare — farklı içerik)
+        frame_tick4 = _distinct_synthetic_frame(olive_bar=True)
+        t3 = self.cr._detect_enemy_target_bar(frame_tick4)
         self.assertTrue(t3)
         self.assertFalse(self.cr.is_targeting_flicker_grace(), "Grace should deactivate when target returns")
         self.assertEqual(self.cr._flicker_grace_counter, 0)
@@ -255,43 +304,52 @@ class TestCombatRecoveryAgentC4(unittest.TestCase):
     def test_confirmed_target_loss_after_grace_expires(self):
         """
         When target is absent for >= 2 consecutive frames, grace expires on tick 2 and returns False.
+        The 1-frame contract is configured explicitly: the production default
+        (GATHERION_FLICKER_GRACE_TICKS, 15) would sustain 15 frames.
+        Entry needs 2 consecutive present frames first (2-frame entry
+        confirmation); each tick passes a fresh frame copy.
         """
-        frame_present = create_synthetic_frame(red_bar=True)
-        frame_empty = create_synthetic_frame()
-
+        self.cr.max_flicker_grace_ticks = 1
         self.cr.reset_flicker_grace()
         self.cr.in_combat = True
 
-        # Tick 1: Target present
-        self.assertTrue(self.cr._detect_enemy_target_bar(frame_present))
+        # Tick 1: Target present once -> unconfirmed, no lock yet
+        self.assertFalse(self.cr._detect_enemy_target_bar(create_synthetic_frame(red_bar=True)))
 
-        time.sleep(0.09)
+        # Tick 2: Target present on the 2nd consecutive frame -> lock confirmed.
+        # İkinci kare gerçekten farklı içerikli olmalı (özdeş yeniden üretim
+        # içerik parmak iziyle "aynı kare" sayılır).
+        frame_tick2 = _distinct_synthetic_frame(red_bar=True)
+        self.assertTrue(self.cr._detect_enemy_target_bar(frame_tick2))
 
-        # Tick 2: 1-frame grace active
-        self.assertTrue(self.cr._detect_enemy_target_bar(frame_empty))
+
+        # Tick 3: 1-frame grace active
+        self.assertTrue(self.cr._detect_enemy_target_bar(create_synthetic_frame()))
         self.assertTrue(self.cr.is_flicker_grace_active)
 
-        time.sleep(0.09)
 
-        # Tick 3: Second consecutive frame of target absence -> grace expired, must return False!
-        t3 = self.cr._detect_enemy_target_bar(frame_empty)
+        # Tick 4: Second consecutive frame of target absence -> grace expired, must return False!
+        t3 = self.cr._detect_enemy_target_bar(create_synthetic_frame())
         self.assertFalse(t3, "Second frame without target must confirm loss and return False")
         self.assertFalse(self.cr.is_flicker_grace_active)
 
     def test_check_under_attack_sustained_during_flicker(self):
-        """check_under_attack remains True during a 1-frame targeting flicker, preventing abort."""
-        frame_present = create_synthetic_frame(olive_bar=True)
-        frame_flicker = create_synthetic_frame(olive_bar=False)
-
+        """check_under_attack remains True during a 1-frame targeting flicker, preventing abort.
+        Entry needs 2 consecutive bar frames first (2-frame entry confirmation)."""
         self.cr.reset_flicker_grace()
-        # Tick 1: under attack
-        under_atk1, _ = self.cr.check_under_attack(frame_present)
+        # Tick 1: bar seen once -> unconfirmed, not under attack yet
+        under_atk0, _ = self.cr.check_under_attack(create_synthetic_frame(olive_bar=True))
+        self.assertFalse(under_atk0)
+
+        # Tick 2: bar on the 2nd consecutive frame -> under attack.
+        # İkinci kare gerçekten farklı içerikli olmalı.
+        frame_tick2 = _distinct_synthetic_frame(olive_bar=True)
+        under_atk1, _ = self.cr.check_under_attack(frame_tick2)
         self.assertTrue(under_atk1)
 
-        time.sleep(0.09)
 
-        # Tick 2: flicker frame
-        under_atk2, _ = self.cr.check_under_attack(frame_flicker)
+        # Tick 3: flicker frame
+        under_atk2, _ = self.cr.check_under_attack(create_synthetic_frame(olive_bar=False))
         self.assertTrue(under_atk2, "check_under_attack must not abort on 1-frame target flicker")
 
     def test_fight_back_step_grace_tick_does_not_abort(self):
@@ -302,11 +360,17 @@ class TestCombatRecoveryAgentC4(unittest.TestCase):
         self.cr.reset_flicker_grace()
         self.cr.in_combat = True
 
+        # fight_back_step, üretimde FIGHTING kapısı barı 2 karede
+        # doğruladıktan sonra çağrılır — test de kilidi önce doğrular.
+        # İkinci doğrulama karesi gerçekten farklı içerikli olmalı.
+        self.cr._detect_enemy_target_bar(create_synthetic_frame(red_bar=True))
+        frame_confirm = _distinct_synthetic_frame(red_bar=True)
+        self.cr._detect_enemy_target_bar(frame_confirm)
+
         # Step 1: Real target present
         self.cr.fight_back_step(self.input_ctrl, frame=frame_present)
         self.assertEqual(getattr(self.cr, "_no_target_steps", 0), 0)
 
-        time.sleep(0.09)
 
         # Step 2: Flicker frame -> sustained via grace, no_target_steps remains 0
         self.cr.fight_back_step(self.input_ctrl, frame=frame_flicker)
@@ -324,25 +388,40 @@ class TestCombatRecoveryAgentC4(unittest.TestCase):
         def mock_capture():
             return frames.pop(0) if frames else None
 
-        self.cr.execute_combat_loop(
-            self.input_ctrl,
-            capture=mock_capture,
-            max_fight_sec=0.15,
-            stop_gather_sec=0.01,
-        )
+        # Speed: the loop sleeps between steps (time.sleep inside
+        # execute_combat_loop); termination here is frame-driven (the
+        # capture runs out), not time-driven, so stubbing the sleeps
+        # changes no key pressed.
+        with patch("time.sleep", return_value=None):
+            self.cr.execute_combat_loop(
+                self.input_ctrl,
+                capture=mock_capture,
+                max_fight_sec=0.15,
+                stop_gather_sec=0.01,
+            )
         self.assertIn("tab", self.input_ctrl.pressed)
         self.assertEqual(self.input_ctrl.pressed[0], "tab")
 
     def test_execute_combat_loop_flicker_grace_sustains_fight(self):
-        """execute_combat_loop does not abort or loot when target drops for 1 frame."""
-        frame_present = create_synthetic_frame(olive_bar=True)
-        frame_flicker = create_synthetic_frame(olive_bar=False)
+        """execute_combat_loop does not abort or loot when target drops for 1 frame.
+        The loop runs after the FIGHTING gate confirmed the bar, so the test
+        pre-confirms the lock the same way (2 bar frames); every loop frame
+        is a fresh copy, as production grabs a new frame per tick."""
+        self.cr.reset_flicker_grace()
+        self.cr._detect_enemy_target_bar(create_synthetic_frame(olive_bar=True))
+        frame_confirm = _distinct_synthetic_frame(olive_bar=True)
+        self.cr._detect_enemy_target_bar(frame_confirm)
 
         # Sequence: Present -> Flicker -> Present -> Present
-        frame_seq = [frame_present, frame_flicker, frame_present, frame_present]
+        frame_seq = [
+            create_synthetic_frame(olive_bar=True),
+            create_synthetic_frame(olive_bar=False),
+            _distinct_synthetic_frame(olive_bar=True),
+            _distinct_synthetic_frame(olive_bar=True),
+        ]
 
         def mock_capture():
-            return frame_seq.pop(0) if frame_seq else frame_present
+            return frame_seq.pop(0) if frame_seq else create_synthetic_frame(olive_bar=True)
 
         step_count = [0]
 
@@ -350,33 +429,51 @@ class TestCombatRecoveryAgentC4(unittest.TestCase):
             step_count[0] += 1
             return step_count[0] > 4
 
-        res = self.cr.execute_combat_loop(
-            self.input_ctrl,
-            capture=mock_capture,
-            is_cancelled_fn=is_cancelled,
-            max_fight_sec=2.0,
-            stop_gather_sec=0.01,
-        )
+        # Speed (was ~0.7s): same frame-driven termination as the
+        # fast-TAB test above — the is_cancelled_fn step counter, not
+        # wall time, ends the loop, so stubbing time.sleep is safe.
+        with patch("time.sleep", return_value=None):
+            res = self.cr.execute_combat_loop(
+                self.input_ctrl,
+                capture=mock_capture,
+                is_cancelled_fn=is_cancelled,
+                max_fight_sec=2.0,
+                stop_gather_sec=0.01,
+            )
         self.assertEqual(res, "CANCELLED")
         self.assertNotIn("f", self.input_ctrl.pressed)
 
     def test_execute_combat_loop_cleared_on_real_death(self):
-        """execute_combat_loop loots (F) and returns CLEARED when mob is dead across consecutive frames."""
-        frame_present = create_synthetic_frame(red_bar=True)
-        frame_dead = create_synthetic_frame(red_bar=False)
+        """execute_combat_loop loots (F) and returns CLEARED when mob is dead across consecutive frames.
+        The loop runs after the FIGHTING gate confirmed the bar, so the test
+        pre-confirms the lock the same way (2 bar frames)."""
+        self.cr.reset_flicker_grace()
+        self.cr._detect_enemy_target_bar(create_synthetic_frame(red_bar=True))
+        frame_confirm = _distinct_synthetic_frame(red_bar=True)
+        self.cr._detect_enemy_target_bar(frame_confirm)
 
         # Sequence: Present -> Dead -> Dead -> Dead (beyond flicker grace)
-        frame_seq = [frame_present, frame_dead, frame_dead, frame_dead, frame_dead]
+        frame_seq = [
+            create_synthetic_frame(red_bar=True),
+            create_synthetic_frame(red_bar=False),
+            create_synthetic_frame(red_bar=False),
+            create_synthetic_frame(red_bar=False),
+            create_synthetic_frame(red_bar=False),
+        ]
 
         def mock_capture():
-            return frame_seq.pop(0) if frame_seq else frame_dead
+            return frame_seq.pop(0) if frame_seq else create_synthetic_frame(red_bar=False)
 
-        res = self.cr.execute_combat_loop(
-            self.input_ctrl,
-            capture=mock_capture,
-            max_fight_sec=3.0,
-            stop_gather_sec=0.05,
-        )
+        # Speed (was ~1.4s): termination is frame-driven (consecutive
+        # dead frames -> CLEARED), so stubbing the loop's time.sleep is
+        # safe; the F loot press and CLEARED result are unchanged.
+        with patch("time.sleep", return_value=None):
+            res = self.cr.execute_combat_loop(
+                self.input_ctrl,
+                capture=mock_capture,
+                max_fight_sec=3.0,
+                stop_gather_sec=0.05,
+            )
         self.assertEqual(res, "CLEARED")
         self.assertIn("f", self.input_ctrl.pressed, "Loot (F) must be pressed upon monster death")
 
@@ -385,10 +482,18 @@ class TestCombatRecoveryAgentC4(unittest.TestCase):
         self.cr._flicker_grace_counter = 1
         self.cr.is_flicker_grace_active = True
         self.cr._last_raw_target_detected = True
+        self.cr._consecutive_raw_target_frames = 2
+        self.cr._last_target_frame_fp = CombatRecovery._frame_fingerprint(
+            create_synthetic_frame(olive_bar=True)
+        )
+        self.cr._target_lock_confirmed = True
         self.cr.reset_flicker_grace()
         self.assertEqual(self.cr._flicker_grace_counter, 0)
         self.assertFalse(self.cr.is_flicker_grace_active)
         self.assertFalse(self.cr._last_raw_target_detected)
+        self.assertEqual(self.cr._consecutive_raw_target_frames, 0)
+        self.assertIsNone(self.cr._last_target_frame_fp)
+        self.assertFalse(self.cr._target_lock_confirmed)
 
 
 if __name__ == "__main__":

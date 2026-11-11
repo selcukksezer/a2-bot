@@ -6,19 +6,12 @@ import numpy as np
 import cv2
 
 from config.materials_db import (
-    AION2_MATERIALS_CATALOG,
-    AION2_TAXONOMY_HIERARCHY,
-    DEFAULT_MAX_HARVESTS,
-    MaterialVisualDescriptor,
     classify_3d_material_patch,
     compute_aspect_ratio_features,
     compute_3d_crest_texture,
     compute_hsv_color_distribution,
     extract_visual_descriptor,
-    get_material_spec,
-    get_region_expected_materials,
     is_rejected_non_material,
-    map_descriptors_to_taxonomy,
 )
 
 
@@ -26,12 +19,32 @@ class MaterialsDbTaxonomyTests(unittest.TestCase):
     """Test suite verifying genuine real-time visual feature descriptors and exact taxonomy mapping."""
 
     def test_empty_and_invalid_inputs_safe_default(self):
-        """Empty or invalid images must safely return defaults without crashing."""
+        """Empty or invalid images must safely return the documented fallback without crashing.
+
+        F-1329 (stale-test fix, R19): the old assertion pinned the
+        pre-D52 behaviour — invalid input returned the "Orichalcum Ore"
+        placeholder at 0.50. That behaviour was itself the [Kritik]
+        audit finding F-1084 ("invalid input is Orichalcum Ore at 0.50"),
+        fixed by D52 (aa19e92, in both v1 and v2): invalid input is
+        "Unknown" with confidence 0.0 and never a fabricated material.
+        Callers gate on confidence and on the `unknown` flag. The test
+        now asserts the corrected safe default: no crash, no region
+        match, no color evidence, fallback confidence 0.0 — below every
+        scanner acceptance gate.
+        """
         for invalid in (None, np.array([]), np.zeros((0, 0, 3), dtype=np.uint8)):
             result = classify_3d_material_patch(invalid)
-            self.assertEqual(result["name"], "Orichalcum Ore")
-            self.assertEqual(result["category"], "Ores & Metals")
-            self.assertEqual(result["max_harvests"], DEFAULT_MAX_HARVESTS)
+            # No visual evidence at all: explicitly NOT a classification.
+            self.assertEqual(result["name"], "Unknown")
+            self.assertEqual(result["category"], "Unknown")
+            self.assertEqual(result["max_harvests"], 0)
+            self.assertTrue(result["unknown"])
+            # ...but it is explicitly flagged as NOT a real classification:
+            # no region match, no color evidence, fallback confidence only.
+            self.assertFalse(result["region_matched"])
+            self.assertEqual(result["confidence"], 0.0)
+            self.assertLess(result["confidence"], 0.65)
+            self.assertEqual(result["color_ratios"], {})
             self.assertIn("visual_descriptor", result)
             self.assertIn("texture_features", result)
             self.assertIn("aspect_ratio_features", result)
@@ -85,19 +98,48 @@ class MaterialsDbTaxonomyTests(unittest.TestCase):
         self.assertGreater(tex["crest_brightness"], 0.05)
 
     def test_aspect_ratio_features_profiles(self):
-        """Aspect ratio feature extractor maps geometric dimensions to proper morphological profiles."""
-        # Tall vertical trunk
-        ar_trunk = compute_aspect_ratio_features(np.zeros((150, 50, 3), dtype=np.uint8))
+        """Aspect ratio feature extractor maps geometric dimensions to proper morphological profiles.
+
+        F-1420: the patches below carry REAL visual content for the claimed
+        morphology (bark grain, ore vein, foliage + berries) instead of
+        content-free zero arrays, so the profile claim is grounded in a
+        realistic instance of each shape. The profile itself is derived
+        from the patch dimensions (see the explicit-bbox check below).
+        """
+        # Tall vertical trunk: brown bark with vertical grain + green canopy
+        trunk_hsv = np.zeros((150, 50, 3), dtype=np.uint8)
+        trunk_hsv[:, :, 0] = 15
+        trunk_hsv[:, :, 1] = 120
+        trunk_hsv[:, :, 2] = 80
+        for c in range(0, 50, 4):
+            trunk_hsv[:, c : c + 2, 2] = 110
+            trunk_hsv[:, c + 2 : c + 4, 2] = 60
+        trunk_hsv[:25, :, 0] = 50
+        trunk_hsv[:25, :, 1] = 170
+        trunk_hsv[:25, :, 2] = 130
+        ar_trunk = compute_aspect_ratio_features(cv2.cvtColor(trunk_hsv, cv2.COLOR_HSV2BGR))
         self.assertEqual(ar_trunk["morphological_profile"], "vertical_trunk")
         self.assertGreater(ar_trunk["height_width_ratio"], 2.0)
 
-        # Horizontal ore vein
-        ar_vein = compute_aspect_ratio_features(np.zeros((50, 100, 3), dtype=np.uint8))
+        # Horizontal ore vein: bronze/teal vein on dark rock outcrop
+        vein_hsv = np.zeros((50, 100, 3), dtype=np.uint8)
+        vein_hsv[:, :, 0] = 0
+        vein_hsv[:, :, 1] = 15
+        vein_hsv[:, :, 2] = 45
+        cv2.line(vein_hsv, (10, 25), (90, 22), (15, 180, 180), 8)
+        cv2.line(vein_hsv, (15, 35), (85, 33), (85, 160, 170), 5)
+        ar_vein = compute_aspect_ratio_features(cv2.cvtColor(vein_hsv, cv2.COLOR_HSV2BGR))
         self.assertEqual(ar_vein["morphological_profile"], "horizontal_vein")
         self.assertGreater(ar_vein["aspect_ratio"], 1.5)
 
-        # Squat bush
-        ar_bush = compute_aspect_ratio_features(np.zeros((60, 80, 3), dtype=np.uint8))
+        # Squat bush: green foliage with dispersed red berries
+        bush_hsv = np.zeros((60, 80, 3), dtype=np.uint8)
+        bush_hsv[:, :, 0] = 55
+        bush_hsv[:, :, 1] = 170
+        bush_hsv[:, :, 2] = 150
+        for cy, cx in ((20, 25), (35, 60), (45, 30)):
+            cv2.circle(bush_hsv, (cx, cy), 5, (5, 220, 220), -1)
+        ar_bush = compute_aspect_ratio_features(cv2.cvtColor(bush_hsv, cv2.COLOR_HSV2BGR))
         self.assertEqual(ar_bush["morphological_profile"], "squat_bush")
 
         # Explicit bbox aspect ratio takes precedence
@@ -310,8 +352,19 @@ class MaterialsDbTaxonomyTests(unittest.TestCase):
         desc_aria = extract_visual_descriptor(bgr_aria)
         self.assertGreater(desc_aria.color_ratios["aria_purple"], 0.90)
 
-        # Perturb to green foliage
+        # Perturb to a real Mela bush: green foliage + red berry clusters
+        # (same recipe as test_taxonomy_mela_bush_exact_mapping).
+        # F-1543 (stale-test fix, R19): the old uniform-green patch carried
+        # no Mela evidence at all (no red berries) — under the D52
+        # calibrated confidence (F-1082, aa19e92, no 0.74 floor) it maps
+        # to Mela at only 0.681, because Targena/Azpha share the green
+        # evidence. The "verified: confidence 0.945" note was measured
+        # under the old floored formula. A genuine Mela patch has berries:
+        # red_berry ~0.049 triggers the +0.44 berry bonus and the
+        # calibrated confidence is ~0.94.
         pert_hsv = np.full((h, w, 3), (55, 180, 180), dtype=np.uint8)
+        for cy, cx in ((20, 25), (35, 60), (45, 30), (25, 70)):
+            cv2.circle(pert_hsv, (cx, cy), 5, (5, 220, 220), -1)
         bgr_green = cv2.cvtColor(pert_hsv, cv2.COLOR_HSV2BGR)
         desc_green = extract_visual_descriptor(bgr_green)
         self.assertEqual(desc_green.color_ratios["aria_purple"], 0.0)
@@ -321,7 +374,14 @@ class MaterialsDbTaxonomyTests(unittest.TestCase):
         res_aria = classify_3d_material_patch(bgr_aria)
         res_green = classify_3d_material_patch(bgr_green)
         self.assertEqual(res_aria["name"], "Aria")
+        # F-1543: assert WHAT the green patch maps to, not merely what it
+        # is not — a genuine Mela bush (green foliage + red berries)
+        # classifies as Mela with calibrated confidence ~0.94, so a silent
+        # remap to any other material would now fail instead of passing on
+        # a bare inequality.
         self.assertNotEqual(res_green["name"], "Aria")
+        self.assertEqual(res_green["name"], "Mela")
+        self.assertGreaterEqual(res_green["confidence"], 0.80)
 
 
 if __name__ == "__main__":

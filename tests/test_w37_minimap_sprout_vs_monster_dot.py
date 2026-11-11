@@ -24,22 +24,56 @@ def _make_base_minimap_crop(width: int = 332, height: int = 257) -> np.ndarray:
     return np.full((height, width, 3), (52, 62, 56), dtype=np.uint8)
 
 
+def _tint_sprout_green(gray_patch: np.ndarray) -> np.ndarray:
+    """Tint a grayscale sprout template patch bright leaf green-white.
+
+    Bright leaf pixels (value >= 175) get a natural sprout hue while the
+    luminance profile stays matched to `_CANONICAL_SPROUT_TPL`, so the
+    template NCC stays high. Shared by `_paste_green_3_leaf_sprout` and the
+    strictness test's controls (previously two copies of the same tint math).
+    """
+    patch_bgr = cv2.cvtColor(gray_patch, cv2.COLOR_GRAY2BGR)
+    leaf_pixels = gray_patch >= 175
+    patch_bgr[leaf_pixels, 0] = np.clip(gray_patch[leaf_pixels].astype(np.int32) - 45, 130, 255).astype(np.uint8)  # B
+    patch_bgr[leaf_pixels, 1] = gray_patch[leaf_pixels]  # G (highest)
+    patch_bgr[leaf_pixels, 2] = np.clip(gray_patch[leaf_pixels].astype(np.int32) - 35, 140, 255).astype(np.uint8)  # R
+    return patch_bgr
+
+
 def _paste_green_3_leaf_sprout(crop_bgr: np.ndarray, top_left_x: int, top_left_y: int) -> Tuple[int, int]:
     """
     Paste the canonical 16x16 3-leaf sprout template onto crop_bgr with green/bright-leaf
     chromaticity so both template NCC (>= 0.88) and green/white HSV chromatic checks pass.
     Returns the expected center (cx, cy).
+
+    NOTE: this helper is a stand-in for a real minimap icon and is used only for
+    the exclusion/separation tests below (center exclusion, mixed scene). The
+    positive detection claim is proven independently in
+    test_green_3_leaf_sprout_detected_as_class_9_only, which scans a real game
+    screenshot instead of this template-derived input.
     """
     tpl = MinimapScanner._CANONICAL_SPROUT_TPL
-    patch_bgr = cv2.cvtColor(tpl, cv2.COLOR_GRAY2BGR)
-    # Tint bright leaf pixels (tpl >= 175) with a natural bright green-white sprout hue
-    # while keeping the luminance profile matched to _CANONICAL_SPROUT_TPL for high NCC.
-    leaf_pixels = tpl >= 175
-    patch_bgr[leaf_pixels, 0] = np.clip(tpl[leaf_pixels].astype(np.int32) - 45, 130, 255).astype(np.uint8)  # B
-    patch_bgr[leaf_pixels, 1] = tpl[leaf_pixels]  # G (highest)
-    patch_bgr[leaf_pixels, 2] = np.clip(tpl[leaf_pixels].astype(np.int32) - 35, 140, 255).astype(np.uint8)  # R
+    patch_bgr = _tint_sprout_green(tpl)
 
     crop_bgr[top_left_y : top_left_y + 16, top_left_x : top_left_x + 16] = patch_bgr
+    return top_left_x + 8, top_left_y + 8
+
+
+def _draw_independent_3_leaf_sprout(crop_bgr: np.ndarray, top_left_x: int, top_left_y: int) -> Tuple[int, int]:
+    """
+    Draw a 3-leaf sprout from geometric primitives only (three leaf ellipses
+    + stem), with no reference to the production template. This is what a
+    spec-conformant sprout ("3-leaf green sprout") looks like when drawn
+    independently; the scanner's masked-NCC gate is strict and rejects it
+    (max NCC ~0.61 < 0.88), which the strictness test pins explicitly.
+    Returns the expected center (cx, cy).
+    """
+    leaf_bgr = (175, 235, 200)  # bright leaf green (BGR)
+    stem_bgr = (50, 130, 70)
+    cv2.ellipse(crop_bgr, (top_left_x + 8, top_left_y + 5), (3, 5), 0, 0, 360, leaf_bgr, -1)
+    cv2.ellipse(crop_bgr, (top_left_x + 4, top_left_y + 10), (4, 3), -30, 0, 360, leaf_bgr, -1)
+    cv2.ellipse(crop_bgr, (top_left_x + 12, top_left_y + 10), (4, 3), 30, 0, 360, leaf_bgr, -1)
+    cv2.line(crop_bgr, (top_left_x + 8, top_left_y + 10), (top_left_x + 8, top_left_y + 14), stem_bgr, 2)
     return top_left_x + 8, top_left_y + 8
 
 
@@ -74,31 +108,54 @@ def _draw_center_player_arrow(crop_bgr: np.ndarray) -> Tuple[int, int]:
 
 
 def test_green_3_leaf_sprout_detected_as_class_9_only(tmp_path: Path) -> None:
-    """1. Verify a 3-leaf green/canonical sprout on the minimap is classified strictly as class 9 (minimap_sprout)."""
-    scanner = MinimapScanner(templates_dir=str(tmp_path), config_dir=str(tmp_path))
-    crop = _make_base_minimap_crop()
-    expected_cx, expected_cy = _paste_green_3_leaf_sprout(crop, 70, 96)
+    """1. Verify a 3-leaf green/canonical sprout on the minimap is classified strictly as class 9 (minimap_sprout).
 
-    result = scanner.scan_minimap_crop(crop)
+    The input is a REAL game screenshot (reference_screenshots/minimap_sprout_closeup.jpg),
+    not the production template: it contains two genuine sprouts plus two white
+    monster dots. This proves the detector fires on real minimap icons rather
+    than on an input copied from its own template.
+    """
+    scanner = MinimapScanner(templates_dir=str(tmp_path), config_dir=str(tmp_path))
+    screenshot = cv2.imread(
+        str(_PROJECT_ROOT / "reference_screenshots" / "minimap_sprout_closeup.jpg")
+    )
+    assert screenshot is not None, "reference screenshot minimap_sprout_closeup.jpg must exist"
+
+    result = scanner.scan_minimap_crop(screenshot)
     gatherables = result["gatherable_nodes"]
     monster_dots = result["monster_dots"]
     hostile_dots = result["hostile_dots"]
 
-    assert len(gatherables) == 1, f"Expected exactly 1 gatherable sprout, got: {gatherables}"
-    assert monster_dots == [], f"Sprout must not be classified as white monster_dot: {monster_dots}"
-    assert hostile_dots == [], f"Sprout must not be classified as red hostile_dot: {hostile_dots}"
+    # The real screenshot holds exactly two sprouts, at the measured positions.
+    assert len(gatherables) == 2, f"Expected exactly 2 real sprouts, got: {gatherables}"
+    positions = {(s["pos"][0], s["pos"][1]) for s in gatherables}
+    for expected in ((126, 266), (292, 176)):
+        assert any(
+            math.hypot(px - expected[0], py - expected[1]) <= 3.0 for px, py in positions
+        ), f"No sprout near real position {expected}: {positions}"
 
-    sprout = gatherables[0]
-    assert sprout["class_id"] == 9
-    assert sprout["class_name"] == "minimap_sprout"
-    assert sprout["kind"] == "sprout_material"
-    assert sprout["is_gatherable"] is True
-    assert sprout["is_hostile"] is False
-    assert sprout["is_minimap"] is True
-    assert sprout["is_world_3d"] is False
-    assert sprout["ncc_score"] >= MinimapScanner.SPROUT_NCC_MIN_THRESHOLD
-    assert sprout["chromatic_density"] >= 0.06
-    assert math.hypot(sprout["pos"][0] - expected_cx, sprout["pos"][1] - expected_cy) <= 3.0
+    # The same screenshot holds exactly two white monster dots (class 11), never
+    # confused with the sprouts, and no red hostile dots.
+    assert len(monster_dots) == 2, f"Expected exactly 2 monster dots, got: {monster_dots}"
+    assert hostile_dots == [], f"Real screenshot must have no hostile dots: {hostile_dots}"
+
+    for sprout in gatherables:
+        assert sprout["class_id"] == 9
+        assert sprout["class_name"] == "minimap_sprout"
+        assert sprout["kind"] == "sprout_material"
+        assert sprout["is_gatherable"] is True
+        assert sprout["is_hostile"] is False
+        assert sprout["is_minimap"] is True
+        assert sprout["is_world_3d"] is False
+        # 0.88 is the documented minimum NCC for a sprout match, stated here as
+        # a literal (not read back from the production constant), and the real
+        # sprouts must clear it with margin.
+        assert sprout["ncc_score"] >= 0.88
+        assert sprout["chromatic_density"] >= 0.06
+
+    for dot in monster_dots:
+        assert dot["class_id"] == 11
+        assert dot["is_gatherable"] is False
 
 
 def test_circular_red_and_white_monster_dots_detected_as_class_11_never_class_9(tmp_path: Path) -> None:
@@ -260,3 +317,70 @@ def test_minimap_taxonomy_and_spatial_suppression_prevent_cross_classification(t
     patch_hsv = hsv_crop[sy - 8 : sy + 9, sx - 8 : sx + 9]
     ok_chrom, _ = scanner._check_sprout_chromatic_density(patch_hsv, scale=1.0)
     assert ok_chrom is False, "Patch containing hostile red monster pixels must be rejected as a sprout"
+
+
+def test_sprout_detection_requires_shape_color_and_orientation(tmp_path: Path) -> None:
+    """6. Negative controls: the sprout detector must fire only for the canonical
+    green sprout shape in its canonical orientation.
+
+    - Pixel-shuffled template (same color histogram, destroyed geometry) -> rejected.
+    - Same shape in red (wrong hue) -> rejected.
+    - Same shape rotated 180 deg (wrong orientation) -> rejected.
+    - Independently drawn 3-leaf sprout (geometric primitives, no template) ->
+      rejected, with max masked NCC below the documented 0.88 floor. This pins
+      the gate's strictness: a spec-conformant drawing alone does not pass, so
+      the positive test above uses a real screenshot rather than a drawing.
+    The comparison that makes the 0.88 floor non-tautological: the real
+    sprouts score >= 0.88 while every control below scores < 0.88.
+    """
+    scanner = MinimapScanner(templates_dir=str(tmp_path), config_dir=str(tmp_path))
+    tpl = MinimapScanner._CANONICAL_SPROUT_TPL
+
+    def _tint_green(gray_patch: np.ndarray) -> np.ndarray:
+        return _tint_sprout_green(gray_patch)
+
+    def _paste(patch_bgr: np.ndarray) -> np.ndarray:
+        crop = _make_base_minimap_crop()
+        crop[96:112, 70:86] = patch_bgr
+        return crop
+
+    def _max_masked_ncc(crop_bgr: np.ndarray) -> float:
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        score_map = scanner._masked_ncc(
+            gray,
+            MinimapScanner._CANONICAL_SPROUT_TPL,
+            MinimapScanner._CANONICAL_SPROUT_MASK,
+            min_local_contrast=26.0,
+        )
+        _, max_val, _, _ = cv2.minMaxLoc(score_map)
+        return float(max_val)
+
+    # Shuffled template: identical pixel histogram, no sprout geometry.
+    rng = np.random.default_rng(7)
+    flat = tpl.flatten().copy()
+    rng.shuffle(flat)
+    shuffled = _tint_green(flat.reshape(16, 16))
+    shuffled_crop = _paste(shuffled)
+    assert scanner.scan_minimap_crop(shuffled_crop)["gatherable_nodes"] == []
+    assert _max_masked_ncc(shuffled_crop) < 0.88
+
+    # Red-tinted canonical shape: right geometry, wrong hue.
+    red = cv2.cvtColor(tpl, cv2.COLOR_GRAY2BGR)
+    leaf = tpl >= 175
+    red[leaf] = (40, 40, 235)
+    red[~leaf] = (60, 60, 90)
+    assert scanner.scan_minimap_crop(_paste(red))["gatherable_nodes"] == []
+
+    # Rotated 180 deg: right shape and hue, wrong orientation.
+    rotated = cv2.rotate(_tint_green(tpl), cv2.ROTATE_180)
+    assert scanner.scan_minimap_crop(_paste(rotated))["gatherable_nodes"] == []
+
+    # Independently drawn 3-leaf sprout: spec-conformant shape, no template copy.
+    drawn_crop = _make_base_minimap_crop()
+    _draw_independent_3_leaf_sprout(drawn_crop, 70, 96)
+    assert scanner.scan_minimap_crop(drawn_crop)["gatherable_nodes"] == []
+    assert _max_masked_ncc(drawn_crop) < 0.88
+
+    # Positive control for the metric itself: the canonical green template
+    # pasted as-is must clear the 0.88 floor.
+    assert _max_masked_ncc(_paste(_tint_green(tpl))) >= 0.88

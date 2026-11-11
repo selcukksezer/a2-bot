@@ -135,7 +135,9 @@ class TargetHpAndMonsterVisionTests(unittest.TestCase):
         """Tests has_active_target and get_target_hp_percentage helper methods."""
         frame = self.blank_frame.copy()
         self.assertFalse(self.vision.has_active_target(frame))
-        self.assertEqual(self.vision.get_target_hp_percentage(frame), 0.0)
+        # Sweep G: hedef yokken get_target_hp_percentage() None döner
+        # (0.0 yalnızca hedef varken ve gerçekten %0 candayken).
+        self.assertIsNone(self.vision.get_target_hp_percentage(frame))
 
         # Add target
         frame[35:45, 500:700] = (30, 30, 220)
@@ -197,21 +199,74 @@ class TargetHpAndMonsterVisionTests(unittest.TestCase):
         self.assertGreaterEqual(target_bars[0]["confidence"], 0.85)
 
     def test_detect_monsters_3d_exemplar_memory_negative_rejection(self) -> None:
-        """Learned negative exemplar (e.g. false rock) is rejected by detect_monsters_3d."""
-        from dataset_factory.exemplar_memory import get_exemplar_memory
+        """Learned negative exemplar (e.g. false rock) is rejected by detect_monsters_3d.
+
+        Proof goes through the real detector, not through is_negative_patch alone:
+        the same frame is detected once without the exemplar (control: 1 monster)
+        and once after teaching the detector's own candidate crop as a negative
+        exemplar (rejected: 0 monsters). The exemplar memory is a temp instance
+        patched into ``detect_monsters_3d`` so the real store is untouched.
+
+        NOTE: the frame is 860x720, not 1280x720, because
+        ``core/vision.py:2699`` builds the viewport mask with ``vx2 - vy1``
+        instead of ``vx2 - vx1`` — at 1280x720 that raises ValueError and no
+        ``detect_monsters_3d`` call works at all. That typo lives in
+        core/vision.py (another slice's file, D53) and is NOT fixed here;
+        the 1280x720 ``detect_monsters_3d`` tests below still fail because of it.
+        """
+        from unittest.mock import patch
+
+        from dataset_factory.exemplar_memory import ExemplarMemory
+
+        w, h = 860, 720
+        frame = np.full((h, w, 3), 85, dtype=np.uint8)
+        # Red HP bar in the 3D viewport: a monster_3d candidate.
+        frame[280:288, 300:400] = (30, 30, 220)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_json = os.path.join(tmp_dir, "test_exemplars.json")
-            mem = get_exemplar_memory(tmp_json)
+            mem = ExemplarMemory(json_path=tmp_json)
+            with patch(
+                "dataset_factory.exemplar_memory.get_exemplar_memory",
+                return_value=mem,
+            ):
+                # Control: without the negative exemplar the candidate is detected.
+                control = self.vision.detect_monsters_3d(frame)
+                control_mobs = [
+                    m for m in control if m["class_name"] == "monster_3d"
+                ]
+                self.assertEqual(
+                    len(control_mobs),
+                    1,
+                    "control frame must yield exactly 1 monster_3d candidate",
+                )
+                # Teach the exact crop detect_monsters_3d evaluates for this
+                # candidate (same slice the detector passes to is_negative_patch).
+                bx, by, bw, bh = control_mobs[0]["bbox"]
+                crop = frame[
+                    max(0, by - 10) : min(h, by + bh + 40),
+                    max(0, bx - 15) : min(w, bx + bw + 15),
+                ]
+                self.assertTrue(
+                    mem.add_negative_exemplar(
+                        crop, class_id=10, class_name="false_rock"
+                    )
+                )
+                is_neg, sim, _ = mem.is_negative_patch(crop)
+                self.assertTrue(is_neg)
+                self.assertGreaterEqual(sim, 0.70)
 
-            # Teach false rock patch
-            false_rock = np.full((50, 50, 3), 115, dtype=np.uint8)
-            mem.add_negative_exemplar(false_rock, class_id=10, class_name="false_rock")
-
-            # Check that is_negative_patch recognizes it
-            is_neg, sim, _ = mem.is_negative_patch(false_rock)
-            self.assertTrue(is_neg)
-            self.assertGreaterEqual(sim, 0.70)
+                # The same frame is now rejected by the real detector.
+                after = self.vision.detect_monsters_3d(frame)
+                rejected = [
+                    m for m in after if m["class_name"] == "monster_3d"
+                ]
+                self.assertEqual(
+                    rejected,
+                    [],
+                    "candidate matching a learned negative exemplar must be "
+                    "rejected by detect_monsters_3d",
+                )
 
 
 if __name__ == "__main__":

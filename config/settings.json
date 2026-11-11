@@ -13,7 +13,8 @@
         "selective_gather_enabled": false,
         "selected_materials": [],
         "proximity_route_auto": true,
-        "pause_on_alt_tab": true
+        "pause_on_alt_tab": true,
+        "auto_consumables": true
     },
     "route": {
         "rest_minutes": 5,
@@ -33,34 +34,38 @@
         "harvests_per_node": 3,
         "minimap_auto_record": true,
         "minimap_ignore_monsters": true,
-        "minimap_auto_filter_check": true,
-        "minimap_cluster_stack_bonus": true,
         "hybrid_3d_and_minimap_record": true,
         "auto_record_3d_crests": true,
         "mp_full_threshold": 0.95,
         "ucb_explore_ratio": 0.2,
         "skill_discovery_enabled": true,
-        "pause_on_alt_tab": true
+        "pause_on_alt_tab": true,
+        "auto_use_hp_potion": true,
+        "hp_potion_threshold_pct": 65,
+        "auto_use_mp_potion": true,
+        "mp_potion_threshold_pct": 45,
+        "auto_refresh_buff_scroll": true,
+        "buff_scroll_interval_sec": 300
     },
     "breaks": {
         "break_every_min": 0,
         "break_every_variance": 1,
         "break_lasts_min": 10,
-        "break_lasts_variance": 1
+        "break_lasts_variance": 1,
+        "enabled": true
     },
     "hotkeys": {
         "toggle_menu_f9": "ctrl+alt+f9",
         "record_node_f8": "ctrl+alt+f8",
-        "pause_resume_f10": "ctrl+alt+f10",
-        "emergency_exit": "esc"
+        "pause_resume_f10": "ctrl+alt+f10"
     },
     "display": {
-        "ui_proportion": "Medium",
         "monitor_idx": 1,
         "last_tab": "home"
     },
     "active_region": "Altgard",
     "active_route": "Dredgion Crash Site",
-    "version": "v1.6.15",
-    "reflex_model": "yolov8"
+    "version": "2.0.0",
+    "reflex_model": "yolov8",
+    "blacklist": []
 }

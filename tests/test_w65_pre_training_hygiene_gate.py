@@ -11,6 +11,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from dataset_factory.pre_training_hygiene_gate import PreTrainingHygieneGate  # noqa: E402
+# F-2052 (Yüksek, cross-slice blocked): bu gate'i rtx_trainer_engine /
+# factory_controller dahil hiçbir üretim modülü çağırmıyor — kablolama bu
+# dilimin dosyaları (yalnızca testler) dışında; orchestrator kararı bekler.
 
 
 def test_is_valid_class_id_rejects_98_and_invalid_values() -> None:

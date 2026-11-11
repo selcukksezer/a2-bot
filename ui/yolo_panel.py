@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListView,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -44,6 +45,9 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.shell_theme import (
+    CONFIDENCE_HIGH_THRESHOLD,
+    CONFIDENCE_MEDIUM_THRESHOLD,
+    CONFIDENCE_TIER_COLORS,
     apply_combobox_dark_style,
     apply_combobox_white_text_style,
     style_combobox_dark_popup,
@@ -52,106 +56,24 @@ from ui.shell_theme import (
 
 
 def style_combobox_dark_view(combo: Optional[QComboBox]) -> None:
-    """
-    Applies high-contrast dark theme styling with crisp white text (#ffffff)
-    to a QComboBox and its dropdown popup view (QAbstractItemView / QListView / combo.view()).
-    Sets both comprehensive QSS and explicit QPalette ColorRole entries (Text, WindowText,
-    HighlightedText) to ensure readable white text across Windows Qt6 native styles.
-    """
-    if combo is None or not isinstance(combo, QComboBox):
-        return
-    try:
-        # 1. Combo widget palette
-        cpal = combo.palette()
-        cpal.setColor(QPalette.ColorRole.WindowText, QColor("#ffffff"))
-        cpal.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
-        cpal.setColor(QPalette.ColorRole.ButtonText, QColor("#ffffff"))
-        cpal.setColor(QPalette.ColorRole.Base, QColor("#0f172a"))
-        cpal.setColor(QPalette.ColorRole.Window, QColor("#0f172a"))
-        cpal.setColor(QPalette.ColorRole.Highlight, QColor("#2563eb"))
-        cpal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-        combo.setPalette(cpal)
+    """Apply the dark combobox style.
 
-        # 2. QSS on combo and popup
-        combo.setStyleSheet(
-            "QComboBox {"
-            " background-color: #1e293b;"
-            " color: #ffffff;"
-            " border: 1px solid #334155;"
-            " border-radius: 6px;"
-            " padding: 4px 8px;"
-            " font-size: 12px;"
-            " font-weight: 500;"
-            " min-height: 24px;"
-            "}"
-            "QComboBox:hover { border-color: #38bdf8; }"
-            "QComboBox::drop-down { border: none; width: 20px; }"
-            "QComboBox QAbstractItemView, QComboBox QListView, QListView {"
-            " background-color: #0f172a !important;"
-            " color: #ffffff !important;"
-            " selection-background-color: #2563eb !important;"
-            " selection-color: #ffffff !important;"
-            " border: 1px solid #334155;"
-            " padding: 4px;"
-            " outline: none;"
-            "}"
-            "QComboBox QAbstractItemView::item, QComboBox QListView::item, QListView::item {"
-            " color: #ffffff !important;"
-            " background-color: #0f172a;"
-            " min-height: 24px;"
-            " padding: 4px 8px;"
-            "}"
-            "QComboBox QAbstractItemView::item:selected, QComboBox QAbstractItemView::item:hover,"
-            "QComboBox QListView::item:selected, QComboBox QListView::item:hover,"
-            "QListView::item:selected, QListView::item:hover {"
-            " background-color: #2563eb !important;"
-            " color: #ffffff !important;"
-            "}"
-        )
-
-        # 3. View styling and palette fallback on combo.view()
-        view = combo.view()
-        if view is not None:
-            view.setAutoFillBackground(True)
-            vpal = view.palette()
-            vpal.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
-            vpal.setColor(QPalette.ColorRole.WindowText, QColor("#ffffff"))
-            vpal.setColor(QPalette.ColorRole.Base, QColor("#0f172a"))
-            vpal.setColor(QPalette.ColorRole.Window, QColor("#0f172a"))
-            vpal.setColor(QPalette.ColorRole.Highlight, QColor("#2563eb"))
-            vpal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-            vpal.setColor(QPalette.ColorRole.AlternateBase, QColor("#1e293b"))
-            view.setPalette(vpal)
-            view.setStyleSheet(
-                "QListView, QAbstractItemView {"
-                " background-color: #0f172a !important;"
-                " color: #ffffff !important;"
-                " selection-background-color: #2563eb !important;"
-                " selection-color: #ffffff !important;"
-                " border: 1px solid #334155;"
-                " outline: none;"
-                " padding: 4px;"
-                " font-size: 12px;"
-                "}"
-                "QListView::item, QAbstractItemView::item {"
-                " color: #ffffff !important;"
-                " background-color: #0f172a;"
-                " min-height: 24px;"
-                " padding: 4px 8px;"
-                "}"
-                "QListView::item:selected, QListView::item:hover,"
-                "QAbstractItemView::item:selected, QAbstractItemView::item:hover {"
-                " background-color: #2563eb !important;"
-                " color: #ffffff !important;"
-                "}"
-            )
-    except Exception as exc:
-        logger.debug("Failed to style combobox view: %s", exc)
+    Single source of truth is ``ui.shell_theme.style_combobox_dark_view``
+    (imported above as ``shell_style_combobox_dark_view``); this wrapper only
+    exists so existing ``ui.yolo_panel.style_combobox_dark_view`` callers keep
+    working. Previously this file carried a ~100-line copy that drifted in
+    colour from the shell one (F-0778).
+    """
+    shell_style_combobox_dark_view(combo)
 
 
 logger = logging.getLogger("Gatherion.YOLOPanel")
 
-# Class ID to Name mapping according to dataset_factory specification
+# Class ID to Name mapping — canonical 27 classes (0..26), single authority
+# dataset_factory/class_taxonomy.py CANONICAL_NAMES (Decision 1 / S-1801).
+# Previously this was a stale 25-class map (0..24): 6/7/8/12 carried legacy
+# names (world_gather_crest, f_gather_prompt, f_press_key,
+# feather_particle_negative) and 25 kinah / 26 player_character were missing.
 CLASS_ID_TO_NAME: Dict[int, str] = {
     0: "herb_aria",
     1: "herb_mela",
@@ -159,13 +81,13 @@ CLASS_ID_TO_NAME: Dict[int, str] = {
     3: "ore_orichalcum",
     4: "gem_crystal",
     5: "tree_log",
-    6: "world_gather_crest",
-    7: "f_gather_prompt",
-    8: "f_press_key",
+    6: "herb_edana",
+    7: "herb_lumina",
+    8: "ore_obsidian",
     9: "minimap_sprout",
     10: "monster_3d",
     11: "minimap_monster_dot",
-    12: "world_gather_crest",
+    12: "crystal_blood",
     13: "skill_ui_prompt",
     14: "obstacle",
     15: "path_ground",
@@ -178,7 +100,17 @@ CLASS_ID_TO_NAME: Dict[int, str] = {
     22: "hp_potion",
     23: "mp_potion",
     24: "buff_scroll",
+    25: "kinah",
+    26: "player_character",
 }
+
+# Confidence tiers — P3-7 (v18): tek kaynak ui.shell_theme (o da
+# dataset_factory/confidence_tier_coloring'dan okur; test-pinned:
+# tests/test_w27_three_tier_box_colors.py). Orta eşik 0.70'tir — bu modül
+# eskiden 0.60 kullanıyordu, web JS (paintBoxes) ile birlikte; o yüzden
+# 0.60-0.69 güven bir yerde "şüpheli", fabrika tarafında "düşük" sayılıyordu.
+# CONFIDENCE_HIGH_THRESHOLD / CONFIDENCE_MEDIUM_THRESHOLD / CONFIDENCE_TIER_COLORS
+# yukarıdaki ui.shell_theme importundan gelir; burada yeniden tanımlanmaz.
 
 # High-contrast color palette categorized by entity type
 CLASS_COLORS: Dict[str, str] = {
@@ -186,12 +118,23 @@ CLASS_COLORS: Dict[str, str] = {
     "herb_aria": "#22c55e",          # Emerald Green
     "herb_mela": "#10b981",          # Teal Green
     "herb_targena": "#14b8a6",       # Aqua Green
+    "herb_edana": "#a855f7",         # Violet (pink/purple herb, S-1801)
+    "herb_lumina": "#facc15",        # Gold (yellow/golden herb, S-1801)
     # Ores, Gems, Trees (Amber / Magenta / Lime)
     "ore_orichalcum": "#f59e0b",     # Amber Gold
+    "ore_obsidian": "#334155",       # Dark Slate (obsidian, S-1801)
     "gem_crystal": "#ec4899",        # Crystal Pink
+    "crystal_blood": "#dc2626",      # Blood Red crystal (S-1801)
     "tree_log": "#84cc16",           # Lime Wood
+    # Currency & Player (S-1801)
+    "kinah": "#fbbf24",              # Kinah Gold
+    "player_character": "#38bdf8",   # Sky Blue player
     # Prompts, Crests & Minimap (Sky Blues & Lime)
+    # Legacy keys below (world_gather_crest, f_gather_prompt, f_press_key,
+    # feather_particle_negative) are no longer canonical class names (S-1801)
+    # but are kept so any caller passing the old name still gets a color.
     "world_gather_crest": "#38bdf8", # Sky Blue
+    "feather_particle_negative": "#e2e8f0", # Pale feather particle
     "f_gather_prompt": "#06b6d4",    # Cyan
     "f_press_key": "#0284c7",        # Deep Blue
     "minimap_sprout": "#4ade80",     # Bright Lime Sprout
@@ -224,16 +167,28 @@ def get_annotation_tier_summary(annotations: Sequence[Any]) -> Dict[str, Any]:
       - confident (>= 0.85): green (#22c55e)
       - suspicious (0.70 .. < 0.85): orange (#fb923c)
       - low (< 0.70): red (#ef4444)
+
+    An annotation with no confidence value at all is never "confident":
+    normalize_annotation() reports unknown confidence as 0.0, and the tier
+    below additionally treats a missing confidence key as 0.0 (F-0613).
     """
     confident = 0
     suspicious = 0
     low = 0
     for raw in annotations or []:
         norm = normalize_annotation(raw)
+        # P2-23 (Y002-K1): geometrisi eksik kutu sayılmaz — şablon
+        # geometriyle çizilmediği gibi tier sayacına da girmez.
+        if norm.get("valid") is False:
+            continue
         conf = float(norm.get("confidence", 0.0) or 0.0)
-        if conf >= 0.85 and bool(norm.get("trusted", True)):
+        if isinstance(raw, dict) and "confidence" not in raw and "conf" not in raw:
+            conf = 0.0
+        elif isinstance(raw, (list, tuple)) and len(raw) < 6:
+            conf = 0.0
+        if conf >= CONFIDENCE_HIGH_THRESHOLD and bool(norm.get("trusted", False)):
             confident += 1
-        elif conf >= 0.70:
+        elif conf >= CONFIDENCE_MEDIUM_THRESHOLD:
             suspicious += 1
         else:
             low += 1
@@ -242,11 +197,8 @@ def get_annotation_tier_summary(annotations: Sequence[Any]) -> Dict[str, Any]:
         "confident": confident,
         "suspicious": suspicious,
         "low": low,
-        "colors": {
-            "confident": "#22c55e",
-            "suspicious": "#fb923c",
-            "low": "#ef4444",
-        },
+        # P3-7: renkler tek kaynaktan (ui.shell_theme.CONFIDENCE_TIER_COLORS).
+        "colors": dict(CONFIDENCE_TIER_COLORS),
     }
 
 
@@ -266,22 +218,37 @@ def normalize_annotation(ann: Any) -> Dict[str, Any]:
             class_name = CLASS_ID_TO_NAME.get(class_id, f"class_{class_id}")
         class_name = str(class_name or "target")
 
-        conf = ann.get("confidence", ann.get("conf", 0.90))
+        conf = ann.get("confidence", ann.get("conf", 0.0))
         try:
-            conf_val = float(conf if conf is not None else 0.90)
+            conf_val = float(conf if conf is not None else 0.0)
             if not math.isfinite(conf_val):
-                conf_val = 0.90
+                conf_val = 0.0
+            # Clamp to [0, 1] (S-1802): out-of-range values such as 5.0 or
+            # -0.5 previously passed through, counted as 'confident' in the
+            # tier summary and rendered as "%5" on the overlay badge.
+            conf_val = min(1.0, max(0.0, conf_val))
         except (ValueError, TypeError):
-            conf_val = 0.90
+            conf_val = 0.0
 
         trusted = ann.get("trusted")
+        # P2-23 (Y002-K1): `trusted` alanı olmayan kutu varsayılan
+        # `trusted=False` sayılır. Eskiden alan yoksa `weak` bayrağına
+        # bakılıp (yoksa True) varsayılıyordu; bozuk girdi böylece
+        # "emin" sayılıyor ve aşağıda uydurma geometriyle görüntünün
+        # ortasına %8'lik "target" hayalet kutusu çiziliyordu.
         if trusted is None:
-            trusted = not bool(ann.get("weak", False))
+            trusted = False
         else:
             trusted = bool(trusted)
 
         color = ann.get("color") or CLASS_COLORS.get(class_name, DEFAULT_BOX_COLOR)
 
+        # P2-23 (Y002-K1): geometrisi eksik kutuya şablon geometri
+        # (cx/cy=0.5, w/h=0.08) uydurulmaz — öyle kutu `valid=False`
+        # ile işaretlenir; çizilmez, tier sayacına girmez.
+        geom_keys = ("cx", "cy", "w", "h")
+        has_geometry = all(k in ann and ann.get(k) is not None for k in geom_keys)
+        valid = bool(has_geometry)
         try:
             raw_cx = ann.get("cx", 0.5)
             raw_cy = ann.get("cy", 0.5)
@@ -295,8 +262,11 @@ def normalize_annotation(ann: Any) -> Dict[str, Any]:
             if not math.isfinite(cy): cy = 0.5
             if not math.isfinite(w): w = 0.08
             if not math.isfinite(h): h = 0.08
+            if not has_geometry or w <= 0 or h <= 0:
+                valid = False
         except (ValueError, TypeError):
             cx, cy, w, h = 0.5, 0.5, 0.08, 0.08
+            valid = False
 
         return {
             "cx": cx,
@@ -307,14 +277,18 @@ def normalize_annotation(ann: Any) -> Dict[str, Any]:
             "confidence": conf_val,
             "trusted": trusted,
             "color": str(color),
+            "valid": valid,
         }
 
     if isinstance(ann, (list, tuple)):
         n = len(ann)
         cx, cy, w, h = 0.5, 0.5, 0.08, 0.08
         class_name = "target"
-        conf_val = 0.90
-        trusted = True
+        conf_val = 0.0
+        # P2-23 (Y002-K1): alan yoksa trusted=False; geometrisiz
+        # tuple (n<4) hayalet kutu olarak çizilmez (valid=False).
+        trusted = False
+        valid = False
 
         try:
             if n >= 6 and isinstance(ann[0], int) and isinstance(ann[1], (int, float)):
@@ -327,15 +301,17 @@ def normalize_annotation(ann: Any) -> Dict[str, Any]:
                     w = float(ann[3])
                     h = float(ann[4])
                     conf_val = float(ann[5])
+                    valid = True
                 except (ValueError, TypeError, IndexError):
                     cx, cy, w, h = 0.5, 0.5, 0.08, 0.08
-                    conf_val = 0.90
+                    conf_val = 0.0
             elif n >= 4:
                 try:
                     cx = float(ann[0])
                     cy = float(ann[1])
                     w = float(ann[2])
                     h = float(ann[3])
+                    valid = True
                 except (ValueError, TypeError, IndexError):
                     cx, cy, w, h = 0.5, 0.5, 0.08, 0.08
                 if n >= 5:
@@ -348,18 +324,23 @@ def normalize_annotation(ann: Any) -> Dict[str, Any]:
                     try:
                         conf_val = float(ann[5])
                     except (ValueError, TypeError, IndexError):
-                        conf_val = 0.90
+                        conf_val = 0.0
                 if n >= 7:
                     trusted = bool(ann[6])
         except Exception:
             cx, cy, w, h = 0.5, 0.5, 0.08, 0.08
-            conf_val = 0.90
+            conf_val = 0.0
+            valid = False
 
         if not math.isfinite(cx): cx = 0.5
         if not math.isfinite(cy): cy = 0.5
         if not math.isfinite(w): w = 0.08
         if not math.isfinite(h): h = 0.08
-        if not math.isfinite(conf_val): conf_val = 0.90
+        if not math.isfinite(conf_val): conf_val = 0.0
+        if w <= 0 or h <= 0:
+            valid = False
+        # Clamp to [0, 1] (S-1802) — same as the dict path above.
+        conf_val = min(1.0, max(0.0, conf_val))
 
         color = CLASS_COLORS.get(class_name, DEFAULT_BOX_COLOR)
         return {
@@ -371,6 +352,7 @@ def normalize_annotation(ann: Any) -> Dict[str, Any]:
             "confidence": conf_val,
             "trusted": trusted,
             "color": color,
+            "valid": valid,
         }
 
     return {
@@ -379,9 +361,10 @@ def normalize_annotation(ann: Any) -> Dict[str, Any]:
         "w": 0.08,
         "h": 0.08,
         "class_name": "target",
-        "confidence": 0.90,
-        "trusted": True,
+        "confidence": 0.0,
+        "trusted": False,
         "color": DEFAULT_BOX_COLOR,
+        "valid": False,
     }
 
 
@@ -407,14 +390,19 @@ def draw_annotation_overlay(
         return
 
     # Dynamic badge font proportional to target viewport height
-    font_pt = max(9, min(14, int(dh * 0.022)))
+    font_pt = max(10, min(15, int(dh * 0.022)))
     tag_font = QFont("Segoe UI", font_pt, QFont.Weight.Bold)
-    close_font = QFont("Segoe UI", max(8, font_pt - 1), QFont.Weight.Black)
+    close_font = QFont("Segoe UI", max(9, font_pt - 1), QFont.Weight.Black)
     painter.setFont(tag_font)
     fm = QFontMetrics(tag_font)
 
     for idx, raw in enumerate(annotations):
         ann = normalize_annotation(raw)
+        # P2-23 (Y002-K1): geometrisi eksik kutu çizilmez — şablon
+        # (0.5/0.5/0.08) "target" hayalet kutu yok; ✕ vuruş alanı da
+        # oluşmaz, silme için eşleşecek kutu yoktur.
+        if ann.get("valid") is False:
+            continue
         try:
             cx = float(ann.get("cx", 0.5))
             cy = float(ann.get("cy", 0.5))
@@ -429,14 +417,20 @@ def draw_annotation_overlay(
 
         cname = str(ann.get("class_name", "target"))
         try:
-            raw_c = ann.get("confidence", 0.90)
-            conf = float(raw_c if raw_c is not None else 0.90)
+            raw_c = ann.get("confidence", 0.0)
+            conf = float(raw_c if raw_c is not None else 0.0)
             if not math.isfinite(conf):
                 conf = 0.0
+            # Defense-in-depth (S-1802): normalize_annotation already clamps
+            # to [0, 1], but clamp again here so a hand-built ann dict can
+            # never render a "%5" / "%-50" badge.
+            conf = min(1.0, max(0.0, conf))
         except (ValueError, TypeError):
             conf = 0.0
 
-        is_trusted = bool(ann.get("trusted", True))
+        # P2-23 (Y002-K1): `trusted` alanı yoksa False sayılır
+        # (normalize_annotation zaten böyle üretir; burası savunma).
+        is_trusted = bool(ann.get("trusted", False))
         color_hex = str(ann.get("color") or CLASS_COLORS.get(cname, DEFAULT_BOX_COLOR))
 
         # Calculate bounding box in pixel coordinates within target_rect
@@ -477,7 +471,9 @@ def draw_annotation_overlay(
             prefix = "" if is_trusted else "şüpheli "
             if math.isfinite(conf):
                 try:
-                    pct = int(round(conf * 100)) if conf <= 1.0 else int(round(conf))
+                    # conf is clamped to [0, 1] in normalize_annotation
+                    # (S-1802), so this is always a 0..100 percentage.
+                    pct = int(round(conf * 100))
                 except (ValueError, OverflowError):
                     pct = 0
             else:
@@ -647,7 +643,7 @@ class YOLOPreviewCanvasWidget(QWidget):
 
             if self._src is None or self._src.isNull():
                 painter.setPen(QColor("#64748b"))
-                painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Medium))
+                painter.setFont(QFont("Segoe UI", 13, QFont.Weight.Medium))
                 painter.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter), "Görüntü yok")
                 return
 
@@ -722,8 +718,8 @@ class YOLOPreviewDialog(QDialog):
         )
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(12)
 
         # Header bar
         top_bar = QHBoxLayout()
@@ -732,7 +728,7 @@ class YOLOPreviewDialog(QDialog):
 
         meta_html = f" &nbsp;·&nbsp; <span style='color:#94a3b8; font-weight:normal;'>{meta}</span>" if meta else ""
         self.title_lbl = QLabel(f"<b>{title}</b>{meta_html}")
-        self.title_lbl.setStyleSheet("color: #f8fafc; font-size: 14px;")
+        self.title_lbl.setStyleSheet("color: #f8fafc; font-size: 15px;")
         top_bar.addWidget(self.title_lbl)
         top_bar.addStretch(1)
 
@@ -745,9 +741,12 @@ class YOLOPreviewDialog(QDialog):
         self._filter_combo.addItem("🟠 Sadece Şüpheliler", "weak")
 
         # Discover unique classes present in current annotations
+        # (P2-23: geometrisi eksik kutu çizilmez, sınıf listesine de girmez)
         seen_classes: set[str] = set()
         for raw in self._all_annotations:
             norm = normalize_annotation(raw)
+            if norm.get("valid") is False:
+                continue
             cname = norm.get("class_name")
             if cname and cname not in seen_classes:
                 seen_classes.add(cname)
@@ -763,7 +762,7 @@ class YOLOPreviewDialog(QDialog):
         self.chk_annotations.setChecked(True)
         self.chk_annotations.setCursor(Qt.CursorShape.PointingHandCursor)
         self.chk_annotations.setStyleSheet(
-            "QCheckBox { color: #94a3b8; font-size: 12px; font-weight: 600; spacing: 6px; }"
+            "QCheckBox { color: #A8B4C4; font-size: 13px; font-weight: 600; spacing: 8px; }"
             "QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px; border: 1px solid #334155; background: #1e293b; }"
             "QCheckBox::indicator:checked { background: #38bdf8; border-color: #38bdf8; }"
         )
@@ -776,7 +775,7 @@ class YOLOPreviewDialog(QDialog):
         btn_close.setStyleSheet(
             "QPushButton {"
             " background: #1e2530; color: #f1f5f9; border: 1px solid #334155;"
-            " border-radius: 6px; padding: 0 14px; font-size: 12px; font-weight: 600;"
+            " border-radius: 6px; padding: 6px 16px; font-size: 13px; font-weight: 600;"
             "}"
             "QPushButton:hover { background: #334155; border-color: #475569; }"
             "QPushButton:pressed { background: #0f172a; }"
@@ -794,42 +793,102 @@ class YOLOPreviewDialog(QDialog):
         # Footer info
         bottom_bar = QHBoxLayout()
         tip = QLabel("Etiket üzerindeki [✕] ile kutuyu sil &nbsp;·&nbsp; Kapatmak için ESC &nbsp;·&nbsp; [V] gizle/göster")
-        tip.setStyleSheet("color: #64748b; font-size: 11px;")
+        tip.setStyleSheet("color: #7E8DA1; font-size: 12px;")
         tip.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         bottom_bar.addWidget(tip)
         bottom_bar.addStretch(1)
 
-        box_count = len(annotations) if annotations else 0
+        # P2-23: yalnızca çizilebilir (geometrili) kutular sayılır.
+        box_count = sum(
+            1
+            for a in (annotations or [])
+            if normalize_annotation(a).get("valid") is not False
+        )
         self.count_lbl = QLabel(f"{box_count} tespit")
-        self.count_lbl.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
+        self.count_lbl.setStyleSheet("color: #A8B4C4; font-size: 12px; font-weight: 600;")
         bottom_bar.addWidget(self.count_lbl)
         root.addLayout(bottom_bar)
 
+    def _rebuild_filter_combo(self) -> None:
+        """Rebuild the class filter items from the current annotations (F-0779).
+
+        Previously the class entries were only built in __init__, so after an
+        annotation was deleted its class stayed in the dropdown (stale filter
+        matching nothing). Preserves the current selection when it still exists.
+        """
+        previous = self._filter_combo.currentData() if hasattr(self, "_filter_combo") else "all"
+        self._filter_combo.blockSignals(True)
+        try:
+            self._filter_combo.clear()
+            self._filter_combo.addItem("Tüm Tespitler (Hepsi)", "all")
+            self._filter_combo.addItem("🟢 Sadece Emin Olunanlar", "trusted")
+            self._filter_combo.addItem("🟠 Sadece Şüpheliler", "weak")
+            seen_classes: set[str] = set()
+            for raw in self._all_annotations:
+                norm = normalize_annotation(raw)
+                if norm.get("valid") is False:
+                    continue
+                cname = norm.get("class_name")
+                if cname and cname not in seen_classes:
+                    seen_classes.add(cname)
+                    self._filter_combo.addItem(f"🎯 {cname}", f"class:{cname}")
+            idx = self._filter_combo.findData(previous)
+            self._filter_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self._filter_combo.blockSignals(False)
+
     def _on_canvas_remove_annotation(self, target_ann: Any) -> None:
-        self._all_annotations = [a for a in self._all_annotations if a is not target_ann]
-        self._on_filter_changed()
+        # P2-23 (Y004-K1): silme önce diskte yapılır, UI sonra güncellenir.
+        # Eskiden kutu önce `self._all_annotations`'tan (UI) çıkarılıp
+        # canvas yeniden çiziliyor, callback hatası `logger.debug`'a
+        # yutuluyordu — diskte duran kutu UI'da yok oluyordu (geri alma
+        # yok). Callback (`YOLOFactoryDialog._reject_box`) bool döner:
+        # True = diskten silindi, False = korumalı / bulunamadı /
+        # diske kaydedilemedi. False/hatada kutu UI'da bırakılır ve
+        # hata kullanıcıya gösterilir (yalnızca loga değil).
+        removed = False
         if callable(self._on_remove_annotation):
             try:
-                self._on_remove_annotation(target_ann)
+                removed = bool(self._on_remove_annotation(target_ann))
             except Exception as exc:
-                logger.debug("on_remove_annotation callback error: %s", exc)
+                logger.warning("on_remove_annotation callback error: %s", exc)
+                removed = False
+        else:
+            # Geri çağırma yok: silinecek disk yok, yerel kaldırma işlemin kendisi.
+            removed = True
+        if not removed:
+            QMessageBox.warning(
+                self,
+                "Kutu silinemedi",
+                "Kutu diskten silinemedi — diskteki etiket değişmedi, "
+                "kutu önizlemede bırakıldı.",
+            )
+            return
+        self._all_annotations = [a for a in self._all_annotations if a is not target_ann]
+        self._rebuild_filter_combo()
+        self._on_filter_changed()
 
     def _on_toggle_annotations(self, checked: bool) -> None:
         self.canvas.set_show_annotations(checked)
 
     def _on_filter_changed(self, index: int = 0) -> None:
         data = self._filter_combo.currentData() if hasattr(self, "_filter_combo") else "all"
+        # P2-23: geometrisi eksik kutu hiçbir filtrede görünmez (çizilmez).
+        source = [
+            a for a in self._all_annotations
+            if normalize_annotation(a).get("valid") is not False
+        ]
         if not data or data == "all":
-            filtered = list(self._all_annotations)
+            filtered = list(source)
         elif data == "trusted":
-            filtered = [a for a in self._all_annotations if normalize_annotation(a).get("trusted")]
+            filtered = [a for a in source if normalize_annotation(a).get("trusted")]
         elif data == "weak":
-            filtered = [a for a in self._all_annotations if not normalize_annotation(a).get("trusted")]
+            filtered = [a for a in source if not normalize_annotation(a).get("trusted")]
         elif str(data).startswith("class:"):
             target_class = str(data)[len("class:"):]
-            filtered = [a for a in self._all_annotations if normalize_annotation(a).get("class_name") == target_class]
+            filtered = [a for a in source if normalize_annotation(a).get("class_name") == target_class]
         else:
-            filtered = list(self._all_annotations)
+            filtered = list(source)
 
         self.canvas.set_content(self.canvas._src, filtered)
         if hasattr(self, "count_lbl"):
@@ -892,32 +951,37 @@ def _harden_factory_dialog_combos(factory_cls: Any) -> None:
         factory_cls._yolo_combos_hardened = True
 
 
-# Re-exports for clean modular imports
-try:
-    from ui.yolo_factory_dialog import YOLOFactoryDialog, YOLOPreviewCanvas
-    _harden_factory_dialog_combos(YOLOFactoryDialog)
-except ImportError:
-    pass
-
-try:
-    from ui.yolo_pipeline_web import create_yolo_factory_page
-except ImportError:
-    pass
-
+# Re-exports for clean modular imports.
+# __all__ is built incrementally: a failed re-export must NOT stay listed
+# (previously the except: pass swallowed the failure while __all__ still
+# advertised the name — F-0702).
 __all__ = [
     "CLASS_COLORS",
     "CLASS_ID_TO_NAME",
+    "CONFIDENCE_HIGH_THRESHOLD",
+    "CONFIDENCE_MEDIUM_THRESHOLD",
     "DEFAULT_BOX_COLOR",
     "YOLOPreviewCanvasWidget",
     "YOLOPreviewDialog",
     "draw_annotation_overlay",
+    "get_annotation_tier_summary",
     "normalize_annotation",
     "render_annotated_pixmap",
     "apply_combobox_dark_style",
     "apply_combobox_white_text_style",
     "style_combobox_dark_view",
-    "YOLOFactoryDialog",
-    "YOLOPreviewCanvas",
-    "create_yolo_factory_page",
 ]
+
+try:
+    from ui.yolo_factory_dialog import YOLOFactoryDialog, YOLOPreviewCanvas
+    _harden_factory_dialog_combos(YOLOFactoryDialog)
+    __all__ += ["YOLOFactoryDialog", "YOLOPreviewCanvas"]
+except ImportError as exc:
+    logger.debug("YOLOFactoryDialog re-export unavailable: %s", exc)
+
+try:
+    from ui.yolo_pipeline_web import create_yolo_factory_page
+    __all__ += ["create_yolo_factory_page"]
+except ImportError as exc:
+    logger.debug("create_yolo_factory_page re-export unavailable: %s", exc)
 

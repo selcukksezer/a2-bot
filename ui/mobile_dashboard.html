@@ -1243,11 +1243,11 @@
         <div class="harvest-cycle-box">
           <div class="ring-wrapper">
             <div class="harvest-steps">
-              <div id="stepNode1" class="step-node done">1/3</div>
-              <div id="stepNode2" class="step-node current">2/3</div>
+              <div id="stepNode1" class="step-node">1/3</div>
+              <div id="stepNode2" class="step-node">2/3</div>
               <div id="stepNode3" class="step-node">3/3</div>
             </div>
-            <div id="harvestCycleLabel" class="ring-caption">Toplama Döngüsü: 2/3</div>
+            <div id="harvestCycleLabel" class="ring-caption">Toplama Döngüsü: —/3</div>
           </div>
 
           <div class="stats-mini-grid">
@@ -1271,20 +1271,20 @@
           <div class="bar-row">
             <div class="bar-label-line">
               <span>❤️ Can Durumu (HP)</span>
-              <span id="hpValueText">100%</span>
+              <span id="hpValueText">—</span>
             </div>
             <div class="progress-track">
-              <div id="hpBarFill" class="progress-fill hp" style="width: 100%;"></div>
+              <div id="hpBarFill" class="progress-fill hp" style="width: 0%;"></div>
             </div>
           </div>
 
           <div class="bar-row">
             <div class="bar-label-line">
               <span>💧 Mana / Enerji Durumu (MP)</span>
-              <span id="mpValueText">100%</span>
+              <span id="mpValueText">—</span>
             </div>
             <div class="progress-track">
-              <div id="mpBarFill" class="progress-fill mp" style="width: 100%;"></div>
+              <div id="mpBarFill" class="progress-fill mp" style="width: 0%;"></div>
             </div>
           </div>
         </div>
@@ -1735,6 +1735,13 @@
     if (qrUrlToken) {
       localStorage.setItem('gatherion_token', qrUrlToken);
       localStorage.setItem('a2_mobile_token', qrUrlToken);
+      // O-2 (dilim 22): token URL'de kalmasın — adres çubuğu /
+      // tarayıcı geçmişinden temizlenir. Sonraki fetch istekleri zaten
+      // X-Gatherion-Token başlığıyla gider; <img> istekleri başlık
+      // gönderemediği için withTokenUrl query param'ı korunur.
+      try {
+        window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+      } catch (e) { /* eski tarayıcıda yoksay */ }
     }
 
     // ==================== UYGULAMA DURUMU (STATE) ====================
@@ -2213,7 +2220,9 @@
     }
 
     async function clearIncidentsGallery() {
-      await sendBotAction('clear_incidents', {});
+      // P3-8 (S-050/S-218): onay penceresi + sunucuya açık onay bayrağı.
+      if (!confirm('Tüm olay kayıtları temizlenecek (dosyalar çöpe taşınır, kalıcı silinmez). Emin misiniz?')) return;
+      await sendBotAction('clear_incidents', {confirm: true});
       AppState.incidents = [];
       renderIncidentsGallery();
     }
@@ -2403,7 +2412,8 @@
       } else if (rawState.includes('HARVEST') || rawState.includes('GATHER') || rawState.includes('TOPLA') || harvestStep > 0) {
         connDot.className = 'brand-dot';
         stateBadge.className = 'badge harvesting';
-        const stepDisp = Math.min(maxHarvest, Math.max(1, harvestStep || 1));
+        // Y-2 (dilim 25): aşama bilinmiyorsa (0) 1 varsayılmaz; "—" gösterilir.
+        const stepDisp = harvestStep > 0 ? Math.min(maxHarvest, harvestStep) : '—';
         stateBadge.textContent = `TOPLANIYOR [${stepDisp}/${maxHarvest}]`;
       } else if (modeStr.includes('explore') || rawState.includes('EXPLORE') || rawState.includes('KEŞİF')) {
         connDot.className = 'brand-dot';
@@ -2489,17 +2499,28 @@
         }
       });
       document.getElementById('harvestCycleLabel').textContent =
-        `Toplama Döngüsü: ${Math.min(maxHarvest, harvestStep)}/${maxHarvest}`;
+        `Toplama Döngüsü: ${harvestStep > 0 ? Math.min(maxHarvest, harvestStep) : '—'}/${maxHarvest}`;
 
-      // Can (HP) ve Mana (MP)
-      const rawHp = vitalsObj.hp_ratio !== undefined ? vitalsObj.hp_ratio * 100 : (s.hp_pct ?? s.hp ?? 100);
-      const rawMp = vitalsObj.mp_ratio !== undefined ? vitalsObj.mp_ratio * 100 : (s.mp_pct ?? s.mp ?? 100);
-      const hpPct = Math.max(0, Math.min(100, Number(rawHp)));
-      const mpPct = Math.max(0, Math.min(100, Number(rawMp)));
-      document.getElementById('hpValueText').textContent = `${Math.round(hpPct)}%`;
-      document.getElementById('hpBarFill').style.width = `${hpPct}%`;
-      document.getElementById('mpValueText').textContent = `${Math.round(mpPct)}%`;
-      document.getElementById('mpBarFill').style.width = `${mpPct}%`;
+      // Can (HP) ve Mana (MP) — Y-2 (dilim 25): sunucu bilinmeyeni null
+      // gönderir (mobile_server.py F-1661); null/eksik değer %100'e
+      // tamamlanmaz, "—" gösterilir ve bar boş kalır. (Eski kodda ayrıca
+      // null * 100 = 0 tuzağı vardı: null !== undefined olduğu için
+      // bilinmeyen HP 0% olarak çiziliyordu.)
+      const pctOrNull = (v) => {
+        if (v === null || v === undefined || v === '') return null;
+        const n = Number(v);
+        return Number.isNaN(n) ? null : Math.max(0, Math.min(100, n));
+      };
+      const hpPct = vitalsObj.hp_ratio != null
+        ? pctOrNull(vitalsObj.hp_ratio * 100)
+        : pctOrNull(s.hp_pct ?? s.hp);
+      const mpPct = vitalsObj.mp_ratio != null
+        ? pctOrNull(vitalsObj.mp_ratio * 100)
+        : pctOrNull(s.mp_pct ?? s.mp);
+      document.getElementById('hpValueText').textContent = hpPct === null ? '—' : `${Math.round(hpPct)}%`;
+      document.getElementById('hpBarFill').style.width = hpPct === null ? '0%' : `${hpPct}%`;
+      document.getElementById('mpValueText').textContent = mpPct === null ? '—' : `${Math.round(mpPct)}%`;
+      document.getElementById('mpBarFill').style.width = mpPct === null ? '0%' : `${mpPct}%`;
 
       // Telemetri & İstatistik Sekmesi
       document.getElementById('metricMinimapSaved').textContent =

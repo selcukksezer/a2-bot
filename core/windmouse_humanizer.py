@@ -10,21 +10,21 @@ ve fiziksel kullanıcı müdahalesini anında algılayarak çakışmayı önleye
 from __future__ import annotations
 
 import ctypes
-from ctypes import wintypes
 import logging
 import math
 import os
 import random
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional, Union
 
 from core.stability_guards import (
-    CURSOR_SHOWING,
     CameraLockExceptionRule,
     CursorVisibilityAutomator,
     SelfInputWhitelistWindow,
 )
+from version import __version__
 
 logger = logging.getLogger("core.windmouse_humanizer")
 if logger.handlers:
@@ -35,31 +35,68 @@ class _POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
-class _LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.UINT),
-        ("dwTime", wintypes.DWORD),
-    ]
-
-
 def _get_cursor_pos() -> tuple[int, int]:
-    """Win32 GetCursorPos çağrısı ile mevcut ekran imleç koordinatlarını döndürür."""
+    """Win32 GetCursorPos çağrısı ile mevcut ekran imleç koordinatlarını döndürür.
+
+    S-1405: Windows'ta okuma başarısız olursa (0, 0) DÖNDÜRMEZ, hata fırlatır —
+    (0, 0) gerçek bir imleç konumu da olabileceğinden sessiz (0, 0) dönüşü
+    guard'ın beklenen/gerçek karşılaştırmasını 0 delta ile geçiştirip
+    fail-open bırakıyordu. Çağıran PhysicalInputGuard._safe_get_cursor hatayı
+    yakalar, okuma-basarısız bayrağını kurar ve denetimler fail-CLOSED
+    davranır. Windows-dışı platformda (Linux/macOS) Win32 API hiç yoktur;
+    orada eski (0, 0) yedeği korunur (geliştirme/test ortamı; üretim
+    Windows'ta çalışır).
+    """
+    if not sys.platform.startswith("win"):
+        return 0, 0
     try:
         pt = _POINT()
         if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
             return int(pt.x), int(pt.y)
     except Exception as exc:
         logger.debug("GetCursorPos hatasi: %s", exc)
-    return 0, 0
+        raise RuntimeError(f"GetCursorPos okunamadi: {exc}") from exc
+    raise RuntimeError("GetCursorPos basarisiz dondu")
 
 
-def _set_cursor_pos_win32(x: int, y: int) -> bool:
-    """Win32 SetCursorPos çağrısı ile imleci verilen koordinata taşır."""
+def _get_screen_size() -> tuple[int, int]:
+    """Ekran boyutunu döndürür; okunamazsa 1920x1080 varsayar (clamp için)."""
     try:
-        return bool(ctypes.windll.user32.SetCursorPos(int(x), int(y)))
+        sw = int(ctypes.windll.user32.GetSystemMetrics(0))
+        sh = int(ctypes.windll.user32.GetSystemMetrics(1))
+        if sw > 0 and sh > 0:
+            return sw, sh
     except Exception as exc:
-        logger.debug("SetCursorPos hatasi (%d, %d): %s", x, y, exc)
-        return False
+        logger.debug("GetSystemMetrics hatasi: %s", exc)
+    return 1920, 1080
+
+
+# Ekran boyutu her yörünge adımında (guard denetimi + clamp) yeniden
+# Win32'ye soruluyordu; çözünürlük saniyeler içinde değişmez, o yüzden
+# kısa TTL'li önbellek yeterli. TTL dolunca yeniden prob edilir.
+_SCREEN_SIZE_CACHE_TTL_SEC: float = 5.0
+_SCREEN_SIZE_CACHE: dict[str, Any] = {"value": None, "ts": 0.0}
+_SCREEN_SIZE_CACHE_LOCK = threading.Lock()
+
+
+def _get_screen_size_cached() -> tuple[int, int]:
+    """TTL'li ekran boyutu: TTL içinde ham probu tekrarlamaz."""
+    now = time.monotonic()
+    with _SCREEN_SIZE_CACHE_LOCK:
+        cached = _SCREEN_SIZE_CACHE["value"]
+        if cached is not None and (now - _SCREEN_SIZE_CACHE["ts"]) < _SCREEN_SIZE_CACHE_TTL_SEC:
+            return cached
+    fresh = _get_screen_size()
+    with _SCREEN_SIZE_CACHE_LOCK:
+        _SCREEN_SIZE_CACHE["value"] = fresh
+        _SCREEN_SIZE_CACHE["ts"] = time.monotonic()
+    return fresh
+
+
+def _clamp_to_screen(x: int, y: int) -> tuple[int, int]:
+    """Koordinatı ekran sınırları içine çeker (jitter sonrası taşmayı önler)."""
+    sw, sh = _get_screen_size_cached()
+    return max(0, min(sw - 1, int(x))), max(0, min(sh - 1, int(y)))
 
 
 class BiometricClickGenerator:
@@ -89,25 +126,47 @@ class BiometricClickGenerator:
         self.mouse_min_sec = float(mouse_min_sec)
         self.mouse_max_sec = float(mouse_max_sec)
 
+    @staticmethod
+    def _sample_gaussian_dwell(
+        mean_sec: float,
+        sigma_sec: float,
+        min_sec: float,
+        max_sec: float,
+        label: str,
+    ) -> float:
+        """
+        Ortalama `mean_sec`, sapma `sigma_sec` ile [min_sec, max_sec] araliginda
+        Gaussian basili tutma suresi ornekler: 8 denemede aralik tutmazsa son
+        ornegi araliga kirpar; hata durumunda ortalamayi dondurur.
+        get_key_dwell_sec / get_mouse_dwell_sec ortak yardimcisidir.
+        """
+        try:
+            for _ in range(8):
+                val = random.gauss(mean_sec, sigma_sec)
+                if min_sec <= val <= max_sec:
+                    return round(val, 6)
+            clamped = max(
+                min_sec,
+                min(max_sec, random.gauss(mean_sec, sigma_sec)),
+            )
+            return round(clamped, 6)
+        except Exception as exc:
+            logger.error("%s hesaplama hatasi: %s", label, exc)
+            return float(mean_sec)
+
     def get_key_dwell_sec(self) -> float:
         """
         F veya M gibi tuş basımlarında KeyDown ile KeyUp arasında
         45 ms ile 115 ms (0.045s - 0.115s, ortalama 76ms, sigma=14ms)
         arasında Gaussian dağılımlı süre döndürür.
         """
-        try:
-            for _ in range(8):
-                val = random.gauss(self.key_mean_sec, self.key_sigma_sec)
-                if self.key_min_sec <= val <= self.key_max_sec:
-                    return round(val, 6)
-            clamped = max(
-                self.key_min_sec,
-                min(self.key_max_sec, random.gauss(self.key_mean_sec, self.key_sigma_sec)),
-            )
-            return round(clamped, 6)
-        except Exception as exc:
-            logger.error("get_key_dwell_sec hesaplama hatasi: %s", exc)
-            return self.key_mean_sec
+        return self._sample_gaussian_dwell(
+            self.key_mean_sec,
+            self.key_sigma_sec,
+            self.key_min_sec,
+            self.key_max_sec,
+            "get_key_dwell_sec",
+        )
 
     def get_mouse_dwell_sec(self) -> float:
         """
@@ -115,19 +174,13 @@ class BiometricClickGenerator:
         55 ms ile 130 ms (0.055s - 0.130s, ortalama 85ms, sigma=16ms)
         arasında Gaussian dağılımlı süre döndürür.
         """
-        try:
-            for _ in range(8):
-                val = random.gauss(self.mouse_mean_sec, self.mouse_sigma_sec)
-                if self.mouse_min_sec <= val <= self.mouse_max_sec:
-                    return round(val, 6)
-            clamped = max(
-                self.mouse_min_sec,
-                min(self.mouse_max_sec, random.gauss(self.mouse_mean_sec, self.mouse_sigma_sec)),
-            )
-            return round(clamped, 6)
-        except Exception as exc:
-            logger.error("get_mouse_dwell_sec hesaplama hatasi: %s", exc)
-            return self.mouse_mean_sec
+        return self._sample_gaussian_dwell(
+            self.mouse_mean_sec,
+            self.mouse_sigma_sec,
+            self.mouse_min_sec,
+            self.mouse_max_sec,
+            "get_mouse_dwell_sec",
+        )
 
     def apply_2d_gaussian_jitter(
         self,
@@ -265,10 +318,14 @@ class PhysicalInputGuard:
         )
 
         self._lock = threading.RLock()
+        # S-1405: son imleç okumasının başarı durumu — _safe_get_cursor kurar.
+        # Okuma başarısızsa beklenen konum (0, 0) ile çapa ATILMAZ.
+        self._last_cursor_read_ok: bool = True
+        self._last_cursor_read_error: str = ""
         cur_x, cur_y = self._safe_get_cursor()
         self._expected_x: int = cur_x
         self._expected_y: int = cur_y
-        self._has_expected_anchor: bool = True
+        self._has_expected_anchor: bool = bool(self._last_cursor_read_ok)
         self._bot_active_vks: set[int] = set()
         self._last_conflict_ts: float = 0.0
         self._last_conflict_reason: str = ""
@@ -298,25 +355,83 @@ class PhysicalInputGuard:
             return 0
 
     def _safe_get_cursor(self) -> tuple[int, int]:
+        """İmleç konumunu okur; okuma başarısızsa (0, 0) yedeği döner AMA
+        S-1405 gereği başarısızlığı _last_cursor_read_ok=False ile işaretler —
+        denetim yapanlar (should_abort_input / check_mid_trajectory_...) bu
+        bayrağı görüp fail-CLOSED (iptal) döner, (0, 0) çapası kurulmaz.
+        Dönüş imzası korunur: yalnızca koordinata ihtiyacı olan çağıranlar
+        değişmeden çalışmaya devam eder.
+        """
         try:
             pos = self._cursor_getter()
+            self._last_cursor_read_ok = True
+            self._last_cursor_read_error = ""
             return int(pos[0]), int(pos[1])
         except Exception as exc:
+            self._last_cursor_read_ok = False
+            self._last_cursor_read_error = str(exc)
             logger.debug("PhysicalInputGuard imlec okuma hatasi: %s", exc)
             return 0, 0
+
+    def _ignored_vks_snapshot(self, now: float) -> Optional[set[int]]:
+        """
+        O an beyaz liste penceresinde (varsayilan 250 ms) olan bot VK'larini
+        tek seferde dondurur; hizli yol mumkun degilse None doner ve cagiran
+        VK basina is_within_ignore_window cagrisina duser.
+
+        Semantik: yalnizca `_vk_timestamps` okunur. Botun kendi kaydettigi
+        her tus (int VK ya da VK'si cozulen isim) oraya da yazildigindan,
+        hizli yolun "yoksay" dedigi her VK yavas yolun da yoksayacagi
+        VK'dir (fail-open yok). Ters yonde sapma yalnizca sayisal-string
+        ("82" gibi) kayitlarda olur — o durumda yavas yola dusulmez,
+        fiziksel girdi sanilip fail-CLOSED iptal olur (guvenli yon).
+        Herhangi bir suphede None doner.
+        """
+        try:
+            whitelist = self.self_input_whitelist
+            vk_ts = getattr(whitelist, "_vk_timestamps", None)
+            if not isinstance(vk_ts, dict):
+                return None
+            window_sec = max(
+                0.0, float(getattr(whitelist, "default_window_ms", 250.0)) / 1000.0
+            )
+            lock = getattr(whitelist, "_lock", None)
+            if lock is not None:
+                with lock:
+                    items = list(vk_ts.items())
+            else:
+                items = list(vk_ts.items())
+        except Exception:
+            return None
+        ignored: set[int] = set()
+        for vk, ts in items:
+            try:
+                if isinstance(vk, int) and (float(now) - float(ts)) <= window_sec:
+                    ignored.add(int(vk))
+            except Exception:
+                continue
+        return ignored
+
+    def _is_self_key_ignored(
+        self, vk: int, now: float, ignored_vks: Optional[set[int]]
+    ) -> bool:
+        """VK botun kendi beyaz listedeki tusuysa True; hizli yol yoksa VK basina sorar."""
+        if vk in self._bot_active_vks:
+            return True
+        if ignored_vks is not None:
+            return vk in ignored_vks
+        return bool(self.self_input_whitelist.is_within_ignore_window(vk, now=now))
 
     @classmethod
     def _get_screen_centers(cls) -> list[tuple[int, int]]:
         centers: list[tuple[int, int]] = list(cls.GAME_CENTER_SNAP_POINTS)
-        try:
-            sw = int(ctypes.windll.user32.GetSystemMetrics(0))
-            sh = int(ctypes.windll.user32.GetSystemMetrics(1))
-            if sw > 0 and sh > 0:
-                dyn_center = (sw // 2, sh // 2)
-                if dyn_center not in centers:
-                    centers.append(dyn_center)
-        except Exception as exc:
-            logger.debug("GetSystemMetrics hatasi: %s", exc)
+        # Dinamik merkez TTL'li ekran boyutundan gelir — her guard adımında
+        # ayrı Win32 probu yapılmaz.
+        sw, sh = _get_screen_size_cached()
+        if sw > 0 and sh > 0:
+            dyn_center = (sw // 2, sh // 2)
+            if dyn_center not in centers:
+                centers.append(dyn_center)
         return centers
 
     def is_game_center_snap(self, x: int, y: int) -> bool:
@@ -357,6 +472,10 @@ class PhysicalInputGuard:
         """Mevcut gerçek imleç konumunu beklenen referans noktası olarak senkronize eder."""
         with self._lock:
             cx, cy = self._safe_get_cursor()
+            if not self._last_cursor_read_ok:
+                # S-1405: okuma başarısızsa (0, 0) yedeğini çapa yapma;
+                # mevcut beklenen konumu koru, çağıran eski çapayı alır.
+                return self._expected_x, self._expected_y
             self.record_virtual_mouse(cx, cy)
             return cx, cy
 
@@ -393,6 +512,11 @@ class PhysicalInputGuard:
             self._last_conflict_ts = 0.0
             self._last_conflict_reason = ""
             cx, cy = self._safe_get_cursor()
+            if not self._last_cursor_read_ok:
+                # S-1405: okuma başarısızsa (0, 0) yedeğini çapa yapma;
+                # çapa bayrağını düşür ki sonraki denetim fail-CLOSED kalsın.
+                self._has_expected_anchor = False
+                return
             self.record_virtual_mouse(cx, cy)
 
     def should_abort_input(self) -> tuple[bool, str]:
@@ -405,6 +529,19 @@ class PhysicalInputGuard:
             with self._lock:
                 now = time.monotonic()
                 actual_x, actual_y = self._safe_get_cursor()
+
+                # S-1405: imleç okunamıyorsa fail-CLOSED — denetim yapılamıyorsa
+                # girdi durdurulur; (0, 0) yedeğiyle delta=0 sayıp devam etmek
+                # (fail-open) fiziksel müdahaleyi kaçırır (F-1697 ile tutarlı).
+                if not self._last_cursor_read_ok:
+                    reason = (
+                        "cursor_read_failed_fail_closed: "
+                        f"{self._last_cursor_read_error or 'GetCursorPos okunamadi'}"
+                    )
+                    self._last_conflict_ts = now
+                    self._last_conflict_reason = reason
+                    logger.warning("Imlec okunamadigi icin girdi iptal: %s", reason)
+                    return True, reason
 
                 if self._has_expected_anchor:
                     if self.is_game_center_snap(actual_x, actual_y):
@@ -430,8 +567,11 @@ class PhysicalInputGuard:
                             logger.warning("Fiziksel fare mudahalesi algilandi: %s", reason)
                             return True, reason
 
+                # Beyaz liste tek anlik goruntuyle sorulur (VK basina 28 ayri
+                # prob yerine); hizli yol yoksa _is_self_key_ignored yavas yola duser.
+                ignored_vks = self._ignored_vks_snapshot(now)
                 for vk in self.MONITORED_VK_CODES:
-                    if vk in self._bot_active_vks or self.self_input_whitelist.is_within_ignore_window(vk, now=now):
+                    if self._is_self_key_ignored(vk, now, ignored_vks):
                         continue
                     state = self._key_state_getter(vk)
                     if state & 0x8000:
@@ -453,8 +593,10 @@ class PhysicalInputGuard:
 
                 return False, "ok"
         except Exception as exc:
+            # F-1697: guard çökerse fail-CLOSED — denetim yapılamıyorsa girdi
+            # durdurulur; "devam et" (fail-open) fiziksel müdahaleyi kaçırır.
             logger.error("should_abort_input denetim hatasi: %s", exc)
-            return False, "guard_exception_recovered"
+            return True, f"guard_exception_fail_closed: {exc}"
 
     def check_mid_trajectory_physical_abort(
         self,
@@ -469,6 +611,17 @@ class PhysicalInputGuard:
             with self._lock:
                 now = time.monotonic()
                 actual_x, actual_y = self._safe_get_cursor()
+
+                # S-1405: imleç okunamıyorsa fail-CLOSED — (0, 0) yedeğiyle
+                # merkez/sürükleme karşılaştırması yapmak fail-open olur.
+                if not self._last_cursor_read_ok:
+                    reason = (
+                        "cursor_read_failed_fail_closed: "
+                        f"{self._last_cursor_read_error or 'GetCursorPos okunamadi'}"
+                    )
+                    self._last_conflict_ts = now
+                    self._last_conflict_reason = reason
+                    return True, reason
 
                 # Madde 11: Oyun merkezi yakalaması (center-snap / "Oyun İmleç Kilidi") ise asla kesme
                 if self.is_game_center_snap(actual_x, actual_y):
@@ -496,8 +649,9 @@ class PhysicalInputGuard:
                         self._last_conflict_reason = reason
                         return True, reason
 
+                ignored_vks = self._ignored_vks_snapshot(now)
                 for vk in self.PHYSICAL_MOUSE_BUTTON_VKS + self.MONITORED_VK_CODES:
-                    if vk in self._bot_active_vks or self.self_input_whitelist.is_within_ignore_window(vk, now=now):
+                    if self._is_self_key_ignored(vk, now, ignored_vks):
                         continue
                     state = self._key_state_getter(vk)
                     if state & 0x8000:
@@ -508,8 +662,9 @@ class PhysicalInputGuard:
 
                 return False, "ok"
         except Exception as exc:
+            # F-1697 ile tutarlı: guard çökerse fail-CLOSED.
             logger.debug("check_mid_trajectory_physical_abort hatasi: %s", exc)
-            return False, "ok"
+            return True, f"guard_exception_fail_closed: {exc}"
 
 def quintic_ease_in_out(t: float) -> float:
     """
@@ -520,6 +675,24 @@ def quintic_ease_in_out(t: float) -> float:
     """
     t_clamped = max(0.0, min(1.0, float(t)))
     return t_clamped * t_clamped * t_clamped * (t_clamped * (t_clamped * 6.0 - 15.0) + 10.0)
+
+
+def _split_step(
+    dx: int, dy: int, dt: float, parts: int
+) -> list[tuple[int, int, float]]:
+    """F-1301: tek bir (dx, dy, dt) adımını tamsayı toplamını koruyarak
+    `parts` eşit alt adıma böler. divmod kalanı ilk parçalara dağıtılır
+    (negatif değerlerde de toplam korunur); süre parçalara eşit bölünür."""
+    parts = max(1, int(parts))
+
+    def _split_int(value: int) -> list[int]:
+        base, rem = divmod(int(value), parts)
+        return [base + 1 if i < rem else base for i in range(parts)]
+
+    xs = _split_int(dx)
+    ys = _split_int(dy)
+    sub_dt = round(float(dt) / parts, 6)
+    return [(xs[i], ys[i], sub_dt) for i in range(parts)]
 
 
 def normalize_angle_diff(target_bearing: float, current_heading: float) -> float:
@@ -770,11 +943,21 @@ class CameraMovementSmoother:
         # 2. Adım sayısı hesabı
         avg_dt = (cfg.min_step_interval_sec + cfg.max_step_interval_sec) * 0.5
         n_steps = max(4, int(round(duration / avg_dt)))
-        # Aşırı büyük tekil adımları önlemek için adım sayısını dinamik yükselt
+        # F-1301: eski formül (ortalama adım <= cap * 0.55) tepe adımı hesaba
+        # katmıyordu — quintic ease-in-out'un tepe türevi ortalama adımın
+        # ~1.875 katıdır; overshoot varsa ana yolculuk 0.82'lik faza sıkışır
+        # (x1/0.82) ve hedef %4'e kadar aşılır (x1.04). 360° (1440px) dönüşte
+        # bu, ~32px'lik cap-aşan (cap=24px) adımlar üretiyordu. Tepe faktörü
+        # 1.875 / 0.82 * (1 + max_overshoot_orani) ~= 2.38; bilek kavis /
+        # tremor payıyla 2.5 alınır ve cap ASLA kalkmaz — dönüş, cap'e uygun
+        # küçük adımlara bölünür (Karar 8).
         max_step_cap = max(8, cfg.max_single_step_px)
-        if dist / n_steps > max_step_cap * 0.55:
-            n_steps = max(n_steps, int(math.ceil(dist / (max_step_cap * 0.55))))
-        n_steps = min(120, max(4, n_steps))
+        ov_max_ratio = float(cfg.overshoot_ratio_range[1])
+        peak_factor = 1.875 / 0.82 * (1.0 + ov_max_ratio) * 1.05
+        n_steps = max(
+            n_steps, int(math.ceil(dist * peak_factor / max_step_cap))
+        )
+        n_steps = min(400, max(4, n_steps))
 
         # 3. Bilek açısı kavis genliği (wrist arc)
         if arc_enabled and abs(tdx) > 12:
@@ -857,7 +1040,25 @@ class CameraMovementSmoother:
             )
             steps.append((step_dx, step_dy, round(dt_clamped, 6)))
 
-        return steps
+        # F-1301 güvenlik ağı: rastgele tremor / bilek kavis payı da dahil
+        # hiçbir adım cap'i aşamaz. Cap'i aşan adım, tamsayı toplamı ve
+        # toplam süreyi koruyarak eşit alt adımlara bölünür (360° dönüş
+        # dahil). Bölme, yörünge toplamını ve ivme profilini değiştirmez.
+        capped_steps: list[tuple[int, int, float]] = []
+        for sdx, sdy, sdt in steps:
+            if math.hypot(sdx, sdy) <= max_step_cap:
+                capped_steps.append((sdx, sdy, sdt))
+                continue
+            parts = int(math.ceil(math.hypot(sdx, sdy) / max_step_cap))
+            for _ in range(4):
+                split = _split_step(sdx, sdy, sdt, parts)
+                if all(math.hypot(a, b) <= max_step_cap for a, b, _ in split):
+                    break
+                parts += 1
+            else:
+                split = _split_step(sdx, sdy, sdt, parts)
+            capped_steps.extend(split)
+        return capped_steps
 
     def generate_heading_turn_trajectory(
         self,
@@ -927,15 +1128,17 @@ class CameraMovementSmoother:
         max_allowed = max_allowed_single_step_px or cfg.max_single_step_px
 
         if not trajectory:
+            # F-1706: boş yörünge denetimden geçemez — "pürüzsüz" sayılmaz.
             return {
-                "is_smooth": True,
+                "is_smooth": False,
                 "is_robotic_snap": False,
                 "step_count": 0,
                 "total_dx": 0,
                 "total_dy": 0,
                 "max_single_step": 0.0,
-                "has_acceleration": True,
-                "has_deceleration": True,
+                "has_acceleration": False,
+                "has_deceleration": False,
+                "reason": "empty_trajectory",
             }
 
         total_dx = sum(s[0] for s in trajectory)
@@ -951,17 +1154,34 @@ class CameraMovementSmoother:
         # Hız profili denetimi (ivmelenme ve yavaşlama varlığı)
         speeds = [step_dists[i] / max(1e-4, trajectory[i][2]) for i in range(n)]
         peak_speed = max(speeds) if speeds else 0.0
-        early_slice = speeds[: max(1, n // 4)]
-        late_slice = speeds[max(0, 3 * n // 4) :]
-        early_avg = sum(early_slice) / len(early_slice) if early_slice else 0.0
-        late_avg = sum(late_slice) / len(late_slice) if late_slice else 0.0
-
-        has_accel = bool(early_avg < peak_speed * 0.90) if n >= 6 else True
-        has_decel = bool(late_avg < peak_speed * 0.90) if n >= 6 else True
+        if n >= 6:
+            early_slice = speeds[: max(1, n // 4)]
+            late_slice = speeds[max(0, 3 * n // 4) :]
+            early_avg = sum(early_slice) / len(early_slice) if early_slice else 0.0
+            late_avg = sum(late_slice) / len(late_slice) if late_slice else 0.0
+            has_accel = bool(early_avg < peak_speed * 0.90)
+            has_decel = bool(late_avg < peak_speed * 0.90)
+        elif n >= 3:
+            # F-1706: kısa yörüngede de profil gerçekten ölçülür — varsayılan True yok.
+            has_accel = bool(speeds[0] < peak_speed * 0.90)
+            has_decel = bool(speeds[-1] < peak_speed * 0.90)
+        else:
+            # F-1706: 1-2 adımlık yörüngede ivme profili kurulamaz — doğrulanamaz.
+            has_accel = False
+            has_decel = False
 
         is_smooth = bool(
-            not is_snap and max_step <= max_allowed and has_accel and has_decel
+            n >= 3 and not is_snap and max_step <= max_allowed and has_accel and has_decel
         )
+        reason = ""
+        if n < 3:
+            reason = "too_short_to_verify"
+        elif is_snap:
+            reason = "robotic_snap"
+        elif max_step > max_allowed:
+            reason = "single_step_exceeds_cap"
+        elif not (has_accel and has_decel):
+            reason = "missing_acceleration_profile"
 
         with self._lock:
             if is_smooth:
@@ -978,69 +1198,194 @@ class CameraMovementSmoother:
             "peak_speed_px_s": round(peak_speed, 1),
             "has_acceleration": has_accel,
             "has_deceleration": has_decel,
+            "reason": reason,
         }
 
     def _resolve_relative_mouse_setter(
         self, input_ctrl: Any
     ) -> Callable[[int, int], Any]:
-        """Girdi sürücüsündeki uygun relative fare hareket metodunu veya Win32 fallback'i çözer."""
+        """Girdi sürücüsündeki uygun relative fare hareket metodunu çözer.
+
+        F-1693 / Karar 4: YALNIZCA donanım zincirli göreli-hareket metotları
+        çözülür — önce `mouse_move_relative` (Interception tabanlı,
+        core/input_driver.py'ye R29 ekler; donanım yoksa False döner, soft
+        SendInput kullanmaz), sonra diğer donanım adlandırmaları, en sonda
+        `nudge_camera`. S-2901 (F2-22) ile gerçek sürücünün `nudge_camera`
+        gövdesi artık doğrudan `mouse_move_relative`'e (Interception
+        donanım HID) delege ediyor — yani `nudge_camera`'yı çözmek yumuşak
+        SendInput yoluna düşmek DEĞİLDİR; yalnızca `mouse_move_relative`
+        sunmayan (ama aynı donanım yolunu `nudge_camera` adıyla sunan)
+        sürücüleri de kabul eder. `mouse_move_relative` her zaman önce
+        çözülür; donanım metodu yoksa fallback her zaman False döndürür
+        ve çağıranlar hareketi başarısız sayar — sessiz soft düşüş YOKTUR.
+        """
         if input_ctrl is not None:
             for attr in (
-                "nudge_camera",
                 "mouse_move_relative",
                 "move_relative",
                 "move_rel",
                 "_relative_mouse_move",
+                "nudge_camera",
             ):
                 fn = getattr(input_ctrl, attr, None)
                 if callable(fn):
                     return fn
 
-        def _fallback_rel_move(dx: int, dy: int) -> bool:
+        def _no_hardware_rel_move(dx: int, dy: int) -> bool:
+            logger.warning(
+                "Relative fare hareketi icin donanim zinciri yok "
+                "(input_ctrl=%s; mouse_move_relative/nudge_camera "
+                "bulunamadi); soft yola dusulmedi, "
+                "hareket yapilmadi (dx=%d, dy=%d)",
+                type(input_ctrl).__name__ if input_ctrl is not None else None,
+                int(dx),
+                int(dy),
+            )
+            return False
+
+        return _no_hardware_rel_move
+
+    def _guard_should_abort(self) -> tuple[bool, str]:
+        """F-1696: guard varsa should_abort_input çağrılır; guard yoksa engel yok."""
+        if self.guard is None:
+            return False, "no_guard"
+        return self.guard.should_abort_input()
+
+    @staticmethod
+    def _call_mouse_button_method(
+        input_ctrl: Any, attrs: tuple[str, ...], button: str, vk: int
+    ) -> bool:
+        """input_ctrl'deki fare buton metodunu dener; dönüş değerini denetler.
+
+        F-1694: yalnızca açık False başarısızlıktır (sonraki metoda geçilir);
+        True başarıdır; None "donanım zincirine istisnasız iletildi" sayılır
+        (örn. InputDriver._hw_mouse_down None döndürür) — ama hiçbir durumda
+        yumuşak Win32 mouse_event fallback'ine düşülmez.
+        """
+        if input_ctrl is None:
+            return False
+        for attr in attrs:
+            fn = getattr(input_ctrl, attr, None)
+            if not callable(fn):
+                continue
             try:
-                ctypes.windll.user32.mouse_event(0x0001, int(dx), int(dy), 0, 0)
-                return True
+                result = fn(button)
+            except TypeError:
+                try:
+                    result = fn(vk)
+                except Exception as exc:
+                    logger.debug("Fare buton metodu %s hatasi: %s", attr, exc)
+                    continue
             except Exception as exc:
-                logger.debug("Win32 mouse_event relative move hatasi: %s", exc)
+                logger.debug("Fare buton metodu %s hatasi: %s", attr, exc)
+                continue
+            if result is False:
+                continue
+            return True
+        return False
+
+    def _press_rmb(self, input_ctrl: Any) -> bool:
+        """Sağ fare tuşunu donanım zinciri üzerinden basılı tutar (RMB down).
+
+        F-1694: donanım yolu yoksa False döndürür — sessiz yumuşak fallback yok.
+        Başarılı basış guard'a bildirilir ki botun kendi RMB'si fiziksel
+        müdahale sanılıp hareket yarıda kesilmesin (F-1696).
+        """
+        ok = self._call_mouse_button_method(
+            input_ctrl, ("_hw_mouse_down", "mouse_down", "press_mouse_button"), "right", 0x02
+        )
+        if not ok:
+            logger.error("RMB basilamadi: donanim fare yolu yok (input_ctrl=%s)",
+                         type(input_ctrl).__name__ if input_ctrl is not None else None)
+            return False
+        if self.guard is not None:
+            self.guard.register_bot_key_press(0x02, pressed=True)
+        return True
+
+    def _release_rmb(self, input_ctrl: Any) -> bool:
+        """Sağ fare tuşunu donanım zinciri üzerinden serbest bırakır (RMB up).
+
+        F-1694: donanım yolu yoksa False döndürür. Bırakma güvenlik yoludur:
+        fare bırakılırken basılı olabilecek R/T skill tuşları da (varsa
+        key_up üzerinden) bırakılır — bırakma yolunda tuş asılı kalmaz.
+        """
+        ok = self._call_mouse_button_method(
+            input_ctrl, ("_hw_mouse_up", "mouse_up", "release_mouse_button"), "right", 0x02
+        )
+        if self.guard is not None:
+            self.guard.register_bot_key_press(0x02, pressed=False)
+        # Güvenlik: basılı kalmış olabilecek R/T skill tuşlarını da bırak.
+        if input_ctrl is not None:
+            key_up = getattr(input_ctrl, "key_up", None)
+            if callable(key_up):
+                for skill_key in ("r", "t"):
+                    try:
+                        key_up(skill_key)
+                    except Exception as exc:
+                        logger.debug("Skill tusu birakma hatasi (%s): %s", skill_key, exc)
+        if not ok:
+            logger.error("RMB birakilamadi: donanim fare yolu yok (input_ctrl=%s)",
+                         type(input_ctrl).__name__ if input_ctrl is not None else None)
+            return False
+        return True
+
+    def _execute_trajectory_steps(
+        self,
+        setter: Callable[[int, int], Any],
+        trajectory: list[tuple[int, int, float]],
+        abort_callback: Optional[Callable[[], bool]],
+        sleep_exec: Callable[[float], None],
+        op_name: str,
+        log_aborts: bool,
+    ) -> bool:
+        """
+        smooth_turn_heading / smooth_camera_pitch_yaw / smooth_camera_nudge
+        ortak adım döngüsü: abort_callback denetimi, yörünge-ortası fiziksel
+        müdahale denetimi, göreli setter çağrısı (açık False = başarısız)
+        ve adım beklemesi. Her iptal yolunda aborts_count bir artar.
+        log_aborts=True yalnızca smooth_turn_heading'in mevcut log satırlarını
+        üretir (diğer iki metodun sessiz iptal davranışı korunur).
+        """
+        for step_dx, step_dy, dt in trajectory:
+            if abort_callback is not None and abort_callback():
+                with self._lock:
+                    self._metrics["aborts_count"] += 1
+                if log_aborts:
+                    logger.info("%s abort_callback ile kesildi", op_name)
                 return False
 
-        return _fallback_rel_move
+            if self.guard is not None:
+                abort, reason = self.guard.check_mid_trajectory_physical_abort(
+                    massive_drag_threshold_px=450.0,
+                )
+                if abort:
+                    with self._lock:
+                        self._metrics["aborts_count"] += 1
+                    if log_aborts:
+                        logger.warning(
+                            "%s kullanici mudahalesi ile kesildi: %s",
+                            op_name,
+                            reason,
+                        )
+                    return False
 
-    @staticmethod
-    def _press_rmb(input_ctrl: Any) -> None:
-        """Sağ fare tuşunu basılı tutar (RMB down)."""
-        if input_ctrl is not None:
-            for attr in ("_hw_mouse_down", "mouse_down", "press_mouse_button"):
-                fn = getattr(input_ctrl, attr, None)
-                if callable(fn):
-                    try:
-                        fn("right")
-                        return
-                    except TypeError:
-                        fn(0x02)
-                        return
-        try:
-            ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTDOWN
-        except Exception:
-            pass
+            # F-1693: setter'ın açık False dönüşü başarısız harekettir —
+            # sessizce "dönüldü" sayılmaz, hareket durdurulur.
+            if setter(step_dx, step_dy) is False:
+                with self._lock:
+                    self._metrics["aborts_count"] += 1
+                logger.error(
+                    "%s relative hareket reddedildi "
+                    "(adim dx=%d, dy=%d); donanim zinciri yok",
+                    op_name,
+                    step_dx,
+                    step_dy,
+                )
+                return False
+            if dt > 0.0:
+                sleep_exec(dt)
 
-    @staticmethod
-    def _release_rmb(input_ctrl: Any) -> None:
-        """Sağ fare tuşunu serbest bırakır (RMB up)."""
-        if input_ctrl is not None:
-            for attr in ("_hw_mouse_up", "mouse_up", "release_mouse_button"):
-                fn = getattr(input_ctrl, attr, None)
-                if callable(fn):
-                    try:
-                        fn("right")
-                        return
-                    except TypeError:
-                        fn(0x02)
-                        return
-        try:
-            ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)  # MOUSEEVENTF_RIGHTUP
-        except Exception:
-            pass
+        return True
 
     def smooth_turn_heading(
         self,
@@ -1075,55 +1420,68 @@ class CameraMovementSmoother:
         if not trajectory:
             return True
 
+        # F-1696: başlamadan önce fiziksel müdahale denetimi (should_abort_input).
+        abort, reason = self._guard_should_abort()
+        if abort:
+            with self._lock:
+                self._metrics["aborts_count"] += 1
+            logger.warning("smooth_turn_heading baslamadan iptal: %s", reason)
+            return False
+
         setter = self._resolve_relative_mouse_setter(input_ctrl)
         sleep_exec = sleep_fn or time.sleep
         rmb_held = False
+        # S-1406: RMB bırakma başarısızlığı dönüş değerine yansır — bırakma
+        # başarısızken "dönüş tamamlandı" (True) dönülmez.
+        rmb_release_failed = False
+        outcome = False
 
         try:
             if use_rmb_drag:
-                self._press_rmb(input_ctrl)
+                # F-1694: RMB basılamazsa sürükleme hiç başlamaz.
+                if not self._press_rmb(input_ctrl):
+                    return False
                 rmb_held = True
                 sleep_exec(random.uniform(0.012, 0.024))
 
-            for step_dx, step_dy, dt in trajectory:
-                if abort_callback is not None and abort_callback():
-                    with self._lock:
-                        self._metrics["aborts_count"] += 1
-                    logger.info("smooth_turn_heading abort_callback ile kesildi")
-                    return False
-
-                if self.guard is not None:
-                    abort, reason = self.guard.check_mid_trajectory_physical_abort(
-                        massive_drag_threshold_px=450.0,
-                    )
-                    if abort:
-                        with self._lock:
-                            self._metrics["aborts_count"] += 1
-                        logger.warning(
-                            "smooth_turn_heading kullanici mudahalesi ile kesildi: %s",
-                            reason,
-                        )
-                        return False
-
-                setter(step_dx, step_dy)
-                if dt > 0.0:
-                    sleep_exec(dt)
+            if not self._execute_trajectory_steps(
+                setter,
+                trajectory,
+                abort_callback,
+                sleep_exec,
+                "smooth_turn_heading",
+                log_aborts=True,
+            ):
+                return False
 
             with self._lock:
                 self._metrics["turns_completed"] += 1
                 self._metrics["total_yaw_deg"] += abs(diff)
 
-            return True
+            outcome = True
         except Exception as exc:
             logger.error("smooth_turn_heading calisma hatasi: %s", exc)
-            return False
+            outcome = False
         finally:
             if rmb_held:
                 try:
                     sleep_exec(random.uniform(0.010, 0.020))
-                    self._release_rmb(input_ctrl)
                 except Exception:
                     pass
+                try:
+                    if not self._release_rmb(input_ctrl):
+                        logger.error("smooth_turn_heading: RMB birakilamadi (asili kalabilir)")
+                        rmb_release_failed = True
+                except Exception as exc:
+                    logger.error("smooth_turn_heading: RMB birakma hatasi: %s", exc)
+                    rmb_release_failed = True
+        if rmb_release_failed:
+            logger.error(
+                "smooth_turn_heading: RMB birakilamadigi icin donus "
+                "basarisiz sayildi (tuslar/fare asili kalabilir)"
+            )
+            return False
+        return outcome
 
     def smooth_camera_pitch_yaw(
         self,
@@ -1147,49 +1505,69 @@ class CameraMovementSmoother:
         if not trajectory:
             return True
 
+        # F-1696: başlamadan önce fiziksel müdahale denetimi (should_abort_input).
+        abort, reason = self._guard_should_abort()
+        if abort:
+            with self._lock:
+                self._metrics["aborts_count"] += 1
+            logger.warning("smooth_camera_pitch_yaw baslamadan iptal: %s", reason)
+            return False
+
         setter = self._resolve_relative_mouse_setter(input_ctrl)
         sleep_exec = sleep_fn or time.sleep
         rmb_held = False
+        # S-1406: RMB bırakma başarısızlığı dönüş değerine yansır — bırakma
+        # başarısızken "ayar tamamlandı" (True) dönülmez.
+        rmb_release_failed = False
+        outcome = False
 
         try:
             if use_rmb_drag:
-                self._press_rmb(input_ctrl)
+                # F-1694: RMB basılamazsa sürükleme hiç başlamaz.
+                if not self._press_rmb(input_ctrl):
+                    return False
                 rmb_held = True
                 sleep_exec(random.uniform(0.012, 0.024))
 
-            for step_dx, step_dy, dt in trajectory:
-                if abort_callback is not None and abort_callback():
-                    with self._lock:
-                        self._metrics["aborts_count"] += 1
-                    return False
-
-                if self.guard is not None:
-                    abort, _ = self.guard.check_mid_trajectory_physical_abort()
-                    if abort:
-                        with self._lock:
-                            self._metrics["aborts_count"] += 1
-                        return False
-
-                setter(step_dx, step_dy)
-                if dt > 0.0:
-                    sleep_exec(dt)
+            if not self._execute_trajectory_steps(
+                setter,
+                trajectory,
+                abort_callback,
+                sleep_exec,
+                "smooth_camera_pitch_yaw",
+                log_aborts=False,
+            ):
+                return False
 
             with self._lock:
                 self._metrics["pitch_adjustments_completed"] += 1
                 self._metrics["total_yaw_deg"] += abs(yaw_deg)
                 self._metrics["total_pitch_deg"] += abs(pitch_deg)
 
-            return True
+            outcome = True
         except Exception as exc:
             logger.error("smooth_camera_pitch_yaw hatasi: %s", exc)
-            return False
+            outcome = False
         finally:
             if rmb_held:
                 try:
                     sleep_exec(random.uniform(0.010, 0.020))
-                    self._release_rmb(input_ctrl)
                 except Exception:
                     pass
+                try:
+                    if not self._release_rmb(input_ctrl):
+                        logger.error("smooth_camera_pitch_yaw: RMB birakilamadi (asili kalabilir)")
+                        rmb_release_failed = True
+                except Exception as exc:
+                    logger.error("smooth_camera_pitch_yaw: RMB birakma hatasi: %s", exc)
+                    rmb_release_failed = True
+        if rmb_release_failed:
+            logger.error(
+                "smooth_camera_pitch_yaw: RMB birakilamadigi icin ayar "
+                "basarisiz sayildi (tuslar/fare asili kalabilir)"
+            )
+            return False
+        return outcome
 
     def smooth_camera_nudge(
         self,
@@ -1215,26 +1593,27 @@ class CameraMovementSmoother:
         if not trajectory:
             return True
 
+        # F-1696: başlamadan önce fiziksel müdahale denetimi (should_abort_input).
+        abort, reason = self._guard_should_abort()
+        if abort:
+            with self._lock:
+                self._metrics["aborts_count"] += 1
+            logger.warning("smooth_camera_nudge baslamadan iptal: %s", reason)
+            return False
+
         setter = self._resolve_relative_mouse_setter(input_ctrl)
         sleep_exec = sleep_fn or time.sleep
 
         try:
-            for step_dx, step_dy, dt in trajectory:
-                if abort_callback is not None and abort_callback():
-                    with self._lock:
-                        self._metrics["aborts_count"] += 1
-                    return False
-
-                if self.guard is not None:
-                    abort, _ = self.guard.check_mid_trajectory_physical_abort()
-                    if abort:
-                        with self._lock:
-                            self._metrics["aborts_count"] += 1
-                        return False
-
-                setter(step_dx, step_dy)
-                if dt > 0.0:
-                    sleep_exec(dt)
+            if not self._execute_trajectory_steps(
+                setter,
+                trajectory,
+                abort_callback,
+                sleep_exec,
+                "smooth_camera_nudge",
+                log_aborts=False,
+            ):
+                return False
 
             with self._lock:
                 self._metrics["nudges_completed"] += 1
@@ -1281,8 +1660,10 @@ class CameraMovementSmoother:
             sleep_fn=sleep_fn,
         )
 
+        # F-1705: dönüş başarısızsa tahmini heading değişmemiş heading'dir —
+        # başarısız dönüş "dönülmüş" gibi raporlanmaz.
         estimated_heading = round(
-            (float(current_heading) + angle_diff + 360.0) % 360.0, 2
+            (float(current_heading) + (angle_diff if ok else 0.0) + 360.0) % 360.0, 2
         )
         return {
             "status": "turned" if ok else "failed",
@@ -1316,7 +1697,7 @@ class WindMouseEngine:
         guard: Optional[PhysicalInputGuard] = None,
         biometrics: Optional[BiometricClickGenerator] = None,
         input_guard: Optional[PhysicalInputGuard] = None,
-        abort_on_physical_mouse: bool = False,
+        abort_on_physical_mouse: bool = True,
         cursor_automator: Optional[CursorVisibilityAutomator] = None,
         auto_reveal_cursor: bool = True,
         camera_config: Optional[CameraSmoothingConfig] = None,
@@ -1352,12 +1733,23 @@ class WindMouseEngine:
         return self.cursor_automator.ensure_cursor_visible(input_ctrl=input_ctrl)
 
     def get_humanizer_profile_summary(self) -> dict:
+        # S-1404: sabit True yok — gerçek prob: sözleşme denetimi +
+        # kamera yumuşatıcı yörünge üretimi + anti-snap doğrulaması.
         try:
+            ready = validate_windmouse_humanizer_contract()
+            smoothing_ready = self._probe_camera_smoothing_ready()
+            anti_snap = False
+            if smoothing_ready:
+                traj = self.camera_smoother.generate_heading_turn_trajectory(
+                    angle_diff_deg=30.0
+                )
+                res = self.verify_trajectory_anti_snap(traj)
+                anti_snap = bool(isinstance(res, dict) and res.get("is_smooth"))
             return {
-                "humanizer_ready": True,
+                "humanizer_ready": bool(ready),
                 "curve_engine": "WindMouse+Bezier",
-                "camera_smoothing_ready": True,
-                "anti_snap_movement": True,
+                "camera_smoothing_ready": bool(smoothing_ready),
+                "anti_snap_movement": bool(anti_snap),
             }
         except Exception:
             return {"humanizer_ready": False, "curve_engine": "WindMouse+Bezier"}
@@ -1516,14 +1908,40 @@ class WindMouseEngine:
 
             final_pos = (int(round(dx)), int(round(dy)))
             if not path or (path[-1][0], path[-1][1]) != final_pos:
-                final_wait = round(
+                # S-1001: 600 iterasyon dolduysa hedef tek adımda eklenemez —
+                # son nokta yüzlerce px uzakta olabilir (ışınlanma). Kalan
+                # mesafe, adım boyu üst sınırını aşmayan düz adımlarla
+                # yürünür; son ekleme ancak bitişik noktaya yapılır.
+                step_cap = max(2.0, cur_max_step)
+                tail_wait = round(
                     max(lo_wait, min(hi_wait, hi_wait * 0.92)),
                     6,
                 )
-                path.append((final_pos[0], final_pos[1], final_wait))
+                guard = 0
+                while (
+                    (int(round(cur_x)), int(round(cur_y))) != final_pos
+                    and guard < 10000
+                ):
+                    guard += 1
+                    rem_x, rem_y = dx - cur_x, dy - cur_y
+                    rem = math.hypot(rem_x, rem_y)
+                    if rem < 1.0:
+                        break
+                    step = min(step_cap, rem)
+                    cur_x += rem_x / rem * step
+                    cur_y += rem_y / rem * step
+                    ix = int(round(cur_x))
+                    iy = int(round(cur_y))
+                    if (ix, iy) != last_int_pos:
+                        path.append((ix, iy, tail_wait))
+                        last_int_pos = (ix, iy)
+                if not path or (path[-1][0], path[-1][1]) != final_pos:
+                    path.append((final_pos[0], final_pos[1], tail_wait))
 
             return path
         except Exception as exc:
+            # F-1702: hata dalı tek noktalı ışınlanma döndüremez — boş yörünge
+            # döner, çağıranlar (move_cursor_humanized) bunu başarısız sayar.
             logger.error(
                 "generate_windmouse_path hatasi ((%d,%d)->(%d,%d)): %s",
                 start_x,
@@ -1532,7 +1950,7 @@ class WindMouseEngine:
                 dest_y,
                 exc,
             )
-            return [(int(dest_x), int(dest_y), round(float(min_wait), 6))]
+            return []
 
     def move_cursor_humanized(
         self,
@@ -1553,8 +1971,11 @@ class WindMouseEngine:
           `self.input_guard.record_virtual_mouse(cur_x, cur_y)` ile senkronize eder
           (böylece önceki tıklamadan kalan bayat konuma veya oyunun 1280x720 merkez
           kilidine karşı karşılaştırma yapıp başlamadan iptal etmez).
-        - Yörünge sırasında yalnızca `abort_on_physical_mouse` açıkça etkinleştirilmişse
-          (varsayılan `False`) fiziksel tuş basımı veya > 450px devasa sürükleme durumunda keser.
+        - Yörünge sırasında `abort_on_physical_mouse` etkinse (varsayılan True,
+          F-1704) fiziksel tuş basımı veya > 450px devasa sürükleme durumunda keser.
+        - Mutlak imleç setter'ı yoksa SetCursorPos ışınlanması yapılmaz (F-1703);
+          bunun yerine yörünge noktaları donanım zincirli göreli hareketle adım
+          adım uygulanır.
         """
         try:
             # 2-arg çağrı desteği: move_cursor_humanized(dest_x, dest_y)
@@ -1566,6 +1987,21 @@ class WindMouseEngine:
                 actual_dest_x = int(dest_x)
                 actual_dest_y = int(dest_y)
                 actual_ctrl = input_ctrl
+
+            use_physical_abort = (
+                self.abort_on_physical_mouse
+                if abort_on_physical_mouse is None
+                else bool(abort_on_physical_mouse)
+            )
+
+            # F-1696: başlamadan önce fiziksel müdahale denetimi.
+            if use_physical_abort:
+                abort, reason = self.input_guard.should_abort_input()
+                if abort:
+                    logger.warning(
+                        "move_cursor_humanized baslamadan iptal: %s", reason
+                    )
+                    return False
 
             # 1. Başlangıçta mevcut OS imleç konumunu oku ve hemen record_virtual_mouse ile senkronize et
             cur_x, cur_y = self.input_guard._safe_get_cursor()
@@ -1583,14 +2019,24 @@ class WindMouseEngine:
                 max_step=max_step,
                 target_area=target_area,
             )
+            # F-1702: boş yörünge (üretim hatası) başarısız harekettir — True sayılmaz.
+            if not path:
+                logger.error(
+                    "move_cursor_humanized yörünge üretilemedi -> (%s, %s)",
+                    actual_dest_x,
+                    actual_dest_y,
+                )
+                return False
 
             setter_fn = self._resolve_cursor_setter(actual_ctrl)
-            use_physical_abort = (
-                self.abort_on_physical_mouse
-                if abort_on_physical_mouse is None
-                else bool(abort_on_physical_mouse)
-            )
+            # F-1703: mutlak setter yoksa göreli zincirle adım adım ilerle.
+            rel_setter = None
+            if setter_fn is None:
+                rel_setter = self.camera_smoother._resolve_relative_mouse_setter(
+                    actual_ctrl
+                )
 
+            prev_x, prev_y = cur_x, cur_y
             for step_x, step_y, sleep_dt in path:
                 aborted = False
                 if actual_ctrl is not None:
@@ -1616,7 +2062,29 @@ class WindMouseEngine:
                         )
                         return False
 
-                setter_fn(step_x, step_y)
+                if setter_fn is not None:
+                    # Açık False = setter hareketi reddetti.
+                    if setter_fn(step_x, step_y) is False:
+                        logger.error(
+                            "move_cursor_humanized imlec tasiyici reddetti "
+                            "-> (%d, %d)",
+                            step_x,
+                            step_y,
+                        )
+                        return False
+                else:
+                    # F-1703: ışınlanma yok — önceki noktadan göreli adımlarla ilerle.
+                    if rel_setter is None or rel_setter(
+                        step_x - prev_x, step_y - prev_y
+                    ) is False:
+                        logger.error(
+                            "move_cursor_humanized göreli hareket reddedildi "
+                            "-> (%d, %d); donanim zinciri yok",
+                            step_x,
+                            step_y,
+                        )
+                        return False
+                prev_x, prev_y = step_x, step_y
                 self.input_guard.record_virtual_mouse(step_x, step_y)
 
                 if sleep_dt > 0.0:
@@ -1632,6 +2100,70 @@ class WindMouseEngine:
             )
             return False
 
+    # F-1700: fare butonuyla yapılan skill aksiyonu fare butonu olarak değil
+    # R/T tuşuyla gönderilir (sol tık -> R, sağ tık -> T); tuşlar Interception
+    # zinciri üzerinden input_ctrl.press_key ile gider.
+    SKILL_KEY_FOR_MOUSE_BUTTON: dict[str, str] = {"left": "r", "right": "t"}
+    SKILL_VK_FOR_MOUSE_BUTTON: dict[str, int] = {"left": 0x52, "right": 0x54}
+
+    def send_skill_key_for_button(
+        self,
+        input_ctrl: Any = None,
+        button: str = "left",
+    ) -> bool:
+        """
+        Fare butonu aksiyonunu skill tuşu olarak gönderir: sol -> R, sağ -> T.
+
+        Tuş input_ctrl.press_key üzerinden (Interception donanım zinciri)
+        gönderilir; yumuşak fallback yoktur. Basış guard'a bildirilir
+        (F-1696) ve press_key'in dönüşü denetlenir: 0.0 / False = gönderilmedi.
+        """
+        btn = str(button).strip().lower()
+        if btn not in self.SKILL_KEY_FOR_MOUSE_BUTTON:
+            logger.error(
+                "send_skill_key_for_button: bilinmeyen buton '%s' (left/right beklenir)",
+                button,
+            )
+            return False
+        if input_ctrl is None:
+            logger.error(
+                "send_skill_key_for_button: input_ctrl yok — skill tusu (%s) "
+                "gonderilemedi, yumusak fallback yok",
+                self.SKILL_KEY_FOR_MOUSE_BUTTON[btn],
+            )
+            return False
+        press_fn = getattr(input_ctrl, "press_key", None)
+        if not callable(press_fn):
+            logger.error(
+                "send_skill_key_for_button: input_ctrl'de press_key yok — "
+                "skill tusu (%s) gonderilemedi",
+                self.SKILL_KEY_FOR_MOUSE_BUTTON[btn],
+            )
+            return False
+        key = self.SKILL_KEY_FOR_MOUSE_BUTTON[btn]
+        vk = self.SKILL_VK_FOR_MOUSE_BUTTON[btn]
+        self.input_guard.register_bot_key_press(vk, pressed=True)
+        try:
+            result = press_fn(key)
+        except Exception as exc:
+            logger.error("send_skill_key_for_button('%s') hatasi: %s", key, exc)
+            self.input_guard.register_bot_key_press(vk, pressed=False)
+            return False
+        self.input_guard.register_bot_key_press(vk, pressed=False)
+        if isinstance(result, (int, float)):
+            ok = float(result) > 0.0
+        else:
+            ok = bool(result)
+        if not ok:
+            logger.warning(
+                "send_skill_key_for_button: press_key('%s') gonderimi "
+                "dogrulanamadi (donus=%r)",
+                key,
+                result,
+            )
+            return False
+        return True
+
     def click_humanized(
         self,
         input_ctrl: Any = None,
@@ -1640,14 +2172,25 @@ class WindMouseEngine:
         button: str = "left",
         apply_jitter: bool = True,
         abort_on_physical_mouse: Optional[bool] = None,
+        use_skill_key: bool = False,
     ) -> bool:
         """
         İmleci hedef koordinata WindMouse ile insansı şekilde taşır ve biyometrik
         basılı tutma süresiyle tıklama gerçekleştirir.
         Başlangıçta mevcut OS imleç konumunu `(cur_x, cur_y)` okuyup
         `self.input_guard.record_virtual_mouse(cur_x, cur_y)` çağırır.
+        `use_skill_key=True` ise tıklama fare butonu olarak değil R/T tuşuyla
+        yapılır (sol -> R, sağ -> T; F-1700).
         """
         try:
+            btn = str(button).strip().lower()
+            # F-1701: orta tuş artık sol tuşa düşmez — desteklenmeyen buton reddedilir.
+            if btn not in ("left", "right"):
+                logger.error(
+                    "click_humanized: desteklenmeyen buton '%s' (yalnizca left/right)",
+                    button,
+                )
+                return False
             if isinstance(input_ctrl, (int, float)) and not hasattr(input_ctrl, "set_cursor_pos"):
                 target_x = int(input_ctrl)
                 target_y = int(x)
@@ -1656,6 +2199,18 @@ class WindMouseEngine:
                 target_x = int(x)
                 target_y = int(y)
                 actual_ctrl = input_ctrl
+
+            use_physical_abort = (
+                self.abort_on_physical_mouse
+                if abort_on_physical_mouse is None
+                else bool(abort_on_physical_mouse)
+            )
+            # F-1696: başlamadan önce fiziksel müdahale denetimi.
+            if use_physical_abort:
+                abort, reason = self.input_guard.should_abort_input()
+                if abort:
+                    logger.warning("click_humanized baslamadan iptal: %s", reason)
+                    return False
 
             # Madde 12: Tıklamadan önce imleç gizliyse 'alt' tuşu ile görünür yap
             if self.auto_reveal_cursor and self.cursor_automator is not None:
@@ -1669,6 +2224,8 @@ class WindMouseEngine:
                 target_x, target_y = self.biometrics.apply_2d_gaussian_jitter(
                     target_x, target_y
                 )
+            # F-1701: jitter sonrası hedef ekran sınırları içine çekilir.
+            target_x, target_y = _clamp_to_screen(target_x, target_y)
 
             moved = self.move_cursor_humanized(
                 actual_ctrl,
@@ -1680,40 +2237,53 @@ class WindMouseEngine:
                 return False
 
             self.input_guard.record_virtual_mouse(target_x, target_y)
-            btn_vk = 0x02 if str(button).lower() == "right" else 0x01
+            btn_vk = 0x02 if btn == "right" else 0x01
             self.input_guard.record_self_key(btn_vk)
+
+            # F-1700: skill aksiyonu fare butonu yerine R/T tuşuyla yapılır.
+            if use_skill_key:
+                return self.send_skill_key_for_button(actual_ctrl, button=btn)
 
             if actual_ctrl is not None:
                 for click_attr in ("click_map", "human_click", "click"):
                     click_fn = getattr(actual_ctrl, click_attr, None)
-                    if callable(click_fn):
-                        click_fn(target_x, target_y, button=button)
-                        self.input_guard.record_virtual_mouse(target_x, target_y)
-                        self.input_guard.record_self_key(btn_vk)
-                        return True
+                    if not callable(click_fn):
+                        continue
+                    try:
+                        result = click_fn(target_x, target_y, button=btn)
+                    except Exception as exc:
+                        logger.debug(
+                            "click_humanized %s hatasi: %s", click_attr, exc
+                        )
+                        continue
+                    # F-1694 ile tutarlı: açık False = tıklama yapılmadı.
+                    if result is False:
+                        continue
+                    self.input_guard.record_virtual_mouse(target_x, target_y)
+                    self.input_guard.record_self_key(btn_vk)
+                    return True
 
-            # Fallback Win32 mouse_event tıklaması
-            dwell_sec = (
-                self.biometrics.get_mouse_dwell_sec()
-                if self.biometrics is not None
-                else 0.085
+            # F-1694/F-1701: donanım zincirli tıklama yolu yoksa sessiz yumuşak
+            # Win32 mouse_event fallback'i YOKTUR — tıklama yapılmadı sayılır.
+            logger.error(
+                "click_humanized: input_ctrl'de tiklama metodu yok "
+                "(%d, %d, button=%s); yumusak fallback kaldirildi",
+                target_x,
+                target_y,
+                btn,
             )
-            btn = str(button).lower()
-            down_flag, up_flag = (0x0008, 0x0010) if btn == "right" else (0x0002, 0x0004)
-            _set_cursor_pos_win32(target_x, target_y)
-            self.input_guard.record_virtual_mouse(target_x, target_y)
-            ctypes.windll.user32.mouse_event(down_flag, 0, 0, 0, 0)
-            time.sleep(max(0.01, dwell_sec))
-            ctypes.windll.user32.mouse_event(up_flag, 0, 0, 0, 0)
-            self.input_guard.record_virtual_mouse(target_x, target_y)
-            return True
+            return False
         except Exception as exc:
             logger.error("click_humanized hatasi (%s, %s): %s", x, y, exc)
             return False
 
     @staticmethod
-    def _resolve_cursor_setter(input_ctrl: Any) -> Callable[[int, int], Any]:
-        """input_ctrl nesnesindeki uygun imleç taşıma metodunu veya Win32 SetCursorPos'u çözer."""
+    def _resolve_cursor_setter(input_ctrl: Any) -> Optional[Callable[[int, int], Any]]:
+        """input_ctrl nesnesindeki uygun imleç taşıma metodunu çözer.
+
+        F-1703: uygun metod yoksa None döner — artık Win32 SetCursorPos
+        ışınlanması fallback'i yoktur; çağıran göreli zincire düşer.
+        """
         if input_ctrl is not None:
             for attr_name in (
                 "_set_cursor_pos_raw",
@@ -1724,7 +2294,7 @@ class WindMouseEngine:
                 fn = getattr(input_ctrl, attr_name, None)
                 if callable(fn):
                     return fn
-        return _set_cursor_pos_win32
+        return None
 
     def generate_relative_camera_trajectory(
         self,
@@ -1862,37 +2432,56 @@ class WindMouseEngine:
             max_allowed_single_step_px=max_allowed_single_step_px,
         )
 
+    def _probe_camera_smoothing_ready(self) -> bool:
+        """S-1404: kamera yumuşatıcının gerçek probu — 30°'lik heading
+        yörüngesi üretilebiliyorsa hazır sayılır (sabit True yok)."""
+        try:
+            traj = self.camera_smoother.generate_heading_turn_trajectory(
+                angle_diff_deg=30.0
+            )
+            return bool(traj)
+        except Exception:
+            return False
+
     def get_camera_smoothing_summary(self) -> dict[str, Any]:
         return {
             "module": "windmouse_humanizer",
-            "camera_smoothing_ready": True,
+            "camera_smoothing_ready": self._probe_camera_smoothing_ready(),
             "metrics": self.camera_smoother.get_metrics(),
         }
 
     def get_windmouse_health_summary(self) -> dict:
+        # S-1404: hazır bilgisi gerçek sözleşme + yumuşatıcı probundan gelir.
         return {
             "module": "windmouse_humanizer",
-            "ready": True,
-            "camera_smoothing_ready": True,
+            "ready": bool(validate_windmouse_humanizer_contract()),
+            "camera_smoothing_ready": self._probe_camera_smoothing_ready(),
         }
 
     def get_windmouse_humanizer_ready_flag(self) -> dict:
-        return {"module": "windmouse_humanizer", "ready": True}
-
-    def get_windmouse_humanizer_version_info(self) -> dict:
-        return {"module": "windmouse_humanizer", "version": "2.1.0", "ready": True}
-
-    def get_windmouse_humanizer_diagnostic_snapshot(self) -> dict:
+        # S-1404: hazır bilgisi gerçek sözleşme denetiminden gelir.
         return {
             "module": "windmouse_humanizer",
-            "status": "ok",
-            "ready": True,
-            "camera_smoothing": self.get_camera_smoothing_summary(),
+            "ready": bool(validate_windmouse_humanizer_contract()),
         }
 
+    def get_windmouse_humanizer_version_info(self) -> dict:
+        # S-1404: sürüm dizesi sabittir ama ready gerçek sözleşme denetimidir.
+        return {
+            "module": "windmouse_humanizer",
+            "version": __version__,
+            "ready": bool(validate_windmouse_humanizer_contract()),
+        }
 
-# Geriye dönük uyumluluk ve alternatif sınıf adı takma adı
-WindMouseController = WindMouseEngine
+    def get_windmouse_humanizer_diagnostic_snapshot(self) -> dict:
+        # S-1404: status/ready gerçek sözleşme denetiminden türetilir.
+        ready = bool(validate_windmouse_humanizer_contract())
+        return {
+            "module": "windmouse_humanizer",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+            "camera_smoothing": self.get_camera_smoothing_summary(),
+        }
 
 
 def check_driver_backend_status() -> dict[str, Any]:
@@ -1902,7 +2491,7 @@ def check_driver_backend_status() -> dict[str, Any]:
     `SendInput ScanCode` katmanlarından hangisinin aktif olduğunu raporlar.
     """
     status: dict[str, Any] = {
-        "active_backend": "sendinput_scancode",
+        "active_backend": "unavailable",
         "fakerinput_available": False,
         "fakerinput_device_path": None,
         "interception_available": False,
@@ -1945,7 +2534,10 @@ def check_driver_backend_status() -> dict[str, Any]:
     except Exception as exc:
         logger.debug("FakerInput denetim hatasi: %s", exc)
 
-    # 2. Interception (interception.dll / keyboard.sys) kontrolü
+    # 2. Interception (interception.dll + kernel driver) kontrolü.
+    # F-1699: salt keyboard.sys dosyasının varlığı Interception kanıtı DEĞİLDİR
+    # (Windows sistem dosyasıdır) — yalnızca interception_create_context
+    # sunan ve context açabilen DLL sayılır.
     try:
         interception_candidates = (
             "interception.dll",
@@ -1953,29 +2545,36 @@ def check_driver_backend_status() -> dict[str, Any]:
             os.path.join(os.getcwd(), "drivers", "interception.dll"),
             r"C:\Program Files\Interception\interception.dll",
             r"C:\Windows\System32\interception.dll",
-            r"C:\Windows\System32\drivers\keyboard.sys",
         )
         for dll_candidate in interception_candidates:
-            if dll_candidate.endswith(".sys"):
-                if os.path.exists(dll_candidate):
-                    status["interception_available"] = True
-                    status["interception_dll_path"] = dll_candidate
-                    status["details"].append(
-                        f"Interception kernel driver detected: {dll_candidate}"
-                    )
-                    break
-            else:
-                try:
-                    lib = ctypes.WinDLL(dll_candidate)
-                    if hasattr(lib, "interception_create_context"):
-                        status["interception_available"] = True
-                        status["interception_dll_path"] = dll_candidate
-                        status["details"].append(
-                            f"Interception DLL loaded: {dll_candidate}"
-                        )
-                        break
-                except OSError:
+            try:
+                lib = ctypes.WinDLL(dll_candidate)
+            except (OSError, AttributeError):
+                continue
+            try:
+                if not hasattr(lib, "interception_create_context"):
                     continue
+                ctx = lib.interception_create_context()
+                if not ctx:
+                    # DLL var ama kernel driver yok — context açılamadı.
+                    status["details"].append(
+                        f"Interception DLL bulundu ama driver yok (context NULL): {dll_candidate}"
+                    )
+                    continue
+                try:
+                    if hasattr(lib, "interception_destroy_context"):
+                        lib.interception_destroy_context(ctx)
+                except Exception:
+                    pass
+                status["interception_available"] = True
+                status["interception_dll_path"] = dll_candidate
+                status["details"].append(
+                    f"Interception DLL loaded + context OK: {dll_candidate}"
+                )
+                break
+            except (OSError, AttributeError) as exc:
+                logger.debug("Interception prob hatasi (%s): %s", dll_candidate, exc)
+                continue
     except Exception as exc:
         logger.debug("Interception denetim hatasi: %s", exc)
 
@@ -2002,6 +2601,12 @@ def check_driver_backend_status() -> dict[str, Any]:
     else:
         status["active_backend"] = "unavailable"
 
+    # F-1699: hardware_free_mode artık sabit True değil — donanım backend'i
+    # (FakerInput/Interception) varsa False'dur.
+    status["hardware_free_mode"] = not (
+        status["fakerinput_available"] or status["interception_available"]
+    )
+
     return status
 
 
@@ -2017,8 +2622,74 @@ def get_windmouse_humanizer_capabilities() -> list:
     ]
 
 
+def _validate_windmouse_humanizer_contract_uncached() -> bool:
+    """Sözleşmeyi gerçekten denetler — F-1698: koşulsuz True yok.
+
+    Denetlenenler: capability listesi dolu; WindMouseEngine kurulabiliyor;
+    üretilen WindMouse yörüngesi hedefte bitiyor; anti-snap denetimi
+    çalışıp beklenen alanları döndürüyor; backend durum raporu beklenen
+    şemada. Herhangi biri sağlanamazsa False.
+    """
+    try:
+        caps = get_windmouse_humanizer_capabilities()
+        if not caps or "windmouse_humanizer" not in caps:
+            logger.error("validate_windmouse_humanizer_contract: capability listesi bos")
+            return False
+        engine = WindMouseEngine()
+        path = engine.generate_windmouse_path(0, 0, 120, 60)
+        if not path or (path[-1][0], path[-1][1]) != (120, 60):
+            logger.error(
+                "validate_windmouse_humanizer_contract: yorunge hedefte bitmiyor: %r",
+                path[-3:] if path else path,
+            )
+            return False
+        res = engine.verify_trajectory_anti_snap(path)
+        if not isinstance(res, dict) or "is_smooth" not in res:
+            logger.error(
+                "validate_windmouse_humanizer_contract: anti-snap denetimi calismadi"
+            )
+            return False
+        status = check_driver_backend_status()
+        if not isinstance(status, dict) or status.get("active_backend") not in (
+            "fakerinput",
+            "interception",
+            "sendinput_scancode",
+            "unavailable",
+        ):
+            logger.error(
+                "validate_windmouse_humanizer_contract: backend durum raporu gecersiz: %r",
+                status,
+            )
+            return False
+        return True
+    except Exception as exc:
+        logger.error("validate_windmouse_humanizer_contract hatasi: %s", exc)
+        return False
+
+
+# Prob zinciri (readiness -> baseline, audit -> readiness, digest -> audit,
+# telemetry -> digest, seal -> telemetry, certificate -> seal, probe ->
+# certificate, summary -> probe) tek dis cagrida probu 8 kez kosuyordu
+# (her biri engine kurup yörünge üretip backend probu yapıyor). Prob sonucu
+# yalnizca surec ortamına bağlı; 60 sn TTL memoizasyon yeterli. Hicbir stub
+# silinmedi/kablolanmadi, yeni ready_flag/validate kalibi eklenmedi (K4).
+_CONTRACT_PROBE_CACHE_TTL_SEC: float = 60.0
+_CONTRACT_PROBE_CACHE: dict[str, Any] = {"value": None, "ts": 0.0}
+_CONTRACT_PROBE_CACHE_LOCK = threading.Lock()
+
+
 def validate_windmouse_humanizer_contract() -> bool:
-    return bool(get_windmouse_humanizer_capabilities())
+    """Sözleşme probunu 60 sn TTL ile önbellekli dondurur (zincir 8x kosmasin)."""
+    now = time.monotonic()
+    with _CONTRACT_PROBE_CACHE_LOCK:
+        cached = _CONTRACT_PROBE_CACHE["value"]
+        if cached is not None and (now - _CONTRACT_PROBE_CACHE["ts"]) < _CONTRACT_PROBE_CACHE_TTL_SEC:
+            return bool(cached)
+    fresh = _validate_windmouse_humanizer_contract_uncached()
+    with _CONTRACT_PROBE_CACHE_LOCK:
+        _CONTRACT_PROBE_CACHE["value"] = bool(fresh)
+        _CONTRACT_PROBE_CACHE["ts"] = time.monotonic()
+    return bool(fresh)
 
 
 def get_windmouse_humanizer_baseline_metrics() -> dict:
@@ -2096,18 +2767,36 @@ def get_windmouse_humanizer_audit_summary() -> dict:
 # MODÜL SEVİYESİ TEKİL NESNE VE KOLAYLIK FONKSİYONLARI (CONVENIENCE APIS)
 # ============================================================================
 
-_DEFAULT_ENGINE = WindMouseEngine()
-_DEFAULT_SMOOTHER = _DEFAULT_ENGINE.camera_smoother
+# F-1708: import anında tekil nesne kurulmaz — ilk kullanımda tembel kurulur.
+_DEFAULT_ENGINE: Optional[WindMouseEngine] = None
+_DEFAULT_SMOOTHER: Optional[CameraMovementSmoother] = None
+_DEFAULT_LOCK = threading.Lock()
+
+
+def _get_default_engine() -> WindMouseEngine:
+    global _DEFAULT_ENGINE, _DEFAULT_SMOOTHER
+    if _DEFAULT_ENGINE is None:
+        with _DEFAULT_LOCK:
+            if _DEFAULT_ENGINE is None:
+                _DEFAULT_ENGINE = WindMouseEngine()
+                _DEFAULT_SMOOTHER = _DEFAULT_ENGINE.camera_smoother
+    return _DEFAULT_ENGINE
+
+
+def _get_default_smoother() -> CameraMovementSmoother:
+    _get_default_engine()
+    assert _DEFAULT_SMOOTHER is not None
+    return _DEFAULT_SMOOTHER
 
 
 def get_windmouse_humanizer_diagnostic_snapshot() -> dict:
     """Modül seviyesi tanı anlık görüntüsü."""
-    return _DEFAULT_ENGINE.get_windmouse_humanizer_diagnostic_snapshot()
+    return _get_default_engine().get_windmouse_humanizer_diagnostic_snapshot()
 
 
 def get_camera_smoothing_summary() -> dict[str, Any]:
     """Modül seviyesi kamera yumuşatma durum özeti."""
-    return _DEFAULT_ENGINE.get_camera_smoothing_summary()
+    return _get_default_engine().get_camera_smoothing_summary()
 
 
 def generate_relative_camera_trajectory(
@@ -2119,7 +2808,7 @@ def generate_relative_camera_trajectory(
     enable_overshoot: Optional[bool] = None,
 ) -> list[tuple[int, int, float]]:
     """Modül seviyesi relative kamera Bezier yörünge üretimi."""
-    return _DEFAULT_SMOOTHER.generate_relative_camera_trajectory(
+    return _get_default_smoother().generate_relative_camera_trajectory(
         total_dx=total_dx,
         total_dy=total_dy,
         duration_sec=duration_sec,
@@ -2136,7 +2825,7 @@ def generate_heading_turn_trajectory(
     config: Optional[CameraSmoothingConfig] = None,
 ) -> list[tuple[int, int, float]]:
     """Modül seviyesi heading açı değişimi Bezier yörünge üretimi."""
-    return _DEFAULT_SMOOTHER.generate_heading_turn_trajectory(
+    return _get_default_smoother().generate_heading_turn_trajectory(
         angle_diff_deg=angle_diff_deg,
         current_heading_deg=current_heading_deg,
         target_bearing_deg=target_bearing_deg,
@@ -2150,7 +2839,7 @@ def generate_pitch_yaw_trajectory(
     config: Optional[CameraSmoothingConfig] = None,
 ) -> list[tuple[int, int, float]]:
     """Modül seviyesi 2D pitch/yaw Bezier yörünge üretimi."""
-    return _DEFAULT_SMOOTHER.generate_pitch_yaw_trajectory(
+    return _get_default_smoother().generate_pitch_yaw_trajectory(
         yaw_deg=yaw_deg,
         pitch_deg=pitch_deg,
         config=config,
@@ -2168,7 +2857,7 @@ def smooth_turn_heading(
     sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> bool:
     """Modül seviyesi insani karakter dönüşü."""
-    return _DEFAULT_SMOOTHER.smooth_turn_heading(
+    return _get_default_smoother().smooth_turn_heading(
         input_ctrl=input_ctrl,
         angle_diff_deg=angle_diff_deg,
         target_bearing_deg=target_bearing_deg,
@@ -2190,7 +2879,7 @@ def smooth_camera_pitch_yaw(
     sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> bool:
     """Modül seviyesi insani pitch/yaw kamera hareketi."""
-    return _DEFAULT_SMOOTHER.smooth_camera_pitch_yaw(
+    return _get_default_smoother().smooth_camera_pitch_yaw(
         input_ctrl=input_ctrl,
         yaw_deg=yaw_deg,
         pitch_deg=pitch_deg,
@@ -2211,7 +2900,7 @@ def smooth_camera_nudge(
     sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> bool:
     """Modül seviyesi robotik snap'i önleyen kamera hareketi."""
-    return _DEFAULT_SMOOTHER.smooth_camera_nudge(
+    return _get_default_smoother().smooth_camera_nudge(
         input_ctrl=input_ctrl,
         dx=dx,
         dy=dy,
@@ -2232,7 +2921,7 @@ def smooth_movement_heading_step(
     sleep_fn: Optional[Callable[[float], None]] = None,
 ) -> dict[str, Any]:
     """Modül seviyesi hareket esnasında rota yönlendirme adımı."""
-    return _DEFAULT_SMOOTHER.smooth_movement_heading_step(
+    return _get_default_smoother().smooth_movement_heading_step(
         input_ctrl=input_ctrl,
         current_pos=current_pos,
         next_waypoint=next_waypoint,
@@ -2248,7 +2937,7 @@ def verify_trajectory_anti_snap(
     max_allowed_single_step_px: Optional[int] = None,
 ) -> dict[str, Any]:
     """Modül seviyesi anti-snap yörünge denetimi."""
-    return _DEFAULT_SMOOTHER.verify_trajectory_anti_snap(
+    return _get_default_smoother().verify_trajectory_anti_snap(
         trajectory=trajectory,
         max_allowed_single_step_px=max_allowed_single_step_px,
     )

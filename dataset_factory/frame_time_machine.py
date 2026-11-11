@@ -10,13 +10,16 @@ character) can be retrieved and exported as a YOLO training sample.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass, field
+import itertools
 import threading
 import time
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+from version import __version__
 
 
 @dataclass
@@ -91,6 +94,13 @@ class PreGatherTimeMachineBuffer:
     Default configuration keeps 6.0 seconds of frames sampled at >=0.20s intervals
     (~30 snapshots), enabling accurate retrieval of the `t - 2.0s` frame (or
     multi-horizon snapshots at `2.5s`, `2.0s`, `1.2s`) upon gather completion.
+
+    Lookbacks are resolved with ``bisect`` over a parallel timestamp index
+    (``self._timestamps``, kept in sync with the deque on every push/prune/
+    evict/clear), so ``get_frame_before`` / ``get_multi_horizon_frames`` /
+    ``get_window`` cost O(log n) per lookup instead of a full O(n) scan of
+    the buffer on every call — previously each of the 3 default horizons
+    re-scanned all buffered frames.
     """
 
     def __init__(
@@ -106,6 +116,9 @@ class PreGatherTimeMachineBuffer:
         self.max_capacity: int = max(8, int(max_capacity))
 
         self._buffer: Deque[FrameSnapshot] = deque(maxlen=self.max_capacity)
+        # Parallel timestamp index, same order/length as ``_buffer`` at all
+        # times (n <= max_capacity, so front pops are negligible memmoves).
+        self._timestamps: List[float] = []
         self._lock = threading.RLock()
         self._total_pushed: int = 0
         self._total_skipped_interval: int = 0
@@ -132,6 +145,7 @@ class PreGatherTimeMachineBuffer:
         """Remove all snapshots from the ring buffer."""
         with self._lock:
             self._buffer.clear()
+            self._timestamps.clear()
 
     def push_frame(
         self,
@@ -160,10 +174,16 @@ class PreGatherTimeMachineBuffer:
         ts = float(timestamp) if timestamp is not None else time.time()
 
         with self._lock:
-            if not force and self._buffer and self.min_push_interval_sec > 0.0:
+            if not force and self._buffer:
                 last_ts = self._buffer[-1].timestamp
                 elapsed = ts - last_ts
-                if 0.0 <= elapsed < (self.min_push_interval_sec - 1e-6):
+                if elapsed < 0.0:
+                    # Backwards timestamp: accepting it would insert a stale
+                    # frame after newer ones and corrupt the chronology the
+                    # t-2s lookback relies on. Reject it (unless forced).
+                    self._total_skipped_interval += 1
+                    return None
+                if self.min_push_interval_sec > 0.0 and elapsed < (self.min_push_interval_sec - 1e-6):
                     self._total_skipped_interval += 1
                     return None
 
@@ -177,7 +197,12 @@ class PreGatherTimeMachineBuffer:
                 metadata=metadata if metadata is not None else {},
             )
 
+            was_full = len(self._buffer) >= self.max_capacity
             self._buffer.append(snapshot)
+            if was_full:
+                # deque maxlen evicted the oldest snapshot; drop its index entry.
+                self._timestamps.pop(0)
+            self._timestamps.append(ts)
             self._total_pushed += 1
             self._prune_expired_locked(current_ts=ts)
             return snapshot
@@ -187,6 +212,7 @@ class PreGatherTimeMachineBuffer:
         cutoff_ts = current_ts - self.max_duration_sec
         while len(self._buffer) > 1 and self._buffer[0].timestamp < (cutoff_ts - 1e-6):
             self._buffer.popleft()
+            self._timestamps.pop(0)
             self._total_pruned += 1
 
     def _resolve_reference_ts_locked(self, reference_ts: Optional[float]) -> float:
@@ -213,6 +239,37 @@ class PreGatherTimeMachineBuffer:
             return latest_ts
         return now
 
+    def _frame_before_locked(self, target_ts: float) -> Optional[FrameSnapshot]:
+        """Nearest snapshot to ``target_ts`` (O(log n) via the timestamp index).
+
+        Caller must hold ``self._lock``. Behaviour matches the previous
+        linear scan exactly: ``None`` when the target predates the earliest
+        buffered frame, the latest frame when the target is at/after it,
+        otherwise the closest snapshot — with ties resolved to the LATER
+        snapshot (the old scan used ``diff <= best_diff`` while walking in
+        chronological order).
+        """
+        if not self._buffer:
+            return None
+
+        earliest_ts = self._timestamps[0]
+        if target_ts < earliest_ts - 1e-6:
+            return None
+
+        latest = self._buffer[-1]
+        if target_ts >= latest.timestamp:
+            return latest
+
+        idx = bisect_right(self._timestamps, target_ts)
+        if idx <= 0:
+            # Target is within epsilon below the earliest timestamp.
+            return self._buffer[0]
+        lo = self._buffer[idx - 1]
+        hi = self._buffer[idx]
+        if abs(hi.timestamp - target_ts) <= abs(lo.timestamp - target_ts):
+            return hi
+        return lo
+
     def get_frame_before(
         self,
         seconds_ago: float = 2.0,
@@ -221,8 +278,11 @@ class PreGatherTimeMachineBuffer:
         """
         Return the buffered ``FrameSnapshot`` closest to ``reference_ts - seconds_ago``.
 
-        If the buffer has fewer than ``seconds_ago`` seconds of history, gracefully
-        returns the earliest available ``FrameSnapshot`` in the buffer.
+        Returns ``None`` when the buffer does not cover the requested lookback
+        (target timestamp predates the earliest buffered frame): silently
+        substituting the earliest/latest frame for the t-2s frame used to
+        label a gather as if it were the pre-gather frame. Callers fall back
+        to the current frame (or skip) when ``None`` is returned.
         """
         lookback = max(0.0, float(seconds_ago))
 
@@ -231,26 +291,7 @@ class PreGatherTimeMachineBuffer:
                 return None
 
             ref_ts = self._resolve_reference_ts_locked(reference_ts)
-            target_ts = ref_ts - lookback
-
-            earliest = self._buffer[0]
-            if target_ts <= earliest.timestamp:
-                return earliest
-
-            latest = self._buffer[-1]
-            if target_ts >= latest.timestamp:
-                return latest
-
-            best_snap: FrameSnapshot = earliest
-            best_diff: float = abs(earliest.timestamp - target_ts)
-
-            for snap in self._buffer:
-                diff = abs(snap.timestamp - target_ts)
-                if diff <= best_diff:
-                    best_diff = diff
-                    best_snap = snap
-
-            return best_snap
+            return self._frame_before_locked(ref_ts - lookback)
 
     def get_multi_horizon_frames(
         self,
@@ -262,6 +303,10 @@ class PreGatherTimeMachineBuffer:
         Retrieve multiple pre-gather snapshots across several lookback horizons
         (default: 2.5s, 2.0s, 1.2s before gather) to capture multiple viewing
         distances/angles from a single gather event.
+
+        Resolves the reference timestamp once and answers each horizon with
+        one O(log n) bisect lookup, instead of re-scanning the whole buffer
+        once per horizon.
         """
         with self._lock:
             if not self._buffer:
@@ -272,7 +317,7 @@ class PreGatherTimeMachineBuffer:
             seen_timestamps: set[float] = set()
 
             for horizon in horizons_sec:
-                snap = self.get_frame_before(seconds_ago=float(horizon), reference_ts=ref_ts)
+                snap = self._frame_before_locked(ref_ts - max(0.0, float(horizon)))
                 if snap is None:
                     continue
                 if deduplicate and snap.timestamp in seen_timestamps:
@@ -311,11 +356,11 @@ class PreGatherTimeMachineBuffer:
             lo_ago = min(float(start_seconds_ago), float(end_seconds_ago))
             t_start = ref_ts - hi_ago
             t_end = ref_ts - lo_ago
-            return [
-                snap
-                for snap in self._buffer
-                if (t_start - 1e-6) <= snap.timestamp <= (t_end + 1e-6)
-            ]
+            # Bisect the timestamp index to the inclusive window bounds
+            # (same 1e-6 epsilon as the old full-scan filter), then slice.
+            lo = bisect_left(self._timestamps, t_start - 1e-6)
+            hi = bisect_right(self._timestamps, t_end + 1e-6)
+            return list(itertools.islice(self._buffer, lo, hi))
 
     def get_stats(self) -> Dict[str, Any]:
         """Return diagnostic metrics for the time-machine ring buffer."""
@@ -352,19 +397,25 @@ class PreGatherTimeMachineBuffer:
             return []
 
     def get_time_machine_health_summary(self) -> dict:
+        # Delegates to the real contract validator (live push/retrieve smoke
+        # test) instead of unconditionally reporting ready.
         try:
-            return {"time_machine_ready": True}
+            return {"time_machine_ready": bool(validate_frame_time_machine_contract())}
         except Exception:
             return {"time_machine_ready": False}
 
     def get_time_machine_ready_flag(self) -> dict:
-        return {"module": "frame_time_machine", "ready": True}
+        # No hard-coded ready=True: delegate to the real contract validator,
+        # like get_time_machine_health_summary() already does, so a broken
+        # buffer cannot report itself ready.
+        return {"module": "frame_time_machine", "ready": bool(validate_frame_time_machine_contract())}
 
     def get_time_machine_version_info(self) -> dict:
-        return {"module": "frame_time_machine", "version": "2.0.0", "ready": True}
+        return {"module": "frame_time_machine", "version": __version__, "ready": bool(validate_frame_time_machine_contract())}
 
     def get_frame_time_machine_diagnostic_snapshot(self) -> dict:
-        return {"module": "frame_time_machine", "status": "ok", "ready": True}
+        ready = bool(validate_frame_time_machine_contract())
+        return {"module": "frame_time_machine", "status": "ok" if ready else "not_ready", "ready": ready}
 
 
 def get_frame_time_machine_capabilities() -> list:
@@ -372,7 +423,37 @@ def get_frame_time_machine_capabilities() -> list:
 
 
 def validate_frame_time_machine_contract() -> bool:
-    return bool(get_frame_time_machine_capabilities())
+    """Real contract check: the buffer must accept, order and retrieve frames.
+
+    Previously this only checked that a hard-coded capability list was
+    non-empty (a tautology). Now it runs a live smoke test: push two frames
+    2s apart and verify the t-2s lookback returns the older one (and that a
+    lookback the buffer cannot cover returns None instead of a substitute).
+    """
+    try:
+        if not get_frame_time_machine_capabilities():
+            return False
+        import numpy as _np
+
+        buf = PreGatherTimeMachineBuffer(
+            max_duration_sec=6.0, min_push_interval_sec=0.0, max_capacity=8
+        )
+        old = _np.zeros((4, 4, 3), dtype=_np.uint8)
+        new = _np.full((4, 4, 3), 7, dtype=_np.uint8)
+        if buf.push_frame(old, timestamp=1000.0) is None:
+            return False
+        if buf.push_frame(new, timestamp=1002.0) is None:
+            return False
+        snap = buf.get_frame_before(seconds_ago=2.0, reference_ts=1002.0)
+        if snap is None or snap.timestamp != 1000.0:
+            return False
+        if buf.get_frame_before(seconds_ago=5.0, reference_ts=1002.0) is not None:
+            return False
+        if buf.push_frame(old, timestamp=999.0) is not None:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def get_frame_time_machine_baseline_metrics() -> dict:

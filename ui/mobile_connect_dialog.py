@@ -1,12 +1,14 @@
-import hashlib
+import json
 import logging
-import platform
+import secrets
 import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import cv2
@@ -36,6 +38,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.shell_page_frame import wrap_shell_tab_root_layout
+from version import __version__
 
 logger = logging.getLogger("MobileConnectDialog")
 if not logger.handlers:
@@ -66,14 +69,51 @@ def _detect_lan_ip() -> str:
             return str(ip)
     except Exception as exc:
         logger.debug("Hostname LAN IP tespiti atlandı: %s", exc)
-    return "192.168.1.100"
+    # Uydurma bir 192.168.x.x adresi asla gercek adres gibi gosterilmez;
+    # tespit basarisizsa bu makinenin gercek loopback adresi doner.
+    return "127.0.0.1"
 
 
 def _default_ntfy_topic() -> str:
-    """Cihaza özgü deterministik ve ücretsiz ntfy.sh bildirim kanalı üretir."""
-    node_id = f"{platform.node()}-gatherion-tr"
-    digest = hashlib.sha256(node_id.encode("utf-8", errors="ignore")).hexdigest()[:10]
-    return f"gatherion_tr_{digest}"
+    """Kriptografik rastgele ntfy.sh bildirim kanali (kalici).
+
+    Konu, relay config dosyasinda saklanir; yoksa 128-bit rastgele
+    uretilip kaydedilir. Hostname'den turetilen deterministik konu
+    herkes tarafindan tahmin edilebildigi icin kullanilmaz.
+    """
+    try:
+        from core.mobile_tunnel import DEFAULT_RELAY_CONFIG_PATH
+
+        cfg_path = Path(DEFAULT_RELAY_CONFIG_PATH)
+        if cfg_path.exists():
+            raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                saved = str(raw.get("topic", "")).strip()
+                # Eski 32-bit (8 hex) konu tahmin edilebilir; gecerli sayilmaz.
+                import re as _re
+
+                if saved and len(saved) >= 6 and not _re.match(
+                    r"^gatherion_tr_[0-9a-f]{8}$", saved
+                ):
+                    return saved
+        topic = f"gatherion_tr_{secrets.token_hex(16)}"
+        try:
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            existing: Dict[str, Any] = {}
+            if cfg_path.exists():
+                loaded = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            existing.setdefault("topic", topic)
+            cfg_path.write_text(
+                json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.debug("ntfy konu kaliciligi atlandi: %s", exc)
+        return topic
+    except Exception as exc:
+        logger.debug("ntfy konu yuklemesi atlandi: %s", exc)
+        return f"gatherion_tr_{secrets.token_hex(16)}"
 
 
 class MobileConnectDialog(QDialog):
@@ -85,6 +125,10 @@ class MobileConnectDialog(QDialog):
     """
 
     tunnel_result_signal = pyqtSignal(bool, str, str)
+
+    # QR pixmap önbelleğinin üst sınırı (farklı URL/boyut başına bir
+    # 250 px pixmap; sınır, tanılama/yenileme döngülerinde büyümesini engeller).
+    _QR_PIXMAP_CACHE_MAX_ENTRIES = 8
 
     def __init__(
         self,
@@ -101,6 +145,7 @@ class MobileConnectDialog(QDialog):
         self._tunnel_connecting: bool = False
         self._active_tunnel_url: str = ""
         self._tunnel_method_label: str = "Hazır (Beklemede)"
+        self._last_qr_url: str = ""
 
         self.setWindowTitle(
             "📱 Mobil Uzaktan Kontrol ve Canlı Takip Merkezi (Ücretsiz Web Paneli)"
@@ -141,9 +186,10 @@ class MobileConnectDialog(QDialog):
                 elif hasattr(self.mobile_server, "token_rotation_active"):
                     status["token_rotation"] = getattr(self.mobile_server, "token_rotation_active")
                 else:
-                    status["token_rotation"] = getattr(self.mobile_server, "_token_rotated", True)
+                    # Kanit yoksa True varsayilmez: bilinmiyor.
+                    status["token_rotation"] = getattr(self.mobile_server, "_token_rotated", None)
             else:
-                status["token_rotation"] = True
+                status["token_rotation"] = None
         except Exception as exc:
             status["token_rotation_error"] = str(exc)
 
@@ -200,7 +246,7 @@ class MobileConnectDialog(QDialog):
                 color: #f1f5f9;
                 border: 1px solid #334155;
                 border-radius: 6px;
-                padding: 7px 14px;
+                padding: 8px 16px;
                 font-size: 12px;
                 font-weight: 600;
             }
@@ -234,7 +280,7 @@ class MobileConnectDialog(QDialog):
                 border: 1px solid #38bdf8;
                 border-radius: 6px;
                 padding: 7px 10px;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 800;
             }
             QPushButton#SwitchBtnInactive {
@@ -243,7 +289,7 @@ class MobileConnectDialog(QDialog):
                 border: 1px solid #263548;
                 border-radius: 6px;
                 padding: 7px 10px;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 600;
             }
             QPushButton#SwitchBtnInactive:hover {
@@ -264,13 +310,13 @@ class MobileConnectDialog(QDialog):
         header_layout.setContentsMargins(16, 12, 16, 12)
         header_layout.setSpacing(12)
 
-        self.lbl_live_badge = QLabel("● SUNUCU AKTİF")
+        self.lbl_live_badge = QLabel("● DURUM KONTROL EDİLİYOR")
         self.lbl_live_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_live_badge.setFixedHeight(30)
+        self.lbl_live_badge.setFixedHeight(32)
         self.lbl_live_badge.setStyleSheet(
             "background-color: rgba(16, 185, 129, 0.16); color: #34d399; "
             "border: 1px solid #10b981; border-radius: 15px; padding: 0 14px; "
-            "font-size: 11px; font-weight: 800;"
+            "font-size: 12px; font-weight: 800;"
         )
 
         header_layout.addStretch(1)
@@ -349,7 +395,7 @@ class MobileConnectDialog(QDialog):
         )
         lbl_qr_hint.setWordWrap(True)
         lbl_qr_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_qr_hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        lbl_qr_hint.setStyleSheet("color: #94a3b8; font-size: 12px;")
         qr_layout.addWidget(lbl_qr_hint)
         qr_layout.addStretch(1)
 
@@ -375,7 +421,7 @@ class MobileConnectDialog(QDialog):
             "1. 📶 Yerel Wi-Fi Adresi (Aynı Ağa Bağlı Telefonlar İçin)"
         )
         lbl_lan_title.setStyleSheet(
-            "color: #38bdf8; font-size: 13px; font-weight: 800;"
+            "color: #38bdf8; font-size: 14px; font-weight: 800;"
         )
         sec_lan_layout.addWidget(lbl_lan_title)
 
@@ -412,7 +458,7 @@ class MobileConnectDialog(QDialog):
             "2. 🌐 Ücretsiz İnternet Tüneli (4G/5G / Dışarıdan Erişim — Cloudflare / localhost.run)"
         )
         lbl_tunnel_title.setStyleSheet(
-            "color: #a855f7; font-size: 13px; font-weight: 800;"
+            "color: #a855f7; font-size: 14px; font-weight: 800;"
         )
         sec_tunnel_layout.addWidget(lbl_tunnel_title)
 
@@ -476,7 +522,7 @@ class MobileConnectDialog(QDialog):
             "3. 🔔 Ücretsiz ntfy.sh Bulut Bildirim & Komut Kanalı"
         )
         lbl_ntfy_title.setStyleSheet(
-            "color: #34d399; font-size: 13px; font-weight: 800;"
+            "color: #34d399; font-size: 14px; font-weight: 800;"
         )
         sec_ntfy_layout.addWidget(lbl_ntfy_title)
 
@@ -485,7 +531,7 @@ class MobileConnectDialog(QDialog):
             "bot durduğunda, Captcha çıktığında veya rota tamamlandığında anlık bildirim alabilirsiniz:"
         )
         lbl_ntfy_desc.setWordWrap(True)
-        lbl_ntfy_desc.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        lbl_ntfy_desc.setStyleSheet("color: #94a3b8; font-size: 12px;")
         sec_ntfy_layout.addWidget(lbl_ntfy_desc)
 
         ntfy_row = QHBoxLayout()
@@ -519,7 +565,7 @@ class MobileConnectDialog(QDialog):
 
         lbl_status_title = QLabel("4. 🛡️ Sunucu Durumu ve Güvenlik Bilgileri")
         lbl_status_title.setStyleSheet(
-            "color: #f59e0b; font-size: 13px; font-weight: 800;"
+            "color: #f59e0b; font-size: 14px; font-weight: 800;"
         )
         sec_status_layout.addWidget(lbl_status_title)
 
@@ -558,11 +604,13 @@ class MobileConnectDialog(QDialog):
         bottom_row.addWidget(self.lbl_feedback, stretch=1)
 
         btn_refresh = QPushButton("🔄 QR ve Durumu Yenile")
+        btn_refresh.setMinimumHeight(34)
         btn_refresh.setObjectName("ActionBtn")
         btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_refresh.clicked.connect(self._manual_refresh)
 
         btn_close = QPushButton("Kapat")
+        btn_close.setMinimumHeight(34)
         btn_close.setObjectName("ActionBtn")
         btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_close.clicked.connect(self.close)
@@ -599,10 +647,26 @@ class MobileConnectDialog(QDialog):
                 val = getattr(self.tunnel_mgr, attr, None)
                 if isinstance(val, str) and val.strip():
                     return val.strip()
-        node_seed = f"{platform.node()}-gatherion-mobile-token"
-        return hashlib.sha256(node_seed.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        # Hostname'den turetilen token tahmin edilebilir ve ekranda acik
+        # yazilmamali; sunucu token vermediyse token yoktur.
+        return ""
+
+    def _with_token(self, url: str) -> str:
+        """Y-1 (dilim 22): QR ile giriş akışı token'lı URL gerektirir —
+        tokensız URL sunucuda 401 verir. Token varsa `?token=` eklenir
+        (dashboard URL'den okuyup localStorage'a yazar). Token yoksa
+        URL olduğu gibi döner."""
+        base = str(url or "").strip()
+        if not base or "?token=" in base or "?key=" in base:
+            return base
+        token = self._get_security_token()
+        if not token:
+            return base
+        sep = "&" if "?" in base else "?"
+        return f"{base}{sep}token={urllib.parse.quote(token, safe='')}"
 
     def _get_lan_url(self) -> str:
+        base = ""
         if self.mobile_server is not None:
             for attr in ("get_lan_url", "get_local_url"):
                 fn = getattr(self.mobile_server, attr, None)
@@ -610,30 +674,33 @@ class MobileConnectDialog(QDialog):
                     try:
                         res = fn()
                         if isinstance(res, str) and res.startswith("http"):
-                            return res
+                            base = res
+                            break
                     except Exception as exc:
                         logger.debug("Sunucu LAN URL sorgusu atlandı: %s", exc)
-            for attr in ("lan_url", "local_url"):
-                val = getattr(self.mobile_server, attr, None)
-                if isinstance(val, str) and val.startswith("http"):
-                    return val
+            if not base:
+                for attr in ("lan_url", "local_url"):
+                    val = getattr(self.mobile_server, attr, None)
+                    if isinstance(val, str) and val.startswith("http"):
+                        base = val
+                        break
 
-        lan_ip = ""
-        if self.tunnel_mgr is not None:
-            fn_ip = getattr(self.tunnel_mgr, "get_lan_ip", None)
-            if callable(fn_ip):
-                try:
-                    lan_ip = str(fn_ip() or "")
-                except Exception:
-                    lan_ip = ""
-        if not lan_ip:
-            lan_ip = _detect_lan_ip()
+        if not base:
+            lan_ip = ""
+            if self.tunnel_mgr is not None:
+                fn_ip = getattr(self.tunnel_mgr, "get_lan_ip", None)
+                if callable(fn_ip):
+                    try:
+                        lan_ip = str(fn_ip() or "")
+                    except Exception:
+                        lan_ip = ""
+            if not lan_ip:
+                lan_ip = _detect_lan_ip()
 
-        port = self._get_server_port()
-        token = self._get_security_token()
-        if self.mobile_server is not None and getattr(self.mobile_server, "include_token_in_url", False):
-            return f"http://{lan_ip}:{port}/?token={token}"
-        return f"http://{lan_ip}:{port}"
+            port = self._get_server_port()
+            base = f"http://{lan_ip}:{port}"
+
+        return self._with_token(base)
 
     def _get_ntfy_url(self) -> str:
         for obj in (self.tunnel_mgr, self.mobile_server):
@@ -660,9 +727,13 @@ class MobileConnectDialog(QDialog):
                     return f"https://ntfy.sh/{clean_topic}"
         return f"https://ntfy.sh/{_default_ntfy_topic()}"
 
-    def _get_connected_clients_count(self) -> int:
+    def _get_connected_clients_count(self) -> Optional[int]:
+        """Bagli istemci sayisi; sunucu sayac vermiyorsa None (bilinmiyor).
+
+        Sayac kaynagi yokken 0 dondurmek "hic istemci yok" yalanidir.
+        """
         if self.mobile_server is None:
-            return 0
+            return None
         for attr in (
             "request_count",
             "connected_clients",
@@ -685,7 +756,7 @@ class MobileConnectDialog(QDialog):
                             return int(st[k])
             except Exception as exc:
                 logger.debug("Sunucu durum sorgusu atlandı: %s", exc)
-        return 0
+        return None
 
     def _sync_from_backends(self) -> None:
         lan_url = self._get_lan_url()
@@ -732,12 +803,16 @@ class MobileConnectDialog(QDialog):
         token = self._get_security_token()
 
         self.lbl_port_info.setText(f"Aktif Port: {port}")
-        self.lbl_clients_info.setText(f"Bağlı İstemci / İstek: {clients}")
-        self.lbl_token_info.setText(f"Güvenlik Anahtarı: {token}")
+        clients_text = str(clients) if clients is not None else "Bilinmiyor"
+        self.lbl_clients_info.setText(f"Bağlı İstemci / İstek: {clients_text}")
+        # Token ekranda asla acik yazilmaz; yalnizca maskeli onizleme.
+        token_text = f"{token[:4]}***" if token else "Tanımlı değil"
+        self.lbl_token_info.setText(f"Güvenlik Anahtarı: {token_text}")
 
-        server_running = True
+        # Sunucu nesnesi yoksa "aktif" varsayilamaz.
+        server_running = False
         if self.mobile_server is not None:
-            is_run = getattr(self.mobile_server, "running", getattr(self.mobile_server, "is_running", True))
+            is_run = getattr(self.mobile_server, "running", getattr(self.mobile_server, "is_running", False))
             server_running = bool(is_run() if callable(is_run) else is_run)
 
         if server_running:
@@ -762,7 +837,7 @@ class MobileConnectDialog(QDialog):
     def get_active_qr_url(self) -> str:
         """Seçili QR hedefine göre taranacak URL'yi döndürür."""
         if self._qr_target_mode == "tunnel" and self._active_tunnel_url:
-            return self._active_tunnel_url
+            return self._with_token(self._active_tunnel_url)
         return self._get_lan_url()
 
     def set_qr_target_mode(self, mode: str) -> None:
@@ -783,16 +858,36 @@ class MobileConnectDialog(QDialog):
         self.style().unpolish(self.btn_mode_tunnel)
         self.style().polish(self.btn_mode_tunnel)
 
-    def _generate_qr_pixmap(self, url: str, size: int = 250) -> QPixmap:
+    def _try_generate_real_qr_pixmap(self, url: str, size: int = 250) -> Optional[QPixmap]:
         """
-        Verilen URL için net bir QR Kod QPixmap üretir.
-        Öncelikle `tunnel_mgr.generate_qr_image(url)` metodunu dener,
-        ardından OpenCV `cv2.QRCodeEncoder` ve deterministik matris
-        yedek mekanizmasını kullanır.
+        Gercek bir QR ureteciyle (core.mobile_tunnel / tunnel_mgr /
+        OpenCV QRCodeEncoder) taranabilir bir QR QPixmap uretmeyi dener.
+
+        Gercek ureteci yoksa None doner — cagiran, "olusturulamadi"
+        kartini gosterip gostermeyecegine kendisi karar verir. S-4101:
+        _render_unavailable_qr_pixmap karti da 252x252 dolu, null
+        olmayan bir QPixmap oldugu icin dogrulama bu metoda bakarak
+        yapilamaz; kart pixmap'i gecerli QR sayilmamalidir.
         """
-        # 1. tunnel_mgr.generate_qr_image(active_url) varsa kullan
-        if self.tunnel_mgr is not None:
-            gen_fn = getattr(self.tunnel_mgr, "generate_qr_image", None)
+        # QPixmap, QGuiApplication olmadan olusturulamaz (Qt abort eder ve
+        # Python try/except yakalayamaz); uygulama yoksa hata firlat.
+        if QGuiApplication.instance() is None:
+            raise RuntimeError("QR pixmap requires a QGuiApplication instance")
+        # 1. core.mobile_tunnel.generate_qr_image(url) modül fonksiyonu
+        try:
+            from core.mobile_tunnel import generate_qr_image as _mt_generate_qr
+
+            raw_qr = _mt_generate_qr(url, size=size)
+            pix = self._convert_any_qr_to_pixmap(raw_qr, size)
+            if pix is not None and not pix.isNull():
+                return pix
+        except Exception as exc:
+            logger.debug("core.mobile_tunnel.generate_qr_image hatası: %s", exc)
+
+        # 1b. tunnel_mgr.generate_qr_image(active_url) varsa kullan
+        tunnel_mgr = getattr(self, "tunnel_mgr", None)
+        if tunnel_mgr is not None:
+            gen_fn = getattr(tunnel_mgr, "generate_qr_image", None)
             if callable(gen_fn):
                 try:
                     raw_qr = gen_fn(url)
@@ -815,8 +910,62 @@ class MobileConnectDialog(QDialog):
             except Exception as exc:
                 logger.debug("cv2.QRCodeEncoder hatası: %s", exc)
 
-        # 3. Yedek QR Matris Çizici (OpenCV derlemesinde QRCodeEncoder yoksa bile 100% çalışır)
-        return self._render_fallback_qr_pixmap(url, size)
+        # Gerçek QR üreticisi yok.
+        return None
+
+    def _generate_qr_pixmap(self, url: str, size: int = 250) -> QPixmap:
+        """Cached wrapper around :meth:`_generate_qr_pixmap_uncached`.
+
+        QR encoding (cv2 ``QRCodeEncoder`` + numpy resize + QImage
+        conversion) costs ~100-300 ms per call on this machine, and the
+        dialog re-requests the same (url, size) on every manual refresh and
+        every diagnostics pass. The pixmap is a pure function of
+        (url, size), so a repeat request returns the cached pixmap.
+        Only pixmaps from a real producer are cached: the "unavailable"
+        fallback card is deliberately NOT cached, so a later retry can
+        succeed once a real producer becomes available.
+        """
+        # __dict__ lookup (not getattr): on a __new__-constructed dialog
+        # whose __init__ never ran, PyQt raises RuntimeError for a missing
+        # attribute instead of AttributeError.
+        cache = self.__dict__.get("_qr_pixmap_cache")
+        if cache is None:
+            cache = {}
+            try:
+                setattr(self, "_qr_pixmap_cache", cache)
+            except Exception:
+                pass
+        key = (str(url), int(size))
+        hit = cache.get(key)
+        if hit is not None and not hit.isNull():
+            return hit
+        pix, from_producer = self._generate_qr_pixmap_uncached(url, size)
+        if from_producer and pix is not None and not pix.isNull():
+            if len(cache) >= self._QR_PIXMAP_CACHE_MAX_ENTRIES:
+                cache.pop(next(iter(cache)))
+            cache[key] = pix
+        return pix
+
+    def _generate_qr_pixmap_uncached(self, url: str, size: int = 250) -> tuple:
+        """
+        Verilen URL için net bir QR Kod QPixmap üretir.
+        Öncelikle `core.mobile_tunnel.generate_qr_image(url)` modül
+        fonksiyonunu dener (gerçek yönetici FreeCloudTunnelManager'da
+        bu isimde metot yoktur), ardından OpenCV `cv2.QRCodeEncoder`
+        kullanır. Hiçbir gerçek üretici yoksa sahte matris çizilmez;
+        açık bir "oluşturulamadı" kartı döner.
+
+        Returns ``(pixmap, from_real_producer)``: the second element is
+        False exactly when the pixmap is the "unavailable" fallback card,
+        so the caller can decide whether the result is worth caching.
+        """
+        pix = self._try_generate_real_qr_pixmap(url, size)
+        if pix is not None and not pix.isNull():
+            return pix, True
+
+        # 3. Gerçek QR üreticisi yok: sahte matris çizilmez, dürüst kart döner.
+        # from_real_producer=False: bu kart önbelleğe alınmaz.
+        return self._render_unavailable_qr_pixmap(url, size), False
 
     def _convert_any_qr_to_pixmap(self, raw_qr: Any, size: int) -> Optional[QPixmap]:
         if isinstance(raw_qr, QPixmap):
@@ -886,59 +1035,30 @@ class MobileConnectDialog(QDialog):
         except Exception:
             return None
 
-    def _render_fallback_qr_pixmap(self, url: str, size: int) -> QPixmap:
-        """Standart QR Bulucu Desenli yüksek kontrastlı karekod matrisi üretir."""
-        modules = 29
-        grid = np.ones((modules, modules), dtype=np.uint8) * 255
+    def _render_unavailable_qr_pixmap(self, url: str, size: int) -> QPixmap:
+        """Gerçek QR üreticisi yokken gösterilecek dürüst bilgi kartı.
 
-        def _place_finder(r0: int, c0: int) -> None:
-            for r in range(7):
-                for c in range(7):
-                    if (
-                        r in (0, 6)
-                        or c in (0, 6)
-                        or (2 <= r <= 4 and 2 <= c <= 4)
-                    ):
-                        grid[r0 + r, c0 + c] = 0
-                    else:
-                        grid[r0 + r, c0 + c] = 255
-
-        _place_finder(1, 1)
-        _place_finder(1, modules - 8)
-        _place_finder(modules - 8, 1)
-
-        digest = hashlib.sha512(url.encode("utf-8", errors="ignore")).digest()
-        bit_idx = 0
-        for r in range(2, modules - 2):
-            for c in range(2, modules - 2):
-                if (r < 9 and c < 9) or (r < 9 and c >= modules - 9) or (r >= modules - 9 and c < 9):
-                    continue
-                byte_val = digest[(bit_idx // 8) % len(digest)]
-                bit_val = (byte_val >> (bit_idx % 8)) & 1
-                grid[r, c] = 0 if bit_val else 255
-                bit_idx += 1
-
-        pix = self._numpy_to_qr_pixmap(grid, size)
-        if pix is not None:
-            return pix
-
-        fallback_pix = QPixmap(size, size)
-        fallback_pix.fill(QColor("#ffffff"))
-        painter = QPainter(fallback_pix)
-        painter.setPen(QPen(QColor("#0f172a"), 2))
-        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        Hash ile doldurulmuş sahte bir matris QR kodu değildir ve
+        taranamaz; bu yüzden karekod görünümü verilmez, yalnızca
+        metinle "oluşturulamadı" yazılır.
+        """
+        pix = QPixmap(size, size)
+        pix.fill(QColor("#ffffff"))
+        painter = QPainter(pix)
+        painter.setPen(QPen(QColor("#b91c1c"), 2))
+        painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         painter.drawText(
-            fallback_pix.rect(),
+            pix.rect(),
             Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
-            url,
+            "QR oluşturulamadı\nGerçek QR üreticisi\n(qrcode / OpenCV)\nbulunamadı.\n\n" + url,
         )
         painter.end()
-        return fallback_pix
+        return pix
 
     def _refresh_qr_display(self) -> None:
         if self._qr_target_mode == "tunnel":
             if self._active_tunnel_url:
-                target_url = self._active_tunnel_url
+                target_url = self._with_token(self._active_tunnel_url)
                 self.lbl_qr_active_mode.setText(
                     "Aktif QR Hedefi: 🌐 Ücretsiz İnternet Tüneli (Her Yerden)"
                 )
@@ -954,6 +1074,14 @@ class MobileConnectDialog(QDialog):
             )
 
         self.lbl_qr_active_url.setText(target_url)
+        self._last_qr_url = target_url
+        # S156 (v19/P3-8): QGuiApplication yokken QR yenileme korumasız
+        # RuntimeError fırlatıyordu (_try_generate_real_qr_pixmap).
+        # QPixmap qapp olmadan üretilemez — metinler güncellenir,
+        # pixmap adımı atlanır (uygulama varken davranış değişmez).
+        if QGuiApplication.instance() is None:
+            logger.debug("QR yenileme atlandı: QGuiApplication yok.")
+            return
         pixmap = self._generate_qr_pixmap(target_url, size=252)
         self.qr_image_label.setPixmap(pixmap)
 
@@ -976,17 +1104,19 @@ class MobileConnectDialog(QDialog):
 
         port = self._get_server_port()
 
+        # Yonetici ana is parcaciginda olusturulur: arka plan is parcacigi
+        # self.tunnel_mgr'ye dogrudan yazmaz (F-0749).
+        if self.tunnel_mgr is None:
+            try:
+                from core.mobile_tunnel import FreeCloudTunnelManager
+                self.tunnel_mgr = FreeCloudTunnelManager(local_port=port)
+            except Exception:
+                pass
+
         def _worker() -> None:
             public_url = ""
             method_used = "Cloudflare"
             try:
-                if self.tunnel_mgr is None:
-                    try:
-                        from core.mobile_tunnel import FreeCloudTunnelManager
-                        self.tunnel_mgr = FreeCloudTunnelManager(local_port=port)
-                    except Exception:
-                        pass
-
                 is_real_mgr = bool(
                     self.tunnel_mgr is not None
                     and hasattr(self.tunnel_mgr, "ensure_cloudflared_binary")
@@ -1012,17 +1142,9 @@ class MobileConnectDialog(QDialog):
                             if isinstance(res, str) and res.startswith("http"):
                                 public_url = res.strip()
 
-                if not public_url and not is_real_mgr:
-                    # Yalnızca bağımsız birim testi ortamında yedek URL
-                    token_short = self._get_security_token()[:8]
-                    public_url = f"https://gatherion-{token_short}.trycloudflare.com"
-
+                # Tünel kurulamadiysa uydurma trycloudflare URL'si uretilmez;
+                # basarisizlik oldugu gibi bildirilir.
                 if public_url:
-                    if self.mobile_server is not None:
-                        try:
-                            setattr(self.mobile_server, "public_url", public_url)
-                        except Exception:
-                            pass
                     self.tunnel_result_signal.emit(True, public_url, method_used)
                 else:
                     err_msg = getattr(self.tunnel_mgr, "_last_error", "") or "Tünel bağlantısı kurulamadı"
@@ -1049,16 +1171,19 @@ class MobileConnectDialog(QDialog):
 
         port = self._get_server_port()
 
+        # Yonetici ana is parcaciginda olusturulur: arka plan is parcacigi
+        # self.tunnel_mgr'ye dogrudan yazmaz (F-0749).
+        if self.tunnel_mgr is None:
+            try:
+                from core.mobile_tunnel import FreeCloudTunnelManager
+                self.tunnel_mgr = FreeCloudTunnelManager(local_port=port)
+            except Exception:
+                pass
+
         def _worker() -> None:
             public_url = ""
+            method_used = "localhost.run"
             try:
-                if self.tunnel_mgr is None:
-                    try:
-                        from core.mobile_tunnel import FreeCloudTunnelManager
-                        self.tunnel_mgr = FreeCloudTunnelManager(local_port=port)
-                    except Exception:
-                        pass
-
                 is_real_mgr = bool(
                     self.tunnel_mgr is not None
                     and hasattr(self.tunnel_mgr, "ensure_cloudflared_binary")
@@ -1072,25 +1197,22 @@ class MobileConnectDialog(QDialog):
                     if not public_url and is_real_mgr:
                         cf_fn = getattr(self.tunnel_mgr, "start_cloudflare_tunnel", None)
                         if callable(cf_fn):
+                            # Yedek Cloudflare ile kurulduysa yontem etiketi
+                            # "localhost.run" olarak kalmaz.
+                            method_used = "cloudflare"
                             res = cf_fn(port)
                             if isinstance(res, str) and res.startswith("http"):
                                 public_url = res.strip()
-                if not public_url and not is_real_mgr:
-                    token_short = self._get_security_token()[:8]
-                    public_url = f"https://gatherion-{token_short}.lhr.life"
+                # Tünel kurulamadiysa uydurma lhr.life URL'si uretilmez;
+                # basarisizlik oldugu gibi bildirilir.
                 if public_url:
-                    if self.mobile_server is not None:
-                        try:
-                            setattr(self.mobile_server, "public_url", public_url)
-                        except Exception:
-                            pass
-                    self.tunnel_result_signal.emit(True, public_url, "localhost.run")
+                    self.tunnel_result_signal.emit(True, public_url, method_used)
                 else:
                     err_msg = getattr(self.tunnel_mgr, "_last_error", "") or "SSH tüneli kurulamadı"
-                    self.tunnel_result_signal.emit(False, str(err_msg), "localhost.run")
+                    self.tunnel_result_signal.emit(False, str(err_msg), method_used)
             except Exception as exc:
                 logger.warning("SSH Tünel başlatma hatası: %s", exc)
-                self.tunnel_result_signal.emit(False, str(exc), "localhost.run")
+                self.tunnel_result_signal.emit(False, str(exc), method_used)
 
         thread = threading.Thread(target=_worker, daemon=True, name="MobileSSHTunnelStarter")
         thread.start()
@@ -1104,6 +1226,12 @@ class MobileConnectDialog(QDialog):
             self._active_tunnel_url = result_text
             self._tunnel_running = True
             self._tunnel_method_label = f"Aktif ({method_name})"
+            # mobile_server.public_url ana is parcaciginda yazilir (F-0749).
+            if self.mobile_server is not None:
+                try:
+                    setattr(self.mobile_server, "public_url", result_text)
+                except Exception:
+                    pass
             self.edit_tunnel_url.setText(self._active_tunnel_url)
             self.lbl_tunnel_status.setText(f"Aktif: {self._active_tunnel_url}")
             self.lbl_tunnel_status.setStyleSheet(
@@ -1116,7 +1244,17 @@ class MobileConnectDialog(QDialog):
                 f"✅ {method_name} tüneli aktif! QR kod genel internet adresine güncellendi."
             )
         else:
+            # Basarisiz yenilemede eski URL temizlenir: artik gecerli
+            # olmayan bir tünel adresi ekranda kalmaz.
+            self._active_tunnel_url = ""
             self._tunnel_running = False
+            self._tunnel_method_label = "Hazır (Beklemede)"
+            self.edit_tunnel_url.clear()
+            if self.mobile_server is not None:
+                try:
+                    setattr(self.mobile_server, "public_url", "")
+                except Exception:
+                    pass
             self.lbl_tunnel_status.setText(
                 f"Hata: Tünel kurulamadı ({result_text[:45]})"
             )
@@ -1124,18 +1262,28 @@ class MobileConnectDialog(QDialog):
                 "color: #f87171; font-size: 12px; font-weight: 700;"
             )
             self._show_feedback("⚠️ İnternet tüneli başlatılamadı; yerel Wi-Fi bağlantısı aktif.")
+            # QR hedefi tünelse artik gecersiz URL'yi gostermez.
+            if self._qr_target_mode == "tunnel":
+                self._refresh_qr_display()
 
     # ------------------------------------------------------------------
     # Kullanıcı Etkileşimleri (Kopyala / Tarayıcıda Aç / Yenile)
     # ------------------------------------------------------------------
 
-    def _copy_to_clipboard(self, text: str, label_tr: str) -> None:
+    def _copy_to_clipboard(self, text: str, label_tr: str) -> bool:
         if not text:
-            return
+            return False
         clipboard: Optional[QClipboard] = QGuiApplication.clipboard()
-        if clipboard is not None:
-            clipboard.setText(text)
-        self._show_feedback(f"📋 {label_tr} panoya kopyalandı: {text}")
+        if clipboard is None:
+            self._show_feedback(f"⚠️ {label_tr} kopyalanamadı: pano bulunamadı.")
+            return False
+        clipboard.setText(text)
+        # Kopyalamanin gercekten yapildigi dogrulanmadan "oldu" denmez.
+        if clipboard.text() == text:
+            self._show_feedback(f"📋 {label_tr} panoya kopyalandı: {text}")
+            return True
+        self._show_feedback(f"⚠️ {label_tr} panoya kopyalanamadı.")
+        return False
 
     def _copy_lan_url(self) -> None:
         self._copy_to_clipboard(self.edit_lan_url.text().strip(), "Yerel Wi-Fi adresi")
@@ -1155,14 +1303,18 @@ class MobileConnectDialog(QDialog):
     def _open_lan_in_browser(self) -> None:
         url = self.edit_lan_url.text().strip()
         if url:
-            webbrowser.open(url)
-            self._show_feedback("🌍 Yerel web paneli varsayılan tarayıcıda açıldı.")
+            if webbrowser.open(url):
+                self._show_feedback("🌍 Yerel web paneli varsayılan tarayıcıda açıldı.")
+            else:
+                self._show_feedback("⚠️ Tarayıcı açılamadı.")
 
     def _open_ntfy_in_browser(self) -> None:
         url = self.edit_ntfy_url.text().strip()
         if url:
-            webbrowser.open(url)
-            self._show_feedback("🔔 ntfy.sh bildirim kanalı tarayıcıda açıldı.")
+            if webbrowser.open(url):
+                self._show_feedback("🔔 ntfy.sh bildirim kanalı tarayıcıda açıldı.")
+            else:
+                self._show_feedback("⚠️ Tarayıcı açılamadı.")
 
     def _manual_refresh(self) -> None:
         self._sync_from_backends()
@@ -1171,6 +1323,14 @@ class MobileConnectDialog(QDialog):
 
     def _on_periodic_refresh(self) -> None:
         self._sync_from_backends()
+        # Periyodik yenileme QR'i da taze tutar: aktif hedef URL degismisse
+        # QR yeniden uretilir, degismediyse bosuna cizilmez.
+        try:
+            current_url = self.get_active_qr_url()
+        except Exception:
+            current_url = ""
+        if current_url and current_url != self._last_qr_url:
+            self._refresh_qr_display()
 
     def _show_feedback(self, message: str) -> None:
         self.lbl_feedback.setText(message)
@@ -1200,27 +1360,32 @@ class MobileConnectDialog(QDialog):
             active_qr_url = self.get_active_qr_url()
         except Exception:
             active_qr_url = lan_url
-        qr_pixmap = None
+        # S-4101: QR gecerliligi yalnizca GERCEK bir uretecinin
+        # taranabilir QR uretebildigine bakarak verilir. Ekrandaki
+        # etiket pixmap'i (qr_image_label) veya _generate_qr_pixmap
+        # sonucu bu ise yaramaz: ureteci yokken donen
+        # "olusturulamadi" karti da 252x252 dolu, null olmayan bir
+        # QPixmap'dir ve eski kontrol onu gecerli QR sayip
+        # overall_healthy'yi True yapiyordu. Bu yuzden dogrulama,
+        # _try_generate_real_qr_pixmap probuyla yapilir; kart
+        # pixmap'i boyut/icerik olarak QR sayilmaz.
+        real_qr_pixmap = None
         try:
-            qr_lbl = self.__dict__.get("qr_image_label")
-            if qr_lbl is not None:
-                qr_pixmap = qr_lbl.pixmap()
-            if qr_pixmap is None or qr_pixmap.isNull():
-                qr_pixmap = self._generate_qr_pixmap(active_qr_url, size=252)
+            real_qr_pixmap = self._try_generate_real_qr_pixmap(active_qr_url, size=252)
         except Exception as exc:
-            logger.debug("QR tanı doğrulaması sırasında yedek kontrol: %s", exc)
+            logger.debug("QR tanı doğrulaması sırasında gerçek üretici probu: %s", exc)
 
         qr_valid = bool(
-            qr_pixmap is not None
-            and not qr_pixmap.isNull()
-            and qr_pixmap.width() > 0
-            and qr_pixmap.height() > 0
+            real_qr_pixmap is not None
+            and not real_qr_pixmap.isNull()
+            and real_qr_pixmap.width() > 0
+            and real_qr_pixmap.height() > 0
             and isinstance(active_qr_url, str)
             and active_qr_url.startswith("http")
         )
         qr_size = (
-            (int(qr_pixmap.width()), int(qr_pixmap.height()))
-            if qr_pixmap is not None and not qr_pixmap.isNull()
+            (int(real_qr_pixmap.width()), int(real_qr_pixmap.height()))
+            if qr_valid
             else (0, 0)
         )
 
@@ -1235,45 +1400,70 @@ class MobileConnectDialog(QDialog):
             and len(ntfy_topic) > 0
         )
 
+        # Uzaktan komutlar yalnizca ntfy dinleyicisi gercekten calisiyorsa
+        # "destekli" sayilir; calismayan bir akis saglikli ilan edilmez.
+        relay_listener_running = False
+        mgr = self.__dict__.get("tunnel_mgr")
+        if mgr is not None:
+            relay = getattr(mgr, "ntfy_relay", None)
+            if relay is not None:
+                try:
+                    relay_status = relay.get_status()
+                    relay_listener_running = bool(
+                        relay_status.get("listener_running")
+                    )
+                except Exception as exc:
+                    logger.debug("ntfy dinleyici durum sorgusu atlandı: %s", exc)
         remote_commands: Dict[str, Dict[str, Any]] = {
             "pause_resume": {
                 "id": "pause_resume",
                 "name": "Duraklat/Devam",
-                "enabled": True,
-                "supported": True,
+                "enabled": relay_listener_running,
+                "supported": relay_listener_running,
                 "endpoint": "/api/command/pause_resume",
             },
             "emergency_stop": {
                 "id": "emergency_stop",
                 "name": "Acil Durdur",
-                "enabled": True,
-                "supported": True,
+                "enabled": relay_listener_running,
+                "supported": relay_listener_running,
                 "endpoint": "/api/command/emergency_stop",
             },
             "toggle_pick_collect": {
                 "id": "toggle_pick_collect",
                 "name": "Seç-Topla değiştir",
-                "enabled": True,
-                "supported": True,
+                # Y-7 (dilim 22): bu komutun sunucuda karşılığı yok
+                # (ne /api/command/* rotası ne execute_action dalı ne de
+                # ntfy listesinde var). Eskiden "destekleniyor" görünüp
+                # basıldığında hiçbir şey yapmıyordu — artık dürüstçe
+                # desteklenmiyor olarak işaretlenir.
+                "enabled": False,
+                "supported": False,
                 "endpoint": "/api/command/toggle_pick_collect",
+                "reason": "Sunucuda karşılığı yok (desteklenmiyor).",
             },
         }
 
         try:
             token = self._get_security_token()
         except Exception:
-            token = "gatherion"
+            # Sunucu token vermediyse token yoktur; varsayilan "gatherion"
+            # tahmini, guvenlik anahtari varmis gibi gosterirdi (S-0505).
+            token = ""
         try:
             clients = self._get_connected_clients_count()
         except Exception:
-            clients = 0
+            # Sayac okunamiyorsa sayi bilinmiyor; 0 "hic istemci yok" yalanidir
+            # (F-0584 gerekcesi; _get_connected_clients_count zaten None doner).
+            clients = None
         qr_target_mode = str(self.__dict__.get("_qr_target_mode") or "lan")
         tunnel_method_label = str(self.__dict__.get("_tunnel_method_label") or "cloudflare")
 
+        overall_healthy = bool(lan_healthy and qr_valid and ntfy_healthy)
         return {
-            "status": "ok",
-            "ready": True,
-            "healthy": bool(lan_healthy and qr_valid and ntfy_healthy),
+            "status": "ok" if overall_healthy else "degraded",
+            "ready": overall_healthy,
+            "healthy": overall_healthy,
             "qr_target_mode": qr_target_mode,
             "lan": {
                 "mode": "lan",
@@ -1289,13 +1479,16 @@ class MobileConnectDialog(QDialog):
                 "running": tunnel_running,
                 "connecting": tunnel_connecting,
                 "method": tunnel_method_label,
-                "healthy": True,
+                "healthy": tunnel_running,
                 "active": qr_target_mode == "tunnel",
                 "providers": ["cloudflare", "localhost.run", "pinggy.io"],
             },
             "qr_verification": {
                 "valid": qr_valid,
                 "verified": qr_valid,
+                "generator_available": bool(
+                    real_qr_pixmap is not None and not real_qr_pixmap.isNull()
+                ),
                 "target_mode": qr_target_mode,
                 "encoded_url": active_qr_url,
                 "dimensions": qr_size,
@@ -1313,11 +1506,12 @@ class MobileConnectDialog(QDialog):
                 "Acil Durdur",
                 "Seç-Topla değiştir",
             ],
-            "remote_commands_ready": True,
+            "remote_commands_ready": relay_listener_running,
             "security": {
                 "token_configured": bool(token),
                 "token_preview": f"{token[:4]}***" if len(token) >= 4 else "***",
                 "connected_clients": clients,
+                "connected_clients_known": clients is not None,
                 "port": port,
             },
         }
@@ -1345,9 +1539,9 @@ class MobileConnectDialog(QDialog):
         )
 
         delivered_live = False
-        http_status = 200
+        http_status = 0
         error_detail: Optional[str] = None
-        delivery_mode = "simulated_fallback"
+        delivery_mode = "failed_offline"
 
         # 1. Önce tunnel_mgr veya mobile_server üzerinde özel bildirim gönderici varsa dene
         for backend in (self.__dict__.get("tunnel_mgr"), self.__dict__.get("mobile_server")):
@@ -1404,9 +1598,9 @@ class MobileConnectDialog(QDialog):
             pass
 
         return {
-            "success": True,
-            "ok": True,
-            "status": "delivered" if delivered_live else "simulated_fallback",
+            "success": delivered_live,
+            "ok": delivered_live,
+            "status": "delivered" if delivered_live else "failed_offline",
             "mode": delivery_mode,
             "simulated": not delivered_live,
             "fallback": not delivered_live,
@@ -1420,19 +1614,66 @@ class MobileConnectDialog(QDialog):
         }
 
     def get_mobile_connect_dialog_health_summary(self) -> dict:
+        # Denetim yapmadan "hazir" raporlanmaz (S-0502): diyalogun dayanak
+        # metotlari + modul sozlesmesi gercekten saglaniyor mu, proba bakilir.
         try:
-            return {"mobile_connect_dialog_ready": True}
+            required = (
+                "get_mobile_connection_diagnostics",
+                "_generate_qr_pixmap",
+                "get_active_qr_url",
+                "_get_security_token",
+                "_get_connected_clients_count",
+                "_get_ntfy_url",
+            )
+            structural_ok = all(hasattr(self, name) for name in required)
+            ready = bool(structural_ok and validate_mobile_connect_dialog_contract())
         except Exception:
-            return {"mobile_connect_dialog_ready": False}
+            ready = False
+        return {"mobile_connect_dialog_ready": ready}
 
     def get_mobile_connect_dialog_ready_flag(self) -> dict:
-        return {"module": "mobile_connect_dialog", "ready": True}
+        # S-4102: was hardcoded {"ready": True}. Now delegates to the
+        # real probe in get_mobile_connect_dialog_health_summary
+        # (structural checks + module contract); any probe failure
+        # reports not-ready instead of unconditional True.
+        try:
+            ready = bool(
+                self.get_mobile_connect_dialog_health_summary().get(
+                    "mobile_connect_dialog_ready", False
+                )
+            )
+        except Exception:
+            ready = False
+        return {"module": "mobile_connect_dialog", "ready": ready}
 
     def get_mobile_connect_dialog_version_info(self) -> dict:
-        return {"module": "mobile_connect_dialog", "version": "2.0.0", "ready": True}
+        # S-4102: "ready" now reflects the real health probe, not a
+        # constant True.
+        try:
+            ready = bool(
+                self.get_mobile_connect_dialog_health_summary().get(
+                    "mobile_connect_dialog_ready", False
+                )
+            )
+        except Exception:
+            ready = False
+        return {"module": "mobile_connect_dialog", "version": __version__, "ready": ready}
 
     def get_mobile_connect_dialog_diagnostic_snapshot(self) -> dict:
-        return {"module": "mobile_connect_dialog", "status": "ok", "ready": True}
+        # S-4102: "status"/"ready" now reflect the real health probe.
+        try:
+            ready = bool(
+                self.get_mobile_connect_dialog_health_summary().get(
+                    "mobile_connect_dialog_ready", False
+                )
+            )
+        except Exception:
+            ready = False
+        return {
+            "module": "mobile_connect_dialog",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+        }
 
 
 if __name__ == "__main__":
@@ -1448,12 +1689,50 @@ if __name__ == "__main__":
     sys.exit(app.exec())
 
 
+# S-0502 (Karar 3): yetenekler sabit liste degil, gercek prob sonucudur.
+# Her yetenek, MobileConnectDialog uzerindeki dayanak metodun varligina
+# baglidir; dayanak kaldirilirsa yetenek listeden duser ve sozlesme bozulur.
+_MOBILE_CONNECT_DIALOG_EXPECTED_CAPABILITIES = (
+    "mobile_connect_dialog",
+    "qr_pairing",
+    "diagnostic_snapshot",
+)
+
+
+def _probe_mobile_connect_dialog_capabilities() -> dict:
+    """Yetenek dayanaklarini sinif uzerinden yoklar (ornek gerektirmez)."""
+    return {
+        "dialog_class": isinstance(MobileConnectDialog, type),
+        "qr_pairing": all(
+            hasattr(MobileConnectDialog, name)
+            for name in ("_generate_qr_pixmap", "get_active_qr_url")
+        ),
+        "diagnostic_snapshot": hasattr(
+            MobileConnectDialog, "get_mobile_connection_diagnostics"
+        ),
+    }
+
+
 def get_mobile_connect_dialog_capabilities() -> list:
-    return ["mobile_connect_dialog", "qr_pairing", "diagnostic_snapshot"]
+    probe = _probe_mobile_connect_dialog_capabilities()
+    capabilities = []
+    if probe["dialog_class"]:
+        capabilities.append("mobile_connect_dialog")
+    if probe["qr_pairing"]:
+        capabilities.append("qr_pairing")
+    if probe["diagnostic_snapshot"]:
+        capabilities.append("diagnostic_snapshot")
+    return capabilities
 
 
 def validate_mobile_connect_dialog_contract() -> bool:
-    return bool(get_mobile_connect_dialog_capabilities())
+    # Bos olmayan sabit liste degil: beklenen yeteneklerin TAMAMI probdan
+    # gecmeli; biri eksikse sozlesme gecersizdir.
+    capabilities = get_mobile_connect_dialog_capabilities()
+    return all(
+        expected in capabilities
+        for expected in _MOBILE_CONNECT_DIALOG_EXPECTED_CAPABILITIES
+    )
 
 
 def get_mobile_connect_dialog_baseline_metrics() -> dict:

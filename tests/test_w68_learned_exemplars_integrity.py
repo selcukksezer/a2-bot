@@ -4,7 +4,7 @@ tests/test_w68_learned_exemplars_integrity.py
 =============================================
 Worker W68: Integrity verification suite for `dataset/learned_exemplars.json`.
 Verifies that:
-1. No poisoned `class_id >= 22` (`essence_*`) exemplars exist in positive, negative, or class dicts.
+1. No poisoned `class_id >= 27` (`essence_*`) exemplars exist in positive, negative, or class dicts.
 2. All feature vectors extracted from `dataset/learned_exemplars.json` are 438-dimensional and L2-normalized.
 """
 
@@ -48,7 +48,9 @@ def test_learned_exemplars_no_poisoned_essence_positive_entries(
 ) -> None:
     """
     Test 1: Verify that no positive exemplar in `dataset/learned_exemplars.json`
-    has `class_id >= 22`, non-canonical class ID, or `essence_*` class name.
+    has `class_id >= 27`, non-canonical class ID, or `essence_*` class name.
+    (22..26 are canonical now: hp/mp_potion, buff_scroll, kinah, player —
+    Tarama K onarımı `ee3c631` ile dosyada 6 adet kanonik (22, hp_potion) var.)
     """
     positives: List[Dict[str, Any]] = learned_exemplars_data.get("positive", [])
     assert isinstance(positives, list) and len(positives) > 0, (
@@ -58,7 +60,7 @@ def test_learned_exemplars_no_poisoned_essence_positive_entries(
     for idx, ex in enumerate(positives):
         cid = int(ex.get("class_id", -1))
         cname = str(ex.get("class_name", "")).strip().lower()
-        assert cid < 22, f"Positive exemplar #{idx} has poisoned class_id={cid} (>= 22)"
+        assert cid < 27, f"Positive exemplar #{idx} has poisoned class_id={cid} (>= 27)"
         assert cid in CANONICAL_CLASSES, (
             f"Positive exemplar #{idx} has non-canonical class_id={cid}"
         )
@@ -72,7 +74,7 @@ def test_learned_exemplars_no_poisoned_essence_negative_and_clean_sanitize(
 ) -> None:
     """
     Test 2: Verify that no negative exemplar (or optional `classes` section) in
-    `dataset/learned_exemplars.json` has `class_id >= 22` or `essence_*`, and
+    `dataset/learned_exemplars.json` has `class_id >= 27` or `essence_*`, and
     `ExemplarMemory.sanitize(persist=False)` finds 0 poisoned records to purge.
     """
     negatives: List[Dict[str, Any]] = learned_exemplars_data.get("negative", [])
@@ -83,7 +85,7 @@ def test_learned_exemplars_no_poisoned_essence_negative_and_clean_sanitize(
     for idx, ex in enumerate(negatives):
         cid = int(ex.get("class_id", -1))
         cname = str(ex.get("class_name", "")).strip().lower()
-        assert cid < 22, f"Negative exemplar #{idx} has poisoned class_id={cid} (>= 22)"
+        assert cid < 27, f"Negative exemplar #{idx} has poisoned class_id={cid} (>= 27)"
         assert cid in CANONICAL_CLASSES, (
             f"Negative exemplar #{idx} has non-canonical class_id={cid}"
         )
@@ -96,7 +98,7 @@ def test_learned_exemplars_no_poisoned_essence_negative_and_clean_sanitize(
         for key, cinfo in classes_dict.items():
             cid = int(key) if str(key).isdigit() else int(cinfo.get("class_id", -1))
             cname = str(cinfo.get("class_name", "")).strip().lower()
-            assert 0 <= cid < 22, f"classes[{key}] has poisoned class_id={cid}"
+            assert 0 <= cid < 27, f"classes[{key}] has poisoned class_id={cid}"
             assert "essence" not in cname, f"classes[{key}] has poisoned class_name='{cname}'"
 
     mem = ExemplarMemory(json_path=DEFAULT_EXEMPLAR_PATH)
@@ -174,7 +176,7 @@ def test_exemplar_memory_pre_normalized_matrices_438d_l2_integrity() -> None:
     """
     Test 5: Verify that `ExemplarMemory` builds `(N_pos, 438)` and `(N_neg, 438)`
     feature matrices where every row is L2-normalized (`||row||_2 == 1.0`) and
-    every class ID in `_pos_cids` and `_neg_cids` is strictly `< 22`.
+    every class ID in `_pos_cids` and `_neg_cids` is strictly `< 27`.
     """
     mem = ExemplarMemory(json_path=DEFAULT_EXEMPLAR_PATH)
 
@@ -188,9 +190,9 @@ def test_exemplar_memory_pre_normalized_matrices_438d_l2_integrity() -> None:
     assert mem._pos_matrix.shape == (n_pos, 438)
     assert mem._neg_matrix.shape == (n_neg, 438)
 
-    # All class IDs strictly in canonical range [0, 21] (< 22)
-    assert np.all((mem._pos_cids >= 0) & (mem._pos_cids < 22))
-    assert np.all((mem._neg_cids >= 0) & (mem._neg_cids < 22))
+    # All class IDs strictly in canonical range [0, 26] (< 27)
+    assert np.all((mem._pos_cids >= 0) & (mem._pos_cids < 27))
+    assert np.all((mem._neg_cids >= 0) & (mem._neg_cids < 27))
 
     # Row-wise L2 norms of both positive and negative matrices must be 1.0
     pos_norms = np.linalg.norm(mem._pos_matrix, axis=1)

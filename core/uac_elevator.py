@@ -15,6 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
+from version import __version__
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -205,7 +206,11 @@ def ensure_admin_elevation(
     LAST_ELEVATION_REQUEST.clear()
     LAST_ELEVATION_REQUEST.update(payload)
 
-    if is_admin() and shell_execute_fn is None and not dry_run:
+    is_dry = bool(dry_run or os.environ.get(DRY_RUN_ENV_FLAG, "0") == "1")
+
+    # F-1931: zaten admin ise — mock shell_execute_fn verilmiş olsa bile —
+    # yeniden yükseltme denenmez; mock hiç çağrılmaz.
+    if is_admin() and not is_dry:
         LAST_ELEVATION_REQUEST["already_admin"] = True
         LAST_ELEVATION_REQUEST["elevated"] = True
         logger.debug("Süreç zaten Yönetici (Administrator) yetkileriyle çalışıyor.")
@@ -215,17 +220,24 @@ def ensure_admin_elevation(
     params: str = payload["lpParameters"]
     target_dir: str = payload["lpDirectory"]
 
-    is_dry = bool(dry_run or os.environ.get(DRY_RUN_ENV_FLAG, "0") == "1")
-    if is_dry and shell_execute_fn is None:
-        valid = bool(os.path.exists(target_exe) and os.path.isdir(target_dir))
+    # F-1930: dry-run asla ShellExecuteW çağırmaz (mock bile) ve yalnızca
+    # Windows'ta, hedef exe/dizin geçerliyken True döner. Linux'ta
+    # dry-run True dönmez — UAC Windows'a özgüdür.
+    if is_dry:
+        valid = bool(
+            sys.platform.startswith("win")
+            and os.path.exists(target_exe)
+            and os.path.isdir(target_dir)
+        )
         LAST_ELEVATION_REQUEST["already_admin"] = is_admin()
         LAST_ELEVATION_REQUEST["dry_run"] = True
         LAST_ELEVATION_REQUEST["elevated"] = valid
         logger.info(
-            "[UAC Dry-Run] ShellExecuteW('runas') hazırlandı | Exe: %s | Params: %s | Dir: %s",
+            "[UAC Dry-Run] ShellExecuteW('runas') hazırlandı | Exe: %s | Params: %s | Dir: %s | Geçerli: %s",
             target_exe,
             params,
             target_dir,
+            valid,
         )
         return valid
 
@@ -277,32 +289,52 @@ def ensure_admin_elevation(
 
 
 def get_uac_elevation_summary() -> dict:
-    """Returns basic status summary for the UAC elevator module."""
+    """Gerçek durum özeti — koşulsuz True yok (F-1930)."""
     try:
-        return {"uac_module_ready": True}
+        payload = build_elevation_payload()
+        return {
+            "uac_module_ready": bool(validate_uac_elevator_contract()),
+            "platform_supported": bool(sys.platform.startswith("win")),
+            "is_admin": bool(is_admin()),
+            "exe_exists": bool(os.path.exists(payload["lpFile"])),
+            "dir_exists": bool(os.path.isdir(payload["lpDirectory"])),
+            "last_elevated": bool(LAST_ELEVATION_REQUEST.get("elevated", False)),
+        }
     except Exception:
         return {"uac_module_ready": False}
 
 
 def get_uac_elevator_ready_flag() -> dict:
-    return {"module": "uac_elevator", "ready": True}
+    # F-1930: hazır bayrağı gerçek sözleşme + platform desteğini yansıtır.
+    return {
+        "module": "uac_elevator",
+        "ready": bool(validate_uac_elevator_contract() and sys.platform.startswith("win")),
+        "platform_supported": bool(sys.platform.startswith("win")),
+        "is_admin": bool(is_admin()),
+    }
 
 
 class UACElevator:
     """UAC Elevator sarmalayıcı sınıfı."""
 
     def get_uac_elevator_version_info(self) -> dict:
-        return {"module": "uac_elevator", "version": "2.0.0", "ready": True}
+        return {"module": "uac_elevator", "version": __version__, "ready": bool(validate_uac_elevator_contract())}
 
     def get_uac_elevator_diagnostic_snapshot(self) -> dict:
-        return {"module": "uac_elevator", "status": "ok", "ready": True}
+        return {
+            "module": "uac_elevator",
+            "status": "ok" if validate_uac_elevator_contract() else "contract_failed",
+            "ready": bool(validate_uac_elevator_contract()),
+            "platform_supported": bool(sys.platform.startswith("win")),
+            "is_admin": bool(is_admin()),
+        }
 
     def get_uac_elevator_capabilities(self) -> list:
         return ["uac_elevator", "diagnostic_snapshot", "version_info"]
 
 
 def get_uac_elevator_version_info() -> dict:
-    return {"module": "uac_elevator", "version": "2.0.0", "ready": True}
+    return {"module": "uac_elevator", "version": __version__, "ready": bool(validate_uac_elevator_contract())}
 
 
 if __name__ == "__main__":
@@ -325,16 +357,31 @@ if __name__ == "__main__":
         captured_calls.append((hwnd, verb, exe, prms, wdir, show))
         return 42
 
-    ok = ensure_admin_elevation(
-        preserve_venv=True,
-        argv=test_argv,
-        working_dir=str(PROJECT_ROOT),
-        shell_execute_fn=_mock_shell_execute,
-    )
-    assert ok is True, "ensure_admin_elevation with mock ShellExecuteW(>32) must return True"
-    assert len(captured_calls) == 1
-    assert captured_calls[0][1] == "runas"
-    assert captured_calls[0][4] == str(PROJECT_ROOT)
+    if admin_state:
+        # F-1931: zaten admin ise mock ShellExecuteW hiç çağrılmaz.
+        ok = ensure_admin_elevation(
+            preserve_venv=True,
+            argv=test_argv,
+            working_dir=str(PROJECT_ROOT),
+            shell_execute_fn=_mock_shell_execute,
+        )
+        assert ok is True, "ensure_admin_elevation already-admin must return True"
+        assert len(captured_calls) == 0, "already-admin must not call ShellExecuteW (even a mock)"
+    else:
+        ok = ensure_admin_elevation(
+            preserve_venv=True,
+            argv=test_argv,
+            working_dir=str(PROJECT_ROOT),
+            shell_execute_fn=_mock_shell_execute,
+        )
+        assert ok is True, "ensure_admin_elevation with mock ShellExecuteW(>32) must return True"
+        assert len(captured_calls) == 1
+        assert captured_calls[0][1] == "runas"
+        assert captured_calls[0][4] == str(PROJECT_ROOT)
+
+    # F-1930: dry-run Windows dışı platformda True dönmez.
+    if not sys.platform.startswith("win"):
+        assert ensure_admin_elevation(dry_run=True) is False, "dry-run must be False off Windows"
 
     logger.info("core/uac_elevator.py self-check PASSED (is_admin=%s, exe=%s).", admin_state, payload["lpFile"])
 
@@ -344,7 +391,20 @@ def get_uac_elevator_capabilities() -> list:
 
 
 def validate_uac_elevator_contract() -> bool:
-    return bool(get_uac_elevator_capabilities())
+    """F-1930: gerçek sözleşme kontrolü — yükseltme yükü kurulabilmeli
+    (runas, mevcut exe, mevcut dizin). Koşulsuz True yok."""
+    try:
+        payload = build_elevation_payload()
+        return bool(
+            payload.get("lpVerb") == "runas"
+            and payload.get("lpFile")
+            and os.path.exists(str(payload["lpFile"]))
+            and payload.get("lpDirectory")
+            and os.path.isdir(str(payload["lpDirectory"]))
+            and bool(get_uac_elevator_capabilities())
+        )
+    except Exception:
+        return False
 
 
 def get_uac_elevator_baseline_metrics() -> dict:
@@ -352,7 +412,12 @@ def get_uac_elevator_baseline_metrics() -> dict:
 
 
 def get_uac_elevator_readiness_status() -> dict:
-    return {"module": "uac_elevator", "ready": validate_uac_elevator_contract(), "metrics": get_uac_elevator_baseline_metrics()}
+    return {
+        "module": "uac_elevator",
+        "ready": bool(validate_uac_elevator_contract() and sys.platform.startswith("win")),
+        "platform_supported": bool(sys.platform.startswith("win")),
+        "metrics": get_uac_elevator_baseline_metrics(),
+    }
 
 
 def get_uac_elevator_audit_record() -> dict:

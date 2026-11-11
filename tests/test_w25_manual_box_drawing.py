@@ -192,37 +192,96 @@ def test_manual_box_saved_with_trusted_hand_label_and_full_confidence() -> None:
     assert ann_from_tag_search["conf"] == pytest.approx(1.0)
 
 
-def test_manual_box_teaches_exemplar_memory_positive_prototype(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """4. Verify a manually drawn box crop is learned as a positive exemplar in ExemplarMemory."""
-    ex_json = tmp_path / "learned_exemplars.json"
-    mem = ExemplarMemory(json_path=ex_json)
-    monkeypatch.setattr("dataset_factory.exemplar_memory.get_exemplar_memory", lambda: mem)
+def test_manual_box_teaches_exemplar_memory_positive_prototype(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4. Verify a manually drawn box crop is learned as a positive exemplar in ExemplarMemory.
 
-    # Create a synthetic image with a distinct copper-orange Orichalcum patch at center
+    The teaching must go through the DIALOG wiring — a real canvas drag emits
+    ``boxAdded`` and ``YOLOFactoryDialog._on_manual_box_added`` resolves the
+    class, persists the box and teaches the exemplar via
+    ``_learn_box_exemplar`` — not through a direct ``add_positive_exemplar``
+    API call that bypasses the dialog entirely.
+    """
+    ds_dir = tmp_path / "dataset"
+    (ds_dir / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (ds_dir / "labels" / "train").mkdir(parents=True, exist_ok=True)
+    (ds_dir / "review" / "train").mkdir(parents=True, exist_ok=True)
+
+    stem = "manual_draw_exemplar_01"
+    img_path = ds_dir / "images" / "train" / f"{stem}.png"
+    rev_path = ds_dir / "review" / "train" / f"{stem}.json"
+
+    # Synthetic image with a distinct copper-orange Orichalcum patch at center
     img = np.full((400, 400, 3), 35, dtype=np.uint8)
     patch = np.zeros((100, 100, 3), dtype=np.uint8)
     patch[:, :] = (25, 110, 230)  # Distinct BGR color
     patch[::4, ::4] = (60, 160, 255)  # Texture edges for descriptor
     img[150:250, 150:250] = patch
+    ok_enc, buf = cv2.imencode(".png", img)
+    assert ok_enc is True
+    buf.tofile(str(img_path))
+    assert img_path.is_file()
 
-    manual_box = {
-        "class_id": 3,
-        "class_name": "ore_orichalcum",
-        "cx": 0.50,
-        "cy": 0.50,
-        "w": 0.25,
-        "h": 0.25,
-        "trusted": True,
-        "hand_label": True,
-        "confidence": 1.0,
-    }
+    ex_json = tmp_path / "learned_exemplars.json"
+    mem = ExemplarMemory(json_path=ex_json)
+    monkeypatch.setattr("dataset_factory.exemplar_memory.get_exemplar_memory", lambda: mem)
 
-    crop = extract_box_crop(img, manual_box)
-    assert crop is not None and crop.size > 0
+    # Lightweight harness binding YOLOFactoryDialog's manual box methods
+    dialog = YOLOFactoryDialog.__new__(YOLOFactoryDialog)
+    dialog._dataset_dir = lambda: ds_dir
+    dialog._review_decode_cache = {}
+    dialog._pipeline = {"pending": 1, "reviewed": 0, "step": 2}
+    dialog.manual_tag_combo = QComboBox()
+    dialog.manual_tag_combo.addItem("0: herb_aria — 0: Aria", 0)
+    dialog.manual_tag_combo.addItem("3: ore_orichalcum — 3: Orichalcum", 3)
+    dialog.manual_tag_combo.setCurrentIndex(1)  # Select class_id = 3 (ore_orichalcum)
+    dialog._review_items = [
+        {
+            "path": rev_path,
+            "split": "train",
+            "stem": stem,
+            "weak": [],
+            "trusted": [],
+            "done": None,
+            "conf": 0.0,
+        }
+    ]
+    dialog._review_index = 0
+    dialog._resolve_review_image = lambda split, s: img_path
+    dialog._imread_cached = lambda p: cv2.imread(str(p))
+    dialog._mark_model_stale = lambda reason="": None
+    dialog._append_log = lambda msg="": None
+    dialog._render_queue_list = lambda: None
+    dialog._render_review_frame = lambda: None
 
-    added = mem.add_positive_exemplar(crop, class_id=3, class_name="ore_orichalcum", source="manual_draw")
-    assert added is True
+    canvas = YOLOPreviewCanvas()
+    canvas._last_target_rect = QRectF(0.0, 0.0, 400.0, 400.0)
+    canvas.boxAdded.connect(lambda b: dialog._on_manual_box_added(b))
+
+    # Real mouse drag from (150, 150) to (250, 250) on the 400x400 target rect:
+    # the drawn box covers exactly the Orichalcum patch (cx=0.5, cy=0.5, w=0.25, h=0.25).
+    p_start = QPointF(150.0, 150.0)
+    p_end = QPointF(250.0, 250.0)
+    canvas.mousePressEvent(_make_mouse_event(QEvent.Type.MouseButtonPress, p_start))
+    canvas.mouseMoveEvent(_make_mouse_event(QEvent.Type.MouseMove, p_end))
+    canvas.mouseReleaseEvent(
+        _make_mouse_event(
+            QEvent.Type.MouseButtonRelease,
+            p_end,
+            button=Qt.MouseButton.LeftButton,
+            buttons=Qt.MouseButton.NoButton,
+        )
+    )
+
+    # The dialog wiring must have taught the exemplar from the drawn box crop
     assert mem.has_positive_exemplars(3) is True
+    pos_entries = [p for p in mem._positive if int(p.get("class_id", -1)) == 3]
+    assert len(pos_entries) == 1
+    assert pos_entries[0]["source"] == "manual_draw"
+    assert pos_entries[0]["class_name"] == "ore_orichalcum"
 
     # Verify persistence to disk JSON
     assert ex_json.is_file()
@@ -233,7 +292,16 @@ def test_manual_box_teaches_exemplar_memory_positive_prototype(tmp_path: Path, m
     assert pos_list[0]["class_name"] == "ore_orichalcum"
     assert pos_list[0]["source"] == "manual_draw"
 
-    # Verify matching against the learned positive exemplar
+    # Verify matching against the learned positive exemplar, using the crop
+    # of the box the dialog itself persisted (not a hand-built crop).
+    saved_box = dialog._review_items[0]["trusted"][0]
+    assert saved_box["class_id"] == 3
+    assert saved_box["cx"] == pytest.approx(0.50, abs=1e-4)
+    assert saved_box["cy"] == pytest.approx(0.50, abs=1e-4)
+    assert saved_box["w"] == pytest.approx(0.25, abs=1e-4)
+    assert saved_box["h"] == pytest.approx(0.25, abs=1e-4)
+    crop = extract_box_crop(img, saved_box)
+    assert crop is not None and crop.size > 0
     sim, matched_cid, matched_cname, matched_ex = mem.match_positive(crop, allowed_classes={3})
     assert matched_cid == 3
     assert matched_cname == "ore_orichalcum"

@@ -43,7 +43,13 @@ def _make_textured_frame(seed: int = 42, h: int = 240, w: int = 320) -> np.ndarr
 def test_super_category_mapping_and_isolation() -> None:
     """
     Test 1: Verify get_super_category and is_same_super_category strictly isolate
-    3D materials (0..5, 12) from HUD classes (13, 16..21) and essence_* (class_id >= 22).
+    3D materials (0..5, 12) from HUD classes (13, 16..21) and from
+    non-canonical IDs (35, 64, 105). Class IDs 22/23 are canonical
+    'consumables' (exemplar_memory.get_super_category docstring:
+    22 hp_potion, 23 mp_potion, 24 buff_scroll) — NOT essence_* — so
+    they map to "consumables" while still never sharing a super-category
+    with 3D materials. Poison is detected by name (Decision 1), not by
+    ID range.
     """
     for mat_cid in SUPER_CATEGORY_3D_MATERIALS:
         assert get_super_category(mat_cid) == "3d_materials"
@@ -57,11 +63,19 @@ def test_super_category_mapping_and_isolation() -> None:
             assert is_same_super_category(mat_cid, hud_cid) is False
             assert is_same_super_category(hud_cid, mat_cid) is False
 
-        # Never same category as essence_* (class_id >= 22)
-        for essence_cid in (22, 23, 35, 64, 105):
-            assert get_super_category(essence_cid) is None
-            assert is_same_super_category(mat_cid, essence_cid) is False
-            assert is_same_super_category(essence_cid, mat_cid) is False
+        # Canonical consumables (22 hp_potion, 23 mp_potion): they have
+        # their own super-category, so they never share one with 3D
+        # materials — but get_super_category must NOT return None for them.
+        for consumable_cid in (22, 23):
+            assert get_super_category(consumable_cid) == "consumables"
+            assert is_same_super_category(mat_cid, consumable_cid) is False
+            assert is_same_super_category(consumable_cid, mat_cid) is False
+
+        # Non-canonical IDs (outside 0..26) have no super-category.
+        for invalid_cid in (35, 64, 105):
+            assert get_super_category(invalid_cid) is None
+            assert is_same_super_category(mat_cid, invalid_cid) is False
+            assert is_same_super_category(invalid_cid, mat_cid) is False
 
 
 def test_refine_candidate_never_converts_3d_material_to_essence_class(tmp_path: Path) -> None:
@@ -182,12 +196,15 @@ def test_match_positive_with_same_category_lock_excludes_hud_and_essence(tmp_pat
     assert best_ex is None
     assert sim == 0.0
 
-    # Now add a legitimate 3D material exemplar (class_id=3) and verify intra-category match works
+    # Now add a legitimate 3D material exemplar (class_id=3) and verify intra-category match works.
+    # add_positive_exemplar stores the canonical (cid, cname): (3, "herb_flower")
+    # canonicalizes to (3, "ore_orichalcum") (Priority 4: valid cid falls back
+    # to its canonical name), so the matched name is "ore_orichalcum".
     mem.add_positive_exemplar(crop, class_id=3, class_name="herb_flower", source="3d_world_approval")
     sim2, best_cid2, best_cname2, _ = mem.match_positive(crop, same_category_as=0)
     assert best_cid2 == 3
     assert best_cid2 in SUPER_CATEGORY_3D_MATERIALS
-    assert best_cname2 == "herb_flower"
+    assert best_cname2 == "ore_orichalcum"
     assert sim2 >= 0.99
 
 
@@ -243,7 +260,11 @@ def test_add_positive_and_sanitize_block_essence_and_3d_hud_poisoning(tmp_path: 
     assert summary["purged_positive"] == 2
     assert summary["remaining_positive"] == 1
 
-    # 5. Candidate 3D material box (class_id=1) can only repair to valid 3D material (class_id=4)
+    # 5. Candidate 3D material box (class_id=1, herb family) must NOT be
+    # repaired to the tree_log exemplar from step 3 (class 5, trees family).
+    # Step 3 added (4, "wood_tree") which canonicalizes to (5, "tree_log");
+    # v20 material-family lock blocks herb↔tree repair even though both are
+    # SUPER_CATEGORY_3D_MATERIALS. Candidate stays class 1.
     candidate = {
         "class_id": 1,
         "class_name": "stone_rock",
@@ -252,6 +273,35 @@ def test_add_positive_and_sanitize_block_essence_and_3d_hud_poisoning(tmp_path: 
     }
     keep, refined = mem.refine_candidate(frame, candidate)
     assert keep is True
-    assert refined["class_id"] == 4
+    assert refined["class_id"] == 1
     assert refined["class_id"] in SUPER_CATEGORY_3D_MATERIALS
-    assert refined.get("repaired_by_exemplar") is True
+    assert refined.get("repaired_by_exemplar") is not True
+
+
+def test_add_negative_blocks_essence_poisoning_before_canonicalization(tmp_path: Path) -> None:
+    """
+    Test 6 (F-B2 gate): Negative mirror of test 5 step 1 — add_negative_exemplar
+    must reject unresolved `essence_*` catalog aliases on the RAW name, before
+    canonicalization renames them away. Without the pre-canonicalization gate,
+    (22, "essence_ruby") would be renamed to (22, "hp_potion") and
+    (5, "essence_spoofed") would be remapped to (15, "path_ground"), and the
+    stored poison would teach the matcher to reject legitimate detections.
+    A legitimate legacy record must still be accepted and canonicalized:
+    (18, "hp_potion") -> (22, "hp_potion").
+    """
+    json_path = tmp_path / "learned_exemplars.json"
+    mem = ExemplarMemory(json_path=json_path)
+
+    frame = _make_textured_frame(seed=505)
+    crop = frame[60:140, 80:180]
+
+    # 1. Direct add of essence_* poison as a negative exemplar is rejected
+    assert mem.add_negative_exemplar(crop, class_id=22, class_name="essence_ruby", source="ui_rejection") is False
+    assert mem.add_negative_exemplar(crop, class_id=5, class_name="essence_spoofed", source="ui_rejection") is False
+    assert len(mem._negative) == 0
+
+    # 2. Legitimate legacy record is accepted and canonicalized, not rejected
+    assert mem.add_negative_exemplar(crop, class_id=18, class_name="hp_potion", source="ui_rejection") is True
+    assert len(mem._negative) == 1
+    assert int(mem._negative[0]["class_id"]) == 22
+    assert mem._negative[0]["class_name"] == "hp_potion"

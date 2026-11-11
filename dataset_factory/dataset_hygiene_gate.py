@@ -8,8 +8,12 @@ YOLO training datasets (`dataset/labels/{train,val}/*.txt`,
 before YOLO training begins.
 
 Enforces 4 strict zero-defect pre-training invariants:
-1. 0 invalid/unknown `class_id` entries (strictly canonical 0..21).
-2. 0 unapproved/unverified boxes in training set (strictly enforces human approval
+1. 0 invalid/unknown `class_id` entries (core training classes 0..21, see
+   `dataset_factory/class_taxonomy.py::CORE_22_CLASSES` — the training set.
+   The taxonomy has 27 classes total (0..26); consumables 22..24, kinah 25
+   and player_character 26 are valid taxonomy classes but NOT training
+   classes for this gate, so boxes carrying them are purged, F-1305/D66).
+2. 0 unapproved/unverified boxes in training and validation sets (strictly enforces human approval
    or high-confidence verified trust).
 3. 0 zero-area, unnormalized, or corrupted boxes.
 4. 0 empty/corrupted labels with mismatched images (orphaned labels/images).
@@ -25,6 +29,7 @@ Exclusive Owner: Worker L20 (`dataset_factory/dataset_hygiene_gate.py`)
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import logging
 import math
@@ -33,6 +38,14 @@ from pathlib import Path
 import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+
+from dataset_factory.class_taxonomy import (
+    CORE_22_CLASSES,
+    MATERIAL_3D_CLASSES,
+    MINIMAP_SYMBOL_CLASSES,
+    canonical_names,
+    is_valid_canonical_class_id,
+)
 
 logger = logging.getLogger("DatasetFactory.HygieneGate")
 if not logger.handlers:
@@ -47,33 +60,21 @@ if not logger.handlers:
 # Canonical Taxonomy & Domain Definitions
 # ==============================================================================
 
-# Strictly canonical YOLO class IDs 0..21 (22 classes total)
-CANONICAL_CLASS_IDS: frozenset[int] = frozenset(range(22))
+# Canonical training-set class IDs: the core 22 classes 0..21.
+# Pinned to dataset_factory/class_taxonomy.py::CORE_22_CLASSES so the set
+# cannot silently drift (D66 test_canonical_classes). The taxonomy has 27
+# classes total (0..26); consumables 22..24, kinah 25 and player_character 26
+# are valid taxonomy classes but NOT training classes for this gate.
+# (D45's F-0795 widened this to 0..26; [O5] narrowed it back: the merged
+# D66 test explicitly pins the core-22 training scope, F-1305.)
+CANONICAL_CLASS_IDS: frozenset[int] = CORE_22_CLASSES
 
-CANONICAL_CLASS_NAMES: Dict[int, str] = {
-    0: "herb_aria",
-    1: "herb_mela",
-    2: "herb_targena",
-    3: "ore_orichalcum",
-    4: "gem_crystal",
-    5: "wood_tree",
-    6: "world_gather_crest",
-    7: "f_gather_prompt",
-    8: "e_gather_icon",
-    9: "minimap_sprout",
-    10: "monster_3d_negative",
-    11: "minimap_monster_negative",
-    12: "world_material",
-    13: "skill_ui_prompt",
-    14: "obstacle",
-    15: "path_ground",
-    16: "player_hp_bar",
-    17: "player_mp_bar",
-    18: "hp_potion",
-    19: "mp_potion",
-    20: "target_hp_bar",
-    21: "skill_slot",
-}
+# Human-readable names for all 27 taxonomy classes (kept complete: used for
+# diagnostics/messages even for classes outside the training set).
+# P1-1: read from the authority (dataset/data.yaml via
+# dataset_factory.class_taxonomy.canonical_names) — NOT a second copy of
+# the table. Any data.yaml rename flows here automatically.
+CANONICAL_CLASS_NAMES: Dict[int, str] = canonical_names()
 
 # Heuristic sources that cannot enter labels/train/*.txt without human approval
 UNVERIFIED_HEURISTIC_SOURCES: frozenset[str] = frozenset({
@@ -117,11 +118,22 @@ MIN_BOX_DIM: float = 0.002
 MIN_BOX_AREA: float = 1e-6
 MAX_BOX_DIM: float = 0.98
 DEFAULT_EMIN_THRESHOLD: float = 0.85
+# Demoted boxes are capped below the train floor (label_trust
+# TRAIN_CONF_FLOOR = 0.45): a demote must really demote — the old 0.68
+# cap still cleared the floor, so a demoted box re-entered the train txt
+# through the learn weak path (sweep E-02).
+DEMOTED_CONF_CAP: float = 0.40
 
 # Minimap HUD bounds (normalized right-top corner)
 MINIMAP_HUD_XYXY: Tuple[float, float, float, float] = (0.80, 0.00, 1.00, 0.35)
-WORLD_RESOURCE_CLASS_IDS: frozenset[int] = frozenset({0, 1, 2, 3, 4, 5, 6})
-MINIMAP_ALLOWED_CLASS_IDS: frozenset[int] = frozenset({7, 8, 9, 11})
+# 3D gatherable world materials — P1-1: the taxonomy set itself
+# (dataset_factory/class_taxonomy.py::MATERIAL_3D_CLASSES), not a copy.
+# Other files used {0..6} or {0..5, 12}; the taxonomy set is authoritative.
+WORLD_RESOURCE_CLASS_IDS: frozenset[int] = MATERIAL_3D_CLASSES
+# Minimap symbols allowed inside the minimap HUD — P1-1: the taxonomy
+# set itself (dataset_factory/class_taxonomy.py::MINIMAP_SYMBOL_CLASSES).
+# (7/8 are world materials — herb_lumina / ore_obsidian — not minimap symbols.)
+MINIMAP_ALLOWED_CLASS_IDS: frozenset[int] = MINIMAP_SYMBOL_CLASSES
 
 SUPPORTED_IMAGE_EXTS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp"})
 
@@ -131,12 +143,50 @@ SUPPORTED_IMAGE_EXTS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".bmp
 # ==============================================================================
 
 def is_canonical_class(class_id: Any) -> bool:
-    """Check if class_id is an integer within canonical range 0..21."""
-    try:
-        cid = int(class_id)
-        return cid in CANONICAL_CLASS_IDS
-    except (TypeError, ValueError):
+    """Check if class_id is an integer within the core training range 0..21.
+
+    NOTE (P1-1): despite the name, this is the TRAINING-scope check,
+    not taxonomy membership — 22..26 are valid taxonomy classes but NOT
+    training classes for this gate (pinned by D66/F-1305, unchanged).
+    Use :func:`is_taxonomy_class` when the question is "is this a real
+    class at all" (0..26, single source).
+
+    Strict: only real ints count. ``bool`` is rejected (``int(True) == 1``
+    would otherwise smuggle ``True`` in as class 1) and ``float``/``str``
+    values are rejected even when integral (``7.0``/``"7"`` are malformed
+    class ids, not canonical ones) (F-1038).
+    """
+    if isinstance(class_id, bool) or not isinstance(class_id, int):
         return False
+    return class_id in CANONICAL_CLASS_IDS
+
+
+def is_taxonomy_class(class_id: Any) -> bool:
+    """Check if class_id is a real taxonomy class (0..26, single source).
+
+    P1-1: the range comes from the authority (``dataset/data.yaml`` via
+    ``dataset_factory.class_taxonomy.is_valid_canonical_class_id``).
+    Unlike :func:`is_canonical_class`, 22..26 (consumables, kinah,
+    player_character) pass here — they are valid classes, just not
+    training classes for this gate.
+    """
+    return is_valid_canonical_class_id(class_id)
+
+
+def _non_training_class_reason(cid: Any) -> str:
+    """Message fragment for a box purged by the training-scope check.
+
+    P1-1: a 22..26 box is a VALID taxonomy class, just not a training
+    class — calling it "non-canonical" in the report hid that
+    distinction (K-01). Truly unknown ids keep the old wording.
+    """
+    if is_taxonomy_class(cid):
+        return (
+            f"Valid taxonomy class {cid} "
+            f"({CANONICAL_CLASS_NAMES.get(cid, '?')}) but not a training "
+            f"class (0..21)"
+        )
+    return f"Non-canonical class_id {cid}"
 
 
 def is_box_in_minimap_hud(cx: float, cy: float, xyxy: Tuple[float, float, float, float] = MINIMAP_HUD_XYXY) -> bool:
@@ -145,8 +195,131 @@ def is_box_in_minimap_hud(cx: float, cy: float, xyxy: Tuple[float, float, float,
     return float(x1) <= float(cx) <= float(x2) and float(y1) <= float(cy) <= float(y2)
 
 
-def is_hand_or_human_approved(box: Dict[str, Any]) -> bool:
-    """Return True if box has explicit human approval or hand-labeled origin."""
+def _box_score(box: Dict[str, Any]) -> float:
+    """Best-effort confidence/score of a review box (0.0 when absent)."""
+    for key in ("confidence", "score"):
+        try:
+            return float(box.get(key, 0.0))
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+# Tolerance used when matching a label-txt line to a trusted review box
+# (class + centre + size must all agree within this, F-0932).
+_LABEL_MATCH_TOLERANCE: float = 0.05
+
+
+def _build_trusted_box_index(
+    trusted_boxes: Sequence[Dict[str, Any]],
+) -> Dict[Tuple[int, int, int], List[Tuple[int, Dict[str, Any], float, float, float, float]]]:
+    """Bucket index over trusted review boxes for label-line matching.
+
+    Keyed by ``(class_id, floor(cx / tol), floor(cy / tol))`` so a lookup
+    only inspects the 3x3 neighbourhood of the query cell instead of
+    scanning every trusted box per label line (O(n*m) -> ~O(n)).
+    A box within tolerance (< tol on both centre axes) always lands in
+    the same or an adjacent cell, because the cell width equals the
+    tolerance. Malformed entries are skipped, mirroring the old linear
+    scan's ``try/except: continue``. Each entry keeps its original list
+    position so first-match-wins order is preserved.
+    """
+    index: Dict[Tuple[int, int, int], List[Tuple[int, Dict[str, Any], float, float, float, float]]] = {}
+    for order, t_box in enumerate(trusted_boxes):
+        try:
+            cid = int(t_box.get("class_id", -1))
+            cx = float(t_box.get("cx", 0))
+            cy = float(t_box.get("cy", 0))
+            w = float(t_box.get("w", 0))
+            h = float(t_box.get("h", 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        key = (cid, math.floor(cx / _LABEL_MATCH_TOLERANCE), math.floor(cy / _LABEL_MATCH_TOLERANCE))
+        index.setdefault(key, []).append((order, t_box, cx, cy, w, h))
+    return index
+
+
+def _find_matching_trusted_box(
+    index: Dict[Tuple[int, int, int], List[Tuple[int, Dict[str, Any], float, float, float, float]]],
+    cid: int,
+    cx: float,
+    cy: float,
+    w: float,
+    h: float,
+) -> Optional[Dict[str, Any]]:
+    """First (lowest original order) trusted box matching class + centre + size.
+
+    Same match rule as the old linear scan: ``|d_cx|, |d_cy|, |d_w|, |d_h|``
+    all strictly below ``_LABEL_MATCH_TOLERANCE``. Returns ``None`` when
+    nothing matches.
+    """
+    tol = _LABEL_MATCH_TOLERANCE
+    if not (math.isfinite(cx) and math.isfinite(cy) and math.isfinite(w) and math.isfinite(h)):
+        return None
+    cell_x = math.floor(cx / tol)
+    cell_y = math.floor(cy / tol)
+    best: Optional[Tuple[int, Dict[str, Any]]] = None
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for order, t_box, tcx, tcy, tw, th in index.get((cid, cell_x + dx, cell_y + dy), ()):
+                if (
+                    abs(tcx - cx) < tol
+                    and abs(tcy - cy) < tol
+                    and abs(tw - w) < tol
+                    and abs(th - h) < tol
+                ):
+                    if best is None or order < best[0]:
+                        best = (order, t_box)
+    return best[1] if best is not None else None
+
+
+def _validate_review_box_shape(
+    box: Any, split: str, stem: str, list_name: str
+) -> Tuple[str, str, bool]:
+    """Shared shape/canonical/geometry check for trusted and weak review boxes.
+
+    The trusted and weak sanitization loops ran the same ~30-line block
+    twice; this helper is the single copy. It mutates ``box`` in place
+    when clamping applies. Returns ``(outcome, detail, clamped_changed)``
+    where outcome is ``"ok"``, ``"purged_corrupted"`` or
+    ``"purged_invalid_cid"``, ``detail`` is the ``[{split}:{stem}] ...``
+    message (``""`` when the old code appended no detail, e.g. non-dict /
+    unparsable boxes), and ``clamped_changed`` reports whether clamping
+    moved a coordinate (the caller must mark the file modified then).
+    """
+    if not isinstance(box, dict):
+        return "purged_corrupted", "", False
+    cid = box.get("class_id")
+    if not is_canonical_class(cid):
+        return "purged_invalid_cid", f"[{split}:{stem}] Review {list_name} purged {_non_training_class_reason(cid)}", False
+    try:
+        cx = float(box.get("cx", 0))
+        cy = float(box.get("cy", 0))
+        w = float(box.get("w", 0))
+        h = float(box.get("h", 0))
+    except (TypeError, ValueError):
+        return "purged_corrupted", "", False
+    valid_geom, clamped, geom_reason = validate_and_clamp_box(cx, cy, w, h)
+    if not valid_geom:
+        return "purged_corrupted", f"[{split}:{stem}] Review {list_name} purged invalid geom ({geom_reason})", False
+    if clamped:
+        cx_c, cy_c, w_c, h_c = clamped
+        if abs(cx_c - cx) > 1e-5 or abs(cy_c - cy) > 1e-5 or abs(w_c - w) > 1e-5 or abs(h_c - h) > 1e-5:
+            box["cx"], box["cy"], box["w"], box["h"] = cx_c, cy_c, w_c, h_c
+            return "ok", "", True
+    return "ok", "", False
+
+
+def is_hand_or_human_approved(box: Dict[str, Any], emin_threshold: float = DEFAULT_EMIN_THRESHOLD) -> bool:
+    """Return True if box has explicit human approval or hand-labeled origin.
+
+    Seed-prompt hints (canonical class 13 ``skill_ui_prompt`` + ``f``/``e``
+    key) are NOT bare approval: they only count when the box also carries
+    a confidence/score at or above ``emin_threshold`` (F-0844). A key/source
+    substring match with no score never approves a box. (Sweep Y1: the old
+    7/8 mapping was wrong — 7 is ``herb_lumina``, 8 is ``ore_obsidian``,
+    materials, not prompts.)
+    """
     if not isinstance(box, dict):
         return False
     if box.get("hand_label") is True or box.get("human_approved") is True or box.get("approved") is True:
@@ -156,13 +329,23 @@ def is_hand_or_human_approved(box: Dict[str, Any]) -> bool:
     source = str(box.get("source", "")).strip().lower()
     if any(tok in source for tok in ("hand", "manual", "human")):
         return True
-    # Seed prompts
-    cid = box.get("class_id")
+    # Seed prompts — approval only with a high-confidence score.
+    try:
+        cid = int(box.get("class_id"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
     key = str(box.get("gather_key", box.get("key", ""))).strip().lower()
-    if cid == 7 and (key == "f" or "f_gather" in source or "gather_prompt" in source or "f_template" in source):
-        return True
-    if cid == 8 and (key == "e" or "e_gather" in source or "e_floating" in source or "e_template" in source):
-        return True
+    if cid == 13 and (
+        key in ("f", "e")
+        or "f_gather" in source
+        or "e_gather" in source
+        or "gather_prompt" in source
+        or "f_template" in source
+        or "e_template" in source
+        or "e_floating" in source
+        or "floating" in source
+    ):
+        return _box_score(box) >= float(emin_threshold)
     return False
 
 
@@ -236,15 +419,19 @@ def is_training_box_verified(
     if not isinstance(box, dict):
         return False, "Box is not a dictionary"
 
-    # 1. Human approval or hand label always approved
-    if is_hand_or_human_approved(box):
-        return True, "human_approved"
-
-    # 2. Check canonical class
+    # 1. Canonical class FIRST (S-2304): human approval must never admit a
+    # non-canonical class. Previously the approval check came first, so a
+    # box with class_id=99 (or 26, a valid taxonomy class but not a core
+    # training class 0..21) and human_approved=True was admitted as
+    # "human_approved" even though it can never belong in training labels.
     cid = box.get("class_id")
     if not is_canonical_class(cid):
-        return False, f"Non-canonical class_id {cid}"
+        return False, _non_training_class_reason(cid)
     cid = int(cid)
+
+    # 2. Human approval or hand label always approved (canonical classes only)
+    if is_hand_or_human_approved(box, emin_threshold=emin_threshold):
+        return True, "human_approved"
 
     # 3. Check weak flag or untrusted flag
     if box.get("weak") is True or box.get("trusted") is False:
@@ -272,18 +459,29 @@ def is_training_box_verified(
     if is_stem_incompatible_with_class(stem, cid, source):
         return False, f"Incompatible class {cid} ({CANONICAL_CLASS_NAMES.get(cid)}) on stem '{stem}'"
 
-    # 7. Check minimap HUD false positive
+    # 7. Check minimap HUD false positive: only minimap symbols belong in
+    # the minimap HUD. A 3D world resource centred there is a false
+    # positive; minimap symbols (MINIMAP_ALLOWED_CLASS_IDS) and genuine HUD
+    # elements (skill/vitals bars) are expected there and pass.
     try:
         cx = float(box.get("cx", 0.5))
         cy = float(box.get("cy", 0.5))
-        if is_box_in_minimap_hud(cx, cy) and cid in WORLD_RESOURCE_CLASS_IDS:
-            return False, f"World resource class {cid} falsely detected in minimap HUD zone"
+        if is_box_in_minimap_hud(cx, cy):
+            if cid in MINIMAP_ALLOWED_CLASS_IDS:
+                pass
+            elif cid in WORLD_RESOURCE_CLASS_IDS:
+                return False, f"World resource class {cid} falsely detected in minimap HUD zone"
     except (TypeError, ValueError):
         pass
 
-    # 8. Must have trusted=True and verified source
+    # 8. Must have trusted=True, confidence >= threshold, AND a verified
+    # ground-truth source. trusted + high confidence alone never suffices —
+    # otherwise the VERIFIED_GROUND_TRUTH_SOURCES allowlist is dead code
+    # and any source passes (F-0794).
     if box.get("trusted") is True and conf >= float(emin_threshold):
-        return True, "verified_high_confidence"
+        if source in VERIFIED_GROUND_TRUTH_SOURCES:
+            return True, "verified_high_confidence"
+        return False, f"Source '{source}' is not in the verified ground-truth allowlist"
 
     return False, "Lacks verified trust evidence"
 
@@ -316,6 +514,25 @@ def _load_review_json_safe(path_str: str) -> Tuple[Optional[Dict[str, Any]], boo
         pass
 
     content = raw_bytes.decode("utf-8", errors="ignore").strip()
+
+    # Fast path: the C JSON decoder parses the first complete object and
+    # ignores trailing garbage (duplicated braces, concatenated blocks)
+    # instead of the O(n) Python char-by-char scan below. It is only tried
+    # when the text before the first '{' holds no '"' or '\\' — with such
+    # a prefix the char scanner's string/escape tracking could disagree
+    # about where the first object starts, so those cases still use the
+    # scanner. Any decode failure falls back to the scanner unchanged.
+    first_brace = content.find("{")
+    if first_brace != -1:
+        prefix = content[:first_brace]
+        if '"' not in prefix and "\\" not in prefix:
+            try:
+                data, _end = json.JSONDecoder().raw_decode(content[first_brace:])
+                if isinstance(data, dict):
+                    logger.info("Successfully repaired malformed JSON in %s", os.path.basename(path_str))
+                    return data, True
+            except Exception:
+                pass
 
     # Recovery: Extract first balanced outermost JSON object '{ ... }'
     brace_depth = 0
@@ -360,21 +577,104 @@ def _load_review_json_safe(path_str: str) -> Tuple[Optional[Dict[str, Any]], boo
     return None, False
 
 
+def _file_sha256(path_str: str) -> str:
+    """Dosyanın SHA-256 özeti; okunamazsa boş döner."""
+    try:
+        digest = hashlib.sha256()
+        with open(path_str, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def _atomic_copy_file(src: str, dst: str) -> bool:
+    """P2-6 (K-05/K-19): tmp + flush + fsync + os.replace ile atomik kopya.
+
+    Kopya boyut + SHA-256 ile doğrulanır; başarısızlıkta hedefe
+    dokunulmaz ve tmp temizlenir.
+    """
+    tmp_path = f"{dst}.tmp-{os.getpid()}-{time.time_ns()}"
+    try:
+        with open(src, "rb") as f_src, open(tmp_path, "wb") as f_dst:
+            for chunk in iter(lambda: f_src.read(1024 * 1024), b""):
+                f_dst.write(chunk)
+            f_dst.flush()
+            try:
+                os.fsync(f_dst.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, dst)
+        try:
+            if os.path.getsize(src) != os.path.getsize(dst):
+                return False
+        except OSError:
+            return False
+        src_sig = _file_sha256(src)
+        return bool(src_sig) and src_sig == _file_sha256(dst)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def _backup_file_before_destructive_write(path_str: str) -> Optional[str]:
+    """P2-6 (K-05): yıkıcı yazım/silme ÖNCESİ dosyanın zaman damgalı,
+    atomik, doğrulanmış yedeğini aynı dizine alır.
+
+    Yedek adı ``<orijinal>.hygiene-bak-<YYYYMMDD_HHMMSS_ffffff>`` —
+    ``.json``/``.txt`` ile bitmez, gate taramalarının
+    (``endswith(".json")`` / ``endswith(".txt")``) yeniden okumasına
+    girmez. Döner: yedek yolu; kaynak yoksa None (yedeklenecek bir
+    şey yok, hata değil); kopya doğrulanamazsa None (çağıran yıkıcı
+    adıma GİRMEZ — fail-closed).
+    """
+    if not os.path.isfile(path_str):
+        return None
+    ts = time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1_000_000:06d}"
+    dst = f"{path_str}.hygiene-bak-{ts}"
+    if _atomic_copy_file(path_str, dst):
+        return dst
+    logger.warning("Yedek alınamadı, yıkıcı işlem atlanıyor: %s", path_str)
+    return None
+
+
 def _atomic_write_json(path_str: str, data: Dict[str, Any]) -> None:
-    """Atomically write JSON payload with UTF-8 encoding."""
+    """Atomically write JSON payload with UTF-8 encoding.
+
+    P2-6: tmp artık fsync'lenir — eskiden fsync yoktu, çökme anında
+    replace edilmiş yarım/0 bayt dosya kalıcı kayıp demekti.
+    """
     temp_path = f"{path_str}.tmp_{os.getpid()}_{time.time_ns()}"
     payload_str = json.dumps(data, indent=2, ensure_ascii=False)
     with open(temp_path, "w", encoding="utf-8") as f:
         f.write(payload_str)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
     os.replace(temp_path, path_str)
 
 
 def _atomic_write_lines(path_str: str, lines: Sequence[str]) -> None:
-    """Atomically write text lines to path with UTF-8 encoding."""
+    """Atomically write text lines to path with UTF-8 encoding.
+
+    P2-6: tmp artık fsync'lenir (yukarıdaki gerekçe aynen geçerli).
+    """
     temp_path = f"{path_str}.tmp_{os.getpid()}_{time.time_ns()}"
     content = ("\n".join(lines) + "\n") if lines else ""
     with open(temp_path, "w", encoding="utf-8") as f:
         f.write(content)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
     os.replace(temp_path, path_str)
 
 
@@ -393,16 +693,32 @@ def _process_single_review_file(
     invalid_cids = 0
     corrupted_boxes = 0
     unapproved_boxes = 0
+    demoted_boxes = 0
+    unresolved_issues = 0
+    backups_created = 0
 
     data, was_repaired = _load_review_json_safe(path_str)
     if data is None:
         if auto_clean:
-            try:
-                os.unlink(path_str)
-                fixed_files += 1
-                details.append(f"[{split}:{stem}] Deleted unrecoverable corrupt JSON file")
-            except OSError:
-                pass
+            # P2-6 (K-05): kurtarılamaz dosya artık yedeksiz silinmiyor.
+            # Yedek alınamazsa silme yapılmaz — dosya yerinde kalır ve
+            # sorun "çözülmemiş" sayılır (gate clean=False döner).
+            backup_path = _backup_file_before_destructive_write(path_str)
+            if backup_path is None:
+                unresolved_issues += 1
+                details.append(f"[{split}:{stem}] Unrecoverable corrupt JSON kept (backup FAILED, not deleted)")
+            else:
+                backups_created += 1
+                try:
+                    os.unlink(path_str)
+                    fixed_files += 1
+                    details.append(f"[{split}:{stem}] Deleted unrecoverable corrupt JSON file (backed up to {os.path.basename(backup_path)})")
+                except OSError as exc:
+                    unresolved_issues += 1
+                    details.append(f"[{split}:{stem}] Could not delete unrecoverable corrupt JSON file: {exc}")
+        else:
+            unresolved_issues += 1
+            details.append(f"[{split}:{stem}] Unrecoverable corrupt JSON file (dry-run, kept)")
         return {
             "stem": stem,
             "data": None,
@@ -411,6 +727,9 @@ def _process_single_review_file(
             "invalid_cids": 0,
             "corrupted_boxes": 0,
             "unapproved_boxes": 0,
+            "demoted_boxes": 0,
+            "unresolved_issues": unresolved_issues,
+            "backups_created": backups_created,
             "details": details,
         }
 
@@ -427,109 +746,69 @@ def _process_single_review_file(
     new_trusted: List[Dict[str, Any]] = []
     new_weak: List[Dict[str, Any]] = []
 
-    # Sanitize trusted boxes
+    # Sanitize trusted boxes (shape/canonical/geometry via the shared
+    # helper; approval/demotion is trusted-list-only logic below).
     for b in trusted_boxes:
-        if not isinstance(b, dict):
+        outcome, detail, clamped_changed = _validate_review_box_shape(b, split, stem, "trusted")
+        if outcome != "ok":
             modified = True
             purged_boxes += 1
-            corrupted_boxes += 1
+            if outcome == "purged_invalid_cid":
+                invalid_cids += 1
+            else:
+                corrupted_boxes += 1
+            if detail:
+                details.append(detail)
             continue
-
-        cid = b.get("class_id")
-        if not is_canonical_class(cid):
+        if clamped_changed:
             modified = True
-            purged_boxes += 1
-            invalid_cids += 1
-            details.append(f"[{split}:{stem}] Review trusted purged non-canonical class_id {cid}")
-            continue
 
-        cid = int(cid)
-        try:
-            cx = float(b.get("cx", 0))
-            cy = float(b.get("cy", 0))
-            w = float(b.get("w", 0))
-            h = float(b.get("h", 0))
-        except (TypeError, ValueError):
-            modified = True
-            purged_boxes += 1
-            corrupted_boxes += 1
-            continue
+        cid = int(b["class_id"])
 
-        valid_geom, clamped, geom_reason = validate_and_clamp_box(cx, cy, w, h)
-        if not valid_geom:
-            modified = True
-            purged_boxes += 1
-            corrupted_boxes += 1
-            details.append(f"[{split}:{stem}] Review trusted purged invalid geom ({geom_reason})")
-            continue
-
-        if clamped:
-            cx_c, cy_c, w_c, h_c = clamped
-            if abs(cx_c - cx) > 1e-5 or abs(cy_c - cy) > 1e-5 or abs(w_c - w) > 1e-5 or abs(h_c - h) > 1e-5:
-                b["cx"], b["cy"], b["w"], b["h"] = cx_c, cy_c, w_c, h_c
-                modified = True
-
-        # Check training approval
-        if split == "train" and enforce_approval:
+        # Check approval on EVERY split (train and val alike): an unverified
+        # box is toxic wherever it sits, not only in train (F-0845).
+        # Weak-list boxes are quarantine by definition and are not re-checked
+        # here — they never reach training labels.
+        if enforce_approval:
             verified, reason = is_training_box_verified(b, stem=stem, emin_threshold=emin_threshold)
             if not verified:
                 modified = True
-                purged_boxes += 1
                 unapproved_boxes += 1
                 details.append(f"[{split}:{stem}] Review trusted demoted unapproved box (cid={cid}): {reason}")
-                # Demote to weak list with capped confidence
+                # Demote to weak list with capped confidence. A demoted box
+                # is NOT purged — it still exists in the dataset (weak list)
+                # — so it must not inflate purged_boxes (F-0931). The cap
+                # sits below the train floor (sweep E-02): a demoted box
+                # must never re-enter the train txt through a weak path.
+                demoted_boxes += 1
                 b["trusted"] = False
                 b["weak"] = True
                 try:
                     conf = float(b.get("confidence", 0.5))
                 except (TypeError, ValueError):
                     conf = 0.5
-                b["confidence"] = min(conf, 0.68)
+                b["confidence"] = min(conf, DEMOTED_CONF_CAP)
                 new_weak.append(b)
                 continue
 
         new_trusted.append(b)
 
-    # Sanitize weak boxes
+    # Sanitize weak boxes (same shared shape check as trusted; no
+    # approval/demotion — weak boxes never reach training labels).
     for b in weak_boxes:
-        if not isinstance(b, dict):
+        outcome, detail, clamped_changed = _validate_review_box_shape(b, split, stem, "weak")
+        if outcome != "ok":
             modified = True
             purged_boxes += 1
-            corrupted_boxes += 1
+            if outcome == "purged_invalid_cid":
+                invalid_cids += 1
+            else:
+                corrupted_boxes += 1
+            if detail:
+                details.append(detail)
             continue
-
-        cid = b.get("class_id")
-        if not is_canonical_class(cid):
+        if clamped_changed:
             modified = True
-            purged_boxes += 1
-            invalid_cids += 1
-            details.append(f"[{split}:{stem}] Review weak purged non-canonical class_id {cid}")
-            continue
-
-        try:
-            cx = float(b.get("cx", 0))
-            cy = float(b.get("cy", 0))
-            w = float(b.get("w", 0))
-            h = float(b.get("h", 0))
-        except (TypeError, ValueError):
-            modified = True
-            purged_boxes += 1
-            corrupted_boxes += 1
-            continue
-
-        valid_geom, clamped, geom_reason = validate_and_clamp_box(cx, cy, w, h)
-        if not valid_geom:
-            modified = True
-            purged_boxes += 1
-            corrupted_boxes += 1
-            details.append(f"[{split}:{stem}] Review weak purged invalid geom ({geom_reason})")
-            continue
-
-        if clamped:
-            cx_c, cy_c, w_c, h_c = clamped
-            if abs(cx_c - cx) > 1e-5 or abs(cy_c - cy) > 1e-5 or abs(w_c - w) > 1e-5 or abs(h_c - h) > 1e-5:
-                b["cx"], b["cy"], b["w"], b["h"] = cx_c, cy_c, w_c, h_c
-                modified = True
 
         new_weak.append(b)
 
@@ -537,11 +816,21 @@ def _process_single_review_file(
     data["weak"] = new_weak
 
     if modified and auto_clean:
-        try:
-            _atomic_write_json(path_str, data)
-            fixed_files += 1
-        except OSError as exc:
-            details.append(f"[{split}:{stem}] Failed to write sanitized review JSON: {exc}")
+        # P2-6: kutu silen/budayan her yeniden yazım ÖNCESİ yedek —
+        # eşik yok, silme sayısı ne olursa olsun (yarıdan az silmede
+        # de yedek alınır). Yedek alınamazsa yazım yapılmaz.
+        backup_path = _backup_file_before_destructive_write(path_str)
+        if backup_path is None:
+            unresolved_issues += 1
+            details.append(f"[{split}:{stem}] Sanitized review JSON NOT written (backup FAILED)")
+        else:
+            backups_created += 1
+            try:
+                _atomic_write_json(path_str, data)
+                fixed_files += 1
+            except OSError as exc:
+                unresolved_issues += 1
+                details.append(f"[{split}:{stem}] Failed to write sanitized review JSON: {exc}")
 
     return {
         "stem": stem,
@@ -551,6 +840,9 @@ def _process_single_review_file(
         "invalid_cids": invalid_cids,
         "corrupted_boxes": corrupted_boxes,
         "unapproved_boxes": unapproved_boxes,
+        "demoted_boxes": demoted_boxes,
+        "unresolved_issues": unresolved_issues,
+        "backups_created": backups_created,
         "details": details,
     }
 
@@ -566,11 +858,15 @@ def _process_single_label_file(
     invalid_cids = 0
     corrupted_boxes = 0
     unapproved_boxes = 0
+    empty_label_files = 0
+    unresolved_issues = 0
+    backups_created = 0
 
     try:
         with open(path_str, "r", encoding="utf-8", errors="ignore") as f:
             raw_content = f.read()
     except Exception as exc:
+        unresolved_issues += 1
         details.append(f"[{split}:{stem}] Read error: {exc}")
         return {
             "purged_boxes": 0,
@@ -578,14 +874,29 @@ def _process_single_label_file(
             "invalid_cids": 0,
             "corrupted_boxes": 0,
             "unapproved_boxes": 0,
+            "empty_label_files": 0,
+            "unresolved_issues": unresolved_issues,
+            "backups_created": backups_created,
             "details": details,
         }
 
     lines = raw_content.splitlines()
+
+    # An existing label file with no content lines at all is flagged
+    # (informational only — a legit background frame may have no boxes).
+    # Previously such a file passed silently with no trace (F-0934).
+    if not any(line.strip() for line in lines):
+        empty_label_files += 1
+        details.append(f"[{split}:{stem}] Empty label file (no boxes)")
+
     clean_lines: List[str] = []
     modified = False
 
     trusted_boxes = list(rev_data.get("trusted", [])) if rev_data else []
+    # Bucket index over trusted boxes: the old code rescanned the whole
+    # trusted list for every label line (O(lines x trusted)); the index
+    # answers each lookup from the 3x3 neighbourhood of one cell (~O(1)).
+    trusted_index = _build_trusted_box_index(trusted_boxes) if enforce_approval and trusted_boxes else {}
 
     for line_idx, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
@@ -601,13 +912,20 @@ def _process_single_label_file(
             continue
 
         try:
-            cid = int(float(parts[0]))
+            # S-2306: never truncate a fractional class_id. '7.9' used to
+            # become 7 via int(float(...)) — a corrupt token silently
+            # turning into a legitimate class. Only integral values pass:
+            # '7.0' is tolerated (== 7), '7.9'/'nan'/'inf' are corrupt.
+            cid_float = float(parts[0])
+            if not cid_float.is_integer():
+                raise ValueError(f"fractional class_id {parts[0]!r}")
+            cid = int(cid_float)
             cx = float(parts[1])
             cy = float(parts[2])
             w = float(parts[3])
             h = float(parts[4])
-        except ValueError:
-            details.append(f"[{split}:{stem}] Line {line_idx} non-numeric coordinate error")
+        except ValueError as exc:
+            details.append(f"[{split}:{stem}] Line {line_idx} non-numeric coordinate error ({exc})")
             purged_boxes += 1
             corrupted_boxes += 1
             modified = True
@@ -615,7 +933,7 @@ def _process_single_label_file(
 
         # Check 1: Canonical class_id (0..21)
         if not is_canonical_class(cid):
-            details.append(f"[{split}:{stem}] Invalid non-canonical class_id {cid} (allowed: 0..21)")
+            details.append(f"[{split}:{stem}] Invalid {_non_training_class_reason(cid)} (allowed: 0..21)")
             purged_boxes += 1
             invalid_cids += 1
             modified = True
@@ -634,21 +952,15 @@ def _process_single_label_file(
         if abs(cx_c - cx) > 1e-5 or abs(cy_c - cy) > 1e-5 or abs(w_c - w) > 1e-5 or abs(h_c - h) > 1e-5:
             modified = True
 
-        # Check 2: Unapproved / unverified box in training set
-        if split == "train" and enforce_approval:
-            matched_trusted = None
-            if rev_data:
-                for t_box in trusted_boxes:
-                    try:
-                        if int(t_box.get("class_id", -1)) == cid:
-                            if (
-                                abs(float(t_box.get("cx", 0)) - cx) < 0.05
-                                and abs(float(t_box.get("cy", 0)) - cy) < 0.05
-                            ):
-                                matched_trusted = t_box
-                                break
-                    except (TypeError, ValueError):
-                        continue
+        # Check 2: Unapproved / unverified box — enforced on EVERY split
+        # (train and val alike, F-0845), not only train.
+        if enforce_approval:
+            # Match on class + centre AND size: centre-only matching pairs
+            # a txt line with a different-sized review box (F-0932).
+            # Indexed lookup: same rule as the old linear scan (tolerance
+            # strictly below _LABEL_MATCH_TOLERANCE on all four axes,
+            # first match in review order wins).
+            matched_trusted = _find_matching_trusted_box(trusted_index, cid, cx, cy, w, h) if rev_data else None
 
             box_rep = matched_trusted if matched_trusted else {
                 "class_id": cid,
@@ -672,11 +984,21 @@ def _process_single_label_file(
         clean_lines.append(f"{cid} {cx_c:.6f} {cy_c:.6f} {w_c:.6f} {h_c:.6f}")
 
     if modified and auto_clean:
-        try:
-            _atomic_write_lines(path_str, clean_lines)
-            fixed_files += 1
-        except OSError as exc:
-            details.append(f"[{split}:{stem}] Failed to write sanitized label txt: {exc}")
+        # P2-6: kutu silen/budayan her yeniden yazım ÖNCESİ yedek —
+        # eşik yok, silme sayısı ne olursa olsun. Yedek alınamazsa
+        # yazım yapılmaz, sorun "çözülmemiş" sayılır.
+        backup_path = _backup_file_before_destructive_write(path_str)
+        if backup_path is None:
+            unresolved_issues += 1
+            details.append(f"[{split}:{stem}] Sanitized label txt NOT written (backup FAILED)")
+        else:
+            backups_created += 1
+            try:
+                _atomic_write_lines(path_str, clean_lines)
+                fixed_files += 1
+            except OSError as exc:
+                unresolved_issues += 1
+                details.append(f"[{split}:{stem}] Failed to write sanitized label txt: {exc}")
 
     return {
         "purged_boxes": purged_boxes,
@@ -684,6 +1006,9 @@ def _process_single_label_file(
         "invalid_cids": invalid_cids,
         "corrupted_boxes": corrupted_boxes,
         "unapproved_boxes": unapproved_boxes,
+        "empty_label_files": empty_label_files,
+        "unresolved_issues": unresolved_issues,
+        "backups_created": backups_created,
         "details": details,
     }
 
@@ -711,7 +1036,7 @@ def pre_training_dataset_hygiene_gate(
 
     Enforces 4 strict zero-defect pre-training invariants:
       1. 0 invalid/unknown `class_id` entries (strictly canonical 0..21).
-      2. 0 unapproved/unverified boxes in training set.
+      2. 0 unapproved/unverified boxes in training and validation sets.
       3. 0 zero-area, unnormalized, or corrupted boxes.
       4. 0 empty labels with mismatched/missing images.
 
@@ -719,6 +1044,10 @@ def pre_training_dataset_hygiene_gate(
 
     Returns:
       dict: {"clean": bool, "purged_boxes": int, "fixed_files": int, "details": list}
+      ``clean`` is COMPUTED, never a constant (F-0797): it is True only when
+      no defect remains after this run — in dry-run mode (``auto_clean=False``)
+      that means no defect was found; in auto-clean mode it means every
+      found defect was actually fixed (any failed fix makes the gate FAIL).
     """
     t0 = time.perf_counter()
     root = Path(dataset_dir).resolve()
@@ -734,6 +1063,11 @@ def pre_training_dataset_hygiene_gate(
     unapproved_boxes_purged = 0
     corrupted_boxes_purged = 0
     mismatched_files_fixed = 0
+    mismatched_files_detected = 0
+    demoted_boxes_total = 0
+    empty_label_files_total = 0
+    unresolved_issues_total = 0
+    backups_created_total = 0
 
     if not root.is_dir():
         msg = f"Dataset root directory does not exist: {root}"
@@ -781,16 +1115,32 @@ def pre_training_dataset_hygiene_gate(
                         stem = os.path.splitext(entry.name)[0]
                         scanned_reviews_total += 1
 
-                        # Check 4: Orphaned review JSON without image
+                        # Check 4: Orphaned review JSON without image.
+                        # "Fixed" is only counted when the file was actually
+                        # deleted (auto_clean); a dry-run only DETECTS it
+                        # (F-0933).
                         if stem not in image_stem_to_file:
-                            mismatched_files_fixed += 1
-                            fixed_files_total += 1
-                            details.append(f"[{split}] Purged orphaned review JSON with missing image: {entry.name}")
+                            mismatched_files_detected += 1
                             if auto_clean:
-                                try:
-                                    os.unlink(entry.path)
-                                except OSError:
-                                    pass
+                                # P2-6: yetim review JSON yedeksiz
+                                # silinmiyor — yedek alınamazsa dosya
+                                # yerinde kalır, sorun çözülmemiş sayılır.
+                                backup_path = _backup_file_before_destructive_write(entry.path)
+                                if backup_path is None:
+                                    unresolved_issues_total += 1
+                                    details.append(f"[{split}] Orphaned review JSON kept (backup FAILED): {entry.name}")
+                                else:
+                                    backups_created_total += 1
+                                    try:
+                                        os.unlink(entry.path)
+                                        mismatched_files_fixed += 1
+                                        fixed_files_total += 1
+                                        details.append(f"[{split}] Purged orphaned review JSON with missing image: {entry.name} (backed up to {os.path.basename(backup_path)})")
+                                    except OSError as exc:
+                                        unresolved_issues_total += 1
+                                        details.append(f"[{split}] Could not purge orphaned review JSON {entry.name}: {exc}")
+                            else:
+                                details.append(f"[{split}] Orphaned review JSON with missing image (dry-run, kept): {entry.name}")
                             continue
 
                         review_tasks.append(
@@ -812,6 +1162,9 @@ def pre_training_dataset_hygiene_gate(
                     invalid_class_ids_purged += res["invalid_cids"]
                     corrupted_boxes_purged += res["corrupted_boxes"]
                     unapproved_boxes_purged += res["unapproved_boxes"]
+                    demoted_boxes_total += res.get("demoted_boxes", 0)
+                    unresolved_issues_total += res.get("unresolved_issues", 0)
+                    backups_created_total += res.get("backups_created", 0)
                     details.extend(res["details"])
 
         # 3. Process Label TXT files
@@ -823,16 +1176,29 @@ def pre_training_dataset_hygiene_gate(
                         stem = os.path.splitext(entry.name)[0]
                         scanned_labels_total += 1
 
-                        # Check 4: Orphaned label file without image
+                        # Check 4: Orphaned label file without image.
+                        # Counted as fixed only when actually deleted (F-0933).
                         if stem not in image_stem_to_file:
-                            details.append(f"[{split}] Orphaned label file without image: {entry.name}")
-                            mismatched_files_fixed += 1
-                            fixed_files_total += 1
+                            mismatched_files_detected += 1
                             if auto_clean:
-                                try:
-                                    os.unlink(entry.path)
-                                except OSError:
-                                    pass
+                                # P2-6: yetim label txt yedeksiz
+                                # silinmiyor (gerekçe review JSON ile aynı).
+                                backup_path = _backup_file_before_destructive_write(entry.path)
+                                if backup_path is None:
+                                    unresolved_issues_total += 1
+                                    details.append(f"[{split}] Orphaned label file kept (backup FAILED): {entry.name}")
+                                else:
+                                    backups_created_total += 1
+                                    try:
+                                        os.unlink(entry.path)
+                                        mismatched_files_fixed += 1
+                                        fixed_files_total += 1
+                                        details.append(f"[{split}] Orphaned label file without image (purged): {entry.name} (backed up to {os.path.basename(backup_path)})")
+                                    except OSError as exc:
+                                        unresolved_issues_total += 1
+                                        details.append(f"[{split}] Could not purge orphaned label file {entry.name}: {exc}")
+                            else:
+                                details.append(f"[{split}] Orphaned label file without image (dry-run, kept): {entry.name}")
                             continue
 
                         rev_data = review_cache.get(stem)
@@ -860,6 +1226,9 @@ def pre_training_dataset_hygiene_gate(
                     invalid_class_ids_purged += res["invalid_cids"]
                     corrupted_boxes_purged += res["corrupted_boxes"]
                     unapproved_boxes_purged += res["unapproved_boxes"]
+                    empty_label_files_total += res.get("empty_label_files", 0)
+                    unresolved_issues_total += res.get("unresolved_issues", 0)
+                    backups_created_total += res.get("backups_created", 0)
                     details.extend(res["details"])
 
         # 4. Check 4 reverse: Images that have missing label files
@@ -867,19 +1236,36 @@ def pre_training_dataset_hygiene_gate(
             for stem, img_path_str in image_stem_to_file.items():
                 lbl_path_str = os.path.join(str(split_lbl_dir), f"{stem}.txt")
                 if not os.path.isfile(lbl_path_str):
-                    details.append(f"[{split}] Missing label file for image: {os.path.basename(img_path_str)}")
-                    mismatched_files_fixed += 1
-                    fixed_files_total += 1
+                    mismatched_files_detected += 1
                     if auto_clean:
-                        _atomic_write_lines(lbl_path_str, [])
+                        try:
+                            _atomic_write_lines(lbl_path_str, [])
+                            mismatched_files_fixed += 1
+                            fixed_files_total += 1
+                            details.append(f"[{split}] Missing label file for image (created empty): {os.path.basename(img_path_str)}")
+                        except OSError as exc:
+                            unresolved_issues_total += 1
+                            details.append(f"[{split}] Could not create missing label file for image {os.path.basename(img_path_str)}: {exc}")
+                    else:
+                        details.append(f"[{split}] Missing label file for image (dry-run, not created): {os.path.basename(img_path_str)}")
 
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    is_clean = True
+    # clean is COMPUTED (F-0797), never a constant True:
+    # - dry-run: clean only when no defect was found at all (nothing was
+    #   fixed, so any found defect still stands);
+    # - auto-clean: clean when every found defect was actually fixed, i.e.
+    #   no fix failed (purged/demoted/deleted/created defects are gone).
+    defects_found = purged_boxes_total + demoted_boxes_total + mismatched_files_detected
+    if auto_clean:
+        is_clean = unresolved_issues_total == 0
+    else:
+        is_clean = defects_found == 0 and unresolved_issues_total == 0
 
     summary = (
         f"Pre-Training Hygiene Gate Completed in {elapsed_ms:.1f}ms: "
         f"Scanned {scanned_labels_total} labels, {scanned_reviews_total} reviews, {scanned_images_total} images. "
-        f"Purged {purged_boxes_total} toxic/corrupted boxes, fixed {fixed_files_total} files."
+        f"Purged {purged_boxes_total} toxic/corrupted boxes, demoted {demoted_boxes_total} boxes to weak, "
+        f"fixed {fixed_files_total} files, {unresolved_issues_total} unresolved issue(s)."
     )
     logger.info(summary)
 
@@ -895,7 +1281,12 @@ def pre_training_dataset_hygiene_gate(
         "invalid_class_ids_purged": invalid_class_ids_purged,
         "unapproved_boxes_purged": unapproved_boxes_purged,
         "corrupted_boxes_purged": corrupted_boxes_purged,
+        "demoted_boxes": demoted_boxes_total,
+        "empty_label_files": empty_label_files_total,
         "mismatched_files_fixed": mismatched_files_fixed,
+        "mismatched_files_detected": mismatched_files_detected,
+        "unresolved_issues": unresolved_issues_total,
+        "backups_created": backups_created_total,
         "duration_ms": round(elapsed_ms, 2),
         "status": "PASSED" if is_clean else "FAILED",
         "summary": summary,
@@ -932,6 +1323,8 @@ if __name__ == "__main__":
     print(f"Invalid Class IDs: {report.get('invalid_class_ids_purged', 0)}")
     print(f"Unapproved Boxes: {report.get('unapproved_boxes_purged', 0)}")
     print(f"Corrupted Boxes: {report.get('corrupted_boxes_purged', 0)}")
+    print(f"Demoted to Weak: {report.get('demoted_boxes', 0)}")
+    print(f"Unresolved Issues: {report.get('unresolved_issues', 0)}")
     print(f"Mismatched Files: {report.get('mismatched_files_fixed', 0)}")
     print(f"Total Details: {len(report['details'])}")
     if report["details"]:

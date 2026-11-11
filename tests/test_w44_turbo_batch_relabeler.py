@@ -12,7 +12,6 @@ import json
 from pathlib import Path
 import sys
 import threading
-import time
 from typing import Any, Dict, List
 from unittest.mock import patch
 
@@ -54,20 +53,29 @@ def test_relabel_dataset_batch_parallel_execution_and_thread_local_workers(tmp_p
     labeler_ids_by_thread: Dict[int, set[int]] = {}
     lock = threading.Lock()
     progress_events: List[Dict[str, Any]] = []
+    # Deterministic parallelism proof (D89/F-2062): a 2-party barrier trips only
+    # when two worker threads overlap inside auto_label_frame. The old
+    # time.sleep(0.04) merely hoped the pool would schedule concurrently; the
+    # barrier either rendezvouses (parallelism proven) or times out (failure).
+    rendezvous = threading.Barrier(2)
+    barrier_failures: List[str] = []
 
     class DummyParallelLabeler:
         def __init__(self) -> None:
             self.instance_id = id(self)
 
         def auto_label_frame(
-            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None
+            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None, full_scan: bool = False
         ) -> List[Dict[str, Any]]:
             tid = threading.get_ident()
             with lock:
                 thread_ids.add(tid)
                 labeler_ids_by_thread.setdefault(tid, set()).add(self.instance_id)
-            # Small sleep so the thread pool schedules tasks concurrently across workers
-            time.sleep(0.04)
+            try:
+                rendezvous.wait(timeout=10.0)
+            except threading.BrokenBarrierError:
+                with lock:
+                    barrier_failures.append(f"thread {tid} timed out at barrier")
             return [
                 {
                     "class_id": 0,
@@ -78,6 +86,10 @@ def test_relabel_dataset_batch_parallel_execution_and_thread_local_workers(tmp_p
                     "h": 0.20,
                     "confidence": 0.93,
                     "source": "yolo_detector",
+                    # E-07: high confidence alone never trusts; this fixture
+                    # needs a txt-written box, so it carries an explicit
+                    # human decision (the test's subject is parallelism).
+                    "hand_label": True,
                 }
             ]
 
@@ -96,7 +108,9 @@ def test_relabel_dataset_batch_parallel_execution_and_thread_local_workers(tmp_p
     assert res["total_boxes"] == 8
     assert res["fps"] > 0.0
 
-    # Multi-threading check: multiple worker threads participated
+    # Multi-threading check: multiple worker threads participated, and at least
+    # two of them overlapped inside auto_label_frame (barrier rendezvous).
+    assert not barrier_failures, f"Worker threads never overlapped: {barrier_failures}"
     assert len(thread_ids) >= 2, f"Expected multi-threaded execution, got threads={thread_ids}"
     # Thread-local check: each thread reused a single YOLOAutoLabeler instance
     for tid, inst_set in labeler_ids_by_thread.items():
@@ -109,10 +123,17 @@ def test_relabel_dataset_batch_parallel_execution_and_thread_local_workers(tmp_p
 
 def test_relabel_dataset_batch_trusted_vs_weak_separation_and_sidecar_output(tmp_path: Path) -> None:
     """
-    2. Verifies that `relabel_dataset_batch` separates `trusted` boxes (hand_label,
-       F/E prompt seeds, or verified high-confidence detections >= emin_threshold)
-       from `weak` boxes (UNVERIFIED_HEURISTIC_SOURCES capped <= 0.68 or low-conf boxes),
+    2. Verifies that `relabel_dataset_batch` separates `trusted` boxes (hand_label /
+       human_approved) from `weak` boxes
+       (UNVERIFIED_HEURISTIC_SOURCES capped <= 0.68 or low-conf boxes),
        writing both to `review/{split}/{stem}.json` and ONLY trusted boxes to `labels/{split}/{stem}.txt`.
+       E-07: high confidence alone never trusts; Y1: the F/E seed is cid 13.
+       P1-12 (K-34): an F/E gather seed ALONE is no longer a human decision —
+       the v16 rule ("seed -> trusted, conf boosted >= 0.90") was the K-34 bug
+       itself (template trace is not evidence). A seed without an explicit
+       per-box human approval calibrates weak (conf kept, never inflated) and
+       is blocked from the txt by the K1 gate in `train_txt_boxes`; the only
+       door in is `human_approved`/`hand_label` (see test 5's approved omni box).
     """
     dataset_dir = tmp_path / "dataset"
     curator = DatasetCurator(project_root=tmp_path, dataset_dir=dataset_dir)
@@ -121,13 +142,16 @@ def test_relabel_dataset_batch_trusted_vs_weak_separation_and_sidecar_output(tmp
 
     class DummyTrustSplitLabeler:
         def auto_label_frame(
-            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None
+            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None, full_scan: bool = False
         ) -> List[Dict[str, Any]]:
             return [
-                # 1. Immune F-gather prompt seed -> trusted=True (conf boosted >= 0.90)
+                # 1. F-gather prompt seed (cid 13, Y1) WITHOUT an explicit
+                # per-box human approval -> weak=True (P1-12/K-34: a seed
+                # alone is not a human decision; conf is KEPT at 0.72, never
+                # boosted to 0.90, and the K1 gate keeps it out of the txt).
                 {
-                    "class_id": 7,
-                    "class_name": "f_gather_prompt",
+                    "class_id": 13,
+                    "class_name": "skill_ui_prompt",
                     "cx": 0.55,
                     "cy": 0.48,
                     "w": 0.12,
@@ -135,7 +159,8 @@ def test_relabel_dataset_batch_trusted_vs_weak_separation_and_sidecar_output(tmp
                     "confidence": 0.72,
                     "source": "f_gather_template",
                 },
-                # 2. High-confidence verified model detection >= 0.85 -> trusted=True
+                # 2. Human-approved high-confidence detection -> trusted=True
+                # (E-07: conf >= 0.85 alone no longer trusts)
                 {
                     "class_id": 0,
                     "class_name": "herb_aria",
@@ -145,6 +170,7 @@ def test_relabel_dataset_batch_trusted_vs_weak_separation_and_sidecar_output(tmp
                     "h": 0.22,
                     "confidence": 0.91,
                     "source": "yolo_model_v2",
+                    "human_approved": True,
                 },
                 # 3. Unverified heuristic source -> capped at <= 0.68, trusted=False, weak=True
                 {
@@ -179,7 +205,10 @@ def test_relabel_dataset_batch_trusted_vs_weak_separation_and_sidecar_output(tmp
         )
 
     assert res["labeled"] == 1
-    assert res["total_boxes"] == 4
+    # O9: total_boxes counts boxes actually written to the txt (1 trusted),
+    # not the raw calibrated box count (4). P1-12 (K-34): the unapproved
+    # F/E seed (cid 13) is weak and never reaches the txt.
+    assert res["total_boxes"] == 1
 
     review_path = dataset_dir / "review" / "train" / "field_capture_01.json"
     label_path = dataset_dir / "labels" / "train" / "field_capture_01.txt"
@@ -190,13 +219,13 @@ def test_relabel_dataset_batch_trusted_vs_weak_separation_and_sidecar_output(tmp
     trusted_boxes = review_data["trusted"]
     weak_boxes = review_data["weak"]
 
-    assert len(trusted_boxes) == 2
-    assert len(weak_boxes) == 2
+    assert len(trusted_boxes) == 1
+    assert len(weak_boxes) == 3
 
     trusted_cids = {b["class_id"] for b in trusted_boxes}
     weak_cids = {b["class_id"] for b in weak_boxes}
-    assert trusted_cids == {0, 7}
-    assert weak_cids == {3, 4}
+    assert trusted_cids == {0}
+    assert weak_cids == {3, 4, 13}
 
     assert all(b["trusted"] is True and b["weak"] is False for b in trusted_boxes)
     assert all(b["trusted"] is False and b["weak"] is True for b in weak_boxes)
@@ -205,11 +234,16 @@ def test_relabel_dataset_batch_trusted_vs_weak_separation_and_sidecar_output(tmp
     heuristic_box = next(b for b in weak_boxes if b["class_id"] == 3)
     assert heuristic_box["confidence"] <= 0.68
 
-    # Train .txt file must contain ONLY the 2 trusted boxes (class 0 and class 7)
+    # P1-12 (K-32/K-34, never inflate): the unapproved seed keeps its
+    # measured confidence (0.72) — it is weak, not boosted to 0.90.
+    seed_box = next(b for b in weak_boxes if b["class_id"] == 13)
+    assert seed_box["confidence"] == 0.72
+
+    # Train .txt file must contain ONLY the 1 trusted box (class 0)
     txt_lines = [ln.strip() for ln in label_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert len(txt_lines) == 2
+    assert len(txt_lines) == 1
     emitted_cids = {int(ln.split()[0]) for ln in txt_lines}
-    assert emitted_cids == {0, 7}
+    assert emitted_cids == {0}
 
 
 def test_relabel_dataset_batch_stem_mismatch_and_exemplar_trust_calibration(tmp_path: Path) -> None:
@@ -218,8 +252,10 @@ def test_relabel_dataset_batch_stem_mismatch_and_exemplar_trust_calibration(tmp_
        batch relabeling:
        - On an `aria_cluster_01.jpg` stem, a mismatched material class (`mela`, cid=1)
          is penalized to <= 0.45 and marked `weak=True` (`trusted=False`).
-       - A matching `herb_aria` (cid=0) with `exemplar_match=True` and conf >= 0.85
-         is marked `trusted=True` and emitted to `labels/val/aria_cluster_01.txt`.
+       - A matching `herb_aria` (cid=0) with `exemplar_match=True` AND an explicit
+         human approval is marked `trusted=True` and emitted to
+         `labels/val/aria_cluster_01.txt` (E-07: exemplar_match alone no
+         longer trusts — calibrate is the single trust path).
     """
     dataset_dir = tmp_path / "dataset"
     curator = DatasetCurator(project_root=tmp_path, dataset_dir=dataset_dir)
@@ -228,10 +264,11 @@ def test_relabel_dataset_batch_stem_mismatch_and_exemplar_trust_calibration(tmp_
 
     class DummyStemLabeler:
         def auto_label_frame(
-            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None
+            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None, full_scan: bool = False
         ) -> List[Dict[str, Any]]:
             return [
-                # Matching material + exemplar_match=True -> trusted
+                # Matching material + exemplar_match=True + explicit human
+                # approval -> trusted (exemplar_match alone does not trust)
                 {
                     "class_id": 0,
                     "class_name": "herb_aria",
@@ -241,6 +278,7 @@ def test_relabel_dataset_batch_stem_mismatch_and_exemplar_trust_calibration(tmp_
                     "h": 0.15,
                     "confidence": 0.89,
                     "exemplar_match": True,
+                    "human_approved": True,
                     "source": "exemplar_memory",
                 },
                 # Mismatched material (class 1 mela on aria stem) despite high raw conf -> weak (<= 0.45)
@@ -304,7 +342,7 @@ def test_relabel_dataset_batch_incremental_cache_skips_valid_and_reprocesses_zer
 
     class DummyCacheLabeler:
         def auto_label_frame(
-            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None
+            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None, full_scan: bool = False
         ) -> List[Dict[str, Any]]:
             stem = Path(source_path).stem if source_path else ""
             with lock:
@@ -351,61 +389,95 @@ def test_relabel_dataset_batch_incremental_cache_skips_valid_and_reprocesses_zer
         assert call_counts["node_empty"] == 3
 
 
-def test_relabel_dataset_batch_learn_stem_emits_weak_omni_boxes_to_train_txt(tmp_path: Path) -> None:
+def test_relabel_dataset_batch_learn_stem_no_longer_emits_unapproved_weak_omni_boxes(tmp_path: Path) -> None:
     """
-    5. Verifies `trusted`/`weak` handling for `learn_*` stems vs normal stems:
+    5. Verifies `trusted`/`weak` handling for `learn_*` stems vs normal stems
+       under sweep E-06 (the old learn-stem exception is gone):
        - `omni_*` synthetic boxes are calibrated as `weak` (`trusted=False`, `weak=True`, conf <= 0.68).
-       - For `learn_skills_01.jpg`, `train_txt_boxes` includes weak omni boxes in `labels/train/learn_skills_01.txt`
-         so that initial OmniGameLearner captures are not empty before Step 2 review.
-       - For `normal_capture_01.jpg`, the identical weak omni box stays only in `review/train/normal_capture_01.json`
-         and is NOT written to `labels/train/normal_capture_01.txt`.
+       - An UNAPPROVED weak omni box reaches NEITHER `labels/train/learn_skills_01.txt`
+         NOR `labels/train/normal_capture_01.txt` — it stays only in the
+         review sidecars. "Adım 2 culls mistakes" was never enforced by code,
+         so unapproved weak boxes trained the model.
+       - The same omni box WITH an explicit per-box human approval is trusted
+         and IS emitted to the learn train .txt (E-06's only door in).
+       - A weak box from a non-learn source below the confidence floor must
+         NOT leak into train .txt even on a learn_* stem.
     """
     dataset_dir = tmp_path / "dataset"
     curator = DatasetCurator(project_root=tmp_path, dataset_dir=dataset_dir)
 
     learn_img = _create_dummy_image(curator.images_train_dir / "learn_skills_01.jpg")
     normal_img = _create_dummy_image(curator.images_train_dir / "normal_capture_01.jpg")
+    learn_img_approved = _create_dummy_image(curator.images_train_dir / "learn_skills_02.jpg")
 
     class DummyOmniLabeler:
         def auto_label_frame(
-            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None
+            self, frame: np.ndarray, fast_mode: bool = True, source_path: Any = None, full_scan: bool = False
         ) -> List[Dict[str, Any]]:
+            stem = Path(source_path).stem if source_path else ""
+            omni_box = {
+                "class_id": 13,
+                "class_name": "skill_ui_prompt",
+                "cx": 0.50,
+                "cy": 0.85,
+                "w": 0.08,
+                "h": 0.08,
+                "confidence": 0.65,
+                "source": "omni_skill_sweep",
+            }
+            if stem == "learn_skills_02":
+                # Explicit per-box human approval: the E-06 door in.
+                omni_box["human_approved"] = True
             return [
+                omni_box,
+                # Weak box from a NON-learn source, below the floor: must never
+                # reach train .txt, not even on a learn_* stem.
                 {
-                    "class_id": 13,
-                    "class_name": "skill_ui_prompt",
-                    "cx": 0.50,
-                    "cy": 0.85,
-                    "w": 0.08,
-                    "h": 0.08,
-                    "confidence": 0.65,
-                    "source": "omni_skill_sweep",
-                }
+                    "class_id": 4,
+                    "class_name": "gem_crystal",
+                    "cx": 0.15,
+                    "cy": 0.30,
+                    "w": 0.10,
+                    "h": 0.12,
+                    "confidence": 0.30,
+                    "source": "yolo_model_v2",
+                },
             ]
 
     with patch("dataset_factory.yolo_auto_labeler.YOLOAutoLabeler", DummyOmniLabeler):
         res = curator.relabel_dataset_batch(
-            image_paths=[learn_img, normal_img],
+            image_paths=[learn_img, normal_img, learn_img_approved],
             max_workers=2,
             emin_threshold=0.85,
             conf_floor=0.45,
         )
 
-    assert res["labeled"] == 2
+    assert res["labeled"] == 3
 
     learn_rev = json.loads((dataset_dir / "review" / "train" / "learn_skills_01.json").read_text(encoding="utf-8"))
     normal_rev = json.loads((dataset_dir / "review" / "train" / "normal_capture_01.json").read_text(encoding="utf-8"))
+    approved_rev = json.loads((dataset_dir / "review" / "train" / "learn_skills_02.json").read_text(encoding="utf-8"))
 
-    # In both review sidecars, omni_skill_sweep is untrusted (weak)
-    assert len(learn_rev["trusted"]) == 0 and len(learn_rev["weak"]) == 1
-    assert len(normal_rev["trusted"]) == 0 and len(normal_rev["weak"]) == 1
-    assert learn_rev["weak"][0]["trusted"] is False and learn_rev["weak"][0]["weak"] is True
+    # In both unapproved review sidecars, omni_skill_sweep is untrusted (weak)
+    assert len(learn_rev["trusted"]) == 0 and len(learn_rev["weak"]) == 2
+    assert len(normal_rev["trusted"]) == 0 and len(normal_rev["weak"]) == 2
+    assert all(b["trusted"] is False and b["weak"] is True for b in learn_rev["weak"])
+    assert all(b["trusted"] is False and b["weak"] is True for b in normal_rev["weak"])
+    assert {b["class_id"] for b in learn_rev["weak"]} == {4, 13}
+    assert {b["class_id"] for b in normal_rev["weak"]} == {4, 13}
 
-    # For learn_* stem, weak omni box is emitted to train .txt
+    # E-06: the unapproved weak omni box is emitted to NEITHER train .txt.
     learn_txt = (dataset_dir / "labels" / "train" / "learn_skills_01.txt").read_text(encoding="utf-8").strip()
-    assert learn_txt != ""
-    assert int(learn_txt.split()[0]) == 13
-
-    # For normal stem, weak omni box is NOT emitted to train .txt
+    assert learn_txt == ""
     normal_txt = (dataset_dir / "labels" / "train" / "normal_capture_01.txt").read_text(encoding="utf-8").strip()
     assert normal_txt == ""
+
+    # ...but the human-approved omni box IS trusted and emitted.
+    assert len(approved_rev["trusted"]) == 1 and len(approved_rev["weak"]) == 1
+    assert approved_rev["trusted"][0]["class_id"] == 13
+    approved_txt = (dataset_dir / "labels" / "train" / "learn_skills_02.txt").read_text(encoding="utf-8").strip()
+    approved_lines = [ln for ln in approved_txt.splitlines() if ln.strip()]
+    assert len(approved_lines) == 1
+    assert int(approved_lines[0].split()[0]) == 13
+    # The non-learn weak box (class 4, conf 0.30 < floor) must NOT leak in.
+    assert {int(ln.split()[0]) for ln in approved_lines} == {13}

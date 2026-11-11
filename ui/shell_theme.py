@@ -5,10 +5,28 @@ from __future__ import annotations
 
 from typing import Any
 
+# P3-7 (v18): 3-tier güven renkleri/eşikleri TEK kaynaktan okunur —
+# dataset_factory/confidence_tier_coloring.py (test-pinned:
+# tests/test_w27_three_tier_box_colors.py — 0.69 -> kırmızı, 0.70 -> turuncu,
+# 0.84 -> turuncu, 0.85 -> yeşil). Eskiden her modül kendi literalini taşıyordu;
+# ui/yolo_panel.py ile ui/yolo_pipeline_web.py orta eşiği 0.60 sayarken fabrika
+# diyaloğu / shell rozeti / kılavuz 0.70 sayıyordu — aynı güven bir yerde
+# "şüpheli", başka yerde "düşük" çıkıyordu. Kanonik orta eşik 0.70'tir.
+from dataset_factory.confidence_tier_coloring import (
+    CONFIDENT_COLOR_HEX,
+    CONFIDENT_THRESHOLD,
+    LOW_CONFIDENCE_COLOR_HEX,
+    SUSPICIOUS_COLOR_HEX,
+    SUSPICIOUS_THRESHOLD,
+)
+
+CONFIDENCE_HIGH_THRESHOLD: float = CONFIDENT_THRESHOLD
+CONFIDENCE_MEDIUM_THRESHOLD: float = SUSPICIOUS_THRESHOLD
+
 CONFIDENCE_TIER_COLORS = {
-    "confident": "#22c55e",
-    "suspicious": "#fb923c",
-    "low": "#ef4444",
+    "confident": CONFIDENT_COLOR_HEX,
+    "suspicious": SUSPICIOUS_COLOR_HEX,
+    "low": LOW_CONFIDENCE_COLOR_HEX,
 }
 
 CONFIDENCE_TIER_PALETTE = CONFIDENCE_TIER_COLORS
@@ -16,16 +34,25 @@ CONFIDENCE_TIER_PALETTE = CONFIDENCE_TIER_COLORS
 
 def get_confidence_badge_qss(confidence: float, trusted: bool = True) -> str:
     """Returns 3-tier badge QSS with crisp white text for >=85% green, 70-84% orange, <70% red."""
-    c = float(confidence or 0.0)
+    # P3-8 (S-244): sayısal olmayan güven ("yüksek") ValueError verirdi.
+    try:
+        c = float(confidence or 0.0)
+    except (TypeError, ValueError):
+        c = 0.0
     if c > 1.0:
         c = c / 100.0
-    if c >= 0.85 and trusted:
+    # S243 (v19/P3-8): JS rozet kuralıyla (yolo_pipeline_web.py)
+    # ters yöndeydi — Python yeşil için trusted VE yüksek güven
+    # isterken JS trusted VEYA yüksek güven veriyordu. Belgelı
+    # kural P2-23'tür: el etiketli (trusted) kutu yeşil + ✓
+    # (güveni ölçülmemiş el kutusu "%0" değil "el" yazar).
+    if trusted or c >= CONFIDENCE_HIGH_THRESHOLD:
         bg = CONFIDENCE_TIER_COLORS["confident"]
-    elif c >= 0.70:
+    elif c >= CONFIDENCE_MEDIUM_THRESHOLD:
         bg = CONFIDENCE_TIER_COLORS["suspicious"]
     else:
         bg = CONFIDENCE_TIER_COLORS["low"]
-    return f"background-color: {bg}; color: #ffffff; border-radius: 4px; padding: 2px 6px; font-weight: 700;"
+    return f"background-color: {bg}; color: #ffffff; border-radius: 4px; padding: 3px 8px; font-weight: 700;"
 
 
 SHELL_COLORS = {
@@ -35,8 +62,8 @@ SHELL_COLORS = {
     "line": "#1e2530",
     "text": "#eef1f5",
     "muted": "#9aa3af",
-    "faint": "#6b7280",
-    "kicker": "#6b7280",
+    "faint": "#8a94a3",
+    "kicker": "#8a94a3",
     "accent": "#f5b50a",
     "accent_press": "#d89e06",
     "ok": "#34d399",
@@ -45,6 +72,68 @@ SHELL_COLORS = {
     "sky": "#56c8f5",
     "purple": "#a78bfa",
 }
+
+# F-0766: the QComboBox block used to be duplicated verbatim in both QSS
+# constants. One shared block now; both constants interpolate it.
+_SHELL_COMBOBOX_QSS = """
+    QComboBox,
+    QComboBox#ShellFilter,
+    QComboBox#PipeCombo,
+    QComboBox#PipeClassFilter,
+    QComboBox#PipeClassCombo,
+    QComboBox#ShellRegionCombo,
+    QComboBox#ShellRouteCombo {
+        background-color: #111622;
+        color: #f0f4f8;
+        border: 1px solid #1e2530;
+        border-radius: 6px;
+        padding: 6px 12px;
+        font-size: 12px;
+        min-height: 26px;
+    }
+    QComboBox:hover,
+    QComboBox#ShellFilter:hover,
+    QComboBox#PipeCombo:hover {
+        border-color: #38bdf8;
+    }
+    QComboBox::drop-down,
+    QComboBox#ShellFilter::drop-down,
+    QComboBox#PipeCombo::drop-down {
+        border: none;
+        width: 22px;
+    }
+    QComboBox QAbstractItemView,
+    QComboBox QListView,
+    QComboBox#ShellFilter QAbstractItemView,
+    QComboBox#PipeCombo QAbstractItemView,
+    QComboBox#PipeClassFilter QAbstractItemView,
+    QComboBox#PipeClassCombo QAbstractItemView,
+    QComboBox#ShellRegionCombo QAbstractItemView,
+    QComboBox#ShellRouteCombo QAbstractItemView {
+        background-color: #111622;
+        color: #ffffff !important;
+        border: 1px solid #1e2530;
+        selection-background-color: #2563eb;
+        selection-color: #ffffff !important;
+        font-size: 12px;
+        padding: 4px;
+        outline: none;
+    }
+    QComboBox QAbstractItemView::item,
+    QComboBox QListView::item {
+        color: #ffffff !important;
+        background-color: #111622;
+        min-height: 24px;
+        padding: 4px 8px;
+    }
+    QComboBox QAbstractItemView::item:selected,
+    QComboBox QAbstractItemView::item:hover,
+    QComboBox QListView::item:selected,
+    QComboBox QListView::item:hover {
+        background-color: #2563eb;
+        color: #ffffff !important;
+    }
+"""
 
 SHELL_PAGE_FRAME_QSS = f"""
     QFrame#ShellPageFrame {{
@@ -59,22 +148,22 @@ SHELL_PAGE_FRAME_QSS = f"""
     }}
     QLabel#ShellPageKicker {{
         color: {SHELL_COLORS["kicker"]};
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 800;
-        letter-spacing: 2.0px;
+        letter-spacing: 1.6px;
         padding: 0px;
         font-family: "Segoe UI", system-ui, sans-serif;
     }}
     QLabel#ShellPageTitle {{
         color: {SHELL_COLORS["text"]};
-        font-size: 21px;
+        font-size: 22px;
         font-weight: 800;
         padding: 0px;
         font-family: "Segoe UI", system-ui, sans-serif;
     }}
     QLabel#ShellPageSubtitle {{
         color: {SHELL_COLORS["muted"]};
-        font-size: 12px;
+        font-size: 13px;
         font-weight: 500;
         padding: 0px;
         font-family: "Segoe UI", system-ui, sans-serif;
@@ -86,12 +175,12 @@ SHELL_PAGE_FRAME_QSS = f"""
     }}
     QLabel#ShellMetricCaption {{
         color: {SHELL_COLORS["muted"]};
-        font-size: 11px;
+        font-size: 12px;
         font-weight: 600;
     }}
     QLabel#ShellMetricValue {{
         color: {SHELL_COLORS["text"]};
-        font-size: 18px;
+        font-size: 20px;
         font-weight: 700;
         font-family: "Segoe UI", system-ui, sans-serif;
     }}
@@ -100,8 +189,8 @@ SHELL_PAGE_FRAME_QSS = f"""
         color: #120d00;
         border: 1px solid {SHELL_COLORS["accent"]};
         border-radius: 7px;
-        padding: 8px 14px;
-        font-size: 12px;
+        padding: 10px 16px;
+        font-size: 13px;
         font-weight: 800;
         font-family: "Segoe UI", system-ui, sans-serif;
     }}
@@ -112,15 +201,15 @@ SHELL_PAGE_FRAME_QSS = f"""
     QPushButton#ShellPrimaryBtn:disabled {{
         background-color: #252b36;
         border-color: #252b36;
-        color: #6b7280;
+        color: #9AA3B2;
     }}
     QPushButton#ShellSecondaryBtn {{
         background-color: {SHELL_COLORS["panel"]};
         color: {SHELL_COLORS["text"]};
         border: 1px solid {SHELL_COLORS["line"]};
         border-radius: 7px;
-        padding: 8px 14px;
-        font-size: 12px;
+        padding: 10px 16px;
+        font-size: 13px;
         font-weight: 600;
     }}
     QPushButton#ShellSecondaryBtn:hover {{
@@ -133,8 +222,8 @@ SHELL_PAGE_FRAME_QSS = f"""
         color: {SHELL_COLORS["text"]};
         border: 1px solid {SHELL_COLORS["line"]};
         border-radius: 7px;
-        padding: 7px 12px;
-        font-size: 12px;
+        padding: 9px 14px;
+        font-size: 13px;
         font-weight: 600;
     }}
     QPushButton#ShellGhostBtn:hover {{
@@ -150,70 +239,14 @@ SHELL_PAGE_FRAME_QSS = f"""
         color: #ffffff;
         font-size: 12px;
         font-weight: 700;
-        min-height: 20px;
-        max-height: 20px;
+        min-height: 22px;
+        max-height: 22px;
     }}
     QProgressBar#ShellProgress::chunk {{
         background-color: {SHELL_COLORS["ok"]};
         border-radius: 4px;
     }}
-    QComboBox,
-    QComboBox#ShellFilter,
-    QComboBox#PipeCombo,
-    QComboBox#PipeClassFilter,
-    QComboBox#PipeClassCombo,
-    QComboBox#ShellRegionCombo,
-    QComboBox#ShellRouteCombo {{
-        background-color: #111622;
-        color: #f0f4f8;
-        border: 1px solid {SHELL_COLORS["line"]};
-        border-radius: 6px;
-        padding: 5px 10px;
-        font-size: 12px;
-        min-height: 26px;
-    }}
-    QComboBox:hover,
-    QComboBox#ShellFilter:hover,
-    QComboBox#PipeCombo:hover {{
-        border-color: #38bdf8;
-    }}
-    QComboBox::drop-down,
-    QComboBox#ShellFilter::drop-down,
-    QComboBox#PipeCombo::drop-down {{
-        border: none;
-        width: 22px;
-    }}
-    QComboBox QAbstractItemView,
-    QComboBox QListView,
-    QComboBox#ShellFilter QAbstractItemView,
-    QComboBox#PipeCombo QAbstractItemView,
-    QComboBox#PipeClassFilter QAbstractItemView,
-    QComboBox#PipeClassCombo QAbstractItemView,
-    QComboBox#ShellRegionCombo QAbstractItemView,
-    QComboBox#ShellRouteCombo QAbstractItemView {{
-        background-color: #111622;
-        color: #ffffff !important;
-        border: 1px solid #1e2530;
-        selection-background-color: #2563eb;
-        selection-color: #ffffff !important;
-        font-size: 12px;
-        padding: 4px;
-        outline: none;
-    }}
-    QComboBox QAbstractItemView::item,
-    QComboBox QListView::item {{
-        color: #ffffff !important;
-        background-color: #111622;
-        min-height: 24px;
-        padding: 4px 8px;
-    }}
-    QComboBox QAbstractItemView::item:selected,
-    QComboBox QAbstractItemView::item:hover,
-    QComboBox QListView::item:selected,
-    QComboBox QListView::item:hover {{
-        background-color: #2563eb;
-        color: #ffffff !important;
-    }}
+{_SHELL_COMBOBOX_QSS}
     QScrollArea#ShellScroll {{
         background: transparent;
         border: none;
@@ -264,7 +297,7 @@ SHELL_MAIN_QSS = f"""
         border: none;
         border-left: 2px solid transparent;
         border-radius: 7px;
-        padding: 8px 10px;
+        padding: 10px 12px;
         font-size: 13px;
         font-weight: 500;
     }}
@@ -285,8 +318,8 @@ SHELL_MAIN_QSS = f"""
         border: none;
         border-left: 2px solid transparent;
         border-radius: 6px;
-        padding: 6px 8px;
-        font-size: 12px;
+        padding: 8px 10px;
+        font-size: 13px;
         font-weight: 500;
     }}
     QPushButton#Rail_settings:hover {{
@@ -302,7 +335,7 @@ SHELL_MAIN_QSS = f"""
     QLabel#RailVersion {{
         color: {SHELL_COLORS["faint"]};
         font-family: Consolas, "Cascadia Mono", monospace;
-        font-size: 10px;
+        font-size: 11px;
     }}
     QFrame#ShellLogCard {{
         background-color: #05070a;
@@ -318,7 +351,7 @@ SHELL_MAIN_QSS = f"""
     }}
     QLabel#ShellLogTitle {{
         color: {SHELL_COLORS["muted"]};
-        font-size: 11px;
+        font-size: 12px;
         font-weight: 700;
         letter-spacing: 0.6px;
     }}
@@ -326,9 +359,9 @@ SHELL_MAIN_QSS = f"""
         background: transparent;
         border: 1px solid {SHELL_COLORS["line"]};
         color: {SHELL_COLORS["muted"]};
-        padding: 2px 8px;
+        padding: 4px 10px;
         border-radius: 4px;
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
     }}
     QPushButton[logPill="true"]:hover {{
@@ -344,9 +377,9 @@ SHELL_MAIN_QSS = f"""
         background: transparent;
         border: 1px solid {SHELL_COLORS["line"]};
         color: {SHELL_COLORS["danger"]};
-        padding: 2px 8px;
+        padding: 4px 10px;
         border-radius: 4px;
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
     }}
     QPushButton#ShellLogClearBtn:hover {{
@@ -360,7 +393,7 @@ SHELL_MAIN_QSS = f"""
         border-bottom-left-radius: 9px;
         border-bottom-right-radius: 9px;
         font-family: Consolas, "Cascadia Mono", monospace;
-        font-size: 11px;
+        font-size: 12px;
         padding: 6px 12px;
     }}
     QWidget#HomePage, QScrollArea#HomeScroll, QWidget#HomeScrollContent {{
@@ -410,19 +443,19 @@ SHELL_MAIN_QSS = f"""
     }}
     QLabel#HomeStatCaption {{
         color: {SHELL_COLORS["faint"]};
-        font-size: 11px;
+        font-size: 12px;
         font-weight: 700;
         letter-spacing: 0.6px;
     }}
     QLabel#HomeStatValue {{
         color: {SHELL_COLORS["text"]};
-        font-size: 22px;
+        font-size: 24px;
         font-weight: 800;
         font-family: "Segoe UI", system-ui, sans-serif;
     }}
     QLabel#HomeStatSub {{
         color: {SHELL_COLORS["muted"]};
-        font-size: 12px;
+        font-size: 13px;
         font-weight: 500;
     }}
     QPushButton[homePrimaryBtn="true"] {{
@@ -430,8 +463,8 @@ SHELL_MAIN_QSS = f"""
         color: #120d00;
         border: 1px solid {SHELL_COLORS["accent"]};
         border-radius: 7px;
-        padding: 8px 14px;
-        font-size: 12px;
+        padding: 10px 16px;
+        font-size: 13px;
         font-weight: 800;
     }}
     QPushButton[homePrimaryBtn="true"]:hover {{
@@ -533,63 +566,7 @@ SHELL_MAIN_QSS = f"""
     QFrame#F9Overlay QScrollArea > QWidget {{
         background-color: {SHELL_COLORS["panel_deep"]};
     }}
-    QComboBox,
-    QComboBox#ShellFilter,
-    QComboBox#PipeCombo,
-    QComboBox#PipeClassFilter,
-    QComboBox#PipeClassCombo,
-    QComboBox#ShellRegionCombo,
-    QComboBox#ShellRouteCombo {{
-        background-color: #111622;
-        color: #f0f4f8;
-        border: 1px solid {SHELL_COLORS["line"]};
-        border-radius: 6px;
-        padding: 5px 10px;
-        font-size: 12px;
-        min-height: 26px;
-    }}
-    QComboBox:hover,
-    QComboBox#ShellFilter:hover,
-    QComboBox#PipeCombo:hover {{
-        border-color: #38bdf8;
-    }}
-    QComboBox::drop-down,
-    QComboBox#ShellFilter::drop-down,
-    QComboBox#PipeCombo::drop-down {{
-        border: none;
-        width: 22px;
-    }}
-    QComboBox QAbstractItemView,
-    QComboBox QListView,
-    QComboBox#ShellFilter QAbstractItemView,
-    QComboBox#PipeCombo QAbstractItemView,
-    QComboBox#PipeClassFilter QAbstractItemView,
-    QComboBox#PipeClassCombo QAbstractItemView,
-    QComboBox#ShellRegionCombo QAbstractItemView,
-    QComboBox#ShellRouteCombo QAbstractItemView {{
-        background-color: #111622;
-        color: #ffffff !important;
-        border: 1px solid #1e2530;
-        selection-background-color: #2563eb;
-        selection-color: #ffffff !important;
-        font-size: 12px;
-        padding: 4px;
-        outline: none;
-    }}
-    QComboBox QAbstractItemView::item,
-    QComboBox QListView::item {{
-        color: #ffffff !important;
-        background-color: #111622;
-        min-height: 24px;
-        padding: 4px 8px;
-    }}
-    QComboBox QAbstractItemView::item:selected,
-    QComboBox QAbstractItemView::item:hover,
-    QComboBox QListView::item:selected,
-    QComboBox QListView::item:hover {{
-        background-color: #2563eb;
-        color: #ffffff !important;
-    }}
+{_SHELL_COMBOBOX_QSS}
 """
 
 
@@ -834,10 +811,16 @@ def apply_high_contrast_input_style(widget: Any) -> None:
         pass
 
 
-# Automatically install global hook on import
-install_combobox_dark_theme_hook()
+# F-0767: no import-time global monkey-patch. Importing this module used
+# to rewrite QComboBox.showPopup for the whole process, and the hook then
+# fought the explicit per-combo styling (apply_combobox_dark_style) with a
+# second style pass. Callers that want the global hook must opt in
+# explicitly via install_combobox_dark_theme_hook(); the shell already
+# styles its combos explicitly.
 
 __all__ = [
+    "CONFIDENCE_HIGH_THRESHOLD",
+    "CONFIDENCE_MEDIUM_THRESHOLD",
     "CONFIDENCE_TIER_COLORS",
     "SHELL_COLORS",
     "SHELL_PAGE_FRAME_QSS",

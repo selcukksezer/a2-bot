@@ -77,6 +77,7 @@ from dataset_factory.exemplar_memory import (
     ExemplarMemory,
     extract_box_crop,
     extract_crop_features,
+    feature_dict_to_normalized_vector,
     is_same_super_category,
     sanitize_exemplar_memory,
 )
@@ -118,6 +119,25 @@ def temp_dataset_dir(tmp_path: Path):
         (ds / "review" / split).mkdir(parents=True, exist_ok=True)
     yield ds
     shutil.rmtree(ds, ignore_errors=True)
+
+
+def _hsv_patch(h: int, s: int, v: int, seed: int, size: int = 64) -> np.ndarray:
+    """Deterministic BGR patch built from a real HSV colour: base hue with
+    seeded per-pixel jitter plus a darker stripe every 8 rows for texture, so
+    discriminate_3d_material sees genuine colour + edge evidence, not noise."""
+    rng = np.random.default_rng(seed)
+    H = np.clip(h + rng.integers(-4, 5, (size, size)), 0, 179).astype(np.uint8)
+    S = np.clip(s + rng.integers(-12, 13, (size, size)), 0, 255).astype(np.uint8)
+    V = np.clip(v + rng.integers(-12, 13, (size, size)), 0, 255).astype(np.uint8)
+    hsv = np.stack([H, S, V], axis=2)
+    hsv[::8, :, :] = np.clip(hsv[::8, :, :].astype(int) - 25, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+
+def _empty_exemplar_memory(tmp_path: Path) -> ExemplarMemory:
+    """A real, empty ExemplarMemory on a tmp JSON path, so material
+    discrimination runs deterministically without the global learned file."""
+    return ExemplarMemory(json_path=tmp_path / "empty_exemplars.json")
 
 
 # ==============================================================================
@@ -181,17 +201,16 @@ class TestPart1TrustAndConfidenceCalibration:
             assert calibrated["weak"] is True, f"Source '{src}' must be flagged as weak (Şüpheli)"
 
     def test_human_approved_boxes_preserve_high_confidence_and_emin(self):
-        """Human-approved or hand-labeled boxes are immune: confidence >= 0.90, trusted=True, weak=False."""
-        cases = [
-            {"hand_label": True, "source": "hand_drawn", "confidence": 0.50},
-            {"human_approved": True, "source": "ui_reviewed", "confidence": 0.62},
-            {"approved": True, "source": "batch_approved", "confidence": 0.70},
-            {"source": "vision_f_gather_prompt", "confidence": 0.94},
-            {"source": "vision_3d_crest", "confidence": 0.92},
+        """P1-12 (K-32/K-34, F-1212 never inflate): human-approved or
+        hand-labeled boxes are immune (trusted=True, weak=False) and keep
+        their MEASURED confidence — no 0.90 inflation. A bare "approved"
+        flag and a gather seed are not human decisions: weak/untrusted."""
+        human_cases = [
+            ({"hand_label": True, "source": "hand_drawn", "confidence": 0.50}, 0.50),
+            ({"human_approved": True, "source": "ui_reviewed", "confidence": 0.62}, 0.62),
         ]
-
-        for box in cases:
-            box["class_id"] = 0
+        for box, expected_conf in human_cases:
+            box.setdefault("class_id", 0)
             box["cx"] = 0.5
             box["cy"] = 0.5
             box["w"] = 0.1
@@ -199,7 +218,41 @@ class TestPart1TrustAndConfidenceCalibration:
             calibrated = calibrate_box_confidence_and_trust(box, stem="boot_sample_02")
             assert calibrated["trusted"] is True, f"Approved box {box} must be trusted=True"
             assert calibrated["weak"] is False, f"Approved box {box} must be weak=False"
-            assert calibrated["confidence"] >= 0.90, f"Approved box confidence must be >= 0.90, got {calibrated['confidence']}"
+            assert calibrated["confidence"] == expected_conf, (
+                f"Human box confidence must be kept as measured ({expected_conf}), "
+                f"got {calibrated['confidence']}"
+            )
+
+        # Bare "approved" (pipeline flag) and a gather seed (cid 13) are
+        # NOT human decisions: they stay weak with confidence kept as-is.
+        for box in [
+            {"approved": True, "source": "batch_approved", "confidence": 0.70},
+            # Y1: the F/E gather seed is cid 13 (skill_ui_prompt) + F/E trace.
+            {"class_id": 13, "source": "vision_f_gather_prompt", "confidence": 0.94},
+        ]:
+            box.setdefault("class_id", 0)
+            box["cx"] = 0.5
+            box["cy"] = 0.5
+            box["w"] = 0.1
+            box["h"] = 0.1
+            expected_conf = box["confidence"]
+            calibrated = calibrate_box_confidence_and_trust(box, stem="boot_sample_02")
+            assert calibrated["trusted"] is False, f"Non-human box {box} must be trusted=False"
+            assert calibrated["weak"] is True, f"Non-human box {box} must be weak=True"
+            assert calibrated["confidence"] == expected_conf
+
+        # E-07: a high-confidence vision box with no human decision is NOT
+        # immune — it stays weak (flagged as a high-confidence candidate).
+        # The old matrix trusted these two on confidence alone.
+        for box in [
+            {"source": "vision_f_gather_prompt", "confidence": 0.94},
+            {"source": "vision_3d_crest", "confidence": 0.92},
+        ]:
+            box.update({"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1})
+            calibrated = calibrate_box_confidence_and_trust(box, stem="boot_sample_02")
+            assert calibrated["trusted"] is False, f"Unapproved box {box} must be trusted=False"
+            assert calibrated["weak"] is True, f"Unapproved box {box} must be weak=True"
+            assert calibrated.get("high_confidence_candidate") is True
 
     def test_stem_material_conflict_calibration(self):
         """When stem indicates one material (e.g. Aria) but box claims conflicting material (e.g. Orichalcum),
@@ -222,7 +275,15 @@ class TestPart1TrustAndConfidenceCalibration:
         assert calibrated["weak"] is True
 
     def test_requeue_default_conf_is_058_and_legacy_txt_is_weak(self, temp_dataset_dir: Path):
-        """default_conf in requeue functions must be 0.58, and legacy boxes without proof must be weak=True."""
+        """default_conf in requeue functions must be 0.58; a bare legacy box
+        without the requeue stamp stays weak=True in direct normalization.
+
+        §7 P0-8 requeue kararı: requeue TXT-only kareye hand_label damgası
+        vurur (diskteki 5-alanlı TXT satırı el etiketiyle ayırt edilemez)
+        ve damgalı kare korumalı sayılır — kare düzeyinde atlanır, review
+        JSON yazılmaz. Uçtan uca requeue artık bu kareyi kuyruğa almaz;
+        0.58 weak sözleşmesi doğrudan normalize geçişinde denetlenir.
+        """
         # Check signature defaults
         sig_norm = inspect.signature(_normalize_requeue_box)
         assert sig_norm.parameters["default_conf"].default == 0.58, "Expected _normalize_requeue_box default_conf == 0.58"
@@ -254,17 +315,17 @@ class TestPart1TrustAndConfidenceCalibration:
 
         stats = requeue_labeled_dataset_for_review(temp_dataset_dir, default_conf=0.58)
         assert stats["ok"] is True
-        assert stats["trusted_boxes"] == 0, "Unproven legacy boxes must not enter trusted"
-        assert stats["weak_boxes"] >= 1, "Unproven legacy boxes must be classified as weak"
+        # §7 P0-8: TXT-only kare hand_label damgasıyla korumalı atlanır —
+        # kuyruğa girmez, review JSON yazılmaz.
+        assert stats["samples"] == 0, "TXT-only legacy frame is skipped as protected, never requeued"
+        assert stats["boxes"] == 0
+        assert stats["trusted_boxes"] == 0, "No trusted boxes: a stamp grants no trust"
+        assert stats["weak_boxes"] == 0
+        assert stats["skipped_protected"] == 1
 
         rev_file = temp_dataset_dir / "review" / "train" / "legacy_frame_01.json"
-        assert rev_file.is_file()
-        payload = json.loads(rev_file.read_text(encoding="utf-8"))
-        assert len(payload["trusted"]) == 0
-        assert len(payload["weak"]) == 1
-        assert payload["weak"][0]["confidence"] == 0.58
-        assert payload["weak"][0]["trusted"] is False
-        assert payload["weak"][0]["weak"] is True
+        assert not rev_file.is_file()
+        assert train_lbl.read_text(encoding="utf-8") == "0 0.5 0.5 0.1 0.1\n"
 
     def test_salient_fallback_confidence_cap(self):
         """Salient 3D resource detector must cap confidence at <= 0.68, set weak=True, and never assign essence classes."""
@@ -283,6 +344,11 @@ class TestPart1TrustAndConfidenceCalibration:
             hint_material_name="",
         )
 
+        # The synthetic patch must actually produce annotations — otherwise the
+        # loop below would pass vacuously on an empty list.
+        assert len(salient_anns) >= 1, (
+            "Salient scan must return >= 1 annotation for the synthetic resource patch"
+        )
         for ann in salient_anns:
             assert ann["confidence"] <= 0.68, (
                 f"Salient resource box confidence must not exceed 0.68, got {ann['confidence']}"
@@ -330,8 +396,11 @@ class TestPart2MaterialAndSymbolDiscrimination:
     """Verifies 6-material discrimination, 3D crest vertical alignment proof,
     minimap sprout vs monster dot vs central player arrow, and category-locked exemplar memory."""
 
-    def test_six_material_discrimination_and_background_rejection(self):
-        """Verify the 6 main game materials are defined and distinguishable, while flat background is rejected."""
+    def test_six_material_discrimination_and_background_rejection(self, tmp_path: Path):
+        """Verify ALL 6 main game materials are discriminated by the REAL
+        discriminate_3d_material on genuine HSV-colour patches (one per
+        material, each with its own nameplate width), while flat background
+        is rejected."""
         # 1. Verify MAIN_MATERIALS_6 registry
         expected_keys = {
             "herb_aria",
@@ -343,36 +412,34 @@ class TestPart2MaterialAndSymbolDiscrimination:
         }
         assert set(MAIN_MATERIALS_6.keys()) == expected_keys
 
-        # 2. Test authentic textured Aria patch
-        np.random.seed(101)
-        aria_patch = np.random.randint(140, 240, (64, 64, 3), dtype=np.uint8)
-        aria_patch[:, :, 0] = np.clip(aria_patch[:, :, 0] + 50, 0, 255)  # Boost blue floral tone
-        res_aria = discriminate_3d_material(
-            aria_patch,
-            nameplate_width_px=60,
-            has_specular_crest=True,
-        )
-        assert res_aria.is_authentic_node is True
-        assert res_aria.class_name == "herb_aria"
-        assert res_aria.calibrated_confidence >= 0.80
+        # 2. One genuine colour patch per material: (key, hue, sat, val, nameplate_width_px)
+        #    Hues sit inside the production HSV masks in compute_color_histogram_scores.
+        memory = _empty_exemplar_memory(tmp_path)
+        cases = [
+            ("herb_aria", 105, 150, 220, 60),      # blue petals
+            ("herb_edana", 155, 180, 220, 70),     # purple/pink petals
+            ("herb_lumina", 28, 200, 230, 70),     # golden/yellow glow
+            ("ore_orichalcum", 15, 180, 200, 110),  # copper/orange-brown vein
+            ("ore_obsidian", 140, 100, 70, 110),   # dark violet glassy vein
+            ("crystal_blood", 0, 220, 200, 100),   # crimson red crystal
+        ]
+        for i, (key, h, s, v, width) in enumerate(cases):
+            patch = _hsv_patch(h, s, v, seed=100 + i)
+            res = discriminate_3d_material(
+                patch,
+                nameplate_width_px=width,
+                has_specular_crest=True,
+                exemplar_memory=memory,
+            )
+            assert res.is_authentic_node is True, f"{key}: patch rejected ({res.rejection_reason})"
+            assert res.class_name == key, f"Expected {key}, got {res.class_name}"
+            assert res.calibrated_confidence >= 0.80, (
+                f"{key}: confidence {res.calibrated_confidence} < 0.80"
+            )
 
-        # 3. Test authentic textured Orichalcum Ore patch
-        ori_patch = np.random.randint(80, 200, (64, 64, 3), dtype=np.uint8)
-        ori_patch[:, :, 0] = np.clip(ori_patch[:, :, 0] - 40, 0, 255)  # Low blue
-        ori_patch[:, :, 1] = np.clip(ori_patch[:, :, 1] + 10, 0, 255)  # Orange-brown
-        ori_patch[:, :, 2] = np.clip(ori_patch[:, :, 2] + 70, 0, 255)  # High red/copper
-        res_ori = discriminate_3d_material(
-            ori_patch,
-            nameplate_width_px=110,
-            has_specular_crest=True,
-        )
-        assert res_ori.is_authentic_node is True
-        assert res_ori.class_name == "ore_orichalcum"
-        assert res_ori.calibrated_confidence >= 0.80
-
-        # 4. Test flat / featureless background rejection (dead dirt/sky)
+        # 3. Test flat / featureless background rejection (dead dirt/sky)
         flat_dirt = np.full((64, 64, 3), (70, 90, 110), dtype=np.uint8)
-        res_dirt = discriminate_3d_material(flat_dirt, nameplate_width_px=0)
+        res_dirt = discriminate_3d_material(flat_dirt, nameplate_width_px=0, exemplar_memory=memory)
         assert res_dirt.is_authentic_node is False
         assert res_dirt.calibrated_confidence < 0.35
 
@@ -409,27 +476,66 @@ class TestPart2MaterialAndSymbolDiscrimination:
         assert proof_unaligned["confidence"] <= 0.68
 
     def test_player_self_exclusion_zone_guards(self):
-        """Player self-exclusion zone must accurately identify center player screen coords."""
-        x1, y1, x2, y2 = PLAYER_SELF_EXCLUSION_ZONE
-        center_x = (x1 + x2) * 0.5
-        center_y = (y1 + y2) * 0.5
+        """Player self-exclusion zone must accurately identify center player screen coords.
 
-        assert is_in_player_self_exclusion_zone(center_x, center_y) is True
+        Points are LITERAL coordinates of the documented zone
+        (x 0.43..0.57, y 0.38..0.64) — never derived from the constant under
+        test, so the test cannot pass tautologically."""
+        assert PLAYER_SELF_EXCLUSION_ZONE == (0.43, 0.38, 0.57, 0.64)
+
+        # Inside: documented centre and inclusive boundaries
+        assert is_in_player_self_exclusion_zone(0.50, 0.51) is True
+        assert is_in_player_self_exclusion_zone(0.43, 0.38) is True
+        assert is_in_player_self_exclusion_zone(0.57, 0.64) is True
+        # Just outside each edge
+        assert is_in_player_self_exclusion_zone(0.42, 0.51) is False
+        assert is_in_player_self_exclusion_zone(0.58, 0.51) is False
+        assert is_in_player_self_exclusion_zone(0.50, 0.37) is False
+        assert is_in_player_self_exclusion_zone(0.50, 0.65) is False
+        # Far away: upper-left and minimap zone
         assert is_in_player_self_exclusion_zone(0.10, 0.10) is False  # Far upper-left
         assert is_in_player_self_exclusion_zone(0.85, 0.15) is False  # Minimap zone
 
     def test_minimap_sprout_vs_monster_dot_vs_player_arrow(self):
-        """MinimapScanner must strictly separate sprout 9, monster dot 11, and player center arrow (r<=14px)."""
+        """MinimapScanner must strictly separate sprout 9, monster dot 11, and player center arrow (r<=14px).
+
+        The centre exclusion is exercised through the REAL production scan
+        (MinimapScanner.scan_minimap_crop) on synthetic 300x300 crops: a white
+        dot ~2px from the production player centre must be swallowed by the
+        centre exclusion, while an identical dot 50px away must be reported
+        as a monster dot with dist_px > 14."""
         scanner = MinimapScanner()
         assert scanner.CENTER_EXCLUSION_RADIUS_PX == 14.0
         assert scanner.CLASS_ID_SPROUT == 9
         assert scanner.CLASS_ID_MONSTER_DOT == 11
 
-        # Center exclusion logic: points within r <= 14px of player center (150, 150 in 300x300) must be rejected
-        cx, cy = 150, 150
-        in_center_pt = (152, 149)
-        dist = ((in_center_pt[0] - cx) ** 2 + (in_center_pt[1] - cy) ** 2) ** 0.5
-        assert dist <= scanner.CENTER_EXCLUSION_RADIUS_PX
+        # Production player centre for a blank 300x300 crop (no arrow drawn yet).
+        blank = np.full((300, 300, 3), (25, 30, 22), dtype=np.uint8)
+        pcx, pcy = scanner.get_minimap_player_center(blank.shape, crop_bgr=blank)
+        cx, cy = int(round(pcx)), int(round(pcy))
+
+        def _crop_with_dot(dot_dx: int, dot_dy: int) -> np.ndarray:
+            crop = np.full((300, 300, 3), (25, 30, 22), dtype=np.uint8)
+            cv2.circle(crop, (cx, cy), 6, (255, 255, 255), -1)  # player arrow
+            cv2.circle(crop, (cx + dot_dx, cy + dot_dy), 4, (255, 255, 255), -1)
+            return crop
+
+        # Dot ~2px from centre: inside r<=14 -> must NOT appear as a monster dot.
+        near = scanner.scan_minimap_crop(_crop_with_dot(2, -1))
+        near_positions = [d["pos"] for d in near["monster_dots"]]
+        assert near_positions == [], (
+            f"Dot at r~2px from player centre must be excluded, got {near_positions}"
+        )
+        assert all(d["dist_px"] > scanner.CENTER_EXCLUSION_RADIUS_PX for d in near["monster_dots"])
+
+        # Identical dot 50px away: outside r<=14 -> must be reported as monster dot 11.
+        far = scanner.scan_minimap_crop(_crop_with_dot(50, 0))
+        assert len(far["monster_dots"]) == 1, f"Expected 1 far monster dot, got {far['monster_dots']}"
+        far_dot = far["monster_dots"][0]
+        assert far_dot["class_id"] == 11
+        assert far_dot["dist_px"] > scanner.CENTER_EXCLUSION_RADIUS_PX
+        assert abs(far_dot["pos"][0] - (cx + 50)) <= 2
+        assert abs(far_dot["pos"][1] - cy) <= 2
 
         # Test Taxonomy isolation: MinimapScanner must reject world 3D class injections
         det_world = {"class_id": 0, "class_name": "herb_aria", "source": "minimap"}
@@ -583,7 +689,7 @@ class TestPart3DataHygieneAndZeroBugGuardrails:
         assert is_navigable_element(15) is True   # Path Ground
 
     def test_pre_training_hygiene_gate_invariants(self, temp_dataset_dir: Path):
-        """pre_training_dataset_hygiene_gate must purge invalid classes, unapproved boxes, and orphans in sub-second time."""
+        """pre_training_dataset_hygiene_gate must purge invalid classes, unapproved boxes, and orphans."""
         # Setup contaminated dataset
         (temp_dataset_dir / "images" / "train" / "img_01.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32)
         (temp_dataset_dir / "images" / "train" / "img_02.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 32)
@@ -617,7 +723,11 @@ class TestPart3DataHygieneAndZeroBugGuardrails:
         assert report["status"] == "PASSED"
         assert report["purged_boxes"] >= 1
         assert report["fixed_files"] >= 1
-        assert report["duration_ms"] < 1000.0  # Sub-second guarantee
+        # duration_ms is reported for observability only — it is a wall-clock
+        # measurement, so no threshold is asserted here (timing assertions
+        # are flaky under load and prove nothing about correctness).
+        assert isinstance(report["duration_ms"], (int, float))
+        assert report["duration_ms"] >= 0.0
 
         # Second pass must be 100% clean
         clean_report = pre_training_dataset_hygiene_gate(temp_dataset_dir, auto_clean=True)
@@ -633,37 +743,74 @@ class TestPart4PerformanceAndVectorization:
     """Verifies vectorized NumPy dot product speed and accuracy, as well as
     incremental label cache delta detection."""
 
-    def test_vectorized_exemplar_memory_numpy_dot_product_speed_and_accuracy(self):
-        """Vectorized NumPy dot product must yield exact numerical equivalence to cosine loops
-        and achieve sub-millisecond execution for 100 exemplars."""
+    def test_vectorized_exemplar_memory_numpy_dot_product_speed_and_accuracy(self, tmp_path: Path):
+        """The REAL ExemplarMemory vectorized match (np.dot over the
+        pre-normalized (N, 438) exemplar matrix) must yield exact numerical
+        equivalence to a per-exemplar cosine loop and stay sub-millisecond
+        for the dot product over 100 exemplars.
+
+        100 distinct real crops are loaded through the production JSON path
+        (ExemplarMemory.load + _rebuild_matrices), then a query crop identical
+        to exemplar #42 must match itself with sim ~1.0 and class 0."""
         N = 100
-        D = 432  # 12 Hue x 6 Sat x 6 Val bins
+        D = 438  # 432 HSV bins + aspect ratio + 5 texture bins
 
-        np.random.seed(42)
-        raw_matrix = np.random.rand(N, D).astype(np.float32)
-        # Normalize L2
-        norms = np.linalg.norm(raw_matrix, axis=1, keepdims=True)
-        norm_matrix = raw_matrix / np.maximum(norms, 1e-7)
+        # 100 distinct real crops (cycling hue/sat/val) -> real production features.
+        crops = [
+            _hsv_patch((i * 37) % 180, 90 + (i * 53) % 160, 110 + (i * 71) % 140, seed=1000 + i)
+            for i in range(N)
+        ]
+        positives = []
+        for crop in crops:
+            feat = extract_crop_features(crop)
+            assert feat is not None
+            positives.append({
+                "class_id": 0,
+                "class_name": "herb_aria",
+                "hsv_hist": feat["hsv_hist"],
+                "aspect_ratio": feat["aspect_ratio"],
+                "texture": feat["texture"],
+                "mean_hsv": feat.get("mean_hsv", []),
+                "source": "ui_approval",
+            })
+        ex_file = tmp_path / "learned_exemplars.json"
+        ex_file.write_text(json.dumps({"version": 1, "positive": positives, "negative": []}), encoding="utf-8")
+        memory = ExemplarMemory(json_path=ex_file)
+        assert len(memory._positive) == N
+        assert memory._pos_matrix is not None and memory._pos_matrix.shape == (N, D)
 
-        raw_query = np.random.rand(D).astype(np.float32)
-        norm_query = raw_query / max(float(np.linalg.norm(raw_query)), 1e-7)
-
-        # 1. Vectorized dot product
+        # 1. Production vectorized match on a query identical to exemplar #42.
+        query = crops[42]
         t0 = time.perf_counter()
-        vectorized_sims = np.dot(norm_matrix, norm_query)
+        sim, cid, cname, best_ex = memory.match_positive(query)
+        match_duration = time.perf_counter() - t0
+        assert cid == 0 and cname == "herb_aria"
+        assert best_ex is not None and int(best_ex["class_id"]) == 0
+        assert sim >= 0.99, f"Identical query crop must match with sim ~1.0, got {sim}"
+
+        # 2. The same dot product, computed directly over the production matrix,
+        #    must equal the production result and the per-exemplar cosine loop.
+        query_feat = extract_crop_features(query)
+        assert query_feat is not None
+        query_vec = feature_dict_to_normalized_vector(query_feat)
+        t0 = time.perf_counter()
+        vectorized_sims = np.dot(memory._pos_matrix, query_vec)
         vec_duration = time.perf_counter() - t0
-
-        # 2. Sequential loop dot product
-        t0 = time.perf_counter()
-        loop_sims = np.array([float(np.dot(norm_matrix[i], norm_query)) for i in range(N)], dtype=np.float32)
-        loop_duration = time.perf_counter() - t0
-
-        # Verify numerical accuracy within 1e-5
+        loop_sims = np.array(
+            [float(np.dot(feature_dict_to_normalized_vector(ex), query_vec)) for ex in memory._positive],
+            dtype=np.float32,
+        )
         assert np.allclose(vectorized_sims, loop_sims, atol=1e-5), "Vectorized sims must match loop sims"
+        assert np.allclose(float(vectorized_sims.max()), float(sim), atol=1e-3)
+        assert int(np.argmax(vectorized_sims)) == 42
 
-        # Verify sub-millisecond speed
+        # 3. Vectorized dot product stays sub-millisecond for 100 exemplars.
         assert vec_duration < 0.005, f"Vectorized dot product must take < 5ms, took {vec_duration * 1000:.3f}ms"
-        assert loop_duration >= vec_duration, "Vectorized operation must be as fast or faster than iterative loop"
+        assert match_duration < 1.0, f"Production match_positive must take < 1s, took {match_duration:.3f}s"
+
+        # 4. No learned negatives -> match_negative returns the zero sentinel.
+        neg_sim, neg_ex = memory.match_negative(query, class_id=0)
+        assert neg_sim == 0.0 and neg_ex is None
 
     def test_incremental_label_cache_delta_detection(self, tmp_path: Path):
         """LabelCache must perform delta skipping when file and revision are unchanged,

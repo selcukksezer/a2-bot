@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -20,12 +21,27 @@ if str(ROOT) not in sys.path:
 from tools.hid_com_util import (
     env_export_line,
     format_port_table,
+    hid_candidates,
     list_com_ports,
     pick_best_port,
     port_devices,
     wait_for_new_com,
     write_settings_serial_port,
 )
+
+_PORT_RE = re.compile(r"^COM[0-9]+$", re.IGNORECASE)
+
+
+def _valid_port(port: str) -> str:
+    """Validate a COM port name (e.g. COM5); return normalised upper-case form.
+
+    F-1227: port bicimi hic dogrulanmiyordu; gecersiz deger settings.json'a
+    yazilabiliyordu.
+    """
+    port = str(port or "").strip().upper()
+    if not _PORT_RE.match(port):
+        raise ValueError(f"invalid COM port: {port!r} (expected e.g. COM5)")
+    return port
 
 
 def main() -> int:
@@ -59,7 +75,21 @@ def main() -> int:
         print(format_port_table())
         return 0
 
-    port = str(args.port or "").strip()
+    # F-1227: konumsal port + --wait-plug birlikte verilirse --wait-plug
+    # konumsal portu sessizce eziyordu; artik catisma acikca reddedilir.
+    if args.port and args.wait_plug:
+        print(
+            "ERROR: pass either a COM port or --wait-plug, not both "
+            f"(got port {args.port!r} with --wait-plug)",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        port = _valid_port(args.port) if args.port else ""
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print(format_port_table(), file=sys.stderr)
+        return 2
     prefer_new: list[str] = []
 
     if args.wait_plug:
@@ -74,12 +104,32 @@ def main() -> int:
             return 1
         prefer_new = fresh
         print("New COM:", ", ".join(fresh))
-        port = pick_best_port(prefer_new=fresh) or fresh[0]
+        # F-1227: `pick_best_port(...) or fresh[0]` yeni portu aday olup
+        # olmadigina bakmadan seciyordu. Belirsiz/aday-disi durumda hata ver.
+        picked = pick_best_port(prefer_new=fresh)
+        if not picked:
+            cands = hid_candidates()
+            print(
+                "ERROR: new COM(s) could not be resolved to a single HID "
+                f"candidate: {', '.join(fresh)}; candidates: "
+                + (", ".join(c.device for c in cands) or "(none)"),
+                file=sys.stderr,
+            )
+            return 1
+        port = _valid_port(picked)
 
     if args.auto and not port:
         port = pick_best_port()
         if not port:
-            print("ERROR: no Pico/Leonardo/CDC candidate COM found", file=sys.stderr)
+            cands = hid_candidates()
+            if cands:
+                print(
+                    "ERROR: ambiguous HID candidates, pick one explicitly: "
+                    + ", ".join(c.device for c in cands),
+                    file=sys.stderr,
+                )
+            else:
+                print("ERROR: no Pico/Leonardo/CDC candidate COM found", file=sys.stderr)
             print(format_port_table(), file=sys.stderr)
             return 1
 

@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
-import platform
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -27,12 +28,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
+from version import __version__
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -61,8 +62,68 @@ ALLOWED_REMOTE_COMMANDS: Set[str] = {
     "reset_stuck",
 }
 
+# ntfy topic formatlari: yeni konular 128-bit rastgele (32 hex), eski
+# deterministik konular 32-bit (8 hex) idi ve tahmin edilebiliyordu.
+_NTFY_TOPIC_RE = re.compile(r"^gatherion_tr_[0-9a-f]{32}$")
+_WEAK_TOPIC_RE = re.compile(r"^gatherion_tr_[0-9a-f]{8}$")
+_MAX_SEEN_MESSAGE_IDS = 5000
+# Imzali uzaktan komut gecerlilik penceresi (P0-4 / K-09): imza yukundeki
+# zaman damgasi, dogrulama anina gore bu pencerenin disindaysa komut
+# reddedilir. Ornek sinif duzeyinde degistirilebilir; tekil relay
+# ornegi icin `signed_command_max_age_sec` niteligi ayni degeri tasir.
+SIGNED_COMMAND_MAX_AGE_SEC = 300
+# Tek kullanimlik komut id'leri (cid) icin gorulmus-kume tavani. Asimda
+# en eski kayit atilir (tum kumenin silinmesi eski id'lerin replay'ine
+# yol acardi). Kayitlar yalnizca surec omru boyunca tutulur.
+_MAX_SEEN_COMMAND_IDS = 5000
+_COMMAND_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+# ntfy yoklamasi cevrimdisi/hatali iken araligi katlayarak artirir:
+# 3.5 sn -> 7 -> 14 -> 28 -> 30 sn (tavan); basarili yoklamada tabana doner.
+_POLL_BACKOFF_CAP_SEC = 30.0
 
-def get_lan_ip() -> str:
+
+def _validate_server_url(url: str, default: str = "https://ntfy.sh") -> str:
+    """Yalnizca https:// semali, host'lu bir relay URL'si kabul et.
+
+    S325 (v19/P3-8): köşeli parantezsiz çıplak IPv6
+    (https://2001:db8::1/...) eskiden geçiyordu — urlparse netloc'u
+    doldurur ama hostname '2001' olur, istek yanlış hosta gider.
+    Birden fazla ':' içeren netloc köşeli parantezli IPv6 olmak
+    zorunda; ayrıca geçersiz port da reddedilir.
+    """
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+        if parsed.scheme == "https" and parsed.netloc and " " not in parsed.netloc:
+            host = parsed.netloc.split("@")[-1]
+            if host.count(":") > 1 and not host.startswith("["):
+                return default
+            _ = parsed.hostname  # geçersiz IPv6/port ValueError fırlatır
+            _ = parsed.port
+            return str(url).strip().rstrip("/")
+    except Exception:
+        pass
+    return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+_LAN_IP_CACHE: Dict[str, Any] = {"ip": None, "at": 0.0}
+_LAN_IP_TTL_SEC = 30.0
+
+
+def _detect_lan_ip() -> str:
     """Detect the primary active LAN IPv4 address of this machine."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -84,6 +145,24 @@ def get_lan_ip() -> str:
         _ = exc
 
     return "127.0.0.1"
+
+
+def get_lan_ip() -> str:
+    """Detect the primary active LAN IPv4 address of this machine.
+
+    Sonuc 30 sn TTL ile onbellege alinir: LAN IP'si nadiren degisir ama
+    get_status()/get_lan_url() her cagrida (panel yoklamasi) soket aciyordu.
+    TTL dolunca yeniden tespit edilir; cevrimdisi iken donen 127.0.0.1 de
+    ayni TTL ile onbellege alinir (kalici degil, 30 sn sonra tekrar denenir).
+    """
+    now = time.monotonic()
+    cached_ip = _LAN_IP_CACHE.get("ip")
+    if cached_ip and (now - float(_LAN_IP_CACHE.get("at", 0.0))) < _LAN_IP_TTL_SEC:
+        return str(cached_ip)
+    ip = _detect_lan_ip()
+    _LAN_IP_CACHE["ip"] = ip
+    _LAN_IP_CACHE["at"] = now
+    return ip
 
 
 def get_lan_url(port: int = 8765, token: Optional[str] = None) -> str:
@@ -120,16 +199,33 @@ class NtfyCloudRelay:
         self.enabled: bool = True
         self.publish_interval_sec: float = 30.0
         self.poll_interval_sec: float = 3.5
+        # Uzaktan komut kimlik dogrulama: her kuruluma ozel, config dosyasinda
+        # saklanan gizli anahtarla HMAC-SHA256 imzasi. Imzasiz komutlar
+        # poll_commands_once tarafindan dagitilmaz (yalnizca sayilir).
+        self.command_secret: str = ""
+        self.require_signed_commands: bool = True
+        # Imzali komut zaman penceresi (sn); SIGNED_COMMAND_MAX_AGE_SEC
+        # varsayilanidir, ornek basina degistirilebilir.
+        self.signed_command_max_age_sec: float = float(SIGNED_COMMAND_MAX_AGE_SEC)
+        self._rejected_commands: int = 0
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._listener_thread: Optional[threading.Thread] = None
         self._seen_message_ids: Set[str] = set()
+        # Gorulmus tek-kullanimlik komut id'leri (cid -> goruldugu zaman):
+        # imzali komutlarda replay korumasi bu kumeye dayanir, ntfy
+        # mesaj id'sine degil. Yalnizca surec omru boyunca tutulur.
+        self._seen_command_ids: Dict[str, float] = {}
         self._last_poll_timestamp: int = int(time.time())
         self._last_publish_ts: float = 0.0
         self._last_error: str = ""
         self._published_count: int = 0
         self._received_commands: List[Dict[str, Any]] = []
+        # Uyarlanabilir yoklama araligi: art arda hata sayisi ve o anki aralik.
+        # _listener_loop bu araligi bekler; basarili yoklama tabana dondurur.
+        self._consecutive_poll_errors: int = 0
+        self._current_poll_interval_sec: float = self.poll_interval_sec
 
         self._load_or_create_config()
 
@@ -146,12 +242,13 @@ class NtfyCloudRelay:
         return f"{self.server_url}/{self.command_topic}"
 
     def _generate_unique_topic(self) -> str:
-        machine_seed = f"{platform.node()}-{uuid.getnode()}-{os.getpid()}-{time.time_ns()}"
-        digest = hashlib.sha256(machine_seed.encode("utf-8")).hexdigest()[:8]
-        return f"gatherion_tr_{digest}"
+        # 128-bit kriptografik rastgele konu: hostname/PID/zaman gibi
+        # tahmin edilebilir girdilerden turetilmez.
+        return f"gatherion_tr_{secrets.token_hex(16)}"
 
     def _load_or_create_config(self) -> None:
         with self._lock:
+            needs_save = False
             try:
                 if self.config_path.exists():
                     raw = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -160,15 +257,38 @@ class NtfyCloudRelay:
                         if saved_topic and re.match(r"^[a-zA-Z0-9_-]{6,64}$", saved_topic):
                             self.topic = saved_topic
                         self.enabled = bool(raw.get("enabled", True))
-                        self.server_url = str(raw.get("server_url", self.server_url)).rstrip("/")
+                        self.server_url = _validate_server_url(
+                            str(raw.get("server_url", self.server_url)), self.server_url
+                        )
                         self.publish_interval_sec = max(
                             5.0, float(raw.get("publish_interval_sec", 30.0))
                         )
+                        saved_secret = str(raw.get("command_secret", "")).strip()
+                        if saved_secret:
+                            self.command_secret = saved_secret
+                        if isinstance(raw.get("require_signed_commands"), bool):
+                            self.require_signed_commands = bool(
+                                raw.get("require_signed_commands")
+                            )
             except Exception as exc:
                 self._last_error = f"Config load warning: {exc}"
 
+            # Eski 32-bit deterministik konu (8 hex) tahmin edilebilir oldugu
+            # icin ilk yuklemede yenisiyle degistirilir. Bu goc yolu
+            # regenerate_topic() uzerinden gecer: rotasyon mantigi tek
+            # yerde kalir ve metot canli bir cagirana sahip olur (F-0138).
+            if self.topic and _WEAK_TOPIC_RE.match(self.topic):
+                self.regenerate_topic()
+
+            if not self.command_secret:
+                self.command_secret = secrets.token_hex(32)
+                needs_save = True
+
             if not self.topic:
                 self.topic = self._generate_unique_topic()
+                needs_save = True
+
+            if needs_save:
                 self.save_config()
 
     def save_config(self) -> None:
@@ -181,6 +301,8 @@ class NtfyCloudRelay:
                     "server_url": self.server_url,
                     "enabled": self.enabled,
                     "publish_interval_sec": self.publish_interval_sec,
+                    "command_secret": self.command_secret,
+                    "require_signed_commands": self.require_signed_commands,
                     "web_topic_url": self.web_topic_url,
                     "web_command_url": self.web_command_url,
                     "updated_at": int(time.time()),
@@ -192,12 +314,184 @@ class NtfyCloudRelay:
                 self._last_error = f"Config save error: {exc}"
 
     def regenerate_topic(self) -> str:
-        """Generate a fresh private ntfy topic and persist it."""
+        """Generate a fresh private ntfy topic and persist it.
+
+        Canli cagiranlar: zayif (8-hex) konu goc yolu
+        (_load_or_create_config) ve FreeCloudTunnelManager.regenerate_ntfy_topic
+        (diyalogdaki rotasyon butonunun baglanacagi herkese acik API).
+        """
         with self._lock:
             self.topic = self._generate_unique_topic()
             self._seen_message_ids.clear()
+            self._seen_command_ids.clear()
             self.save_config()
             return self.topic
+
+    @staticmethod
+    def _signed_payload(cmd: str, ts: int, command_id: str) -> str:
+        """HMAC'a giren kanonik yuk: komut + zaman damgasi + tek-kullanimlik id."""
+        return f"{cmd}\n{ts}\n{command_id}"
+
+    def _record_seen_command_id(self, command_id: str, now: float) -> bool:
+        """cid'yi gorulmus kumesine ekle; daha once gorulduyse False don.
+
+        Suresi dolmus kayitlar budanir, kume tasarsa en eski kayit atilir
+        (tum kumenin bosaltilmasi eski id'lere replay araligi acardi).
+        """
+        with self._lock:
+            if command_id in self._seen_command_ids:
+                return False
+            cutoff = now - max(0.0, float(self.signed_command_max_age_sec))
+            expired = [
+                cid for cid, seen_at in self._seen_command_ids.items()
+                if seen_at < cutoff
+            ]
+            for cid in expired:
+                del self._seen_command_ids[cid]
+            while len(self._seen_command_ids) >= _MAX_SEEN_COMMAND_IDS:
+                self._seen_command_ids.pop(next(iter(self._seen_command_ids)))
+            self._seen_command_ids[command_id] = now
+            return True
+
+    def sign_command(
+        self,
+        cmd: str,
+        *,
+        ts: Optional[int] = None,
+        command_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Imzali uzaktan komut yuku uret (P0-4 / K-09).
+
+        Yuk: {"cmd", "ts", "cid", "sig"}; "sig", kanonik
+        "cmd\\n<ts>\\n<cid>" dizesinin HMAC-SHA256'sidir. "ts" unix
+        saniye, "cid" tek-kullanimlik komut id'sidir (varsayilan:
+        128-bit rastgele, 32 hex). Telefon tarafi komutlari bu imzayla
+        gondermelidir; imzasiz / eski formatli komutlar
+        poll_commands_once tarafindan dagitilmaz.
+        """
+        clean = str(cmd or "").strip().lower()
+        stamp = int(time.time()) if ts is None else int(ts)
+        cid = command_id if command_id else secrets.token_hex(16)
+        sig = hmac.new(
+            self.command_secret.encode("utf-8"),
+            self._signed_payload(clean, stamp, cid).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return {"cmd": clean, "ts": stamp, "cid": cid, "sig": sig}
+
+    def verify_command_signature(
+        self,
+        cmd: str,
+        signature: Any,
+        *,
+        ts: Any = None,
+        command_id: Any = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Imzali komutu dogrula; fail-closed (P0-4 / K-09).
+
+        Gecerli sayilmasi icin: (1) "ts" ve "cid" verilmis olmali —
+        eski {"cmd", "sig"} yukleri reddedilir; (2) |simdi - ts| <=
+        signed_command_max_age_sec (varsayilan 300 sn) olmali;
+        (3) HMAC kanonik "cmd\\n<ts>\\n<cid>" uzerinden sabit sureli
+        karsilastirmayla tutmali; (4) "cid" daha once gorulmemis
+        olmali (replay reddi). Basarili dogrulama cid'yi gorulmus
+        kumesine yazar, boylece ayni yukun ikinci sunumu (yeni ntfy
+        mesaj id'siyle bile) reddedilir. "now" yalnizca test edilebilirlik
+        icindir; verilmezse time.time() kullanilir.
+        """
+        if not cmd or not isinstance(signature, str) or not self.command_secret:
+            return False
+        clean = str(cmd).strip().lower()
+        if not isinstance(command_id, str) or not _COMMAND_ID_RE.match(command_id):
+            return False
+        if isinstance(ts, bool):
+            return False
+        if isinstance(ts, int):
+            stamp = ts
+        elif isinstance(ts, str) and re.fullmatch(r"[0-9]+", ts.strip()):
+            stamp = int(ts.strip())
+        else:
+            # Zaman damgasi yok / sayi degil: eski imzasiz form dahil reddet.
+            return False
+        moment = float(time.time()) if now is None else float(now)
+        if abs(moment - stamp) > max(0.0, float(self.signed_command_max_age_sec)):
+            return False
+        expected = hmac.new(
+            self.command_secret.encode("utf-8"),
+            self._signed_payload(clean, stamp, command_id).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        try:
+            if not hmac.compare_digest(expected, signature.strip()):
+                return False
+        except Exception:
+            return False
+        # HMAC + pencere gecti: cid'yi isaretle; tekrar sunum replay'dir.
+        return self._record_seen_command_id(command_id, moment)
+
+    def _note_message_id(self, dedup_key: str) -> bool:
+        """ntfy mesaj id'sini gorulmus kumesine ekle; tekrar ise False don.
+
+        Yalnizca cid tasimayan (imzasiz/legacy ya da komut olmayan)
+        mesajlar icin kullanilir; imzali komutlarda dedup cid ile
+        yapilir (verify_command_signature), mesaj id'siyle degil.
+        """
+        with self._lock:
+            if dedup_key in self._seen_message_ids:
+                return False
+            if len(self._seen_message_ids) > _MAX_SEEN_MESSAGE_IDS:
+                self._seen_message_ids.clear()
+            self._seen_message_ids.add(dedup_key)
+            return True
+
+    def publish_command(self, cmd: str, timeout: float = 6.0) -> bool:
+        """Y-5 (dilim 22): imzalı uzaktan komut gönder — `sign_command`
+        ile üretilen `{"cmd", "ts", "cid", "sig"}` yükünü
+        `<topic>_cmd` kanalına yazar; `poll_commands_once` bunu HMAC
+        doğrulamasıyla dağıtır.
+        Bu, imza üretecek repo-içi yoldur (CLI: `python -m
+        core.mobile_tunnel send <komut>`). Komut ALLOWED listesinde
+        değilse gönderilmez."""
+        clean = str(cmd or "").strip().lower()
+        if clean not in ALLOWED_REMOTE_COMMANDS:
+            with self._lock:
+                self._last_error = f"publish_command reddedildi (izinli komut değil): {clean}"
+            return False
+        if not self.enabled or not self.topic:
+            return False
+        signed = self.sign_command(clean)
+        url = f"{self.server_url}/{urllib.parse.quote(self.command_topic)}"
+        data = json.dumps(signed).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": "GatherionMobileRelay/2.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                ok = 200 <= int(resp.status) < 300
+                if ok:
+                    with self._lock:
+                        self._published_count += 1
+                        self._last_publish_ts = time.time()
+                        self._last_error = ""
+                return ok
+        except Exception as exc:
+            with self._lock:
+                self._last_error = f"ntfy signed command publish failed: {exc}"
+            return False
+
+    def set_remote_command_handler(
+        self, on_command: Optional[Callable[[str, Dict[str, Any]], None]]
+    ) -> None:
+        """Uzaktan komut callback'ini bagla (uretimde main.py tarafindan cagrilir)."""
+        with self._lock:
+            self.on_command = on_command
 
     def publish_message(
         self,
@@ -260,21 +554,31 @@ class NtfyCloudRelay:
             return False
 
         state = str(stats.get("state", "IDLE"))
-        gathers = int(stats.get("total_gathers", stats.get("gathered", 0)))
-        rate_hr = float(stats.get("gathers_per_hour", 0.0))
-        hp_pct = float(stats.get("hp_pct", 100.0))
+        gathers = _safe_int(stats.get("total_gathers", stats.get("gathered", 0)))
+        rate_hr = _safe_float(stats.get("gathers_per_hour", 0.0))
+        # HP okunamiyorsa uydurma varsayilan YOK (S-1901/S-2002): bilinmeyen
+        # HP "%100" diye raporlanamaz; okunamayan deger "bilinmiyor" yazilir.
+        hp_pct: Optional[float] = None
+        hp_raw = stats.get("hp_pct")
+        if hp_raw is not None:
+            try:
+                hp_pct = float(hp_raw)
+            except (TypeError, ValueError):
+                hp_pct = None
+        hp_text = f"%{hp_pct:.0f}" if hp_pct is not None else "bilinmiyor"
         route_name = str(stats.get("route_name", stats.get("active_route", "-")))
         wp_idx = stats.get("waypoint_index", "-")
         uptime = str(stats.get("uptime_str", stats.get("uptime", "00:00:00")))
 
         lines = [
-            f"Durum: {state} | HP: %{hp_pct:.0f}",
+            f"Durum: {state} | HP: {hp_text}",
             f"Toplama: {gathers} adet ({rate_hr:.1f}/saat)",
             f"Rota: {route_name} (WP #{wp_idx}) | Süre: {uptime}",
         ]
         if public_url:
             lines.append(f"Canlı Panel: {public_url}")
-        lines.append(f"Komut Gönder ({self.command_topic}): pause | resume | f8 | skip | panic")
+        # Komut kanali (command_topic) telemetri mesajinda duyurulmaz:
+        # konu adini bilen herkes imzasiz komut deneyebilirdi.
 
         return self.publish_message(
             message="\n".join(lines),
@@ -394,6 +698,10 @@ class NtfyCloudRelay:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw_body = resp.read().decode("utf-8", errors="replace")
+            # Basarili yoklama (yeni komut olmasa bile): geri cekilmeyi sifirla.
+            with self._lock:
+                self._consecutive_poll_errors = 0
+                self._current_poll_interval_sec = self.poll_interval_sec
 
             for line in raw_body.splitlines():
                 line = line.strip()
@@ -412,16 +720,46 @@ class NtfyCloudRelay:
                 msg_text = str(event.get("message", ""))
 
                 with self._lock:
-                    if msg_id and msg_id in self._seen_message_ids:
-                        continue
-                    if msg_id:
-                        self._seen_message_ids.add(msg_id)
                     if msg_time > self._last_poll_timestamp:
                         self._last_poll_timestamp = msg_time
 
                 parsed = self.parse_remote_command(msg_text)
                 if parsed is not None:
                     cmd, meta = parsed
+                    # Dedup (P0-4 / K-09): cid tasiyan imzali komutlarda
+                    # dedup komut id'siyledir — yeni ntfy mesaj id'siyle
+                    # yeniden gonderilen ayni komut, verify icindeki
+                    # gorulmus-cid kontrolunde reddedilir. cid tasimayan
+                    # (imzasiz/legacy) yuklerde dedup eskisi gibi mesaj
+                    # id'si / (zaman + icerik) karmasiyla yapilir.
+                    if not (isinstance(meta.get("cid"), str) and meta.get("cid")):
+                        dedup_key = msg_id or hashlib.sha256(
+                            f"{msg_time}:{msg_text}".encode("utf-8", errors="ignore")
+                        ).hexdigest()[:16]
+                        if not self._note_message_id(dedup_key):
+                            continue
+                    # Imzasiz/token'suz uzaktan komut kabul edilmez: yalnizca
+                    # gecerli HMAC imzali komutlar dagitilir. verify; ts/cid
+                    # eksik ya da suresi dolmus ya da cid tekrar ise reddeder.
+                    if self.require_signed_commands and not self.verify_command_signature(
+                        cmd, meta.get("sig"), ts=meta.get("ts"),
+                        command_id=meta.get("cid"),
+                    ):
+                        with self._lock:
+                            self._rejected_commands += 1
+                            self._last_error = (
+                                f"Rejected unsigned remote command: {cmd}"
+                            )
+                        # Reddedilen yukun `since` ortusmesinde (2 sn)
+                        # tekrar sayilmamasi icin mesaj id'sini isaretle;
+                        # bu, imzali komutlarda dedup degildir — dedup
+                        # cid ile verify icinde yapilir.
+                        self._note_message_id(
+                            msg_id or hashlib.sha256(
+                                f"{msg_time}:{msg_text}".encode("utf-8", errors="ignore")
+                            ).hexdigest()[:16]
+                        )
+                        continue
                     record = {
                         "id": msg_id,
                         "command": cmd,
@@ -443,6 +781,14 @@ class NtfyCloudRelay:
         except Exception as exc:
             with self._lock:
                 self._last_error = f"ntfy poll error: {exc}"
+                # Cevrimdisi/hatali iken yoklama araligini katla (tavan 30 sn):
+                # ntfy.sh'a sabit 3.5 sn aralikla vurmak yerine hata suresince
+                # istek sayisi azalir; basarili yoklamada aralik tabana doner.
+                self._consecutive_poll_errors += 1
+                self._current_poll_interval_sec = min(
+                    _POLL_BACKOFF_CAP_SEC,
+                    self.poll_interval_sec * (2 ** self._consecutive_poll_errors),
+                )
 
         return dispatched
 
@@ -456,6 +802,8 @@ class NtfyCloudRelay:
             if self._listener_thread is not None and self._listener_thread.is_alive():
                 return
             self._stop_event.clear()
+            self._consecutive_poll_errors = 0
+            self._current_poll_interval_sec = self.poll_interval_sec
             self._last_poll_timestamp = int(time.time())
             self._listener_thread = threading.Thread(
                 target=self._listener_loop,
@@ -477,7 +825,9 @@ class NtfyCloudRelay:
         while not self._stop_event.is_set():
             if self.enabled:
                 self.poll_commands_once(timeout=4.5)
-            self._stop_event.wait(self.poll_interval_sec)
+            # Hata suresince aralik katlanarak artar (tavan 30 sn); basarida
+            # poll_commands_once araligi poll_interval_sec tabanina dondurur.
+            self._stop_event.wait(self._current_poll_interval_sec)
 
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
@@ -492,17 +842,56 @@ class NtfyCloudRelay:
                 ),
                 "published_count": self._published_count,
                 "received_commands": list(self._received_commands[-10:]),
+                "require_signed_commands": self.require_signed_commands,
+                "rejected_commands": self._rejected_commands,
+                "signed_command_max_age_sec": self.signed_command_max_age_sec,
+                "seen_command_ids": len(self._seen_command_ids),
+                "poll_interval_sec": self._current_poll_interval_sec,
+                "consecutive_poll_errors": self._consecutive_poll_errors,
                 "last_error": self._last_error,
             }
 
     def get_mobile_tunnel_ready_flag(self) -> dict:
-        return {"module": "mobile_tunnel", "ready": True}
+        # Kosulsuz True YOK (S-2001): hazirlik, relay'in gercek durumuna
+        # baglidir — etkin + konu yapilandirilmis olmali.
+        ready = bool(self.enabled and self.topic)
+        return {
+            "module": "mobile_tunnel",
+            "ready": ready,
+            "enabled": self.enabled,
+            "topic_configured": bool(self.topic),
+        }
 
     def get_mobile_tunnel_version_info(self) -> dict:
-        return {"module": "mobile_tunnel", "version": "2.0.0", "ready": True}
+        return {
+            "module": "mobile_tunnel",
+            "version": __version__,
+            "ready": bool(self.enabled and self.topic),
+        }
 
     def get_mobile_tunnel_diagnostic_snapshot(self) -> dict:
-        return {"module": "mobile_tunnel", "status": "ok", "ready": True}
+        # Kosulsuz "ok"/True YOK (S-2001): durum canli yoklamadan cikar.
+        with self._lock:
+            listener_running = bool(
+                self._listener_thread is not None and self._listener_thread.is_alive()
+            )
+            last_error = self._last_error
+            published_count = self._published_count
+        ready = bool(self.enabled and self.topic)
+        if not ready:
+            status = "disabled" if not self.enabled else "unconfigured"
+        elif last_error:
+            status = "degraded"
+        else:
+            status = "ok"
+        return {
+            "module": "mobile_tunnel",
+            "status": status,
+            "ready": ready,
+            "listener_running": listener_running,
+            "published_count": published_count,
+            "last_error": last_error,
+        }
 
 
 
@@ -527,15 +916,43 @@ class FreeCloudTunnelManager:
         self.public_url: Optional[str] = None
         self.active_method: str = "none"
         self.ntfy_relay: NtfyCloudRelay = NtfyCloudRelay(on_command=on_remote_command)
+        # Guvenlik token'i yalnizca cagiran (mobile_server) tarafindan
+        # belirlenirse token korumasi var sayilir; varsayilan korumasizdir.
+        self.security_token: Optional[str] = None
 
         self._lock = threading.RLock()
         self._proc: Optional[subprocess.Popen] = None
         self._reader_threads: List[threading.Thread] = []
         self._url_found_event = threading.Event()
+        self._url_ready_fired: bool = False
+        # P2-8 (K-17): her tünel denemesi nesli artırır; eski denemenin
+        # okuyucu thread'i bayat nesille paylaşımlı duruma yazamaz —
+        # yoksa eski tünelin satırı yeni denemeyi "başarılı" sanıp
+        # çalışan tüneli öldürtür.
+        self._tunnel_generation: int = 0
         self._logs: List[str] = []
         self._last_error: str = ""
         self._is_downloading: bool = False
         self._download_progress: float = 0.0
+
+    def set_security_token(self, token: Optional[str]) -> None:
+        """Mobil panel token'ini kaydet (token_protected raporu buna dayanir)."""
+        with self._lock:
+            self.security_token = str(token).strip() if token else None
+
+    def set_remote_command_handler(
+        self, on_command: Optional[Callable[[str, Dict[str, Any]], None]]
+    ) -> None:
+        """ntfy uzaktan komut callback'ini bagla (uretimde main.py cagrisi gerekir)."""
+        self.ntfy_relay.set_remote_command_handler(on_command)
+
+    def regenerate_ntfy_topic(self) -> str:
+        """ntfy konusunu yenile (eski zayif konularin goc yolu).
+
+        Herkese acik rotasyon API'si: mobil baglanti diyalogundaki
+        rotasyon butonu bu metoda baglanir.
+        """
+        return self.ntfy_relay.regenerate_topic()
 
     def _append_log(self, line: str) -> None:
         clean = line.strip()
@@ -547,18 +964,89 @@ class FreeCloudTunnelManager:
                 self._logs = self._logs[-120:]
 
     def find_cloudflared_binary(self) -> Optional[str]:
-        """Check if `cloudflared.exe` exists in `tools/cloudflared.exe` or system `PATH`."""
+        """Check if `cloudflared.exe` exists in `tools/cloudflared.exe` or system `PATH`.
+
+        Her aday _verify_cloudflared_binary ile dogrulanir (S-0504):
+        dogrulama basarisiz olan ikili (degistirilmis/eski/bozuk) dondurulmez;
+        siradaki adaya gecilir, hicbiri gecemezse None doner ve
+        ensure_cloudflared_binary taze indirmeye duser.
+        """
         if CLOUDFLARED_EXE_PATH.exists() and CLOUDFLARED_EXE_PATH.is_file():
             try:
                 if CLOUDFLARED_EXE_PATH.stat().st_size > 1_000_000:
-                    return str(CLOUDFLARED_EXE_PATH)
+                    if self._verify_cloudflared_binary(CLOUDFLARED_EXE_PATH):
+                        return str(CLOUDFLARED_EXE_PATH)
+                    self._append_log(
+                        f"cloudflared dogrulama basarisiz, yoksayiliyor: {CLOUDFLARED_EXE_PATH}"
+                    )
             except OSError as exc:
                 self._append_log(f"cloudflared stat check warning: {exc}")
 
         which_path = shutil.which("cloudflared") or shutil.which("cloudflared.exe")
         if which_path:
-            return which_path
+            if self._verify_cloudflared_binary(Path(which_path)):
+                return which_path
+            self._append_log(
+                f"cloudflared dogrulama basarisiz, yoksayiliyor: {which_path}"
+            )
 
+        return None
+
+    def _verify_cloudflared_binary(self, path: Path, expected_sha256: Optional[str] = None) -> bool:
+        """cloudflared ikilisini dogrula: boyut + calistirilabilir imza + `--version` calisir.
+
+        O-4 (dilim 22): GitHub 'latest' indirmesinde sabit bir hash
+        yayinlanmadigi icin eskiden yalnızca calistirilabilirlik kaniti
+        araniyordu. Artık indirilen ikilinin SHA-256'sı her zaman
+        hesaplanıp loglanır (operatör `config/cloudflared.sha256`
+        dosyasına yazarak pin'leyebilir); pin dosyası varsa uyumsuz
+        hash reddedilir (fail-closed). Pin yoksa doğrulama eski
+        seviyede kalır — bu durum logda açıkça uyarı olarak yazılır.
+        Windows PE (MZ) ve Linux ELF ikilileri kabul edilir.
+        """
+        try:
+            if not path.exists() or path.stat().st_size <= 1_000_000:
+                return False
+            with open(path, "rb") as fh:
+                header = fh.read(4)
+                if header[:2] != b"MZ" and header != b"\x7fELF":
+                    return False
+            digest = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            actual_sha256 = digest.hexdigest()
+            self._append_log(f"cloudflared SHA-256: {actual_sha256}")
+            if expected_sha256:
+                expected = str(expected_sha256).strip().lower().split()[0]
+                if not expected or not hmac.compare_digest(actual_sha256, expected):
+                    self._append_log(
+                        "cloudflared SHA-256 pin uyumsuzluğu — ikili reddedildi "
+                        f"(beklenen {expected[:16]}..., alınan {actual_sha256[:16]}...)."
+                    )
+                    return False
+            completed = subprocess.run(
+                [str(path), "--version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            return completed.returncode == 0
+        except Exception as exc:
+            self._append_log(f"cloudflared dogrulama hatasi: {exc}")
+            return False
+
+    @staticmethod
+    def _read_pinned_cloudflared_sha256() -> Optional[str]:
+        """`config/cloudflared.sha256` varsa ilk token'ı pin olarak döner."""
+        try:
+            pin_path = CONFIG_DIR / "cloudflared.sha256"
+            if pin_path.is_file():
+                text = pin_path.read_text(encoding="utf-8").strip()
+                if text:
+                    return text.split()[0].lower()
+        except Exception:
+            pass
         return None
 
     def ensure_cloudflared_binary(
@@ -618,6 +1106,20 @@ class FreeCloudTunnelManager:
                             progress_callback(pct, f"cloudflared indiriliyor ({mb_done:.1f} MB)")
 
             if temp_path.exists() and temp_path.stat().st_size > 1_000_000:
+                # O-4 (dilim 22): pin dosyası varsa hash zorunlu tutulur;
+                # yoksa indirilen hash loglanır ki operatör pin'leyebilsin.
+                pinned_sha256 = self._read_pinned_cloudflared_sha256()
+                if not pinned_sha256:
+                    self._append_log(
+                        "UYARI: config/cloudflared.sha256 yok — cloudflared "
+                        "hash pin'i olmadan indiriliyor (yalnızca boyut + "
+                        "imza + --version doğrulaması)."
+                    )
+                if not self._verify_cloudflared_binary(temp_path, expected_sha256=pinned_sha256):
+                    raise RuntimeError(
+                        "Downloaded cloudflared binary failed verification "
+                        "(invalid executable, --version check failed, or SHA-256 pin mismatch)."
+                    )
                 if CLOUDFLARED_EXE_PATH.exists():
                     CLOUDFLARED_EXE_PATH.unlink()
                 temp_path.replace(CLOUDFLARED_EXE_PATH)
@@ -647,6 +1149,12 @@ class FreeCloudTunnelManager:
         pattern: re.Pattern[str],
         method_name: str,
     ) -> threading.Thread:
+        # P2-8: okuyucu doğduğu andaki nesli yakalar; deneme yenilenirse
+        # (yeni nesil) bu okuyucu artık paylaşımlı duruma yazmaz — log
+        # satırı yazmaya devam eder, URL/event yazmaz.
+        with self._lock:
+            generation = self._tunnel_generation
+
         def _reader() -> None:
             try:
                 for raw_line in iter(stream.readline, ""):
@@ -658,13 +1166,21 @@ class FreeCloudTunnelManager:
                         match = pattern.search(line)
                         if match:
                             found_url = match.group(0).strip()
+                            fire_callback = False
                             with self._lock:
+                                if generation != self._tunnel_generation:
+                                    continue
                                 if not self.public_url:
                                     self.public_url = found_url
                                     self.active_method = method_name
                                     self._last_error = ""
                                     self._url_found_event.set()
-                            if self.on_url_ready:
+                                    # on_url_ready yalnizca ilk URL'de bir kez
+                                    # cagrilir; sonraki eslesen satirlar tekrarlamaz.
+                                    if not self._url_ready_fired:
+                                        self._url_ready_fired = True
+                                        fire_callback = True
+                            if fire_callback and self.on_url_ready:
                                 try:
                                     self.on_url_ready(found_url, method_name)
                                 except Exception as cb_exc:
@@ -676,49 +1192,121 @@ class FreeCloudTunnelManager:
         t.start()
         return t
 
-    def start_cloudflare_tunnel(
+    def _snapshot_tunnel(self) -> Dict[str, Any]:
+        """Çalışan tünelin geri yüklenebilir anlık görüntüsü (P2-8).
+
+        Yenileme denemesi öncesi alınır; deneme başarısız olursa eski
+        tünel bu görüntüden geri yüklenir. Canlı tünel yoksa proc/URL
+        None döner — davranış o durumda eskisiyle aynıdır.
+        """
+        with self._lock:
+            return {
+                "proc": self._proc,
+                "public_url": self.public_url,
+                "active_method": self.active_method,
+                "url_ready_fired": self._url_ready_fired,
+            }
+
+    def _snapshot_has_live_tunnel(self, snapshot: Optional[Dict[str, Any]]) -> bool:
+        """Anlık görüntüdeki tünel hâlâ canlı mı? (P2-8)
+
+        Deneme saniyeler sürer; eski süreç o arada ölmüş olabilir —
+        ölü sürecin bayat URL'si geri yüklenmez, durum temizlenir.
+        """
+        if not snapshot or not snapshot.get("public_url"):
+            return False
+        proc = snapshot.get("proc")
+        if proc is None:
+            return False
+        try:
+            return proc.poll() is None
+        except Exception:
+            return False
+
+    def _restore_tunnel_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """`_snapshot_tunnel` görüntüsünü paylaşımlı duruma geri yazar."""
+        with self._lock:
+            self._proc = snapshot.get("proc")
+            self.public_url = snapshot.get("public_url")
+            self.active_method = snapshot.get("active_method") or "none"
+            self._url_ready_fired = bool(snapshot.get("url_ready_fired"))
+            if self.public_url:
+                self._url_found_event.set()
+            else:
+                self._url_found_event.clear()
+
+    def _terminate_proc(self, proc: Any) -> None:
+        """Tek bir alt süreci kibarca durdur (paylaşımlı duruma dokunmaz).
+
+        Kilit tutulmazken çağrılır (deadlock yok): terminate → 3 sn bekle
+        → gerekirse kill. `poll()` ölü ise no-op. Fake/eksik `kill`
+        olan süreçlerde (test double) kill adımı atlanır.
+        """
+        if proc is None:
+            return
+        try:
+            if proc.poll() is not None:
+                return
+        except Exception:
+            return
+        try:
+            proc.terminate()
+        except Exception as exc:
+            self._append_log(f"Tunnel process terminate warning: {exc}")
+            return
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            kill = getattr(proc, "kill", None)
+            if callable(kill):
+                try:
+                    kill()
+                except Exception as exc:
+                    self._append_log(f"Tunnel process kill warning: {exc}")
+                    return
+                try:
+                    proc.wait(timeout=3.0)
+                except Exception:
+                    pass
+        except Exception as exc:
+            self._append_log(f"Tunnel process wait warning: {exc}")
+
+    def _run_tunnel_process(
         self,
-        local_port: Optional[int] = None,
-        auto_download: bool = True,
-        timeout_sec: float = 25.0,
+        cmd: List[str],
+        pattern: re.Pattern[str],
+        *,
+        starting_label: str,
+        reader_name: str,
+        start_log: str,
+        timeout_sec: float,
+        timeout_message: str,
+        error_prefix: str,
+        previous: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
+        """Tünel alt sürecini başlatıp stdout/stderr'de public URL bekleyen
+        ortak gövde (start_cloudflare_tunnel / start_ssh_tunnel).
+
+        P2-8 (K-17): eski tünel deneme ÖNCESİ öldürülmez. `previous`
+        (`_snapshot_tunnel` çıktısı) verilen canlı tünel, deneme
+        başarısız olursa (zaman aşımı / Popen hatası / ikili yok)
+        aynen geri yüklenir ve hata loglanır; yalnızca deneme
+        BAŞARILI olursa eski süreç durdurulur. `previous` yoksa
+        davranış eskisiyle aynıdır (başarısızlıkta durum temizlenir).
         """
-        Method 1 — Start a 100% Free Cloudflare Quick Tunnel (`*.trycloudflare.com`).
-        Spawns `cloudflared tunnel --url http://127.0.0.1:<port> --no-autoupdate`
-        with `CREATE_NO_WINDOW` and parses stdout/stderr for the public HTTPS URL.
-        """
-        self.stop_tunnel()
-        port = int(local_port or self.local_port)
-        self.local_port = port
-
-        binary = self.find_cloudflared_binary()
-        if not binary and auto_download:
-            binary = self.ensure_cloudflared_binary()
-
-        if not binary:
-            with self._lock:
-                self._last_error = "cloudflared.exe bulunamadı ve indirilemedi."
-            return None
-
-        cmd = [
-            binary,
-            "tunnel",
-            "--url",
-            f"http://127.0.0.1:{port}",
-            "--no-autoupdate",
-            "--protocol",
-            "http2",
-        ]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+        new_proc: Any = None
 
         try:
             with self._lock:
+                self._tunnel_generation += 1
                 self.public_url = None
-                self.active_method = "starting_cloudflare"
+                self.active_method = starting_label
                 self._url_found_event.clear()
+                self._url_ready_fired = False
 
-            self._append_log(f"Starting Cloudflare Quick Tunnel on port {port}")
-            proc = subprocess.Popen(
+            self._append_log(start_log)
+            new_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -730,29 +1318,106 @@ class FreeCloudTunnelManager:
                 creationflags=creationflags,
             )
             with self._lock:
-                self._proc = proc
+                self._proc = new_proc
                 self._reader_threads = []
-                if proc.stdout:
+                if new_proc.stdout:
                     self._reader_threads.append(
-                        self._spawn_stream_reader(proc.stdout, TRYCLOUDFLARE_URL_RE, "cloudflare")
+                        self._spawn_stream_reader(new_proc.stdout, pattern, reader_name)
                     )
-                if proc.stderr:
+                if new_proc.stderr:
                     self._reader_threads.append(
-                        self._spawn_stream_reader(proc.stderr, TRYCLOUDFLARE_URL_RE, "cloudflare")
+                        self._spawn_stream_reader(new_proc.stderr, pattern, reader_name)
                     )
 
             if self._url_found_event.wait(timeout=timeout_sec):
+                # Başarı: artık eski tünel süreci durdurulur (yenisi
+                # URL'yi aldı; iki tünel aynı yerel porta baksa da tek
+                # aktif tünel kalır).
+                prev_proc = previous.get("proc") if previous else None
+                if prev_proc is not None and prev_proc is not new_proc:
+                    self._terminate_proc(prev_proc)
                 return self.public_url
 
             with self._lock:
-                self._last_error = "Cloudflare tüneli zaman aşımına uğradı (URL alınamadı)."
-            self.stop_tunnel()
+                self._last_error = timeout_message
+            self._terminate_proc(new_proc)
+            if self._snapshot_has_live_tunnel(previous):
+                self._restore_tunnel_snapshot(previous)
+                self._append_log(
+                    "Tünel yenileme zaman aşımına uğradı; çalışan eski tünel korunuyor."
+                )
+            else:
+                self._stop_tunnel_process()
             return None
         except Exception as exc:
             with self._lock:
-                self._last_error = f"Cloudflare başlatma hatası: {exc}"
-            self.stop_tunnel()
+                self._last_error = f"{error_prefix}: {exc}"
+            if new_proc is not None:
+                self._terminate_proc(new_proc)
+            if self._snapshot_has_live_tunnel(previous):
+                self._restore_tunnel_snapshot(previous)
+                self._append_log(
+                    "Tünel yenileme hatası; çalışan eski tünel korunuyor: "
+                    f"{self._last_error}"
+                )
+            else:
+                self._stop_tunnel_process()
             return None
+
+    def start_cloudflare_tunnel(
+        self,
+        local_port: Optional[int] = None,
+        auto_download: bool = True,
+        timeout_sec: float = 25.0,
+    ) -> Optional[str]:
+        """
+        Method 1 — Start a 100% Free Cloudflare Quick Tunnel (`*.trycloudflare.com`).
+        Spawns `cloudflared tunnel --url http://127.0.0.1:<port> --no-autoupdate`
+        with `CREATE_NO_WINDOW` and parses stdout/stderr for the public HTTPS URL.
+
+        P2-8: çalışan tünel deneme öncesi öldürülmez — önce anlık
+        görüntü alınır, yeni tünel kurulamazsa eski tünel geri yüklenir.
+        """
+        # P2-8: anlık görüntü İLK alınır; ikili bulunamazsa bile eski
+        # tünel yaşar (eski kod burada `_stop_tunnel_process` çağırıp
+        # canlı tüneli yok ediyordu).
+        previous = self._snapshot_tunnel()
+        port = int(local_port or self.local_port)
+        self.local_port = port
+
+        binary = self.find_cloudflared_binary()
+        if not binary and auto_download:
+            binary = self.ensure_cloudflared_binary()
+
+        if not binary:
+            with self._lock:
+                self._last_error = "cloudflared.exe bulunamadı ve indirilemedi."
+            if self._snapshot_has_live_tunnel(previous):
+                self._append_log(
+                    "Cloudflare yenileme: ikili bulunamadı; çalışan eski tünel korunuyor."
+                )
+            return None
+
+        cmd = [
+            binary,
+            "tunnel",
+            "--url",
+            f"http://127.0.0.1:{port}",
+            "--no-autoupdate",
+            "--protocol",
+            "http2",
+        ]
+        return self._run_tunnel_process(
+            cmd,
+            TRYCLOUDFLARE_URL_RE,
+            starting_label="starting_cloudflare",
+            reader_name="cloudflare",
+            start_log=f"Starting Cloudflare Quick Tunnel on port {port}",
+            timeout_sec=timeout_sec,
+            timeout_message="Cloudflare tüneli zaman aşımına uğradı (URL alınamadı).",
+            error_prefix="Cloudflare başlatma hatası",
+            previous=previous,
+        )
 
     def start_ssh_tunnel(
         self,
@@ -762,10 +1427,18 @@ class FreeCloudTunnelManager:
     ) -> Optional[str]:
         """
         Method 2 — SSH-based Free Tunnel Fallback (`localhost.run` / `pinggy.io`).
-        Uses Windows built-in `ssh.exe -o StrictHostKeyChecking=no -R 80:127.0.0.1:<port> nokey@localhost.run`
+        Uses Windows built-in `ssh.exe -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=<config>/ssh_known_hosts -R 80:127.0.0.1:<port> nokey@localhost.run`
         to obtain a free `https://*.lhr.life` public URL without installing anything!
+        Host keys are stored persistently (TOFU): the first connection records
+        the server key in `config/ssh_known_hosts`; later connections verify
+        against it. `/dev/null` (or `NUL` on Windows) is never used here —
+        with it the presented key would be accepted unconditionally on every
+        connection and a changed key (MITM) would go unnoticed.
+
+        P2-8: çalışan tünel deneme öncesi öldürülmez (bkz.
+        `start_cloudflare_tunnel`); başarısız denemede eski tünel korunur.
         """
-        self.stop_tunnel()
+        previous = self._snapshot_tunnel()
         port = int(local_port or self.local_port)
         self.local_port = port
 
@@ -778,7 +1451,20 @@ class FreeCloudTunnelManager:
         if not ssh_bin:
             with self._lock:
                 self._last_error = "Sistemde ssh.exe bulunamadı."
+            if self._snapshot_has_live_tunnel(previous):
+                self._append_log(
+                    "SSH yenileme: ssh bulunamadı; çalışan eski tünel korunuyor."
+                )
             return None
+
+        # Kalıcı TOFU: sunucu anahtarı config/ssh_known_hosts dosyasına
+        # yazılır; accept-new ilk bağlantıda kaydeder, sonrakilerde doğrular.
+        known_hosts = CONFIG_DIR / "ssh_known_hosts"
+        try:
+            known_hosts.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        known_hosts_opt = f"UserKnownHostsFile={known_hosts.as_posix()}"
 
         if provider == "pinggy.io":
             cmd = [
@@ -786,9 +1472,9 @@ class FreeCloudTunnelManager:
                 "-p",
                 "443",
                 "-o",
-                "StrictHostKeyChecking=no",
+                "StrictHostKeyChecking=accept-new",
                 "-o",
-                "UserKnownHostsFile=/dev/null" if os.name != "nt" else "UserKnownHostsFile=NUL",
+                known_hosts_opt,
                 "-o",
                 "ServerAliveInterval=30",
                 "-R",
@@ -799,9 +1485,9 @@ class FreeCloudTunnelManager:
             cmd = [
                 ssh_bin,
                 "-o",
-                "StrictHostKeyChecking=no",
+                "StrictHostKeyChecking=accept-new",
                 "-o",
-                "UserKnownHostsFile=/dev/null" if os.name != "nt" else "UserKnownHostsFile=NUL",
+                known_hosts_opt,
                 "-o",
                 "ServerAliveInterval=30",
                 "-o",
@@ -811,50 +1497,17 @@ class FreeCloudTunnelManager:
                 "nokey@localhost.run",
             ]
 
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
-
-        try:
-            with self._lock:
-                self.public_url = None
-                self.active_method = f"starting_ssh_{provider}"
-                self._url_found_event.clear()
-
-            self._append_log(f"Starting SSH Reverse Tunnel ({provider}) on port {port}")
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                creationflags=creationflags,
-            )
-            with self._lock:
-                self._proc = proc
-                self._reader_threads = []
-                if proc.stdout:
-                    self._reader_threads.append(
-                        self._spawn_stream_reader(proc.stdout, SSH_TUNNEL_URL_RE, "ssh_localhost_run")
-                    )
-                if proc.stderr:
-                    self._reader_threads.append(
-                        self._spawn_stream_reader(proc.stderr, SSH_TUNNEL_URL_RE, "ssh_localhost_run")
-                    )
-
-            if self._url_found_event.wait(timeout=timeout_sec):
-                return self.public_url
-
-            with self._lock:
-                self._last_error = f"SSH tüneli ({provider}) zaman aşımına uğradı."
-            self.stop_tunnel()
-            return None
-        except Exception as exc:
-            with self._lock:
-                self._last_error = f"SSH tünel hatası: {exc}"
-            self.stop_tunnel()
-            return None
+        return self._run_tunnel_process(
+            cmd,
+            SSH_TUNNEL_URL_RE,
+            starting_label=f"starting_ssh_{provider}",
+            reader_name="ssh_localhost_run",
+            start_log=f"Starting SSH Reverse Tunnel ({provider}) on port {port}",
+            timeout_sec=timeout_sec,
+            timeout_message=f"SSH tüneli ({provider}) zaman aşımına uğradı.",
+            error_prefix="SSH tünel hatası",
+            previous=previous,
+        )
 
     def start_best_free_tunnel(
         self,
@@ -891,7 +1544,12 @@ class FreeCloudTunnelManager:
                 click_url=url,
             )
 
-        return self.get_status()
+        # Hata donusu yoksayilmaz: cagiran basari/hata durumunu acikca gorur.
+        status = self.get_status()
+        status["tunnel_started"] = bool(url)
+        if not url:
+            status["tunnel_error"] = self._last_error or "Tünel kurulamadı."
+        return status
 
     def start_tunnel(
         self,
@@ -910,26 +1568,51 @@ class FreeCloudTunnelManager:
         with self._lock:
             return bool(self._proc is not None and self._proc.poll() is None and self.public_url)
 
-    def stop_tunnel(self) -> None:
-        """Terminate any active `cloudflared` or `ssh` tunnel subprocess cleanly."""
+    def check_tunnel_alive(self) -> bool:
+        """Y-6 (dilim 22): tünel süreci ölmüşse bayat `public_url`
+        temizlenir — `is_tunnel_running()` False der ama eski URL
+        `public_url` / dialog / `mobile_url.txt`'de kalırdı. Ölü süreç
+        + bayat URL durumunda False döner ve URL sıfırlanır; canlı
+        tünelde True döner. Çağıran (main.py izleyicisi) False'da
+        yeniden başlatır."""
+        with self._lock:
+            proc = self._proc
+            if proc is None:
+                return False
+            if proc.poll() is None:
+                return bool(self.public_url)
+            if self.public_url:
+                self._append_log("Tunnel process died; clearing stale public URL.")
+                self.public_url = None
+                self.active_method = "none"
+                self._url_found_event.clear()
+                self._url_ready_fired = False
+            return False
+
+    def _stop_tunnel_process(self) -> None:
+        """Yalnizca tünel alt sürecini durdur (ntfy dinleyicisine dokunmaz).
+
+        start_*_tunnel metotlari P2-8'den beri baslangicta bunu
+        cagirmaz (canlı tünel deneme öncesi öldürülmez); yalnızca
+        açık kapatma (stop_tunnel/shutdown) ve tünelsiz başarısız
+        deneme sonrası durum temizliği için kullanılır.
+        """
         with self._lock:
             proc = self._proc
             self._proc = None
             self.public_url = None
             self.active_method = "none"
             self._url_found_event.clear()
+            self._url_ready_fired = False
 
         if proc is not None:
-            try:
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3.0)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-            except Exception as stop_exc:
-                self._append_log(f"Tunnel stop warning: {stop_exc}")
+            self._terminate_proc(proc)
             self._append_log("Tunnel process stopped.")
+
+    def stop_tunnel(self) -> None:
+        """Aktif tüneli ve ntfy komut dinleyicisini durdur."""
+        self._stop_tunnel_process()
+        self.ntfy_relay.stop_command_listener()
 
     def shutdown(self) -> None:
         """Stop both the public HTTPS tunnel and the ntfy background listener."""
@@ -946,6 +1629,9 @@ class FreeCloudTunnelManager:
             else:
                 pub_url_with_token = pub_url
 
+            # Binary aramasi (PATH tarama + stat, ~1 ms) cagri basina bir kez:
+            # once installed ve path icin ayri ayri cagriliyordu.
+            cloudflared_binary = self.find_cloudflared_binary()
             return {
                 "running": self.is_tunnel_running(),
                 "active_method": self.active_method,
@@ -954,8 +1640,8 @@ class FreeCloudTunnelManager:
                 "lan_url": lan_url,
                 "public_url": pub_url,
                 "public_url_with_token": pub_url_with_token,
-                "cloudflared_installed": self.find_cloudflared_binary() is not None,
-                "cloudflared_path": self.find_cloudflared_binary() or str(CLOUDFLARED_EXE_PATH),
+                "cloudflared_installed": cloudflared_binary is not None,
+                "cloudflared_path": cloudflared_binary or str(CLOUDFLARED_EXE_PATH),
                 "is_downloading": self._is_downloading,
                 "download_progress": round(self._download_progress, 1),
                 "last_error": self._last_error,
@@ -964,66 +1650,43 @@ class FreeCloudTunnelManager:
             }
 
     def get_mobile_tunnel_ready_flag(self) -> dict:
-        return {"module": "mobile_tunnel", "ready": True}
+        # Kosulsuz True YOK (S-2001): hazirlik canli duruma baglidir —
+        # tunel calisiyor olmali ya da ntfy relay'i yapilandirilmis olmali.
+        running = self.is_tunnel_running()
+        relay_ready = bool(self.ntfy_relay.enabled and self.ntfy_relay.topic)
+        return {
+            "module": "mobile_tunnel",
+            "ready": bool(running or relay_ready),
+            "tunnel_running": running,
+            "active_method": self.active_method,
+        }
 
     def get_mobile_tunnel_version_info(self) -> dict:
-        return {"module": "mobile_tunnel", "version": "2.0.0", "ready": True}
+        return {
+            "module": "mobile_tunnel",
+            "version": __version__,
+            "ready": bool(self.get_mobile_tunnel_ready_flag().get("ready")),
+        }
 
     def get_mobile_tunnel_diagnostic_snapshot(self) -> dict:
-        return {"module": "mobile_tunnel", "status": "ok", "ready": True}
+        # Kosulsuz "ok"/True YOK (S-2001): durum canli yoklamadan cikar.
+        running = self.is_tunnel_running()
+        relay_ready = bool(self.ntfy_relay.enabled and self.ntfy_relay.topic)
+        if running:
+            status = "ok"
+        elif relay_ready:
+            status = "relay_only"
+        else:
+            status = "down"
+        return {
+            "module": "mobile_tunnel",
+            "status": status,
+            "ready": bool(running or relay_ready),
+            "tunnel_running": running,
+            "active_method": self.active_method,
+            "ntfy": self.ntfy_relay.get_status(),
+        }
 
-
-
-def _draw_finder_pattern(grid: np.ndarray, top: int, left: int) -> None:
-    """Draw a standard 7x7 QR finder pattern at (top, left) on a binary matrix (0=black, 255=white)."""
-    grid[top : top + 7, left : left + 7] = 0
-    grid[top + 1 : top + 6, left + 1 : left + 6] = 255
-    grid[top + 2 : top + 5, left + 2 : left + 5] = 0
-
-
-def _build_fallback_visual_matrix(url: str, modules: int = 29) -> np.ndarray:
-    """
-    Pure-NumPy deterministic visual matrix fallback if neither `qrcode` nor
-    `cv2.QRCodeEncoder_create` is present in a minimal environment.
-    """
-    grid = np.full((modules, modules), 255, dtype=np.uint8)
-
-    # Finder patterns with quiet separators
-    _draw_finder_pattern(grid, 0, 0)
-    _draw_finder_pattern(grid, 0, modules - 7)
-    _draw_finder_pattern(grid, modules - 7, 0)
-
-    # Timing patterns
-    for i in range(8, modules - 8):
-        val = 0 if (i % 2 == 0) else 255
-        grid[6, i] = val
-        grid[i, 6] = val
-
-    # Alignment pattern for Version 3 (29x29)
-    ax, ay = modules - 9, modules - 9
-    grid[ay - 2 : ay + 3, ax - 2 : ax + 3] = 0
-    grid[ay - 1 : ay + 2, ax - 1 : ax + 2] = 255
-    grid[ay, ax] = 0
-
-    # Fill payload bits deterministically from URL SHA-256 stream
-    seed_bytes = hashlib.sha512(url.encode("utf-8")).digest() + url.encode("utf-8")
-    bit_idx = 0
-    total_bits = len(seed_bytes) * 8
-
-    for r in range(modules):
-        for c in range(modules):
-            if (r < 9 and c < 9) or (r < 9 and c >= modules - 8) or (r >= modules - 8 and c < 9):
-                continue
-            if r == 6 or c == 6:
-                continue
-            if abs(r - ay) <= 2 and abs(c - ax) <= 2:
-                continue
-            byte_val = seed_bytes[(bit_idx // 8) % len(seed_bytes)]
-            bit = (byte_val >> (7 - (bit_idx % 8))) & 1
-            grid[r, c] = 0 if bit else 255
-            bit_idx = (bit_idx + 1) % max(1, total_bits)
-
-    return grid
 
 
 def generate_qr_image(url: str, size: int = 260, border: int = 2) -> np.ndarray:
@@ -1035,7 +1698,8 @@ def generate_qr_image(url: str, size: int = 260, border: int = 2) -> np.ndarray:
     Priority:
       1. `qrcode` package (if installed in environment)
       2. `cv2.QRCodeEncoder_create()` (built into OpenCV!)
-      3. Deterministic visual matrix card renderer fallback
+    Raises RuntimeError if no real QR encoder is available instead of
+    returning a fake, unscannable matrix.
     """
     clean_url = (url or "http://127.0.0.1:8765").strip()
     target_size = max(96, int(size))
@@ -1081,17 +1745,12 @@ def generate_qr_image(url: str, size: int = 260, border: int = 2) -> np.ndarray:
         except Exception:
             qr_gray = None
 
-    # 3. Clean fallback visual matrix
+    # 3. Sahte matris YOK: hash ile doldurulmus bir matris QR degildir,
+    # taranamaz ve "basari" diye gosterilemez. Gercek uretici yoksa hata ver.
     if qr_gray is None:
-        raw_grid = _build_fallback_visual_matrix(clean_url, modules=29)
-        qr_gray = cv2.copyMakeBorder(
-            raw_grid,
-            border_modules,
-            border_modules,
-            border_modules,
-            border_modules,
-            cv2.BORDER_CONSTANT,
-            value=255,
+        raise RuntimeError(
+            "QR code cannot be generated: neither the 'qrcode' package nor "
+            "cv2.QRCodeEncoder_create is available in this environment."
         )
 
     resized_gray = cv2.resize(
@@ -1134,8 +1793,21 @@ class TunnelBridge:
         self.manager = manager or FreeCloudTunnelManager()
 
     def get_mobile_tunnel_health_summary(self) -> dict:
+        # Kosulsuz True YOK (S-2001): saglik, manager'in canli durumundan
+        # cikar; tunel kapali ve relay yapilandirilmamissa hazir degildir.
         try:
-            return {"mobile_tunnel_ready": True}
+            if self.manager is None:
+                return {"mobile_tunnel_ready": False}
+            running = self.manager.is_tunnel_running()
+            relay = getattr(self.manager, "ntfy_relay", None)
+            relay_ready = bool(
+                relay is not None and relay.enabled and relay.topic
+            )
+            return {
+                "mobile_tunnel_ready": bool(running or relay_ready),
+                "tunnel_running": running,
+                "active_method": self.manager.active_method,
+            }
         except Exception:
             return {"mobile_tunnel_ready": False}
 
@@ -1144,16 +1816,27 @@ class TunnelBridge:
         if self.manager:
             with self.manager._lock:
                 is_running = bool(self.manager.public_url and self.manager._proc and self.manager._proc.poll() is None)
-        return {"is_running": is_running, "token_protected": True}
+        token_protected = bool(
+            self.manager is not None and getattr(self.manager, "security_token", None)
+        )
+        return {"is_running": is_running, "token_protected": token_protected}
 
     def get_mobile_tunnel_ready_flag(self) -> dict:
-        return {"module": "mobile_tunnel", "ready": True}
+        # Kosulsuz True YOK (S-2001): manager'in canli hazirlik bayragi.
+        if self.manager is None:
+            return {"module": "mobile_tunnel", "ready": False}
+        return self.manager.get_mobile_tunnel_ready_flag()
 
     def get_mobile_tunnel_version_info(self) -> dict:
-        return {"module": "mobile_tunnel", "version": "2.0.0", "ready": True}
+        if self.manager is None:
+            return {"module": "mobile_tunnel", "version": __version__, "ready": False}
+        return self.manager.get_mobile_tunnel_version_info()
 
     def get_mobile_tunnel_diagnostic_snapshot(self) -> dict:
-        return {"module": "mobile_tunnel", "status": "ok", "ready": True}
+        # Kosulsuz "ok"/True YOK (S-2001): manager'in canli tani anlik goruntusu.
+        if self.manager is None:
+            return {"module": "mobile_tunnel", "status": "down", "ready": False}
+        return self.manager.get_mobile_tunnel_diagnostic_snapshot()
 
 
 MobileTunnel = FreeCloudTunnelManager
@@ -1165,7 +1848,8 @@ def _add_security_status_method():
     def get_tunnel_security_status(self) -> dict:
         with self._lock:
             is_running = bool(self.public_url and self._proc and self._proc.poll() is None)
-        return {"is_running": is_running, "token_protected": True}
+            token_protected = bool(self.security_token)
+        return {"is_running": is_running, "token_protected": token_protected}
     FreeCloudTunnelManager.get_tunnel_security_status = get_tunnel_security_status
 
 _add_security_status_method()
@@ -1175,44 +1859,266 @@ def get_mobile_tunnel_capabilities() -> list:
     return ["mobile_tunnel", "ntfy_relay", "diagnostic_snapshot"]
 
 
+def _probe_live_tunnel_state(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> Optional[dict]:
+    """Canli tunel/relay durumunu yokla (S-2001).
+
+    `manager` verilmediyse None doner: canli durum yoklanmadi, bilinmiyor.
+    Bu, statik sozlesme kontrolunun (validate_mobile_tunnel_contract)
+    canli basari gibi sunulmasini engeller — yoklanmamis durum True degildir.
+    """
+    if manager is None:
+        return None
+    try:
+        snap = manager.get_mobile_tunnel_diagnostic_snapshot()
+        return {
+            "ready": bool(snap.get("ready")),
+            "status": snap.get("status"),
+            "tunnel_running": bool(snap.get("tunnel_running")),
+        }
+    except Exception:
+        return {"ready": False, "status": "probe_failed", "tunnel_running": False}
+
+
+def _live_audit_verdict(manager: Optional["FreeCloudTunnelManager"] = None) -> dict:
+    """Sozlesme gecerliligi + canli durum birlesik karari (S-2001).
+
+    audit_passed/certified/ready yalnizca sozlesme gecerli VE canli tunel
+    ya da relay hazirsa True olur. Canli ornek verilmediyse (manager=None)
+    durum yoklanmamistir: fail-closed — False + "not_probed" gerekcesi.
+    """
+    contract_valid = validate_mobile_tunnel_contract()
+    live = _probe_live_tunnel_state(manager)
+    if live is None:
+        return {
+            "passed": False,
+            "contract_valid": contract_valid,
+            "live": "not_probed",
+            "reason": "no live tunnel instance probed; contract check alone does not prove a running tunnel",
+        }
+    passed = bool(contract_valid and live.get("ready"))
+    return {
+        "passed": passed,
+        "contract_valid": contract_valid,
+        "live": live,
+        "reason": "" if passed else "live tunnel/relay not ready",
+    }
+
+
 def validate_mobile_tunnel_contract() -> bool:
-    return bool(get_mobile_tunnel_capabilities())
+    """Real probe (not a tautology): every declared capability must map to
+    a real, present component — no instantiation and no I/O, so this is safe
+    to call from audit/compliance helpers.
+
+    - "mobile_tunnel": FreeCloudTunnelManager exposes the real tunnel
+      entry points (Cloudflare / SSH / best-free starter).
+    - "ntfy_relay": NtfyCloudRelay exposes publish + poll entry points.
+    - "diagnostic_snapshot": TunnelBridge exposes the diagnostic
+      snapshot method (checked on the class, not an instance — building
+      one would create a manager/relay and touch config files).
+    Returns False if any capability is missing or any entry point was
+    removed/renamed, instead of always returning True for a non-empty
+    static list.
+
+    NOT: bu yalnizca statik bir yetenek/sozlesme kontroludur; canli bir
+    tunelin/relay'in calistigini KANITLAMAZ (S-2001). audit_passed /
+    certified / ready kararlari icin `_live_audit_verdict(manager)` kullanilir;
+    yalnizca bu fonksiyonun sonucu canli basari gibi raporlanamaz.
+    """
+    try:
+        caps = get_mobile_tunnel_capabilities()
+        if not caps:
+            return False
+        if not {"mobile_tunnel", "ntfy_relay", "diagnostic_snapshot"}.issubset(set(caps)):
+            return False
+        if not all(
+            callable(getattr(FreeCloudTunnelManager, name, None))
+            for name in (
+                "start_cloudflare_tunnel",
+                "start_ssh_tunnel",
+                "start_best_free_tunnel",
+            )
+        ):
+            return False
+        if not all(
+            callable(getattr(NtfyCloudRelay, name, None))
+            for name in ("publish_message", "poll_commands_once")
+        ):
+            return False
+        if not callable(getattr(TunnelBridge, "get_mobile_tunnel_diagnostic_snapshot", None)):
+            return False
+        return True
+    except Exception:
+        return False
 
 
-def get_mobile_tunnel_baseline_metrics() -> dict:
-    return {"module": "mobile_tunnel", "contract_valid": validate_mobile_tunnel_contract(), "capability_count": len(get_mobile_tunnel_capabilities())}
+def get_mobile_tunnel_baseline_metrics(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> dict:
+    live = _probe_live_tunnel_state(manager)
+    return {
+        "module": "mobile_tunnel",
+        "contract_valid": validate_mobile_tunnel_contract(),
+        "capability_count": len(get_mobile_tunnel_capabilities()),
+        "live": live if live is not None else "not_probed",
+    }
 
 
-def get_mobile_tunnel_readiness_status() -> dict:
-    return {"module": "mobile_tunnel", "ready": validate_mobile_tunnel_contract(), "metrics": get_mobile_tunnel_baseline_metrics()}
+def get_mobile_tunnel_readiness_status(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> dict:
+    # Kosulsuz True YOK (S-2001): hazirlik = sozlesme gecerli VE canli hazir.
+    verdict = _live_audit_verdict(manager)
+    return {
+        "module": "mobile_tunnel",
+        "ready": verdict["passed"],
+        "contract_valid": verdict["contract_valid"],
+        "live": verdict["live"],
+        "reason": verdict["reason"],
+        "metrics": get_mobile_tunnel_baseline_metrics(manager),
+    }
 
 
-def get_mobile_tunnel_audit_record() -> dict:
-    return {"module": "mobile_tunnel", "audit_passed": validate_mobile_tunnel_contract(), "readiness": get_mobile_tunnel_readiness_status()}
+def get_mobile_tunnel_audit_record(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> dict:
+    verdict = _live_audit_verdict(manager)
+    return {
+        "module": "mobile_tunnel",
+        "audit_passed": verdict["passed"],
+        "contract_valid": verdict["contract_valid"],
+        "live": verdict["live"],
+        "reason": verdict["reason"],
+        "readiness": get_mobile_tunnel_readiness_status(manager),
+    }
 
 
-def get_mobile_tunnel_operational_digest() -> dict:
-    return {"module": "mobile_tunnel", "operational": validate_mobile_tunnel_contract(), "audit": get_mobile_tunnel_audit_record()}
+def get_mobile_tunnel_operational_digest(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> dict:
+    verdict = _live_audit_verdict(manager)
+    return {
+        "module": "mobile_tunnel",
+        "operational": verdict["passed"],
+        "contract_valid": verdict["contract_valid"],
+        "live": verdict["live"],
+        "reason": verdict["reason"],
+        "audit": get_mobile_tunnel_audit_record(manager),
+    }
 
 
-def get_mobile_tunnel_telemetry_payload() -> dict:
-    return {"module": "mobile_tunnel", "payload": get_mobile_tunnel_operational_digest()}
+def get_mobile_tunnel_telemetry_payload(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> dict:
+    return {
+        "module": "mobile_tunnel",
+        "payload": get_mobile_tunnel_operational_digest(manager),
+    }
 
 
-def get_mobile_tunnel_integrity_seal() -> dict:
-    return {"module": "mobile_tunnel", "sealed": validate_mobile_tunnel_contract(), "telemetry": get_mobile_tunnel_telemetry_payload()}
+def get_mobile_tunnel_integrity_seal(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> dict:
+    verdict = _live_audit_verdict(manager)
+    return {
+        "module": "mobile_tunnel",
+        "sealed": verdict["passed"],
+        "contract_valid": verdict["contract_valid"],
+        "live": verdict["live"],
+        "reason": verdict["reason"],
+        "telemetry": get_mobile_tunnel_telemetry_payload(manager),
+    }
 
 
-def get_mobile_tunnel_compliance_certificate() -> dict:
-    return {"module": "mobile_tunnel", "certified": validate_mobile_tunnel_contract(), "seal": get_mobile_tunnel_integrity_seal()}
+def get_mobile_tunnel_compliance_certificate(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> dict:
+    # Kosulsuz certified YOK (S-2001): sertifika, canli tunel/relay
+    # yoklanmadan verilmez; yoklanmamis durum fail-closed False'dur.
+    verdict = _live_audit_verdict(manager)
+    return {
+        "module": "mobile_tunnel",
+        "certified": verdict["passed"],
+        "contract_valid": verdict["contract_valid"],
+        "live": verdict["live"],
+        "reason": verdict["reason"],
+        "seal": get_mobile_tunnel_integrity_seal(manager),
+    }
 
 
-def get_mobile_tunnel_readiness_probe() -> dict:
-    return {"module": "mobile_tunnel", "ready": validate_mobile_tunnel_contract(), "certificate": get_mobile_tunnel_compliance_certificate()}
+def get_mobile_tunnel_readiness_probe(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> dict:
+    verdict = _live_audit_verdict(manager)
+    return {
+        "module": "mobile_tunnel",
+        "ready": verdict["passed"],
+        "contract_valid": verdict["contract_valid"],
+        "live": verdict["live"],
+        "reason": verdict["reason"],
+        "certificate": get_mobile_tunnel_compliance_certificate(manager),
+    }
 
 
-def get_mobile_tunnel_audit_summary() -> dict:
-    return {"module": "mobile_tunnel", "audit_passed": validate_mobile_tunnel_contract(), "probe": get_mobile_tunnel_readiness_probe()}
+def get_mobile_tunnel_audit_summary(
+    manager: Optional["FreeCloudTunnelManager"] = None,
+) -> dict:
+    # Kosulsuz audit_passed YOK (S-2001): tunel kapaliyken ya da canli
+    # durum yoklanmamissa audit gecmis sayilmaz.
+    verdict = _live_audit_verdict(manager)
+    return {
+        "module": "mobile_tunnel",
+        "audit_passed": verdict["passed"],
+        "contract_valid": verdict["contract_valid"],
+        "live": verdict["live"],
+        "reason": verdict["reason"],
+        "probe": get_mobile_tunnel_readiness_probe(manager),
+    }
 
 
 
+
+
+def _tunnel_cli() -> int:
+    """Y-5 (dilim 22): imzalı ntfy komut kanalı için repo-içi istemci.
+
+    `python -m core.mobile_tunnel sign pause`  -> {"cmd", "ts", "cid",
+    "sig"} yazar (P0-4: ts unix saniye, cid tek-kullanimlik komut id'si;
+    sig, "cmd\n<ts>\n<cid>" uzerinden HMAC-SHA256'dir)
+    `python -m core.mobile_tunnel send pause`  -> imzalı komutu
+    `<topic>_cmd` kanalına gönderir (bot `poll_commands_once` ile
+    HMAC doğrulamasıyla alır; ts penceresi ±300 sn, cid tekrarina
+    replay reddi uygulanir). İzinli komutlar: pause, resume, f8,
+    skip, panic, stop, start, status, reset_stuck.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Gatherion imzalı ntfy uzaktan komut istemcisi (dilim 22 Y-5)"
+    )
+    sub = ap.add_subparsers(dest="command", required=True)
+    p_sign = sub.add_parser("sign", help="İmzalı komut yükünü yazdır (göndermez)")
+    p_sign.add_argument("cmd", help="Komut (pause/resume/f8/skip/panic/stop/start/status/reset_stuck)")
+    p_send = sub.add_parser("send", help="İmzalı komutu ntfy _cmd kanalına gönder")
+    p_send.add_argument("cmd", help="Komut (pause/resume/f8/skip/panic/stop/start/status/reset_stuck)")
+    args = ap.parse_args()
+
+    mgr = FreeCloudTunnelManager()
+    relay = mgr.ntfy_relay
+    clean = str(args.cmd or "").strip().lower()
+    if clean not in ALLOWED_REMOTE_COMMANDS:
+        print(f"Reddedildi: '{clean}' izinli komut değil: {sorted(ALLOWED_REMOTE_COMMANDS)}")
+        return 2
+    if args.command == "sign":
+        print(json.dumps(relay.sign_command(clean), ensure_ascii=False))
+        return 0
+    ok = relay.publish_command(clean)
+    print(("Gönderildi: " if ok else "GÖNDERİLEMEDİ: ") + clean)
+    if not ok:
+        print(f"Son hata: {relay._last_error}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_tunnel_cli())

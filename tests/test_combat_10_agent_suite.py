@@ -17,6 +17,7 @@ from __future__ import annotations
 import collections
 import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -167,12 +168,37 @@ class TestSub100msBurstRotation:
         worker = BotWorker.__new__(BotWorker)
         driver = MockInputDriver(trusted=True)
         worker.input_driver = driver
-        worker._keyboard_trusted_for_combat = lambda: True
+        # F-1458: no lambda stand-in — the real _keyboard_trusted_for_combat()
+        # must read trust from the driver (keyboard_inject_trusted()).
+        assert worker._keyboard_trusted_for_combat() is True
         worker.config = {}
 
         assert worker._combat_skill_burst_sec() == 0.08
         assert worker._combat_skills_per_burst() == 4
         assert worker._combat_skill_cooldown_sec("1") == 0.12
+
+    def test_state_machine_burst_knobs_untrusted_driver(self):
+        """
+        S-7101: the UNTRUSTED branch of the safety gate must be pinned too.
+        With MockInputDriver(trusted=False) the gate must report False and
+        the slow (soft) knobs must apply: burst 0.15s, per_burst 2, hold
+        0.06-0.10s, cooldown 0.18s (core/state_machine.py:2069, :2084,
+        :2087-2088, :2107-2110). Previously every driver in this file was
+        trusted=True, so a gate stuck on True (or a driver always reporting
+        trusted) was invisible here.
+        """
+        worker = BotWorker.__new__(BotWorker)
+        driver = MockInputDriver(trusted=False)
+        worker.input_driver = driver
+        # No lambda stand-in — the real _keyboard_trusted_for_combat()
+        # must read trust from the driver (keyboard_inject_trusted()).
+        assert worker._keyboard_trusted_for_combat() is False
+        worker.config = {}
+
+        assert worker._combat_skill_burst_sec() == 0.15
+        assert worker._combat_skills_per_burst() == 2
+        assert worker._combat_skill_hold_range() == (0.06, 0.10)
+        assert worker._combat_skill_cooldown_sec("1") == 0.18
 
     def test_deterministic_rapid_burst_sequence_without_stall(self):
         """
@@ -211,15 +237,15 @@ class TestSub100msBurstRotation:
 
 
 # =============================================================================
-# 2. 7-KEY ROUND-ROBIN ROTATION TESTS
+# 2. 8-KEY ROUND-ROBIN ROTATION TESTS
 # =============================================================================
 
-class Test7KeyRoundRobinRotation:
-    """Verifies round-robin rotation across 7 keys (1, 2, 3, 4, q, e, r) and anti-sticky '2'."""
+class Test8KeyRoundRobinRotation:
+    """Verifies round-robin rotation across 8 keys (1, 2, 3, 4, q, e, r, t) and anti-sticky '2'."""
 
-    def test_all_7_hotbar_keys_configured(self):
-        """Default hotbar keys must encompass all 7 keys."""
-        expected = ["1", "2", "3", "4", "q", "e", "r"]
+    def test_all_8_hotbar_keys_configured(self):
+        """Default hotbar keys must encompass all 8 keys."""
+        expected = ["1", "2", "3", "4", "q", "e", "r", "t"]
         combat = ManaPhaseCombat()
         assert combat.combat_skill_keys == expected
         assert list(DEFAULT_COMBAT_SKILL_KEYS) == expected
@@ -232,26 +258,26 @@ class Test7KeyRoundRobinRotation:
 
     def test_round_robin_slice_progression_across_all_keys(self):
         """
-        Slices of size 3 must advance cleanly across all 7 keys:
+        Slices of size 3 must advance cleanly across all 8 keys:
         Slice 1: ['1', '2', '3']
         Slice 2: ['4', 'q', 'e']
-        Slice 3: ['r', '1', '2']
-        Slice 4: ['3', '4', 'q']
-        Slice 5: ['e', 'r', '1']
+        Slice 3: ['r', 't', '1']
+        Slice 4: ['2', '3', '4']
+        Slice 5: ['q', 'e', 'r']
         """
         combat = ManaPhaseCombat()
         combat.reset_rotation()
 
         assert combat.get_round_robin_burst_slice(count=3, allow_combo=False) == ["1", "2", "3"]
         assert combat.get_round_robin_burst_slice(count=3, allow_combo=False) == ["4", "q", "e"]
-        assert combat.get_round_robin_burst_slice(count=3, allow_combo=False) == ["r", "1", "2"]
-        assert combat.get_round_robin_burst_slice(count=3, allow_combo=False) == ["3", "4", "q"]
-        assert combat.get_round_robin_burst_slice(count=3, allow_combo=False) == ["e", "r", "1"]
+        assert combat.get_round_robin_burst_slice(count=3, allow_combo=False) == ["r", "t", "1"]
+        assert combat.get_round_robin_burst_slice(count=3, allow_combo=False) == ["2", "3", "4"]
+        assert combat.get_round_robin_burst_slice(count=3, allow_combo=False) == ["q", "e", "r"]
 
     def test_zero_sticky_2_bias_empirical_distribution(self):
         """
-        Simulate 70 combat decisions in BURST phase.
-        Every key in ('1', '2', '3', '4', 'q', 'e', 'r') must be primary exactly 10 times.
+        Simulate 80 combat decisions in BURST phase.
+        Every key in ('1', '2', '3', '4', 'q', 'e', 'r', 't') must be primary exactly 10 times.
         Key '2' must NEVER monopolize or exceed fair share.
         """
         combat = ManaPhaseCombat()
@@ -260,7 +286,7 @@ class Test7KeyRoundRobinRotation:
         counts = collections.Counter()
         t = 100.0
 
-        for _ in range(70):
+        for _ in range(80):
             decision = combat.decide(player_mp=1.0, player_hp=1.0, now=t)
             primary = decision.skill_keys[0]
             counts[primary] += 1
@@ -329,7 +355,9 @@ class Test7KeyRoundRobinRotation:
         worker._lock = threading.RLock()
         driver = MockInputDriver(trusted=True)
         worker.input_driver = driver
-        worker._keyboard_trusted_for_combat = lambda: True
+        # S-2901: no lambda stand-in — the real _keyboard_trusted_for_combat()
+        # must read trust from the driver (keyboard_inject_trusted()).
+        assert worker._keyboard_trusted_for_combat() is True
         worker._mode = BotMode.COMBAT_MODE.value
         worker._state = BotState.FIGHTING.value
         worker._combat_was_targeting = True
@@ -342,16 +370,22 @@ class Test7KeyRoundRobinRotation:
         fired_keys = []
         now = 1000.0
 
-        for _ in range(7):
-            now += 0.150  # Advance past burst gap (0.08s) and GCD floor (0.12s)
-            with patch("core.state_machine.time.time", return_value=now):
-                ok = worker._send_configured_combat_skill()
-                assert ok is True
-                fired_keys.extend(list(driver.pressed))
-                driver.clear()
+        # Speed (was ~2.5s): each burst burns 3 x 0.035s inter-key settle
+        # sleeps (time.sleep inside _send_configured_combat_skill). Key
+        # selection is driven by the patched time.time, not the sleeps —
+        # verified: the fired sequence stays exactly 4 x
+        # ['1','2','3','4','q','e','r','t'] in order.
+        with patch("time.sleep", return_value=None):
+            for _ in range(8):
+                now += 0.150  # Advance past burst gap (0.08s) and GCD floor (0.12s)
+                with patch("core.state_machine.time.time", return_value=now):
+                    ok = worker._send_configured_combat_skill()
+                    assert ok is True
+                    fired_keys.extend(list(driver.pressed))
+                    driver.clear()
 
-        # All 7 keys should be represented across bursts
-        assert set(fired_keys) == {"1", "2", "3", "4", "q", "e", "r"}
+        # All 8 keys should be represented across bursts
+        assert set(fired_keys) == {"1", "2", "3", "4", "q", "e", "r", "t"}
 
 
 # =============================================================================
@@ -414,37 +448,53 @@ class TestTargetAcquisitionAndValidation:
         assert "f" in driver.pressed
         assert "tab" in driver.pressed
 
-    def test_monster_target_validation_with_exemplar_memory(self):
+    def test_monster_target_validation_with_real_exemplar_memory(self):
         """
-        is_valid_monster_target() verifies 10: monster_3d crops as valid (conf >= 0.85)
-        and rejects non-monster or negative exemplars.
+        is_valid_monster_target() verified against a REAL ExemplarMemory
+        (tmp JSON store, real crops -> real feature vectors), not a hand-made
+        mock: monster_3d exemplar validates (conf >= 0.85), a negative
+        exemplar rejects, and a resource exemplar (herb) is not a monster.
         """
+        from dataset_factory.exemplar_memory import ExemplarMemory
+
         combat = ManaPhaseCombat()
+        rng = np.random.default_rng(7)
+        patch_crop = rng.integers(0, 256, size=(50, 50, 3), dtype=np.uint8)
         fake_frame = np.full((200, 200, 3), 120, dtype=np.uint8)
+        fake_frame[10:60, 10:60] = patch_crop
 
-        # Case 1: Mock ExemplarMemory matching positive monster
-        mock_mem = MagicMock()
-        mock_mem.is_negative_patch.return_value = (False, 0.10, None)
-        mock_mem.classify_patch.return_value = (10, "monster_3d", 0.92)
+        def _real_memory(tmpdir, kind):
+            mem = ExemplarMemory(json_path=Path(tmpdir) / "exemplars.json")
+            if kind == "monster":
+                assert mem.add_positive_exemplar(patch_crop, 10, "monster_3d") is True
+            elif kind == "negative":
+                assert mem.add_negative_exemplar(patch_crop, 10, "monster_3d") is True
+            elif kind == "herb":
+                assert mem.add_positive_exemplar(patch_crop, 0, "herb_aria") is True
+            return mem
 
-        with patch("dataset_factory.exemplar_memory.get_exemplar_memory", return_value=mock_mem):
-            is_valid, conf = combat.is_valid_monster_target(fake_frame, bbox=(10, 10, 50, 50))
-            assert is_valid is True
-            assert conf >= 0.85
+        # Case 1: real positive monster exemplar -> valid, conf >= 0.85
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mem = _real_memory(tmpdir, "monster")
+            with patch("dataset_factory.exemplar_memory.get_exemplar_memory", return_value=mem):
+                is_valid, conf = combat.is_valid_monster_target(fake_frame, bbox=(10, 10, 50, 50))
+                assert is_valid is True
+                assert conf >= 0.85
 
-        # Case 2: Negative exemplar (e.g. false rock contour)
-        mock_mem.is_negative_patch.return_value = (True, 0.88, "rejected_rock")
-        with patch("dataset_factory.exemplar_memory.get_exemplar_memory", return_value=mock_mem):
-            is_valid, conf = combat.is_valid_monster_target(fake_frame, bbox=(10, 10, 50, 50))
-            assert is_valid is False
-            assert conf <= 0.20
+        # Case 2: real negative exemplar (rejected rock/false target) -> invalid
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mem = _real_memory(tmpdir, "negative")
+            with patch("dataset_factory.exemplar_memory.get_exemplar_memory", return_value=mem):
+                is_valid, conf = combat.is_valid_monster_target(fake_frame, bbox=(10, 10, 50, 50))
+                assert is_valid is False
+                assert conf <= 0.20
 
-        # Case 3: Resource patch (herb/ore), not a monster
-        mock_mem.is_negative_patch.return_value = (False, 0.05, None)
-        mock_mem.classify_patch.return_value = (0, "herb_aria", 0.90)
-        with patch("dataset_factory.exemplar_memory.get_exemplar_memory", return_value=mock_mem):
-            is_valid, conf = combat.is_valid_monster_target(fake_frame, bbox=(10, 10, 50, 50))
-            assert is_valid is False
+        # Case 3: real resource exemplar (herb), not a monster -> invalid
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mem = _real_memory(tmpdir, "herb")
+            with patch("dataset_factory.exemplar_memory.get_exemplar_memory", return_value=mem):
+                is_valid, conf = combat.is_valid_monster_target(fake_frame, bbox=(10, 10, 50, 50))
+                assert is_valid is False
 
     def test_filter_monster_targets_ranks_by_confidence(self):
         """filter_monster_targets ranks candidate bounding boxes descending by confidence."""
@@ -478,7 +528,13 @@ class TestTargetAcquisitionAndValidation:
         # Red bar in BGR: (30, 30, 220) -> high Red, low Blue/Green
         cv2.rectangle(frame, (int(1280 * 0.40), int(720 * 0.05)), (int(1280 * 0.60), int(720 * 0.08)), (30, 30, 220), -1)
 
-        has_bar = recovery._detect_enemy_target_bar(frame)
+        # Tek karelik bar girişi sayılmaz — kilit 2. ardışık karede doğrulanır.
+        assert recovery._detect_enemy_target_bar(frame.copy()) is False
+        # İkinci kare gerçekten farklı içerikli olmalı — .copy() içerik
+        # parmak iziyle "aynı kare" sayılır ve doğrulama ilerlemez.
+        frame2 = frame.copy()
+        frame2[0, 0] = (1, 0, 0)
+        has_bar = recovery._detect_enemy_target_bar(frame2)
         assert has_bar is True
 
 
@@ -528,7 +584,9 @@ class TestAutoPotionsAndVitalsManagement:
     def test_mana_phase_transitions_regen_and_burst(self):
         """
         When MP < 0.95 -> REGEN phase (hold_left=True, hold_right=False).
-        When MP reaches >= 0.95 -> BURST phase (hold_left=False, hold_right=True).
+        REGEN is sticky: exit needs MP >= 0.99 (D3 hysteresis), so 0.96
+        stays in REGEN; (nearly) full MP -> BURST phase
+        (hold_left=False, hold_right=True).
         """
         combat = ManaPhaseCombat(mp_full_threshold=0.95)
 
@@ -549,10 +607,16 @@ class TestAutoPotionsAndVitalsManagement:
         d3 = combat.decide(player_mp=0.80, player_hp=1.0)
         assert d3.phase == ManaPhase.REGEN
 
-        # MP reaches 0.96 -> returns to BURST
+        # MP reaches 0.96 -> STILL in REGEN: hysteresis exit is 0.99 (D3),
+        # so the entry threshold (0.95) alone does not re-enter BURST.
         d4 = combat.decide(player_mp=0.96, player_hp=1.0)
-        assert d4.phase == ManaPhase.BURST
-        assert d4.hold_right is True
+        assert d4.phase == ManaPhase.REGEN
+        assert d4.hold_left is True
+
+        # MP reaches (nearly) full -> returns to BURST
+        d5 = combat.decide(player_mp=1.0, player_hp=1.0)
+        assert d5.phase == ManaPhase.BURST
+        assert d5.hold_right is True
 
     def test_panic_defense_priority_on_low_hp(self):
         """
@@ -584,24 +648,41 @@ class TestAutoPotionsAndVitalsManagement:
         )
 
         t = 1000.0
+        # F-1356: no hasattr/if guard — if check_auto_potions is ever removed
+        # this test must fail loudly instead of passing with zero assertions.
+        assert hasattr(combat, "check_auto_potions")
         # Normal vitals: no potions
-        p0 = combat.check_auto_potions(player_hp=0.80, player_mp=0.80, now=t) if hasattr(combat, "check_auto_potions") else None
-        if p0 is not None:
-            assert p0.hp_potion_triggered is False
-            assert p0.mp_potion_triggered is False
+        p0 = combat.check_auto_potions(player_hp=0.80, player_mp=0.80, now=t)
+        assert p0.hp_potion_triggered is False
+        assert p0.mp_potion_triggered is False
 
-            # Low HP -> triggers HP potion '7'
-            p1 = combat.check_auto_potions(player_hp=0.40, player_mp=0.80, now=t)
-            assert p1.hp_potion_triggered is True
-            assert "7" in p1.keys_to_press
+        # Low HP -> triggers HP potion '7', but only once the drop is
+        # confirmed (v20 madde 6, `_hp_low_reading_confirmed`): the
+        # first low sample after a healthy one is an unconfirmed cliff
+        # (single-frame misreads read 0.00 while full) and must not
+        # trigger; the second consecutive low sample confirms it.
+        p1 = combat.check_auto_potions(player_hp=0.40, player_mp=0.80, now=t)
+        assert p1.hp_potion_triggered is False
+        assert p1.hp_potion_key is None
 
-            # Immediate repeat at t + 1.0s -> blocked by cooldown
-            p2 = combat.check_auto_potions(player_hp=0.30, player_mp=0.80, now=t + 1.0)
-            assert p2.hp_potion_triggered is False
+        # P0-6: karar tek başına damgalamaz — gönderim onayı olmadan
+        # hemen yeniden karar da tetikler. Bu ikinci düşük örnek aynı
+        # zamanda düşüşü doğrulayan örnektir: iksir burada tetiklenir.
+        p_confirmed = combat.check_auto_potions(player_hp=0.30, player_mp=0.80, now=t + 1.0)
+        assert p_confirmed.hp_potion_triggered is True
+        assert "7" in p_confirmed.keys_to_press
+        assert p_confirmed.hp_potion_key == "7"
 
-            # After 11.0s -> permitted again
-            p3 = combat.check_auto_potions(player_hp=0.30, player_mp=0.80, now=t + 11.0)
-            assert p3.hp_potion_triggered is True
+        # t + 1.0'daki basım onaylanınca cooldown başlar.
+        combat.mark_potions_sent([p_confirmed.hp_potion_key], hp_key=p_confirmed.hp_potion_key, now=t + 1.0)
+
+        # Immediate repeat at t + 1.0s -> blocked by cooldown
+        p2 = combat.check_auto_potions(player_hp=0.30, player_mp=0.80, now=t + 1.0)
+        assert p2.hp_potion_triggered is False
+
+        # After 11.0s -> permitted again
+        p3 = combat.check_auto_potions(player_hp=0.30, player_mp=0.80, now=t + 11.0)
+        assert p3.hp_potion_triggered is True
 
 
 # =============================================================================
@@ -637,7 +718,9 @@ class TestCombatIsolationAndModeGate:
         }
         worker.input_driver = driver or MockInputDriver(trusted=True)
         worker._get_cfg = lambda k, d=None: worker.config.get(k, d)
-        worker._keyboard_trusted_for_combat = lambda: True
+        # S-2902: no lambda stand-in — the real _keyboard_trusted_for_combat()
+        # reads trust from the driver (keyboard_inject_trusted()); the helper
+        # installs a trusted MockInputDriver by default, so the gate stays True.
         worker._grab_frame = lambda grayscale=False: np.zeros((720, 1280, 3), dtype=np.uint8)
         worker._sync_combat_left_button = MagicMock()
         worker._sync_combat_right_button = MagicMock()
@@ -667,7 +750,7 @@ class TestCombatIsolationAndModeGate:
         mock_cr.check_under_attack.return_value = (True, 0.70)
         worker.combat_recovery = mock_cr
 
-        # Execute combat/death check in route mode
+        # Phase A — fight_back=False: gate short-circuits, nothing handled.
         handled = worker._handle_combat_and_death()
         assert handled is False
 
@@ -675,6 +758,28 @@ class TestCombatIsolationAndModeGate:
         combat_keys = {"1", "2", "3", "4", "q", "e", "r"}
         pressed_set = set(driver.pressed)
         assert not (pressed_set & combat_keys), f"Combat skills leaked into Toplama: {pressed_set & combat_keys}"
+
+        # Phase B (F-1459) — the SAME (True, 0.70) damage signal must actually
+        # reach production: with fight_back=True the worker reads it (handled
+        # True) yet route mode still suppresses every combat skill key.
+        # 2-kare kuralı (core/state_machine.py _route_combat_signal_confirmed,
+        # route_fight_confirm_frames=2): tick 1 only primes the streak,
+        # tick 2 confirms — handled is True only on the 2nd tick.
+        worker.config["fight_back"] = True
+        driver.clear()
+        mock_cr.reset_mock()
+        mock_cr.check_character_dead.return_value = False
+        mock_cr.check_under_attack.return_value = (True, 0.70)
+        worker.combat_recovery = mock_cr
+
+        handled_b_first = worker._handle_combat_and_death()
+        assert handled_b_first is False
+        handled_b = worker._handle_combat_and_death()
+        assert handled_b is True
+        assert mock_cr.check_under_attack.call_count >= 2, "damage signal never reached production"
+        assert mock_cr.fight_back_step.call_count == 0, "fight_back_step must stay suppressed in Toplama"
+        pressed_b = set(driver.pressed)
+        assert not (pressed_b & combat_keys), f"Combat skills leaked into Toplama: {pressed_b & combat_keys}"
 
     def test_fight_back_engages_cleanly_when_enabled_in_route_mode(self):
         """
@@ -686,10 +791,15 @@ class TestCombatIsolationAndModeGate:
 
         mock_cr = MagicMock()
         mock_cr.check_character_dead.return_value = False
-        # Under attack with HP drop (from 1.0 to 0.70)
+        # Under attack with HP drop (from 1.0 to 0.70).
+        # 2-kare kuralı (core/state_machine.py _route_combat_signal_confirmed,
+        # route_fight_confirm_frames=2): tick 1 only primes the streak,
+        # tick 2 confirms — handled is True only on the 2nd tick.
         mock_cr.check_under_attack.return_value = (True, 0.70)
         worker.combat_recovery = mock_cr
 
+        handled_first = worker._handle_combat_and_death()
+        assert handled_first is False
         handled = worker._handle_combat_and_death()
         assert handled is True
 
@@ -705,10 +815,13 @@ class TestCombatIsolationAndModeGate:
         worker._grab_frame = lambda grayscale=False: frame
         worker._combat_has_hostile_lock = lambda f: True
         worker._combat_was_targeting = True
-        worker._send_configured_combat_skill = MagicMock(return_value=True)
 
+        # F-1304: no stub — the real _send_configured_combat_skill() must run
+        # and put real keys into the driver. COMBAT_MODE + hostile lock means
+        # mouse spam fires 't' first, then the first 4-key burst 1,2,3,4.
         worker._step_combat_mode()
-        assert worker._send_configured_combat_skill.called is True
+        assert driver.pressed == ["t", "1", "2", "3", "4"]
+        assert worker._combat_was_targeting is True
 
     def test_action_bus_exclusive_ui_protection(self):
         """
@@ -754,9 +867,11 @@ class TestLineOfSightAndRangeRecovery:
         """
         tracker = LineOfSightTracker(CombatPositioningConfig(damage_stagnation_threshold=3))
 
-        # Initial successful cast: target damaged from 100% to 95% -> resets stagnation to 0
+        # S-1303: first reading is the baseline only — no damage verdict is
+        # possible without a previous reading, so it neither deals damage
+        # nor moves the stagnation counter.
         damage_dealt = tracker.record_cast_outcome(target_hp_pct=95.0, now=100.0)
-        assert damage_dealt is True
+        assert damage_dealt is False
         assert tracker.consecutive_stagnant_casts == 0
 
         # Cast 1 with no HP drop (still 95%) -> stagnant = 1
@@ -806,9 +921,12 @@ class TestLineOfSightAndRangeRecovery:
         recovery = CombatRecovery()
         driver = MockInputDriver(trusted=True)
 
+        # F-1460: attempt=1 is deterministic in production — exactly
+        # "JUMP_AND_STRAFE" with space, strafe 'a' + forward 'w', space.
+        # A loose membership assertion would also pass ERROR/COMPLETED.
         res = recovery.recover_from_stuck(input_ctrl=driver, attempt=1, fly_unreachable=False)
-        assert res in ("JUMP_AND_STRAFE", "COMPLETED", "RECOVERED")
-        assert "space" in driver.pressed or "w" in driver.pressed or "a" in driver.pressed
+        assert res == "JUMP_AND_STRAFE"
+        assert driver.pressed == ["space", "a", "w", "space"]
 
 
 # =============================================================================
@@ -823,7 +941,7 @@ class TestEndToEnd10AgentCombatBenchmark:
         Simulates complete combat lifecycle:
         1. Target search with TAB
         2. Hostile target acquired
-        3. Sub-100ms burst rotation across 7 keys
+        3. Sub-100ms burst rotation across 8 keys
         4. Target damaged from 100% to 0%
         5. Loot F + instant next target TAB
         """
@@ -839,15 +957,27 @@ class TestEndToEnd10AgentCombatBenchmark:
         driver.clear()
 
         # Step 2: Target acquired!
+        # F-1357 [DOĞRULA]: this frame was dead code in the base (built but
+        # never fed to the combat system). It is now actually consumed: the
+        # red target bar must drive a real attack step, deterministically
+        # (random.choice pinned to the first pool entry, 't').
         enemy_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         # Add target bar
         cv2.rectangle(enemy_frame, (int(1280 * 0.4), int(720 * 0.05)), (int(1280 * 0.6), int(720 * 0.08)), (30, 30, 220), -1)
 
+        with patch("core.combat.random.choice", side_effect=lambda pool: pool[0]):
+            acquired = combat_sys.fight_back_step(input_ctrl=driver, frame=enemy_frame)
+        assert acquired is True
+        assert combat_sys.in_combat is True
+        assert combat_sys.total_attacks == 1
+        assert driver.pressed == ["t"]
+        driver.clear()
+
         sim_t = 100.0
         fired_keys = []
 
-        # Step 3: Run 14 burst ticks (2 full 7-key cycles)
-        for _ in range(14):
+        # Step 3: Run 16 burst ticks (2 full 8-key cycles)
+        for _ in range(16):
             if mana_brain.should_cast_skill(now=sim_t):
                 dec = mana_brain.decide(player_mp=1.0, player_hp=1.0, now=sim_t)
                 prim = dec.skill_keys[0]
@@ -856,8 +986,8 @@ class TestEndToEnd10AgentCombatBenchmark:
                 fired_keys.append(prim)
             sim_t += 0.085
 
-        # All 7 keys should have fired
-        assert set(fired_keys) == {"1", "2", "3", "4", "q", "e", "r"}
+        # All 8 keys should have fired
+        assert set(fired_keys) == {"1", "2", "3", "4", "q", "e", "r", "t"}
         driver.clear()
 
         # Step 4: Target dies -> Loot and TAB next
@@ -868,3 +998,39 @@ class TestEndToEnd10AgentCombatBenchmark:
 
         assert "f" in driver.pressed
         assert "tab" in driver.pressed
+
+
+# =============================================================================
+# 8. FAILURE MODES: MOCKS THAT CAN FAIL (F-1568)
+# =============================================================================
+
+class TestFailureModesDriverAndVision:
+    """Mock driver/vision must be able to fail — a mock that always succeeds
+    cannot prove production handles failure."""
+
+    def test_vision_blackout_returns_no_target_without_crash(self):
+        """Vision returns no frame at all: no crash, no target, no skill keys."""
+        combat_sys = CombatSystem(vision=MockVisionEngine(frame=None), driver=MockInputDriver())
+        driver = combat_sys.driver
+        res = combat_sys.fight_back_step(input_ctrl=driver, frame=None)
+        assert res is False
+        combat_keys = {"1", "2", "3", "4", "q", "e", "r", "t"}
+        assert not (set(driver.pressed) & combat_keys)
+
+    def test_failing_input_driver_error_is_not_silently_swallowed(self):
+        """A raising driver must surface, not be logged away as success.
+
+        NOTE: core/combat.py currently has no driver-failure handling, so the
+        error propagates out of fight_back_step. This test pins that contract
+        explicitly (D22 scope if graceful handling is ever added) instead of
+        letting a never-failing mock pretend every press succeeded.
+        """
+
+        class FailingDriver(MockInputDriver):
+            def press_key(self, key: str, min_hold: float = 0.03, max_hold: float = 0.05, **kwargs) -> bool:
+                raise RuntimeError("simulated HID failure")
+
+        combat_sys = CombatSystem(vision=MockVisionEngine(), driver=FailingDriver())
+        empty_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        with pytest.raises(RuntimeError, match="simulated HID failure"):
+            combat_sys.fight_back_step(input_ctrl=combat_sys.driver, frame=empty_frame)

@@ -11,6 +11,7 @@ Validates:
 """
 
 import math
+import random
 from typing import List, Tuple
 from unittest.mock import MagicMock
 
@@ -44,6 +45,14 @@ class MockInputController:
         self.mouse_events: List[Tuple[str, str]] = []
 
     def nudge_camera(self, dx: int, dy: int = 0) -> bool:
+        self.moves.append((int(dx), int(dy)))
+        return True
+
+    def mouse_move_relative(self, dx: int, dy: int = 0) -> bool:
+        # F-1301 / Karar 4 (R27 ile birlikte): donanım zincirli göreli hareket
+        # yolu (Interception). R27 sonrası _resolve_relative_mouse_setter
+        # önce bunu çözer; soft nudge_camera yoluna düşülmez. Mock, donanım
+        # sürücüsünü taklit edip hareketi moves'a kaydeder.
         self.moves.append((int(dx), int(dy)))
         return True
 
@@ -170,6 +179,20 @@ def test_overshoot_for_large_turns():
         enable_wrist_arc=False,
         tremor_amplitude_px=0.0,
     )
+    # Flaky-by-design deterministik kilidi (W3): üreteç overshoot'u
+    # `random.random() < 0.85` kapısıyla açar
+    # (core/windmouse_humanizer.py:969-972) — çağrıların ~%15'inde hiç
+    # overshoot üretilmez ve aşağıdaki düzeltme assertion'ı o zaman
+    # kaçınılmaz olarak düşer. Bu test ise overshoot'un VARLIĞINI
+    # deterministik bir özellik olarak pinler; olasılıksal kapıyla
+    # çelişir. Üretim davranışı değiştirilmeden (canlı botta %15
+    # overshoot'suz varyasyon kasıtlı humanisation'dır) test, çağrıdan
+    # hemen önce RNG'yi tohumlar: seed=1'de kapı çekilişi 0.134364
+    # (< 0.85) ve ov_ratio 0.036186 -> ov_dx=11px olur; kapıdan sonraki
+    # ilk random() çağrısı üreteçteki kapının kendisidir, arada RNG
+    # tüketen kod yoktur (CameraMovementSmoother.__init__ deterministik).
+    # Assertion'lar aynen korundu, gevşetilmedi.
+    random.seed(1)
     steps = smoother.generate_relative_camera_trajectory(300, 0, config=cfg)
     assert len(steps) > 15
 
@@ -219,7 +242,12 @@ def test_no_single_step_exceeds_max_cap_even_on_360_turn():
 
     step_mags = [math.hypot(s[0], s[1]) for s in steps]
     max_step = max(step_mags)
-    assert max_step <= cfg.max_single_step_px + 2  # Allow tiny rounding jitter
+    # Strict cap: no rounding slack. The quintic peak (~1.875x the mean step)
+    # plus overshoot must stay within max_single_step_px; see F-1301/F-1440.
+    # Karar 8: cap kalkmaz — üretim (R27, core/windmouse_humanizer.py)
+    # 360° dönüşü cap'i aşmayan artımlı adımlara böler; bu test o davranışı
+    # pinler (baz e9794df'de üretim düzeltmesi yokken fail verir).
+    assert max_step <= cfg.max_single_step_px
     assert sum(s[0] for s in steps) == 1440
 
 
@@ -247,15 +275,22 @@ def test_pitch_clamping_prevents_looking_at_sky_or_ground():
     smoother = CameraMovementSmoother()
     cfg = CameraSmoothingConfig(max_pitch_up_deg=40.0, max_pitch_down_deg=50.0)
 
+    # The documented scale is 3.5 px/deg (CameraSmoothingConfig.deg_to_px_pitch
+    # default): -40deg -> -140px, +50deg -> +175px. Expectations are literals,
+    # not derived from the production constant, so the test cannot pass by
+    # construction if the scale changes.
     # Looking up 80° -> clamped to -40°
     steps_up = smoother.generate_pitch_yaw_trajectory(yaw_deg=0.0, pitch_deg=-80.0, config=cfg)
-    expected_dy_up = int(round(-40.0 * cfg.deg_to_px_pitch))
-    assert sum(s[1] for s in steps_up) == expected_dy_up
+    assert sum(s[1] for s in steps_up) == -140
+    # At the clamp limit itself the result must be identical (clamp equivalence)
+    steps_up_limit = smoother.generate_pitch_yaw_trajectory(yaw_deg=0.0, pitch_deg=-40.0, config=cfg)
+    assert sum(s[1] for s in steps_up_limit) == -140
 
     # Looking down 90° -> clamped to +50°
     steps_down = smoother.generate_pitch_yaw_trajectory(yaw_deg=0.0, pitch_deg=90.0, config=cfg)
-    expected_dy_down = int(round(50.0 * cfg.deg_to_px_pitch))
-    assert sum(s[1] for s in steps_down) == expected_dy_down
+    assert sum(s[1] for s in steps_down) == 175
+    steps_down_limit = smoother.generate_pitch_yaw_trajectory(yaw_deg=0.0, pitch_deg=50.0, config=cfg)
+    assert sum(s[1] for s in steps_down_limit) == 175
 
 
 def test_reversal_damping_on_rapid_direction_changes():
@@ -340,7 +375,13 @@ def test_abort_callback_stops_motion_and_releases_rmb():
         sleep_fn=lambda dt: None,
     )
     assert ok is False
-    assert len(driver.moves) == 4  # Aborted at step 5
+    # Abort must stop the motion EARLY: at least one step ran, but strictly
+    # fewer than the full uninterrupted 90-degree trajectory (46 steps), and
+    # no more than the 5 steps the abort callback allows before it fires.
+    # (No exact count: the count depends on where the abort check sits in the
+    # step loop, which is an implementation detail.)
+    full_trajectory = smoother.generate_heading_turn_trajectory(angle_diff_deg=90.0)
+    assert 0 < len(driver.moves) <= 5 < len(full_trajectory)
     assert driver.mouse_events[-1] == ("up", "right")  # RMB cleaned up
     assert smoother.get_metrics()["aborts_count"] == 1
 

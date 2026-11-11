@@ -8,13 +8,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import tempfile
 import pytest
 
 from dataset_factory.dataset_validator import (
     MIN_BOX_DIM_BOUND,
     MAX_BOX_DIM_BOUND,
-    BoxValidationResult,
     check_box_size_bounds,
     validate_label_box,
     sanitize_boxes,
@@ -133,10 +131,11 @@ class TestSanitizeDatasetBoxes:
         assert len(clean) == 1
         assert clean[0]["class_id"] == 0
 
+        # Exact issue types: micro box -> micro_noise, massive box ->
+        # massive_box, zero-area box -> zero_area. No disjunctive fallback;
+        # a misclassified issue must fail this test.
         types = {iss.issue_type for iss in issues}
-        assert "micro_noise" in types or "size_bounds" in types
-        assert "massive_box" in types or "size_bounds" in types
-        assert "zero_area" in types
+        assert types == {"micro_noise", "massive_box", "zero_area"}
 
     def test_auto_fixes_corner_oob_within_bounds(self) -> None:
         """Clips box corners to [0.0, 1.0] if clamped dimensions remain within [0.004, 0.65]."""
@@ -157,6 +156,145 @@ class TestSanitizeDatasetBoxes:
         assert len(clean) == 1
         assert clean[0]["hand_label"] is True
         assert any(iss.issue_type == "duplicate_overlap" for iss in issues)
+
+
+class TestCheckBoxSizeBounds:
+    """Direct tests for check_box_size_bounds and the L17 bound constants."""
+
+    def test_bounds_constants(self) -> None:
+        assert MIN_BOX_DIM_BOUND == 0.004
+        assert MAX_BOX_DIM_BOUND == 0.65
+
+    def test_valid_dimensions_accepted(self) -> None:
+        is_bad, msg = check_box_size_bounds(0.1, 0.1)
+        assert is_bad is False
+        assert msg == ""
+        # Exact boundaries are accepted.
+        assert check_box_size_bounds(0.004, 0.004) == (False, "")
+        assert check_box_size_bounds(0.65, 0.65) == (False, "")
+
+    def test_micro_noise_rejected(self) -> None:
+        is_bad, msg = check_box_size_bounds(0.002, 0.1)
+        assert is_bad is True
+        assert "mikro" in msg.lower() or "micro" in msg.lower()
+        is_bad, _ = check_box_size_bounds(0.1, 0.001)
+        assert is_bad is True
+
+    def test_massive_box_rejected(self) -> None:
+        is_bad, msg = check_box_size_bounds(0.7, 0.1)
+        assert is_bad is True
+        assert "büyük" in msg.lower() or "massive" in msg.lower()
+        is_bad, _ = check_box_size_bounds(0.1, 0.66)
+        assert is_bad is True
+
+    def test_zero_negative_and_nonfinite_rejected(self) -> None:
+        assert check_box_size_bounds(0.0, 0.1)[0] is True
+        assert check_box_size_bounds(0.1, -0.05)[0] is True
+        assert check_box_size_bounds(float("nan"), 0.1)[0] is True
+        assert check_box_size_bounds(float("inf"), 0.1)[0] is True
+
+
+class TestSanitizeBoxesDirect:
+    """Direct tests for sanitize_boxes (the non-dataset entry point)."""
+
+    def test_filters_micro_box_keeping_clean(self) -> None:
+        boxes = [
+            {"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1},
+            {"class_id": 1, "cx": 0.3, "cy": 0.3, "w": 0.002, "h": 0.05},
+        ]
+        clean, issues = sanitize_boxes(boxes)
+        assert len(clean) == 1
+        assert clean[0]["class_id"] == 0
+        assert [iss.issue_type for iss in issues] == ["micro_noise"]
+
+
+class TestValidateYoloFile:
+    """Tests for validate_yolo_file (per-file YOLO validation)."""
+
+    def test_clean_file_has_no_issues(self, tmp_path: Path) -> None:
+        f = tmp_path / "clean.txt"
+        f.write_text("0 0.500000 0.500000 0.100000 0.100000\n", encoding="utf-8")
+        boxes, issues = validate_yolo_file(f)
+        assert len(boxes) == 1
+        assert boxes[0]["class_id"] == 0
+        assert issues == []
+
+    def test_micro_box_reported_as_micro_noise(self, tmp_path: Path) -> None:
+        f = tmp_path / "dirty.txt"
+        f.write_text(
+            "0 0.500000 0.500000 0.100000 0.100000\n"
+            "1 0.300000 0.300000 0.002000 0.050000\n",
+            encoding="utf-8",
+        )
+        boxes, issues = validate_yolo_file(f)
+        # F-0852: a line that fails an error-severity check is reported as an
+        # issue but NOT added to the returned boxes. The stale assertion
+        # len==2 counted the invalid micro box as a returned box.
+        assert len(boxes) == 1
+        assert boxes[0]["class_id"] == 0
+        assert [iss.issue_type for iss in issues] == ["micro_noise"]
+        assert issues[0].severity == "error"
+
+    def test_missing_file_reported(self, tmp_path: Path) -> None:
+        boxes, issues = validate_yolo_file(tmp_path / "missing.txt")
+        assert boxes == []
+        assert [iss.issue_type for iss in issues] == ["file_not_found"]
+        assert issues[0].severity == "error"
+
+
+class TestValidateDataset:
+    """Tests for validate_dataset (whole-dataset QA audit)."""
+
+    def test_clean_dataset_is_valid(self, tmp_path: Path) -> None:
+        labels = tmp_path / "labels" / "train"
+        labels.mkdir(parents=True)
+        (labels / "good.txt").write_text("0 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+        report = validate_dataset(tmp_path, check_pending=False)
+        assert report.valid is True
+        assert report.total_files_scanned == 1
+        assert report.total_boxes_scanned == 1
+        assert report.issues == []
+
+    def test_dirty_dataset_reports_exact_issues(self, tmp_path: Path) -> None:
+        labels = tmp_path / "labels" / "train"
+        labels.mkdir(parents=True)
+        (labels / "good.txt").write_text("0 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+        (labels / "bad.txt").write_text(
+            "1 0.3 0.3 0.002 0.05\n2 0.5 0.5 0.0 0.1\n", encoding="utf-8"
+        )
+        report = validate_dataset(tmp_path, check_pending=False)
+        assert report.valid is False
+        assert report.total_files_scanned == 2
+        # F-0852: total_boxes_scanned counts returned (valid) boxes only; the
+        # micro-noise and zero-area lines are reported as issues, not counted
+        # as scanned boxes. The stale assertion ==3 counted all 3 lines.
+        assert report.total_boxes_scanned == 1
+        assert report.error_count == 2
+        assert {iss.issue_type for iss in report.issues} == {"micro_noise", "zero_area"}
+
+
+class TestAtomicWrites:
+    """Tests for atomic_write_text / atomic_write_json."""
+
+    def test_atomic_write_text_round_trip(self, tmp_path: Path) -> None:
+        target = tmp_path / "out.txt"
+        atomic_write_text(target, "hello\nworld\n")
+        assert target.read_text(encoding="utf-8") == "hello\nworld\n"
+        # No temp leftovers beside the target.
+        assert [p.name for p in tmp_path.iterdir()] == ["out.txt"]
+
+    def test_atomic_write_text_overwrites(self, tmp_path: Path) -> None:
+        target = tmp_path / "out.txt"
+        target.write_text("stale", encoding="utf-8")
+        atomic_write_text(target, "fresh")
+        assert target.read_text(encoding="utf-8") == "fresh"
+
+    def test_atomic_write_json_round_trip(self, tmp_path: Path) -> None:
+        target = tmp_path / "out.json"
+        atomic_write_json(target, {"stem": "x", "trusted": [{"class_id": 0}]})
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data == {"stem": "x", "trusted": [{"class_id": 0}]}
+        assert [p.name for p in tmp_path.iterdir()] == ["out.json"]
 
 
 class TestAtomicSyncReviewTxtPair:

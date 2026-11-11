@@ -41,20 +41,65 @@ def _paste_sprout(image: np.ndarray, x: int, y: int) -> None:
     image[y : y + 16, x : x + 16] = patch
 
 
-def test_crop_box_ignores_distance_text() -> None:
-    plain = MinimapLiveCropPreviewWidget.crop_box(1280, 720)
-    marked = np.zeros((720, 1280, 3), np.uint8)
-    cv2.putText(
-        marked,
-        "5225m",
-        (1100, 80),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.4,
-        (255, 255, 255),
-        3,
-        cv2.LINE_AA,
+def _real_sprout_patch(size: int) -> np.ndarray:
+    """A sprout patch cut from real game pixels — never the production template.
+
+    Loads ``reference_screenshots/minimap_sprout_closeup.jpg``, locates a
+    sprout with the scanner, and cuts a 16x16 window centred on the detected
+    node. The returned pixels are the game's own sprout glyph: the helper
+    asserts they differ from ``MinimapScanner._CANONICAL_SPROUT_TPL`` so a
+    test using them cannot pass by matching the production template (F-1421).
+    """
+    root = os.path.dirname(__file__)
+    shot = _load(os.path.join(root, "reference_screenshots", "minimap_sprout_closeup.jpg"))
+    scanner = MinimapScanner()
+    shot_crop, _bounds = scanner.extract_minimap(shot)
+    nodes = scanner.scan_minimap_crop(shot_crop)["gatherable_nodes"]
+    assert len(nodes) >= 1, nodes
+    cx, cy = nodes[0]["pos"]
+    patch = shot_crop[cy - 8 : cy + 8, cx - 8 : cx + 8].copy()
+    assert patch.shape == (16, 16, 3), patch.shape
+    tpl = cv2.cvtColor(MinimapScanner._CANONICAL_SPROUT_TPL, cv2.COLOR_GRAY2BGR)
+    assert float(np.mean(np.abs(patch.astype(np.int16) - tpl.astype(np.int16)))) > 1.0, (
+        "extracted patch is (near-)identical to the production template; "
+        "it would not prove real pixels are counted"
     )
-    assert MinimapLiveCropPreviewWidget.crop_box(marked.shape[1], marked.shape[0]) == plain
+    if size == 16:
+        return patch
+    return cv2.resize(patch, (size, size), interpolation=cv2.INTER_AREA)
+
+
+def test_crop_box_ignores_distance_text() -> None:
+    # crop_box is pure geometry: the same (w, h) must give the same rect no
+    # matter what text the frame carries. The old test only called it on one
+    # marked image and never showed the text was really there (F-1330).
+    plain = MinimapLiveCropPreviewWidget.crop_box(1280, 720)
+    variants = []
+    for text, org, scale, thick in (
+        ("5225m", (1100, 80), 1.4, 3),
+        ("12m", (50, 700), 1.0, 2),
+        ("99999m", (1100, 80), 2.0, 4),
+        ("", (0, 0), 1.0, 1),
+    ):
+        marked = np.zeros((720, 1280, 3), np.uint8)
+        if text:
+            cv2.putText(
+                marked,
+                text,
+                org,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                scale,
+                (255, 255, 255),
+                thick,
+                cv2.LINE_AA,
+            )
+            # Prove the text pixels are really in this image: the crop is
+            # supposed to ignore them, not to never have seen them.
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+            region = marked[org[1] - th : org[1] + 2, org[0] : org[0] + tw]
+            assert int(np.count_nonzero(region)) > 0, text
+        variants.append(marked)
+        assert MinimapLiveCropPreviewWidget.crop_box(marked.shape[1], marked.shape[0]) == plain, text
     assert plain == (
         int(1280 * 0.855),
         int(720 * 0.065),
@@ -217,7 +262,14 @@ def test_dredgion_crop_counts_a_real_sprout() -> None:
     assert distance is not None
     pasted = crop.copy()
     origin = (24, 100)
-    _paste_sprout(pasted, origin[0], origin[1])
+    # The 166px-wide crop is half the scanner's 332px reference width, so the
+    # sprout must be pasted at the scanner's expected kernel size (9px), and
+    # it must be real game pixels from the reference screenshot — the old
+    # test pasted the production template itself at 16px and counted nothing
+    # (F-1421; it failed at baseline with 0 materials).
+    patch_size = 9
+    patch = _real_sprout_patch(patch_size)
+    pasted[origin[1] : origin[1] + patch_size, origin[0] : origin[0] + patch_size] = patch
     materials, monsters = classify_minimap_crop_bgr(pasted)
     assert len(materials) == 1, materials
     mat = materials[0]
@@ -227,7 +279,8 @@ def test_dredgion_crop_counts_a_real_sprout() -> None:
     height, width = pasted.shape[:2]
     px = mat["norm_x"] * width
     py = mat["norm_y"] * height
-    assert abs(px - (origin[0] + 8)) < 14 and abs(py - (origin[1] + 8)) < 14, mat
+    center_x, center_y = origin[0] + patch_size // 2, origin[1] + patch_size // 2
+    assert abs(px - center_x) < 14 and abs(py - center_y) < 14, mat
     dx, dy, dw, dh = distance
     assert not (dx <= px <= dx + dw and dy <= py <= dy + dh)
     assert mat["norm_y"] >= 0.18
@@ -253,80 +306,47 @@ def test_save_skips_monsters_chrome_and_placeholders() -> None:
     assert "AÇIK" in dialog.btn_toggle_minimap_inset.text()
     assert dialog.canvas._show_minimap_overlay is True
     _assert_no_bot_rings_or_center_dot(dialog.minimap_preview_widget)
-    good = {
-        "norm_x": 0.75,
-        "norm_y": 0.70,
-        "rel_map_dx": 40.0,
-        "rel_map_dy": -12.0,
-        "resource_type": "Toplanabilir Materyal",
-        "stack_count": 3,
-        "max_harvests": 3,
-        "kind": "sprout_material",
-        "is_gatherable": True,
-        "hud_chrome": False,
-        "source_type": "minimap_auto",
-    }
+    # Feed the record path through the real classifier instead of assigning
+    # a hand-made list to the widget's private state (F-1422): a synthetic
+    # minimap with a REAL sprout (reference-screenshot pixels) at rel dx +40
+    # and a hostile red dot. The classifier must produce exactly one
+    # recordable material and one rejected monster.
+    height, width = 257, 332
+    scene = np.full((height, width, 3), (42, 58, 70), np.uint8)
+    pcx = int(round(width * MinimapScanner.PLAYER_CENTER_REL[0]))
+    pcy = int(round(height * MinimapScanner.PLAYER_CENTER_REL[1]))
+    cv2.circle(scene, (pcx, pcy), 5, (250, 250, 250), -1)
+    scene[pcy - 8 : pcy + 8, pcx + 32 : pcx + 48] = _real_sprout_patch(16)
+    cv2.circle(scene, (pcx - 60, pcy + 20), 4, (20, 20, 240), -1)
+    materials, monsters = classify_minimap_crop_bgr(scene)
+    assert len(materials) == 1, materials
+    assert materials[0]["kind"] == "sprout_material"
+    assert abs(materials[0]["rel_map_dx"] - 40.0) < 0.5, materials
+    assert len(monsters) == 1, monsters
+    assert monsters[0]["kind"] == "hostile_dot", monsters
+    assert monsters[0]["is_gatherable"] is False
+
+    dialog.minimap_preview_widget.set_minimap_detections(materials, monsters)
+    live = dialog.minimap_preview_widget.get_gatherable_materials()
+    assert len(live) == 1, live
+    assert live[0]["kind"] == "sprout_material"
+    rejected = dialog.minimap_preview_widget.get_rejected_monsters()
+    assert len(rejected) == 1, rejected
+    assert rejected[0]["kind"] == "hostile_dot"
+    good = live[0]
     if dialog.canvas._player_pos is not None:
         base_x = float(dialog.canvas._player_pos[0])
     elif dialog._walk_trajectory:
         base_x = float(dialog._walk_trajectory[-1][0])
     else:
         base_x = float(dialog.canvas._base_pixmap.width()) * 0.5
-    dialog.minimap_preview_widget._gatherable_materials = [
-        good,
-        {
-            "norm_x": 0.40,
-            "norm_y": 0.55,
-            "kind": "monster_dot",
-            "is_gatherable": False,
-            "label": "•✕",
-            "rel_map_dx": 10.0,
-            "rel_map_dy": 8.0,
-        },
-        {
-            "norm_x": 0.72,
-            "norm_y": 0.26,
-            "rel_map_dx": 36.0,
-            "rel_map_dy": -32.0,
-            "resource_type": "Aether Gem",
-            "stack_count": 6,
-            "stack_badge": "6x",
-            "source_type": "minimap_auto",
-        },
-        {
-            "norm_x": 0.50,
-            "norm_y": 0.08,
-            "rel_map_dx": 0.0,
-            "rel_map_dy": -80.0,
-            "kind": "sprout_material",
-            "is_gatherable": True,
-            "resource_type": "Toplanabilir Materyal",
-        },
-        {
-            "norm_x": 0.86,
-            "norm_y": 0.90,
-            "rel_map_dx": 70.0,
-            "rel_map_dy": 60.0,
-            "kind": "sprout_material",
-            "is_gatherable": True,
-            "resource_type": "Toplanabilir Materyal",
-        },
-        {
-            "norm_x": 0.50,
-            "norm_y": 0.545,
-            "rel_map_dx": 0.0,
-            "rel_map_dy": 0.0,
-            "kind": "sprout_material",
-            "is_gatherable": True,
-            "resource_type": "Toplanabilir Materyal",
-        },
-    ]
     saved = dialog.record_minimap_now()
     assert len(saved) == 1, saved
     assert saved[0]["resource_type"] == "Toplanabilir Materyal"
     assert saved[0].get("kind") == "sprout_material"
     assert abs(float(saved[0]["map_x"]) - (base_x + 40.0)) <= 1.0
-    assert all(n.get("resource_type") != "Aether Gem" for n in dialog._ordered_nodes)
+    # Only the real sprout was recorded: the hostile dot never became a node.
+    assert all(n.get("kind") != "hostile_dot" for n in dialog._ordered_nodes)
     assert all(n.get("kind") != "monster_dot" for n in dialog._ordered_nodes)
 
     dialog._minimap_inset_user_override = False

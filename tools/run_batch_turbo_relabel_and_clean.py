@@ -40,14 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import cv2
-import numpy as np
-
-# Core Engine Imports
 import dataset_factory.label_trust as label_trust
 from dataset_factory.dataset_curator import DatasetCurator
-from dataset_factory.exemplar_memory import ExemplarMemory, extract_box_crop
-from dataset_factory.yolo_auto_labeler import YOLOAutoLabeler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +54,13 @@ logger = logging.getLogger("TurboRelabelRunner")
 # ==============================================================================
 # Box-Level Low-Confidence Pruner ("✂️ Düşük Güvenli Etiketleri Sil (Görseli Koru)")
 # ==============================================================================
+# F-1216: the canonical implementation lives in dataset_factory.label_trust
+# (which HAS prune_low_confidence_boxes_in_dataset). The ~150-line local
+# copy below it used to be dead code — the old delegation branch at the top
+# of the function always won — and it had drifted from the real
+# implementation. It is replaced by a thin delegating wrapper so there is
+# exactly one implementation; the wrapper only normalises the result keys
+# this runner's reporting expects.
 def prune_low_confidence_boxes_in_dataset(
     dataset_dir: Union[str, Path],
     threshold: float = 0.50,
@@ -69,187 +70,31 @@ def prune_low_confidence_boxes_in_dataset(
     """
     Remove ONLY low-confidence boxes (< threshold) from review JSON and label TXT.
     The image and all remaining confident boxes (>= threshold) are 100% PRESERVED.
-    Pruned low-confidence crops are optionally recorded into ExemplarMemory as
-    negative exemplars so the model learns from the cleanup.
+    Delegates to dataset_factory.label_trust.prune_low_confidence_boxes_in_dataset.
     """
-    # If label_trust already provides this function, delegate directly
-    if hasattr(label_trust, "prune_low_confidence_boxes_in_dataset") and (
-        getattr(label_trust, "prune_low_confidence_boxes_in_dataset")
-        != prune_low_confidence_boxes_in_dataset
-    ):
-        return getattr(label_trust, "prune_low_confidence_boxes_in_dataset")(
+    result = dict(
+        label_trust.prune_low_confidence_boxes_in_dataset(
             dataset_dir=dataset_dir,
             threshold=threshold,
             indices_or_stems=indices_or_stems,
             record_negative_exemplars=record_negative_exemplars,
         )
-
-    from dataset_factory.label_trust import (
-        TRAIN_CONF_FLOOR,
-        _is_hand_or_gather_seed,
-        _rewrite_label_txt,
-        annotation_confidence,
-        train_txt_boxes,
     )
-
-    root = Path(dataset_dir)
-    stem_filter = set(indices_or_stems) if indices_or_stems is not None else None
-
-    ex_memory: Optional[ExemplarMemory] = None
-    if record_negative_exemplars:
-        try:
-            ex_memory = ExemplarMemory()
-        except Exception:
-            ex_memory = None
-
-    scanned_frames = 0
-    modified_frames = 0
-    total_boxes_before = 0
-    pruned_boxes = 0
-    preserved_boxes = 0
-    negatives_taught = 0
-
-    for split in ("train", "val"):
-        review_dir = root / "review" / split
-        labels_dir = root / "labels" / split
-        images_dir = root / "images" / split
-
-        if not review_dir.is_dir():
-            continue
-
-        for rev_file in sorted(review_dir.glob("*.json")):
-            stem = rev_file.stem
-            if stem == "trusted_seed":
-                continue
-            if stem_filter is not None and stem not in stem_filter:
-                continue
-
-            scanned_frames += 1
-            try:
-                payload = json.loads(rev_file.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-
-            if not isinstance(payload, dict):
-                continue
-
-            trusted_in = [b for b in payload.get("trusted", []) if isinstance(b, dict)]
-            weak_in = [b for b in payload.get("weak", []) if isinstance(b, dict)]
-            all_boxes = list(trusted_in) + list(weak_in)
-            if not all_boxes:
-                continue
-
-            total_boxes_before += len(all_boxes)
-
-            # Fast check: are there any prunable boxes below threshold that are not protected?
-            prunable_exists = any(
-                annotation_confidence(b) < float(threshold)
-                and not (
-                    b.get("hand_label") is True
-                    or b.get("human_approved") is True
-                    or b.get("approved") is True
-                    or _is_hand_or_gather_seed(b)
-                )
-                for b in all_boxes
-            )
-
-            frame: Optional[np.ndarray] = None
-            if prunable_exists and record_negative_exemplars and ex_memory is not None:
-                for ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
-                    img_cand = images_dir / f"{stem}{ext}"
-                    if img_cand.is_file():
-                        try:
-                            data = np.fromfile(str(img_cand), dtype=np.uint8)
-                            if data.size > 0:
-                                frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                        except Exception:
-                            frame = None
-                        break
-
-            new_trusted: List[Dict[str, Any]] = []
-            new_weak: List[Dict[str, Any]] = []
-            frame_pruned_count = 0
-
-            for b in all_boxes:
-                b_copy = dict(b)
-                conf = annotation_confidence(b_copy)
-                cid = int(b_copy.get("class_id", 0))
-                cname = str(b_copy.get("class_name", ""))
-
-                is_protected = (
-                    b_copy.get("hand_label") is True
-                    or b_copy.get("human_approved") is True
-                    or b_copy.get("approved") is True
-                    or _is_hand_or_gather_seed(b_copy)
-                )
-
-                # Prune if strictly below threshold and not immune
-                if conf < float(threshold) and not is_protected:
-                    frame_pruned_count += 1
-                    pruned_boxes += 1
-                    if (
-                        record_negative_exemplars
-                        and ex_memory is not None
-                        and frame is not None
-                    ):
-                        try:
-                            crop = extract_box_crop(frame, b_copy)
-                            if crop is not None and crop.size >= 16:
-                                ex_memory.add_negative_exemplar(
-                                    crop, cid, cname, source="low_confidence_prune"
-                                )
-                                negatives_taught += 1
-                        except Exception:
-                            pass
-                    continue
-
-                # Preserve box: if >= threshold, promote to trusted (🟢 Emin)
-                if conf >= float(threshold) or is_protected:
-                    b_copy["trusted"] = True
-                    b_copy["weak"] = False
-                    new_trusted.append(b_copy)
-                else:
-                    b_copy["trusted"] = False
-                    b_copy["weak"] = True
-                    new_weak.append(b_copy)
-                preserved_boxes += 1
-
-            if frame_pruned_count > 0:
-                payload["trusted"] = new_trusted
-                payload["weak"] = new_weak
-                rev_file.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-
-                # Sync labels/*.txt
-                lbl_file = labels_dir / f"{stem}.txt"
-                labels_dir.mkdir(parents=True, exist_ok=True)
-                emit = train_txt_boxes(
-                    new_trusted, new_weak, stem=stem, floor=float(threshold)
-                )
-                _rewrite_label_txt(lbl_file, emit)
-                modified_frames += 1
-
-    return {
-        "scanned_frames": scanned_frames,
-        "modified_frames": modified_frames,
-        "total_boxes_before": total_boxes_before,
-        "pruned_boxes": pruned_boxes,
-        "preserved_boxes": preserved_boxes,
-        "negatives_taught": negatives_taught,
-        "threshold": float(threshold),
-    }
+    # Normalise keys for this runner's reporting (canonical impl reports
+    # "scanned"/"files_rewritten"/"promoted_boxes"; it does not report a
+    # negative-exemplar count, so that stays 0 rather than invented).
+    result.setdefault("scanned_frames", result.get("scanned", 0))
+    result.setdefault("modified_frames", result.get("files_rewritten", 0))
+    result.setdefault("preserved_boxes", result.get("promoted_boxes", 0))
+    result.setdefault(
+        "total_boxes_before",
+        result.get("pruned_boxes", 0) + result.get("promoted_boxes", 0),
+    )
+    result.setdefault("negatives_taught", 0)
+    return result
 
 
 # Ensure label_trust has aliases if missing
-if not hasattr(label_trust, "prune_low_confidence_boxes_in_dataset"):
-    setattr(
-        label_trust,
-        "prune_low_confidence_boxes_in_dataset",
-        prune_low_confidence_boxes_in_dataset,
-    )
-
 if not hasattr(label_trust, "smart_ai_purge_poisoned_labels"):
     setattr(
         label_trust,
@@ -379,6 +224,7 @@ def run_batch_turbo_relabel_and_clean(
         "smart_ai_purge_poisoned_labels",
         getattr(label_trust, "clean_poison_labels_ai", None),
     )
+    purge_available = purge_fn is not None
     if purge_fn is not None:
         purge_stats = purge_fn(
             dataset_dir=dataset_path,
@@ -387,6 +233,13 @@ def run_batch_turbo_relabel_and_clean(
             teach_negatives=True,
         )
     else:
+        # F-1272: a missing purge function must NOT silently report zeros
+        # while the run still exits 0 — flag it and fail at the end.
+        logger.error(
+            "Smart AI Poison Purge UNAVAILABLE: neither "
+            "label_trust.smart_ai_purge_poisoned_labels nor "
+            "label_trust.clean_poison_labels_ai exists — purge step skipped."
+        )
         purge_stats = {"poison_deleted_boxes": 0, "auto_repaired_boxes": 0}
     t_purge_end = time.time()
     logger.info(
@@ -429,7 +282,7 @@ def run_batch_turbo_relabel_and_clean(
     benchmark = {
         "dataset_dir": str(dataset_path),
         "total_images_discovered": total_images,
-        "images_processed": relabel_stats.get("processed", total_images),
+        "images_processed": relabel_stats.get("processed", 0),
         "images_labeled": relabel_stats.get("labeled", 0),
         "images_skipped": relabel_stats.get("skipped", 0),
         "boxes_labeled": relabel_stats.get("total_boxes", 0),
@@ -448,6 +301,7 @@ def run_batch_turbo_relabel_and_clean(
         "relabel_fps": relabel_stats.get("fps", 0.0),
         "total_elapsed_seconds": round(total_elapsed, 2),
         "overall_fps": round(overall_fps, 2),
+        "purge_available": purge_available,
         "manifest_stats": manifest,
     }
 
@@ -476,13 +330,29 @@ def run_batch_turbo_relabel_and_clean(
     print(f"   Val Images:                  {manifest.get('val_count', 0)}")
     print(f"   Total Images:                {manifest.get('total_images', 0)}")
     print(f"   Total Valid Bounding Boxes:  {manifest.get('total_boxes', 0)}")
-    print(f"   Classes Represented:         {len(manifest.get('class_counts', {}))}")
+    # F-1215: rebuild_manifest_stats keys "class_counts" by CLASS NAME
+    # (e.g. {"monster_3d": 225}) and "class_id_counts" by numeric id
+    # (e.g. {"10": 225}); the old code sorted the NAME keys as if they
+    # were numeric ids and looked names up in a "class_names" key that
+    # the manifest does not have. Prefer the id-keyed map (numeric order,
+    # names from the curator taxonomy) and fall back to the name map.
+    class_counts = manifest.get("class_counts", {}) or {}
+    class_id_counts = manifest.get("class_id_counts", {}) or {}
+    print(f"   Classes Represented:         {len(class_counts)}")
     print(" Class Distribution:")
-    for cid_str, cnt in sorted(
-        manifest.get("class_counts", {}).items(), key=lambda x: int(x[0]) if x[0].isdigit() else 999
-    ):
-        cname = manifest.get("class_names", {}).get(cid_str, f"class_{cid_str}")
-        print(f"   - Class {cid_str:2s} ({cname:20s}): {cnt:5d} boxes")
+    if class_id_counts:
+        for cid_str, cnt in sorted(
+            class_id_counts.items(),
+            key=lambda x: int(x[0]) if str(x[0]).isdigit() else 999,
+        ):
+            try:
+                cname = curator.class_names.get(int(cid_str), f"class_{cid_str}")
+            except (TypeError, ValueError):
+                cname = f"class_{cid_str}"
+            print(f"   - Class {cid_str:>2s} ({cname:20s}): {cnt:5d} boxes")
+    else:
+        for cname, cnt in sorted(class_counts.items()):
+            print(f"   - {cname:20s}: {cnt:5d} boxes")
     print("=" * 80 + "\n")
 
     return benchmark
@@ -557,6 +427,9 @@ def main() -> int:
         limit=int(args.limit),
     )
 
+    # F-1272: exit code reflects the purge step too, not just the manifest.
+    if not results.get("purge_available", True):
+        return 1
     return 0 if results.get("manifest_stats", {}).get("total_images", 0) > 0 else 1
 
 

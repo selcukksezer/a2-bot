@@ -19,12 +19,74 @@ _ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
+from core.minimap_scanner import MinimapScanner
 from ui.cartography_radar import (
     classify_minimap_crop_bgr,
     find_zone_distance_bbox,
     minimap_material_is_recordable,
     minimap_norm_is_hud_chrome,
 )
+
+
+def _real_sprout_minimap(width: int = 332, height: int = 257) -> np.ndarray:
+    """Build a synthetic minimap crop the REAL pixel scanner can detect.
+
+    Pastes the scanner's own canonical 16x16 sprout template (grayscale ->
+    BGR) onto the dark minimap background, plus one white monster dot and
+    one red hostile dot. No scanner mock is involved anywhere in this test.
+    """
+    crop = _blank_minimap(width, height)
+    template = MinimapScanner._CANONICAL_SPROUT_TPL
+    tpl_bgr = cv2.cvtColor(template, cv2.COLOR_GRAY2BGR)
+    # Sprout centre (100, 115): clear of the player centre, HUD title strip,
+    # magnifier and clock regions.
+    crop[107:123, 92:108] = tpl_bgr
+    cv2.circle(crop, (200, 180), 4, (255, 255, 255), -1)  # white monster dot
+    cv2.circle(crop, (250, 100), 4, (0, 0, 255), -1)  # red hostile dot
+    return crop
+
+
+def test_classify_minimap_crop_real_pixel_detection_without_scanner_mock():
+    """
+    End-to-end real pixel detection: the unmocked MinimapScanner must find
+    the canonical sprout template pasted into the crop (NCC >= 0.88) and
+    classify_minimap_crop_bgr must surface it as the only gatherable
+    material, with the white monster dot and red hostile dot as monsters.
+    This is the counterpart of the mocked tests above — if the real scanner
+    ever stops detecting sprouts, this test (not a fake scan dict) fails.
+    """
+    crop = _real_sprout_minimap()
+
+    # 1. Raw scanner, no mocks: template match + structural verification.
+    scan = MinimapScanner().scan_minimap_crop(crop)
+    assert len(scan["gatherable_nodes"]) == 1
+    node = scan["gatherable_nodes"][0]
+    assert node["kind"] == "sprout_material"
+    assert node["is_gatherable"] is True
+    assert node["ncc_score"] >= 0.88
+    assert node["pos"] == (100, 115)
+    assert len(scan["monster_dots"]) == 1
+    assert scan["monster_dots"][0]["pos"] == (200, 180)
+    assert len(scan["hostile_dots"]) == 1
+    assert scan["hostile_dots"][0]["pos"] == (250, 100)
+
+    # 2. Full classify pipeline on the same pixels, still unmocked.
+    materials, monsters = classify_minimap_crop_bgr(crop)
+
+    assert len(materials) == 1
+    mat = materials[0]
+    assert mat["kind"] == "sprout_material"
+    assert mat["is_gatherable"] is True
+    assert mat["hud_chrome"] is False
+    assert mat["stack_count"] == 3
+    assert mat["stack_badge"] == "3x"
+    assert mat["norm_x"] == 0.3012
+    assert mat["norm_y"] == 0.4475
+    assert mat["confidence"] >= 0.88
+
+    assert len(monsters) == 2
+    assert all(m["is_gatherable"] is False for m in monsters)
+    assert {m["kind"] for m in monsters} == {"monster_dot", "hostile_dot"}
 
 
 def _blank_minimap(width: int = 200, height: int = 200) -> np.ndarray:

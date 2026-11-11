@@ -56,6 +56,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+from version import __version__
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -208,15 +209,17 @@ class MinimapOrientationGuard:
 
         mh, mw = gray.shape[:2]
         if mh < 24 or mw < 24:
+            # Analiz için çok küçük: analiz yapmadan "sabit-kuzey"
+            # denemez; kanıt yoksa doğrulanmamış sayılır.
             return {
-                "is_fixed_north": True,
-                "mode": "fixed_north",
-                "confidence": 0.5,
+                "is_fixed_north": False,
+                "mode": "rotating",
+                "confidence": 0.0,
                 "estimated_map_rotation_deg": 0.0,
-                "axis_alignment_score": 0.5,
-                "header_bar_score": 0.5,
+                "axis_alignment_score": 0.0,
+                "header_bar_score": 0.0,
                 "toggle_icon_score": 0.0,
-                "player_heading_deg": 0.0,
+                "player_heading_deg": None,
                 "is_fullscreen_input": is_fullscreen,
             }
 
@@ -324,7 +327,8 @@ class MinimapOrientationGuard:
 
         ys, xs = np.nonzero(arrow_mask)
         if xs.size < 6:
-            return 0.0
+            # Ok bulunamadı: yön bilinmiyor; 0.0 (Kuzey) uydurulamaz.
+            return None
 
         mean_x = float(np.mean(xs))
         mean_y = float(np.mean(ys))
@@ -335,7 +339,7 @@ class MinimapOrientationGuard:
         q75 = float(np.percentile(dists, 75))
         tip_mask = dists >= max(1.0, q75)
         if not np.any(tip_mask):
-            return 0.0
+            return None
 
         tip_dx = float(np.mean(dx[tip_mask]))
         tip_dy = float(np.mean(dy[tip_mask]))
@@ -343,6 +347,33 @@ class MinimapOrientationGuard:
         angle_rad = math.atan2(tip_dx, -tip_dy)
         heading_deg = (math.degrees(angle_rad) + 360.0) % 360.0
         return float(heading_deg)
+
+    def normalize_patch_to_north_with_frame(
+        self,
+        patch_bgr: np.ndarray,
+        frame_bgr: np.ndarray,
+        target_size: Optional[int] = None,
+    ) -> np.ndarray:
+        """Yamayı, karedeki minimap oyuncu okundan tahmin edilen kamera
+        yaw açısıyla kuzeye normalize eder.
+
+        `normalize_patch_to_north(..., camera_yaw_deg=0.0)` üretimde hep
+        0.0 ile çağrılıyordu (yaw hiç ölçülmüyordu); bu yardımcı yaw'ı
+        kareden ölçer. Ok bulunamazsa `ValueError` yükseltilir — 0.0
+        varsayılıp sessizce yanlış normalize edilmez.
+        """
+        if frame_bgr is None or not isinstance(frame_bgr, np.ndarray) or frame_bgr.size == 0:
+            raise ValueError("frame_bgr boş veya None olamaz.")
+        mm_roi, _ = self._extract_minimap_candidate(frame_bgr)
+        heading = self._estimate_player_arrow_heading(mm_roi)
+        if heading is None:
+            raise ValueError(
+                "Oyuncu oku bulunamadı; kamera yaw açısı tahmin edilemedi, "
+                "yama kuzeye normalize edilemez."
+            )
+        return self.normalize_patch_to_north(
+            patch_bgr, camera_yaw_deg=float(heading), target_size=target_size
+        )
 
     def normalize_patch_to_north(
         self,
@@ -398,6 +429,16 @@ class MinimapOrientationGuard:
                 return cropped.copy()
 
         return cv2.resize(rotated, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
+
+
+def _sobel_magnitude_to_uint8(sobel_mag: np.ndarray, like: np.ndarray) -> np.ndarray:
+    """Sobel büyüklük haritasını 99. persentil ile [0..255] `uint8` aralığına
+    ölçekler. Düz (kenarsız) girdide sıfır harita döner. `normalize_patch`
+    ve `compute_sobel_edge_map` içindeki aynı ölçekleme bloğunun tek tanımıdır."""
+    max_mag = float(np.percentile(sobel_mag, 99.0))
+    if max_mag <= 1e-4:
+        return np.zeros_like(like, dtype=np.uint8)
+    return np.clip((sobel_mag / max_mag) * 255.0, 0.0, 255.0).astype(np.uint8)
 
 
 # ==============================================================================
@@ -470,7 +511,15 @@ class SobelClahePatchNormalizer:
             lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
             lum = lab[:, :, 0]
         else:
-            lum = patch_bgr if patch_bgr.dtype == np.uint8 else np.clip(patch_bgr, 0, 255).astype(np.uint8)
+            # S185 (v19/P3-8): 2-kanal (H,W,2) girdi else dalına düşüp
+            # CLAHE'ye 2-kanal gidiyor, ham cv2 hatası fırlatıyordu.
+            # compute_sobel_edge_map ile aynı kural: ilk kanal alınır.
+            if patch_bgr.ndim == 3:
+                lum = patch_bgr[:, :, 0]
+            else:
+                lum = patch_bgr
+            if lum.dtype != np.uint8:
+                lum = np.clip(lum, 0, 255).astype(np.uint8)
 
         # Dinamik aralık ön-dengesi (Gece çok karanlık veya aşırı parlak karelerde
         # CLAHE'nin kontrast tavanına çarpmasını önler)
@@ -490,13 +539,8 @@ class SobelClahePatchNormalizer:
         grad_y = cv2.Sobel(smoothed, cv2.CV_32F, 0, 1, ksize=3)
         sobel_mag = cv2.magnitude(grad_x, grad_y)
 
-        max_mag = float(np.percentile(sobel_mag, 99.0))
-        if max_mag > 1e-4:
-            sobel_norm = np.clip((sobel_mag / max_mag) * 255.0, 0.0, 255.0).astype(np.uint8)
-        else:
-            sobel_norm = np.zeros_like(clahe_img, dtype=np.uint8)
-
         # 3. %65 CLAHE + %35 Sobel Kenar Harmanı
+        sobel_norm = _sobel_magnitude_to_uint8(sobel_mag, clahe_img)
         blended = cv2.addWeighted(
             clahe_img,
             self.clahe_weight,
@@ -505,6 +549,21 @@ class SobelClahePatchNormalizer:
             0.0,
         )
         return blended
+
+    def compute_sobel_edge_map(self, patch_bgr: np.ndarray) -> np.ndarray:
+        """Girdi görüntünün Sobel kenar büyüklüğü haritasını (`uint8`, 0..255)
+        döndürür. `normalize_patch` içindeki Sobel adımıyla aynı gradyan
+        hesabıdır; kenar enerjisi isteyen çağıranlar içindir."""
+        if patch_bgr is None or not isinstance(patch_bgr, np.ndarray) or patch_bgr.size == 0:
+            raise ValueError("patch_bgr boş veya None olamaz.")
+        if patch_bgr.ndim == 3:
+            gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY) if patch_bgr.shape[2] in (3, 4) else patch_bgr[:, :, 0]
+        else:
+            gray = patch_bgr if patch_bgr.dtype == np.uint8 else np.clip(patch_bgr, 0, 255).astype(np.uint8)
+        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        sobel_mag = cv2.magnitude(grad_x, grad_y)
+        return _sobel_magnitude_to_uint8(sobel_mag, gray)
 
     def match_normalized_patch(
         self,
@@ -528,13 +587,13 @@ class SobelClahePatchNormalizer:
         sh, sw = search_roi_bgr.shape[:2]
         th, tw = template_bgr.shape[:2]
 
-        # Eğer şablon arama alanından büyükse şablonu arama alanına sığacak şekilde küçült
+        # Şablon arama alanından büyükse sessizce küçültülmez: küçültme
+        # skoru sessizce değiştirir ve eşleşme merkezini kaydırır.
         if th > sh or tw > sw:
-            scale = min(sh / float(th), sw / float(tw))
-            new_w = max(8, int(round(tw * scale)))
-            new_h = max(8, int(round(th * scale)))
-            template_bgr = cv2.resize(template_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            th, tw = template_bgr.shape[:2]
+            raise ValueError(
+                f"Şablon ({tw}x{th}) arama alanından ({sw}x{sh}) büyük; "
+                "eşleştirme yapılamaz."
+            )
 
         norm_search = self.normalize_patch(search_roi_bgr)
         norm_tpl = self.normalize_patch(template_bgr)
@@ -555,7 +614,7 @@ class SobelClahePatchNormalizer:
 
     def get_patch_normalizer_version_info(self) -> dict:
         """Returns version info for the patch normalizer module."""
-        return {"module": "patch_normalizer", "version": "2.0.0", "ready": True}
+        return {"module": "patch_normalizer", "version": __version__, "ready": True}
 
     def get_patch_normalizer_diagnostic_snapshot(self) -> dict:
         """Returns diagnostic snapshot for the patch normalizer module."""
@@ -708,6 +767,39 @@ class HighResROICropper:
             return (frame, meta) if return_meta else frame
 
         roi_view, meta = self.crop_with_meta(frame, self.minimap_rect, name="minimap_roi")
+        if return_meta:
+            return roi_view, meta
+        return roi_view
+
+    def crop_minimap_inner_roi(
+        self,
+        frame: np.ndarray,
+        return_meta: bool = False,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, ROISliceMeta]]:
+        """
+        Minimap iç bölgesini (`ROI_MINIMAP_INNER_NORM`: başlık/saat/büyüteç
+        hariç, yalnızca harita tuvali) sıfır-kopya kırpar.
+        Zaten kırpılmış bir minimap yakın çekimiyse (`w < 800`) kopyalamadan
+        doğrudan tam görünümü döndürür.
+        """
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            raise ValueError("frame boş veya None olamaz.")
+
+        fh, fw = frame.shape[:2]
+        if fw < 800 and fh < 500:
+            meta = ROISliceMeta(
+                name="minimap_inner_roi",
+                x_offset=0,
+                y_offset=0,
+                width=fw,
+                height=fh,
+                frame_width=fw,
+                frame_height=fh,
+                norm_rect=(0.0, 0.0, 1.0, 1.0),
+            )
+            return (frame, meta) if return_meta else frame
+
+        roi_view, meta = self.crop_with_meta(frame, self.MINIMAP_INNER_RECT, name="minimap_inner_roi")
         if return_meta:
             return roi_view, meta
         return roi_view
@@ -1034,7 +1126,9 @@ class MotionBlurGate:
         maskelememesi için tam ekran karelerde 3D orta-üst görüş penceresini değerlendirir.
         """
         if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
-            return 0.0
+            # Geçersiz kare "0.0 keskinlik" (mükemmel bulanık) ile aynı
+            # sayılamaz; çağıran ayırt edebilsin diye hata yükseltilir.
+            raise ValueError("frame boş, None veya ndarray değil.")
 
         fh, fw = frame.shape[:2]
         eval_region = frame
@@ -1073,7 +1167,12 @@ class MotionBlurGate:
             `(is_blurry, laplacian_variance)`
         """
         effective_thresh = float(self.default_threshold if threshold is None else threshold)
-        sharpness = self.compute_sharpness(frame)
+        try:
+            sharpness = self.compute_sharpness(frame)
+        except ValueError:
+            # Geçersiz kare keskinliği ölçülemez: kayıt kapısı için
+            # kullanılamaz sayılır (bulanık kabul edilir, skor NaN).
+            return True, float("nan")
         is_blurry = bool(sharpness < effective_thresh)
         return is_blurry, round(sharpness, 4)
 
@@ -1083,7 +1182,7 @@ class MotionBlurGate:
 
     def get_patch_normalizer_version_info(self) -> dict:
         """Returns version info for the patch normalizer module."""
-        return {"module": "patch_normalizer", "version": "2.0.0", "ready": True}
+        return {"module": "patch_normalizer", "version": __version__, "ready": True}
 
     def get_patch_normalizer_capabilities(self) -> list:
         """Returns capabilities for the patch normalizer module."""
@@ -1122,9 +1221,38 @@ def get_patch_normalizer_capabilities() -> list:
     return ["patch_normalizer", "diagnostic_snapshot", "version_info"]
 
 
+def _probe_patch_normalizer_contract() -> bool:
+    """Gerçek sözleşme probu (DEV-D34, K4 tek-stub istisnası): normalleştiriciyi
+    gerçekten çalıştırır — deterministik sentetik 80x80 yamayı normalize edip
+    çıktının şekil/dtype/değişkenliğini doğrular. CLAHE kurulamamışsa ya da
+    normalize_patch hata verirse / yozlaşmış çıktı üretirse False döner.
+    Bu proba bağlanan tek stub `validate_patch_normalizer_contract()`'tır;
+    zincirdeki diğer get_patch_normalizer_* fonksiyonlarına dokunulmadı."""
+    try:
+        normalizer = SobelClahePatchNormalizer()
+        if getattr(normalizer, "_clahe", None) is None:
+            return False
+        grad = np.tile(np.linspace(0, 255, 80, dtype=np.uint8), (80, 1))
+        patch = cv2.cvtColor(grad, cv2.COLOR_GRAY2BGR)
+        cv2.rectangle(patch, (10, 10), (40, 60), (255, 255, 255), -1)
+        cv2.circle(patch, (60, 60), 12, (0, 0, 0), -1)
+        out = normalizer.normalize_patch(patch)
+        if out is None or out.shape != (80, 80) or out.dtype != np.uint8:
+            return False
+        if float(out.min()) == float(out.max()):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def validate_patch_normalizer_contract() -> bool:
-    """Validates the patch normalizer module contract."""
-    return bool(get_patch_normalizer_capabilities())
+    """Validates the patch normalizer module contract with a real probe:
+    normalleştirici sentetik yamayı gerçekten normalize edebiliyorsa True,
+    aksi halde False. Eskiden yalnızca `bool(get_patch_normalizer_capabilities())`
+    idi — yetenek listesi sabit olduğu için normalleştirici bozukken bile
+    her zaman True dönüyordu."""
+    return bool(_probe_patch_normalizer_contract())
 
 
 def get_patch_normalizer_baseline_metrics() -> dict:

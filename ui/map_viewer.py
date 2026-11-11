@@ -34,11 +34,16 @@ from PyQt6.QtGui import (
 from PyQt6.QtCore import Qt, pyqtSignal, QPoint, QPointF, QRect, QRectF, QSize
 
 from ui.shell_page_frame import wrap_shell_tab_root_layout
+from version import __version__
+
+# P3-6: CWD-bağımlı yollar proje köküne göre çözülür (core/project_root.py).
+from core.project_root import PROJECT_ROOT, project_path, resolve_project_path
 
 try:
-    from core.route_manager import NodeData
+    from core.route_manager import NodeData, SUBREGION_TO_CANONICAL
 except ImportError:
     NodeData = None
+    SUBREGION_TO_CANONICAL = {}
 
 logger = logging.getLogger("Gatherion.MapViewer")
 
@@ -46,7 +51,64 @@ logger = logging.getLogger("Gatherion.MapViewer")
 # Altgard HD zone map constants & affine fit (matching ui/cartography_radar.py)
 # -----------------------------------------------------------------------------
 DEFAULT_MAP_REF: Tuple[float, float] = (1280.0, 720.0)
+
+# Mozaik tuval boyutu (P3-7, tek kaynak): _build_patch_mosaic_pixmap bu
+# sabitleri okur; 1180/740 sayısı kodun başka yerinde geçmez.
+MOSAIC_CANVAS_WIDTH: int = 1180
+MOSAIC_CANVAS_HEIGHT: int = 740
+
+# Başlık çubuğundaki QComboBox geometrisi (P3-7, tek kaynak): başlıktaki iki
+# combo (materyal filtresi + harita modu) ile yanlarındaki 30px'lik butonlar
+# aynı yükseklikte hizalanır; iki combo da QSS'te padding 5px 10px /
+# min-width 160px taşır. Eskiden bg modu combo 4px 8px padding taşıyor ve
+# hiçbir combo yükseklik almıyordu.
+HEADER_COMBO_MIN_HEIGHT: int = 30
 HD_ZONE_MAP_REL = os.path.join("assets", "maps", "altgard.png")
+
+# Bölgeye duyarlı HD harita görselleri (Görev 4; ui/cartography_radar.py ile aynı).
+# Source: https://aion2data.com/game/maps/verteron.webp
+# AION 2 Verteron dünya haritası (Aion2Data). 2303×2400.
+# KURAL: Altgard görseli yalnızca bölge Altgard (veya bilinmiyor) ise adaydır;
+# başka bölge için asla Altgard haritası gösterilmez.
+HD_ZONE_MAPS: Dict[str, str] = {
+    "altgard": os.path.join("assets", "maps", "altgard.png"),
+    "verteron": os.path.join("assets", "maps", "verteron.png"),
+}
+
+# frame_18s.jpg Altgard dünya haritası kırpmasıdır; yalnızca Altgard
+# bölgesinde yedek olabilir. Başka bölgede yedek olamaz.
+FRAME18_REGION_KEYS: Tuple[str, ...] = ("", "altgard")
+
+
+def region_map_candidates(region_name: Optional[str]) -> List[str]:
+    """Bölge için HD harita görseli adayları (mutlak yol, sırayla).
+
+    Altgard görseli yalnızca bölge Altgard (veya boş/bilinmiyor) ise adaydır;
+    başka bölge için kendi görseli yoksa BOŞ liste döner — çağrıcı mozaik
+    yedeğe düşer, yanlış bölge haritası göstermez (Görev 4).
+    """
+    key = str(region_name or "").strip().lower()
+    if key == "":
+        # Bölge bilinmiyorsa eski varsayılan: Altgard.
+        key = "altgard"
+    rel = HD_ZONE_MAPS.get(key)
+    if rel is None:
+        return []
+    return [str(PROJECT_ROOT / rel)]
+
+
+def is_altgard_map_region(region_name: Optional[str]) -> bool:
+    """frame_18s.jpg (Altgard kırpması) bu bölge için yedek olabilir mi?"""
+    return str(region_name or "").strip().lower() in FRAME18_REGION_KEYS
+
+
+def hd_zone_map_path(region: Optional[str] = None) -> str:
+    """Bölgeye duyarlı HD harita yolu (region verilmezse Altgard; geri uyumlu)."""
+    if region:
+        candidates = region_map_candidates(region)
+        if candidates:
+            return candidates[0]
+    return str(PROJECT_ROOT / HD_ZONE_MAP_REL)
 
 _HD_A = 1.46687753
 _HD_B = -0.0150533993
@@ -125,14 +187,30 @@ def resolve_node_xy(
     return x, y
 
 
+# Module-level caches for the hot material-matching path (D64): building the
+# translation table, compiling the regex and rebuilding the synonym map on
+# every call dominated the cost when filtering hundreds of nodes per frame.
+_TR_TRANSLATION = str.maketrans("çğıöşü", "cgiosu")
+_NON_WORD_RE = re.compile(r"[^\w\s]")
+_CATEGORY_SYNONYMS = {
+    "orichalcum": ["orichalcum", "ore", "maden", "cevher", "ore_orichalcum"],
+    "aria": ["aria", "herb_aria", "ot", "bitki"],
+    "mela": ["mela", "herb_mela", "meyve"],
+    "targena": ["targena", "herb_targena"],
+    "gem": ["gem", "crystal", "odyle", "kristal", "tas", "gem_crystal"],
+    "crystal": ["gem", "crystal", "odyle", "kristal", "gem_crystal"],
+    "tree": ["tree", "log", "agac", "kereste", "odun", "tree_log", "wood"],
+    "log": ["tree", "log", "agac", "kereste", "odun", "tree_log", "wood"],
+}
+
+
 def normalize_material_token(text: Any) -> str:
     """Strips punctuation, emojis, and normalizes Turkish/English characters."""
     if not text:
         return ""
     s = str(text).lower()
-    trans = str.maketrans("çğıöşü", "cgiosu")
-    s = s.translate(trans)
-    s = re.sub(r"[^\w\s]", " ", s)
+    s = s.translate(_TR_TRANSLATION)
+    s = _NON_WORD_RE.sub(" ", s)
     return " ".join(s.split())
 
 
@@ -180,22 +258,11 @@ def node_matches_material(node: Any, filter_val: Union[str, Sequence[str], None]
     if norm_filter in combined_node:
         return True
 
-    # Canonical material category synonyms
-    category_synonyms = {
-        "orichalcum": ["orichalcum", "ore", "maden", "cevher", "ore_orichalcum"],
-        "aria": ["aria", "herb_aria", "ot", "bitki"],
-        "mela": ["mela", "herb_mela", "meyve"],
-        "targena": ["targena", "herb_targena"],
-        "gem": ["gem", "crystal", "odyle", "kristal", "tas", "gem_crystal"],
-        "crystal": ["gem", "crystal", "odyle", "kristal", "gem_crystal"],
-        "tree": ["tree", "log", "agac", "kereste", "odun", "tree_log", "wood"],
-        "log": ["tree", "log", "agac", "kereste", "odun", "tree_log", "wood"],
-    }
-
+    # Canonical material category synonyms (module-level table, D64).
     filter_words = norm_filter.split()
     for fw in filter_words:
-        if fw in category_synonyms:
-            if any(syn in combined_node for syn in category_synonyms[fw]):
+        if fw in _CATEGORY_SYNONYMS:
+            if any(syn in combined_node for syn in _CATEGORY_SYNONYMS[fw]):
                 return True
         elif fw in combined_node:
             return True
@@ -236,66 +303,99 @@ def sort_nodes_by_proximity(
     if len(node_list) <= 1:
         return list(node_list)
 
-    def _get_coords(item: Dict[str, Any]) -> Tuple[float, float]:
-        x = float(item.get("map_x", item.get("x", 0.0)) or 0.0)
-        y = float(item.get("map_y", item.get("y", 0.0)) or 0.0)
-        return x, y
+    # D64: coordinate precomputation. resolve_node_xy does dict/getattr
+    # lookups, float conversions and frame checks per call; the old code
+    # called it O(n^2) times in greedy + O(iterations * n^2) times in 2-opt.
+    # Resolve once per node; all distances below are math.hypot over the
+    # same floats, so orderings are bit-identical to the old code.
+    coords = [
+        resolve_node_xy(item, DEFAULT_MAP_REF[0], DEFAULT_MAP_REF[1])
+        for item in node_list
+    ]
 
-    unvisited = list(node_list)
+    unvisited = list(range(len(node_list)))
     ordered: List[Dict[str, Any]] = []
+    ordered_coords: List[Tuple[float, float]] = []
 
     # Select starting node
     if start_xy is not None:
         curr_x, curr_y = float(start_xy[0]), float(start_xy[1])
-        best_idx = 0
+        best_pos = 0
         best_dist = float("inf")
-        for i, n in enumerate(unvisited):
-            nx, ny = _get_coords(n)
+        for pos, i in enumerate(unvisited):
+            nx, ny = coords[i]
             d = math.hypot(nx - curr_x, ny - curr_y)
             if d < best_dist:
                 best_dist = d
-                best_idx = i
-        ordered.append(unvisited.pop(best_idx))
+                best_pos = pos
+        pick = unvisited.pop(best_pos)
     else:
-        ordered.append(unvisited.pop(0))
+        pick = unvisited.pop(0)
+    ordered.append(node_list[pick])
+    ordered_coords.append(coords[pick])
 
     while unvisited:
-        last_x, last_y = _get_coords(ordered[-1])
-        best_idx = 0
+        last_x, last_y = ordered_coords[-1]
+        best_pos = 0
         best_dist = float("inf")
-        for i, n in enumerate(unvisited):
-            nx, ny = _get_coords(n)
+        for pos, i in enumerate(unvisited):
+            nx, ny = coords[i]
             d = math.hypot(nx - last_x, ny - last_y)
             if d < best_dist:
                 best_dist = d
-                best_idx = i
-        ordered.append(unvisited.pop(best_idx))
+                best_pos = pos
+        pick = unvisited.pop(best_pos)
+        ordered.append(node_list[pick])
+        ordered_coords.append(coords[pick])
 
     # 2-Opt TSP refinement
     if len(ordered) >= 4:
+        n_count = len(ordered)
+        # D64: hoisted adjacent segment lengths. seg[j] is the distance
+        # ordered[j] -> ordered[j+1]; the current cost of an (i, k) swap is
+        # seg[i-1] + seg[k] with no recompute, and only the two boundary
+        # segments change on a reversal (inner ones reverse in place,
+        # distances are symmetric).
+        seg = [
+            math.hypot(
+                ordered_coords[j + 1][0] - ordered_coords[j][0],
+                ordered_coords[j + 1][1] - ordered_coords[j][1],
+            )
+            for j in range(n_count - 1)
+        ]
         improved = True
         iterations = 0
         max_iter = 25
-        n_count = len(ordered)
         while improved and iterations < max_iter:
             improved = False
             iterations += 1
             for i in range(1, n_count - 1):
                 for k in range(i + 1, n_count):
-                    p_im1 = _get_coords(ordered[i - 1])
-                    p_i = _get_coords(ordered[i])
-                    p_k = _get_coords(ordered[k])
-                    p_kp1 = _get_coords(ordered[(k + 1) % n_count]) if k + 1 < n_count else None
-
-                    d_cur = math.hypot(p_i[0] - p_im1[0], p_i[1] - p_im1[1])
-                    if p_kp1 is not None:
-                        d_cur += math.hypot(p_kp1[0] - p_k[0], p_kp1[1] - p_k[1])
-                    d_new = math.hypot(p_k[0] - p_im1[0], p_k[1] - p_im1[1])
-                    if p_kp1 is not None:
-                        d_new += math.hypot(p_kp1[0] - p_i[0], p_kp1[1] - p_i[1])
+                    d_cur = seg[i - 1]
+                    if k + 1 < n_count:
+                        d_cur += seg[k]
+                    kx, ky = ordered_coords[k]
+                    im1x, im1y = ordered_coords[i - 1]
+                    d_new = math.hypot(kx - im1x, ky - im1y)
+                    if k + 1 < n_count:
+                        ix, iy = ordered_coords[i]
+                        kp1x, kp1y = ordered_coords[k + 1]
+                        d_new += math.hypot(kp1x - ix, kp1y - iy)
 
                     if d_new < d_cur - 1e-4:
                         ordered[i : k + 1] = reversed(ordered[i : k + 1])
+                        ordered_coords[i : k + 1] = reversed(
+                            ordered_coords[i : k + 1]
+                        )
+                        seg[i:k] = reversed(seg[i:k])
+                        if i > 0:
+                            ax, ay = ordered_coords[i - 1]
+                            bx, by = ordered_coords[i]
+                            seg[i - 1] = math.hypot(bx - ax, by - ay)
+                        if k + 1 < n_count:
+                            ax, ay = ordered_coords[k]
+                            bx, by = ordered_coords[k + 1]
+                            seg[k] = math.hypot(bx - ax, by - ay)
                         improved = True
                         break
                 if improved:
@@ -357,6 +457,11 @@ class _MapCanvas(QWidget):
         # Selective material gathering & proximity route
         self._material_filter: Optional[str] = None
         self._proximity_ordered_nodes: List[Dict[str, Any]] = []
+        # Cache for the proximity ordering: recomputing NN + 2-Opt on every
+        # paintEvent is O(n^2) per frame. Invalidated whenever the node set,
+        # the filter, the player position or a node coordinate changes.
+        self._proximity_cache_valid: bool = False
+        self._proximity_cache_start: Optional[Tuple[float, float]] = None
 
     def set_material_filter(self, material: Union[str, Sequence[str], None]) -> None:
         """
@@ -378,6 +483,7 @@ class _MapCanvas(QWidget):
                 self._material_filter = None
             else:
                 self._material_filter = s
+        self._proximity_cache_valid = False
         self.calculate_proximity_route()
         self.update()
 
@@ -388,20 +494,30 @@ class _MapCanvas(QWidget):
         """
         Calculates proximity ordering for matching nodes starting from player position
         (or provided start_xy) using Greedy Nearest-Neighbor + 2-Opt TSP optimization.
+        The result is cached: repeated calls (e.g. from every paintEvent) reuse the
+        cached ordering until nodes, filter or start position change.
         """
         if not self._material_filter:
             self._proximity_ordered_nodes = []
+            self._proximity_cache_valid = False
+            self._proximity_cache_start = None
             return []
+        if start_xy is None:
+            start_xy = (self._player_pos[0], self._player_pos[1]) if self._player_pos is not None else None
+        if self._proximity_cache_valid and start_xy == self._proximity_cache_start:
+            return list(self._proximity_ordered_nodes)
         matching = [
             n for n in self._nodes
             if isinstance(n, dict) and node_matches_material(n, self._material_filter)
         ]
         if not matching:
             self._proximity_ordered_nodes = []
+            self._proximity_cache_start = start_xy
+            self._proximity_cache_valid = True
             return []
-        if start_xy is None:
-            start_xy = (self._player_pos[0], self._player_pos[1]) if self._player_pos is not None else None
         self._proximity_ordered_nodes = sort_nodes_by_proximity(matching, start_xy=start_xy)
+        self._proximity_cache_start = start_xy
+        self._proximity_cache_valid = True
         return list(self._proximity_ordered_nodes)
 
     def get_proximity_ordered_nodes(self) -> List[Dict[str, Any]]:
@@ -485,8 +601,29 @@ class _MapCanvas(QWidget):
                     reordered_nodes.append(n)
             self._nodes = reordered_nodes
 
+        if self._material_filter:
+            self._proximity_cache_start = start_xy
+            self._proximity_cache_valid = True
+        else:
+            self._proximity_cache_valid = False
         self.update()
         return ordered_ids
+
+    def _is_ready_for_route_summary(self) -> bool:
+        """Real readiness probe for the canvas route summary (S-1803,
+        Decision 3: bind the ready flag to a real probe, no unconditional
+        True). Ready only when the module contract holds AND a map pixmap
+        is loaded AND at least one node is present — a pixmap-less / empty
+        canvas is not 'ready'."""
+        try:
+            if not validate_map_viewer_contract():
+                return False
+            pix = self._base_pixmap
+            if pix is None or pix.isNull():
+                return False
+            return len(self._nodes) > 0
+        except Exception:
+            return False
 
     def get_map_viewer_route_summary(self) -> dict:
         """
@@ -520,7 +657,7 @@ class _MapCanvas(QWidget):
             filtered_count = len(self._nodes)
 
         return {
-            "map_viewer_ready": True,
+            "map_viewer_ready": self._is_ready_for_route_summary(),
             "total_nodes": len(self._nodes),
             "active_route_nodes": ready_count + resting_count,
             "ready_count": ready_count,
@@ -567,7 +704,15 @@ class _MapCanvas(QWidget):
         elif pixmap is not None and not pixmap.isNull():
             pw = pixmap.width()
             ph = pixmap.height()
-            self._hd_fit = (pw >= 1800 and ph >= 1800 and crop_norm_rect is None)
+            # Size alone misclassifies 4K video frames as HD maps: HD zone maps
+            # (e.g. Altgard 2258x2400) are near-square/portrait, video frames are
+            # 16:9, so require a map-like aspect ratio as well.
+            self._hd_fit = (
+                pw >= 1800
+                and ph >= 1800
+                and crop_norm_rect is None
+                and 0.7 <= (pw / ph) <= 1.35
+            )
         else:
             self._hd_fit = False
         self._fit_to_view()
@@ -598,6 +743,7 @@ class _MapCanvas(QWidget):
         self._route_node_ids_list = [int(nid) for nid in (route_node_ids or [])]
         self._route_node_ids = set(self._route_node_ids_list)
         self._rest_duration_sec = float(rest_duration_sec)
+        self._proximity_cache_valid = False
         self.clear_patch_cache()
         self.update()
 
@@ -611,6 +757,7 @@ class _MapCanvas(QWidget):
             self._player_pos = None
         else:
             self._player_pos = (float(x), float(y), float(angle_deg))
+        self._proximity_cache_valid = False
         self.update()
 
     def reset_view(self) -> None:
@@ -791,10 +938,12 @@ class _MapCanvas(QWidget):
         """
         if self._hd_fit:
             rx, ry = inv_hd_fit(map_pt.x(), map_pt.y())
-            pw = max(1.0, float(self._base_pixmap.width())) if (self._base_pixmap and not self._base_pixmap.isNull()) else 2258.0
-            ph = max(1.0, float(self._base_pixmap.height())) if (self._base_pixmap and not self._base_pixmap.isNull()) else 2400.0
-            norm_x = max(0.0, min(1.0, map_pt.x() / pw))
-            norm_y = max(0.0, min(1.0, map_pt.y() / ph))
+            # norm, 1280x720 referans kareye göredir (pixmap kesrine değil):
+            # _node_to_map_coords norm'u DEFAULT_MAP_REF ile çarpar, bu yüzden
+            # ters yön de rx/1280, ry/720 olmalı; aksi halde gidiş-dönüş
+            # tutmaz (520 -> norm 0.2618 olur, 0.40625 beklenir).
+            norm_x = max(0.0, min(1.0, rx / DEFAULT_MAP_REF[0]))
+            norm_y = max(0.0, min(1.0, ry / DEFAULT_MAP_REF[1]))
             map_x = int(round(rx))
             map_y = int(round(ry))
             return map_x, map_y, float(norm_x), float(norm_y)
@@ -901,6 +1050,8 @@ class _MapCanvas(QWidget):
             "id": new_id,
             "region": region,
             "routes": list(routes_list),
+            # Repo-göreli saklanır (kalıcı JSON makineden bağımsız kalsın);
+            # okuyan taraf resolve_node_patch_path ile köke göre çözer (P3-6).
             "patch_path": f"routes/{region}/patches/node_{new_id}.png",
             "map_x": int(round(map_x)),
             "map_y": int(round(map_y)),
@@ -917,6 +1068,7 @@ class _MapCanvas(QWidget):
             self._nodes.append(new_node)
             self._route_node_ids.add(new_id)
             self._route_node_ids_list.append(new_id)
+            self._proximity_cache_valid = False
 
         if callable(getattr(self, "on_canvas_add_node", None)):
             try:
@@ -938,20 +1090,55 @@ class _MapCanvas(QWidget):
         map_y: float,
         norm_x: float,
         norm_y: float,
-    ) -> None:
-        """Persists the updated node position to RouteManager."""
-        parent = self.parent()
-        if parent is not None and hasattr(parent, "move_node") and callable(parent.move_node):
+    ) -> bool:
+        """Persists the updated node position to RouteManager.
+
+        K-19: ``node_moved`` yalnızca konum gerçekten kalıcı depoya
+        yazıldıysa (veya kalıcı depo hiç yoksa — o zaman tuval tek
+        depodur) yayılır. Yazım başarısızsa sinyal yayılmaz; dinleyenler
+        eski konumu korur.
+        """
+        self._proximity_cache_valid = False
+        # [O4] The canvas is reparented into an inner host by the shell
+        # chrome (D32 F-0689: wrap_shell_tab_root_layout returns an inner
+        # layout for non-embedded pages), so self.parent() is a plain
+        # QWidget, not the MapViewerWindow. Walk up the ancestor chain to
+        # the owner that has move_node / routes / _region_name.
+        owner: Optional[QWidget] = self.parent()
+        while owner is not None and not callable(getattr(owner, "move_node", None)):
+            owner = owner.parentWidget() if hasattr(owner, "parentWidget") else None
+        if owner is not None:
             try:
-                parent.move_node(node_id, map_x, map_y, norm_x=norm_x, norm_y=norm_y)
-                self.node_moved.emit(node_id, float(map_x), float(map_y))
-                return
+                moved = owner.move_node(node_id, map_x, map_y, norm_x=norm_x, norm_y=norm_y)
+                # move_node kendisi node_moved yayar ve yazım sonucunu
+                # döner; False temiz bir ret ise ikinci bir daldan
+                # yeniden yazmak (çift dal) yerine burada durulur.
+                # Başarıda tuval sinyali de yayılır (önceki davranış;
+                # pencere slotu aynı koordinatı bellekten günceller).
+                if moved is None or bool(moved):
+                    self.node_moved.emit(node_id, float(map_x), float(map_y))
+                    return True
+                logger.error(
+                    "Taşınan düğüm #%d kalıcı depoya yazılamadı; node_moved yayılmadı.",
+                    node_id,
+                )
+                return False
             except Exception as exc:
                 logger.error("Error delegating to parent.move_node: %s", exc)
 
-        routes = getattr(parent, "routes", None)
-        region = getattr(parent, "_region_name", "Altgard") or "Altgard"
+        routes = None
+        region = "Altgard"
+        node = self.parent()
+        while node is not None:
+            if routes is None:
+                routes = getattr(node, "routes", None)
+            name = getattr(node, "_region_name", None)
+            if name:
+                region = name
+                break
+            node = node.parentWidget() if hasattr(node, "parentWidget") else None
         if routes is not None:
+            persist_ok = False
             try:
                 updated = False
                 if hasattr(routes, "_regions") and isinstance(routes._regions, dict) and region in routes._regions:
@@ -972,9 +1159,9 @@ class _MapCanvas(QWidget):
                             break
                     if updated:
                         if hasattr(routes, "save_region"):
-                            routes.save_region(region)
+                            persist_ok = routes.save_region(region) is not False
                         elif hasattr(routes, "save_data"):
-                            routes.save_data()
+                            persist_ok = routes.save_data() is not False
                 elif hasattr(routes, "data") and isinstance(routes.data, dict):
                     reg_nodes = routes.data.get("regions", {}).get(region, {}).get("nodes", [])
                     for n in reg_nodes:
@@ -987,31 +1174,78 @@ class _MapCanvas(QWidget):
                             updated = True
                             break
                     if updated and hasattr(routes, "save_data"):
-                        routes.save_data()
+                        persist_ok = routes.save_data() is not False
             except Exception as exc:
                 logger.error("Failed persisting moved node #%d: %s", node_id, exc)
+                persist_ok = False
+            if not persist_ok:
+                logger.error(
+                    "Taşınan düğüm #%d kalıcı depoya yazılamadı (%s); node_moved yayılmadı.",
+                    node_id, region,
+                )
+                return False
+        else:
+            logger.debug(
+                "Taşınan düğüm #%d için kalıcı depo yok; konum yalnızca tuval belleğinde.",
+                node_id,
+            )
 
         self.node_moved.emit(node_id, float(map_x), float(map_y))
+        return True
 
     def delete_node(self, node_id: int) -> bool:
-        """Deletes a node from the canvas and route manager."""
+        """Deletes a node from the canvas and route manager.
+
+        Returns True only if the node was actually removed; False when the
+        node does not exist (or the parent reports failure). The deletion
+        runs exactly once: when a parent handler removes the node, this
+        method does not re-delete via the node_deleted signal (the window
+        slot guards against already-deleted ids).
+        """
         parent = self.parent()
+        parent_ok: Optional[bool] = None
         if parent is not None and hasattr(parent, "delete_node") and callable(parent.delete_node):
             try:
-                parent.delete_node(node_id)
+                res = parent.delete_node(node_id)
+                parent_ok = True if res is None else bool(res)
             except Exception as exc:
                 logger.error("Error in parent.delete_node: %s", exc)
+                parent_ok = False
         elif parent is not None and hasattr(parent, "_delete_node") and callable(parent._delete_node):
             try:
-                parent._delete_node(node_id)
+                res = parent._delete_node(node_id)
+                parent_ok = True if res is None else bool(res)
             except Exception as exc:
                 logger.error("Error in parent._delete_node: %s", exc)
-        self._nodes = [n for n in self._nodes if int(n.get("id", -1)) != node_id]
+                parent_ok = False
+        existed = any(int(n.get("id", -1)) == node_id for n in self._nodes if isinstance(n, dict))
+        if parent_ok is False:
+            # F-0574: the parent explicitly failed to delete the node, so
+            # the canvas must not pretend the deletion happened (no local
+            # removal, no node_deleted emit, return False).
+            return False
+        if parent_ok is None and not existed:
+            # F-0574: no parent handled the delete and the node is not on
+            # this canvas at all — nothing was removed.
+            return False
+        # P3-8 (S-040): _nodes dict olmayabilir; .get çağrısı AttributeError
+        # verirdi. Dict-olmayan öğe hiçbir id ile eşleşemez, korunur.
+        kept_nodes = []
+        for n in self._nodes:
+            if isinstance(n, dict):
+                try:
+                    nid = int(n.get("id", -1))
+                except (TypeError, ValueError):
+                    nid = -1
+                if nid == node_id:
+                    continue
+            kept_nodes.append(n)
+        self._nodes = kept_nodes
         self._route_node_ids.discard(node_id)
         if node_id in self._route_node_ids_list:
             self._route_node_ids_list.remove(node_id)
+        self._proximity_cache_valid = False
         self.node_deleted.emit(node_id)
-        self.node_delete_requested.emit(node_id)
         self.update()
         return True
 
@@ -1026,10 +1260,10 @@ class _MapCanvas(QWidget):
                 border-radius: 6px;
                 padding: 4px;
                 font-family: 'Segoe UI', sans-serif;
-                font-size: 12px;
+                font-size: 13px;
             }
             QMenu::item {
-                padding: 6px 20px 6px 12px;
+                padding: 8px 22px 8px 14px;
                 border-radius: 4px;
             }
             QMenu::item:selected {
@@ -1042,7 +1276,23 @@ class _MapCanvas(QWidget):
         menu.addAction(act_toggle)
         menu.addSeparator()
         act_del = QAction(f"Noktayı Sil (#{node_id})", menu)
-        act_del.triggered.connect(lambda: self.delete_node(node_id))
+        # S038 (v19/P3-8): menüden silme onaysızdı — yanlışlıkla bir
+        # tıklama düğümü kalıcı siliyordu. Onay sorulur (ayarlar
+        # penceresindeki toplu-silme deseniyle aynı). Shift+Sağ Tık
+        # kısayolu bilinçli "hızlı silme"dir — test kilitli
+        # (test_right_click_delete_node), orada onay sorulmaz.
+        def _confirm_delete() -> None:
+            reply = QMessageBox.question(
+                self,
+                "Noktayı Sil",
+                f"#{node_id} numaralı düğüm silinsin mi?\nBu işlem geri alınamaz.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.delete_node(node_id)
+
+        act_del.triggered.connect(_confirm_delete)
         menu.addAction(act_del)
         menu.popup(global_pos)
 
@@ -1120,7 +1370,12 @@ class _MapCanvas(QWidget):
                     node["norm_x"] = float(norm_x)
                     node["norm_y"] = float(norm_y)
                     break
+            # Live update only: emit node_moved so the UI follows the drag,
+            # but do NOT write to disk per mouse-move — the window slot updates
+            # the position in memory and the single disk save happens on
+            # release via _save_node_position().
             self.node_moved.emit(self._dragging_node_id, float(map_x), float(map_y))
+            self._proximity_cache_valid = False
             self.update()
             return
 
@@ -1191,6 +1446,14 @@ class _MapCanvas(QWidget):
         """
         Returns 'ready' (green #22c55e), 'resting' (amber #f59e0b),
         or 'out_of_route' (gray #64748b).
+
+        P2-7 (K-02/K-06): gri kova "rota dışı / toplanamaz" demektir —
+        efsane metni ("Başarısız") bu kovayı anlatmıyordu. `failed`
+        durumu P1-6 `effective_node_state` ile aynı öncelikle tanınır
+        (karantina > başarısız > dinlenen > aktif): `state == "failed"`
+        (ya da "quarantined") ya da `consecutive_failures > 0` olan
+        düğüm toplanamaz, gri kovaya girer; eskiden buradan geçip
+        yeşil/turuncu (hazır/dinleniyor) çiziliyordu.
         """
         if now is None:
             now = time.time()
@@ -1205,6 +1468,16 @@ class _MapCanvas(QWidget):
 
         if not in_route or explicit_status in ("out", "out_of_route", "gray", "disabled", "inactive"):
             return "out_of_route"
+
+        # P2-7: `failed` tanınsın — başarısız düğüm hazır/dinleniyor
+        # sayılmaz; P1-6 önceliğiyle (failed > resting) gri kovaya girer.
+        if explicit_status in ("failed", "fail", "error", "quarantined"):
+            return "out_of_route"
+        try:
+            if int(node.get("consecutive_failures", 0) or 0) > 0:
+                return "out_of_route"
+        except (TypeError, ValueError):
+            pass
 
         if explicit_status in ("resting", "cooldown", "amber"):
             return "resting"
@@ -1281,7 +1554,7 @@ class _MapCanvas(QWidget):
         closed = (n_nodes >= 3)
         count = n_nodes if closed else (n_nodes - 1)
 
-        step_font = QFont("Segoe UI", 8)
+        step_font = QFont("Segoe UI", 9)
         step_font.setWeight(QFont.Weight.Bold)
 
         for i in range(count):
@@ -1334,7 +1607,7 @@ class _MapCanvas(QWidget):
                 # Soft cyan/gold corridor glow
                 corridor_glow = QPen(
                     QColor(250, 204, 21, 80) if is_prox else QColor(14, 165, 233, 60),
-                    7.5,
+                    8.0,
                     Qt.PenStyle.SolidLine,
                     Qt.PenCapStyle.RoundCap,
                     Qt.PenJoinStyle.RoundJoin,
@@ -1345,7 +1618,7 @@ class _MapCanvas(QWidget):
                 # Main crisp route line (#facc15 for proximity, #22d3ee for default)
                 main_pen = QPen(
                     QColor("#facc15") if is_prox else QColor("#22d3ee"),
-                    2.6 if is_prox else 2.4,
+                    3.0 if is_prox else 2.8,
                     Qt.PenStyle.SolidLine,
                     Qt.PenCapStyle.RoundCap,
                     Qt.PenJoinStyle.RoundJoin,
@@ -1433,7 +1706,7 @@ class _MapCanvas(QWidget):
         painter.setFont(font)
         fm = painter.fontMetrics()
         tw = max(18.0, float(fm.horizontalAdvance(text)))
-        th = 13.0
+        th = 15.0
         rect = QRectF(center.x() - tw * 0.5 - 3.0, center.y() - th * 0.5, tw + 6.0, th)
         painter.setPen(QPen(QColor("#0284c7"), 1.0))
         painter.setBrush(QBrush(QColor(15, 23, 42, 215)))
@@ -1456,7 +1729,7 @@ class _MapCanvas(QWidget):
         badge_text = f"#{rank}"
         fm = painter.fontMetrics()
         bw = max(24.0, float(fm.horizontalAdvance(badge_text)) + 10.0)
-        bh = 14.0
+        bh = 16.0
         rect = QRectF(x, y - bh * 0.5, bw, bh)
 
         painter.setPen(QPen(QColor("#facc15"), 1.5))
@@ -1485,21 +1758,26 @@ class _MapCanvas(QWidget):
             reg = getattr(parent, "_region_name", "Altgard") if parent else "Altgard"
         reg = str(reg or "Altgard")
 
-        # Canonical standard path
-        primary_path = os.path.join("routes", reg, "patches", f"node_{nid}.png")
+        # Canonical standard path (P3-6: kök-bağımlı; eski CWD'ye göreli
+        # os.path.join("routes", ...) bot başka dizinden başlatılınca bulamazdı).
+        primary_path = str(project_path("routes", reg, "patches", f"node_{nid}.png"))
         if os.path.isfile(primary_path):
             return primary_path
 
-        # Explicit node patch_path / patch_file
+        # Explicit node patch_path / patch_file. Saklanan değer repo-göreli
+        # olabilir ("routes/...", kalıcı JSON'da makineden bağımsız kalsın
+        # diye böyle yazılır); okurken köke göre çözülür, mutlaksa aynen geçer.
         raw_path = (node.get("patch_path") if isinstance(node, dict) else getattr(node, "patch_path", "")) or \
                    (node.get("patch_file") if isinstance(node, dict) else getattr(node, "patch_file", ""))
-        if raw_path and os.path.isfile(str(raw_path)):
-            return str(raw_path)
+        if raw_path:
+            raw_resolved = str(resolve_project_path(str(raw_path)))
+            if os.path.isfile(raw_resolved):
+                return raw_resolved
 
         for cand in (
-            os.path.join("routes", "patches", f"{reg}_node_{nid}.png"),
-            os.path.join("routes", "patches", f"node_{nid}.png"),
-            os.path.join("routes", reg, f"node_{nid}.png"),
+            str(project_path("routes", "patches", f"{reg}_node_{nid}.png")),
+            str(project_path("routes", "patches", f"node_{nid}.png")),
+            str(project_path("routes", reg, f"node_{nid}.png")),
         ):
             if os.path.isfile(cand):
                 return cand
@@ -1547,7 +1825,7 @@ class _MapCanvas(QWidget):
             p.setBrush(QBrush(QColor(15, 23, 42, 200)))
             p.drawRoundedRect(QRectF(5, 5, size - 10, size - 10), 4, 4)
 
-            font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+            font = QFont("Segoe UI", 10, QFont.Weight.Bold)
             p.setFont(font)
             p.setPen(QColor("#ffffff"))
             p.drawText(fallback.rect(), Qt.AlignmentFlag.AlignCenter, f"#{nid}")
@@ -1568,8 +1846,8 @@ class _MapCanvas(QWidget):
         thumb_size = 64
         thumb_pix = self.get_node_patch_pixmap(node, size=thumb_size)
 
-        card_w = 260.0
-        card_h = 86.0
+        card_w = 280.0
+        card_h = 92.0
 
         card_x = pin_pt.x() + 18.0
         card_y = pin_pt.y() - card_h - 10.0
@@ -1602,28 +1880,28 @@ class _MapCanvas(QWidget):
         tx = card_x + 8.0 + thumb_size + 10.0
         ty = card_y + 18.0
 
-        title_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        title_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
         painter.setFont(title_font)
         painter.setPen(QColor("#38bdf8"))
         seq_idx = node.get("seq_index")
         seq_text = f" [#{seq_idx}]" if seq_idx else ""
         painter.drawText(QPointF(tx, ty), f"Nokta #{nid}{seq_text}")
 
-        info_font = QFont("Segoe UI", 8)
+        info_font = QFont("Segoe UI", 9)
         painter.setFont(info_font)
         painter.setPen(QColor("#fde047"))
         rtype = str(node.get("resource_type", "Orichalcum Ore"))
-        painter.drawText(QPointF(tx, ty + 14.0), rtype)
+        painter.drawText(QPointF(tx, ty + 16.0), rtype)
 
         painter.setPen(QColor("#94a3b8"))
         mx = node.get("map_x", 0)
         my = node.get("map_y", 0)
-        painter.drawText(QPointF(tx, ty + 28.0), f"Konum: ({mx}, {my})")
+        painter.drawText(QPointF(tx, ty + 32.0), f"Konum: ({mx}, {my})")
 
         badge_str = self._format_harvest_badge(node)
         state_str = str(node.get("state", "active")).title()
         painter.setPen(QColor("#4ade80") if badge_str.endswith("x") else QColor("#67e8f9"))
-        painter.drawText(QPointF(tx, ty + 42.0), f"Hasat: {badge_str} · {state_str}")
+        painter.drawText(QPointF(tx, ty + 48.0), f"Hasat: {badge_str} · {state_str}")
 
         painter.restore()
 
@@ -1669,9 +1947,9 @@ class _MapCanvas(QWidget):
             "out_of_route": QColor("#64748b")  # Gray out of route
         }
 
-        font = QFont("Segoe UI", 9)
+        font = QFont("Segoe UI", 10)
         font.setWeight(QFont.Weight.Bold)
-        badge_font = QFont("Segoe UI", 8)
+        badge_font = QFont("Segoe UI", 9)
         badge_font.setWeight(QFont.Weight.Bold)
 
         is_filter_active = bool(self._material_filter)
@@ -1698,7 +1976,7 @@ class _MapCanvas(QWidget):
                 is_selected = (nid == self._selected_node_id)
                 is_minimap_auto = self._is_minimap_auto_node(node)
 
-                radius = 6.5 if is_hovered else 5.2
+                radius = 7.5 if is_hovered else 6.0
                 border_width = 2.2 if is_hovered else 1.8
 
                 # Distinct cyan/emerald dual ring for minimap-auto-recorded nodes (source_type == "minimap_auto")
@@ -1894,7 +2172,7 @@ class _MapCanvas(QWidget):
         tw = max(18.0, float(fm.horizontalAdvance(badge_text)))
         pad_x = 4.5
         pill_w = tw + pad_x * 2.0
-        pill_h = 14.5
+        pill_h = 16.0
         pill_rect = QRectF(x, y - pill_h * 0.5 + 0.5, pill_w, pill_h)
 
         if is_minimap_auto:
@@ -1927,20 +2205,20 @@ class _MapCanvas(QWidget):
         if self.height() < 120 or self.width() < 260:
             return
         legend_w = min(float(self.width() - 20), 920.0)
-        legend_rect = QRectF(10.0, float(self.height() - 34), legend_w, 24.0)
+        legend_rect = QRectF(10.0, float(self.height() - 38), legend_w, 28.0)
         painter.save()
         painter.setPen(QPen(QColor(45, 55, 72, 200), 1.0))
         painter.setBrush(QBrush(QColor(15, 20, 28, 220)))
         painter.drawRoundedRect(legend_rect, 5.0, 5.0)
 
-        l_font = QFont("Segoe UI", 8)
+        l_font = QFont("Segoe UI", 9)
         l_font.setWeight(QFont.Weight.DemiBold)
         painter.setFont(l_font)
         painter.setPen(QColor("#e2e8f0"))
         legend_str = (
-            "  ● Aktif   |   ● Dinleniyor (5dk)   |   ● Başarısız   |   "
+            "  ● Aktif   |   ● Dinleniyor (5dk)   |   ● Rota dışı   |   "
             "◎ Minimap/3B Oto-Kayıt   |   [0/3 · 1/3 · 2/3 · 3x]: Hasat Rozeti   |   "
-            "Sol Tık: Nokta Ekle | Sağ Tık: Nokta Sil | Sürükle: Taşı"
+            "Sol Tık: Seç / Boş Alana Nokta Ekle | Sağ Tık: Menü (Shift+Sağ Tık: Sil) | Sürükle: Taşı"
         )
         painter.drawText(
             legend_rect,
@@ -2036,7 +2314,16 @@ class MapViewerWindow(QDialog):
         self._region_name = region_name or self._resolve_active_region()
         self._route_name = route_name or self._resolve_active_route()
         self._explicit_map_path = map_image_path
+        # Görev 4: bölgeye ait HD harita görseli yoksa bölge adı burada tutulur
+        # ("bu bölge için harita yok" durumu; Altgard görseli kullanılmaz).
+        self._map_missing_for_region: str = ""
         self._rest_duration_sec = float(rest_duration_sec)
+        # Normalise to the (x, y, angle_deg) triple the canvas uses so the
+        # heading survives reloads instead of being dropped.
+        if player_pos is not None and len(player_pos) == 2:
+            player_pos = (float(player_pos[0]), float(player_pos[1]), 0.0)
+        elif player_pos is not None:
+            player_pos = (float(player_pos[0]), float(player_pos[1]), float(player_pos[2]))
         self._player_pos = player_pos
 
         self._init_ui()
@@ -2071,10 +2358,22 @@ class MapViewerWindow(QDialog):
     def _build_title_text(self) -> str:
         region_label = self._region_name or "Altgard"
         route_label = self._route_name or "All"
-        return (
+        title = (
             f"Rota ve Harita Görüntüleyici · Bölge: {region_label} | Rota: {route_label} · "
-            "Aktif, Dinleniyor (5dk), Başarısız, Minimap/3B Oto-Kayıt"
+            "Aktif, Dinleniyor (5dk), Rota dışı, Minimap/3B Oto-Kayıt"
         )
+        # Görev 4: bölge uyumsuzluğu varsa başlıkta görünür uyarı.
+        try:
+            getter = getattr(self.routes, "get_region_mismatch", None)
+            mismatch = getter() if callable(getter) else None
+        except Exception:
+            mismatch = None
+        if isinstance(mismatch, dict):
+            title += (
+                f" · ⚠ BÖLGE UYUMSUZLUĞU: {mismatch.get('detected_region')} ≠ "
+                f"{mismatch.get('active_region')} — rota durduruldu"
+            )
+        return title
 
     def _init_ui(self) -> None:
         title_str = self._build_title_text()
@@ -2100,7 +2399,7 @@ class MapViewerWindow(QDialog):
                 color: #ffffff;
                 border: 1px solid #38bdf8;
                 border-radius: 5px;
-                padding: 5px 12px;
+                padding: 7px 14px;
                 font-size: 12px;
                 font-weight: bold;
             }
@@ -2116,8 +2415,8 @@ class MapViewerWindow(QDialog):
         self.header_bar = QWidget(self)
         self.header_bar.setObjectName("MapTopHeader")
         header_layout = QHBoxLayout(self.header_bar)
-        header_layout.setContentsMargins(12, 6, 12, 6)
-        header_layout.setSpacing(10)
+        header_layout.setContentsMargins(14, 8, 14, 8)
+        header_layout.setSpacing(12)
 
         self.lbl_region_prefix = QLabel("Bölge:", self.header_bar)
         self.lbl_region_prefix.setStyleSheet("color: #94a3b8; font-weight: bold;")
@@ -2137,31 +2436,37 @@ class MapViewerWindow(QDialog):
 
         header_layout.addStretch(1)
 
-        # Durum Rozetleri (Aktif | Dinleniyor (5dk) | Başarısız | Minimap/3B Oto-Kayıt)
+        # Durum Rozetleri (Aktif | Dinleniyor (5dk) | Rota dışı | Minimap/3B Oto-Kayıt)
+        # P2-7: gri rozet "Başarısız" değil "Rota dışı" yazar — gri kova
+        # _classify_node'da out_of_route'dur (rota dışı / başarısız /
+        # karantinalı / toplanamaz); "Başarısız" etiketi yanıltıcıydı.
         self.lbl_badge_active = QLabel("● Aktif", self.header_bar)
-        self.lbl_badge_active.setStyleSheet("color: #22c55e; font-weight: bold; font-size: 11px;")
+        self.lbl_badge_active.setStyleSheet("color: #22c55e; font-weight: bold; font-size: 12px;")
         header_layout.addWidget(self.lbl_badge_active)
 
         self.lbl_badge_resting = QLabel("● Dinleniyor (5dk)", self.header_bar)
-        self.lbl_badge_resting.setStyleSheet("color: #f59e0b; font-weight: bold; font-size: 11px;")
+        self.lbl_badge_resting.setStyleSheet("color: #f59e0b; font-weight: bold; font-size: 12px;")
         header_layout.addWidget(self.lbl_badge_resting)
 
-        self.lbl_badge_failed = QLabel("● Başarısız", self.header_bar)
-        self.lbl_badge_failed.setStyleSheet("color: #64748b; font-weight: bold; font-size: 11px;")
-        header_layout.addWidget(self.lbl_badge_failed)
+        self.lbl_badge_out_of_route = QLabel("● Rota dışı", self.header_bar)
+        self.lbl_badge_out_of_route.setStyleSheet("color: #64748b; font-weight: bold; font-size: 12px;")
+        header_layout.addWidget(self.lbl_badge_out_of_route)
+        # Geriye dönük uyumluluk takma adı (eski ad: lbl_badge_failed).
+        self.lbl_badge_failed = self.lbl_badge_out_of_route
 
         self.lbl_badge_minimap_auto = QLabel("◎ Minimap/3B Oto-Kayıt", self.header_bar)
-        self.lbl_badge_minimap_auto.setStyleSheet("color: #d4a017; font-weight: bold; font-size: 11px;")
+        self.lbl_badge_minimap_auto.setStyleSheet("color: #d4a017; font-weight: bold; font-size: 12px;")
         header_layout.addWidget(self.lbl_badge_minimap_auto)
 
         self.btn_optimize_route = QPushButton("Sıralı Rota Optimize Et", self.header_bar)
         self.btn_optimize_route.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_optimize_route.setMinimumHeight(30)
         self.btn_optimize_route.clicked.connect(self.optimize_sequential_route)
         header_layout.addWidget(self.btn_optimize_route)
 
         # 🎯 Seç-Topla Filtresi Dropdown & 🧭 Yakınlık Rotası Çiz Butonu
         self.lbl_material_filter = QLabel("🎯 Seç-Topla Filtresi:", self.header_bar)
-        self.lbl_material_filter.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        self.lbl_material_filter.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 12px;")
         header_layout.addWidget(self.lbl_material_filter)
 
         self.combo_material_filter = QComboBox(self.header_bar)
@@ -2173,10 +2478,10 @@ class MapViewerWindow(QDialog):
                 color: #ffffff;
                 border: 1px solid #0284c7;
                 border-radius: 4px;
-                padding: 3px 8px;
-                font-size: 11px;
+                padding: 5px 10px;
+                font-size: 12px;
                 font-weight: bold;
-                min-width: 140px;
+                min-width: 160px;
             }
             QComboBox::drop-down { border: 0px; }
             QComboBox QAbstractItemView {
@@ -2186,6 +2491,9 @@ class MapViewerWindow(QDialog):
                 selection-color: #ffffff;
             }
         """)
+        # P3-7: başlık comboları tek geometri — HEADER_COMBO_MIN_HEIGHT.
+        # (padding 5px 10px / min-width 160px aşağıdaki QSS'te bg moduyla aynı değerlerdedir.)
+        self.combo_material_filter.setMinimumHeight(HEADER_COMBO_MIN_HEIGHT)
         if hasattr(self.combo_material_filter, "view") and self.combo_material_filter.view() is not None:
             view = self.combo_material_filter.view()
             palette = view.palette()
@@ -2210,6 +2518,7 @@ class MapViewerWindow(QDialog):
         self.btn_draw_proximity_route = QPushButton("🧭 Yakınlık Rotası Çiz", self.header_bar)
         self.btn_draw_proximity_route.setObjectName("MapDrawProximityRouteBtn")
         self.btn_draw_proximity_route.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_draw_proximity_route.setMinimumHeight(30)
         self.btn_draw_proximity_route.setToolTip("Seçilen materyalin noktalarını en yakın mesafeye göre sıralayıp rota çizer")
         self.btn_draw_proximity_route.setStyleSheet("""
             QPushButton {
@@ -2217,8 +2526,8 @@ class MapViewerWindow(QDialog):
                 color: #ffffff;
                 border: 1px solid #38bdf8;
                 border-radius: 4px;
-                padding: 4px 10px;
-                font-size: 11px;
+                padding: 6px 12px;
+                font-size: 12px;
                 font-weight: bold;
             }
             QPushButton:hover {
@@ -2242,17 +2551,22 @@ class MapViewerWindow(QDialog):
                 self.auto_cartographer = ac
 
         self.lbl_bg_mode = QLabel("Harita:", self.header_bar)
-        self.lbl_bg_mode.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 11px;")
+        self.lbl_bg_mode.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 12px;")
         self.combo_bg_mode = QComboBox(self.header_bar)
+        # P3-7: materyal filtresi combosuyla aynı geometri (padding 5px 10px,
+        # min-width 160px, min-height HEADER_COMBO_MIN_HEIGHT). Eskiden bu
+        # combo 4px 8px padding taşıyor ve yükseklik almıyordu — iki kardeş
+        # combo başlıkta farklı yükseklikte çiziliyordu.
+        self.combo_bg_mode.setMinimumHeight(HEADER_COMBO_MIN_HEIGHT)
         self.combo_bg_mode.setStyleSheet("""
             QComboBox {
                 background-color: #1e293b;
                 color: #f1f5f9;
                 border: 1px solid #475569;
                 border-radius: 4px;
-                padding: 2px 6px;
-                font-size: 11px;
-                min-width: 140px;
+                padding: 5px 10px;
+                font-size: 12px;
+                min-width: 160px;
             }
             QComboBox::drop-down { border: 0px; }
             QComboBox QAbstractItemView {
@@ -2283,12 +2597,13 @@ class MapViewerWindow(QDialog):
         self.footer_bar = QWidget(self)
         self.footer_bar.setObjectName("MapBottomFooter")
         footer_layout = QHBoxLayout(self.footer_bar)
-        footer_layout.setContentsMargins(12, 4, 12, 4)
+        footer_layout.setContentsMargins(14, 6, 14, 6)
         self.lbl_footer_help = QLabel(
-            "Sol Tık: Nokta Ekle | Sağ Tık: Nokta Sil | Sürükle: Taşı",
+            "Sol Tık: Seç / Boş Alana Nokta Ekle | Sağ Tık: Menü (Shift+Sağ Tık: Sil) | Sürükle: Taşı",
             self.footer_bar,
         )
-        self.lbl_footer_help.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
+        self.lbl_footer_help.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 600;")
+        self.lbl_footer_help.setWordWrap(True)
         footer_layout.addWidget(self.lbl_footer_help)
         footer_layout.addStretch(1)
         root_layout.addWidget(self.footer_bar)
@@ -2306,19 +2621,16 @@ class MapViewerWindow(QDialog):
     # -------------------------------------------------------------------------
     # Subregion Canonical Mapping
     # -------------------------------------------------------------------------
+    # J (sweep): kendi kopya harita kaldırıldı — tek kaynak
+    # core/route_manager.py SUBREGION_TO_CANONICAL. Bu sözlük yalnızca
+    # onun küçük harfli türev görünümüdür (yeni kaynak eklenmez).
+    # Eksik 5 map_viewer girdisi (Mumu Farmland, Dredgion, Calderon,
+    # Gribbler Sanctuary, Basfelt Village) tek kaynağa taşındı.
+    # canonical_region_name boş/None için "Altgard" varsayar (route_manager
+    # DEFAULT_REGION "Verteron"dur — viewer varsayılanı korunur) ve alt
+    # dize eşleşmesini de korur (örn. "Dredgion Crash Site (Elite)").
     SUBREGION_CANONICAL_MAP: Dict[str, str] = {
-        "dredgion crash site": "Altgard",
-        "dredgion": "Altgard",
-        "safe haven": "Altgard",
-        "calderon canyon": "Altgard",
-        "calderon": "Altgard",
-        "quai campsite": "Altgard",
-        "moslan forest": "Altgard",
-        "mumu farmland": "Altgard",
-        "basfelt village": "Altgard",
-        "gribbler sanctuary": "Altgard",
-        "altgard fortress": "Altgard",
-        "altgard": "Altgard",
+        str(k).strip().lower(): v for k, v in SUBREGION_TO_CANONICAL.items()
     }
 
     @classmethod
@@ -2344,7 +2656,9 @@ class MapViewerWindow(QDialog):
     def set_background_mode(self, mode: str) -> None:
         """
         Seamlessly switches the background map mode between:
-        - 'hd' or 'altgard_hd': Altgard HD map (assets/maps/altgard.png)
+        - 'hd': bölgenin HD haritası (assets/maps/<bölge>.png; Altgard 2258x2400,
+          Verteron 2303x2400). Bölgenin görseli yoksa Altgard haritası
+          kullanılmaz, mozaik yedeğe düşülür.
         - 'reference_frame' or 'frame18': Cropped reference frame (video_frames/frame_18s.jpg)
         - 'mosaic': Constructed 80x80 node patch mosaic
         - 'auto': Automatic fallback (HD -> reference frame -> mosaic)
@@ -2417,6 +2731,8 @@ class MapViewerWindow(QDialog):
         """
         mode = getattr(self, "_background_mode", "auto")
         safe_reg = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in (self._region_name or "Altgard"))
+        # Görev 4: her yüklemede sıfırlanır; harita yoksa ilgili dal doldurur.
+        self._map_missing_for_region = ""
 
         # 1. Mosaic mode
         if mode == "mosaic":
@@ -2425,30 +2741,48 @@ class MapViewerWindow(QDialog):
 
         # 2. Reference frame mode
         if mode == "frame18":
+            # P3-6: referans kareler kök-bağımlı (eski: biri os.getcwd(),
+            # biri CWD'ye göreli "video_frames/..." idi).
             for f_cand in (
-                os.path.join(os.getcwd(), "video_frames", "frame_18s.jpg"),
-                os.path.join("video_frames", "frame_18s.jpg"),
-                os.path.join(os.getcwd(), "video_frames", "frame_24s.jpg"),
+                str(project_path("video_frames", "frame_18s.jpg")),
+                str(project_path("video_frames", "frame_24s.jpg")),
             ):
                 if os.path.exists(f_cand):
                     pix, off = self._load_frame_pixmap(f_cand)
                     if pix is not None and not pix.isNull():
                         return pix, off
+            # Explicit mode requested but no reference frame exists: do NOT
+            # silently fall through to auto mode.
+            logger.warning(
+                "Harita modu 'frame18' seçili ama referans kare dosyası bulunamadı; mozaik kullanılıyor."
+            )
+            self._current_crop_norm_rect = None
+            return self._build_patch_mosaic_pixmap(nodes), (0, 0)
 
         # 3. HD Map mode
         if mode == "hd":
+            # Görev 4: Altgard görseli yalnızca bölge Altgard (veya bilinmiyor)
+            # ise adaydır; başka bölge için kendi haritası yoksa mozaik kullanılır.
             for hd_cand in (
-                os.path.join("assets", "maps", f"{safe_reg}.png"),
-                os.path.join("assets", "maps", f"{safe_reg.lower()}.png"),
-                os.path.join("assets", "maps", "altgard.png"),
-                os.path.join("routes", "maps", f"{safe_reg}.png"),
-                os.path.join("routes", f"{safe_reg}_map.png"),
+                *region_map_candidates(self._region_name),
+                str(project_path("routes", "maps", f"{safe_reg}.png")),
+                str(project_path("routes", f"{safe_reg}_map.png")),
             ):
                 if os.path.exists(hd_cand):
                     img = QImage(hd_cand)
                     if not img.isNull():
                         self._current_crop_norm_rect = None
                         return self._to_grayscale_pixmap(img), (0, 0)
+            # Explicit mode requested but no HD map file exists: do NOT silently
+            # fall through to auto mode (which would ignore the explicit choice).
+            if not is_altgard_map_region(self._region_name):
+                self._map_missing_for_region = str(self._region_name or "")
+            logger.warning(
+                "Harita modu 'hd' seçili ama '%s' için HD harita dosyası bulunamadı; mozaik kullanılıyor.",
+                self._region_name,
+            )
+            self._current_crop_norm_rect = None
+            return self._build_patch_mosaic_pixmap(nodes), (0, 0)
 
         # 4. Auto mode (fallback priority: explicit -> HD map -> reference frame -> mosaic)
         candidates: List[Tuple[str, bool]] = []
@@ -2456,21 +2790,36 @@ class MapViewerWindow(QDialog):
             is_f18 = "frame_18" in os.path.basename(self._explicit_map_path).lower()
             candidates.append((self._explicit_map_path, is_f18))
 
-        # Check HD map paths for region or Altgard
+        # Check HD map paths for region (Görev 4: Altgard görseli yalnızca
+        # bölge Altgard — veya bilinmiyor — ise adaydır; başka bölgede kendi
+        # görseli yoksa mozaik yedeğe düşülür, yanlış harita gösterilmez).
         for rel_path in (
-            os.path.join("assets", "maps", f"{safe_reg}.png"),
-            os.path.join("assets", "maps", f"{safe_reg.lower()}.png"),
-            os.path.join("assets", "maps", "altgard.png"),
-            os.path.join("routes", "maps", f"{safe_reg}.png"),
-            os.path.join("routes", "maps", f"{safe_reg}.jpg"),
-            os.path.join("routes", f"{safe_reg}_map.png"),
+            *region_map_candidates(self._region_name),
+            str(project_path("routes", "maps", f"{safe_reg}.png")),
+            str(project_path("routes", "maps", f"{safe_reg}.jpg")),
+            str(project_path("routes", f"{safe_reg}_map.png")),
         ):
             if os.path.exists(rel_path) and rel_path not in [c[0] for c in candidates]:
                 candidates.append((rel_path, False))
+        if not is_altgard_map_region(self._region_name) and not any(
+            os.path.isfile(p) for p in region_map_candidates(self._region_name)
+        ):
+            self._map_missing_for_region = str(self._region_name or "")
+            logger.warning(
+                "'%s' bölgesi için HD harita görseli yok (assets/maps/%s.png); "
+                "Altgard haritası kullanılmıyor, mozaik yedeğe düşülüyor.",
+                self._region_name,
+                str(self._region_name or "").strip().lower(),
+            )
 
-        # Reference frame fallback
-        frame18_path = os.path.join(os.getcwd(), "video_frames", "frame_18s.jpg")
-        if os.path.exists(frame18_path) and frame18_path not in [c[0] for c in candidates]:
+        # Reference frame fallback (frame_18s.jpg Altgard kırpmasıdır;
+        # başka bölgede yedek olamaz).
+        frame18_path = str(project_path("video_frames", "frame_18s.jpg"))
+        if (
+            os.path.exists(frame18_path)
+            and frame18_path not in [c[0] for c in candidates]
+            and is_altgard_map_region(self._region_name)
+        ):
             candidates.append((frame18_path, True))
 
         self._current_crop_norm_rect = None
@@ -2505,8 +2854,16 @@ class MapViewerWindow(QDialog):
         """
         Builds a grayscale map mosaic using saved 80x80 node patches in routes/patches/
         placed at each node's coordinates.
+
+        P3-7 (v18): yerleştirme TEK formülle yapılır — 1180 eşiği kaldırıldı.
+        Eskiden mx > 1180 ise ölçekli, altı ise ham piksel kullanılıyordu:
+        mx=1180 -> 1180 ama mx=1181 -> ~1089 (91px geri sıçrama); mx=1280 ->
+        1180 ama mx=1281 -> ~787 (393px geri sıçrama); my=720 -> 720 ama
+        my=721 -> ~494. Şimdi norm_x/norm_y varsa doğrudan tuvale, yoksa
+        dosyanın kanonik yardımcısı resolve_node_xy ile 1280x720 referans
+        çerçeveye çekilip tek ölçekle tuvale taşınır — süreksiz eşik yok.
         """
-        width, height = 1180, 740
+        width, height = MOSAIC_CANVAS_WIDTH, MOSAIC_CANVAS_HEIGHT
         canvas_img = QImage(width, height, QImage.Format.Format_RGB32)
         canvas_img.fill(QColor("#262a30"))
 
@@ -2522,9 +2879,13 @@ class MapViewerWindow(QDialog):
         for gy in range(0, height, 60):
             painter.drawLine(0, gy, width, gy)
 
-        patch_dir = "routes/patches"
+        # P3-6: varsayılan yama dizini kök-bağımlı (eski: CWD'ye göreli
+        # "routes/patches"). RouteManager.patch_dir göreliyse de köke göre
+        # çözülür (RouteManager base_dir varsayılanı "routes" CWD'ye görelidir;
+        # o varsayılan bu maddenin kapsamında değil, burada savunulur).
+        patch_dir = str(project_path("routes", "patches"))
         if self.routes is not None and hasattr(self.routes, "patch_dir"):
-            patch_dir = self.routes.patch_dir
+            patch_dir = str(resolve_project_path(self.routes.patch_dir))
 
         for node in (nodes or []):
             patch_file = node.get("patch_file") or node.get("patch_path")
@@ -2542,15 +2903,14 @@ class MapViewerWindow(QDialog):
                             nx = int(round(float(nx_val) * width))
                             ny = int(round(float(ny_val) * height))
                         else:
-                            mx = float(node.get("map_x", node.get("x", width // 2)))
-                            my = float(node.get("map_y", node.get("y", height // 2)))
-                            if mx > width:
-                                scale = width / 1920.0 if mx > 1280 else width / 1280.0
-                                nx = int(round(mx * scale))
-                                ny = int(round(my * scale))
-                            else:
-                                nx = int(mx)
-                                ny = int(my)
+                            rx, ry = resolve_node_xy(node, DEFAULT_MAP_REF[0], DEFAULT_MAP_REF[1])
+                            if rx == 0.0 and ry == 0.0 and not any(
+                                k in node for k in ("map_x", "map_y", "x", "y", "norm_x", "norm_y")
+                            ):
+                                # Hiç koordinatı olmayan düğüm eskisi gibi tuval ortasına konur.
+                                rx, ry = DEFAULT_MAP_REF[0] / 2.0, DEFAULT_MAP_REF[1] / 2.0
+                            nx = int(round(rx * width / DEFAULT_MAP_REF[0]))
+                            ny = int(round(ry * height / DEFAULT_MAP_REF[1]))
                         pw, ph = gray_patch.width(), gray_patch.height()
                         painter.drawImage(nx - pw // 2, ny - ph // 2, gray_patch)
                 except Exception as exc:
@@ -2592,10 +2952,9 @@ class MapViewerWindow(QDialog):
                 mx = getattr(cartographer, "map_x", None)
                 my = getattr(cartographer, "map_y", None)
                 if mx is not None and my is not None:
-                    try:
-                        self.set_player_position(float(mx), float(my))
-                    except Exception:
-                        pass
+                    # Live odometry carries no heading: keep the last known angle.
+                    prev_angle = float(self._player_pos[2]) if self._player_pos is not None and len(self._player_pos) > 2 else 0.0
+                    self.set_player_position(float(mx), float(my), prev_angle)
 
                 reg = self.canonical_region_name(self._region_name)
                 auto_nodes = []
@@ -2661,12 +3020,10 @@ class MapViewerWindow(QDialog):
                 except Exception as exc:
                     logger.debug("Could not connect %s: %s", sig_name, exc)
 
-        if not hasattr(self.canvas, "on_node_added") or self.canvas.on_node_added is None:
-            self.canvas.on_node_added = self._on_canvas_node_added
-        if not hasattr(self.canvas, "on_node_moved") or self.canvas.on_node_moved is None:
-            self.canvas.on_node_moved = self._on_canvas_node_moved
-        if not hasattr(self.canvas, "on_node_deleted") or self.canvas.on_node_deleted is None:
-            self.canvas.on_node_deleted = self._on_canvas_node_deleted
+        # NOTE: the canvas has no on_node_added / on_node_moved / on_node_deleted
+        # callback attributes — those assignments were dead (nothing ever reads
+        # them). Node add/move/delete arrive via the pyqtSignals connected above
+        # and via the canvas' on_canvas_add_node hook; do not re-add dead hooks.
 
     def _on_canvas_node_added(self, data: Any, *args) -> None:
         """Slot for canvas node addition signal or callback."""
@@ -2697,17 +3054,65 @@ class MapViewerWindow(QDialog):
             logger.error("Error in _on_canvas_node_added: %s", exc)
 
     def _on_canvas_node_moved(self, node_id: int, new_x: float, new_y: float, *args) -> None:
-        """Slot for canvas node drag-to-move signal or callback."""
+        """Slot for canvas node drag-to-move signal or callback.
+
+        Live drag update: refreshes the node position in memory only. The
+        disk write happens exactly once on release (canvas
+        _save_node_position -> move_node); saving here would write to disk
+        on every mouse-move event during a drag.
+        """
         try:
             norm_x = args[0] if len(args) > 0 else None
             norm_y = args[1] if len(args) > 1 else None
-            self.move_node(int(node_id), float(new_x), float(new_y), norm_x=norm_x, norm_y=norm_y)
+            reg = self.canonical_region_name(self._region_name)
+            updated = False
+            if self.routes is not None and hasattr(self.routes, "_regions") and isinstance(self.routes._regions, dict):
+                reg_info = self.routes._regions.get(reg)
+                if reg_info is not None:
+                    for n in reg_info.get("nodes", []):
+                        nid = getattr(n, "id", None) or (n.get("id") if isinstance(n, dict) else None)
+                        if nid is not None and int(nid) == int(node_id):
+                            if hasattr(n, "map_x"):
+                                n.map_x = int(round(float(new_x)))
+                                n.map_y = int(round(float(new_y)))
+                                if norm_x is not None:
+                                    n.norm_x = round(float(norm_x), 4)
+                                if norm_y is not None:
+                                    n.norm_y = round(float(norm_y), 4)
+                            if isinstance(n, dict):
+                                n["map_x"] = int(round(float(new_x)))
+                                n["map_y"] = int(round(float(new_y)))
+                                if norm_x is not None:
+                                    n["norm_x"] = round(float(norm_x), 4)
+                                if norm_y is not None:
+                                    n["norm_y"] = round(float(norm_y), 4)
+                            updated = True
+                            break
+            if self.canvas is not None and hasattr(self.canvas, "_nodes"):
+                for cn in self.canvas._nodes:
+                    if int(cn.get("id", -1)) == int(node_id):
+                        cn["map_x"] = int(round(float(new_x)))
+                        cn["map_y"] = int(round(float(new_y)))
+                        if norm_x is not None:
+                            cn["norm_x"] = round(float(norm_x), 4)
+                        if norm_y is not None:
+                            cn["norm_y"] = round(float(norm_y), 4)
+                        updated = True
+                        break
+                self.canvas.update()
+            if not updated:
+                logger.debug("Dragged node #%d not found in region '%s'; no update.", node_id, reg)
         except Exception as exc:
             logger.error("Error in _on_canvas_node_moved: %s", exc)
 
     def _on_canvas_node_deleted(self, node_id: int) -> None:
         """Slot for canvas node deletion signal or callback."""
         try:
+            # Guard: canvas.delete_node() already delegates to the window, so
+            # this slot must not delete the same node a second time.
+            nodes, _ = self._extract_region_nodes_and_route_ids()
+            if not any(int(n.get("id", -1)) == int(node_id) for n in nodes):
+                return
             self.delete_node(int(node_id))
         except Exception as exc:
             logger.error("Error in _on_canvas_node_deleted: %s", exc)
@@ -2765,6 +3170,8 @@ class MapViewerWindow(QDialog):
             "id": new_id,
             "region": reg,
             "routes": list(target_routes),
+            # Repo-göreli saklanır (kalıcı JSON makineden bağımsız kalsın);
+            # okuyan taraf resolve_node_patch_path ile köke göre çözer (P3-6).
             "patch_path": f"routes/{reg}/patches/node_{new_id}.png",
             "in_air": False,
             "map_x": int(round(float(map_x))),
@@ -2845,6 +3252,7 @@ class MapViewerWindow(QDialog):
                 norm_y = round(float(new_y) / ph, 4)
 
         found = False
+        saved = False
         if self.routes is not None:
             if hasattr(self.routes, "_regions") and isinstance(self.routes._regions, dict):
                 reg_info = self.routes._regions.get(reg)
@@ -2881,10 +3289,16 @@ class MapViewerWindow(QDialog):
                                 n.norm_x = round(float(norm_x), 4)
                                 n.norm_y = round(float(norm_y), 4)
 
-                if hasattr(self.routes, "save_region"):
-                    self.routes.save_region(reg)
-                elif hasattr(self.routes, "save_data"):
-                    self.routes.save_data()
+                # Only persist when the node was actually found: saving (and
+                # logging "saved to disk") for a missing node is misleading.
+                if found:
+                    if hasattr(self.routes, "save_region"):
+                        # K-19: yalnızca açık False başarısızlıktır (None
+                        # dönen eski/mock kayıtçılar başarılı sayılır);
+                        # False ise "kaydedildi" logu ve node_moved yok.
+                        saved = self.routes.save_region(reg) is not False
+                    elif hasattr(self.routes, "save_data"):
+                        saved = self.routes.save_data() is not False
 
             elif hasattr(self.routes, "data") and isinstance(self.routes.data, dict):
                 reg_data = self.routes.data.get("regions", {}).get(reg, {})
@@ -2896,8 +3310,21 @@ class MapViewerWindow(QDialog):
                         n["norm_y"] = round(float(norm_y), 4)
                         found = True
                         break
-                if hasattr(self.routes, "save_data"):
-                    self.routes.save_data()
+                if found and hasattr(self.routes, "save_data"):
+                    saved = self.routes.save_data() is not False
+
+        # No RouteManager attached: the canvas is the only store — a node that
+        # exists on the canvas can still be moved in memory (no disk save).
+        if not found and self.routes is None and self.canvas is not None and hasattr(self.canvas, "_nodes"):
+            if any(int(cn.get("id", -1)) == int(node_id) for cn in self.canvas._nodes if isinstance(cn, dict)):
+                found = True
+
+        if not found:
+            logger.warning(
+                "Taşınacak düğüm bulunamadı: #%d (%s); konum güncellenmedi, diske yazılmadı.",
+                node_id, reg,
+            )
+            return False
 
         if self.canvas is not None and hasattr(self.canvas, "_nodes"):
             for cn in self.canvas._nodes:
@@ -2909,13 +3336,20 @@ class MapViewerWindow(QDialog):
                     break
             self.canvas.update()
 
-        logger.info("Nokta #%d (%s, %s) koordinatlarına taşındı (%s) ve diske kaydedildi.", node_id, new_x, new_y, reg)
+        if saved:
+            logger.info("Nokta #%d (%s, %s) koordinatlarına taşındı (%s) ve diske kaydedildi.", node_id, new_x, new_y, reg)
+        elif self.routes is not None:
+            # K-19: yazım başarısızken "taşındı/kaydedildi" denmez ve
+            # node_moved yayılmaz — dinleyenler eski konumu korur.
+            logger.error(
+                "Nokta #%d (%s, %s) diske yazılamadı (%s); konum yalnızca bellekte güncellendi, node_moved yayılmadı.",
+                node_id, new_x, new_y, reg,
+            )
+            return False
+        else:
+            logger.info("Nokta #%d (%s, %s) koordinatlarına taşındı (%s); kalıcı kayıt yok (RouteManager bağlı değil).", node_id, new_x, new_y, reg)
         self.node_moved.emit(int(node_id), float(new_x), float(new_y))
         return found
-
-    def delete_node(self, node_id: int) -> None:
-        """Public alias for node deletion."""
-        self._delete_node(node_id)
 
     def get_node_patch_path(self, node_id: int) -> str:
         """Returns the resolved disk path of routes/<region>/patches/node_<id>.png."""
@@ -2923,7 +3357,7 @@ class MapViewerWindow(QDialog):
         node = next((n for n in nodes if int(n.get("id", 0)) == int(node_id)), {"id": node_id})
         if self.canvas is not None and hasattr(self.canvas, "resolve_node_patch_path"):
             return self.canvas.resolve_node_patch_path(node, self._region_name)
-        return os.path.join("routes", self._region_name or "Altgard", "patches", f"node_{node_id}.png")
+        return str(project_path("routes", self._region_name or "Altgard", "patches", f"node_{node_id}.png"))
 
     def get_node_patch_pixmap(self, node_id: int, size: int = 72) -> QPixmap:
         """Loads and returns the 80x80 node patch preview thumbnail."""
@@ -2978,7 +3412,9 @@ class MapViewerWindow(QDialog):
                 mx = getattr(cartographer, "map_x", None)
                 my = getattr(cartographer, "map_y", None)
                 if mx is not None and my is not None:
-                    self._player_pos = (float(mx), float(my))
+                    # Live odometry carries no heading: keep the last known angle.
+                    prev_angle = float(self._player_pos[2]) if self._player_pos is not None and len(self._player_pos) > 2 else 0.0
+                    self._player_pos = (float(mx), float(my), prev_angle)
 
             # Update auto-mapped badge count in UI
             total_auto = sum(1 for n in nodes if n.get("source_type") == "minimap_auto" or n.get("is_auto"))
@@ -3003,7 +3439,8 @@ class MapViewerWindow(QDialog):
             self.canvas.set_map_pixmap(pixmap, coord_offset=offset, crop_norm_rect=crop_norm)
             self.canvas.set_nodes_data(nodes, route_ids, rest_duration_sec=self._rest_duration_sec)
             if self._player_pos is not None:
-                self.canvas.set_player_position(self._player_pos[0], self._player_pos[1])
+                angle = float(self._player_pos[2]) if len(self._player_pos) > 2 else 0.0
+                self.canvas.set_player_position(self._player_pos[0], self._player_pos[1], angle)
             self._populate_material_filter_combo()
         except Exception as exc:
             logger.error("Error in MapViewerWindow.reload_map_and_nodes: %s", exc)
@@ -3035,6 +3472,10 @@ class MapViewerWindow(QDialog):
                 if reg_info is None and regions:
                     # Fallback to first available region only if canonical target not present
                     first_reg = next(iter(regions.keys()))
+                    logger.warning(
+                        "Bölge '%s' bulunamadı; ilk bölge '%s' kullanılıyor.",
+                        target_reg, first_reg,
+                    )
                     self._region_name = first_reg
                     target_reg = first_reg
                     self.setWindowTitle(self._build_title_text())
@@ -3057,9 +3498,12 @@ class MapViewerWindow(QDialog):
                             if nid is not None and self._route_name in (r_list or []):
                                 route_ids.append(int(nid))
                     else:
+                        # 'All' is the virtual route: every node whose in_route
+                        # flag is not False belongs to it.
                         for n in raw_nodes:
                             nid = getattr(n, "id", None) or (n.get("id") if isinstance(n, dict) else None)
-                            if nid is not None:
+                            in_route = getattr(n, "in_route", None) if hasattr(n, "in_route") else (n.get("in_route", True) if isinstance(n, dict) else True)
+                            if nid is not None and in_route is not False:
                                 route_ids.append(int(nid))
                     return nodes, route_ids
 
@@ -3077,6 +3521,10 @@ class MapViewerWindow(QDialog):
 
                 if reg_data is None and regions:
                     first_reg = next(iter(regions.keys()))
+                    logger.warning(
+                        "Bölge '%s' bulunamadı; ilk bölge '%s' kullanılıyor.",
+                        target_reg, first_reg,
+                    )
                     self._region_name = first_reg
                     target_reg = first_reg
                     self.setWindowTitle(self._build_title_text())
@@ -3121,29 +3569,86 @@ class MapViewerWindow(QDialog):
         günceller (seq_index 1..N) ve save_region(self._region_name) çağırarak diske kaydeder.
         """
         try:
-            nodes = list(self.canvas._nodes)
-            if len(nodes) <= 2:
-                return nodes
+            # Only nodes that belong to the active route are optimized. The
+            # canvas holds ALL region nodes (including ones removed from the
+            # route), so optimizing the full canvas list would silently put
+            # out-of-route nodes back into the route.
+            canvas_nodes = list(self.canvas._nodes)
+            route_ids = list(getattr(self.canvas, "_route_node_ids_list", []) or [])
+            if route_ids:
+                route_set = set(route_ids)
+                nodes = [n for n in canvas_nodes if int(n.get("id", 0) if isinstance(n, dict) else getattr(n, "id", 0)) in route_set]
+            else:
+                nodes = [
+                    n for n in canvas_nodes
+                    if (n.get("in_route", True) if isinstance(n, dict) else getattr(n, "in_route", True)) is not False
+                ]
+            if not nodes:
+                # F-0532: empty route — route_ids is empty and every region
+                # node has in_route False. There is nothing to optimise, and
+                # falling back to the full canvas list would write the
+                # removed nodes back into the route (routes_dict + the
+                # set_nodes_data call at the end of this function). No-op
+                # instead: no persistence, no canvas mutation.
+                logger.info(
+                    "Sıralı rota optimize edilmedi: rota boş (%s).", self._route_name
+                )
+                return []
+            # P1-7 (K-20): norm/piksel birimleri ayrılır, çözünürlük
+            # kanvastan okunur. Kurallar:
+            #  * norm_x VE norm_y ikisi de [0,1] içindeyse norm dalı —
+            #    kanvas boyutuyla ölçeklenir (eski `or` koşulu karışık
+            #    birimli düğümü de norm sayıp yanlış ölçekliyordu; eski
+            #    sabit 1920x1080 kaldırıldı, kanvas yoksa 1280x720).
+            #  * değilse piksel dalı (map_x/map_y); ikisi de 0 ise düğüm
+            #    koordinatsızdır -> None (turdan çıkarılır, (0,0)
+            #    hayaleti olarak sıralamaya girmez).
+            _canvas_w, _canvas_h = DEFAULT_MAP_REF
+            try:
+                _pix = self.canvas._base_pixmap if self.canvas is not None else None
+                if _pix is not None and not _pix.isNull():
+                    _canvas_w = float(_pix.width())
+                    _canvas_h = float(_pix.height())
+            except Exception:
+                pass
 
-            def _node_dist_xy(n: Dict[str, Any]) -> Tuple[float, float]:
+            def _node_dist_xy(n: Dict[str, Any]) -> Optional[Tuple[float, float]]:
                 nx_val = n.get("norm_x")
                 ny_val = n.get("norm_y")
                 if nx_val is not None and ny_val is not None:
                     try:
                         nx_f = float(nx_val)
                         ny_f = float(ny_val)
-                        if 0.0 < nx_f <= 1.0 or 0.0 < ny_f <= 1.0:
-                            return nx_f * 1920.0, ny_f * 1080.0
+                        if 0.0 <= nx_f <= 1.0 and 0.0 <= ny_f <= 1.0:
+                            # (0.5, 0.5) yer tutucudur — norm dalı reddedilir
+                            # ama piksel koordinat varsa piksel dalına düşülür.
+                            if not (nx_f == 0.5 and ny_f == 0.5):
+                                return nx_f * _canvas_w, ny_f * _canvas_h
                     except (ValueError, TypeError):
                         pass
                 mx = float(n.get("map_x", n.get("x", 0.0)) or 0.0)
                 my = float(n.get("map_y", n.get("y", 0.0)) or 0.0)
+                if mx == 0.0 and my == 0.0:
+                    return None
                 return mx, my
+
+            _coordless = [n for n in nodes if _node_dist_xy(n) is None]
+            if _coordless:
+                logger.warning(
+                    "optimize_sequential_route: %d koordinatsız düğüm "
+                    "sıralamadan çıkarıldı (id=%s).",
+                    len(_coordless),
+                    [n.get("id") for n in _coordless],
+                )
+                nodes = [n for n in nodes if _node_dist_xy(n) is not None]
+
+            if len(nodes) <= 2:
+                return nodes
 
             # 1. Nearest Neighbor Ordering
             unvisited = list(nodes)
             unvisited.sort(
-                key=lambda n: _node_dist_xy(n)[0] * 0.7 + _node_dist_xy(n)[1] * 0.3
+                key=lambda n: _node_dist_xy(n)[0] * 0.7 + _node_dist_xy(n)[1] * 0.3  # type: ignore[index]
             )
             ordered = [unvisited.pop(0)]
             while unvisited:
@@ -3213,22 +3718,33 @@ class MapViewerWindow(QDialog):
                     ordered_ids = set()
                     for idx, n in enumerate(ordered, start=1):
                         nid = int(n.get("id", 0) if isinstance(n, dict) else getattr(n, "id", 0))
-                        ordered_ids.add(nid)
                         node_obj = existing_node_map.get(nid)
                         if node_obj is not None:
                             if hasattr(node_obj, "seq_index"):
                                 node_obj.seq_index = idx
                             if isinstance(node_obj, dict):
                                 node_obj["seq_index"] = idx
+                            ordered_ids.add(nid)
                             ordered_node_objs.append(node_obj)
+                        elif isinstance(n, dict) and _MapCanvas._is_minimap_auto_node(n):
+                            # S044 (v19/P3-8): eski hali koşullu ifadeydi
+                            # (`... if isinstance(n, dict) else False`) —
+                            # okunması ve önceliği belirsizdi. Eşdeğer açık
+                            # yazım: dict değilse False, dict ise kontrol.
+                            # Temporary live AutoCartographer points (source_type
+                            # 'minimap_auto') are display-only: never persist
+                            # them as permanent region nodes.
+                            continue
                         else:
                             if NodeData is not None and isinstance(n, dict):
                                 new_nd = NodeData.from_dict(n)
                                 new_nd.seq_index = idx
+                                ordered_ids.add(nid)
                                 ordered_node_objs.append(new_nd)
                             else:
                                 if isinstance(n, dict):
                                     n["seq_index"] = idx
+                                ordered_ids.add(nid)
                                 ordered_node_objs.append(n)
 
                     # Append any region nodes not in ordered
@@ -3254,9 +3770,13 @@ class MapViewerWindow(QDialog):
                                 n.to_dict() if hasattr(n, "to_dict") else n for n in ordered_node_objs
                             ]
                             routes_dict = reg_data.setdefault("routes", {})
+                            # Only persistent region nodes go into the saved
+                            # route list (no temporary minimap_auto points),
+                            # keeping the optimized sequence order.
                             routes_dict[self._route_name] = [
                                 int(n.get("id", 0) if isinstance(n, dict) else getattr(n, "id", 0))
                                 for n in ordered
+                                if int(n.get("id", 0) if isinstance(n, dict) else getattr(n, "id", 0)) in ordered_ids
                             ]
 
                     # Save authoritative region to disk
@@ -3266,17 +3786,34 @@ class MapViewerWindow(QDialog):
                         self.routes.save_data()
 
                 elif hasattr(self.routes, "data") and isinstance(self.routes.data, dict):
-                    # Legacy fallback
+                    # Legacy fallback (temporary minimap_auto points are
+                    # display-only and must not be persisted).
+                    persistent_ordered = [
+                        n for n in ordered
+                        if not (isinstance(n, dict) and _MapCanvas._is_minimap_auto_node(n))
+                    ]
                     reg_data = self.routes.data.get("regions", {}).get(self._region_name, {})
                     if isinstance(reg_data, dict):
-                        reg_data["nodes"] = list(ordered)
+                        reg_data["nodes"] = list(persistent_ordered)
                         routes_dict = reg_data.setdefault("routes", {})
-                        routes_dict[self._route_name] = [int(n.get("id", 0)) for n in ordered]
+                        routes_dict[self._route_name] = [int(n.get("id", 0)) for n in persistent_ordered]
                         if hasattr(self.routes, "save_data"):
                             self.routes.save_data()
 
             route_ids = [int(n.get("id", 0) if isinstance(n, dict) else getattr(n, "id", 0)) for n in ordered]
-            self.canvas.set_nodes_data(ordered, route_ids, rest_duration_sec=self._rest_duration_sec)
+            # F-0532: the canvas holds ALL region nodes — only route_ids
+            # marks route membership. Passing just `ordered` would drop
+            # out-of-route nodes from the canvas until the next reload, so
+            # keep them (in their original relative order) after the
+            # optimised route nodes.
+            ordered_id_set = set(route_ids)
+            remaining = [
+                n for n in canvas_nodes
+                if int(n.get("id", 0) if isinstance(n, dict) else getattr(n, "id", 0)) not in ordered_id_set
+            ]
+            self.canvas.set_nodes_data(
+                list(ordered) + remaining, route_ids, rest_duration_sec=self._rest_duration_sec
+            )
             logger.info("Sıralı rota optimize edildi (%d nokta).", len(ordered))
             return ordered
         except Exception as exc:
@@ -3288,7 +3825,10 @@ class MapViewerWindow(QDialog):
         if material is None:
             text = "Tümü"
         elif isinstance(material, (list, tuple, set)):
-            text = str(list(material)[0]) if material else "Tümü"
+            # Keep every selected material: taking only the first silently
+            # dropped the rest of the selection.
+            clean = [str(m).strip() for m in material if str(m).strip()]
+            text = ", ".join(clean) if clean else "Tümü"
         else:
             text = str(material).strip()
 
@@ -3387,12 +3927,35 @@ class MapViewerWindow(QDialog):
         elif self.__dict__.get("_current_nodes"):
             mat_filter = str(self.__dict__.get("_selected_material_filter") or "")
             pool = self.filter_nodes_by_selected_material(mat_filter) if mat_filter and mat_filter not in ("ALL", "Tümü") else [dict(n) for n in self.__dict__.get("_current_nodes", []) if isinstance(n, dict)]
-            sx, sy = start_xy if start_xy is not None else (0.0, 0.0)
-            pool.sort(key=lambda n: math.hypot(float(n.get("x", n.get("map_x", 0.0))) - sx, float(n.get("y", n.get("map_y", 0.0))) - sy))
-            ordered_ids = [int(n.get("id", idx + 1)) for idx, n in enumerate(pool)]
+            # S045 (v19/P3-8): başlangıç konumu yokken (0,0)'dan
+            # sıralanıyordu — (0,0) harita köşesidir, oyuncu değil;
+            # konum yoksa havuz sırası korunur. Ayrıca id'siz düğüme
+            # `idx+1` uydurma id veriliyordu — gerçek bir id ile
+            # çakışıp yanlış düğüme sıra atayabilirdi; id'siz düğüm
+            # sıralamaya girmez, eski seq_index'i korunur.
+            if start_xy is not None:
+                sx, sy = start_xy
+                pool.sort(key=lambda n: math.hypot(resolve_node_xy(n)[0] - sx, resolve_node_xy(n)[1] - sy))
+            ordered_ids = []
+            for n in pool:
+                nid = n.get("id")
+                if nid is None:
+                    continue
+                try:
+                    ordered_ids.append(int(nid))
+                except (TypeError, ValueError):
+                    continue
 
         routes_obj = self.__dict__.get("routes")
         if ordered_ids and routes_obj is not None:
+            # K-19: sıra değişimi önce bellekte yapılır; disk yazımı
+            # başarısız olursa bellek eski sıraya geri alınır, yoksa
+            # bellek/disk ayrışır ve hata sessizce yutulur.
+            seq_snapshot: Dict[int, Any] = {}
+            prev_nodes: Optional[List[Any]] = None
+            prev_route_ids: Optional[List[int]] = None
+            reg_entry: Optional[Dict[str, Any]] = None
+            reg_data: Optional[Dict[str, Any]] = None
             try:
                 reg = self.canonical_region_name(self._region_name)
                 rank_map = {nid: rank for rank, nid in enumerate(ordered_ids, start=1)}
@@ -3400,6 +3963,9 @@ class MapViewerWindow(QDialog):
                 if hasattr(self.routes, "_regions") and isinstance(self.routes._regions, dict) and reg in self.routes._regions:
                     reg_entry = self.routes._regions[reg]
                     existing_nodes = reg_entry.get("nodes", [])
+                    prev_nodes = list(existing_nodes)
+                    for nd in existing_nodes:
+                        seq_snapshot[id(nd)] = getattr(nd, "seq_index", None) if hasattr(nd, "seq_index") else (nd.get("seq_index") if isinstance(nd, dict) else None)
                     node_by_id: Dict[int, Any] = {}
                     for nd in existing_nodes:
                         nid = getattr(nd, "id", None) or (nd.get("id") if isinstance(nd, dict) else None)
@@ -3430,14 +3996,22 @@ class MapViewerWindow(QDialog):
 
                     reg_entry["nodes"] = reordered_objs
                     if hasattr(self.routes, "save_region"):
-                        self.routes.save_region(reg)
+                        saved = self.routes.save_region(reg)
                     elif hasattr(self.routes, "save_data"):
-                        self.routes.save_data()
+                        saved = self.routes.save_data()
+                    else:
+                        saved = None
+                    if saved is False:
+                        raise OSError("sıra diske yazılamadı (save False döndü)")
 
                 elif hasattr(self.routes, "data") and isinstance(self.routes.data, dict):
                     reg_data = self.routes.data.get("regions", {}).get(reg, {})
                     if isinstance(reg_data, dict):
                         routes_dict = reg_data.setdefault("routes", {})
+                        prev_route_ids = list(routes_dict[self._route_name]) if self._route_name in routes_dict else None
+                        for nd in reg_data.get("nodes", []):
+                            if isinstance(nd, dict):
+                                seq_snapshot[id(nd)] = nd.get("seq_index")
                         routes_dict[self._route_name] = list(ordered_ids)
                         for nd in reg_data.get("nodes", []):
                             if isinstance(nd, dict):
@@ -3445,9 +4019,37 @@ class MapViewerWindow(QDialog):
                                 if nid in rank_map:
                                     nd["seq_index"] = rank_map[nid]
                         if hasattr(self.routes, "save_data"):
-                            self.routes.save_data()
+                            saved = self.routes.save_data()
+                        else:
+                            saved = None
+                        if saved is False:
+                            raise OSError("sıra diske yazılamadı (save_data False döndü)")
             except Exception as exc:
-                logger.debug("resequence_active_route_by_proximity persistence error: %s", exc)
+                # Geri alma: bellek diskteki eski sıraya döner.
+                try:
+                    if reg_entry is not None and prev_nodes is not None:
+                        reg_entry["nodes"] = prev_nodes
+                    if reg_data is not None and isinstance(reg_data, dict):
+                        routes_dict = reg_data.get("routes", {})
+                        if isinstance(routes_dict, dict):
+                            if prev_route_ids is None:
+                                routes_dict.pop(self._route_name, None)
+                            else:
+                                routes_dict[self._route_name] = prev_route_ids
+                    if reg_entry is not None and prev_nodes is not None:
+                        for nd in prev_nodes:
+                            if id(nd) in seq_snapshot and seq_snapshot[id(nd)] is not None:
+                                if hasattr(nd, "seq_index"):
+                                    nd.seq_index = seq_snapshot[id(nd)]
+                                if isinstance(nd, dict):
+                                    nd["seq_index"] = seq_snapshot[id(nd)]
+                    if reg_data is not None and isinstance(reg_data, dict):
+                        for nd in reg_data.get("nodes", []):
+                            if isinstance(nd, dict) and id(nd) in seq_snapshot and seq_snapshot[id(nd)] is not None:
+                                nd["seq_index"] = seq_snapshot[id(nd)]
+                except Exception as rb_exc:
+                    logger.error("resequence_active_route_by_proximity geri alma başarısız: %s", rb_exc)
+                logger.error("resequence_active_route_by_proximity kalıcılık hatası (%s): %s; bellek eski sıraya alındı.", self._region_name, exc)
 
         return ordered_ids
 
@@ -3493,7 +4095,9 @@ class MapViewerWindow(QDialog):
 
 
     def set_player_position(self, x: Optional[float], y: Optional[float], angle_deg: float = 0.0) -> None:
-        self._player_pos = (x, y) if (x is not None and y is not None) else None
+        # Keep the heading: the canvas stores a 3-tuple (x, y, angle) and the
+        # old 2-tuple dropped the angle, resetting it on every reload.
+        self._player_pos = (x, y, float(angle_deg)) if (x is not None and y is not None) else None
         self.canvas.set_player_position(x, y, angle_deg)
 
     def get_dry_run_trajectory_points(self) -> List[Tuple[float, float]]:
@@ -3555,13 +4159,43 @@ class MapViewerWindow(QDialog):
                         None
                     )
                     if target_node is not None:
-                        routes = target_node.routes if hasattr(target_node, "routes") else (target_node.setdefault("routes", []) if isinstance(target_node, dict) else [])
-                        if self._route_name in routes:
-                            routes.remove(self._route_name)
-                            logger.info("Nokta #%d '%s' (%s) rotasından çıkarıldı", node_id, self._route_name, reg)
+                        if self._route_name == "All":
+                            # 'All' is a virtual route: no node carries it as a
+                            # real membership entry, so toggling the routes list
+                            # was a no-op. Membership in 'All' is the in_route
+                            # flag instead.
+                            if isinstance(target_node, dict):
+                                cur = target_node.get("in_route", True)
+                                target_node["in_route"] = not cur
+                                routes = target_node.setdefault("routes", [])
+                                if cur is not False:
+                                    if "All" in routes:
+                                        routes.remove("All")
+                                else:
+                                    if "All" not in routes:
+                                        routes.append("All")
+                            else:
+                                cur = getattr(target_node, "in_route", True)
+                                target_node.in_route = not cur
+                                routes = getattr(target_node, "routes", None)
+                                if isinstance(routes, list):
+                                    if cur is not False:
+                                        if "All" in routes:
+                                            routes.remove("All")
+                                    elif "All" not in routes:
+                                        routes.append("All")
+                            if cur is not False:
+                                logger.info("Nokta #%d '%s' (%s) rotasından çıkarıldı", node_id, self._route_name, reg)
+                            else:
+                                logger.info("Nokta #%d '%s' (%s) rotasına eklendi", node_id, self._route_name, reg)
                         else:
-                            routes.append(self._route_name)
-                            logger.info("Nokta #%d '%s' (%s) rotasına eklendi", node_id, self._route_name, reg)
+                            routes = target_node.routes if hasattr(target_node, "routes") else (target_node.setdefault("routes", []) if isinstance(target_node, dict) else [])
+                            if self._route_name in routes:
+                                routes.remove(self._route_name)
+                                logger.info("Nokta #%d '%s' (%s) rotasından çıkarıldı", node_id, self._route_name, reg)
+                            else:
+                                routes.append(self._route_name)
+                                logger.info("Nokta #%d '%s' (%s) rotasına eklendi", node_id, self._route_name, reg)
                     if hasattr(self.routes, "save_region"):
                         self.routes.save_region(reg)
                     elif hasattr(self.routes, "save_data"):
@@ -3612,10 +4246,10 @@ class MapViewerWindow(QDialog):
                     border-radius: 6px;
                     padding: 4px;
                     font-family: 'Segoe UI', sans-serif;
-                    font-size: 12px;
+                    font-size: 13px;
                 }
                 QMenu::item {
-                    padding: 6px 20px 6px 12px;
+                    padding: 8px 22px 8px 14px;
                     border-radius: 4px;
                 }
                 QMenu::item:selected {
@@ -3629,7 +4263,7 @@ class MapViewerWindow(QDialog):
                 QMenu::separator {
                     height: 1px;
                     background: #2d323b;
-                    margin: 4px 6px;
+                    margin: 6px 8px;
                 }
             """)
 
@@ -3642,7 +4276,7 @@ class MapViewerWindow(QDialog):
             menu.addSeparator()
 
             toggle_label = (
-                "Aktif Rotadan Çıkar (Başarısız / Pasif Yap)"
+                "Aktif Rotadan Çıkar (Rota Dışı / Pasif Yap)"
                 if in_route
                 else "Aktif Rotaya Ekle (Aktif Yap)"
             )
@@ -3764,8 +4398,15 @@ class MapViewerWindow(QDialog):
                     reg_data = self.routes.data.get("regions", {}).get(reg, {})
                     for n in reg_data.get("nodes", []):
                         if int(n.get("id", -1)) == int(node_id):
+                            # S043 (v19/P3-8): bu dal yalnızca
+                            # last_visited+status yazıyordu — dict'te
+                            # last_visited_timestamp ayrı anahtardır
+                            # (NodeData'daki property takma adının aksine),
+                            # bayat kalıyordu. Diğer dallarla aynı alanlar.
                             n["last_visited"] = time.time() if resting else 0
+                            n["last_visited_timestamp"] = time.time() if resting else 0.0
                             n["status"] = "resting" if resting else "ready"
+                            n["state"] = "resting" if resting else "active"
                             break
                     if hasattr(self.routes, "save_data"):
                         self.routes.save_data()
@@ -3775,87 +4416,153 @@ class MapViewerWindow(QDialog):
             logger.error("Failed updating cooldown state for node #%d: %s", node_id, exc)
 
     def delete_node(self, node_id: int) -> bool:
-        """Public API to delete node from route manager and reload map canvas."""
-        self._delete_node(node_id)
-        return True
+        """Public API to delete node from route manager and reload map canvas.
 
-    def _delete_node(self, node_id: int) -> None:
+        Returns True only if the node was actually removed.
+        """
+        return self._delete_node(node_id)
+
+    def _delete_node(self, node_id: int) -> bool:
         try:
             reg = self.canonical_region_name(self._region_name)
             self._region_name = reg
+            removed = False
             if self.routes is not None:
+                # One authoritative delete: RouteManager.delete_node already
+                # removes the node AND persists; re-filtering + re-saving the
+                # region afterwards would delete/save it a second time.
                 if hasattr(self.routes, "delete_node") and callable(self.routes.delete_node):
                     try:
-                        self.routes.delete_node(node_id, region=reg)
+                        res = self.routes.delete_node(node_id, region=reg)
                     except TypeError:
-                        self.routes.delete_node(node_id)
-                if hasattr(self.routes, "_regions") and isinstance(self.routes._regions, dict) and reg in self.routes._regions:
+                        res = self.routes.delete_node(node_id)
+                    removed = True if res is None else bool(res)
+                if not removed and hasattr(self.routes, "_regions") and isinstance(self.routes._regions, dict) and reg in self.routes._regions:
                     reg_info = self.routes._regions[reg]
                     if "nodes" in reg_info:
+                        before = len(reg_info["nodes"])
                         reg_info["nodes"] = [
                             n for n in reg_info["nodes"]
                             if int(getattr(n, "id", -1) if hasattr(n, "id") else (n.get("id", -1) if isinstance(n, dict) else -1)) != int(node_id)
                         ]
+                        removed = len(reg_info["nodes"]) < before
                         for idx, n in enumerate(reg_info["nodes"], start=1):
                             if hasattr(n, "seq_index"):
                                 n.seq_index = idx
                             if isinstance(n, dict):
                                 n["seq_index"] = idx
 
-                    if hasattr(self.routes, "save_region"):
-                        self.routes.save_region(reg)
-                    elif hasattr(self.routes, "save_data"):
-                        self.routes.save_data()
-                elif hasattr(self.routes, "data") and isinstance(self.routes.data, dict):
+                    if removed:
+                        if hasattr(self.routes, "save_region"):
+                            self.routes.save_region(reg)
+                        elif hasattr(self.routes, "save_data"):
+                            self.routes.save_data()
+                elif not removed and hasattr(self.routes, "data") and isinstance(self.routes.data, dict):
                     reg_data = self.routes.data.get("regions", {}).get(reg, {})
                     if "nodes" in reg_data:
+                        before = len(reg_data["nodes"])
                         reg_data["nodes"] = [
                             n for n in reg_data["nodes"] if int(n.get("id", -1)) != int(node_id)
                         ]
+                        removed = len(reg_data["nodes"]) < before
                         for idx, n in enumerate(reg_data["nodes"], start=1):
                             if isinstance(n, dict):
                                 n["seq_index"] = idx
                     for r_name, r_list in reg_data.get("routes", {}).items():
                         if int(node_id) in r_list:
                             r_list.remove(int(node_id))
-                    if hasattr(self.routes, "save_data"):
+                    if removed and hasattr(self.routes, "save_data"):
                         self.routes.save_data()
+
+            if not removed:
+                logger.warning("Silinecek düğüm bulunamadı: #%d (%s)", node_id, reg)
+                return False
 
             nodes, route_ids = self._extract_region_nodes_and_route_ids()
             self.canvas.set_nodes_data(nodes, route_ids, rest_duration_sec=self._rest_duration_sec)
             self.node_deleted.emit(int(node_id))
             logger.info("Deleted node #%d from canonical region '%s'", node_id, reg)
+            return True
         except Exception as exc:
             logger.error("Failed deleting node #%d: %s", node_id, exc)
+            return False
 
     def get_map_viewer_route_summary(self) -> Dict[str, Any]:
-        """Returns a structured summary of the currently loaded region, route, and filtered nodes."""
-        nodes = list(self.__dict__.get("_current_nodes") or [])
-        mat_filter = str(self.__dict__.get("_selected_material_filter") or "ALL")
-        filtered = self.filter_nodes_by_selected_material(mat_filter) if hasattr(self, "filter_nodes_by_selected_material") else nodes
+        """Returns a structured summary of the currently loaded region, route, and filtered nodes.
+
+        Prefers the live window state (_region_name / RouteManager nodes);
+        falls back to the legacy _current_region / _current_nodes dict entries
+        (used by lightweight / uninitialised dialog harnesses) when present.
+        """
+        d = self.__dict__
+        region = d.get("_current_region") or d.get("_region_name") or "Altgard"
+        route = d.get("_current_route") or d.get("_route_name") or "All"
+        nodes = list(d.get("_current_nodes") or [])
+        if not nodes:
+            try:
+                nodes, _route_ids = self._extract_region_nodes_and_route_ids()
+            except Exception:
+                nodes = []
+        if not nodes:
+            canvas = d.get("canvas")
+            if canvas is not None:
+                try:
+                    nodes = [dict(n) for n in getattr(canvas, "_nodes", []) if isinstance(n, dict)]
+                except Exception:
+                    nodes = []
+        mat_filter = str(d.get("_selected_material_filter") or "Tümü")
+        if not mat_filter or mat_filter in ("Tümü", "ALL", "All"):
+            filtered = list(nodes)
+        else:
+            filtered = [n for n in nodes if node_matches_material(n, mat_filter)]
+        # S-1803 / Decision 3: bind the ready flag to the real contract
+        # probe plus live state — a pixmap-less / empty canvas is not
+        # 'ready'. A bare dialog harness with no canvas attached (used by
+        # lightweight tests) has no pixmap to check, so only the node
+        # count applies there.
+        canvas = d.get("canvas") or d.get("_canvas")
+        has_pixmap = True
+        if canvas is not None:
+            pix = getattr(canvas, "_base_pixmap", None)
+            has_pixmap = pix is not None and not pix.isNull()
+        ready = bool(validate_map_viewer_contract() and nodes and has_pixmap)
         return {
-            "region": str(self.__dict__.get("_current_region") or "Beluslan"),
-            "route": str(self.__dict__.get("_current_route") or "All"),
+            "region": str(region),
+            "route": str(route),
             "total_nodes": len(nodes),
             "filtered_nodes": len(filtered),
             "selected_material": mat_filter,
-            "ready": True,
+            "ready": ready,
         }
 
     def get_map_viewer_health_summary(self) -> dict:
         try:
-            return {"map_viewer_ready": True}
+            d = self.__dict__
+            canvas = d.get("canvas")
+            node_count = 0
+            if canvas is not None:
+                try:
+                    node_count = len(getattr(canvas, "_nodes", []) or [])
+                except Exception:
+                    node_count = 0
+            return {
+                "map_viewer_ready": validate_map_viewer_contract(),
+                "canvas_ready": canvas is not None,
+                "region": str(d.get("_region_name") or ""),
+                "route": str(d.get("_route_name") or ""),
+                "node_count": node_count,
+            }
         except Exception:
             return {"map_viewer_ready": False}
 
     def get_map_viewer_ready_flag(self) -> dict:
-        return {"module": "map_viewer", "ready": True}
+        return {"module": "map_viewer", "ready": validate_map_viewer_contract()}
 
     def get_map_viewer_version_info(self) -> dict:
-        return {"module": "map_viewer", "version": "2.0.0", "ready": True}
+        return {"module": "map_viewer", "version": __version__, "ready": validate_map_viewer_contract()}
 
     def get_map_viewer_diagnostic_snapshot(self) -> dict:
-        return {"module": "map_viewer", "status": "ok", "ready": True}
+        return {"module": "map_viewer", "status": "ok" if validate_map_viewer_contract() else "degraded", "ready": validate_map_viewer_contract()}
 
 
 # Backwards compatibility alias so existing imports (`from ui.map_viewer import MapViewerDialog`) continue to work
@@ -3868,7 +4575,33 @@ def get_map_viewer_capabilities() -> list:
 
 
 def validate_map_viewer_contract() -> bool:
-    return bool(get_map_viewer_capabilities())
+    """Actually checks the map viewer contract instead of rubber-stamping it.
+
+    Verifies the capability list is non-empty, both viewer classes exist, and
+    the public methods the rest of the app calls are present and callable.
+    """
+    try:
+        caps = get_map_viewer_capabilities()
+        if not caps:
+            return False
+        if MapViewerWindow is None or _MapCanvas is None:
+            return False
+        window_methods = (
+            "reload_map_and_nodes", "add_node", "move_node", "delete_node",
+            "optimize_sequential_route", "set_material_filter",
+            "set_player_position", "get_map_viewer_route_summary",
+        )
+        if not all(callable(getattr(MapViewerWindow, m, None)) for m in window_methods):
+            return False
+        canvas_methods = (
+            "set_nodes_data", "set_map_pixmap", "set_player_position",
+            "calculate_proximity_route", "delete_node",
+        )
+        if not all(callable(getattr(_MapCanvas, m, None)) for m in canvas_methods):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def get_map_viewer_baseline_metrics() -> dict:

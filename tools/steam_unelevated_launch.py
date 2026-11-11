@@ -35,7 +35,6 @@ from pathlib import Path
 STEAM_EXE = Path(r"C:\Program Files (x86)\Steam\steam.exe")
 AION2_APPID = "3393110"
 TASK_NAME = "Gatherion_SteamMedium"
-TASK_XML_NAME = "Gatherion_SteamMedium"
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TOKEN_QUERY = 0x0008
@@ -49,31 +48,56 @@ RID_NAMES = {
     0x4000: "System",
 }
 
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+# F-1285: Windows-only DLLs are loaded lazily (see _load_win32) so this
+# module imports cleanly on non-Windows platforms; token probing then
+# reports "unavailable" instead of crashing at import time.
+kernel32 = None
+advapi32 = None
+OpenProcess = None
+CloseHandle = None
+OpenProcessToken = None
+GetTokenInformation = None
+GetSidSubAuthorityCount = None
+GetSidSubAuthority = None
 
-OpenProcess = kernel32.OpenProcess
-OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-OpenProcess.restype = wintypes.HANDLE
-CloseHandle = kernel32.CloseHandle
-OpenProcessToken = advapi32.OpenProcessToken
-OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-OpenProcessToken.restype = wintypes.BOOL
-GetTokenInformation = advapi32.GetTokenInformation
-GetTokenInformation.argtypes = [
-    wintypes.HANDLE,
-    ctypes.c_int,
-    ctypes.c_void_p,
-    wintypes.DWORD,
-    ctypes.POINTER(wintypes.DWORD),
-]
-GetTokenInformation.restype = wintypes.BOOL
-GetSidSubAuthorityCount = advapi32.GetSidSubAuthorityCount
-GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
-GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
-GetSidSubAuthority = advapi32.GetSidSubAuthority
-GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
-GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+
+def _load_win32() -> bool:
+    """Load kernel32/advapi32 and bind the token-probe functions (Windows only)."""
+    global kernel32, advapi32
+    global OpenProcess, CloseHandle, OpenProcessToken
+    global GetTokenInformation, GetSidSubAuthorityCount, GetSidSubAuthority
+    if kernel32 is not None and advapi32 is not None:
+        return True
+    if sys.platform != "win32":
+        return False
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    except Exception:
+        return False
+    OpenProcess = kernel32.OpenProcess
+    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    OpenProcess.restype = wintypes.HANDLE
+    CloseHandle = kernel32.CloseHandle
+    OpenProcessToken = advapi32.OpenProcessToken
+    OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    OpenProcessToken.restype = wintypes.BOOL
+    GetTokenInformation = advapi32.GetTokenInformation
+    GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    GetTokenInformation.restype = wintypes.BOOL
+    GetSidSubAuthorityCount = advapi32.GetSidSubAuthorityCount
+    GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+    GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    GetSidSubAuthority = advapi32.GetSidSubAuthority
+    GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+    return True
 
 
 class SID_AND_ATTRIBUTES(ctypes.Structure):
@@ -85,6 +109,8 @@ class TOKEN_MANDATORY_LABEL(ctypes.Structure):
 
 
 def probe_pid(pid: int) -> dict:
+    if not _load_win32():
+        return {"pid": pid, "ok": False, "error": "Windows-only token probe unavailable on this platform"}
     h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not h:
         return {"pid": pid, "ok": False, "error": f"OpenProcess={ctypes.get_last_error()}"}
@@ -112,6 +138,16 @@ def probe_pid(pid: int) -> dict:
             tml = ctypes.cast(buf, ctypes.POINTER(TOKEN_MANDATORY_LABEL)).contents
             sid = tml.Label.Sid
             count = GetSidSubAuthorityCount(sid).contents.value
+            # S295 (v19/P3-8): count == 0 ise count-1 == -1 DWORD'a
+            # sarılır, NULL .contents ValueError fırlatır. Gerçek
+            # SID'lerde count >= 1'dir; 0 gelirse hata dön.
+            if count <= 0:
+                return {
+                    "pid": pid,
+                    "ok": False,
+                    "elevated": elevated,
+                    "error": f"IL: SID sub-authority count={count}",
+                }
             rid = GetSidSubAuthority(sid, count - 1).contents.value
             return {
                 "pid": pid,
@@ -129,7 +165,17 @@ def probe_pid(pid: int) -> dict:
 def list_processes(*names: str) -> list[dict]:
     want = {n.lower() for n in names}
     out: list[dict] = []
-    raw = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], text=True, errors="replace")
+    try:
+        raw = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"], text=True, errors="replace", timeout=15
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # A failed tasklist must not take down the whole status query:
+        # callers treat "no processes seen" as absent, not as a crash.
+        # (The sibling bot_elevated_launch.py already handles its tasklist
+        # call this way; this one used to raise with no timeout at all, so
+        # a hung tasklist could hang --status forever.)
+        return out
     seen: set[tuple[str, str]] = set()
     for line in raw.splitlines():
         parts = [p.strip('"') for p in line.split('","')]
@@ -171,6 +217,18 @@ def status_report() -> dict:
 
 def _run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, text=True, capture_output=True, check=check)
+
+
+def task_exists() -> bool:
+    try:
+        cp = _run(["schtasks", "/Query", "/TN", TASK_NAME])
+    except OSError:
+        # schtasks.exe itself missing (non-Windows / broken PATH): the task
+        # is not visible, which is exactly what False means. Without this,
+        # ensure_medium_task()'s post-register verification raised
+        # FileNotFoundError instead of reporting "not registered".
+        return False
+    return cp.returncode == 0
 
 
 def steam_shutdown(timeout_s: float = 25.0) -> bool:
@@ -226,6 +284,17 @@ Register-ScheduledTask -TaskName $tn -Action $action -Principal $principal -Sett
         raise RuntimeError(
             "Failed to register Medium scheduled task:\n"
             + (cp.stderr or cp.stdout or f"exit={cp.returncode}")
+        )
+    # A zero PowerShell exit alone does not prove the task exists (silent
+    # Register-ScheduledTask failure, renamed task, GPO block). Verify via
+    # schtasks /Query — the same check bot_elevated_launch.py already does
+    # after its own register — instead of reporting success and letting the
+    # later schtasks /Run fail with a confusing error.
+    if not task_exists():
+        raise RuntimeError(
+            "Medium scheduled task registration reported success but "
+            f"{TASK_NAME} is not visible via schtasks /Query. Check Task "
+            "Scheduler for errors (e.g. GPO restrictions) and re-run."
         )
 
 
@@ -319,16 +388,17 @@ def main(argv: list[str] | None = None) -> int:
         print(text)
         if isinstance(result, dict) and result.get("ok") is False and result.get("error"):
             print(f"\nERROR: {result['error']}", file=sys.stderr)
-            return 1
         if isinstance(result, dict) and "steam_medium_unelevated" in result:
             flag = "YES" if result["steam_medium_unelevated"] else "NO"
             print(f"\nSteam Medium unelevated: {flag}")
-            return 0 if result["steam_medium_unelevated"] else 2
-        if isinstance(result, dict) and result.get("ok"):
+        elif isinstance(result, dict) and result.get("ok"):
             print("\nSteam Medium unelevated: YES")
-            return 0
-        return 1
-    return 0 if result.get("ok") or result.get("steam_medium_unelevated") else 1
+    # F-1283: --status exit code is the same with and without --json:
+    # 0 when Steam is Medium/unelevated, 2 otherwise. Launch mode:
+    # 0 on success, 1 on failure.
+    if args.status:
+        return 0 if isinstance(result, dict) and result.get("steam_medium_unelevated") else 2
+    return 0 if isinstance(result, dict) and result.get("ok") else 1
 
 
 if __name__ == "__main__":

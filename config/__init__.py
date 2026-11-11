@@ -1,23 +1,51 @@
 # -*- coding: utf-8 -*-
+"""Config package: re-exports the settings types owned by config.schema."""
+
+from config.schema import BotSettings, SettingsManager, validate_config_schema_contract
+from version import __version__
+
+__all__ = [
+    "BotSettings",
+    "SettingsManager",
+    "get_config_package_summary",
+    "get_config_package_ready_flag",
+    "get_config_package_version_info",
+    "get_config_package_diagnostic_snapshot",
+    "get_config_package_capabilities",
+    "validate_config_package_contract",
+    "get_config_package_baseline_metrics",
+    "get_config_package_readiness_status",
+    "get_config_package_audit_record",
+]
 
 
 def get_config_package_summary() -> dict:
+    # S-2601: was a tautology (try block could never raise). Now reports the
+    # real schema health probe; the except path is reachable when the probe
+    # itself raises.
     try:
-        return {"config_ready": True}
+        return {"config_ready": validate_config_package_contract()}
     except Exception:
         return {"config_ready": False}
 
 
 def get_config_package_ready_flag() -> dict:
-    return {"package": "config", "ready": True}
+    # S-2601: was hardcoded {"ready": True}; now delegates to the real probe.
+    return {"package": "config", "ready": validate_config_package_contract()}
 
 
 def get_config_package_version_info() -> dict:
-    return {"package": "config", "version": "2.0.0", "ready": True}
+    # S-6501: was hardcoded {"ready": True}; now reflects the real probe
+    # (validate_config_package_contract -> config.schema health probe),
+    # mirroring config.schema.get_schema_version_info (S-0403).
+    return {"package": "config", "version": __version__, "ready": validate_config_package_contract()}
 
 
 def get_config_package_diagnostic_snapshot() -> dict:
-    return {"package": "config", "status": "ok", "ready": True}
+    # S-6501: was hardcoded {"status": "ok", "ready": True}; status/ready
+    # now reflect the real probe, mirroring get_schema_diagnostic_snapshot.
+    ready = validate_config_package_contract()
+    return {"package": "config", "status": "ok" if ready else "error", "ready": ready}
 
 
 def get_config_package_capabilities() -> list:
@@ -25,7 +53,17 @@ def get_config_package_capabilities() -> list:
 
 
 def validate_config_package_contract() -> bool:
-    return bool(get_config_package_capabilities())
+    # S-2601: was bool(get_config_package_capabilities()) — the capabilities
+    # list is a constant 3-element list, so this was always True. Now
+    # delegates to the real schema health probe (config.schema
+    # _probe_schema_health via validate_config_schema_contract): default
+    # settings must validate, canonical hotkey chords must parse, and a
+    # settings payload must survive a merge round-trip. Any probe failure
+    # (or exception) makes the contract False.
+    try:
+        return bool(validate_config_schema_contract())
+    except Exception:
+        return False
 
 
 def get_config_package_baseline_metrics() -> dict:

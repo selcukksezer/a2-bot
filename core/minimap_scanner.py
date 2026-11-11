@@ -19,6 +19,7 @@ yüksek doğrulukla tespit eder.
 
 from __future__ import annotations
 
+import copy
 import itertools
 import json
 import logging
@@ -28,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from version import __version__
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -39,6 +41,33 @@ if not logger.handlers:
     _handler.setFormatter(_formatter)
     logger.addHandler(_handler)
     logger.setLevel(logging.INFO)
+
+
+# config/calibrated_rois.json disk okuma önbelleği: mutlak dosya yolu ->
+# (mtime, parse edilmiş JSON dict). Her MinimapScanner() yapımı dosyayı
+# diskten yeniden okuyordu (açılışta 8 kez ölçüldü); dosya değişmediyse
+# önbellekten dönülür. Veri instance başına deepcopy ile verilir, böylece
+# bir instance'ın dict'i diğerininkini etkilemez. Dosya değişirse (mtime
+# farklı) diskten yeniden okunur ve önbellek tazelenir.
+_CALIBRATED_ROIS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _get_sprout_monster_discriminator():
+    """`MinimapSproutMonsterDiscriminator` örneğini tembel yükle.
+
+    Modül düzeyinde import döngüsünden kaçınmak için ilk kullanımda yüklenir.
+    Yüklenemezse `None` döner; çağıran o durumda diskriminatörsüz
+    (yalnızca NCC + kromatik doğrulamalı) yola düşer ve bunu bayraklar.
+    """
+    try:
+        from dataset_factory.minimap_sprout_monster_discriminator import (
+            MinimapSproutMonsterDiscriminator,
+        )
+
+        return MinimapSproutMonsterDiscriminator()
+    except Exception as exc:  # pragma: no cover - import ortamı hatası
+        logger.debug("Sprout/monster discriminator yüklenemedi: %s", exc)
+        return None
 
 
 class MinimapScanner:
@@ -62,8 +91,31 @@ class MinimapScanner:
 
     # Sıkı Ayrım Kriterleri ve Eşik Değerleri (Strict Separation Criteria)
     SPROUT_NCC_MIN_THRESHOLD: float = 0.88
+    # Tam-kare NCC ölçekleri: 5 yerine 3 (0.95/1.00/1.05) — 25 yerine en
+    # fazla 20 tam-kare _masked_ncc (2 kanonik + 3 dış şablon x 4 ölçek:
+    # çarpanlardan gelen 3 boyut + kanonik şablonun kendi 16px boyutu).
+    SPROUT_NCC_SCALES: Tuple[float, ...] = (0.95, 1.00, 1.05)
     HOSTILE_RED_CIRCULARITY_MIN: float = 0.65
     CENTER_EXCLUSION_RADIUS_PX: float = 14.0
+
+    # 3D Dünya Odyle Küresi (P2-10 / v19) — kompakt blob gürültü kapıları.
+    # Bunlar "orb imzası" değil, yalnızca benek/çizgi reddi için gevşek
+    # kapılardır; asıl kanıt `classify_3d_material_patch` "Odyle" kararı +
+    # `ODYLE_ORB_MIN_RATIO`'dur (aşağıda). Değerler bu dosyadaki mevcut
+    # kompakt-blob disiplininden alınır (hostile: alan 3..95, dairesellik
+    # >= 0.65; monster: alan 7..85, dairesellik >= 0.62, solidity >= 0.80,
+    # en-boy 0.72..1.38) — orb parlayan bir leke olduğu için kapılar
+    # bilerek daha gevşektir.
+    # `ODYLE_ORB_MIN_RATIO`: config/materials_db.py `map_descriptors_to_taxonomy`
+    # satır ~1787'deki Odyle kanıt kuralı (`odyle_orb >= 0.045`).
+    ODYLE_ORB_MIN_RATIO: float = 0.045
+    ODYLE_ORB_MIN_AREA_REF_PX: float = 40.0  # 2000x1125 referans karede
+    ODYLE_ORB_MIN_AREA_ABS_PX: float = 25.0  # küçük karelerde mutlak taban
+    ODYLE_ORB_MAX_AREA_FRAC: float = 0.02  # kare alanının %2'si (arazi yıkaması reddi)
+    ODYLE_ORB_MAX_BBOX_FRAC: float = 0.25  # kenar başına kare boyutunun %25'i
+    ODYLE_ORB_CIRCULARITY_MIN: float = 0.50
+    ODYLE_ORB_SOLIDITY_MIN: float = 0.70
+    ODYLE_ORB_REF_AREA_PX: float = 2000.0 * 1125.0  # alan ölçek referansı
 
     # 3D Dünya ve Minimap Sınıflarının Birbirine Karışmasını Engelleyen Taksonomi
     MINIMAP_CLASS_IDS: frozenset[int] = frozenset({9, 11})
@@ -71,7 +123,13 @@ class MinimapScanner:
         {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
     )
 
-    # Kanonik Bölge ve Alt Bölge Eşleme Haritası
+    # Kanonik Bölge ve Alt Bölge Eşleme Haritası — TEK KAYNAK:
+    # `core/route_manager.py:SUBREGION_TO_CANONICAL` (orada da
+    # `SUBREGION_CANONICAL_MAP` adıyla ihraç edilir). Bu sınıftaki sözlük
+    # yalnızca route_manager import edilemezse kullanılan yedektir ve
+    # onunla aynı değerleri taşımalıdır (H-sweep dilim 13 K1: scanner
+    # "pilgrim's ridge" -> Altgard diyordu, tek kaynak Verteron diyor).
+    # Yeni alt bölge eklenecekse SADECE route_manager'a eklenir.
     SUBREGION_CANONICAL_MAP: Dict[str, str] = {
         "dredgion crash site": "Altgard",
         "safe haven": "Altgard",
@@ -86,9 +144,30 @@ class MinimapScanner:
         "basfelt ruins": "Altgard",
         "black plains": "Altgard",
         "heart of the dragon": "Altgard",
-        "pilgrim's ridge": "Altgard",
+        "pilgrim's ridge": "Verteron",
         "altgard": "Altgard",
     }
+
+    @classmethod
+    def _canonical_region_for(cls, subregion_name: Optional[str]) -> Optional[str]:
+        """Alt bölge adından kanonik bölge; bilinmeyende None döner.
+
+        Önce route_manager'daki tek kaynağa bakılır (Title-Case anahtarlar
+        küçük harfe çevrilerek); import başarısız olursa yukarıdaki
+        yedek sözlük kullanılır. Asla varsayılan bölge uydurulmaz.
+        """
+        if not subregion_name:
+            return None
+        key = str(subregion_name).strip().lower()
+        try:
+            from core.route_manager import SUBREGION_TO_CANONICAL
+
+            lowered = {str(k).lower(): v for k, v in SUBREGION_TO_CANONICAL.items()}
+            if key in lowered:
+                return str(lowered[key])
+        except Exception:
+            pass
+        return cls.SUBREGION_CANONICAL_MAP.get(key)
 
     # 332x257 referans minimap ölçeğinde kanonik 16x16 beyaz 3-yapraklı filiz (sprout) şablonu
     _CANONICAL_SPROUT_TPL: np.ndarray = np.array(
@@ -162,7 +241,9 @@ class MinimapScanner:
         self,
         norm_rect: Tuple[float, float, float, float] = DEFAULT_NORM_RECT,
         movement_shift_threshold: float = 0.22,
-        movement_diff_threshold: float = 3.2,
+        # P1-13: varsayılan 2.2 — önceden gömülü 2.2 sabitiydi; parametre
+        # hiç okunmuyordu. Varsayılan eski sabite eşit, davranış değişmez.
+        movement_diff_threshold: float = 2.2,
         templates_dir: Optional[str] = None,
         config_dir: Optional[str] = None,
     ) -> None:
@@ -189,11 +270,21 @@ class MinimapScanner:
 
         self.calibrated_rois: Dict[str, Any] = {}
         self._calibrated_rois_mtime: float = 0.0
+        # norm_rect'in alındığı minimap girdisinin kayıtlı çözünürlüğü
+        # (w, h) — None ise çözünürlük kaydı yok demektir.
+        self._calibrated_minimap_resolution: Optional[Tuple[int, int]] = None
 
         self._external_sprout_templates: List[Tuple[np.ndarray, np.ndarray]] = []
         self._external_arrow_templates: List[Tuple[np.ndarray, np.ndarray]] = []
         self._player_arrow_template: Optional[np.ndarray] = None
         self._player_arrow_mask: Optional[np.ndarray] = None
+        # Yön (heading) şablon önbelleği: döndürülmüş şablon/maske çiftleri
+        # yalnızca (_player_arrow_template, _player_arrow_mask) ikilisine
+        # bağlıdır; şablon değişirse kimlik kontrolüyle sıfırlanır.
+        self._heading_cache_tpl: Optional[np.ndarray] = None
+        self._heading_cache_mask: Optional[np.ndarray] = None
+        self._heading_base_heading: Optional[float] = None
+        self._heading_rot_cache: Dict[float, Tuple[np.ndarray, np.ndarray, int]] = {}
 
         self._load_calibrated_rois()
         self._load_optional_templates()
@@ -201,18 +292,41 @@ class MinimapScanner:
     def _load_calibrated_rois(self) -> None:
         """Diskte mevcutsa config/calibrated_rois.json dosyasından kalibre edilmiş ROI sınırlarını yükler."""
         self.calibrated_rois = {}
+        self._calibrated_minimap_resolution = None
         calibrated_file = os.path.join(self.config_dir, "calibrated_rois.json")
         if not os.path.isfile(calibrated_file):
             return
         try:
             mtime = os.path.getmtime(calibrated_file)
             self._calibrated_rois_mtime = mtime
-            with open(calibrated_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            # Modül düzeyi önbellek: dosya değişmediyse diskten yeniden
+            # okuma, önbellekten dön (her yapımda 1 disk okuma + json
+            # parse ödeniyordu). Anahtar (mutlak yol, mtime).
+            cache_key = os.path.abspath(calibrated_file)
+            cached = _CALIBRATED_ROIS_CACHE.get(cache_key)
+            if cached is not None and cached[0] == mtime:
+                data = copy.deepcopy(cached[1])
+            else:
+                with open(calibrated_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    _CALIBRATED_ROIS_CACHE[cache_key] = (
+                        mtime,
+                        copy.deepcopy(data),
+                    )
             if isinstance(data, dict):
                 self.calibrated_rois = data
-                # Global norm_rect kontrolü
+                # Global norm_rect kontrolü. Gerçek dosya şeması
+                # (config/calibrated_rois.json) üst anahtar olarak
+                # "minimap_norm" taşımaz; minimap rect'i "rois"/"minimap"
+                # (veya üst düzey "minimap") girdisinde, normalized_roi
+                # [x, y, w, h] olarak durur — o da okunur.
                 norm = data.get("minimap_norm") or data.get("minimap_norm_rect")
+                minimap_entry: Optional[Dict[str, Any]] = None
+                if not norm:
+                    minimap_entry = self._find_calibrated_minimap_entry(data)
+                    if isinstance(minimap_entry, dict):
+                        norm = minimap_entry.get("normalized_roi") or minimap_entry.get("norm_rect")
                 if norm and isinstance(norm, (list, tuple)) and len(norm) == 4:
                     self.norm_rect = (
                         float(norm[0]),
@@ -220,13 +334,65 @@ class MinimapScanner:
                         float(norm[2]),
                         float(norm[3]),
                     )
-                # Global player_center_rel kontrolü
+                    # Bu norm_rect hangi çözünürlük için kaydedildiyse
+                    # yalnızca o çözünürlükte geçerlidir: çözünürlük
+                    # kaydı olmayan (örn. 1920x1080 tohumu) bir girdinin
+                    # yakın çekime uygulanması regresyona yol açar
+                    # (get_minimap_pixel_bounds adım 2).
+                    self._calibrated_minimap_resolution = self._parse_entry_resolution(
+                        minimap_entry
+                    )
+                # Global player_center_rel kontrolü (yalnızca dosya
+                # açıkça player_center_rel verirse uygulanır).
                 p_rel = data.get("player_center_rel")
                 if p_rel and isinstance(p_rel, (list, tuple)) and len(p_rel) == 2:
                     self.player_center_rel = (float(p_rel[0]), float(p_rel[1]))
                 logger.info("Kalibre edilmiş ROI'ler yüklendi: %s", calibrated_file)
         except Exception as exc:
             logger.warning("Kalibre edilmiş ROI dosyası yüklenemedi (%s): %s", calibrated_file, exc)
+
+    @staticmethod
+    def _find_calibrated_minimap_entry(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Kalibrasyon JSON'undan minimap rect girdisini bulur."""
+        rois = data.get("rois") if isinstance(data.get("rois"), dict) else {}
+        for container in (rois, data):
+            for key in ("minimap", "minimap_roi", "minimap_bounds", "minimap_rect"):
+                entry = container.get(key)
+                if isinstance(entry, dict):
+                    return entry
+        return None
+
+    @staticmethod
+    def _parse_entry_resolution(entry: Any) -> Optional[Tuple[int, int]]:
+        """Kalibre girdisinin kayıtlı ``resolution`` alanını (w, h) olarak çözer.
+
+        Kayıt yoksa / çözümlenemezse None döner; None, eski davranışın
+        (çözünürlük kontrolsüz uygulama) korunması anlamına gelir.
+        """
+        if not isinstance(entry, dict):
+            return None
+        res = entry.get("resolution")
+        if res is None and isinstance(entry.get("minimap"), dict):
+            res = entry["minimap"].get("resolution")
+        if not isinstance(res, (list, tuple)) or len(res) != 2:
+            return None
+        try:
+            return (int(res[0]), int(res[1]))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _calibrated_entry_matches_resolution(entry: Any, w: int, h: int) -> bool:
+        """Jenerik kalibre girdisi bu kareye uygulanabilir mi?
+
+        Girdi çözünürlük kaydı taşıyor ve kare o çözünürlükte değilse
+        False döner (örn. 1920x1080 tohumu 365x309 yakın çekime
+        uygulanmaz). Kayıt yoksa True döner — eski davranış korunur.
+        """
+        res = MinimapScanner._parse_entry_resolution(entry)
+        if res is None:
+            return True
+        return res == (w, h)
 
     def _check_and_reload_calibrated_rois(self) -> None:
         """Gerektiğinde kalibre edilmiş ROI dosyasını dinamik olarak yeniden yükler."""
@@ -243,6 +409,8 @@ class MinimapScanner:
         """Verilen JSON girdisinden (x1, y1, x2, y2) piksel sınırlarını çözer."""
         try:
             if isinstance(entry, dict):
+                if "normalized_roi" in entry:
+                    return self._parse_roi_bounds(entry["normalized_roi"], w, h)
                 if "x1" in entry and "y1" in entry and "x2" in entry and "y2" in entry:
                     x1 = int(round(float(entry["x1"])))
                     y1 = int(round(float(entry["y1"])))
@@ -268,17 +436,20 @@ class MinimapScanner:
             elif isinstance(entry, (list, tuple)) and len(entry) == 4:
                 vals = [float(v) for v in entry]
                 if all(0.0 <= v <= 1.0 for v in vals):
-                    nx, ny, nw_or_x2, nh_or_y2 = vals
-                    if nw_or_x2 > nx and nh_or_y2 > ny and nw_or_x2 <= 1.0 and nh_or_y2 <= 1.0:
-                        x1 = int(round(w * nx))
-                        y1 = int(round(h * ny))
-                        x2 = int(round(w * nw_or_x2))
-                        y2 = int(round(h * nh_or_y2))
-                    else:
-                        x1 = int(round(w * nx))
-                        y1 = int(round(h * ny))
-                        x2 = int(round(w * (nx + nw_or_x2)))
-                        y2 = int(round(h * (ny + nh_or_y2)))
+                    # S105 (v19/P3-8): normalize 4'lü her zaman
+                    # (x, y, w, h)'dir — sözleşme config/
+                    # calibrated_rois.json'daki 11 ROI'nin tamamında bu
+                    # (norm_x/norm_y/norm_w/norm_h anahtarları da aynı).
+                    # Eski kod 3./4. değer 1./2.'den büyükse köşe
+                    # (x1,y1,x2,y2) sanıyordu; w>x ve h>y olan bir
+                    # (x,y,w,h) ROI yanlış okunurdu. Köşe biçimi
+                    # yalnızca dict dalındaki açık x1/y1/x2/y2
+                    # anahtarlarıyla verilir.
+                    nx, ny, nw, nh = vals
+                    x1 = int(round(w * nx))
+                    y1 = int(round(h * ny))
+                    x2 = int(round(w * (nx + nw)))
+                    y2 = int(round(h * (ny + nh)))
                     return max(0, min(x1, w - 1)), max(0, min(y1, h - 1)), max(x1 + 1, min(x2, w)), max(y1 + 1, min(y2, h))
                 else:
                     x1, y1, x2, y2 = int(round(vals[0])), int(round(vals[1])), int(round(vals[2])), int(round(vals[3]))
@@ -321,9 +492,23 @@ class MinimapScanner:
                 th, tw = gray.shape[:2]
                 if 10 <= tw <= 36 and 10 <= th <= 36:
                     med = float(np.median(gray))
-                    mask = ((gray < max(68.0, med - 15.0)) | (gray > min(180.0, med + 25.0))).astype(
-                        np.uint8
+                    dev = (
+                        ((gray < max(68.0, med - 15.0)) | (gray > min(180.0, med + 25.0))).astype(
+                            np.uint8
+                        )
+                        * 255
                     )
+                    # Şekilsiz eşik blob'u yerine ikon şekli: sapma
+                    # maskesindeki en büyük bağlı bileşen + kapatma.
+                    num, labels, stats, _ = cv2.connectedComponentsWithStats(dev, 8)
+                    if num > 1:
+                        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                        mask = (labels == largest).astype(np.uint8)
+                        mask = cv2.morphologyEx(
+                            mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8)
+                        )
+                    else:
+                        mask = (dev > 0).astype(np.uint8)
                     if int(mask.sum()) >= 20:
                         self._external_sprout_templates.append((gray, mask))
             except Exception as exc:
@@ -387,24 +572,42 @@ class MinimapScanner:
         self._check_and_reload_calibrated_rois()
         if self.calibrated_rois:
             calib_entry = None
+            resolution_keyed = False
             if res_key in self.calibrated_rois:
                 calib_entry = self.calibrated_rois[res_key]
+                resolution_keyed = True
             elif f"{w}_{h}" in self.calibrated_rois:
                 calib_entry = self.calibrated_rois[f"{w}_{h}"]
+                resolution_keyed = True
             elif "minimap" in self.calibrated_rois:
                 calib_entry = self.calibrated_rois["minimap"]
             elif "minimap_roi" in self.calibrated_rois:
                 calib_entry = self.calibrated_rois["minimap_roi"]
             elif "minimap_bounds" in self.calibrated_rois:
                 calib_entry = self.calibrated_rois["minimap_bounds"]
+            elif isinstance(self.calibrated_rois.get("rois"), dict):
+                calib_entry = self._find_calibrated_minimap_entry(self.calibrated_rois)
 
-            if calib_entry is not None:
+            # Jenerik ("minimap" vb.) girdi yalnızca kayıtlı çözünürlüğü
+            # kareyle eşleşiyorsa uygulanır: 1920x1080 tohumunun 365x309
+            # yakın çekime uygulanması filizleri sıfırlıyordu.
+            # Çözünürlük anahtarlı ("1920x1080") girdiler anahtarın
+            # kendisiyle eşleştiği için korumadan muaftır.
+            if calib_entry is not None and (
+                resolution_keyed
+                or self._calibrated_entry_matches_resolution(calib_entry, w, h)
+            ):
                 parsed = self._parse_roi_bounds(calib_entry, w, h)
                 if parsed is not None:
                     return parsed
 
         # 2. Yakın çekimler
-        if self.norm_rect == self.DEFAULT_NORM_RECT:
+        # norm_rect kalibre girdiden geldiyse ve o girdinin çözünürlüğü
+        # bu kareyle eşleşmiyorsa yakın-çekim geometrisi uygulanır
+        # (kalibre ROI yalnızca kendi çözünürlüğünde geçerlidir).
+        calib_res = getattr(self, "_calibrated_minimap_resolution", None)
+        calib_applies = calib_res is None or tuple(calib_res) == (w, h)
+        if self.norm_rect == self.DEFAULT_NORM_RECT or not calib_applies:
             if w < 500 and h < 450:
                 if 340 <= w <= 390 and 290 <= h <= 335:
                     return (
@@ -423,17 +626,14 @@ class MinimapScanner:
                     int(round(h * 0.915)),
                 )
 
-            ref_h = h
-            if w >= 1200:
-                expected_16_9_h = int(round(w * 9.0 / 16.0))
-                if int(round(expected_16_9_h * 0.80)) <= h <= int(round(expected_16_9_h * 1.05)):
-                    ref_h = expected_16_9_h
-
+            # 16:9 ref_h düzeltmesi KALDIRILDI: auto_cartographer gerçek
+            # frame_h kullanır; iki modül aynı karede farklı bölgeye
+            # bakıyordu (2000x981'de ~9px y kayması). Gerçek h kullanılır.
             nx, ny, nw, nh = self.norm_rect
             x1 = max(0, min(int(round(w * nx)), w - 1))
-            y1 = max(0, min(int(round(ref_h * ny)), h - 1))
+            y1 = max(0, min(int(round(h * ny)), h - 1))
             x2 = max(x1 + 1, min(int(round(w * (nx + nw))), w))
-            y2 = max(y1 + 1, min(int(round(ref_h * (ny + nh))), h))
+            y2 = max(y1 + 1, min(int(round(h * (ny + nh))), h))
             return x1, y1, x2, y2
 
         nx, ny, nw, nh = self.norm_rect
@@ -447,6 +647,10 @@ class MinimapScanner:
         """Kareden minimap alt görüntüsünü (BGR) ve ekran koordinat sınırlarını çıkarır."""
         if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
             raise ValueError("Geçersiz veya boş görüntü karesi (frame).")
+        if frame.ndim not in (2, 3):
+            raise ValueError(f"Geçersiz kare boyutu: ndim={frame.ndim} (2 veya 3 beklenir).")
+        if frame.ndim == 3 and frame.shape[2] not in (3, 4):
+            raise ValueError(f"Geçersiz kanal sayısı: {frame.shape[2]} (3 veya 4 beklenir).")
 
         if frame.ndim == 2:
             bgr_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
@@ -547,7 +751,18 @@ class MinimapScanner:
 
             if cnts:
                 best_cnt = max(cnts, key=cv2.contourArea)
-                if cv2.contourArea(best_cnt) >= 3.0:
+                best_area = float(cv2.contourArea(best_cnt))
+                bx, by, bw, bh = cv2.boundingRect(best_cnt)
+                # En büyük parlak kontur her zaman ok değildir (parlak
+                # filiz/ikon da girebilir): ok-benzeri boyut/oran şartı
+                # sağlanmazsa kalibre varsayılan merkeze düşülür.
+                arrow_plausible = (
+                    3.0 <= best_area <= 600.0
+                    and 4 <= bw <= 48
+                    and 4 <= bh <= 48
+                    and 0.4 <= (bw / float(max(1, bh))) <= 2.5
+                )
+                if arrow_plausible:
                     m = cv2.moments(best_cnt)
                     if m["m00"] > 1e-5:
                         cx = float(rx1) + float(m["m10"] / m["m00"])
@@ -618,6 +833,52 @@ class MinimapScanner:
             logger.debug("_get_template_base_heading hatası: %s", exc)
         return 0.0
 
+    def _get_cached_template_base_heading(self, tpl: np.ndarray, mask: np.ndarray) -> float:
+        """Şablonun doğal yön açısını döndürür; sonuç yalnızca (tpl, mask)
+        ikilisine bağlı olduğundan örnek başına bir kez hesaplanıp saklanır.
+        Şablon/maske kimliği değişirse önbellek sıfırlanır."""
+        if (
+            self._heading_cache_tpl is tpl
+            and self._heading_cache_mask is mask
+            and self._heading_base_heading is not None
+        ):
+            return self._heading_base_heading
+        heading = self._get_template_base_heading(tpl, mask)
+        self._heading_cache_tpl = tpl
+        self._heading_cache_mask = mask
+        self._heading_base_heading = heading
+        self._heading_rot_cache = {}
+        return heading
+
+    def _get_heading_rotation(
+        self, deg: float, tpl: np.ndarray, mask: np.ndarray, base_heading: float
+    ) -> Tuple[np.ndarray, np.ndarray, int]:
+        """`deg` açısına döndürülmüş (şablon, maske, maske piksel sayısı)
+        üçlüsünü döndürür; döndürme yalnızca (şablon, maske, açı) üçlüsüne
+        bağlı olduğundan kareler arasında yeniden kullanılır. Şablon/maske
+        kimliği değişirse önbellek sıfırlanır."""
+        if self._heading_cache_tpl is not tpl or self._heading_cache_mask is not mask:
+            self._heading_cache_tpl = tpl
+            self._heading_cache_mask = mask
+            self._heading_base_heading = None
+            self._heading_rot_cache = {}
+        cached = self._heading_rot_cache.get(float(deg))
+        if cached is not None:
+            return cached
+        th, tw = tpl.shape[:2]
+        center = (tw / 2.0, th / 2.0)
+        rot_deg = float(deg) - base_heading
+        M = cv2.getRotationMatrix2D(center, -rot_deg, 1.0)
+        rot_tpl = cv2.warpAffine(
+            tpl, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+        )
+        rot_m = cv2.warpAffine(
+            mask, M, (tw, th), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+        )
+        entry = (rot_tpl, rot_m, int(np.sum(rot_m > 0)))
+        self._heading_rot_cache[float(deg)] = entry
+        return entry
+
     def _detect_heading_via_template(self, gray_roi: np.ndarray) -> Optional[float]:
         """Şablon döndürme ve eşleme ile oyuncu ok açısını güvenilir şekilde tespit eder."""
         if self._player_arrow_template is None or self._player_arrow_mask is None:
@@ -631,19 +892,15 @@ class MinimapScanner:
             if rh < th or rw < tw:
                 return None
 
-            base_heading = self._get_template_base_heading(tpl_g, tpl_m)
-            center = (tw / 2.0, th / 2.0)
+            base_heading = self._get_cached_template_base_heading(tpl_g, tpl_m)
 
             best_score = -1.0
             best_angle = 0.0
 
             # 1. Kaba arama: 10 derecelik adımlarla
             for deg in range(0, 360, 10):
-                rot_deg = float(deg) - base_heading
-                M = cv2.getRotationMatrix2D(center, -rot_deg, 1.0)
-                rot_tpl = cv2.warpAffine(tpl_g, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                rot_m = cv2.warpAffine(tpl_m, M, (tw, th), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                if int(np.sum(rot_m > 0)) < 6:
+                rot_tpl, rot_m, mask_px = self._get_heading_rotation(float(deg), tpl_g, tpl_m, base_heading)
+                if mask_px < 6:
                     continue
                 res = cv2.matchTemplate(gray_roi, rot_tpl, cv2.TM_CCOEFF_NORMED, mask=rot_m)
                 _, max_v, _, _ = cv2.minMaxLoc(res)
@@ -656,11 +913,8 @@ class MinimapScanner:
                 refined_angle = best_angle
                 for delta in (-8, -6, -4, -2, 2, 4, 6, 8):
                     test_deg = (best_angle + float(delta) + 360.0) % 360.0
-                    rot_deg = test_deg - base_heading
-                    M = cv2.getRotationMatrix2D(center, -rot_deg, 1.0)
-                    rot_tpl = cv2.warpAffine(tpl_g, M, (tw, th), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                    rot_m = cv2.warpAffine(tpl_m, M, (tw, th), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                    if int(np.sum(rot_m > 0)) < 6:
+                    rot_tpl, rot_m, mask_px = self._get_heading_rotation(test_deg, tpl_g, tpl_m, base_heading)
+                    if mask_px < 6:
                         continue
                     res = cv2.matchTemplate(gray_roi, rot_tpl, cv2.TM_CCOEFF_NORMED, mask=rot_m)
                     _, max_v, _, _ = cv2.minMaxLoc(res)
@@ -686,10 +940,14 @@ class MinimapScanner:
             )
 
             best_contour = None
+            # 8x büyütülmüş uzayda eşik de 8^2 ile ölçeklenir: orijinalde
+            # >= 10 px^2 alan şartı (önceki 40 px^2, büyütülmüş uzayda
+            # ~0.6 px^2'e denk gelip parlak gürültüyü geçiriyordu).
+            min_area_upscaled = 10.0 * float(scale) * float(scale)
             for thresh_val in (205, 195, 185, 175):
                 _, bw = cv2.threshold(up_gray, thresh_val, 255, cv2.THRESH_BINARY)
                 contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                valid_cnts = [c for c in contours if cv2.contourArea(c) >= 40.0]
+                valid_cnts = [c for c in contours if cv2.contourArea(c) >= min_area_upscaled]
                 if valid_cnts:
                     best_contour = max(valid_cnts, key=cv2.contourArea)
                     break
@@ -736,11 +994,15 @@ class MinimapScanner:
                             chosen_apex = apex
                             chosen_base_mid = mid_wings
 
-                    dx = float(chosen_apex[0] - chosen_base_mid[0])
-                    dy = float(chosen_apex[1] - chosen_base_mid[1])
-                    if math.hypot(dx, dy) > 1e-3:
-                        heading = self._vector_to_compass_deg(dx, dy)
-                        return True, heading
+                    # Mutlak koyuluk şartı: üç aday çentik de parlaksa
+                    # (arka plan koyu olmalı) tepe seçimi geçersizdir;
+                    # moment/uç geri dönüşüne düşülür.
+                    if lowest_notch_intensity < 160.0:
+                        dx = float(chosen_apex[0] - chosen_base_mid[0])
+                        dy = float(chosen_apex[1] - chosen_base_mid[1])
+                        if math.hypot(dx, dy) > 1e-3:
+                            heading = self._vector_to_compass_deg(dx, dy)
+                            return True, heading
 
             pts = best_contour.reshape(-1, 2)
             dists = np.hypot(pts[:, 0] - mcx, pts[:, 1] - mcy)
@@ -800,24 +1062,6 @@ class MinimapScanner:
             logger.error("detect_player_heading hatası: %s", exc)
             return False, 0.0
 
-            roi = crop[ry1:ry2, rx1:rx2]
-            if roi.size == 0:
-                return False, 0.0
-
-            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
-
-            # 1. Şablon eşleme ile yön tespiti (eğer şablon mevcut ve güvenilirse)
-            tpl_heading = self._detect_heading_via_template(gray_roi)
-            if tpl_heading is not None:
-                return True, tpl_heading
-
-            # 2. Geri dönüş (Fallback): Moment ve kontur köşe analizi
-            return self._detect_heading_via_moments(gray_roi)
-
-        except Exception as exc:
-            logger.error("detect_player_heading hatası: %s", exc)
-            return False, 0.0
-
     # ------------------------------------------------------------------
     # 2. Minimap Filter Settings Açılır Penceresi Durum Tespiti
     # ------------------------------------------------------------------
@@ -851,14 +1095,12 @@ class MinimapScanner:
                 return result
 
             if w >= 1000:
-                ref_h = h
-                expected_16_9_h = int(round(w * 9.0 / 16.0))
-                if int(round(expected_16_9_h * 0.80)) <= h <= int(round(expected_16_9_h * 1.05)):
-                    ref_h = expected_16_9_h
+                # Gerçek frame_h kullanılır (16:9 ref_h düzeltmesi kaldırıldı;
+                # bkz. get_minimap_pixel_bounds).
                 px1 = int(round(w * 0.723))
-                py1 = int(round(ref_h * 0.066))
+                py1 = int(round(h * 0.066))
                 px2 = int(round(w * 0.842))
-                py2 = min(h, int(round(ref_h * 0.248)))
+                py2 = min(h, int(round(h * 0.248)))
             else:
                 px1 = int(round(w * 0.020))
                 py1 = int(round(h * 0.200))
@@ -888,19 +1130,29 @@ class MinimapScanner:
             if cb_col.size == 0:
                 return result
 
-            q_max = float(np.max(cb_col[int(ph * 0.22) : int(ph * 0.39), :]))
-            m_max = float(np.max(cb_col[int(ph * 0.41) : int(ph * 0.57), :]))
-            g_max = float(np.max(cb_col[int(ph * 0.59) : int(ph * 0.75), :]))
-            n_max = float(np.max(cb_col[int(ph * 0.77) : int(ph * 0.93), :]))
+            def _band_checked(y0: float, y1: float) -> bool:
+                # Tek parlak piksel yetmez: bandın %90 persentili >= 170
+                # VE en az 3 piksel >= 170 olmalı (onay işareti bir leke).
+                band = cb_col[int(ph * y0) : int(ph * y1), :]
+                if band.size == 0:
+                    return False
+                p90 = float(np.percentile(band, 90))
+                bright_px = int(np.sum(band >= 170))
+                return bool(p90 >= 170.0 and bright_px >= 3)
 
-            if max(q_max, m_max, g_max, n_max) < 165.0:
+            quest = _band_checked(0.22, 0.39)
+            monster = _band_checked(0.41, 0.57)
+            gatherable = _band_checked(0.59, 0.75)
+            npc = _band_checked(0.77, 0.93)
+
+            if not (quest or monster or gatherable or npc):
                 return result
 
             result["popup_open"] = True
-            result["quest_checked"] = bool(q_max >= 170.0)
-            result["monster_checked"] = bool(m_max >= 170.0)
-            result["gatherable_checked"] = bool(g_max >= 170.0)
-            result["npc_checked"] = bool(n_max >= 170.0)
+            result["quest_checked"] = quest
+            result["monster_checked"] = monster
+            result["gatherable_checked"] = gatherable
+            result["npc_checked"] = npc
             return result
 
         except Exception as exc:
@@ -911,17 +1163,49 @@ class MinimapScanner:
     # 3. Maskeli Normalize Çapraz Korelasyon (3-Yapraklı Filiz Tespiti)
     # ------------------------------------------------------------------
     @staticmethod
+    def _masked_ncc_local_std(
+        gray_img: np.ndarray,
+        mask: np.ndarray,
+        min_local_contrast: float = 26.0,
+    ) -> Optional[np.ndarray]:
+        """
+        Maskeli NCC'nin yalnızca maskeye/görüntüye bağlı kısmını (yerel
+        standart sapma haritasını) hesaplar. Aynı (görüntü, maske) ikilisi
+        birden çok şablonla kullanıldığında (ör. iki kanonik filiz şablonu
+        aynı maskeyi paylaşır) bu iki `filter2D` çağrısı şablon başına
+        tekrarlanmak yerine bir kez yapılıp paylaşılır.
+        Maske pikseli < 12 ise `None` döner.
+        """
+        m = (mask > 0).astype(np.float32)
+        n = float(np.sum(m))
+        if n < 12.0:
+            return None
+
+        img_f = gray_img.astype(np.float32)
+        loc_sum = cv2.filter2D(img_f, cv2.CV_32F, m)
+        loc_sq_sum = cv2.filter2D(img_f * img_f, cv2.CV_32F, m)
+        loc_var = np.maximum(loc_sq_sum - (loc_sum * loc_sum) / n, 1.0)
+        return np.sqrt(loc_var)
+
+    @staticmethod
     def _masked_ncc(
         gray_img: np.ndarray,
         tpl: np.ndarray,
         mask: np.ndarray,
         min_local_contrast: float = 26.0,
+        loc_std: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Yalnızca ikon + koyu dış kontur maskesi (`mask > 0`) üzerinde sıfır-ortalama
         birim-varyanslı çapraz korelasyon hesaplar; böylece minimap zemin parlaklığından
         (parlak sarı radar halkası veya koyu çim zemin) bağımsız olarak 3-yapraklı
         filiz ikonunu yüksek hassasiyetle yakalar.
+
+        `loc_std` verilirse (aynı görüntü+maske için
+        `_masked_ncc_local_std` ile önceden hesaplanmış) yerel istatistik
+        `filter2D` çağrıları atlanır; verilmezse eskisi gibi yerinde hesaplanır.
+        `loc_std` yalnızca bu çağrıdaki `gray_img`/`mask` için hesaplanmış
+        bir harita olmalıdır.
         """
         m = (mask > 0).astype(np.float32)
         n = float(np.sum(m))
@@ -935,10 +1219,10 @@ class MinimapScanner:
         t_kernel = t_zero / t_norm
 
         img_f = gray_img.astype(np.float32)
-        loc_sum = cv2.filter2D(img_f, cv2.CV_32F, m)
-        loc_sq_sum = cv2.filter2D(img_f * img_f, cv2.CV_32F, m)
-        loc_var = np.maximum(loc_sq_sum - (loc_sum * loc_sum) / n, 1.0)
-        loc_std = np.sqrt(loc_var)
+        if loc_std is None:
+            loc_std = MinimapScanner._masked_ncc_local_std(gray_img, mask, min_local_contrast)
+            if loc_std is None:
+                return np.zeros(gray_img.shape[:2], dtype=np.float32)
 
         corr = cv2.filter2D(img_f, cv2.CV_32F, t_kernel) / loc_std
         contrast = loc_std / math.sqrt(n)
@@ -981,6 +1265,11 @@ class MinimapScanner:
         elif cls.is_world_3d_class(cid):
             raise ValueError(
                 f"Taksonomi İhlali: 3D Dünya sınıfı (class_id={cid}) minimap tarayıcısına sızamaz!"
+            )
+        else:
+            raise ValueError(
+                f"Bilinmeyen class_id={cid}: minimap sınıfı (9/11) değil; "
+                "sessizce minimap diye damgalanamaz."
             )
         det["is_minimap"] = True
         det["is_world_3d"] = False
@@ -1152,6 +1441,62 @@ class MinimapScanner:
 
         return True, chromatic_density
 
+    @staticmethod
+    def _measure_stack_badge(
+        hsv_crop: np.ndarray, cx: int, cy: int, scale: float = 1.0
+    ) -> Tuple[int, int]:
+        """Filiz ikonunun yanındaki yeşil yığın rozetini (`2`/`3`) okur (F-0130).
+
+        `core/auto_cartographer.py::_detect_minimap_gatherables` ile aynı kanıtlanmış
+        mantık: rozet HSV aralığı (H: 68..90, S >= 75, V >= 115), yalnızca kompakt
+        rozet boyutunda bileşenler sayılır (dağınık yeşil arazi pikselleri sayılmaz,
+        F-0055); `badge_px >= 28` -> 3, `>= 10` -> 2, yoksa 1. Eşikler referans
+        ölçeğe (332px minimap) göre `scale` ile ölçeklenir.
+
+        Döndürür: (stack_count, badge_px). Rozet yoksa stack_count=1 döner — bu
+        artık uydurma bir varsayılan değil, o karede rozet aranıp bulunamadığının
+        ölçülmüş sonucudur; çağıran `stack_count_measured=True` yazmalıdır.
+        Herhangi bir hatada fail-safe (1, 0) döner.
+        """
+        try:
+            ch, cw = hsv_crop.shape[:2]
+            s = max(0.5, float(scale))
+            half = 8.0 * s
+            x1 = max(0, int(math.floor(cx - half - 4.0 * s)))
+            y1 = max(0, int(math.floor(cy - half - 4.0 * s)))
+            x2 = min(cw, int(math.ceil(cx + half + 8.0 * s)))
+            y2 = min(ch, int(math.ceil(cy + half + 6.0 * s)))
+            if x2 <= x1 or y2 <= y1:
+                return 1, 0
+            badge_mask = cv2.inRange(
+                hsv_crop[y1:y2, x1:x2], (68, 75, 115), (90, 255, 255)
+            )
+            min_area = 8.0 * s * s
+            min_side = max(2.0, 3.0 * s)
+            max_side = 24.0 * s
+            badge_px = 0
+            num_b, _, stats_b, _ = cv2.connectedComponentsWithStats(badge_mask)
+            for b_idx in range(1, num_b):
+                _bx, _by, _bw, _bh, _area = stats_b[b_idx]
+                if (
+                    _area < min_area
+                    or _bw < min_side
+                    or _bh < min_side
+                    or _bw > max_side
+                    or _bh > max_side
+                ):
+                    continue
+                if float(_area) / float(max(1, _bw * _bh)) < 0.30:
+                    continue
+                badge_px += int(_area)
+            if badge_px >= int(round(28.0 * s * s)):
+                return 3, int(badge_px)
+            if badge_px >= int(round(10.0 * s * s)):
+                return 2, int(badge_px)
+            return 1, int(badge_px)
+        except Exception:
+            return 1, 0
+
     # ------------------------------------------------------------------
     # 4. Ana Minimap Kesit Analizörü (3-Yapraklı Filiz vs Canavar Noktası)
     # ------------------------------------------------------------------
@@ -1181,6 +1526,7 @@ class MinimapScanner:
                 "hostile_dots": hostile_dots,
                 "rejected_icons": rejected_icons,
                 "player_center": (0.0, 0.0),
+                "player_center_found": False,
             }
 
         if crop_bgr.ndim == 2:
@@ -1198,6 +1544,7 @@ class MinimapScanner:
                 "hostile_dots": hostile_dots,
                 "rejected_icons": rejected_icons,
                 "player_center": (0.0, 0.0),
+                "player_center_found": False,
             }
 
         ox, oy = int(offset_xy[0]), int(offset_xy[1])
@@ -1440,9 +1787,43 @@ class MinimapScanner:
 
         combined_score_map = np.zeros((ch, cw), dtype=np.float32)
 
+        # NCC yalnızca geçerli minimap dikdörtgeninde anlamlıdır
+        # (valid_mask dışı zaten sıfırlanır): filter2D'leri bbox +
+        # çekirdek yarıçapı payı (pad) kırpımında çalıştır, sonucu bbox'a
+        # geri yerleştir. Her çıktı pikselinin ks×ks penceresi kırpım
+        # içinde gerçek piksellerle kaplı olduğundan (pad, kırpımın görüntü
+        # kenarına dayandığı yerde görüntü kenarıyla çakışır ve yansıma
+        # aynı kalır) bbox içi skorlar tam-kare hesabıyla aynıdır — yalnızca
+        # float32 toplama sırası farkından <1e-6 sapma olabilir.
+        bbox_y1, bbox_y2 = top_margin, bottom_margin
+        bbox_x1, bbox_x2 = side_margin, cw - side_margin
+        bbox_h, bbox_w = bbox_y2 - bbox_y1, bbox_x2 - bbox_x1
+        # Değerlendirilecek şablon boyutları: ölçek çarpanlarından gelenler +
+        # kanonik şablonun kendi 16px boyutu. scale_ref kırpım genişliğinden
+        # türetilir; yakın çekimde (365px) gerçek 16px ikon hiçbir çarpan
+        # ölçeğinde (17/18px) yakalanamaz — W37: iki gerçek filizden biri
+        # en fazla 0.8468'de kalıp 0.88 eşiğini geçemedi, öteki 0.8845 ile
+        # ancak geçti. Yerel boyut her zaman denendiği için 332px referans
+        # kırpımlarda küme değişmez ({15, 16, 17}).
+        ks_values = sorted(
+            {max(9, int(round(16.0 * scale_ref * mult))) for mult in self.SPROUT_NCC_SCALES}
+            | {16}
+        )
+        max_ks = max(ks_values)
+        pad = max_ks // 2 + 1
+        ncc_y1 = max(0, bbox_y1 - pad)
+        ncc_y2 = min(ch, bbox_y2 + pad)
+        ncc_x1 = max(0, bbox_x1 - pad)
+        ncc_x2 = min(cw, bbox_x2 + pad)
+        gray_ncc = gray[ncc_y1:ncc_y2, ncc_x1:ncc_x2]
+        off_y, off_x = bbox_y1 - ncc_y1, bbox_x1 - ncc_x1
+
+        # Aynı maskeyi paylaşan şablonlar (iki kanonik şablon) aynı ölçekte
+        # aynı yerel istatistiği kullanır: iki filter2D şablon başına değil,
+        # (maske, ölçek) başına bir kez çalışır.
+        stats_cache: Dict[Tuple[bytes, Tuple[int, int], int], Optional[np.ndarray]] = {}
         for base_tpl, base_mask in templates_to_eval:
-            for mult in (0.90, 0.95, 1.00, 1.05, 1.10):
-                ks = max(9, int(round(16.0 * scale_ref * mult)))
+            for ks in ks_values:
                 t_scaled = cv2.resize(base_tpl, (ks, ks), interpolation=cv2.INTER_AREA)
                 m_scaled = (
                     cv2.resize(
@@ -1452,8 +1833,21 @@ class MinimapScanner:
                     )
                     > 0.40
                 ).astype(np.uint8)
-                score_map = self._masked_ncc(gray, t_scaled, m_scaled, min_local_contrast=26.0)
-                combined_score_map = np.maximum(combined_score_map, score_map)
+                stats_key = (base_mask.tobytes(), base_mask.shape, ks)
+                if stats_key not in stats_cache:
+                    stats_cache[stats_key] = self._masked_ncc_local_std(gray_ncc, m_scaled)
+                loc_std = stats_cache[stats_key]
+                if loc_std is None:
+                    continue
+                score_map = self._masked_ncc(
+                    gray_ncc, t_scaled, m_scaled, min_local_contrast=26.0, loc_std=loc_std
+                )
+                region = score_map[off_y : off_y + bbox_h, off_x : off_x + bbox_w]
+                np.maximum(
+                    combined_score_map[bbox_y1:bbox_y2, bbox_x1:bbox_x2],
+                    region,
+                    out=combined_score_map[bbox_y1:bbox_y2, bbox_x1:bbox_x2],
+                )
 
         # Geçerli minimap alanı dışını sıfırla
         combined_score_map[valid_mask == 0] = 0.0
@@ -1469,13 +1863,16 @@ class MinimapScanner:
                 -1,
             )
 
-        # Beyaz monster dot merkezlerinin tam üzerini sıfırla
+        # Beyaz monster dot merkezlerinin tam üzerini sıfırla — yalnızca
+        # noktanın kendisi (yarıçap ~3px); geniş bastırma bitişikteki
+        # gerçek filizin NCC tepesini de silerdi. Tepe döngüsündeki
+        # yakınlık kontrolü geri kalan ayrımı yapar.
         for mdot in monster_dots:
             mx, my = mdot["pos"]
             cv2.circle(
                 combined_score_map,
                 (int(mx), int(my)),
-                max(6, int(round(8.0 * scale_ref))),
+                max(3, int(round(3.0 * scale_ref))),
                 0.0,
                 -1,
             )
@@ -1554,6 +1951,31 @@ class MinimapScanner:
             norm_y = round(float(sy) / float(max(1, full_h)), 4)
             conf = round(min(1.0, max(0.0, float(max_val))), 3)
 
+            # Ölçülen filiz alanı: tepe çevresindeki parlak/kromatik
+            # maskenin en büyük kontur alanı (formül değil, ölçüm).
+            measured_area: Optional[float] = None
+            try:
+                ar = max(4, int(round(9.0 * scale_ref)))
+                ay1, ay2 = max(0, py - ar), min(ch, py + ar + 1)
+                ax1, ax2 = max(0, px - ar), min(cw, px + ar + 1)
+                patch_hsv_m = hsv[ay1:ay2, ax1:ax2]
+                patch_gray_m = gray[ay1:ay2, ax1:ax2]
+                if patch_hsv_m.size > 0:
+                    bright_m = ((patch_hsv_m[:, :, 2] >= 170) & (patch_hsv_m[:, :, 1] <= 70)).astype(np.uint8) * 255
+                    m_cnts, _ = cv2.findContours(bright_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if m_cnts:
+                        measured_area = float(cv2.contourArea(max(m_cnts, key=cv2.contourArea)))
+            except Exception:
+                measured_area = None
+
+            # Yığın rozeti ölçümü (F-0130): filiz ikonunun yanındaki yeşil
+            # rozet (`2`/`3`) bu karede gerçekten okunur; rozet yoksa
+            # stack_count=1 ölçülmüş değerdir (uydurma varsayılan değil).
+            # harvests_available = 3 * stack_count, o da ölçülmüştür.
+            stack_count, _badge_px = self._measure_stack_badge(
+                hsv, px, py, scale_ref
+            )
+
             s_item = {
                 "dx": dx,
                 "dy": dy,
@@ -1562,8 +1984,13 @@ class MinimapScanner:
                 "kind": "sprout_material",
                 "class_id": self.CLASS_ID_SPROUT,
                 "class_name": self.CLASS_NAME_SPROUT,
-                "stack_count": 1,
-                "harvests_available": 3,
+                # stack/harvest sayıları bu karede rozetten ÖLÇÜLÜR
+                # (_measure_stack_badge); downstream max() birleştirmesi
+                # (auto_cartographer) artık ölçülmüş değerle çalışır.
+                "stack_count": int(stack_count),
+                "stack_count_measured": True,
+                "harvests_available": int(3 * stack_count),
+                "harvests_available_measured": True,
                 "screen_x": sx,
                 "screen_y": sy,
                 "norm_x": norm_x,
@@ -1575,7 +2002,8 @@ class MinimapScanner:
                 "category": "resource_icon",
                 "pos": (px, py),
                 "screen_pos": (sx, sy),
-                "area": round(16.0 * scale_ref * scale_ref, 1),
+                "area": round(measured_area, 1) if measured_area is not None else round(16.0 * scale_ref * scale_ref, 1),
+                "area_measured": bool(measured_area is not None),
                 "is_hostile": False,
                 "is_odyle": False,
                 "is_gatherable": True,
@@ -1593,6 +2021,7 @@ class MinimapScanner:
             "hostile_dots": hostile_dots,
             "rejected_icons": rejected_icons,
             "player_center": (round(center_x, 2), round(center_y, 2)),
+            "player_center_found": True,
             "player_clearance_norm": self.PLAYER_CLEARANCE_NORM,
             "player_clearance_px": round(clearance_px, 2),
         }
@@ -1621,6 +2050,19 @@ class MinimapScanner:
             )
             scan_res["minimap_bounds"] = (x1, y1, x2, y2)
             scan_res["filter_state"] = self.detect_minimap_filter_state(frame)
+            # H-sweep (dilim 13 O10): filtre durumu artık yalnızca
+            # döndürülmüyor, yorumlanıyor da. Ayar penceresi açıkken
+            # "Gatherable" işaretsizse minimap'te filiz görünmez ve
+            # "düğüm yok" sonucu yanlıştır — tüketici uyarıyı görür.
+            fs = scan_res.get("filter_state")
+            if (
+                isinstance(fs, dict)
+                and fs.get("popup_open")
+                and not fs.get("gatherable_checked")
+            ):
+                scan_res["minimap_filter_warning"] = "gatherable_unchecked"
+            else:
+                scan_res["minimap_filter_warning"] = None
             return scan_res
         except Exception as exc:
             logger.error("scan_gatherable_materials hatası: %s", exc)
@@ -1630,29 +2072,40 @@ class MinimapScanner:
                 "hostile_dots": [],
                 "rejected_icons": [],
                 "player_center": (0.0, 0.0),
+                "player_center_found": False,
                 "minimap_bounds": (0, 0, 0, 0),
                 "filter_state": self.detect_minimap_filter_state(frame)
                 if isinstance(frame, np.ndarray)
                 else {},
+                "minimap_filter_warning": None,
             }
 
-    def scan_odyle_dots(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+    def scan_sprout_nodes(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
         Yalnızca gerçek toplanabilir materyal (`sprout_material` 3-yapraklı filiz)
         düğümlerini döndürür. Küçük yuvarlak beyaz canavar noktalarını (`•`) ve
-        beyaz tüy (`minimap_feather_odyle.png`) ikonlarını ASLA döndürmez!
+        beyaz tüy (`minimap_feather_odyle.png`) ikonlarını ASLA döndürmez.
         """
         res = self.scan_gatherable_materials(frame)
         return list(res.get("gatherable_nodes", []))
 
-    def get_nearest_odyle_offset(
+    def scan_odyle_dots(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        DEPRECATED ad: Odyle (uçan tüy) döndürmez; `scan_sprout_nodes` ile
+        aynıdır — yalnızca `sprout_material` filiz düğümleri döner.
+        Geriye dönük uyumluluk için korunur; yeni kod `scan_sprout_nodes`
+        kullanmalıdır.
+        """
+        return self.scan_sprout_nodes(frame)
+
+    def get_nearest_sprout_offset(
         self, frame: np.ndarray
     ) -> Optional[Tuple[float, float, float]]:
         """
         En yakın gerçek toplanabilir materyalin (`sprout_material`) oyuncuya göre
         `(dx, dy, dist_px)` ofsetini döndürür; yoksa `None` döner.
         """
-        nodes = self.scan_odyle_dots(frame)
+        nodes = self.scan_sprout_nodes(frame)
         if not nodes:
             return None
         nearest = nodes[0]
@@ -1661,6 +2114,207 @@ class MinimapScanner:
             float(nearest["dy"]),
             float(nearest["dist_px"]),
         )
+
+    def get_nearest_odyle_offset(
+        self, frame: np.ndarray
+    ) -> Optional[Tuple[float, float, float]]:
+        """DEPRECATED ad: `get_nearest_sprout_offset` ile aynıdır."""
+        return self.get_nearest_sprout_offset(frame)
+
+    def _scan_3d_odyle_orbs(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        3D dünyada süzülen GERÇEK Odyle enerji kürelerini tespit eder.
+
+        Kök neden (P2-10 / v19): minimap'te Odyle ikonu YOKTUR — katalog
+        (`config/materials_db.py` Odyle spec: `shows_on_minimap=False`,
+        `in_air=True`, "NEVER the white feather on the minimap") ve yerleşik
+        kararlar (F-0413: beyaz tüy / mavi kanat kesin ret;
+        `auto_cartographer.py:3390`: minimap-kaynaklı "odyle" reddedilir)
+        bunu kapatır. Dolayısıyla `scan_minimap_crop` hiçbir zaman
+        `is_odyle=True` üretemez — bu minimap yolu için DOĞRU davranıştır.
+        Odyle yalnızca 3D dünyada görünür: süzülen turkuaz/yeşil enerji
+        küresi + [E]/[F] etkileşim kutusu. Bu metot o kanıtı tam karede
+        arar; `scan_minimap_resources_and_odyle` yalnızca bu yolla
+        `is_odyle=True` / `type="odyle_air"` üretebilir.
+
+        Kanıt zinciri (uydurma eşik yok — tamamı mevcut kural):
+        1. Kanonik `ODYLE_HSV_RANGE` (`config/materials_db.py:81`,
+           P3-3 tek kaynak — aralık burada kopyalanmaz, import edilir).
+        2. 3D dünya maskesi: minimap dikdörtgeni + üst bar + alt skill/HP
+           barı + sağ görev paneli + sol-alt sohbet hariç tutulur (yalnızca
+           3D dünya pikselleri kanıt sayılır; tüy/kanat zaten minimap'te).
+        3. Kompakt blob kapıları (sınıf sabitleri — benek/çizgi reddi).
+        4. Blob-maskeli yama (yalnızca lekenin kendi pikselleri) üzerinde
+           `classify_3d_material_patch` kararı `"Odyle"` olmalı; maskesiz
+           bbox köşelerindeki arazi (bronz kaya) taksonomi oyunu
+           Orichalcum Ore'a çeviriyordu (ölçüldü: vein 0.985).
+        5. `odyle_orb >= 0.045` ve `targena_gold_green < 0.15`
+           (`materials_db.py:1786-1788` bonus koşulu, burada sert kapı).
+
+        Döndürülen isabetlerde `dist_px`, EKRAN merkezinden ekran
+        pikselidir (`dist_basis="screen_center_px"`) — 3D küre için minimap
+        pikseli ölçülemez (derinlik yok). Tüketici
+        (`behavioral_guard.should_fly_to_odyle_node`, 260 px kapısı) bu
+        değeri merkezi görüş-alanı kapısı olarak uygular: yalnızca
+        bakılan/merkezdeki küre uçuşu onaylar; kenardaki küre muhafazakâr
+        biçimde reddedilir (uçuş iptali = güvenli varsayılan).
+        `sanitize_minimap_detection` BU isabetlere uygulanmaz: o metot
+        minimap taksonomi güvenlik duvarıdır (`is_minimap=True` dayatır,
+        9/11 dışı class_id reddeder); küre 3D dünya tespitidir.
+
+        Kanıt yoksa / katalog import edilemezse boş liste döner (fail-closed).
+        """
+        try:
+            from config.materials_db import (
+                ODYLE_HSV_RANGE,
+                classify_3d_material_patch,
+            )
+        except Exception as exc:  # pragma: no cover - import ortamı hatası
+            logger.warning("Odyle kataloğu yüklenemedi, 3D küre taraması atlandı: %s", exc)
+            return []
+
+        try:
+            if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+                return []
+            if frame.ndim == 2:
+                bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif frame.ndim == 3 and frame.shape[2] == 4:
+                bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            elif frame.ndim == 3 and frame.shape[2] == 3:
+                bgr = frame
+            else:
+                return []
+
+            fh, fw = int(bgr.shape[0]), int(bgr.shape[1])
+            if fh < 40 or fw < 40:
+                return []
+            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+            # 3D dünya maskesi: UI chrome hariç (yalnızca 3D dünya kanıttır).
+            world_mask = np.full((fh, fw), 255, dtype=np.uint8)
+            try:
+                mx1, my1, mx2, my2 = self.get_minimap_pixel_bounds(bgr.shape)
+            except Exception:
+                mx1 = int(round(fw * self.DEFAULT_NORM_RECT[0]))
+                my1 = int(round(fh * self.DEFAULT_NORM_RECT[1]))
+                mx2 = int(round(fw * (self.DEFAULT_NORM_RECT[0] + self.DEFAULT_NORM_RECT[2])))
+                my2 = int(round(fh * (self.DEFAULT_NORM_RECT[1] + self.DEFAULT_NORM_RECT[3])))
+            world_mask[my1:my2, mx1:mx2] = 0  # minimap
+            world_mask[: int(round(fh * 0.06)), :] = 0  # üst bar (para birimleri)
+            world_mask[int(round(fh * 0.86)) :, :] = 0  # alt skill/HP barı
+            world_mask[:, int(round(fw * 0.85)) :] = 0  # sağ görev paneli şeridi
+            world_mask[int(round(fh * 0.70)) :, : int(round(fw * 0.30))] = 0  # sol-alt sohbet
+
+            lo = np.array(ODYLE_HSV_RANGE[0], dtype=np.uint8)
+            hi = np.array(ODYLE_HSV_RANGE[1], dtype=np.uint8)
+            teal_mask = cv2.inRange(hsv, lo, hi)
+            teal_mask = cv2.bitwise_and(teal_mask, world_mask)
+            teal_mask = cv2.morphologyEx(
+                teal_mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8)
+            )
+
+            cnts, _ = cv2.findContours(
+                teal_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            frame_area = float(fw * fh)
+            area_min = max(
+                self.ODYLE_ORB_MIN_AREA_ABS_PX,
+                self.ODYLE_ORB_MIN_AREA_REF_PX * frame_area / self.ODYLE_ORB_REF_AREA_PX,
+            )
+            area_max = self.ODYLE_ORB_MAX_AREA_FRAC * frame_area
+            cx0, cy0 = float(fw) * 0.5, float(fh) * 0.5
+
+            hits: List[Dict[str, Any]] = []
+            for cnt in cnts:
+                area = float(cv2.contourArea(cnt))
+                if area < area_min or area > area_max:
+                    continue
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bw > self.ODYLE_ORB_MAX_BBOX_FRAC * fw or bh > self.ODYLE_ORB_MAX_BBOX_FRAC * fh:
+                    continue
+                aspect = float(bw) / float(max(1, bh))
+                if not (0.5 <= aspect <= 2.0):
+                    continue
+                peri = float(cv2.arcLength(cnt, True))
+                circularity = 4.0 * math.pi * area / (peri * peri + 1e-6)
+                hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
+                solidity = area / (hull_area + 1e-6)
+                if circularity < self.ODYLE_ORB_CIRCULARITY_MIN:
+                    continue
+                if solidity < self.ODYLE_ORB_SOLIDITY_MIN:
+                    continue
+
+                # Blob-maskeli yama: yalnızca lekenin kendi pikselleri
+                # kanıttır (bbox köşelerindeki arazi oyu çevirir).
+                patch = bgr[by : by + bh, bx : bx + bw].copy()
+                blob_in_patch = teal_mask[by : by + bh, bx : bx + bw]
+                patch[blob_in_patch == 0] = 0
+                try:
+                    verdict = classify_3d_material_patch(patch)
+                except Exception as exc:
+                    logger.debug("Odyle yama sınıflandırması atlandı: %s", exc)
+                    continue
+                color_ratios = verdict.get("color_ratios", {}) or {}
+                odyle_ratio = float(color_ratios.get("odyle_orb", 0.0) or 0.0)
+                targena_ratio = float(color_ratios.get("targena_gold_green", 0.0) or 0.0)
+                if verdict.get("unknown", True):
+                    continue
+                if str(verdict.get("chosen_name")) != "Odyle":
+                    continue
+                if odyle_ratio < self.ODYLE_ORB_MIN_RATIO:
+                    continue
+                if targena_ratio >= 0.15:
+                    continue
+
+                ix = float(bx) + float(bw) * 0.5
+                iy = float(by) + float(bh) * 0.5
+                dx = round(ix - cx0, 2)
+                dy = round(iy - cy0, 2)
+                dist_px = round(math.hypot(dx, dy), 2)
+                conf_raw = verdict.get("confidence")
+                try:
+                    confidence = round(min(1.0, max(0.0, float(conf_raw))), 3)
+                except (TypeError, ValueError):
+                    confidence = 0.0
+
+                hits.append(
+                    {
+                        "type": "odyle_air",
+                        "category": "odyle_air",
+                        "kind": "odyle_air",
+                        "class_name": "odyle_air",
+                        "dx": dx,
+                        "dy": dy,
+                        "dist_px": dist_px,
+                        # 3D kürede mesafe ekran pikselidir (minimap px değil);
+                        # tüketici kapıyı merkezi görüş-alanı olarak uygular.
+                        "dist_basis": "screen_center_px",
+                        "angle_deg": self._vector_to_compass_deg(dx, dy),
+                        "pos": (int(round(ix)), int(round(iy))),
+                        "screen_pos": (int(round(ix)), int(round(iy))),
+                        "screen_x": int(round(ix)),
+                        "screen_y": int(round(iy)),
+                        "area": round(area, 1),
+                        "circularity": round(circularity, 3),
+                        "solidity": round(solidity, 3),
+                        "confidence": confidence,
+                        "odyle_orb_ratio": round(odyle_ratio, 4),
+                        "targena_ratio": round(targena_ratio, 4),
+                        "odyle_evidence": "orb_blob+taxonomy",
+                        "is_hostile": False,
+                        "is_odyle": True,
+                        "is_gatherable": True,
+                        "is_minimap": False,
+                        "is_world_3d": True,
+                        "in_air": True,
+                    }
+                )
+
+            hits.sort(key=lambda d: float(d["dist_px"]))
+            return hits
+        except Exception as exc:
+            logger.error("_scan_3d_odyle_orbs hatası: %s", exc)
+            return []
 
     def scan_minimap_resources_and_odyle(
         self,
@@ -1672,13 +2326,35 @@ class MinimapScanner:
         kırmızı düşman noktalarını (`hostile_dots`) tespit eder.
         Küçük yuvarlak beyaz canavar noktalarını (`•`) ve beyaz tüy (`minimap_feather_odyle.png`)
         ikonlarını kesin olarak filtreler.
+
+        P2-10 (v19): `check_odyle_air=True` iken ayrıca 3D dünyadaki GERÇEK
+        Odyle enerji küreleri taranır (`_scan_3d_odyle_orbs`) ve
+        `is_odyle=True` / `type="odyle_air"` isabetleri döndürülür —
+        minimap'te Odyle ikonu yoktur (katalog `shows_on_minimap=False`;
+        tüy/kanat F-0413 ile ret), bu yüzden minimap yolu tek başına
+        asla `is_odyle=True` üretemezdi. Küre isabetlerinde `dist_px`
+        EKRAN merkezinden ekran pikselidir (`dist_basis="screen_center_px"`);
+        tüketici kapıyı merkezi görüş-alanı olarak uygular.
+        `check_odyle_air=False` ise havadaki Odyle isabetlerini eler
+        (artık ölü kod değil — eskiden elenecek isabet hiç yoktu).
         """
-        _ = check_odyle_air
         detections: List[Dict[str, Any]] = []
         try:
             res = self.scan_gatherable_materials(frame)
             detections.extend(res.get("hostile_dots", []))
             detections.extend(res.get("gatherable_nodes", []))
+            if check_odyle_air:
+                detections.extend(self._scan_3d_odyle_orbs(frame))
+            if not check_odyle_air:
+                # check_odyle_air=False: havadaki Odyle işaretli tespitler
+                # elenir (False geçen çağıran "hava kontrolü yok" sanmamalı).
+                detections = [
+                    d
+                    for d in detections
+                    if not bool(d.get("is_odyle", False))
+                    and d.get("type") not in ("odyle_air",)
+                    and d.get("category") not in ("odyle_air",)
+                ]
             detections.sort(key=lambda d: float(d.get("dist_px", 9999.0)))
             return detections
         except Exception as exc:
@@ -1697,7 +2373,7 @@ class MinimapScanner:
         Minimap dokusunun ardışık kareler arasındaki kaymasını (`cv2.phaseCorrelate`
         ve yoğunluk farkı ile) ölçerek karakterin gerçekten yürüyüp yürümediğini
         veya bir duvara/kayaya takılıp takılmadığını (`is_moving: bool, speed_score: float`)
-        tespit eder.
+        tespit eder. Yoğunluk farkı eşiği `movement_diff_threshold` (varsayılan 2.2).
         """
         try:
             if prev_frame is None or curr_frame is None:
@@ -1737,12 +2413,18 @@ class MinimapScanner:
 
             mean_abs_diff = float(np.mean(np.abs(f1 - f2)))
 
-            diff_contrib = max(0.0, (mean_abs_diff - 2.2) * 0.35)
+            # P1-13: yoğunluk farkı eşiği kurucu parametresinden okunur
+            # (movement_diff_threshold); önceden 2.2 gömülüydü.
+            diff_contrib = max(0.0, (mean_abs_diff - self.movement_diff_threshold) * 0.35)
             speed_score = round(shift_mag + diff_contrib, 4)
 
+            # OR mantığı kaldırıldı: minimaptaki hareketli canavar/NPC/
+            # animasyon tek başına yoğunluk farkı üretip oyuncu duvara
+            # takılıyken bile "hareket ediyor" dedirtiyordu. Gerçek
+            # yürüyüş hem doku kayması hem yoğunluk değişimi ister.
             is_moving = bool(
                 shift_mag >= self.movement_shift_threshold
-                or mean_abs_diff >= self.movement_diff_threshold
+                and mean_abs_diff >= self.movement_diff_threshold
             )
             return is_moving, speed_score
 
@@ -1754,34 +2436,43 @@ class MinimapScanner:
         """
         Minimap oryantasyon koruması ve canavar dairesellik filtresi durumunu döndürür.
         """
-        north_up_verified = True
-        circularity_filter_ready = True
+        north_up_verified = False
+        circularity_filter_ready = False
+        reason = "not_verified"
         try:
             from core.patch_normalizer import MinimapOrientationGuard
             from core.vision_filters import MonsterCircularityFilter
 
-            guard = MinimapOrientationGuard()
             _filter = MonsterCircularityFilter()
+            circularity_filter_ready = bool(
+                hasattr(_filter, "is_monster_dot") and hasattr(_filter, "is_sprout_geometry")
+            )
+            guard = MinimapOrientationGuard()
 
-            if frame is not None:
-                if hasattr(guard, "verify_north_up"):
-                    res = guard.verify_north_up(frame)
-                    if isinstance(res, dict):
-                        north_up_verified = bool(res.get("is_fixed_north", res.get("north_up_verified", True)))
-                    elif isinstance(res, bool):
-                        north_up_verified = res
-                elif hasattr(guard, "verify_fixed_north_minimap"):
-                    res = guard.verify_fixed_north_minimap(frame)
-                    if isinstance(res, dict):
-                        north_up_verified = bool(res.get("is_fixed_north", True))
+            if frame is None:
+                reason = "no_frame"
+            elif hasattr(guard, "verify_north_up"):
+                res = guard.verify_north_up(frame)
+                if isinstance(res, dict):
+                    north_up_verified = bool(res.get("is_fixed_north", res.get("north_up_verified", False)))
+                elif isinstance(res, bool):
+                    north_up_verified = bool(res)
+                reason = "verified" if north_up_verified else "rotating_or_unverified"
+            elif hasattr(guard, "verify_fixed_north_minimap"):
+                res = guard.verify_fixed_north_minimap(frame)
+                if isinstance(res, dict):
+                    north_up_verified = bool(res.get("is_fixed_north", False))
+                    reason = "verified" if north_up_verified else "rotating_or_unverified"
         except Exception as exc:
             logger.debug("get_minimap_orientation_status hatası: %s", exc)
-            north_up_verified = True
-            circularity_filter_ready = True
+            north_up_verified = False
+            circularity_filter_ready = False
+            reason = f"error: {exc}"
 
         return {
             "north_up_verified": bool(north_up_verified),
             "circularity_filter_ready": bool(circularity_filter_ready),
+            "reason": reason,
         }
 
     def scan_minimap_with_strict_discrimination(
@@ -1816,11 +2507,12 @@ class MinimapScanner:
                 "subregion_info": {
                     "subregion": "Altgard",
                     "canonical_region": "Altgard",
-                    "confidence": 0.5,
+                    "confidence": 0.0,
                     "source": "empty_input",
                 },
                 "player_center": (0.0, 0.0),
-                "discriminator_used": True,
+                "player_center_found": False,
+                "discriminator_used": False,
                 "strict_discrimination": True,
             }
 
@@ -1873,8 +2565,12 @@ class MinimapScanner:
                     return r_name
             return None
 
-        # MinimapSproutMonsterDiscriminator entegrasyonu
+        # MinimapSproutMonsterDiscriminator entegrasyonu. Diskriminatörün
+        # `discriminate_patch` diye bir metodu yoktur; gerçek API
+        # `classify_patch(patch_bgr, candidate_center_xy, minimap_center_xy)`
+        # -> 9 (filiz) / 11 (canavar) / None (red) döndürür.
         discriminator = _get_sprout_monster_discriminator()
+        discriminator_available = discriminator is not None
 
         base_scan = self.scan_minimap_crop(crop, offset_xy=offset_xy, frame_shape=frame_shape)
         subregion_info = self.identify_subregion(crop)
@@ -1894,31 +2590,36 @@ class MinimapScanner:
                 continue
 
             rad = max(6, int(round(8.0 * (float(cw) / 332.0))))
-            Patch = crop[max(0, int(py) - rad) : min(ch, int(py) + rad + 1), max(0, int(px) - rad) : min(cw, int(px) + rad + 1)]
-            disc_res = discriminator.discriminate_patch(
-                Patch,
-                ncc_score=float(node.get("ncc_score", node.get("confidence", 0.90))),
-                chromatic_density=float(node.get("chromatic_density", 0.15)),
-            )
-            if disc_res.get("label") == "minimap_monster_dot":
-                m_copy = dict(node)
-                m_copy["class_id"] = self.CLASS_ID_MONSTER_DOT
-                m_copy["class_name"] = self.CLASS_NAME_MINIMAP_MONSTER
-                m_copy["kind"] = self.CLASS_NAME_MINIMAP_MONSTER
-                m_copy["is_gatherable"] = False
-                m_copy["discriminator_label"] = "minimap_monster_dot"
-                strict_monster_dots.append(m_copy)
-                continue
-            if not disc_res.get("is_valid_sprout", True):
-                filtered_chrome_artifacts.append(
-                    {"pos": (int(px), int(py)), "chrome_region": disc_res.get("reason", "discriminator_reject"), "original_kind": "sprout_candidate"}
+            patch = crop[max(0, int(py) - rad) : min(ch, int(py) + rad + 1), max(0, int(px) - rad) : min(cw, int(px) + rad + 1)]
+            if discriminator_available:
+                disc_class = discriminator.classify_patch(
+                    patch,
+                    candidate_center_xy=(float(px), float(py)),
+                    minimap_center_xy=(float(center_x), float(center_y)),
                 )
-                continue
-
-            s_copy = dict(node)
+                if disc_class == self.CLASS_ID_MONSTER_DOT:
+                    m_copy = dict(node)
+                    m_copy["class_id"] = self.CLASS_ID_MONSTER_DOT
+                    m_copy["class_name"] = self.CLASS_NAME_MINIMAP_MONSTER
+                    m_copy["kind"] = self.CLASS_NAME_MINIMAP_MONSTER
+                    m_copy["is_gatherable"] = False
+                    m_copy["discriminator_label"] = "minimap_monster_dot"
+                    strict_monster_dots.append(m_copy)
+                    continue
+                if disc_class != self.CLASS_ID_SPROUT:
+                    filtered_chrome_artifacts.append(
+                        {"pos": (int(px), int(py)), "chrome_region": "discriminator_reject", "original_kind": "sprout_candidate"}
+                    )
+                    continue
+                s_copy = dict(node)
+                s_copy["discriminator_label"] = "minimap_sprout"
+            else:
+                # Diskriminatör yüklenemedi: aday zaten NCC>=0.88 +
+                # kromatik/yapısal doğrulamadan geçti; bayraklı kabul edilir.
+                s_copy = dict(node)
+                s_copy["discriminator_label"] = "unavailable_ncc_only"
             s_copy["class_id"] = self.CLASS_ID_SPROUT
             s_copy["class_name"] = self.CLASS_NAME_SPROUT
-            s_copy["discriminator_label"] = "minimap_sprout"
             s_copy["three_leaf_verified"] = True
             strict_sprouts.append(s_copy)
 
@@ -1956,7 +2657,8 @@ class MinimapScanner:
             "chrome_regions": hud_chrome_regions,
             "subregion_info": subregion_info,
             "player_center": base_scan.get("player_center", (round(center_x, 2), round(center_y, 2))),
-            "discriminator_used": True,
+            "player_center_found": base_scan.get("player_center_found", True),
+            "discriminator_used": bool(discriminator_available),
             "strict_discrimination": True,
         }
 
@@ -1970,11 +2672,13 @@ class MinimapScanner:
         bölge ve alt bölgeyi otomatik tespit eder ('Dredgion Crash Site' -> 'Altgard').
         """
         if frame_or_crop is None or not isinstance(frame_or_crop, np.ndarray) or frame_or_crop.size == 0:
+            # H-sweep (dilim 13 K1): girdi yokken "Altgard" uydurulmaz —
+            # bilinmiyor None'dur, confidence 0.0'dır.
             return {
-                "subregion": "Altgard",
-                "canonical_region": "Altgard",
-                "confidence": 0.50,
-                "source": "default_fallback",
+                "subregion": None,
+                "canonical_region": None,
+                "confidence": 0.0,
+                "source": "no_input",
             }
 
         # 1. Oyuncu koordinatları verilmişse mekansal sınırlayıcı kutu (bounding box) kontrolü
@@ -2009,10 +2713,10 @@ class MinimapScanner:
         ch, cw = crop.shape[:2]
         if ch < 24 or cw < 40:
             return {
-                "subregion": "Altgard",
-                "canonical_region": "Altgard",
-                "confidence": 0.50,
-                "source": "default_fallback",
+                "subregion": None,
+                "canonical_region": None,
+                "confidence": 0.0,
+                "source": "too_small",
             }
 
         # Üst başlık şeridi (y: 0..ch*0.22, x: 0..cw*0.98)
@@ -2058,7 +2762,10 @@ class MinimapScanner:
             cand_best = -1.0
             for scale in (0.40, 0.48, 0.55, 0.62):
                 (tw, th), _ = cv2.getTextSize(cand, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
-                if th + 4 > gray_strip.shape[0] or tw + 4 > gray_strip.shape[1]:
+                # Şablon (th+6, tw+6) boyutundadır; kesitten büyük şablon
+                # cv2.matchTemplate'de çöker (önceki th+4/tw+4 kontrolü
+                # 2px eksikti ve küçük kesitlerde çöküyordu).
+                if th + 6 > gray_strip.shape[0] or tw + 6 > gray_strip.shape[1]:
                     continue
                 tpl = np.zeros((th + 6, tw + 6), dtype=np.uint8)
                 cv2.putText(tpl, cand, (3, th + 2), cv2.FONT_HERSHEY_SIMPLEX, scale, 255, 1, cv2.LINE_AA)
@@ -2074,12 +2781,25 @@ class MinimapScanner:
                 best_score = cand_best
                 best_name = cand
 
-        canonical = self.SUBREGION_CANONICAL_MAP.get(best_name.lower(), "Altgard")
-        conf = float(np.clip(best_score, 0.50, 0.99)) if best_score > 0.45 else 0.65
-        source = "header_template_ncc" if best_score > 0.45 else "canonical_default"
+        # H-sweep (dilim 13 K1): kanonik bölge tek kaynaktan çözülür
+        # (route_manager.SUBREGION_TO_CANONICAL); bilinmeyen ad None'dur.
+        # Eşleşme yoksa en yüksek skorlu aday da isim olarak döndürülmez —
+        # "no_match" bilinmiyor demektir.
+        canonical = self._canonical_region_for(best_name)
+        if best_score > 0.45:
+            conf = float(np.clip(best_score, 0.50, 0.99))
+            source = "header_template_ncc"
+            out_name: Optional[str] = best_name
+        else:
+            # Hiçbir şablon eşleşmedi: uydurma 0.65 güven ve rastgele
+            # aday adı yerine skora bağlı düşük güven + no_match kaynağı.
+            conf = float(np.clip(best_score, 0.0, 0.45))
+            source = "no_match"
+            out_name = None
+            canonical = None
 
         return {
-            "subregion": best_name,
+            "subregion": out_name,
             "canonical_region": canonical,
             "confidence": round(conf, 3),
             "source": source,
@@ -2090,9 +2810,12 @@ class MinimapScanner:
         frame_or_crop: np.ndarray,
         player_map_pos: Optional[Tuple[float, float]] = None,
     ) -> str:
-        """Minimap karesinden tespit edilen alt bölge adını döndürür."""
+        """Minimap karesinden tespit edilen alt bölge adını döndürür.
+
+        Bilinmiyorsa "" döner (eskiden "Altgard" uyduruyordu).
+        """
         info = self.identify_subregion(frame_or_crop, player_map_pos)
-        return str(info.get("subregion", "Altgard"))
+        return str(info.get("subregion") or "")
 
     def classify_minimap_targets(
         self,
@@ -2119,26 +2842,35 @@ class MinimapScanner:
             "player_center": scan_res.get("player_center", (0.0, 0.0)),
             "player_clearance_norm": self.PLAYER_CLEARANCE_NORM,
             "player_clearance_px": scan_res.get("player_clearance_px", 0.0),
-            "subregion": subregion_info.get("subregion", "Altgard"),
-            "canonical_region": subregion_info.get("canonical_region", "Altgard"),
+            # H-sweep (dilim 13 K1): bilinmeyen bölge "Altgard" diye
+            # geçilmez; None tüketicide "bilinmiyor" demektir.
+            "subregion": subregion_info.get("subregion"),
+            "canonical_region": subregion_info.get("canonical_region"),
             "subregion_info": subregion_info,
         }
 
     def get_minimap_scanner_health_summary(self) -> dict:
-        """Returns minimap scanner health summary safely."""
+        """Gerçek sağlık özeti: sözleşme duman testi çalıştırılır."""
         try:
-            return {"minimap_scanner_ready": True}
-        except Exception:
-            return {"minimap_scanner_ready": False}
+            contract_ok = validate_minimap_scanner_contract()
+            return {
+                "minimap_scanner_ready": bool(contract_ok),
+                "contract_valid": bool(contract_ok),
+            }
+        except Exception as exc:
+            return {"minimap_scanner_ready": False, "error": str(exc)}
 
     def get_minimap_scanner_ready_flag(self) -> dict:
-        return {"module": "minimap_scanner", "ready": True}
+        # H-sweep (dilim 13 O3): eskiden ölçüm yapmadan {"ready": True}
+        # dönüyordu. Artık gerçek sözleşme yoklamasına bağlanır.
+        return {"module": "minimap_scanner", "ready": bool(validate_minimap_scanner_contract())}
 
     def get_minimap_scanner_version_info(self) -> dict:
-        return {"module": "minimap_scanner", "version": "2.0.0", "ready": True}
+        return {"module": "minimap_scanner", "version": __version__, "ready": bool(validate_minimap_scanner_contract())}
 
     def get_minimap_scanner_diagnostic_snapshot(self) -> dict:
-        return {"module": "minimap_scanner", "status": "ok", "ready": True}
+        ready = bool(validate_minimap_scanner_contract())
+        return {"module": "minimap_scanner", "status": "ok" if ready else "degraded", "ready": ready}
 
 
 def get_minimap_scanner_capabilities() -> list:
@@ -2146,24 +2878,47 @@ def get_minimap_scanner_capabilities() -> list:
 
 
 def validate_minimap_scanner_contract() -> bool:
-    return bool(get_minimap_scanner_capabilities())
+    """Gerçek sözleşme kontrolü: tarayıcı kurulur ve sentetik bir
+    minimap kesiti üzerinde beklenen anahtarlarla tarama döner."""
+    try:
+        scanner = MinimapScanner()
+        probe = np.zeros((120, 120, 3), dtype=np.uint8)
+        res = scanner.scan_minimap_crop(probe)
+        if not isinstance(res, dict):
+            return False
+        if "gatherable_nodes" not in res or "player_center" not in res:
+            return False
+        if not isinstance(res.get("player_center"), tuple):
+            return False
+        return True
+    except Exception as exc:
+        logger.debug("Minimap scanner sözleşme kontrolü başarısız: %s", exc)
+        return False
+
+
+def _minimap_scanner_baseline_metrics(ok: bool) -> dict:
+    return {
+        "module": "minimap_scanner",
+        "contract_valid": bool(ok),
+        "capability_count": len(get_minimap_scanner_capabilities()),
+    }
 
 
 def get_minimap_scanner_baseline_metrics() -> dict:
+    return _minimap_scanner_baseline_metrics(validate_minimap_scanner_contract())
+
+
+def _minimap_scanner_readiness_status(ok: bool) -> dict:
     return {
         "module": "minimap_scanner",
-        "contract_valid": validate_minimap_scanner_contract(),
-        "capability_count": len(get_minimap_scanner_capabilities()),
+        "ready": bool(ok),
+        "metrics": _minimap_scanner_baseline_metrics(ok),
     }
 
 
 def get_minimap_scanner_readiness_status() -> dict:
     try:
-        return {
-            "module": "minimap_scanner",
-            "ready": validate_minimap_scanner_contract(),
-            "metrics": get_minimap_scanner_baseline_metrics(),
-        }
+        return _minimap_scanner_readiness_status(validate_minimap_scanner_contract())
     except Exception:
         return {
             "module": "minimap_scanner",
@@ -2172,57 +2927,85 @@ def get_minimap_scanner_readiness_status() -> dict:
         }
 
 
-def get_minimap_scanner_audit_record() -> dict:
+def _minimap_scanner_audit_record(ok: bool) -> dict:
     return {
         "module": "minimap_scanner",
-        "audit_passed": validate_minimap_scanner_contract(),
-        "readiness": get_minimap_scanner_readiness_status(),
+        "audit_passed": bool(ok),
+        "readiness": _minimap_scanner_readiness_status(ok),
+    }
+
+
+def get_minimap_scanner_audit_record() -> dict:
+    return _minimap_scanner_audit_record(validate_minimap_scanner_contract())
+
+
+def _minimap_scanner_operational_digest(ok: bool) -> dict:
+    return {
+        "module": "minimap_scanner",
+        "operational": bool(ok),
+        "audit": _minimap_scanner_audit_record(ok),
     }
 
 
 def get_minimap_scanner_operational_digest() -> dict:
+    return _minimap_scanner_operational_digest(validate_minimap_scanner_contract())
+
+
+def _minimap_scanner_telemetry_payload(ok: bool) -> dict:
     return {
         "module": "minimap_scanner",
-        "operational": validate_minimap_scanner_contract(),
-        "audit": get_minimap_scanner_audit_record(),
+        "payload": _minimap_scanner_operational_digest(ok),
     }
 
 
 def get_minimap_scanner_telemetry_payload() -> dict:
+    return _minimap_scanner_telemetry_payload(validate_minimap_scanner_contract())
+
+
+def _minimap_scanner_integrity_seal(ok: bool) -> dict:
     return {
         "module": "minimap_scanner",
-        "payload": get_minimap_scanner_operational_digest(),
+        "sealed": bool(ok),
+        "telemetry": _minimap_scanner_telemetry_payload(ok),
     }
 
 
 def get_minimap_scanner_integrity_seal() -> dict:
+    return _minimap_scanner_integrity_seal(validate_minimap_scanner_contract())
+
+
+def _minimap_scanner_compliance_certificate(ok: bool) -> dict:
     return {
         "module": "minimap_scanner",
-        "sealed": validate_minimap_scanner_contract(),
-        "telemetry": get_minimap_scanner_telemetry_payload(),
+        "certified": bool(ok),
+        "seal": _minimap_scanner_integrity_seal(ok),
     }
 
 
 def get_minimap_scanner_compliance_certificate() -> dict:
+    return _minimap_scanner_compliance_certificate(validate_minimap_scanner_contract())
+
+
+def _minimap_scanner_readiness_probe(ok: bool) -> dict:
     return {
         "module": "minimap_scanner",
-        "certified": validate_minimap_scanner_contract(),
-        "seal": get_minimap_scanner_integrity_seal(),
+        "ready": bool(ok),
+        "certificate": _minimap_scanner_compliance_certificate(ok),
     }
 
 
 def get_minimap_scanner_readiness_probe() -> dict:
+    return _minimap_scanner_readiness_probe(validate_minimap_scanner_contract())
+
+
+def _minimap_scanner_audit_summary(ok: bool) -> dict:
     return {
         "module": "minimap_scanner",
-        "ready": validate_minimap_scanner_contract(),
-        "certificate": get_minimap_scanner_compliance_certificate(),
+        "audit_passed": bool(ok),
+        "probe": _minimap_scanner_readiness_probe(ok),
     }
 
 
 def get_minimap_scanner_audit_summary() -> dict:
-    return {
-        "module": "minimap_scanner",
-        "audit_passed": validate_minimap_scanner_contract(),
-        "probe": get_minimap_scanner_readiness_probe(),
-    }
+    return _minimap_scanner_audit_summary(validate_minimap_scanner_contract())
 

@@ -43,11 +43,91 @@ LEARNING_DIR = DATASET_DIR / "game_learning"
 TRAIN_IMAGES_DIR = DATASET_DIR / "images" / "train"
 TRAIN_LABELS_DIR = DATASET_DIR / "labels" / "train"
 
+# Dedup history bound: _seen_dhashes keeps at most this many frame hashes.
+# Eviction is oldest-first (see _remember_dhash); the history is never
+# wiped wholesale, so a burst of new frames cannot re-admit old duplicates.
+_DEDUP_MAX_HASHES = 600
+
 # Layout conf ≥ TRAIN_CONF_FLOOR so boxes survive purge; still weak + learn_auto.
 try:
+    from dataset_factory.label_trust import CONF_EMIN as _CONF_EMIN
     from dataset_factory.label_trust import LEARN_AUTO_CONF as _LEARN_AUTO_CONF
-except Exception:  # pragma: no cover - import cycle / early boot
+except Exception as _learn_conf_exc:  # pragma: no cover - import cycle / early boot
+    # B-14: the fallback used to be silent — an import failure hid while
+    # the learner kept writing 0.50-confidence boxes as if measured.
+    logger.warning(
+        "LEARN_AUTO_CONF import failed (%s); using fallback 0.50 — "
+        "check dataset_factory/label_trust.py",
+        _learn_conf_exc,
+    )
     _LEARN_AUTO_CONF = 0.50
+    _CONF_EMIN = 0.85
+
+
+# B-01: category -> canonical class ids whose boxes may be saved under it.
+# Disjoint partition (data.yaml 0..26): one detection belongs to exactly
+# one learn category, so the same YOLO boxes can no longer be written to
+# all five category folders at once. Classes outside every set (world
+# materials 0..8/12, minimap symbols 9/11, kinah 25, player 26, ...) have
+# no learn category here — their frames are not saved as a category
+# sample (they reach training through the mix/general path instead).
+_CATEGORY_CLASS_IDS: Dict[str, frozenset] = {
+    "monsters": frozenset({10, 18}),  # monster_3d + target_hp_bar
+    "skills": frozenset({13, 19, 20, 21, 22, 23, 24}),  # prompt/bar/slots/consumables
+    "obstacles": frozenset({14}),  # obstacle
+    "paths": frozenset({15}),  # path_ground
+    "vitality": frozenset({16, 17}),  # player_hp_bar + player_mp_bar
+}
+
+# B-05: the 12-slot hotbar (1-8, Q, E, R, T). Tiebreak order used when
+# learned weights are equal (fresh start: every weight is 1.0). Existing
+# keys keep their historic order; T (right-click skill) sits just under
+# R, 6/7/8 continue the numeric tail after 5.
+_STD_SKILL_PRIO: Dict[str, float] = {
+    "R": 8, "T": 7.5, "E": 7, "Q": 6,
+    "2": 5, "3": 4, "4": 3, "5": 2,
+    "6": 1.8, "7": 1.6, "8": 1.4, "1": 1,
+}
+
+
+def _press_ok(result: Any) -> bool:
+    """Sürücü dönüşünü 'tuş gönderildi mi' kararına çevirir (P0-6, B-02
+    ile aynı kural: InputController.press_key float döner, 0.0 =
+    gönderilmedi; None / False / 0.0 = gönderilmedi; dönüşü
+    raporlamayan sürücü 'gönderildi' sayılmaz — fail-closed)."""
+    if result is None or result is False:
+        return False
+    if isinstance(result, bool):
+        return result
+    if isinstance(result, (int, float)):
+        return float(result) > 0.0
+    return bool(result)
+
+
+def _filter_boxes_for_category(
+    boxes: Optional[Sequence[Dict[str, Any]]],
+    category: str,
+) -> List[Dict[str, Any]]:
+    """Keep only boxes whose class belongs to `category` (B-01/B-02).
+
+    Boxes without a parseable class_id are dropped, never defaulted to
+    monster (10) — see B-09. Returns a new list; callers keep the
+    original untouched.
+    """
+    allowed = _CATEGORY_CLASS_IDS.get(str(category or "").strip().lower())
+    if allowed is None:
+        return []
+    out: List[Dict[str, Any]] = []
+    for b in boxes or []:
+        if not isinstance(b, dict) or "box" not in b:
+            continue
+        try:
+            cid = int(b.get("class_id"))
+        except (TypeError, ValueError):
+            continue
+        if cid in allowed:
+            out.append(b)
+    return out
 
 
 def layout_boxes_for_learn_category(
@@ -116,7 +196,15 @@ class OmniGameLearner:
         self.bot_worker = bot_worker
         self.save_screenshots = bool(save_screenshots)
         # Disk JPEG spam was dropping combat loop to ~0.3 FPS — keep cognition, throttle writes.
-        self.min_sample_interval_sec = max(4.0, float(min_sample_interval_sec))
+        # B-14: a below-minimum interval used to be silently raised to 4.0 —
+        # the caller never learned its configuration was ignored.
+        _requested_iv = float(min_sample_interval_sec)
+        if _requested_iv < 4.0:
+            logger.warning(
+                "min_sample_interval_sec %.2f < 4.0 minimum; clamped to 4.0",
+                _requested_iv,
+            )
+        self.min_sample_interval_sec = max(4.0, _requested_iv)
 
         # Otomatik İksir ve Canlılık Yapılandırması
         self.hp_pot_threshold: float = 0.50
@@ -124,6 +212,16 @@ class OmniGameLearner:
         self.pot_cooldown_sec: float = 8.0
         self._last_hp_pot_ts: float = 0.0
         self._last_mp_pot_ts: float = 0.0
+
+        # GameFrameGate: bu learner kendi kapı örneğini kullanır; modül
+        # düzeyindeki tekil kapının dHash önbelleği çağıranlar arasında
+        # paylaşılmaz (F-0957). Tembel kurulur.
+        self._frame_gate = None
+
+        # _detect_real_boxes için önbelleğe alınmış etiketleyici (F-0342):
+        # her karede yeni YOLOAutoLabeler() kurulmaz.
+        self._yolo_labeler = None
+        self._yolo_labeler_failed_ts: float = 0.0
 
         # Alt klasörleri oluştur
         self._init_storage_directories()
@@ -143,6 +241,9 @@ class OmniGameLearner:
         self._last_obstacle_sample_ts: float = 0.0
         self._last_vitality_sample_ts: float = 0.0
         self._last_general_sample_ts: float = 0.0
+        self._last_select_reader_warn_ts: float = 0.0  # dilim-30 B-08 throttle
+        self._last_detect_failed_warn_ts: float = 0.0  # B-04 throttle
+        self._last_skill_signature: Optional[Tuple[Tuple[str, ...], Tuple[str, ...]]] = None  # B-10
 
         # Canlı durum takibi
         self.current_monster_targeted: bool = False
@@ -153,17 +254,29 @@ class OmniGameLearner:
 
         self.player_hp_ratio: float = 1.0
         self.player_mp_ratio: float = 1.0
+        # S-3101: son bilinen degerlerdir; okunabilirlik ayri izlenir —
+        # okunamayan bar asla %100 diye raporlanmaz.
+        self.player_hp_readable: bool = False
+        self.player_mp_readable: bool = False
 
-        self.ready_skills: List[str] = ["1"]
-        self.cooldown_skills: Dict[str, float] = {}
+        self.ready_skills: List[str] = []
+        self.cooldown_skills: Dict[str, Any] = {}
+        # Cooldown'daki slotun ölçülen parlaklığı (süre DEĞİL; F-0482).
+        # cooldown_skills değerleri yalnızca "cooldown'da" bayrağıdır (True).
+        self.cooldown_brightness: Dict[str, float] = {}
 
         self.obstacle_detected: bool = False
         self.obstacle_type: str = "none"
         self.recommended_steer_deg: float = 0.0
 
         # Event-driven combat learning & dynamic skill DPS metrics
+        # B-05: the bar has 12 slots (1-8, Q, E, R, T). The old 8-key list
+        # silently dropped every 6/7/8/T cast in record_skill_cast, so T
+        # (right-click skill) could never learn a DPS weight.
         self._combat_learning_lock = threading.RLock()
-        self.combat_skill_keys: Tuple[str, ...] = ("1", "2", "3", "4", "5", "Q", "E", "R")
+        self.combat_skill_keys: Tuple[str, ...] = (
+            "1", "2", "3", "4", "5", "6", "7", "8", "Q", "E", "R", "T",
+        )
         self._skill_metrics: Dict[str, Dict[str, Any]] = {}
         for k in self.combat_skill_keys:
             self._skill_metrics[k] = {
@@ -196,8 +309,19 @@ class OmniGameLearner:
         # Load previously saved learned weights
         self.load_learned_weights()
 
-        # Perceptual hash geçmişi (mükerrer kare kaydetmeme koruması)
+        # Perceptual hash geçmişi (mükerrer kare kaydetmeme koruması).
+        # Sınırlı FIFO: _remember_dhash en eski hash'i atar; 600'ü aşınca
+        # tüm geçmişi silen clear() davranışı kaldırıldı (D22).
         self._seen_dhashes: set = set()
+        self._seen_dhash_order: deque = deque()
+
+        # Kare başına YOLO tespit önbelleği (D22): _evaluate aynı kareyi
+        # 5 kategoride (monsters/skills/obstacles/paths/vitality) inceler
+        # ama _detect_real_boxes kategori argümanını yok sayıp her seferinde
+        # aynı auto_label_frame çıkarımını tekrarlardı. Tek girişli
+        # önbellek, aynı dhash anahtarıyla gelen tekrarları 1 çıkarıma indirir.
+        self._detect_cache_key: Optional[int] = None
+        self._detect_cache_boxes: Optional[List[Dict[str, Any]]] = []
 
         # Alt sistem referansları (lazy resolver)
         self._skill_bar_reader = None
@@ -216,7 +340,9 @@ class OmniGameLearner:
             TRAIN_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
             TRAIN_LABELS_DIR.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            logger.debug("Öğrenim dizinleri oluşturulurken bilgi: %s", exc)
+            # B-14: directory failure used to be debug-only — every later
+            # save then failed silently, per frame, for the whole session.
+            logger.warning("Öğrenim dizinleri oluşturulamadı: %s", exc)
 
     @property
     def skill_bar_reader(self) -> Optional[Any]:
@@ -236,18 +362,26 @@ class OmniGameLearner:
 
     @staticmethod
     def _normalize_skill_key(key: Any) -> str:
-        """Normalizes skill key to standard hotbar identifier ('1'..'5', 'Q', 'E', 'R')."""
+        """Normalizes skill key to standard hotbar identifier ('1'..'8', 'Q', 'E', 'R', 'T')."""
         s = str(key or "").strip()
         if not s:
             return ""
         upper = s.upper()
-        if upper in ("Q", "E", "R"):
+        if upper in ("Q", "E", "R", "T"):
             return upper
-        if s in ("1", "2", "3", "4", "5"):
+        if s in ("1", "2", "3", "4", "5", "6", "7", "8"):
             return s
-        if upper in ("1", "2", "3", "4", "5"):
+        if upper in ("1", "2", "3", "4", "5", "6", "7", "8"):
             return upper
         return upper
+
+    def _get_frame_gate(self):
+        """Learner'a özel GameFrameGate örneği (tembel; F-0957)."""
+        if self._frame_gate is None:
+            from dataset_factory.game_frame_gate import GameFrameGate
+
+            self._frame_gate = GameFrameGate()
+        return self._frame_gate
 
     def check_game_frame(
         self,
@@ -266,16 +400,18 @@ class OmniGameLearner:
 
         if _is_valid_game_frame is not None:
             try:
-                ok, reason = _is_valid_game_frame(frame, require_foreground=require_foreground)
+                gate = self._get_frame_gate()
+                ok, reason = gate.is_valid_game_frame(
+                    frame, require_foreground=require_foreground
+                )
                 return bool(ok), str(reason)
             except Exception as exc:
                 logger.debug("GameFrameGate evaluation error: %s", exc)
 
-        # Heuristic fallback if GameFrameGate module is unavailable
-        std_val = float(np.std(frame))
-        if std_val < 4.0:
-            return False, "flat_solid_color"
-        return True, "accepted_fallback"
+        # GameFrameGate kullanılamıyorsa fail-closed: kapı yokken kareyi
+        # oyun karesi saymak masaüstü/tarayıcı karelerini veri setine
+        # yazdırır (F-0344). Eski "accepted_fallback" kabulü kaldırıldı.
+        return False, "gate_unavailable"
 
     def record_skill_cast(
         self,
@@ -284,7 +420,7 @@ class OmniGameLearner:
         timestamp: Optional[float] = None,
     ) -> None:
         """
-        Records an event-driven skill cast by key ('1'..'5', 'Q', 'E', 'R').
+        Records an event-driven skill cast by key ('1'..'8', 'Q', 'E', 'R', 'T').
         Queues cast for subsequent target HP drop measurement.
         """
         norm_key = self._normalize_skill_key(skill_key)
@@ -444,10 +580,21 @@ class OmniGameLearner:
         now = time.time() if timestamp is None else float(timestamp)
         with self._combat_learning_lock:
             if not self._in_encounter:
-                duration = max(0.5, now - self.last_monster_death_ts) if self.last_monster_death_ts > 0 else 5.0
-            else:
-                duration = max(0.5, now - self._encounter_start_ts)
-                self._in_encounter = False
+                # Karşılaşma yokken hayali karşılaşma sayılmaz ve DPS
+                # uydurulmaz (F-0162): karşılaşma başlamadan bitirilemez.
+                logger.debug(
+                    "CombatLearning: on_encounter_end called without an active encounter; ignored"
+                )
+                return {
+                    "duration": 0.0,
+                    "killed": bool(killed),
+                    "speed_rating": "no_encounter",
+                    "dps": 0.0,
+                    "weights": self.get_skill_dps_weights(),
+                    "damage_by_skill": dict(self._encounter_damage_by_skill),
+                }
+            duration = max(0.5, now - self._encounter_start_ts)
+            self._in_encounter = False
 
             self.last_encounter_duration = duration
             self.total_encounters += 1
@@ -457,10 +604,9 @@ class OmniGameLearner:
                 self.avg_encounter_duration = 0.80 * self.avg_encounter_duration + 0.20 * duration
 
             total_dmg = sum(self._encounter_damage_by_skill.values())
-            if total_dmg <= 0.0 and killed:
-                total_dmg = max(0.10, self._encounter_start_hp)
-
-            encounter_dps = total_dmg / duration
+            # S-3104: olculmemis hasar yokken oldurme durumunda DPS
+            # baslangic HP'sinden turetilmez — olcum yoksa DPS 0.0'dir.
+            encounter_dps = total_dmg / duration if total_dmg > 0.0 else 0.0
             self.last_encounter_dps = encounter_dps
 
             # Encounter speed rating (reference kill time: ~7.5s)
@@ -522,16 +668,20 @@ class OmniGameLearner:
                 m for m in self._skill_metrics.values()
                 if m["hits"] > 0 and m["avg_hp_drop"] > 0.0
             ]
-            mean_all_dmg = (
-                float(np.mean([m["avg_hp_drop"] for m in active_skills]))
-                if active_skills
-                else 0.10
-            )
+            # Tek aktif skill varken ortalama onun kendi değeridir ve
+            # damage_ratio hep 1.0 çıkar — ayırt edemez (F-0484). En az
+            # 2 aktif skill yoksa sabit referans (0.10) kullanılır.
+            if len(active_skills) >= 2:
+                mean_all_dmg = float(np.mean([m["avg_hp_drop"] for m in active_skills]))
+            else:
+                mean_all_dmg = 0.10
 
             if monster_died and dur <= 6.5:
                 speed_mult = min(1.80, ref_duration / max(1.5, dur))
             elif dur >= 14.0 or not monster_died:
-                speed_mult = max(0.60, ref_duration / dur)
+                # P3-8 (S-130): dur==0 + monster_died=False ZeroDivisionError
+                # verirdi (ref_duration / dur).
+                speed_mult = max(0.60, ref_duration / max(dur, 0.5))
             else:
                 speed_mult = 1.00
 
@@ -576,9 +726,9 @@ class OmniGameLearner:
             return updated_weights
 
     def get_skills_by_priority(self) -> List[str]:
-        """Returns all 8 combat skill keys ordered by dynamic DPS weight descending."""
+        """Returns all 12 combat skill keys ordered by dynamic DPS weight descending."""
         with self._combat_learning_lock:
-            std_prio = {"R": 8, "E": 7, "Q": 6, "2": 5, "3": 4, "4": 3, "5": 2, "1": 1}
+            std_prio = dict(_STD_SKILL_PRIO)
             skills = list(self.combat_skill_keys)
             skills.sort(
                 key=lambda k: (
@@ -631,26 +781,35 @@ class OmniGameLearner:
             }
 
     def _propagate_learned_weights(self) -> None:
-        """Propagates dynamically tuned weights to BotWorker and SkillBarReader."""
+        """Propagates dynamically tuned weights to BotWorker and SkillBarReader.
+
+        DEFAULT_PRIORITY_WEIGHTS sınıf düzeyinde paylaşımlı bir sözlüktür;
+        yerinde değiştirmek (F-0485) tüm örneklere sızar. Bu yüzden her
+        alıcıya kendi örnek niteliği olarak yeni bir sözlük atanır.
+        """
         weights = self.get_skill_dps_weights()
+        propagated = dict(weights)
+        propagated.update({k.lower(): w for k, w in weights.items()})
         if self.skill_bar_reader is not None:
-            if hasattr(self.skill_bar_reader, "DEFAULT_PRIORITY_WEIGHTS"):
-                try:
-                    for k, w in weights.items():
-                        self.skill_bar_reader.DEFAULT_PRIORITY_WEIGHTS[k] = w
-                        self.skill_bar_reader.DEFAULT_PRIORITY_WEIGHTS[k.lower()] = w
-                except Exception as exc:
-                    logger.debug("Could not propagate weights to skill_bar_reader: %s", exc)
+            try:
+                self.skill_bar_reader.DEFAULT_PRIORITY_WEIGHTS = dict(propagated)
+            except Exception as exc:
+                logger.debug("Could not propagate weights to skill_bar_reader: %s", exc)
 
         if self.bot_worker is not None:
             sbm = getattr(self.bot_worker, "skill_bar_monitor", None)
-            if sbm and hasattr(sbm, "DEFAULT_PRIORITY_WEIGHTS"):
+            if sbm is not None:
                 try:
-                    for k, w in weights.items():
-                        sbm.DEFAULT_PRIORITY_WEIGHTS[k] = w
-                        sbm.DEFAULT_PRIORITY_WEIGHTS[k.lower()] = w
-                except Exception:
-                    pass
+                    sbm.DEFAULT_PRIORITY_WEIGHTS = dict(propagated)
+                except Exception as exc:
+                    # Dilim-30 B-08: the second target used to swallow its
+                    # failure with a bare `pass` — propagation stopped
+                    # halfway and reader/monitor weights silently diverged.
+                    # Propagation is best-effort, but the split must be visible.
+                    logger.warning(
+                        "Could not propagate weights to skill_bar_monitor: %s",
+                        exc,
+                    )
 
     def save_learned_weights(self, path: Optional[Union[str, Path]] = None) -> bool:
         """Persists learned skill weights and metrics to config JSON."""
@@ -737,11 +896,18 @@ class OmniGameLearner:
 
         with self._lock:
             # 1. Canavar & Can Barı Analizi
+            # F-0038: _analyze_monster_and_health yeni HP'yi
+            # current_monster_hp_ratio'ya yazar; on_target_hp_update aynı
+            # değeri "önceki" sanıp düşüşü hep 0.0 ölçer. Analiz öncesi
+            # değer saklanır ve on_target_hp_update öncesinde geri
+            # yüklenir ki gerçek düşüş ölçülsün.
+            prev_monster_hp = self.current_monster_hp_ratio
             monster_info = self._analyze_monster_and_health(frame)
 
             # Event-driven combat encounter tracking & target HP drop processing
             if monster_info.get("has_target"):
                 curr_hp = float(monster_info.get("hp_ratio", 0.0))
+                self.current_monster_hp_ratio = prev_monster_hp
                 self.on_target_hp_update(curr_hp, timestamp=now)
             elif monster_info.get("monster_died"):
                 self.on_encounter_end(killed=True, timestamp=now)
@@ -763,7 +929,12 @@ class OmniGameLearner:
             # Mix, toplama kutularını yazar. Yol, engel, skill ve can barı
             # o karışımdan bağımsız olarak ayrıca etiketlenir.
             if mix_sources is not None:
-                self.observe_mix(frame, mix_sources, now=now)
+                try:
+                    self.observe_mix(frame, mix_sources, now=now)
+                except Exception as exc:
+                    # F-0345: mix füzyon/kayıt hatası observe_frame'i
+                    # yarıda kesmemeli.
+                    logger.debug("observe_mix skipped after error: %s", exc)
             self._evaluate_and_save_learning_samples(
                 frame,
                 now,
@@ -774,6 +945,14 @@ class OmniGameLearner:
                 vitality_info=vitality_info,
                 obstacle_info=obstacle_info,
                 path_info=path_info,
+                # D22 + A13: kapı bu kare için observe_frame başında zaten
+                # değerlendirildi; sonucu aktar ki _evaluate aynı kareyi
+                # ikinci kez kapıdan geçirmesin — kapı stateful'dır, ikinci
+                # denetim aynı kareyi dHash yenilik denetiminde
+                # "duplicate_frame" ile reddeder ve hiçbir öğrenim örneği
+                # yazılmaz. Doğrudan çağrılarda gate_ok=None kalır (kapı
+                # burada çalışır); gate_ok=False kapıya danışmadan düşürür.
+                gate_ok=is_valid_frame,
             )
 
         return self.get_live_cognition_snapshot()
@@ -791,10 +970,19 @@ class OmniGameLearner:
 
         Low-confidence boxes stay out of labels/train. The train image is
         written only when a trusted F/E prompt or a hand label is in the mix.
+        A sample counts as saved only when at least one trusted box reached
+        train (F-0345) and the train image was written (S-0101); if the
+        train image cannot be written, the committed label is rolled back
+        so no orphan label without an image stays in train (S-3103).
+        Fuse/commit errors are reported, never raised.
         """
-        from dataset_factory.multi_mix import commit_mix_sample, fuse_sources
+        try:
+            from dataset_factory.multi_mix import commit_mix_sample, fuse_sources
 
-        fused = fuse_sources(sources)
+            fused = fuse_sources(sources)
+        except Exception as exc:
+            logger.debug("observe_mix fuse_sources failed: %s", exc)
+            return {"saved": False, "reason": "fuse_error", "error": str(exc)}
         now = time.time() if now is None else float(now)
         if not force and (now - self._last_general_sample_ts) < self.min_sample_interval_sec:
             fused["saved"] = False
@@ -805,8 +993,10 @@ class OmniGameLearner:
             fused["reason"] = "empty"
             return fused
 
-        self._last_general_sample_ts = now
-        sample_stem = stem or f"mix_{int(now * 1000)}_{random.randint(100, 999)}"
+        # B-11: throttle commit'ten ÖNCE tüketilmiyor — yalnızca kayıt
+        # gerçekten yapıldıysa ilerler (B-06'nın mix karşılığı).
+        sample_stem = stem or f"mix_{time.time_ns()}_{random.randint(100, 999)}"
+        mix_jpg: Optional[Path] = None
         if (
             self.save_screenshots
             and frame is not None
@@ -817,21 +1007,53 @@ class OmniGameLearner:
                 LEARNING_DIR.joinpath("mix").mkdir(parents=True, exist_ok=True)
                 ok, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                 if ok:
-                    (LEARNING_DIR / "mix" / f"{sample_stem}.jpg").write_bytes(enc.tobytes())
+                    mix_jpg = LEARNING_DIR / "mix" / f"{sample_stem}.jpg"
+                    mix_jpg.write_bytes(enc.tobytes())
             except Exception as exc:
                 logger.debug("mix frame save skipped: %s", exc)
 
         root = Path(dataset_dir) if dataset_dir is not None else DATASET_DIR
-        result = commit_mix_sample(
-            dataset_dir=root,
-            stem=sample_stem,
-            fused=fused,
-            split="train",
-        )
+        try:
+            result = commit_mix_sample(
+                dataset_dir=root,
+                stem=sample_stem,
+                fused=fused,
+                split="train",
+            )
+        except Exception as exc:
+            logger.debug("observe_mix commit_mix_sample failed: %s", exc)
+            # B-11: commit patladıysa mix jpg yetim kalmaz.
+            if mix_jpg is not None:
+                try:
+                    mix_jpg.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            fused["saved"] = False
+            fused["reason"] = "commit_error"
+            fused["error"] = str(exc)
+            return fused
         trusted_n = int(result.get("train_box_count", 0))
+        fused["train_box_count"] = trusted_n
+        fused["weak_box_count"] = int(result.get("weak_box_count", 0))
+        fused["label_path"] = result.get("label_path") or ""
+        fused["stem"] = sample_stem
+        if trusted_n <= 0:
+            # Güvenilir kutu yoksa train'e hiçbir şey yazılmadı; bunu
+            # "kaydedildi" saymak ve sayacı artırmak yanlıştır (F-0345).
+            # B-11: mix jpg de silinir — "kaydedilmedi" sayılan karenin
+            # dosyası diskte kalmaz.
+            if mix_jpg is not None:
+                try:
+                    mix_jpg.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            fused["saved"] = False
+            fused["reason"] = "no_trusted_boxes"
+            return fused
+        train_image_ok = True
+        train_image_error = ""
         if (
-            trusted_n > 0
-            and frame is not None
+            frame is not None
             and isinstance(frame, np.ndarray)
             and frame.size
         ):
@@ -841,14 +1063,46 @@ class OmniGameLearner:
                 ok, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
                 if ok:
                     (train_images / f"{sample_stem}.jpg").write_bytes(enc.tobytes())
+                else:
+                    # Kodlama başarısız: görüntü diske yazılmadı (S-0101).
+                    train_image_ok = False
+                    train_image_error = "train image encode failed"
             except Exception as exc:
                 logger.debug("mix train image skipped: %s", exc)
+                train_image_ok = False
+                train_image_error = str(exc)
+        else:
+            # S-3103: kare yoksa/boşsa train görüntüsü yazılmadı sayılır —
+            # train_image_ok True kalıp saved=True + sayaç artmaz.
+            train_image_ok = False
+            train_image_error = "no valid train frame"
+        if not train_image_ok:
+            # Train görüntüsü yazılamadıysa örnek "kaydedildi" sayılmaz;
+            # sayaç da artmaz (S-0101; F-0343 sınıfı kusur).
+            # S-3103: az önce commit edilen etiket geri alınır — train'de
+            # görüntüsü olmayan yetim etiket kalmaz.
+            label_path = str(fused.get("label_path") or "")
+            if label_path:
+                try:
+                    Path(label_path).unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.debug("orphan mix label rollback skipped: %s", exc)
+                fused["label_path"] = ""
+            # B-11: mix jpg de yetim kalmaz.
+            if mix_jpg is not None:
+                try:
+                    mix_jpg.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            fused["saved"] = False
+            fused["reason"] = "train_image_write_failed"
+            if train_image_error:
+                fused["error"] = train_image_error
+            return fused
+        # B-11: throttle yalnızca burada, kayıt gerçekten tamamlanınca tüketilir.
+        self._last_general_sample_ts = now
         self.total_learned_frames += 1
         fused["saved"] = True
-        fused["stem"] = sample_stem
-        fused["train_box_count"] = trusted_n
-        fused["weak_box_count"] = int(result.get("weak_box_count", 0))
-        fused["label_path"] = result.get("label_path") or ""
         return fused
 
     def _actor_is_moving(self) -> bool:
@@ -954,20 +1208,24 @@ class OmniGameLearner:
             active_cols = np.where(col_sums > 2)[0]
             if len(active_cols) > 0:
                 width_px = float(active_cols[-1] - active_cols[0] + 1)
-                # Fill ratio vs active bar span (not vs huge ROI) — old formula
-                # under-reported HP / flickered to ~0 and cleared combat lock.
-                span = max(1.0, width_px)
-                filled = float(np.sum(col_sums[active_cols[0] : active_cols[-1] + 1] > 2))
-                fill_ratio = filled / span
+                # F-0039: fill_ratio (dolu sütun / aktif aralık) tanımı gereği
+                # bitişik dolu barda ~1.0 çıkar; max(width_ratio,
+                # fill_ratio) bu yüzden HP'yi hep ~%100 okur. Doluluk,
+                # dolu genişliğin beklenen tam bar genişliğine oranıdır.
                 max_expected_bar_w = float(target_roi.shape[1] * 0.55)
                 width_ratio = min(1.0, width_px / max(40.0, max_expected_bar_w))
-                hp_ratio = min(1.0, max(0.08, max(width_ratio, fill_ratio)))
+                hp_ratio = min(1.0, max(0.08, width_ratio))
             else:
-                hp_ratio = max(0.35, float(self.current_monster_hp_ratio) or 0.35)
+                # S-3102: bar sekli var ama aktif sutun yoksa uydurma
+                # taban (0.35) yazilmaz — son bilinen gecerli deger
+                # korunur, yoksa olcum yok sayilir (0.0).
+                prev = float(self.current_monster_hp_ratio or 0.0)
+                hp_ratio = prev if prev >= 0.08 else 0.0
         elif has_reticle:
-            # Soft-lock without top bar: keep last known HP if any, else mid placeholder.
+            # Soft-lock without top bar: keep last known HP if any;
+            # S-3102: bilinmiyorsa uydurma 0.55 placeholder yazilmaz.
             prev = float(self.current_monster_hp_ratio or 0.0)
-            hp_ratio = prev if prev >= 0.08 else 0.55
+            hp_ratio = prev if prev >= 0.08 else 0.0
         else:
             hp_ratio = 0.0
 
@@ -1016,12 +1274,13 @@ class OmniGameLearner:
 
     def _analyze_skills_and_cooldowns(self, frame: np.ndarray, now: float) -> Dict[str, Any]:
         """
-        Alt skill barındaki 8 ana yuvayı (1, 2, 3, 4, 5, Q, E, R) inceler:
+        Alt skill barındaki 12 yuvayı (1, 2, 3, 4, 5, 6, 7, 8, Q, E, R, T) inceler:
         - Hangi skillerin bekleme süresi bitti (hazır)
         - Hangi skillerin bekleme süresinde (cooldown) veya manası yetersiz olduğunu öğrenir.
         """
         ready_list: List[str] = []
-        cd_map: Dict[str, float] = {}
+        cd_map: Dict[str, Any] = {}
+        cd_brightness: Dict[str, float] = {}
 
         if self.skill_bar_reader is not None and hasattr(self.skill_bar_reader, "inspect_skill_bar"):
             try:
@@ -1030,7 +1289,11 @@ class OmniGameLearner:
                     if info.get("ready", False) and info.get("mana_ok", True):
                         ready_list.append(slot_key)
                     else:
-                        cd_map[slot_key] = round(float(info.get("brightness", 0.0)), 1)
+                        # F-0482: bu değer süre değil, ölçülen parlaklıktır.
+                        # cooldown_skills yalnızca "cooldown'da" bayrağı
+                        # taşır (True); parlaklık ayrı sözlükte tutulur.
+                        cd_map[slot_key] = True
+                        cd_brightness[slot_key] = round(float(info.get("brightness", 0.0)), 1)
             except Exception as exc:
                 logger.debug("Skill bar okuma istisnası: %s", exc)
 
@@ -1042,15 +1305,17 @@ class OmniGameLearner:
         for cast_k in new_casts:
             self.record_skill_cast(cast_k, timestamp=now)
 
-        if not ready_list:
-            ready_list = ["1"]  # Güvenli temel vuruş fallback
-
+        # F-0341: okuyucu yokken ya da boş döndüğünde doğrulanmamış '1'
+        # uydurulmaz — hazır listesi boş kalır; bot doğrulanmamış
+        # skile spam yapmaz.
         self.ready_skills = ready_list
         self.cooldown_skills = cd_map
+        self.cooldown_brightness = cd_brightness
 
         return {
             "ready_skills": ready_list,
             "cooldown_skills": cd_map,
+            "cooldown_brightness": cd_brightness,
             "best_skill": self.select_best_skill(frame),
             "combo_sequence": self.get_combo_sequence(frame),
         }
@@ -1063,8 +1328,19 @@ class OmniGameLearner:
                 res = self.skill_bar_reader.select_best_ready_skill(frame, preferred_order=pref)
                 if res:
                     return str(res)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Dilim-30 B-08: the reader failure used to fall through
+                # with a bare `pass` — the local weight-sorted fallback
+                # (which DOES use learned weights) silently replaced the
+                # reader's choice. Throttled warning: this runs per frame.
+                now_w = time.monotonic()
+                if (now_w - float(getattr(self, "_last_select_reader_warn_ts", 0.0))) >= 60.0:
+                    self._last_select_reader_warn_ts = now_w
+                    logger.warning(
+                        "SkillBarReader.select_best_ready_skill failed, "
+                        "local weight-sorted fallback used: %s",
+                        exc,
+                    )
 
         with self._combat_learning_lock:
             candidates = [
@@ -1072,9 +1348,10 @@ class OmniGameLearner:
                 if k not in self.cooldown_skills
             ]
             if not candidates:
-                return self.ready_skills[0] if self.ready_skills else "1"
+                # F-0341: doğrulanmış hazır skill yoksa '1' uydurulmaz.
+                return ""
 
-            std_prio = {"R": 8, "E": 7, "Q": 6, "2": 5, "3": 4, "4": 3, "5": 2, "1": 1}
+            std_prio = dict(_STD_SKILL_PRIO)
             candidates.sort(
                 key=lambda k: (
                     self.get_skill_weight(k),
@@ -1092,8 +1369,9 @@ class OmniGameLearner:
                 if k not in self.cooldown_skills
             ]
             if not combo:
-                return ["1"]
-            std_prio = {"R": 8, "E": 7, "Q": 6, "2": 5, "3": 4, "4": 3, "5": 2, "1": 1}
+                # F-0341: doğrulanmış hazır skill yoksa kombo boştur.
+                return []
+            std_prio = dict(_STD_SKILL_PRIO)
             combo.sort(
                 key=lambda k: (
                     self.get_skill_weight(k),
@@ -1121,7 +1399,11 @@ class OmniGameLearner:
         hp_x1, hp_x2 = int(w * 0.355), int(w * 0.478)
         hp_roi = frame[hp_y1:hp_y2, hp_x1:hp_x2]
 
-        hp_ratio = 1.0
+        # S-3101: okunamayan bar %100 varsayilmaz — olcum yoksa None
+        # kalir; iksir tetikleyicisi ve ornek meta'si uydurma %100
+        # uzerinden calismaz.
+        hp_ratio: Optional[float] = None
+        hp_readable = False
         if hp_roi.size > 0:
             hsv_hp = cv2.cvtColor(hp_roi, cv2.COLOR_BGR2HSV)
             red_mask = (
@@ -1134,20 +1416,37 @@ class OmniGameLearner:
             if len(valid_cols) > 0:
                 hp_ratio = float(valid_cols[-1] + 1) / float(hp_roi.shape[1])
                 hp_ratio = float(np.clip(hp_ratio, 0.05, 1.0))
+                hp_readable = True
             else:
                 # Combat recovery üzerinden kontrol et
                 cr = getattr(self.bot_worker, "combat_recovery", None) if self.bot_worker else None
-                if cr and hasattr(cr, "get_player_hp_ratio"):
+                if cr is not None:
                     try:
-                        hp_ratio = float(cr.get_player_hp_ratio(frame))
+                        if hasattr(cr, "read_hp_ratio_or_none"):
+                            cr_ratio = cr.read_hp_ratio_or_none(frame)
+                            if cr_ratio is not None:
+                                cr_ratio = float(cr_ratio)
+                                if 0.0 < cr_ratio <= 1.0:
+                                    hp_ratio = cr_ratio
+                                    hp_readable = True
+                        elif hasattr(cr, "get_player_hp_ratio"):
+                            # get_player_hp_ratio okunamazsa 0.0 doner ve
+                            # 0.0 "bilinmiyor" demektir — gecerli olcum degil.
+                            cr_ratio = float(cr.get_player_hp_ratio(frame))
+                            if 0.0 < cr_ratio <= 1.0:
+                                hp_ratio = cr_ratio
+                                hp_readable = True
                     except Exception:
-                        hp_ratio = 1.0
+                        # Okunamayan HP 1.0 varsayilmaz — bilinmiyor kalir.
+                        hp_ratio = None
+                        hp_readable = False
 
         # 2. Oyuncu MP Barı Bölgesi (x: 0.522..0.645, y: 0.885..0.905)
         mp_x1, mp_x2 = int(w * 0.522), int(w * 0.645)
         mp_roi = frame[hp_y1:hp_y2, mp_x1:mp_x2]
 
-        mp_ratio = 1.0
+        mp_ratio: Optional[float] = None
+        mp_readable = False
         if mp_roi.size > 0:
             hsv_mp = cv2.cvtColor(mp_roi, cv2.COLOR_BGR2HSV)
             blue_mask = (
@@ -1161,9 +1460,16 @@ class OmniGameLearner:
             if len(valid_cols_mp) > 0:
                 mp_ratio = float(valid_cols_mp[-1] + 1) / float(mp_roi.shape[1])
                 mp_ratio = float(np.clip(mp_ratio, 0.05, 1.0))
+                mp_readable = True
 
-        self.player_hp_ratio = hp_ratio
-        self.player_mp_ratio = mp_ratio
+        # Yalnizca gercek olcum saklanir; okunamayan kare son bilinen
+        # degeri uydurma %100 ile ezmez.
+        if hp_readable and hp_ratio is not None:
+            self.player_hp_ratio = hp_ratio
+        if mp_readable and mp_ratio is not None:
+            self.player_mp_ratio = mp_ratio
+        self.player_hp_readable = hp_readable
+        self.player_mp_readable = mp_readable
 
         # 3. Otomatik İksir Mantığı (X, F6, B otomatik oyun mekanikleri kesinlikle dışlanır)
         worker = self.bot_worker
@@ -1173,43 +1479,59 @@ class OmniGameLearner:
 
         if worker is not None and hasattr(worker, "_check_and_trigger_auto_potions"):
             try:
-                hp_pot_used = bool(worker._check_and_trigger_auto_potions(hp_ratio, mp_ratio, frame_bgr))
+                hp_pot_used = bool(worker._check_and_trigger_auto_potions(hp_ratio, mp_ratio, frame))
             except Exception as w_exc:
                 logger.debug("worker._check_and_trigger_auto_potions hatası: %s", w_exc)
         else:
-            if hp_ratio < self.hp_pot_threshold and (now - self._last_hp_pot_ts) >= self.pot_cooldown_sec:
-                self._last_hp_pot_ts = now
-                hp_pot_used = True
+            # S-3101: okunamayan bar uzerinden iksir tetiklenmez.
+            # P0-6: cooldown damgası + hp_pot_used yalnızca press_key
+            # gerçekten gönderildiyse yazılır. Sürücü yoksa (driver None)
+            # veya press başarısızsa (0.0/False/istisna) damga YOK —
+            # eskisi gibi basılmamış iksir 8 sn "kullanıldı" sayılmaz.
+            if hp_ratio is not None and hp_ratio < self.hp_pot_threshold and (now - self._last_hp_pot_ts) >= self.pot_cooldown_sec:
+                hp_sent = False
                 if driver and hasattr(driver, "press_key"):
                     try:
-                        driver.press_key("7", hold_sec=0.065)
-                        logger.info(
-                            "🧪 [YZ Can/İksir Koruyucu] Oyuncu Canı: %%%d (< %%%d) -> HP İksiri (7) basıldı!",
-                            int(round(hp_ratio * 100)),
-                            int(round(self.hp_pot_threshold * 100)),
-                        )
+                        hp_sent = _press_ok(driver.press_key("7", hold_sec=0.065))
                     except Exception as exc:
                         logger.debug("HP iksiri basma hatası: %s", exc)
+                if hp_sent:
+                    self._last_hp_pot_ts = now
+                    hp_pot_used = True
+                    logger.info(
+                        "🧪 [YZ Can/İksir Koruyucu] Oyuncu Canı: %%%d (< %%%d) -> HP İksiri (7) basıldı!",
+                        int(round(hp_ratio * 100)),
+                        int(round(self.hp_pot_threshold * 100)),
+                    )
+                else:
+                    logger.debug("HP iksiri gönderilemedi (sürücü yok/başarısız) — cooldown başlatılmadı.")
 
-            if mp_ratio < self.mp_pot_threshold and (now - self._last_mp_pot_ts) >= self.pot_cooldown_sec:
-                self._last_mp_pot_ts = now
-                mp_pot_used = True
+            if mp_ratio is not None and mp_ratio < self.mp_pot_threshold and (now - self._last_mp_pot_ts) >= self.pot_cooldown_sec:
+                mp_sent = False
                 if driver and hasattr(driver, "press_key"):
                     try:
-                        driver.press_key("8", hold_sec=0.065)
-                        logger.info(
-                            "💧 [YZ Mana/İksir Koruyucu] Oyuncu Manası: %%%d (< %%%d) -> Mana İksiri (8) basıldı!",
-                            int(round(mp_ratio * 100)),
-                            int(round(self.mp_pot_threshold * 100)),
-                        )
+                        mp_sent = _press_ok(driver.press_key("8", hold_sec=0.065))
                     except Exception as exc:
                         logger.debug("Mana iksiri basma hatası: %s", exc)
+                if mp_sent:
+                    self._last_mp_pot_ts = now
+                    mp_pot_used = True
+                    logger.info(
+                        "💧 [YZ Mana/İksir Koruyucu] Oyuncu Manası: %%%d (< %%%d) -> Mana İksiri (8) basıldı!",
+                        int(round(mp_ratio * 100)),
+                        int(round(self.mp_pot_threshold * 100)),
+                    )
+                else:
+                    logger.debug("Mana iksiri gönderilemedi (sürücü yok/başarısız) — cooldown başlatılmadı.")
 
         return {
-            "player_hp_ratio": round(hp_ratio, 3),
-            "player_hp_percent": int(round(hp_ratio * 100)),
-            "player_mp_ratio": round(mp_ratio, 3),
-            "player_mp_percent": int(round(mp_ratio * 100)),
+            # S-3101: okunamayan bar None doner — %100 uydurulmaz.
+            "player_hp_ratio": round(hp_ratio, 3) if hp_ratio is not None else None,
+            "player_hp_percent": int(round(hp_ratio * 100)) if hp_ratio is not None else None,
+            "player_mp_ratio": round(mp_ratio, 3) if mp_ratio is not None else None,
+            "player_mp_percent": int(round(mp_ratio * 100)) if mp_ratio is not None else None,
+            "hp_readable": hp_readable,
+            "mp_readable": mp_readable,
             "hp_pot_used": hp_pot_used,
             "mp_pot_used": mp_pot_used,
         }
@@ -1275,36 +1597,112 @@ class OmniGameLearner:
     # 6. Akıllı Ekran Görüntüsü Kaydetme ve Veri Seti Üretimi
     # =========================================================================
 
-    def _detect_real_boxes(self, frame: np.ndarray, category: str) -> List[Dict[str, Any]]:
+    def _get_yolo_labeler(self):
+        """Paylaşılan YOLOAutoLabeler örneği (F-0342): her karede yeniden
+        kurulmaz. Kurulum başarısız olursa 60 sn boyunca tekrar denenmez.
+
+        v20-onnx-reload: bot_worker'daki VisionEngine / MaterialScanner /
+        ONNXYolo3DDetector enjekte edilir — aksi halde her labeler kendi
+        MaterialScanner'ı üzerinden ayrı CUDA session açıyordu.
         """
-        Detect genuine visual bounding boxes via YOLOAutoLabeler.
-        Returns empty list [] if no genuine objects are detected; never fabricates
-        hardcoded coordinates.
-        """
+        if self._yolo_labeler is not None:
+            return self._yolo_labeler
+        if (time.time() - self._yolo_labeler_failed_ts) < 60.0:
+            return None
         try:
             from dataset_factory.yolo_auto_labeler import YOLOAutoLabeler
 
-            labeler = YOLOAutoLabeler()
-            anns = labeler.auto_label_frame(frame)
+            kwargs: Dict[str, Any] = {}
+            worker = self.bot_worker
+            if worker is not None:
+                ve = getattr(worker, "vision", None)
+                ms = getattr(worker, "material_scanner", None)
+                det = getattr(worker, "yolo_detector", None)
+                if ve is not None:
+                    kwargs["vision_engine"] = ve
+                if ms is not None:
+                    kwargs["material_scanner"] = ms
+                if det is not None:
+                    kwargs["yolo_detector"] = det
+            self._yolo_labeler = YOLOAutoLabeler(**kwargs)
+            return self._yolo_labeler
+        except Exception as exc:
+            self._yolo_labeler_failed_ts = time.time()
+            logger.debug("YOLOAutoLabeler init failed, will retry later: %s", exc)
+            return None
+
+    def _detect_real_boxes(
+        self,
+        frame: np.ndarray,
+        category: str,
+        cache_key: Optional[int] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Detect genuine visual bounding boxes via YOLOAutoLabeler.
+
+        Returns a list (possibly empty: genuinely nothing detected) or
+        None when the detector itself is unavailable/failed (B-04) — the
+        two cases must never be confused: a failed detector must skip
+        the save, an empty detection may still save a frame-only record.
+
+        D22 per-frame cache: the detector ignores `category` — every call on
+        the same frame returns the same boxes — so _evaluate passes the
+        frame's dHash as `cache_key` and the 5 category calls collapse to a
+        single auto_label_frame inference. `cache_key=None` disables the
+        cache (old behaviour). A shallow list copy is returned so callers
+        cannot mutate the cached entry.
+        """
+        if cache_key is not None and cache_key == self._detect_cache_key:
+            return list(self._detect_cache_boxes) if self._detect_cache_boxes is not None else None
+        try:
+            labeler = self._get_yolo_labeler()
+            if labeler is None:
+                if cache_key is not None:
+                    self._detect_cache_key = cache_key
+                    self._detect_cache_boxes = None
+                return None
+            # V20-YZ-ETİKET: öğrenim yakalaması karedeki HER ŞEYİ etiketler
+            # (full_scan=True). Stem verilmediği için ("") HUD/yol stem
+            # kapıları kapalı kalırdı; skills/obstacles/paths/vitality
+            # kutuları hiç üretilemez, kare hep "monsters" düşerdi.
+            # Çıkan kutular zayıf-cap'lidir; _filter_boxes_for_category
+            # bölümler, _save_learning_sample incelemeye yazar.
+            anns = labeler.auto_label_frame(frame, full_scan=True)
             boxes: List[Dict[str, Any]] = []
             for a in anns:
                 if isinstance(a, dict) and "cx" in a and "cy" in a and "w" in a and "h" in a:
+                    # B-09: a box without a class_id is NOT a monster (10)
+                    # and a box without a confidence is NOT 0.85-confident
+                    # (which would clear the CONF_EMIN trusted bar). Unclassed
+                    # boxes are dropped; unmeasured confidence falls back
+                    # to the weak learn-auto level (0.50).
+                    try:
+                        cid = int(a["class_id"])
+                    except (KeyError, TypeError, ValueError):
+                        logger.debug("Dropping detection without class_id: %r", a)
+                        continue
                     boxes.append(
                         {
-                            "class_id": int(a.get("class_id", 10)),
+                            "class_id": cid,
                             "box": (
                                 float(a["cx"]),
                                 float(a["cy"]),
                                 float(a["w"]),
                                 float(a["h"]),
                             ),
-                            "confidence": float(a.get("confidence", 0.85)),
+                            "confidence": float(a.get("confidence", _LEARN_AUTO_CONF)),
                         }
                     )
+            if cache_key is not None:
+                self._detect_cache_key = cache_key
+                self._detect_cache_boxes = list(boxes)
             return boxes
         except Exception as exc:
             logger.debug("Visual detection in learner failed: %s", exc)
-            return []
+            if cache_key is not None:
+                self._detect_cache_key = cache_key
+                self._detect_cache_boxes = None
+            return None
 
     def _evaluate_and_save_learning_samples(
         self,
@@ -1317,6 +1715,7 @@ class OmniGameLearner:
         obstacle_info: Dict[str, Any],
         path_info: Dict[str, Any],
         vitality_info: Optional[Dict[str, Any]] = None,
+        gate_ok: Optional[bool] = None,
     ) -> None:
         """
         Kullanıcının talep ettiği üzere sadece gem toplarken değil:
@@ -1325,14 +1724,30 @@ class OmniGameLearner:
         - Yolda yürürken ve araziyi tanırken
         - Mağara, kaya, engel veya uçuruma yaklaşıldığında
         otomatik olarak ekran görüntüsü çeker ve veri setine kaydeder.
+
+        gate_ok=True ise kare bu çağrı zincirinde zaten kapıdan geçmiştir;
+        ikinci kapı denetimi atlanır (aynı karenin dHash'i önbellekte
+        olduğundan "duplicate_frame" ile reddedilirdi). gate_ok=None ise
+        kapı burada çalışır (eski davranış); gate_ok=False kapıya
+        danışmadan düşürür.
         """
         if not self.save_screenshots:
             return
 
         # GameFrameGate protection: Drop desktop/non-game frames before saving to training dataset
-        is_valid_frame, gate_reason = self.check_game_frame(frame, require_foreground=False)
-        if not is_valid_frame:
-            logger.debug("Learning sample dropped by GameFrameGate: %s", gate_reason)
+        # D22 + A13: gate_ok verildiyse (observe_frame az önce aynı kareyi
+        # değerlendirdi) kapı ikinci kez çalıştırılmaz. Kapı stateful'dır:
+        # Kapı 3 (novelty) kabul edilen karenin dHash'ini önbelleğe yazar;
+        # ikinci değerlendirme aynı kareyi hamming 0 < 6 ile "duplicate"
+        # diye reddeder ve observe_frame yoluyla HİÇBİR öğrenim karesi
+        # kaydedilemezdi. gate_ok=None ise eski davranış korunur (kapı
+        # burada çalışır); gate_ok=False kapıya danışmadan düşürür.
+        if gate_ok is None:
+            gate_ok, gate_reason = self.check_game_frame(frame, require_foreground=False)
+            if not gate_ok:
+                logger.debug("Learning sample dropped by GameFrameGate: %s", gate_reason)
+                return
+        if not gate_ok:
             return
 
         vitality_info = vitality_info or {}
@@ -1344,9 +1759,43 @@ class OmniGameLearner:
         base_iv = self.min_sample_interval_sec * (5.0 if in_combat else 1.0)
 
         # Çok bulanık veya hareketsiz tekrarlayan kareleri atla
+        # F-0483: dHash hesaplanamazsa None döner; rastgele değerle
+        # yanlış dedup yapılmaz, hatalı kare dedup kümesine girmez.
         dhash_val = self._compute_dhash(frame)
-        if dhash_val in self._seen_dhashes:
+        if dhash_val is not None and dhash_val in self._seen_dhashes:
             return
+
+        # A13: _detect_real_boxes kategori argümanını yok sayar — aynı
+        # kareye her kategori için ayrı YOLO çıkarımı yapmak aynı kutuları
+        # 5 kez üretir. Kare başına tek çıkarım yapılır, sonuç paylaşılır.
+        # B-04: _detect_once None dönebilir (etiketleyici arızalı) — bu,
+        # "hiç nesne yok" ([]) halinden farklıdır; None ise hiçbir dal
+        # kayıt yapmaz.
+        _shared_boxes: Optional[List[Dict[str, Any]]] = None
+        _shared_computed = False
+
+        def _detect_once() -> Optional[List[Dict[str, Any]]]:
+            nonlocal _shared_boxes, _shared_computed
+            if not _shared_computed:
+                # D22 cache_key ile birleşir: aynı karenin dHash'i
+                # _detect_real_boxes iç önbelleğinde de tek çıkarımda
+                # birleşir (bu _evaluate çağrısı dışındaki çağrılar için
+                # de geçerli).
+                _shared_boxes = self._detect_real_boxes(frame, "general", cache_key=dhash_val)
+                _shared_computed = True
+                if _shared_boxes is None:
+                    now_w = time.monotonic()
+                    if (now_w - self._last_detect_failed_warn_ts) >= 60.0:
+                        self._last_detect_failed_warn_ts = now_w
+                        logger.warning(
+                            "YOLO etiketleyici yok/arızalı — öğrenim kaydı "
+                            "atlandı (etiketleyici 60 sn içinde tekrar denenmez)"
+                        )
+            return _shared_boxes
+
+        # B-03: dhash yalnızca gerçekten kaydedilmiş kare için hatırlanır;
+        # hiçbir dal kayıt üretemediyse kare "görüldü" sayılmaz.
+        saved_any = False
 
         # 1. Canavar & Savaş Öğrenimi Örneklemesi (Gerçek görsel tespit)
         if (
@@ -1355,113 +1804,194 @@ class OmniGameLearner:
             or in_combat
         ):
             if now - self._last_monster_sample_ts >= base_iv:
-                self._last_monster_sample_ts = now
-                monster_boxes = self._detect_real_boxes(frame, "monsters")
-                self._save_learning_sample(
-                    frame=frame,
-                    category="monsters",
-                    annotations_meta={
-                        "monster_targeted": monster_info.get("has_target"),
-                        "monster_hp_percent": monster_info.get("hp_percent"),
-                        "monster_died": monster_info.get("monster_died"),
-                        "state": current_state,
-                    },
-                    boxes=monster_boxes,
-                )
-                self.monsters_captured += 1
+                monster_boxes = _detect_once()
+                if monster_boxes is None:
+                    # B-04: etiketleyici arızası — kayıt yok, throttle yok.
+                    pass
+                else:
+                    # B-06: throttle yalnızca kayıt gerçekten yapıldıysa
+                    # tüketilir; başarısız deneme 5 sn sonra tekrarlanır.
+                    saved = self._save_learning_sample(
+                        frame=frame,
+                        category="monsters",
+                        annotations_meta={
+                            "monster_targeted": monster_info.get("has_target"),
+                            "monster_hp_percent": monster_info.get("hp_percent"),
+                            "monster_died": monster_info.get("monster_died"),
+                            "state": current_state,
+                        },
+                        boxes=monster_boxes,
+                        dhash=dhash_val,
+                    ) is not False
+                    self._last_monster_sample_ts = now if saved else now - base_iv + 5.0
+                    if saved:
+                        # F-0343: sayaç yalnızca kayıt gerçekten yapıldıysa artar.
+                        self.monsters_captured += 1
+                        saved_any = True
 
         # 2. Skill barı — savaşta seyrek (disk I/O donması, gerçek tespit)
         skill_iv = max(20.0, base_iv * 2.0) if in_combat else max(8.0, self.min_sample_interval_sec * 2.0)
         if now - self._last_skill_sample_ts >= skill_iv:
-            self._last_skill_sample_ts = now
-            skill_boxes = self._detect_real_boxes(frame, "skills")
-            self._save_learning_sample(
-                frame=frame,
-                category="skills",
-                annotations_meta={
-                    "ready_skills": skill_info.get("ready_skills"),
-                    "cooldown_skills": skill_info.get("cooldown_skills"),
-                    "best_skill": skill_info.get("best_skill"),
-                },
-                boxes=skill_boxes,
-            )
-            self.skills_captured += 1
+            # B-10: skill dalı artık koşulsuz periyodik kayıt yapmıyor —
+            # bar durumu (hazır/beklemede imzası) son örnekten beri
+            # değişmediyse boşta kare kaydedilmez.
+            _ready = skill_info.get("ready_skills") or []
+            _cd = skill_info.get("cooldown_skills") or {}
+            try:
+                skill_sig = (
+                    tuple(sorted(str(k) for k in _ready)),
+                    tuple(sorted(str(k) for k in _cd)),
+                )
+            except TypeError:
+                skill_sig = (tuple(_ready), tuple(_cd))
+            if skill_sig != self._last_skill_signature:
+                skill_boxes = _detect_once()
+                if skill_boxes is None:
+                    pass
+                else:
+                    saved = self._save_learning_sample(
+                        frame=frame,
+                        category="skills",
+                        annotations_meta={
+                            "ready_skills": skill_info.get("ready_skills"),
+                            "cooldown_skills": skill_info.get("cooldown_skills"),
+                            "best_skill": skill_info.get("best_skill"),
+                        },
+                        boxes=skill_boxes,
+                        dhash=dhash_val,
+                    ) is not False
+                    self._last_skill_sample_ts = now if saved else now - skill_iv + 5.0
+                    if saved:
+                        self.skills_captured += 1
+                        self._last_skill_signature = skill_sig
+                        saved_any = True
 
         # 3. Engel, Mağara & Derinlik Öğrenimi Örneklemesi (Gerçek tespit)
         if (not in_combat) and self._obstacle_sample_allowed(obstacle_info):
             if now - self._last_obstacle_sample_ts >= self.min_sample_interval_sec:
-                self._last_obstacle_sample_ts = now
-                steer = float(obstacle_info.get("recommended_steer_deg") or 0.0)
-                obstacle_boxes = self._detect_real_boxes(frame, "obstacles")
-                self._save_learning_sample(
-                    frame=frame,
-                    category="obstacles",
-                    annotations_meta={
-                        "obstacle_type": obstacle_info.get("obstacle_type"),
-                        "recommended_steer_deg": steer,
-                        "layout_auto": False,
-                    },
-                    boxes=obstacle_boxes,
-                )
-                self.obstacles_captured += 1
+                obstacle_boxes = _detect_once()
+                if obstacle_boxes is None:
+                    pass
+                else:
+                    saved = self._save_learning_sample(
+                        frame=frame,
+                        category="obstacles",
+                        annotations_meta={
+                            "obstacle_type": obstacle_info.get("obstacle_type"),
+                            "recommended_steer_deg": float(obstacle_info.get("recommended_steer_deg") or 0.0),
+                            "layout_auto": False,
+                        },
+                        boxes=obstacle_boxes,
+                        dhash=dhash_val,
+                    ) is not False
+                    self._last_obstacle_sample_ts = (
+                        now if saved else now - self.min_sample_interval_sec + 5.0
+                    )
+                    if saved:
+                        self.obstacles_captured += 1
+                        saved_any = True
 
         # 4. Yol & Yürüme Öğrenimi Örneklemesi (Gerçek tespit)
         if (not in_combat) and path_info.get("is_walking") and self._actor_is_moving():
-            if now - self._last_path_sample_ts >= max(8.0, self.min_sample_interval_sec * 2.0):
-                self._last_path_sample_ts = now
-                path_boxes = self._detect_real_boxes(frame, "paths")
-                self._save_learning_sample(
-                    frame=frame,
-                    category="paths",
-                    annotations_meta={
-                        "walking": True,
-                        "state": current_state,
-                        "mode": current_mode,
-                    },
-                    boxes=path_boxes,
-                )
-                self.paths_captured += 1
+            path_iv = max(8.0, self.min_sample_interval_sec * 2.0)
+            if now - self._last_path_sample_ts >= path_iv:
+                path_boxes = _detect_once()
+                if path_boxes is None:
+                    pass
+                else:
+                    saved = self._save_learning_sample(
+                        frame=frame,
+                        category="paths",
+                        annotations_meta={
+                            "walking": True,
+                            "state": current_state,
+                            "mode": current_mode,
+                        },
+                        boxes=path_boxes,
+                        dhash=dhash_val,
+                    ) is not False
+                    self._last_path_sample_ts = now if saved else now - path_iv + 5.0
+                    if saved:
+                        self.paths_captured += 1
+                        saved_any = True
 
         # 5. Oyuncu Can & Mana (Vitality) (Gerçek tespit)
-        hp_pct = int(vitality_info.get("player_hp_percent", 100) or 100)
-        mp_pct = int(vitality_info.get("player_mp_percent", 100) or 100)
+        # S-3101: okunamayan bar None'dur — `or 100` ile %100'e
+        # cevrilmez; dusuk-can kosulu ve ornek meta'si uydurma
+        # %100 uzerinden calismaz.
+        _hp_pct = vitality_info.get("player_hp_percent")
+        hp_pct = int(_hp_pct) if _hp_pct is not None else None
+        _mp_pct = vitality_info.get("player_mp_percent")
+        mp_pct = int(_mp_pct) if _mp_pct is not None else None
         pot_event = bool(vitality_info.get("hp_pot_used") or vitality_info.get("mp_pot_used"))
         vitality_periodic = (not in_combat) and (now - self._last_vitality_sample_ts) >= 20.0
-        if pot_event or hp_pct < 65 or mp_pct < 50 or vitality_periodic:
-            if now - self._last_vitality_sample_ts >= (base_iv if in_combat else self.min_sample_interval_sec):
-                self._last_vitality_sample_ts = now
-                vital_boxes = self._detect_real_boxes(frame, "vitality")
-                self._save_learning_sample(
-                    frame=frame,
-                    category="vitality",
-                    annotations_meta={
-                        "player_hp_percent": hp_pct,
-                        "player_mp_percent": mp_pct,
-                        "hp_pot_used": vitality_info.get("hp_pot_used"),
-                        "mp_pot_used": vitality_info.get("mp_pot_used"),
-                    },
-                    boxes=vital_boxes,
-                )
-                self.vitality_captured += 1
+        if pot_event or (hp_pct is not None and hp_pct < 65) or (mp_pct is not None and mp_pct < 50) or vitality_periodic:
+            vit_iv = base_iv if in_combat else self.min_sample_interval_sec
+            if now - self._last_vitality_sample_ts >= vit_iv:
+                vital_boxes = _detect_once()
+                if vital_boxes is None:
+                    pass
+                else:
+                    saved = self._save_learning_sample(
+                        frame=frame,
+                        category="vitality",
+                        annotations_meta={
+                            "player_hp_percent": hp_pct,
+                            "player_mp_percent": mp_pct,
+                            "hp_pot_used": vitality_info.get("hp_pot_used"),
+                            "mp_pot_used": vitality_info.get("mp_pot_used"),
+                        },
+                        boxes=vital_boxes,
+                        dhash=dhash_val,
+                    ) is not False
+                    self._last_vitality_sample_ts = now if saved else now - vit_iv + 5.0
+                    if saved:
+                        self.vitality_captured += 1
+                        saved_any = True
 
-        self._seen_dhashes.add(dhash_val)
-        if len(self._seen_dhashes) > 600:
-            self._seen_dhashes.clear()
+        # B-03: dedup yalnızca kaydedilmiş kareyi "görüldü" sayar.
+        if saved_any and dhash_val is not None:
+            self._remember_dhash(dhash_val)
 
     def _save_learning_sample(
         self,
         frame: np.ndarray,
         category: str,
         annotations_meta: Dict[str, Any],
-        yolo_class_id: int = 10,
-        box_norm: Tuple[float, float, float, float] = (0.5, 0.5, 0.2, 0.2),
         boxes: Optional[Sequence[Dict[str, Any]]] = None,
-    ) -> None:
-        """Kareyi hem kategori dizinine hem de YOLO eğitim klasörüne kaydeder."""
+        dhash: Optional[int] = None,
+    ) -> bool:
+        """Kareyi hem kategori dizinine hem de YOLO eğitim klasörüne kaydeder.
+
+        Kayıt başarısını döner (F-0343): False ise çağıran sayaç
+        artırmaz. Görüntü kodlanamazsa da False döner.
+
+        B-01/B-02: yalnızca bu kategoriye ait kutular yazılır; üst düzey
+        `box_norm`/`class_id` ilk kategori kutusudur (artık en düşük
+        class_id'li kutu değil). Kategoriye ait kutu yoksa hiçbir dosya
+        yazılmaz ve False döner — boş kayıt sayaç şişirmez (B-04/B-10).
+        B-13: ölü `box_norm`/`yolo_class_id` parametreleri kaldırıldı
+        (hiçbir çağıran geçmiyordu; varsayılanları şablon kutu ve
+        canavar-10 uydurmasıydı).
+        """
+        # B-07: kısmi kayıtta geri alınacak dosyalar (S-3103'ün bu
+        # fonksiyondaki karşılığı — yazılan her dosya izlenir).
+        written: List[Path] = []
         try:
-            ts_int = int(time.time() * 1000)
+            # B-01: kategori filtresi — tek doğruluk kaynağı
+            # _filter_boxes_for_category (çağıran zaten filtrelemiş olsa
+            # da savunma amaçlı tekrar uygulanır).
+            label_boxes = _filter_boxes_for_category(boxes, category)
+            if not label_boxes:
+                logger.debug(
+                    "Öğrenim kaydı atlandı [%s]: kategoriye ait kutu yok",
+                    category,
+                )
+                return False
+
+            ts_ns = time.time_ns()
             rnd = random.randint(100, 999)
-            base_name = f"learn_{category}_{ts_int}_{rnd}"
+            base_name = f"learn_{category}_{ts_ns}_{rnd}"
 
             # 1. Kategori klasörüne kaydet
             cat_dir = LEARNING_DIR / category
@@ -1470,33 +2000,38 @@ class OmniGameLearner:
 
             # Unicode-safe JPEG kaydı
             success, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
-            if success:
-                with open(img_path, "wb") as f:
-                    f.write(enc.tobytes())
+            if not success:
+                logger.debug("Öğrenim karesi kodlanamadı [%s]; kayıt atlandı", category)
+                return False
+            with open(img_path, "wb") as f:
+                f.write(enc.tobytes())
+            written.append(img_path)
 
             # Genuine visual boxes only: boxes=None or boxes=[] means frame only (no fake synthetic box)
-            if boxes is None:
-                label_boxes = []
-            else:
-                label_boxes = [b for b in boxes if isinstance(b, dict) and "box" in b]
-
-            first_box = label_boxes[0].get("box") if label_boxes else None
-            first_class_id = (
-                int(label_boxes[0].get("class_id", yolo_class_id))
-                if label_boxes
-                else None
-            )
+            first_box = label_boxes[0].get("box")
+            try:
+                first_class_id = int(label_boxes[0].get("class_id"))
+            except (KeyError, TypeError, ValueError):
+                first_class_id = None
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "timestamp": time.time(),
                         "category": category,
                         "metadata": annotations_meta,
+                        # B-16: denetim izi — hangi kare, hangi çözünürlük,
+                        # hangi dedektör. Aynı karenin 5 kopyası (B-01)
+                        # artık dhash ile geriye dönük birleştirilebilir.
+                        "dhash": f"{int(dhash):#018x}" if dhash is not None else None,
+                        "frame_shape": [int(frame.shape[0]), int(frame.shape[1])]
+                        if hasattr(frame, "shape") and len(frame.shape) >= 2
+                        else None,
+                        "detection_source": "yolo_auto_labeler",
                         "box_norm": list(first_box) if first_box else None,
                         "class_id": first_class_id,
                         "boxes": [
                             {
-                                "class_id": int(item.get("class_id", yolo_class_id)),
+                                "class_id": int(item["class_id"]),
                                 "box": list(item["box"]),
                             }
                             for item in label_boxes
@@ -1506,6 +2041,7 @@ class OmniGameLearner:
                     ensure_ascii=False,
                     indent=2,
                 )
+            written.append(json_path)
 
             # 2. YOLO Eğitim Veri Setine (images/train & labels/train) ekle
             train_img = TRAIN_IMAGES_DIR / f"{base_name}.jpg"
@@ -1514,6 +2050,7 @@ class OmniGameLearner:
             if success:
                 with open(train_img, "wb") as f:
                     f.write(enc.tobytes())
+                written.append(train_img)
 
             conf = float(_LEARN_AUTO_CONF)
             annotations = []
@@ -1521,19 +2058,29 @@ class OmniGameLearner:
                 raw_box = item.get("box")
                 if not raw_box or len(raw_box) != 4:
                     continue
+                # B-09: sınıfı olmayan kutu atılır — canavar (10)
+                # varsayımı yok.
+                try:
+                    item_cid = int(item["class_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
                 cx, cy, bw, bh = raw_box
                 box_conf = float(item.get("confidence", conf))
                 annotations.append(
                     {
-                        "class_id": int(item.get("class_id", yolo_class_id)),
+                        "class_id": item_cid,
                         "cx": float(cx),
                         "cy": float(cy),
                         "w": float(bw),
                         "h": float(bh),
                         "confidence": box_conf,
                         "source": str(item.get("source", f"omni_{category}")),
-                        "trusted": bool(item.get("trusted", box_conf >= 0.80)),
-                        "weak": bool(item.get("weak", box_conf < 0.80)),
+                        # P1-12 (K-31): "Emin" eşiği tek sabittir (CONF_EMIN);
+                        # eski 0.80 barı aynı kutuyu başka yollarda weak yapıyordu.
+                        # Bu damga tek başına eğitmez — K1 kapısı (train_txt_boxes)
+                        # learn_auto kutuyu insan onayı olmadan txt'ye sokmaz.
+                        "trusted": bool(item.get("trusted", box_conf >= _CONF_EMIN)),
+                        "weak": bool(item.get("weak", box_conf < _CONF_EMIN)),
                         "omni_synthetic": False,  # Pure genuine visual detection, zero synthetic poisoning
                         "learn_auto": True,
                     }
@@ -1562,6 +2109,42 @@ class OmniGameLearner:
                 label_path=train_lbl,
                 annotations=annotations,
             )
+            # P2-21 (O004-K1 / K-07): train_box_count OKUNUR — commit
+            # 0 kutu yazdıysa kare "kaydedildi" sayılmaz: sayaç artmaz,
+            # True dönmez. (Eskiden debug logda okunup yutuluyordu;
+            # total_learned_frames yine de artıyordu.)
+            # F3: geri alma YALNIZCA eğitim çıktısını kapsar (train
+            # img/lbl) — LEARNING_DIR kaydı (kategori img+json) Adım 2
+            # inceleme kuyruğudur, eğitim iddiası değildir. K1/E-06
+            # kapısı gereği onaysız auto kutu zaten weak olarak review
+            # sidecar'da kalır; kategori kaydını da silmek insan-onay
+            # kapısını anlamsız bırakırdı (onaylanacak örnek kalmaz) ve
+            # v17'de öğrenici hiçbir auto örneği biriktiremezdi
+            # (train_box_count auto kutuda deterministik 0'dır — K-10
+            # kanıtı). Review JSON commit tarafından yazılır ve geri
+            # alma listesinde zaten değildir; weak kutu incelemede kalır.
+            if int(result.get("train_box_count", 0) or 0) <= 0:
+                logger.warning(
+                    "Öğrenim karesi eğitime girmedi [%s] #%s: commit 0 kutu yazdı "
+                    "(dropped=%s trusted_in=%s trusted_out=%s) — inceleme kaydı "
+                    "duruyor, sayaç artmadı",
+                    category,
+                    base_name,
+                    result.get("dropped"),
+                    result.get("trusted_in"),
+                    result.get("trusted_out"),
+                )
+                for p in (train_img, train_lbl):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                return False
+            if train_lbl.is_file():
+                written.append(train_lbl)
+            review_json = DATASET_DIR / "review" / "train" / f"{base_name}.json"
+            if review_json.is_file():
+                written.append(review_json)
             logger.debug(
                 "learn_auto write [%s] stem=%s train_boxes=%s weak=%s sources=%s conf=%.2f",
                 category,
@@ -1585,19 +2168,65 @@ class OmniGameLearner:
                 self.total_learned_frames,
                 img_path.name,
             )
+            return True
         except Exception as exc:
-            logger.debug("Öğrenim karesi kaydetme hatası: %s", exc)
+            # B-07: kısmi kayıt geri alınır — "başarısız" sayılan kaydın
+            # dosyaları diskte kalmaz (S-3103). Hata artık debug değil,
+            # warning düzeyinde: sessiz disk arızası gizlenmez (B-14).
+            for p in written:
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            logger.warning("Öğrenim karesi kaydetme hatası [%s]: %s", category, exc)
+            return False
+
+    def _remember_dhash(self, dhash_val: int) -> None:
+        """Records a frame hash in the bounded dedup history.
+
+        Oldest-first eviction at _DEDUP_MAX_HASHES entries; the history is
+        never wiped wholesale (the old clear() at >600 forgot every frame
+        at once, so duplicates seen before the wipe could be saved again).
+        `_seen_dhashes` stays a plain set, so external `.clear()` calls
+        (e.g. tests resetting dedup state) keep working; stale order
+        entries are skipped harmlessly during eviction.
+        """
+        if dhash_val in self._seen_dhashes:
+            return
+        self._seen_dhashes.add(dhash_val)
+        self._seen_dhash_order.append(dhash_val)
+        while (
+            len(self._seen_dhashes) > _DEDUP_MAX_HASHES
+            and self._seen_dhash_order
+        ):
+            oldest = self._seen_dhash_order.popleft()
+            self._seen_dhashes.discard(oldest)
 
     @staticmethod
-    def _compute_dhash(image: np.ndarray, hash_size: int = 8) -> int:
-        """Hızlı perceptual fark karma (dHash) algoritması."""
+    def _compute_dhash(image: np.ndarray, hash_size: int = 8) -> Optional[int]:
+        """Hızlı perceptual fark karma (dHash) algoritması.
+
+        Hata durumunda rastgele değer DÖNMEZ (F-0483): rastgele hash hem
+        yanlış dedup'a hem de tekrar kayda yol açar. None döner; çağıran
+        dedup'u atlar.
+
+        D22: INTER_AREA ile 3-kanal tam kare küçültmek çıkarımın en
+        pahalı adımıydı (~7 ms/kare, profil: süre %98 resize'da).
+        INTER_LINEAR + önce küçült/sonra griye çevir + packbits ile aynı
+        dedup sözleşmesi korunur (aynı/neredeyse aynı kare → aynı hash,
+        farklı kare → farklı hash) ve hash ~100 kat hızlanır. Hash
+        değerleri eski sürümle birebir aynı değildir ama hash'ler
+        diske yazılmaz, yalnızca oturum içi dedup'ta kullanılır.
+        """
         try:
-            resized = cv2.resize(image, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
+            resized = cv2.resize(
+                image, (hash_size + 1, hash_size), interpolation=cv2.INTER_LINEAR
+            )
             gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY) if resized.ndim == 3 else resized
             diff = gray[:, 1:] > gray[:, :-1]
-            return sum([2 ** i for (i, v) in enumerate(diff.flatten()) if v])
+            return int.from_bytes(np.packbits(diff.flatten()).tobytes(), "big")
         except Exception:
-            return random.randint(0, 10000000)
+            return None
 
     # =========================================================================
     # 7. Canlı Biliş ve Telemetri Özeti
@@ -1614,12 +2243,35 @@ class OmniGameLearner:
                 "obstacles_captured": self.obstacles_captured,
                 "vitality_captured": self.vitality_captured,
                 "monster_targeted": self.current_monster_targeted,
-                "monster_hp_ratio": round(self.current_monster_hp_ratio, 2),
-                "monster_hp_percent": int(round(self.current_monster_hp_ratio * 100)),
-                "player_hp_ratio": round(self.player_hp_ratio, 2),
-                "player_hp_percent": int(round(self.player_hp_ratio * 100)),
-                "player_mp_ratio": round(self.player_mp_ratio, 2),
-                "player_mp_percent": int(round(self.player_mp_ratio * 100)),
+                # B-15: hedef yokken canavar canı %0 değildir — bilinmiyor.
+                # Tüketiciler None görünce atlar (state_machine F-0046).
+                "monster_hp_ratio": round(self.current_monster_hp_ratio, 2)
+                if self.current_monster_targeted
+                else None,
+                "monster_hp_percent": int(round(self.current_monster_hp_ratio * 100))
+                if self.current_monster_targeted
+                else None,
+                # B-15: okunmamış bar %100 değildir — S-3101 doktrini:
+                # okunabilirlik bayrağı ayrı alanda durur, yüzde None olur.
+                # Tüketiciler (perception_hub, state_machine) None
+                # görünce doldurmaz; bayrağa bakmayan tüketici de artık
+                # sahte %100 görmez.
+                "player_hp_ratio": round(self.player_hp_ratio, 2)
+                if self.player_hp_readable
+                else None,
+                "player_hp_percent": int(round(self.player_hp_ratio * 100))
+                if self.player_hp_readable
+                else None,
+                "player_mp_ratio": round(self.player_mp_ratio, 2)
+                if self.player_mp_readable
+                else None,
+                "player_mp_percent": int(round(self.player_mp_ratio * 100))
+                if self.player_mp_readable
+                else None,
+                # S-3101: saklanan deger son bilinen olcumdur; okunabilirlik
+                # bayragi olmadan %100 taze olcum sanilmaz.
+                "player_hp_readable": bool(self.player_hp_readable),
+                "player_mp_readable": bool(self.player_mp_readable),
                 "ready_skills": list(self.ready_skills),
                 "combo_sequence": self.get_combo_sequence(),
                 "obstacle_detected": self.obstacle_detected,

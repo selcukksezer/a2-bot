@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.hardware_input_port import NetworkHidAdapter, normalize_hid_endpoint
+from tools.hid_com_util import tap_keys
 
 
 def main() -> int:
@@ -50,14 +50,22 @@ def main() -> int:
 
     print(f"OK connected {endpoint}")
     keys = [k.strip().lower() for k in str(args.keys).split(",") if k.strip()]
-    hold = max(20, int(args.hold_ms)) / 1000.0
-    for key in keys:
+
+    def _report(key: str, down_ok: bool, up_ok: bool) -> None:
         print(f"  KEYDOWN/UP {key}")
-        hid.key_down(key)
-        time.sleep(hold)
-        hid.key_up(key)
-        time.sleep(0.15)
+        if not down_ok:
+            print(f"  FAIL KEYDOWN {key}", file=sys.stderr)
+        if not up_ok:
+            print(f"  FAIL KEYUP {key}", file=sys.stderr)
+
+    failures = tap_keys(hid, keys, hold_ms=int(args.hold_ms), gap_sec=0.15, on_key=_report)
     hid.close()
+    if failures:
+        print(
+            f"FAIL: {len(failures)} key send(s) failed: {', '.join(failures)}",
+            file=sys.stderr,
+        )
+        return 1
     print("Done. Focus Notepad/AION2 — keys should come from the phone HID.")
     return 0
 

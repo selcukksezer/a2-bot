@@ -15,9 +15,11 @@ Validates:
 3. `_scan_hud_and_skills`:
    - Normal frames NEVER receive HUD/skill/vitality/consumable boxes.
    - Only runs on `learn_skills_*` or `learn_vitality_*` stems with confidence <= 0.70 (weak=True).
-   - Upper consumable row (0.870..0.938*H) classifies hp_potion (18), mp_potion (19), buff_scroll (22).
-   - Lower combat skills row (>=0.940*H) classifies skill_slot (21).
+   - Upper consumable row (0.870..0.938*H) classifies hp_potion (22), mp_potion (23), buff_scroll (24).
+   - Lower combat skills row (>=0.940*H) classifies skill_slot (20).
    - Center level 45 emblem is excluded.
+   (Canonical ids per dataset_factory/class_taxonomy.py; the legacy HUD
+   ids 18/19/22/21 must never be pinned here — see test_w31 part 2.)
 4. `shared_frame_context`:
    - Reuses cached bgr, hsv, gray, and edge representations across sub-scanners.
 5. 3D Monster detection:
@@ -47,14 +49,36 @@ from dataset_factory.yolo_auto_labeler import (
 )
 
 
+@pytest.fixture(scope="module")
+def labeler() -> YOLOAutoLabeler:
+    """One labeler for the whole module.
+
+    YOLOAutoLabeler is stateless across the calls used here: it assigns
+    instance attributes only in __init__ (verified by grep: no other
+    ``self.<attr> =`` in yolo_auto_labeler.py) and the sub-scanners take
+    all inputs as arguments, so sharing one instance cannot leak state
+    between tests. It saves one VisionEngine/MaterialScanner/MinimapScanner
+    construction (~1 s) per test.
+    """
+    return YOLOAutoLabeler()
+
+
 def test_stem_gating_helpers():
     """Verify is_path_learning_stem and is_skill_learning_stem accurately discriminate stems."""
     # Path learning stems
     assert is_path_learning_stem("learn_paths_001_corridor") is True
-    assert is_path_learning_stem("path_ground_run") is True
+    assert is_path_learning_stem("learn_paths_corridor_01") is True
     assert is_path_learning_stem("learn_obstacles_stone") is True
     assert is_path_learning_stem("boot_478467_000_aria_3d_crest_far") is False
     assert is_path_learning_stem("gather_orichalcum_node_12") is False
+    # "pathology_scan" is not a path-learning stem: the bare "path" prefix
+    # must not match. NOTE: "path_ground_run" is deliberately NOT asserted
+    # here — production currently matches it via the broad "path_" prefix
+    # (dataset_factory/yolo_auto_labeler.py), which is overly broad and
+    # needs a production-side narrowing; locking it in as True would bless
+    # that over-matching.
+    assert is_path_learning_stem("pathology_scan") is False
+    assert is_path_learning_stem("random_frame_001") is False
 
     # Skill learning stems
     assert is_skill_learning_stem("learn_skills_combo_01") is True
@@ -64,14 +88,13 @@ def test_stem_gating_helpers():
     assert is_skill_learning_stem("gather_orichalcum_node_12") is False
 
 
-def test_salient_3d_resources_no_floor_and_confidence_calibrated():
+def test_salient_3d_resources_no_floor_and_confidence_calibrated(labeler):
     """
     Test 1: _scan_salient_3d_resources must:
     - Never assign class_id > 12.
     - Calibrate confidence to min(0.68, max(0.38, round(p_score * 0.75, 4))).
     - Set trusted=False, weak=True.
     """
-    labeler = YOLOAutoLabeler()
 
     # Create a 720x1280 frame with a high-saturation blob in the viewport
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -89,8 +112,11 @@ def test_salient_3d_resources_no_floor_and_confidence_calibrated():
         has_crest_or_prompt=False,
     )
 
+    # The scanner must actually emit at least one annotation for this frame;
+    # without a len check the per-annotation asserts below would pass
+    # vacuously on an empty return.
+    assert len(salient_anns) >= 1, "Salient scan returned no annotations for the test frame"
     for ann in salient_anns:
-        # Confidence must be strictly <= 0.68 and >= 0.38
         assert ann["confidence"] <= 0.68, f"Artificial floor detected: {ann['confidence']} > 0.68"
         assert ann["confidence"] >= 0.38
         # Class ID must be <= 12
@@ -100,12 +126,11 @@ def test_salient_3d_resources_no_floor_and_confidence_calibrated():
         assert ann["weak"] is True, "Salient fallback must be weak"
 
 
-def test_salient_3d_resources_fallback_gating():
+def test_salient_3d_resources_fallback_gating(labeler):
     """
     Test 2: _scan_salient_3d_resources is a fallback that must NOT run when
     a 3D crest or prompt is already detected.
     """
-    labeler = YOLOAutoLabeler()
     frame = np.zeros((720, 1280, 3), dtype=np.uint8)
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
@@ -119,12 +144,11 @@ def test_salient_3d_resources_fallback_gating():
     assert anns == [], "Salient 3D resource scan must return [] when crest or prompt is present"
 
 
-def test_path_and_obstacles_strict_stem_gating():
+def test_path_and_obstacles_strict_stem_gating(labeler):
     """
     Test 3: _scan_path_and_obstacles ONLY executes on path learning stems.
     Normal gather/boot frames must NEVER receive 15: path_ground or 14: obstacle annotations.
     """
-    labeler = YOLOAutoLabeler()
     frame = np.ones((720, 1280, 3), dtype=np.uint8) * 120
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -154,6 +178,11 @@ def test_path_and_obstacles_strict_stem_gating():
         gray=gray,
         source_stem="learn_paths_corridor_01",
     )
+    # The positive branch must actually emit annotations; without a len
+    # check the per-annotation asserts below would pass vacuously.
+    assert len(anns_path) >= 1, "Path scan returned no annotations for learn_paths stem"
+    assert {a["class_id"] for a in anns_path} <= {14, 15}, "Path scan must only emit obstacle (14) / path_ground (15)"
+    assert any(a["class_id"] == 15 for a in anns_path), "Path scan must emit at least one path_ground (15) box"
     # If any path annotation was emitted, its confidence must be capped at <= 0.68
     for ann in anns_path:
         assert ann["confidence"] <= 0.68, f"Path confidence {ann['confidence']} exceeded 0.68 cap"
@@ -161,16 +190,15 @@ def test_path_and_obstacles_strict_stem_gating():
         assert ann["trusted"] is False
 
 
-def test_hud_and_skills_strict_stem_gating_and_row_separation():
+def test_hud_and_skills_strict_stem_gating_and_row_separation(labeler):
     """
     Test 4: _scan_hud_and_skills ONLY executes on learn_skills/learn_vitality stems.
     On valid stems:
     - Excludes center level 45 emblem.
-    - Upper consumable row classifies hp_potion (18), mp_potion (19), buff_scroll (22).
-    - Lower combat skills row classifies skill_slot (21).
+    - Upper consumable row classifies hp_potion (22), mp_potion (23), buff_scroll (24).
+    - Lower combat skills row classifies skill_slot (20).
     - Confidence is capped at <= 0.70 (weak=True).
     """
-    labeler = YOLOAutoLabeler()
     frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
 
     # 1. Normal frame must return []
@@ -231,20 +259,34 @@ def test_hud_and_skills_strict_stem_gating_and_row_separation():
         assert ann["weak"] is True
         assert ann["trusted"] is False
 
-    # Check that upper row consumable boxes have class_id in (18, 19, 22) and NOT 13 or 21
-    upper_row_anns = [a for a in anns_skill if 0.865 <= a["cy"] <= 0.938 and a["class_id"] in (18, 19, 21, 22)]
+    # Upper consumable row must contain ALL THREE consumable classes —
+    # hp_potion (22), mp_potion (23) and buff_scroll (24) — and never
+    # skill_slot (20) or skill_ui_prompt (13). Checking only "not 20/13"
+    # would pass even if 22/23/24 were never emitted at all.
+    upper_row_anns = [a for a in anns_skill if 0.865 <= a["cy"] <= 0.938]
+    assert len(upper_row_anns) >= 3, f"Upper consumable row emitted too few boxes: {len(upper_row_anns)}"
+    assert {a["class_id"] for a in upper_row_anns} == {22, 23, 24}, (
+        f"Upper row must classify exactly hp/mp potion + buff scroll, got "
+        f"{sorted({a['class_id'] for a in upper_row_anns})}"
+    )
     for a in upper_row_anns:
-        assert a["class_id"] != 21, "Upper consumable row must NEVER be labeled as skill_slot!"
+        assert a["class_id"] != 20, "Upper consumable row must NEVER be labeled as skill_slot!"
         assert a["class_id"] != 13, "Upper consumable row must NEVER be labeled as skill_ui_prompt!"
+    # Lower combat skills row (>= 0.940*H) must contain at least one skill_slot (20).
+    lower_row_anns = [a for a in anns_skill if a["cy"] >= 0.940]
+    assert any(a["class_id"] == 20 for a in lower_row_anns), "Lower row must contain a skill_slot (20) box"
 
 
-def test_shared_frame_context_caching():
+def test_shared_frame_context_caching(labeler):
     """
     Test 5: Verify that shared_frame_context caches bgr, hsv, gray, edges and reuses them.
+
+    Frame is 240x320: detection cost scales with pixels, and the context
+    keys + identity reuse asserted here are size-independent (the same
+    4 keys populate and the same object is reused at this size).
     """
-    labeler = YOLOAutoLabeler()
-    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    cv2.circle(frame, (320, 240), 50, (50, 150, 200), -1)
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    cv2.circle(frame, (160, 120), 25, (50, 150, 200), -1)
 
     context = {}
     _ = labeler.auto_label_frame(frame, shared_frame_context=context)
@@ -263,12 +305,11 @@ def test_shared_frame_context_caching():
     assert id(context["hsv"]) == cached_hsv_id
 
 
-def test_3d_monster_detection_with_brackets():
+def test_3d_monster_detection_with_brackets(labeler):
     """
     Test 6: Verify yellow nameplate mob with cyan diamond brackets is detected
     as 10: monster_3d with genuine bounding box, respecting player self-exclusion zone.
     """
-    labeler = YOLOAutoLabeler()
     # 1080p frame
     frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
 

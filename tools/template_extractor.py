@@ -1,17 +1,20 @@
 import argparse
 import logging
+import os
+import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
 import cv2
 import numpy as np
+from version import __version__
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.schema import SettingsManager
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +51,13 @@ def imwrite_unicode(path: Union[str, Path], img: np.ndarray) -> bool:
         return False
 
 
-def _ensure_templates_dir(project_root: Optional[Path] = None) -> Path:
+def _ensure_templates_dir(project_root: Optional[Path] = None, templates_dir: Optional[Path] = None) -> Path:
+    if templates_dir is not None:
+        out = Path(templates_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "legacy").mkdir(parents=True, exist_ok=True)
+        (out / "negative_filters").mkdir(parents=True, exist_ok=True)
+        return out
     root = Path(project_root) if project_root else PROJECT_ROOT
     templates_dir = root / "templates"
     templates_dir.mkdir(parents=True, exist_ok=True)
@@ -57,11 +66,12 @@ def _ensure_templates_dir(project_root: Optional[Path] = None) -> Path:
     return templates_dir
 
 
-def _load_best_gather_frame(root: Path) -> Optional[np.ndarray]:
+def _load_best_gather_frame(root: Path, analysis_dir: Optional[Path] = None) -> Optional[np.ndarray]:
+    video_analysis = Path(analysis_dir) if analysis_dir else root / "video_analysis"
     candidates = [
-        root / "video_analysis" / "frame_33s.jpg",
+        video_analysis / "frame_33s.jpg",
         root / "video_frames" / "frame_33s.jpg",
-        root / "video_analysis" / "frame_34s.jpg",
+        video_analysis / "frame_34s.jpg",
         root / "video_frames" / "frame_54s.jpg",
     ]
     for candidate in candidates:
@@ -76,10 +86,11 @@ def _load_best_gather_frame(root: Path) -> Optional[np.ndarray]:
     return None
 
 
-def _load_best_map_frame(root: Path) -> Optional[np.ndarray]:
+def _load_best_map_frame(root: Path, analysis_dir: Optional[Path] = None) -> Optional[np.ndarray]:
+    video_analysis = Path(analysis_dir) if analysis_dir else root / "video_analysis"
     candidates = [
         root / "video_frames" / "frame_18s.jpg",
-        root / "video_analysis" / "map_at_25s.jpg",
+        video_analysis / "map_at_25s.jpg",
         root / "video_frames" / "frame_27s.jpg",
     ]
     for candidate in candidates:
@@ -120,11 +131,11 @@ def _clean_hd_f_gather_crop(crop: np.ndarray) -> np.ndarray:
     cleaned = crop.copy()
     ch, cw = cleaned.shape[:2]
     if ch >= 30 and cw >= 100:
+        # D77: vectorized triangle mask — identical pixels to the old
+        # per-pixel loop (x + y < 13 over y in 0..13, x in 0..11).
+        ys, xs = np.ogrid[: min(14, ch), : min(12, cw)]
         mask = np.zeros((ch, cw), dtype=np.uint8)
-        for y in range(min(14, ch)):
-            for x in range(min(12, cw)):
-                if x + y < 13:
-                    mask[y, x] = 255
+        mask[: min(14, ch), : min(12, cw)][(xs + ys) < 13] = 255
         bg_sample = cleaned[0:12, 26:40].copy()
         cleaned = _smooth_fill_masked_region(cleaned, mask, bg_sample)
     return cleaned
@@ -141,15 +152,15 @@ def _clean_feather_crop(crop: np.ndarray) -> np.ndarray:
     ch, cw = cleaned.shape[:2]
     if ch < 28 or cw < 24:
         return cleaned
+    # D77: vectorized mask — every old branch wrote 255, so the elif
+    # chain is exactly the OR of the same conditions.
+    ys, xs = np.ogrid[:ch, :cw]
     mask = np.zeros((ch, cw), dtype=np.uint8)
-    for y in range(ch):
-        for x in range(cw):
-            if y <= 2 and (x <= 15 or x >= 20):
-                mask[y, x] = 255
-            elif y <= 11 and x <= 12 and (x + y <= 20):
-                mask[y, x] = 255
-            elif y <= 8 and x >= 21 and (x - y >= 13):
-                mask[y, x] = 255
+    mask[
+        ((ys <= 2) & ((xs <= 15) | (xs >= 20)))
+        | ((ys <= 11) & (xs <= 12) & ((xs + ys) <= 20))
+        | ((ys <= 8) & (xs >= 21) & ((xs - ys) >= 13))
+    ] = 255
     bg_sample = crop[18:33, 19:29].copy()
     return _smooth_fill_masked_region(cleaned, mask, bg_sample)
 
@@ -166,17 +177,16 @@ def _clean_blue_wing_crop(crop: np.ndarray) -> np.ndarray:
     ch, cw = cleaned.shape[:2]
     if ch < 30 or cw < 30:
         return cleaned
+    # D77: vectorized mask — every old branch wrote 255, so the elif
+    # chain is exactly the OR of the same conditions.
+    ys, xs = np.ogrid[:ch, :cw]
     mask = np.zeros((ch, cw), dtype=np.uint8)
-    for y in range(ch):
-        for x in range(cw):
-            if y <= 8 and x >= 27:
-                mask[y, x] = 255
-            elif y >= 19 and x <= 10 and (x <= 8 or y >= 29):
-                mask[y, x] = 255
-            elif y >= 16 and x >= 24 and (x >= 26 or y >= 23):
-                mask[y, x] = 255
-            elif y >= 31 and x >= 21:
-                mask[y, x] = 255
+    mask[
+        ((ys <= 8) & (xs >= 27))
+        | ((ys >= 19) & (xs <= 10) & ((xs <= 8) | (ys >= 29)))
+        | ((ys >= 16) & (xs >= 24) & ((xs >= 26) | (ys >= 23)))
+        | ((ys >= 31) & (xs >= 21))
+    ] = 255
     bg_sample = crop[1:8, 1:10].copy()
     return _smooth_fill_masked_region(cleaned, mask, bg_sample)
 
@@ -193,25 +203,28 @@ def _clean_green_stack_crop(crop: np.ndarray) -> np.ndarray:
     ch, cw = cleaned.shape[:2]
     if ch < 25 or cw < 20:
         return cleaned
+    # D77: vectorized mask — every old branch wrote 255, so the elif
+    # chain is exactly the OR of the same conditions.
+    ys, xs = np.ogrid[:ch, :cw]
     mask = np.zeros((ch, cw), dtype=np.uint8)
-    for y in range(ch):
-        for x in range(cw):
-            if y <= 3 and x <= 6:
-                mask[y, x] = 255
-            elif y <= 14 and x <= 5 and (x + (y // 3) <= 7):
-                mask[y, x] = 255
-            elif y >= 18 and x <= 6 and ((y - 18) >= x):
-                mask[y, x] = 255
-            elif y >= 25 and x <= 11:
-                mask[y, x] = 255
-            elif y >= 20 and x >= 17:
-                mask[y, x] = 255
+    mask[
+        ((ys <= 3) & (xs <= 6))
+        | ((ys <= 14) & (xs <= 5) & ((xs + (ys // 3)) <= 7))
+        | ((ys >= 18) & (xs <= 6) & ((ys - 18) >= xs))
+        | ((ys >= 25) & (xs <= 11))
+        | ((ys >= 20) & (xs >= 17))
+    ] = 255
     bg_sample = crop[1:9, 15:23].copy()
     return _smooth_fill_masked_region(cleaned, mask, bg_sample)
 
 
 def extract_f_gather_templates(
     root: Optional[Path] = None,
+    *,
+    templates_dir: Optional[Path] = None,
+    reference_dir: Optional[Path] = None,
+    analysis_dir: Optional[Path] = None,
+    assets_dir: Optional[Path] = None,
 ) -> Dict[str, Path]:
     """
     Extracts crystal-clear HD `[flower] F Gather`, `[F Gather]` dark pill, and `[F]` key cap
@@ -219,14 +232,14 @@ def extract_f_gather_templates(
     while also saving legacy 720p video templates in `templates/legacy/` for backward compatibility.
     """
     base_root = Path(root) if root else PROJECT_ROOT
-    templates_dir = _ensure_templates_dir(base_root)
+    templates_dir = _ensure_templates_dir(base_root, templates_dir)
     legacy_dir = templates_dir / "legacy"
-    ref_dir = base_root / "reference_screenshots"
+    ref_dir = Path(reference_dir) if reference_dir else base_root / "reference_screenshots"
     saved: Dict[str, Path] = {}
 
     try:
         # 1. Extract legacy 720p video F Gather templates first (stored in templates/legacy/)
-        frame = _load_best_gather_frame(base_root)
+        frame = _load_best_gather_frame(base_root, analysis_dir)
         legacy_full: Optional[np.ndarray] = None
         legacy_pill: Optional[np.ndarray] = None
         if frame is not None:
@@ -285,7 +298,7 @@ def extract_f_gather_templates(
             full_crop = legacy_full
             pill_crop = legacy_pill
         else:
-            asset_template_path = base_root / "assets" / "f_gather_template.png"
+            asset_template_path = (Path(assets_dir) if assets_dir else base_root / "assets") / "f_gather_template.png"
             asset_img = (
                 imread_unicode(asset_template_path, cv2.IMREAD_COLOR)
                 if asset_template_path.exists()
@@ -327,6 +340,10 @@ def extract_f_gather_templates(
 
 def extract_map_templates(
     root: Optional[Path] = None,
+    *,
+    templates_dir: Optional[Path] = None,
+    reference_dir: Optional[Path] = None,
+    analysis_dir: Optional[Path] = None,
 ) -> Dict[str, Path]:
     """
     Extracts crystal-clear Aion 2 `player_arrow.png` (centered cyan-white directional arrow from
@@ -334,14 +351,14 @@ def extract_map_templates(
     Folded Map + Location Pin icon), while saving the legacy 720p video crops in `templates/legacy/`.
     """
     base_root = Path(root) if root else PROJECT_ROOT
-    templates_dir = _ensure_templates_dir(base_root)
+    templates_dir = _ensure_templates_dir(base_root, templates_dir)
     legacy_dir = templates_dir / "legacy"
-    ref_dir = base_root / "reference_screenshots"
+    ref_dir = Path(reference_dir) if reference_dir else base_root / "reference_screenshots"
     saved: Dict[str, Path] = {}
 
     try:
         # 1. Extract legacy video map templates into templates/legacy/
-        map_frame = _load_best_map_frame(base_root)
+        map_frame = _load_best_map_frame(base_root, analysis_dir)
         legacy_arrow: Optional[np.ndarray] = None
         legacy_header: Optional[np.ndarray] = None
         if map_frame is not None:
@@ -459,8 +476,8 @@ def _locate_refined_crop(
             det_x2 = sx1 + min(sx2 - sx1, int(xs.max()) + pad + 1)
             det_y1 = sy1 + max(0, int(ys.min()) - pad)
             det_y2 = sy1 + min(sy2 - sy1, int(ys.max()) + pad + 1)
-            if fx2 > fx1 and fy2 > fy1:
-                return image[fy1:fy2, fx1:fx2].copy(), (fx1, fy1, fx2, fy2)
+            # F-1131: return the detected box, not the fallback box. The
+            # fallback is only used when no bright pixels are detected.
             return image[det_y1:det_y2, det_x1:det_x2].copy(), (det_x1, det_y1, det_x2, det_y2)
 
     return image[fy1:fy2, fx1:fx2].copy(), (fx1, fy1, fx2, fy2)
@@ -468,6 +485,9 @@ def _locate_refined_crop(
 
 def extract_reference_screenshot_templates(
     root: Optional[Path] = None,
+    *,
+    templates_dir: Optional[Path] = None,
+    reference_dir: Optional[Path] = None,
 ) -> Dict[str, Path]:
     """
     Extracts and mask-cleans high-precision templates from real-game reference screenshots:
@@ -484,9 +504,9 @@ def extract_reference_screenshot_templates(
       - f_gather_aria.png, aria_3d_node.png & mela_3d_node.png (from aria/mela screenshots)
     """
     base_root = Path(root) if root else PROJECT_ROOT
-    templates_dir = _ensure_templates_dir(base_root)
+    templates_dir = _ensure_templates_dir(base_root, templates_dir)
     neg_dir = templates_dir / "negative_filters"
-    ref_dir = base_root / "reference_screenshots"
+    ref_dir = Path(reference_dir) if reference_dir else base_root / "reference_screenshots"
     saved: Dict[str, Path] = {}
 
     if not ref_dir.exists():
@@ -686,16 +706,50 @@ def extract_reference_screenshot_templates(
     return saved
 
 
+# Verification scores below this are treated as a failed extraction (F-1178).
+VERIFY_MIN_SCORE = 0.5
+
+
 def extract_all_templates(
     project_root: Optional[Union[str, Path]] = None,
-    **kwargs: object,
+    *,
+    output_dir: Optional[Union[str, Path]] = None,
+    reference_dir: Optional[Union[str, Path]] = None,
+    analysis_dir: Optional[Union[str, Path]] = None,
+    assets_dir: Optional[Union[str, Path]] = None,
 ) -> Dict[str, str]:
+    """Extract all templates into ``output_dir`` (default ``<root>/templates``).
+
+    F-1177: parameters are explicit keyword arguments — unknown/misspelled
+    kwargs now raise TypeError instead of being silently swallowed, and
+    ``output_dir``/``reference_dir`` are actually honoured, so callers
+    (e.g. tools/self_test_suite.py) no longer mistake the extraction
+    directory. ``analysis_dir``/``assets_dir`` override the root-derived
+    frame/asset locations used by the legacy fallbacks.
+    """
     root = Path(project_root) if project_root else PROJECT_ROOT
+    templates_dir = Path(output_dir) if output_dir else None
+    ref_dir = Path(reference_dir) if reference_dir else None
+    analysis = Path(analysis_dir) if analysis_dir else None
+    assets = Path(assets_dir) if assets_dir else None
     results: Dict[str, str] = {}
     try:
-        ref_saved = extract_reference_screenshot_templates(root)
-        gather_saved = extract_f_gather_templates(root)
-        map_saved = extract_map_templates(root)
+        ref_saved = extract_reference_screenshot_templates(
+            root, templates_dir=templates_dir, reference_dir=ref_dir
+        )
+        gather_saved = extract_f_gather_templates(
+            root,
+            templates_dir=templates_dir,
+            reference_dir=ref_dir,
+            analysis_dir=analysis,
+            assets_dir=assets,
+        )
+        map_saved = extract_map_templates(
+            root,
+            templates_dir=templates_dir,
+            reference_dir=ref_dir,
+            analysis_dir=analysis,
+        )
         for name, path_obj in {**ref_saved, **gather_saved, **map_saved}.items():
             if path_obj.exists():
                 results[name] = str(path_obj)
@@ -704,43 +758,65 @@ def extract_all_templates(
     return results
 
 
-def verify_extracted_templates(
+def verify_extracted_templates_report(
     project_root: Optional[Union[str, Path]] = None,
-) -> Dict[str, float]:
+    min_score: float = VERIFY_MIN_SCORE,
+) -> Dict[str, object]:
+    """Score each extracted template against its reference screenshot.
+
+    F-1178: each template is scored in isolation — one matchTemplate
+    failure no longer swallows the remaining scores — and scores below
+    ``min_score`` are logged as verification failures.
+
+    P3-5 (K-07 fail-open): this is FAIL-CLOSED. Every template in the
+    verification pairs gets exactly one of two outcomes — a numeric
+    score in ``scores``, or an entry in ``unscored`` with the reason
+    (missing file, unreadable image, template larger than reference,
+    scoring error). A template that could not be scored NEVER passes:
+    ``passed`` is False whenever ``unscored`` or ``failed`` is
+    non-empty, and callers (see main()) must enforce that. Absence
+    from ``scores`` means "not verified", never "verified OK".
+    """
     root = Path(project_root) if project_root else PROJECT_ROOT
     templates_dir = _ensure_templates_dir(root)
     ref_dir = root / "reference_screenshots"
     scores: Dict[str, float] = {}
+    unscored: Dict[str, str] = {}
 
-    try:
-        ref_verification_pairs = [
-            ("f_gather_template.png", "aria_f_gather_not_on_minimap.jpg"),
-            ("f_gather.png", "aria_f_gather_not_on_minimap.jpg"),
-            ("f_gather_aria.png", "aria_f_gather_not_on_minimap.jpg"),
-            ("f_gather_pill.png", "aria_f_gather_not_on_minimap.jpg"),
-            ("player_arrow.png", "minimap_sprout_closeup.jpg"),
-            ("map_header.png", "minimap_sprout_closeup.jpg"),
-            ("minimap_map_pin_icon.png", "minimap_sprout_closeup.jpg"),
-            ("e_gather_icon.png", "pilgrims_ridge_1.jpg"),
-            ("minimap_filter_funnel.png", "minimap_filter_closeup.jpg"),
-            ("minimap_feather_odyle.png", "minimap_filter_closeup.jpg"),
-            ("minimap_blue_wing.png", "minimap_filter_closeup.jpg"),
-            ("minimap_green_stack.png", "minimap_filter_closeup.jpg"),
-            ("minimap_monster_dot.png", "minimap_filter_closeup.jpg"),
-            ("minimap_gatherable_sprout_icon.png", "minimap_filter_closeup.jpg"),
-            ("minimap_quest_icon.png", "minimap_filter_closeup.jpg"),
-            ("minimap_npc_icon.png", "minimap_filter_closeup.jpg"),
-            ("minimap_sprout_node.png", "minimap_sprout_closeup.jpg"),
-            ("world_gather_crest.png", "aria_3d_crest_far.jpg"),
-            ("world_gather_crest_near.png", "aria_f_gather_not_on_minimap.jpg"),
-            ("aria_3d_node.png", "aria_f_gather_not_on_minimap.jpg"),
-            ("mela_3d_node.png", "mela_f_gather_not_on_minimap.jpg"),
-        ]
-        loaded_refs: Dict[str, Optional[np.ndarray]] = {}
-        for tname, ref_filename in ref_verification_pairs:
-            tpath = templates_dir / tname
-            if not tpath.exists():
-                continue
+    ref_verification_pairs = [
+        ("f_gather_template.png", "aria_f_gather_not_on_minimap.jpg"),
+        ("f_gather.png", "aria_f_gather_not_on_minimap.jpg"),
+        ("f_gather_aria.png", "aria_f_gather_not_on_minimap.jpg"),
+        ("f_gather_pill.png", "aria_f_gather_not_on_minimap.jpg"),
+        ("f_key_icon.png", "aria_f_gather_not_on_minimap.jpg"),
+        ("player_arrow.png", "minimap_sprout_closeup.jpg"),
+        ("map_header.png", "minimap_sprout_closeup.jpg"),
+        ("minimap_map_pin_icon.png", "minimap_sprout_closeup.jpg"),
+        ("e_gather_icon.png", "pilgrims_ridge_1.jpg"),
+        ("e_key_icon.png", "pilgrims_ridge_1.jpg"),
+        ("minimap_filter_funnel.png", "minimap_filter_closeup.jpg"),
+        ("minimap_feather_odyle.png", "minimap_filter_closeup.jpg"),
+        ("minimap_blue_wing.png", "minimap_filter_closeup.jpg"),
+        ("minimap_green_stack.png", "minimap_filter_closeup.jpg"),
+        ("minimap_monster_dot.png", "minimap_filter_closeup.jpg"),
+        ("minimap_gatherable_sprout_icon.png", "minimap_filter_closeup.jpg"),
+        ("minimap_quest_icon.png", "minimap_filter_closeup.jpg"),
+        ("minimap_npc_icon.png", "minimap_filter_closeup.jpg"),
+        ("minimap_sprout_node.png", "minimap_sprout_closeup.jpg"),
+        ("world_gather_crest.png", "aria_3d_crest_far.jpg"),
+        ("world_gather_crest_near.png", "aria_f_gather_not_on_minimap.jpg"),
+        ("aria_3d_node.png", "aria_f_gather_not_on_minimap.jpg"),
+        ("mela_3d_node.png", "mela_f_gather_not_on_minimap.jpg"),
+    ]
+    loaded_refs: Dict[str, Optional[np.ndarray]] = {}
+    for tname, ref_filename in ref_verification_pairs:
+        tpath = templates_dir / tname
+        if not tpath.exists():
+            # P3-5: a missing template is UNSCORED, not silently skipped.
+            logger.error("Verification FAILED for %s: template file missing.", tname)
+            unscored[tname] = "missing template file"
+            continue
+        try:
             if ref_filename not in loaded_refs:
                 rpath = ref_dir / ref_filename
                 loaded_refs[ref_filename] = (
@@ -748,19 +824,66 @@ def verify_extracted_templates(
                 )
             ref_img = loaded_refs[ref_filename]
             tmpl = imread_unicode(tpath, cv2.IMREAD_COLOR)
-            if ref_img is not None and tmpl is not None:
-                scores[tname] = float(
-                    cv2.matchTemplate(ref_img, tmpl, cv2.TM_CCOEFF_NORMED).max()
+            if ref_img is None or tmpl is None:
+                logger.error("Verification FAILED for %s: unreadable image.", tname)
+                unscored[tname] = "unreadable template or reference image"
+                continue
+            if tmpl.shape[0] > ref_img.shape[0] or tmpl.shape[1] > ref_img.shape[1]:
+                logger.error(
+                    "Verification FAILED for %s: template %s larger than reference %s.",
+                    tname, tmpl.shape, ref_img.shape,
                 )
-    except Exception as exc:
-        logger.error("Error verifying templates: %s", exc)
+                unscored[tname] = "template larger than reference image"
+                continue
+            score = float(cv2.matchTemplate(ref_img, tmpl, cv2.TM_CCOEFF_NORMED).max())
+            scores[tname] = score
+            if score < min_score:
+                logger.error(
+                    "Verification FAILED for %s: score %.4f < threshold %.4f.",
+                    tname, score, min_score,
+                )
+        except Exception as exc:
+            # One template's failure must not swallow the remaining scores.
+            logger.error("Error verifying template %s: %s", tname, exc)
+            unscored[tname] = "scoring error: %s" % exc
 
-    return scores
+    failed = {n: s for n, s in scores.items() if s < min_score}
+    return {
+        "scores": scores,
+        "unscored": unscored,
+        "failed": failed,
+        "passed": not unscored and not failed,
+    }
+
+
+def verify_extracted_templates(
+    project_root: Optional[Union[str, Path]] = None,
+    min_score: float = VERIFY_MIN_SCORE,
+) -> Dict[str, float]:
+    """Score each extracted template against its reference screenshot.
+
+    Thin wrapper over :func:`verify_extracted_templates_report` kept
+    for existing callers: returns only the successfully scored
+    templates. NOTE (P3-5): absence from the returned dict means the
+    template could NOT be scored — it is NOT a pass. Callers that
+    gate on verification must use
+    :func:`verify_extracted_templates_report` and enforce
+    ``passed`` (see main()).
+    """
+    report = verify_extracted_templates_report(project_root, min_score)
+    return dict(report["scores"])  # type: ignore[arg-type]
 
 
 def _grab_live_screen_or_fallback(
     fallback_path: Optional[Union[str, Path]] = None,
 ) -> Optional[np.ndarray]:
+    """Return ``fallback_path`` (explicit caller image) or a live screen grab.
+
+    F-1179: a failed live capture NO LONGER silently falls back to an old
+    video frame — that stale frame was then used to overwrite the current
+    template. On live-capture failure this returns None and the caller
+    must abort calibration instead of writing a stale template.
+    """
     if fallback_path is not None and Path(fallback_path).exists():
         img = imread_unicode(fallback_path, cv2.IMREAD_COLOR)
         if img is not None:
@@ -774,8 +897,100 @@ def _grab_live_screen_or_fallback(
             shot = np.array(sct.grab(monitor))
             return cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
     except Exception as exc:
-        logger.warning("Live screen capture unavailable (%s); falling back to reference frame.", exc)
-        return _load_best_gather_frame(PROJECT_ROOT)
+        logger.error(
+            "Live screen capture unavailable (%s); refusing to calibrate "
+            "from a stale reference frame.",
+            exc,
+        )
+        return None
+
+
+# ----------------------------------------------------------------------
+# P3-5 (K-05): calibration writes are verified + backed up + atomic.
+#
+# A calibration crop overwrites an operator-tuned template, so the write
+# must never destroy a good template: (1) the crop is validated AND
+# encoded BEFORE the existing file is touched; (2) the existing file is
+# copied to a single-generation ``<name>.bak`` (P0-2 convention, cf.
+# dataset_factory/label_trust.py: ``foo.png`` -> ``foo.png.bak``);
+# (3) the new bytes go to a tmp file in the same directory, fsync, then
+# ``os.replace`` — a crash mid-write leaves either the old or the new
+# file, never a half-written one. Any failure returns False and leaves
+# the destination untouched.
+# ----------------------------------------------------------------------
+_TEMPLATE_BACKUP_SUFFIX = ".bak"
+_TEMPLATE_MIN_WIDTH = 4
+_TEMPLATE_MIN_HEIGHT = 4
+
+
+def _validate_template_image(img: Optional[np.ndarray], template_name: str) -> bool:
+    """Pre-write validation for a calibration crop: non-empty, sane dims."""
+    if img is None or img.size == 0:
+        logger.error(
+            "Calibration validation FAILED for %s: empty image.", template_name
+        )
+        return False
+    h, w = img.shape[:2]
+    if h < _TEMPLATE_MIN_HEIGHT or w < _TEMPLATE_MIN_WIDTH:
+        logger.error(
+            "Calibration validation FAILED for %s: crop too small (%dx%d).",
+            template_name, w, h,
+        )
+        return False
+    return True
+
+
+def _write_template_atomic_with_backup(
+    path: Union[str, Path], img: np.ndarray, template_name: str
+) -> bool:
+    """Write a calibration template atomically, keeping a .bak of the old one.
+
+    Returns False (destination untouched) when validation, encoding,
+    backup, or the atomic replace fails.
+    """
+    if not _validate_template_image(img, template_name):
+        return False
+    dest = Path(path)
+    try:
+        ext = dest.suffix if dest.suffix else ".png"
+        success, encoded = cv2.imencode(ext, img)
+        if not success:
+            logger.error(
+                "Calibration validation FAILED for %s: cannot encode image.",
+                template_name,
+            )
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.is_file():
+            bak = dest.with_name(dest.name + _TEMPLATE_BACKUP_SUFFIX)
+            try:
+                shutil.copyfile(str(dest), str(bak))
+            except OSError as exc:
+                logger.error(
+                    "Calibration backup FAILED for %s (%s -> %s): %s; "
+                    "refusing to overwrite without a backup.",
+                    template_name, dest, bak, exc,
+                )
+                return False
+        tmp_path = dest.with_name(".%s.tmp-%d" % (dest.name, os.getpid()))
+        try:
+            tmp_path.write_bytes(encoded.tobytes())
+            with open(tmp_path, "ab") as fh:
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, dest)
+        except OSError:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+        return True
+    except OSError as exc:
+        logger.error(
+            "Calibration write FAILED for %s (%s): %s", template_name, dest, exc
+        )
+        return False
 
 
 def calibrate_template_from_screen(
@@ -815,12 +1030,18 @@ def calibrate_template_from_screen(
                 cropped = cropped[ty1:ty2, tx1:tx2].copy()
 
         out_path = templates_dir / template_name
-        imwrite_unicode(out_path, cropped)
+        # P3-5 (K-05): verified + backed-up + atomic write — a bad crop or
+        # a crash must never destroy the existing template.
+        if not _write_template_atomic_with_backup(out_path, cropped, template_name):
+            return None
         logger.info("Calibrated template saved to %s (shape=%s)", out_path, cropped.shape)
 
         if template_name in ("f_gather_template.png", "f_gather.png"):
             sibling = "f_gather.png" if template_name == "f_gather_template.png" else "f_gather_template.png"
-            imwrite_unicode(templates_dir / sibling, cropped)
+            if not _write_template_atomic_with_backup(
+                templates_dir / sibling, cropped, sibling
+            ):
+                logger.error("Calibrated sibling template '%s' was not updated.", sibling)
 
             ch, cw = cropped.shape[:2]
             if cw >= 30 and ch >= 10:
@@ -828,7 +1049,10 @@ def calibrate_template_from_screen(
                     int(round(ch * 0.12)) : max(int(round(ch * 0.12)) + 6, int(round(ch * 0.88))),
                     int(round(cw * 0.31)) : max(int(round(cw * 0.31)) + 10, int(round(cw * 0.96))),
                 ].copy()
-                imwrite_unicode(templates_dir / "f_gather_pill.png", pill)
+                if not _write_template_atomic_with_backup(
+                    templates_dir / "f_gather_pill.png", pill, "f_gather_pill.png"
+                ):
+                    logger.error("Calibrated pill template 'f_gather_pill.png' was not updated.")
 
         return out_path
     except Exception as exc:
@@ -856,17 +1080,37 @@ def interactive_calibrate(
             bbox = cv2.selectROI(window_title, screen, showCrosshair=True, fromCenter=False)
             cv2.destroyWindow(window_title)
             x, y, w, h = [int(v) for v in bbox]
+            if w <= 0 or h <= 0:
+                # P3-5 (K-05): ESC/C cancels — the user explicitly refused
+                # to save. Previously execution fell through to the
+                # automatic calibration below and OVERWROTE the template
+                # with an auto crop despite the cancel.
+                logger.info(
+                    "Interactive calibration cancelled for %s; template unchanged.",
+                    template_name,
+                )
+                return None
             if w > 4 and h > 4:
                 cropped = screen[y : y + h, x : x + w].copy()
                 out_path = templates_dir / template_name
-                imwrite_unicode(out_path, cropped)
+                # P3-5 (K-05): verified + backed-up + atomic write.
+                if not _write_template_atomic_with_backup(
+                    out_path, cropped, template_name
+                ):
+                    return None
                 if template_name in ("f_gather_template.png", "f_gather.png"):
                     sibling = (
                         "f_gather.png"
                         if template_name == "f_gather_template.png"
                         else "f_gather_template.png"
                     )
-                    imwrite_unicode(templates_dir / sibling, cropped)
+                    if not _write_template_atomic_with_backup(
+                        templates_dir / sibling, cropped, sibling
+                    ):
+                        logger.error(
+                            "Calibrated sibling template '%s' was not updated.",
+                            sibling,
+                        )
                 logger.info("Interactive ROI saved to %s (%dx%d)", out_path, w, h)
                 return out_path
         except Exception as cv_exc:
@@ -883,6 +1127,47 @@ def interactive_calibrate(
     except Exception as exc:
         logger.error("Error during interactive_calibrate: %s", exc)
         return None
+
+
+# D77: single source of truth for the required templates — main() and
+# _extractor_health() both use this tuple (previously the same names
+# were spelled out twice and could drift apart).
+# P3-5: expanded from 15 to 23 — the list now covers every template the
+# verifier scores (previously unscored-but-required gaps) plus the two
+# key-icon templates the extractor produces:
+#   scored but previously not required (6): minimap_map_pin_icon,
+#     minimap_quest_icon, minimap_npc_icon, world_gather_crest_near,
+#     aria_3d_node, mela_3d_node;
+#   key-icon, extracted but previously neither scored nor required (2):
+#     f_key_icon (crop of aria_f_gather_not_on_minimap.jpg),
+#     e_key_icon (crop of pilgrims_ridge_1.jpg).
+# Required set == verification-pairs set by construction; if a new pair
+# is added to verify_extracted_templates_report, add it here too.
+_REQUIRED_TEMPLATES = (
+    "f_gather_template.png",
+    "f_gather.png",
+    "f_gather_pill.png",
+    "f_key_icon.png",
+    "player_arrow.png",
+    "map_header.png",
+    "minimap_map_pin_icon.png",
+    "e_gather_icon.png",
+    "e_key_icon.png",
+    "minimap_filter_funnel.png",
+    "minimap_feather_odyle.png",
+    "minimap_blue_wing.png",
+    "minimap_green_stack.png",
+    "minimap_monster_dot.png",
+    "minimap_gatherable_sprout_icon.png",
+    "minimap_quest_icon.png",
+    "minimap_npc_icon.png",
+    "minimap_sprout_node.png",
+    "world_gather_crest.png",
+    "world_gather_crest_near.png",
+    "aria_3d_node.png",
+    "mela_3d_node.png",
+    "f_gather_aria.png",
+)
 
 
 def main() -> int:
@@ -905,37 +1190,44 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        settings_mgr = SettingsManager(PROJECT_ROOT / "config" / "settings.json")
-        settings_mgr.save()
-
+        # F-1286: do NOT unconditionally rewrite config/settings.json on
+        # every run. SettingsManager.__init__ already creates the file with
+        # defaults when it is missing; an unconditional save() here would
+        # rewrite (and could clobber) the operator's settings, and its
+        # return value was ignored.
         if args.interactive:
             out = interactive_calibrate(template_name=args.template)
             return 0 if out is not None else 1
 
         extracted = extract_all_templates(PROJECT_ROOT)
-        scores = verify_extracted_templates(PROJECT_ROOT)
+        report = verify_extracted_templates_report(PROJECT_ROOT)
+        scores = report["scores"]
 
         logger.info("Extracted %d templates: %s", len(extracted), list(extracted.keys()))
         for name, score in scores.items():
             logger.info("Verification match score for %s: %.4f", name, score)
 
-        required = [
-            "f_gather_template.png",
-            "f_gather.png",
-            "f_gather_pill.png",
-            "player_arrow.png",
-            "map_header.png",
-            "e_gather_icon.png",
-            "minimap_filter_funnel.png",
-            "minimap_feather_odyle.png",
-            "minimap_blue_wing.png",
-            "minimap_green_stack.png",
-            "minimap_monster_dot.png",
-            "minimap_gatherable_sprout_icon.png",
-            "minimap_sprout_node.png",
-            "world_gather_crest.png",
-            "f_gather_aria.png",
-        ]
+        # P3-5: fail-closed — a template that could NOT be scored fails
+        # the run exactly like a low score. Absence from `scores` is
+        # "not verified", never "verified OK".
+        unscored = report["unscored"]
+        if unscored:
+            logger.error(
+                "Template verification FAILED: %d template(s) could not be scored: %s",
+                len(unscored), unscored,
+            )
+            return 1
+
+        # F-1178: enforce the verification threshold — a low score fails the run.
+        low_scores = report["failed"]
+        if low_scores:
+            logger.error(
+                "Template verification FAILED (threshold %.4f): %s",
+                VERIFY_MIN_SCORE, low_scores,
+            )
+            return 1
+
+        required = _REQUIRED_TEMPLATES
         missing = [r for r in required if not (PROJECT_ROOT / "templates" / r).exists()]
         if missing:
             logger.error("Missing required template files: %s", missing)
@@ -947,10 +1239,68 @@ def main() -> int:
         return 1
 
 
+# F-1287: health/readiness helpers below actually inspect the extractor
+# state (templates dir + required template files) instead of always
+# returning ready/ok.
+# D77: memoization window for _extractor_health() (see its docstring).
+_EXTRACTOR_HEALTH_TTL_SECONDS = 2.0
+_EXTRACTOR_HEALTH_CACHE = {"at": 0.0, "value": None}
+
+
+def _extractor_health() -> dict:
+    """Real extractor state: templates dir, file counts, missing files.
+
+    D77: the directory scan is memoized for a short TTL. The nested
+    get_template_extractor_* getters each re-validate through this
+    function, so one heartbeat snapshot used to re-glob the templates
+    dir ~21 times (~19 ms); now it scans once per TTL window. A 2 s
+    staleness window is acceptable for a diagnostic helper — extraction
+    correctness never depends on this (main() checks files directly
+    with .exists()), and the value is recomputed after the TTL expires.
+    """
+    now = time.monotonic()
+    cached = _EXTRACTOR_HEALTH_CACHE
+    if cached["value"] is not None and (now - cached["at"]) < _EXTRACTOR_HEALTH_TTL_SECONDS:
+        health = cached["value"]
+        return {
+            "templates_dir": health["templates_dir"],
+            "template_count": health["template_count"],
+            "missing_required": list(health["missing_required"]),
+            "ready": health["ready"],
+        }
+    templates_dir = PROJECT_ROOT / "templates"
+    try:
+        present = (
+            [p.name for p in templates_dir.glob("*.png")]
+            if templates_dir.is_dir()
+            else []
+        )
+    except OSError as exc:
+        logger.error("Failed listing templates dir %s: %s", templates_dir, exc)
+        present = []
+    missing = [t for t in _REQUIRED_TEMPLATES if t not in present]
+    ready = templates_dir.is_dir() and not missing
+    health = {
+        "templates_dir": str(templates_dir),
+        "template_count": len(present),
+        "missing_required": missing,
+        "ready": ready,
+    }
+    _EXTRACTOR_HEALTH_CACHE["at"] = now
+    _EXTRACTOR_HEALTH_CACHE["value"] = health
+    return {
+        "templates_dir": health["templates_dir"],
+        "template_count": health["template_count"],
+        "missing_required": list(health["missing_required"]),
+        "ready": health["ready"],
+    }
+
+
 def get_extractor_health_summary() -> dict:
     """Returns a health summary dictionary for the template extractor."""
     try:
-        return {"extractor_ready": True}
+        health = _extractor_health()
+        return {"extractor_ready": health["ready"], **health}
     except Exception as exc:
         logger.error("Failed to generate extractor health summary: %s", exc)
         return {"extractor_ready": False}
@@ -958,12 +1308,23 @@ def get_extractor_health_summary() -> dict:
 
 def get_template_extractor_ready_flag() -> dict:
     """Returns template extractor ready flag."""
-    return {"module": "template_extractor", "ready": True}
+    health = _extractor_health()
+    return {
+        "module": "template_extractor",
+        "ready": health["ready"],
+        "template_count": health["template_count"],
+        "missing_required": health["missing_required"],
+    }
 
 
 def get_template_extractor_version_info() -> dict:
     """Returns template extractor version information."""
-    return {"module": "template_extractor", "version": "2.0.0", "ready": True}
+    health = _extractor_health()
+    return {
+        "module": "template_extractor",
+        "version": __version__,
+        "ready": health["ready"],
+    }
 
 
 if __name__ == "__main__":
@@ -971,7 +1332,14 @@ if __name__ == "__main__":
 
 
 def get_template_extractor_diagnostic_snapshot() -> dict:
-    return {"module": "template_extractor", "status": "ok", "ready": True}
+    health = _extractor_health()
+    return {
+        "module": "template_extractor",
+        "status": "ok" if health["ready"] else "missing_templates",
+        "ready": health["ready"],
+        "template_count": health["template_count"],
+        "missing_required": health["missing_required"],
+    }
 
 
 def get_template_extractor_capabilities() -> list:
@@ -979,11 +1347,15 @@ def get_template_extractor_capabilities() -> list:
 
 
 def validate_template_extractor_contract() -> bool:
-    return bool(get_template_extractor_capabilities())
+    # F-1287: the contract is valid only when the extractor can actually
+    # run and the required templates are present — not merely because the
+    # capability list is non-empty.
+    return bool(get_template_extractor_capabilities()) and _extractor_health()["ready"]
 
 
 def get_template_extractor_baseline_metrics() -> dict:
-    return {"module": "template_extractor", "contract_valid": validate_template_extractor_contract(), "capability_count": len(get_template_extractor_capabilities())}
+    health = _extractor_health()
+    return {"module": "template_extractor", "contract_valid": validate_template_extractor_contract(), "capability_count": len(get_template_extractor_capabilities()), "template_count": health["template_count"], "missing_required": health["missing_required"]}
 
 
 def get_template_extractor_readiness_status() -> dict:

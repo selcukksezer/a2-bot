@@ -122,6 +122,9 @@ def test_review_payload_moves_conflicting_orichalcum_from_trusted_to_weak_on_boo
             "h": 0.20,
             "confidence": 0.92,
             "source": "yolo_auto",
+            # E-07: high confidence alone never trusts — the surviving
+            # box needs per-box human approval to stay trusted.
+            "human_approved": True,
         },
         stem=stem,
     )

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,17 @@ class BoxGeometryGuard:
         """Validate a normalized YOLO box (xc, yc, w, h) and return (is_valid, reason)."""
         cfg = self.config
 
+        # F-0831: NaN/inf coordinates must never pass — every comparison
+        # against NaN is False, so a NaN box used to slip through as "valid".
+        try:
+            all_finite = all(
+                math.isfinite(v) for v in (xc, yc, w, h)
+            )
+        except TypeError:
+            all_finite = False
+        if not all_finite:
+            return False, "non_finite_coordinate"
+
         # Check finite numbers and positive dimensions
         if w <= 0.0 or h <= 0.0:
             return False, "non_positive_dimension"
@@ -94,6 +108,14 @@ class BoxGeometryGuard:
         img_height: Optional[ float ] = None,
     ) -> Tuple[bool, str]:
         """Validate an xyxy box (normalized or pixel if img_width/img_height given)."""
+        # S-2403: exactly one of img_width/img_height given used to silently
+        # skip the division, so pixel values (e.g. x2=1920) were validated
+        # as if they were normalized [0,1] and usually rejected as a
+        # giant_false_box. The signature accepts both as independent
+        # Optionals, so a partial pair is a caller error — reject it
+        # explicitly instead of returning a silently wrong verdict.
+        if (img_width is None) != (img_height is None):
+            return False, "partial_image_dimensions"
         if img_width is not None and img_height is not None:
             if img_width <= 0 or img_height <= 0:
                 return False, "invalid_image_dimensions"
@@ -169,50 +191,194 @@ class BoxGeometryGuard:
 
         for item in annotations:
             stats["total"] += 1
-            if isinstance(item, dict):
-                if "bbox" in item and len(item["bbox"]) == 4:
-                    xc, yc, w, h = (float(v) for v in item["bbox"])
-                elif all(k in item for k in ("xc", "yc", "w", "h")):
-                    xc = float(item["xc"])
-                    yc = float(item["yc"])
-                    w = float(item["w"])
-                    h = float(item["h"])
+            try:
+                if isinstance(item, dict):
+                    if "bbox" in item and len(item["bbox"]) == 4:
+                        xc, yc, w, h = (float(v) for v in item["bbox"])
+                    elif all(k in item for k in ("xc", "yc", "w", "h")):
+                        xc = float(item["xc"])
+                        yc = float(item["yc"])
+                        w = float(item["w"])
+                        h = float(item["h"])
+                    else:
+                        stats["rejected"] += 1
+                        stats["malformed"] += 1
+                        continue
+
+                    valid, reason = self.is_valid_yolo_box(xc, yc, w, h)
+                    if valid:
+                        stats["accepted"] += 1
+                        accepted.append(item)
+                    else:
+                        stats["rejected"] += 1
+                        stats[reason] = stats.get(reason, 0) + 1
+                elif isinstance(item, (list, tuple)):
+                    if len(item) == 5:
+                        cls_id = int(item[0])
+                        xc, yc, w, h = float(item[1]), float(item[2]), float(item[3]), float(item[4])
+                    elif len(item) == 4:
+                        cls_id = 0
+                        xc, yc, w, h = float(item[0]), float(item[1]), float(item[2]), float(item[3])
+                    else:
+                        stats["rejected"] += 1
+                        stats["malformed"] += 1
+                        continue
+
+                    valid, reason = self.is_valid_yolo_box(xc, yc, w, h)
+                    if valid:
+                        stats["accepted"] += 1
+                        accepted.append((cls_id, xc, yc, w, h))
+                    else:
+                        stats["rejected"] += 1
+                        stats[reason] = stats.get(reason, 0) + 1
                 else:
                     stats["rejected"] += 1
                     stats["malformed"] += 1
-                    continue
 
-                valid, reason = self.is_valid_yolo_box(xc, yc, w, h)
-                if valid:
-                    stats["accepted"] += 1
-                    accepted.append(item)
-                else:
-                    stats["rejected"] += 1
-                    stats[reason] = stats.get(reason, 0) + 1
-            elif isinstance(item, (list, tuple)):
-                if len(item) == 5:
-                    cls_id = int(item[0])
-                    xc, yc, w, h = float(item[1]), float(item[2]), float(item[3]), float(item[4])
-                elif len(item) == 4:
-                    cls_id = 0
-                    xc, yc, w, h = float(item[0]), float(item[1]), float(item[2]), float(item[3])
-                else:
-                    stats["rejected"] += 1
-                    stats["malformed"] += 1
-                    continue
 
-                valid, reason = self.is_valid_yolo_box(xc, yc, w, h)
-                if valid:
-                    stats["accepted"] += 1
-                    accepted.append((cls_id, xc, yc, w, h))
-                else:
-                    stats["rejected"] += 1
-                    stats[reason] = stats.get(reason, 0) + 1
-            else:
+            except (TypeError, ValueError, OverflowError):
+                # F-0830: a non-numeric box must reject only itself,
+                # never crash the whole filter batch.
                 stats["rejected"] += 1
                 stats["malformed"] += 1
-
+                continue
         return accepted, stats
+
+    def filter_yolo_arrays(
+        self,
+        boxes: Union[np.ndarray, Sequence[Sequence[float]]],
+        class_ids: Optional[Union[np.ndarray, Sequence[int]]] = None,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, int]]:
+        """Vectorized batch filter for ``(xc, yc, w, h)`` boxes (D42).
+
+        Same acceptance rules and reason precedence as :meth:`is_valid_yolo_box`
+        (non-finite → non-positive → micro → giant → center → corners),
+        evaluated with one NumPy pass instead of a per-box Python loop:
+        50k boxes validate in ~0.005-0.014s vs ~0.21-1.40s for
+        :meth:`filter_yolo_annotations` on the same data (this VM, min of
+        3 timeit runs per side, load avg 20-40; see dev-bench-d42/bench.py).
+
+        Args:
+            boxes: ``(N, 4)`` array-like of ``(xc, yc, w, h)`` rows (a flat
+                4-tuple is treated as a single box; empty input is allowed).
+            class_ids: optional length-``N`` class ids, carried through for
+                accepted rows (truncated toward zero like ``int(...)``).
+
+        Returns:
+            ``(accepted_boxes, accepted_class_ids, stats)`` where
+            ``accepted_boxes`` is a float64 ``(M, 4)`` array,
+            ``accepted_class_ids`` is an int64 array or ``None`` when no ids
+            were given, and ``stats`` mirrors the scalar filter's keys
+            (``total`` / ``accepted`` / ``rejected`` / per-reason counts).
+
+        Raises:
+            ValueError: non-numeric boxes, wrong shape, or a ``class_ids``
+                length that does not match the number of boxes.
+        """
+        try:
+            arr = np.asarray(boxes, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("boxes must be numeric (N, 4) values") from exc
+        if arr.ndim == 1:
+            if arr.size == 0:
+                arr = arr.reshape(0, 4)
+            elif arr.size == 4:
+                arr = arr.reshape(1, 4)
+            else:
+                raise ValueError(f"boxes must have shape (N, 4), got {arr.shape}")
+        if arr.ndim != 2 or arr.shape[1] != 4:
+            raise ValueError(f"boxes must have shape (N, 4), got {arr.shape}")
+
+        n = int(arr.shape[0])
+        stats: Dict[str, int] = {
+            "total": n,
+            "accepted": 0,
+            "rejected": 0,
+            "micro_noise_box": 0,
+            "giant_false_box": 0,
+            "center_out_of_screen": 0,
+            "corners_out_of_screen": 0,
+            "non_positive_dimension": 0,
+            "non_finite_coordinate": 0,
+            "malformed": 0,
+        }
+        if n == 0:
+            empty_ids = (
+                np.zeros((0,), dtype=np.int64) if class_ids is not None else None
+            )
+            return arr.reshape(0, 4), empty_ids, stats
+
+        ids: Optional[np.ndarray] = None
+        if class_ids is not None:
+            try:
+                ids = np.asarray(class_ids, dtype=np.float64).ravel().astype(np.int64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("class_ids must be numeric") from exc
+            if ids.shape[0] != n:
+                raise ValueError(
+                    f"class_ids length {ids.shape[0]} does not match {n} boxes"
+                )
+
+        cfg = self.config
+        xc = arr[:, 0]
+        yc = arr[:, 1]
+        w = arr[:, 2]
+        h = arr[:, 3]
+        eps = 1e-6
+        x1 = xc - (w / 2.0)
+        y1 = yc - (h / 2.0)
+        x2 = xc + (w / 2.0)
+        y2 = yc + (h / 2.0)
+
+        # Integer reason codes, not strings: np.select over a "<U22" string
+        # array pays a full() of 50k wide strings plus six string
+        # comparisons for the counts; int8 codes + one bincount do the same
+        # work in ~1/5 of the time (0.30s -> 0.06s per 50k boxes). np.select
+        # takes the FIRST matching condition, so listing the reasons in
+        # is_valid_yolo_box order reproduces its precedence exactly (a NaN
+        # row matches only the first, non-finite, condition because every
+        # NaN comparison below it is False).
+        # Codes: 0 ok, 1 non_finite, 2 non_positive, 3 micro, 4 giant,
+        # 5 center, 6 corners.
+        reason_codes = np.select(
+            [
+                ~np.isfinite(arr).all(axis=1),
+                (w <= 0.0) | (h <= 0.0),
+                (w < cfg.min_width) | (h < cfg.min_height),
+                (w > cfg.max_width) | (h > cfg.max_height),
+                (xc < cfg.min_coord)
+                | (xc > cfg.max_coord)
+                | (yc < cfg.min_coord)
+                | (yc > cfg.max_coord),
+                (x1 < cfg.min_coord - eps)
+                | (y1 < cfg.min_coord - eps)
+                | (x2 > cfg.max_coord + eps)
+                | (y2 > cfg.max_coord + eps),
+            ],
+            [1, 2, 3, 4, 5, 6],
+            default=0,
+        )
+        counts = np.bincount(reason_codes, minlength=7)
+        for code, reason in enumerate(
+            (
+                "ok",
+                "non_finite_coordinate",
+                "non_positive_dimension",
+                "micro_noise_box",
+                "giant_false_box",
+                "center_out_of_screen",
+                "corners_out_of_screen",
+            )
+        ):
+            if code == 0:
+                continue
+            stats[reason] = int(counts[code])
+        accepted_mask = reason_codes == 0
+        stats["accepted"] = int(counts[0])
+        stats["rejected"] = n - stats["accepted"]
+        accepted_boxes = np.ascontiguousarray(arr[accepted_mask], dtype=np.float64)
+        accepted_ids = ids[accepted_mask] if ids is not None else None
+        return accepted_boxes, accepted_ids, stats
 
     def filter_yolo_label_lines(self, lines: Iterable[str]) -> Tuple[List[str], Dict[str, int]]:
         """Filter raw YOLO label text lines ('class_id xc yc w h')."""

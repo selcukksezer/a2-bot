@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QPixmap
 
 from ui.map_viewer import MapViewerWindow, _MapCanvas
 from core.route_manager import RouteManager, NodeData
@@ -26,8 +27,31 @@ def qapp():
     return app
 
 
+@pytest.fixture
+def tiny_map_pixmap(monkeypatch):
+    """Replace the 2258x2400 HD map load with a 64x64 stand-in.
+
+    MapViewerWindow.__init__ (via reload_map_and_nodes) loads the Altgard
+    HD map and grayscale-converts it twice (~2.6 s per window). Tests that
+    assert nothing about the background pixmap use this stand-in instead;
+    test_background_map_switching keeps the real load and still pins the
+    2258x2400 HD size. The stand-in honours the real return contract
+    (QPixmap, (0, 0) offset), so node/route/persistence assertions run
+    through the same reload path, only with a smaller base pixmap.
+    """
+    monkeypatch.setattr(
+        MapViewerWindow,
+        "_load_region_map_pixmap",
+        lambda self, nodes: (QPixmap(64, 64), (0, 0)),
+    )
+
+
 class MockRouteManager:
-    """Mock RouteManager supporting authoritative _regions and atomic save_region."""
+    """Mock RouteManager supporting authoritative _regions and atomic save_region.
+
+    Nodes are real core.route_manager.NodeData objects, as in production:
+    the window must never depend on mock nodes being plain dicts.
+    """
     def __init__(self, region: str = "Altgard"):
         self.active_region = region
         self.active_route = "All"
@@ -35,36 +59,36 @@ class MockRouteManager:
             "Altgard": {
                 "routes": ["All", "Dredgion Crash Site", "Safe Haven"],
                 "nodes": [
-                    {
-                        "id": 1,
-                        "region": "Altgard",
-                        "routes": ["All", "Dredgion Crash Site"],
-                        "map_x": 400,
-                        "map_y": 300,
-                        "norm_x": 0.3125,
-                        "norm_y": 0.4167,
-                        "resource_type": "Orichalcum Ore",
-                        "max_harvests": 3,
-                        "current_harvests": 0,
-                        "source_type": "manual",
-                        "state": "active",
-                        "seq_index": 1,
-                    },
-                    {
-                        "id": 2,
-                        "region": "Altgard",
-                        "routes": ["All", "Safe Haven"],
-                        "map_x": 450,
-                        "map_y": 350,
-                        "norm_x": 0.3515,
-                        "norm_y": 0.4861,
-                        "resource_type": "Orichalcum Ore",
-                        "max_harvests": 3,
-                        "current_harvests": 0,
-                        "source_type": "manual",
-                        "state": "active",
-                        "seq_index": 2,
-                    },
+                    NodeData(
+                        id=1,
+                        region="Altgard",
+                        routes=["All", "Dredgion Crash Site"],
+                        map_x=400,
+                        map_y=300,
+                        norm_x=0.3125,
+                        norm_y=0.4167,
+                        resource_type="Orichalcum Ore",
+                        max_harvests=3,
+                        current_harvests=0,
+                        source_type="manual",
+                        state="active",
+                        seq_index=1,
+                    ),
+                    NodeData(
+                        id=2,
+                        region="Altgard",
+                        routes=["All", "Safe Haven"],
+                        map_x=450,
+                        map_y=350,
+                        norm_x=0.3515,
+                        norm_y=0.4861,
+                        resource_type="Orichalcum Ore",
+                        max_harvests=3,
+                        current_harvests=0,
+                        source_type="manual",
+                        state="active",
+                        seq_index=2,
+                    ),
                 ],
             }
         }
@@ -123,7 +147,7 @@ def test_subregion_canonical_mapping(qapp):
     assert MapViewerWindow.canonical_region_name("Morheim") == "Morheim"
 
 
-def test_subregion_set_region_integration(qapp):
+def test_subregion_set_region_integration(qapp, tiny_map_pixmap):
     """Calling set_region with a subregion sets canonical region Altgard and selects route."""
     rm = MockRouteManager()
     win = MapViewerWindow(route_manager=rm, region_name="Altgard")
@@ -163,8 +187,11 @@ def test_background_map_switching(qapp):
     assert win.combo_bg_mode.currentIndex() == 3
     assert win.canvas._base_pixmap is not None
     assert not win.canvas._base_pixmap.isNull()
-    assert win.canvas._base_pixmap.width() == 1180
-    assert win.canvas._base_pixmap.height() == 740
+    # Mosaic size must match what the production mosaic builder itself
+    # produces (no magic-number pinning of the builder's internal constants).
+    expected_mosaic = win._build_patch_mosaic_pixmap([])
+    assert win.canvas._base_pixmap.width() == expected_mosaic.width()
+    assert win.canvas._base_pixmap.height() == expected_mosaic.height()
 
     # 2. Reference frame mode
     win.set_background_mode("frame18")
@@ -189,7 +216,7 @@ def test_background_map_switching(qapp):
     assert win.combo_bg_mode.currentIndex() == 0
 
 
-def test_background_mode_combo_signal(qapp):
+def test_background_mode_combo_signal(qapp, tiny_map_pixmap):
     """Changing combo box index triggers set_background_mode."""
     rm = MockRouteManager()
     win = MapViewerWindow(route_manager=rm)
@@ -202,7 +229,7 @@ def test_background_mode_combo_signal(qapp):
 # ---------------------------------------------------------------------------
 # Test 3: AutoCartographer Live Sync
 # ---------------------------------------------------------------------------
-def test_autocartographer_live_sync(qapp):
+def test_autocartographer_live_sync(qapp, tiny_map_pixmap):
     """Live auto-mapped points from AutoCartographer appear in MapViewerWindow."""
     rm = MockRouteManager()
     carto = MockAutoCartographer()
@@ -235,7 +262,7 @@ def test_autocartographer_live_sync(qapp):
 # ---------------------------------------------------------------------------
 # Test 4: Interactive Canvas Callbacks & Atomic Persistence
 # ---------------------------------------------------------------------------
-def test_interactive_node_add_atomic_persistence(qapp):
+def test_interactive_node_add_atomic_persistence(qapp, tiny_map_pixmap):
     """Adding a node atomically updates self.routes._regions[reg]['nodes'] and calls save_region."""
     rm = MockRouteManager()
     win = MapViewerWindow(route_manager=rm)
@@ -253,10 +280,10 @@ def test_interactive_node_add_atomic_persistence(qapp):
     # Add node via canvas callback slot _on_canvas_node_added
     win._on_canvas_node_added((600.0, 400.0))
     assert len(rm._regions["Altgard"]["nodes"]) == initial_count + 2
-    assert rm._regions["Altgard"]["nodes"][-1]["id"] == 4
+    assert rm._regions["Altgard"]["nodes"][-1].id == 4
 
 
-def test_interactive_node_move_atomic_persistence(qapp):
+def test_interactive_node_move_atomic_persistence(qapp, tiny_map_pixmap):
     """Moving a node updates coordinates and immediately saves."""
     rm = MockRouteManager()
     win = MapViewerWindow(route_manager=rm)
@@ -264,17 +291,17 @@ def test_interactive_node_move_atomic_persistence(qapp):
     # Move node #1
     success = win.move_node(1, 510.0, 315.0)
     assert success is True
-    assert rm._regions["Altgard"]["nodes"][0]["map_x"] == 510
-    assert rm._regions["Altgard"]["nodes"][0]["map_y"] == 315
+    assert rm._regions["Altgard"]["nodes"][0].map_x == 510
+    assert rm._regions["Altgard"]["nodes"][0].map_y == 315
     assert "Altgard" in rm.saved_regions
 
     # Move via slot _on_canvas_node_moved
     win._on_canvas_node_moved(2, 490.0, 370.0)
-    assert rm._regions["Altgard"]["nodes"][1]["map_x"] == 490
-    assert rm._regions["Altgard"]["nodes"][1]["map_y"] == 370
+    assert rm._regions["Altgard"]["nodes"][1].map_x == 490
+    assert rm._regions["Altgard"]["nodes"][1].map_y == 370
 
 
-def test_interactive_node_delete_atomic_persistence(qapp):
+def test_interactive_node_delete_atomic_persistence(qapp, tiny_map_pixmap):
     """Deleting a node removes it, renumbers seq_index, and immediately saves."""
     rm = MockRouteManager()
     win = MapViewerWindow(route_manager=rm)
@@ -285,11 +312,11 @@ def test_interactive_node_delete_atomic_persistence(qapp):
     assert 1 not in remaining_ids
     assert 2 in remaining_ids
     # seq_index of node #2 should now be 1
-    assert rm._regions["Altgard"]["nodes"][0]["seq_index"] == 1
+    assert rm._regions["Altgard"]["nodes"][0].seq_index == 1
     assert "Altgard" in rm.saved_regions
 
 
-def test_route_toggling_atomic_persistence(qapp):
+def test_route_toggling_atomic_persistence(qapp, tiny_map_pixmap):
     """Toggling a node in/out of active route updates and saves."""
     rm = MockRouteManager()
     win = MapViewerWindow(route_manager=rm)
@@ -297,18 +324,18 @@ def test_route_toggling_atomic_persistence(qapp):
 
     # Toggle node #1 into CustomRoute
     win._toggle_node_in_active_route(1)
-    assert "CustomRoute" in rm._regions["Altgard"]["nodes"][0]["routes"]
+    assert "CustomRoute" in rm._regions["Altgard"]["nodes"][0].routes
     assert "Altgard" in rm.saved_regions
 
     # Toggle node #1 out of CustomRoute
     win._toggle_node_in_active_route(1)
-    assert "CustomRoute" not in rm._regions["Altgard"]["nodes"][0]["routes"]
+    assert "CustomRoute" not in rm._regions["Altgard"]["nodes"][0].routes
 
 
 # ---------------------------------------------------------------------------
 # Test 5: Real RouteManager Disk Persistence Integration
 # ---------------------------------------------------------------------------
-def test_real_routemanager_disk_persistence(qapp):
+def test_real_routemanager_disk_persistence(qapp, tiny_map_pixmap):
     """Verifies that add/move/delete operations on MapViewerWindow persist genuine JSON to disk."""
     temp_dir = tempfile.mkdtemp(prefix="gatherion_test_routes_")
     try:

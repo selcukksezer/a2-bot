@@ -5,9 +5,9 @@ Interactive Manual Tag Search & Human-Approved Annotation Box Builder for Aion 2
 
 Provides:
 - `SearchableTagRegistry`: Bilingual (Turkish & English) instant search and
-  filtering registry over all canonical YOLO classes (0..24: 22 core classes +
-  3 consumable classes: hp_potion, mp_potion, buff_scroll) and the 140+ Aion 2
-  materials catalog.
+  filtering registry over all canonical YOLO classes (0..26: 22 core classes +
+  3 consumable classes: hp_potion, mp_potion, buff_scroll, plus kinah (25)
+  and player_character (26)) and the 140+ Aion 2 materials catalog.
 - `search_label_classes(query: str) -> List[Dict[str, Any]]`: Instant search
   helper for UI search bars, combobox filters, and quick-tag hotkeys (supports
   queries like "aria", "orichalcum", "pot", "iksir", "scroll", "parşömen",
@@ -19,10 +19,14 @@ Provides:
 
 from __future__ import annotations
 
+import bisect
+import logging
 import re
 import time
 import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+
+logger = logging.getLogger("Gatherion.ManualTagSearch")
 
 from config.materials_db import AION2_MATERIALS_CATALOG
 from dataset_factory.class_taxonomy import (
@@ -84,8 +88,11 @@ def _normalize_tr(text: Any) -> str:
     raw = str(text or "").strip()
     if not raw:
         return ""
-    # Replace Turkish capital I/İ before standard lower()
-    raw = raw.replace("İ", "i").replace("I", "ı")
+    # Replace Turkish capital I/İ before standard lower(). F-1063: capital
+    # "I" must fold to "i" here, exactly as _fold_ascii maps it — the old
+    # code mapped "I" to "ı", so a query containing "I" never matched the
+    # ASCII-folded side of the same comparison.
+    raw = raw.replace("İ", "i").replace("I", "i")
     cleaned = " ".join(raw.lower().split())
     return cleaned
 
@@ -101,6 +108,19 @@ def _fold_ascii(text: Any) -> str:
     return " ".join(cleaned.split())
 
 
+def _has_prefix(sorted_terms: Sequence[str], prefix: str) -> bool:
+    """Return True iff any term in the pre-sorted sequence starts with `prefix`.
+
+    Bisect equivalent of ``any(t.startswith(prefix) for t in terms)``:
+    the first term >= prefix is the only candidate that can have it as a
+    prefix, so one comparison decides it instead of a full linear scan.
+    """
+    if not sorted_terms:
+        return False
+    idx = bisect.bisect_left(sorted_terms, prefix)
+    return idx < len(sorted_terms) and sorted_terms[idx].startswith(prefix)
+
+
 def _tokenize_search_text(text: Any) -> List[str]:
     """Split normalized search text into alphanumeric tokens."""
     folded = _fold_ascii(text)
@@ -109,8 +129,18 @@ def _tokenize_search_text(text: Any) -> List[str]:
     return [tok for tok in re.split(r"[\s_\-/,:;()]+", folded) if tok]
 
 
+# P1-8 (K-21): minimum search score for a best guess to silently resolve
+# to a class in get_by_name(). Exact tiers only — exact name/label 950,
+# exact keyword/alias 850, exact primary token 820, exact token 760.
+# Anything weaker (prefix 720/650/600, multi-token AND, substring
+# 520/400) is a guess, not a resolution, and must not become a class
+# that create_manual_annotation_box() then stamps trusted=True,
+# confidence=1.0.
+_EXACT_MATCH_MIN_SCORE = 760.0
+
+
 # =============================================================================
-# Curated Bilingual Keywords & Search Synonyms per Canonical Class (0..24)
+# Curated Bilingual Keywords & Search Synonyms per Canonical Class (0..26)
 # =============================================================================
 
 _SUPER_CATEGORY_LABELS_TR: Dict[str, str] = {
@@ -122,6 +152,7 @@ _SUPER_CATEGORY_LABELS_TR: Dict[str, str] = {
     "hud_skill": "HUD Skill / Arayüz",
     "consumable": "Tüketilebilir Eşya",
     "currency": "Para / Kinah Göstergesi",
+    "player": "Oyuncu Karakteri",
 }
 
 _CURATED_CLASS_KEYWORDS: Dict[int, Tuple[str, ...]] = {
@@ -732,6 +763,37 @@ _CURATED_CLASS_KEYWORDS: Dict[int, Tuple[str, ...]] = {
         "kazanç",
         "kazanc",
     ),
+    26: (
+        # No curated entry existed for the player character: the registry
+        # only knew its canonical name/labels, so UI searches for the
+        # taxonomy aliases ("hero", "avatar", "ben", "self") returned
+        # nothing and "oyuncu" ranked the HP/MP bars above the character
+        # itself. These synonyms mirror the alias map in
+        # class_taxonomy (player/karakter/oyuncu/hero/avatar/ben) — the
+        # class id (26) and the taxonomy itself are untouched.
+        "player_character",
+        "player character",
+        "player_3d",
+        "3d player",
+        "player",
+        "character",
+        "self_character",
+        "self character",
+        "self",
+        "avatar",
+        "hero",
+        "ben",
+        "oyuncu",
+        "oyuncu karakteri",
+        "oyuncu 3d",
+        "3b oyuncu",
+        "karakter",
+        "karakterim",
+        "kendi karakterim",
+        "ana karakter",
+        "kahraman",
+        "kendi oyuncum",
+    ),
 }
 
 
@@ -754,24 +816,41 @@ class SearchableTagRegistry:
         self._keyword_sets_tr: Dict[int, Set[str]] = {}
         self._keyword_sets_ascii: Dict[int, Set[str]] = {}
         self._token_sets_ascii: Dict[int, Set[str]] = {}
+        # Precomputed per-class scoring fields (see _build_registry): the
+        # folded labels, primary-token set, sorted keyword/token lists and
+        # folded category names for one class never change after build, so
+        # _score_entry() reads them instead of re-folding / re-tokenizing
+        # the same strings on every keystroke search.
+        self._score_fields: Dict[int, Dict[str, Any]] = {}
         self._build_registry()
 
     def _build_registry(self) -> None:
-        """Populate registry metadata and search indices for classes 0..24."""
+        """Populate registry metadata and search indices for classes 0..26."""
         gather_ids = gather_class_ids()
 
         # Collect catalog material names mapped to their canonical class IDs
         catalog_keywords_by_cid: Dict[int, List[str]] = {cid: [] for cid in ALL_CANONICAL_CLASSES}
+        # S172 (v19/P3-8): ismi ve base_material'i çözülemeyen katalog
+        # terimleri sessizce atlanıyordu — kaçının düştüğü bilinmiyordu.
+        _skipped_catalog: List[str] = []
         for spec in AION2_MATERIALS_CATALOG:
             sanitized = try_sanitize_class_id_and_name(-1, spec.name)
             if sanitized is None:
                 sanitized = try_sanitize_class_id_and_name(-1, spec.base_material)
-            if sanitized is not None:
-                cid = sanitized[0]
-                if cid in catalog_keywords_by_cid:
-                    for term in (spec.name, spec.name_tr, spec.base_material, spec.category):
-                        if term:
-                            catalog_keywords_by_cid[cid].append(str(term))
+            if sanitized is None:
+                _skipped_catalog.append(str(spec.name or spec.base_material or "?"))
+                continue
+            cid = sanitized[0]
+            if cid in catalog_keywords_by_cid:
+                for term in (spec.name, spec.name_tr, spec.base_material, spec.category):
+                    if term:
+                        catalog_keywords_by_cid[cid].append(str(term))
+        if _skipped_catalog:
+            logger.warning(
+                "SearchableTagRegistry: %d katalog terimi çözülemedi, aramaya girmedi (ör. %s).",
+                len(_skipped_catalog),
+                ", ".join(_skipped_catalog[:5]),
+            )
 
         for cid in sorted(ALL_CANONICAL_CLASSES):
             cname = CANONICAL_NAMES[cid]
@@ -846,7 +925,12 @@ class SearchableTagRegistry:
                 "is_gatherable": cid in gather_ids,
                 "is_3d_material": cid in MATERIAL_3D_CLASSES,
                 "is_minimap": cid in MINIMAP_SYMBOL_CLASSES,
-                "is_monster": cid in MONSTER_CLASSES or cid == 11,
+                # P1-1: single source — is_monster is exactly the taxonomy
+                # MONSTER_CLASSES ({10}); 11 (minimap_monster_dot) is a
+                # MINIMAP symbol of a monster, not a monster element
+                # (class_taxonomy.is_monster_element(11) is False, same
+                # rule), and it already carries is_minimap=True above.
+                "is_monster": cid in MONSTER_CLASSES,
                 "is_navigable": cid in NAVIGABLE_ELEMENT_CLASSES,
                 "is_hud": cid in HUD_ELEMENT_CLASSES,
                 "is_skill": cid in HUD_SKILL_CLASSES,
@@ -861,6 +945,29 @@ class SearchableTagRegistry:
             self._token_sets_ascii[cid] = tok_set_ascii
             self._search_blobs_tr[cid] = " | ".join(sorted(kw_set_tr))
             self._search_blobs_ascii[cid] = " | ".join(sorted(kw_set_ascii))
+            # One-time scoring precompute for this class (read by
+            # _score_entry() and by the category filter in search()).
+            # Values are exactly what _score_entry() used to recompute
+            # per search per class: folded labels, the primary-token set
+            # built from class name + short/TR/EN labels, sorted keyword
+            # and token lists for bisect prefix checks, and the folded
+            # super-category / display-category names.
+            self._score_fields[cid] = {
+                "cname_ascii": _fold_ascii(cname),
+                "short_tr": _normalize_tr(short_tr),
+                "short_ascii": _fold_ascii(short_tr),
+                "label_tr": _normalize_tr(label_tr),
+                "label_ascii": _fold_ascii(label_tr),
+                "label_en_ascii": _fold_ascii(label_en),
+                "primary_tokens": frozenset(
+                    _tokenize_search_text(f"{cname} {short_tr} {label_tr} {label_en}")
+                ),
+                "sorted_kw_tr": sorted(kw_set_tr),
+                "sorted_kw_ascii": sorted(kw_set_ascii),
+                "sorted_tokens": sorted(tok_set_ascii),
+                "super_fold": _fold_ascii(super_cat),
+                "category_fold": _fold_ascii(category_tr),
+            }
 
     def get_all_classes(self, include_consumables: bool = True) -> List[Dict[str, Any]]:
         """Return all canonical class metadata dictionaries ordered by class_id."""
@@ -874,7 +981,7 @@ class SearchableTagRegistry:
         return results
 
     def get_by_id(self, class_id: Any) -> Optional[Dict[str, Any]]:
-        """Return class metadata dictionary for a canonical class_id (0..24), or None."""
+        """Return class metadata dictionary for a canonical class_id (0..26), or None."""
         try:
             cid = int(class_id)
         except (TypeError, ValueError):
@@ -887,12 +994,27 @@ class SearchableTagRegistry:
         return result
 
     def get_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        """Resolve a class name or alias to its canonical class metadata dictionary."""
+        """Resolve a class name or alias to its canonical class metadata dictionary.
+
+        Only exact-tier evidence resolves here: the canonical sanitizer
+        (exact name / alias / whole-token match) or a top search hit at
+        exact-name / exact-keyword / exact-token score (>=
+        ``_EXACT_MATCH_MIN_SCORE``). A weaker best guess (prefix, substring,
+        multi-token AND) must NOT silently become a class — it used to flow
+        into ``create_manual_annotation_box()`` and get stamped
+        ``trusted=True, confidence=1.0`` (P1-8, K-21). Returns None when
+        nothing exact matches; callers must treat None as "unknown", not
+        fall back to a default class.
+        """
         sanitized = try_sanitize_class_id_and_name(-1, name)
         if sanitized is not None:
             return self.get_by_id(sanitized[0])
         matches = self.search(name, limit=1)
-        return matches[0] if matches else None
+        if not matches:
+            return None
+        if float(matches[0].get("score", 0.0)) < _EXACT_MATCH_MIN_SCORE:
+            return None
+        return matches[0]
 
     def get_class(self, class_id_or_name: Any) -> Optional[Dict[str, Any]]:
         """Return canonical class metadata by integer ID or string name/query."""
@@ -907,21 +1029,33 @@ class SearchableTagRegistry:
         return self.get_by_name(str(class_id_or_name or ""))
 
     def resolve_class_id(self, query_or_id: Any) -> Optional[int]:
-        """Resolve any integer ID, class name, or search term to a canonical class ID (0..24)."""
+        """Resolve any integer ID, class name, or search term to a canonical class ID (0..26)."""
         entry = self.get_class(query_or_id)
         if entry is not None:
             return int(entry["class_id"])
         return None
 
     def _score_entry(self, cid: int, query_tr: str, query_ascii: str, query_tokens: List[str]) -> float:
-        """Compute relevance score (>= 0.0) for class `cid` against a search query."""
+        """Compute relevance score (>= 0.0) for class `cid` against a search query.
+
+        All per-class strings (folded labels, primary tokens, sorted
+        keyword/token lists) come from ``self._score_fields[cid]``,
+        precomputed once in :meth:`_build_registry`; nothing here
+        re-folds or re-tokenizes entry text per search.
+        """
+        # P1-8 (K-21): an empty query is a prefix of every label, so the
+        # prefix tier below scored it 720.0 for all 27 classes. An empty
+        # query matches nothing; search() also short-circuits it to [].
+        if not query_ascii and not query_tr:
+            return 0.0
         entry = self._entries_by_id[cid]
-        cname_ascii = _fold_ascii(entry["class_name"])
-        short_tr = _normalize_tr(entry["short_label_tr"])
-        short_ascii = _fold_ascii(entry["short_label_tr"])
-        label_tr = _normalize_tr(entry["label_tr"])
-        label_ascii = _fold_ascii(entry["label_tr"])
-        label_en_ascii = _fold_ascii(entry["label_en"])
+        fields = self._score_fields[cid]
+        cname_ascii = fields["cname_ascii"]
+        short_tr = fields["short_tr"]
+        short_ascii = fields["short_ascii"]
+        label_tr = fields["label_tr"]
+        label_ascii = fields["label_ascii"]
+        label_en_ascii = fields["label_en_ascii"]
 
         kw_tr = self._keyword_sets_tr[cid]
         kw_ascii = self._keyword_sets_ascii[cid]
@@ -949,50 +1083,58 @@ class SearchableTagRegistry:
             score = max(score, 850.0)
 
         # 4. Exact token match in primary fields (e.g., "aria", "orichalcum", "pot", "iksir", "scroll", "parşömen", "canavar", "skill", "filiz", "engel", "yol")
-        primary_tokens = set(
-            _tokenize_search_text(
-                f"{entry['class_name']} {entry['short_label_tr']} {entry['label_tr']} {entry['label_en']}"
-            )
-        )
+        primary_tokens = fields["primary_tokens"]
         if query_ascii in primary_tokens:
             score = max(score, 820.0)
         elif query_ascii in tokens_ascii:
             score = max(score, 760.0)
 
-        # 5. Prefix match on primary labels or keywords
-        if (
-            cname_ascii.startswith(query_ascii)
-            or short_ascii.startswith(query_ascii)
-            or label_ascii.startswith(query_ascii)
-            or label_en_ascii.startswith(query_ascii)
-            or short_tr.startswith(query_tr)
-            or label_tr.startswith(query_tr)
-        ):
-            score = max(score, 720.0)
-        elif any(k.startswith(query_tr) for k in kw_tr) or any(k.startswith(query_ascii) for k in kw_ascii):
-            score = max(score, 650.0)
-        elif any(tok.startswith(query_ascii) for tok in tokens_ascii):
-            score = max(score, 600.0)
+        # 5-6. Prefix and multi-token tiers. Their ceilings are 720.0
+        # (prefix) and 500.0 + 120.0 per query token (multi-token AND);
+        # once the score already reaches both ceilings neither tier can
+        # raise it, so both scans are skipped — this is the hot path for
+        # exact-name / exact-keyword queries ("aria", "pot", ...).
+        # The prefix scans themselves are bisect lookups over the
+        # pre-sorted keyword/token lists instead of linear startswith
+        # scans over the whole sets.
+        ceiling = max(720.0, 500.0 + 120.0 * len(query_tokens))
+        if score < ceiling:
+            # 5. Prefix match on primary labels or keywords
+            if (
+                cname_ascii.startswith(query_ascii)
+                or short_ascii.startswith(query_ascii)
+                or label_ascii.startswith(query_ascii)
+                or label_en_ascii.startswith(query_ascii)
+                or short_tr.startswith(query_tr)
+                or label_tr.startswith(query_tr)
+            ):
+                score = max(score, 720.0)
+            elif _has_prefix(fields["sorted_kw_tr"], query_tr) or _has_prefix(
+                fields["sorted_kw_ascii"], query_ascii
+            ):
+                score = max(score, 650.0)
+            elif _has_prefix(fields["sorted_tokens"], query_ascii):
+                score = max(score, 600.0)
 
-        # 6. Multi-token AND matching (all query tokens must match when multiple tokens are given)
-        if len(query_tokens) > 1:
-            matched_tokens = 0
-            token_bonus = 0.0
-            for qtok in query_tokens:
-                if qtok in primary_tokens:
-                    matched_tokens += 1
-                    token_bonus += 120.0
-                elif qtok in tokens_ascii:
-                    matched_tokens += 1
-                    token_bonus += 90.0
-                elif any(t.startswith(qtok) for t in tokens_ascii):
-                    matched_tokens += 1
-                    token_bonus += 70.0
-                elif qtok in blob_ascii:
-                    matched_tokens += 1
-                    token_bonus += 50.0
-            if matched_tokens == len(query_tokens):
-                score = max(score, 500.0 + token_bonus)
+            # 6. Multi-token AND matching (all query tokens must match when multiple tokens are given)
+            if len(query_tokens) > 1:
+                matched_tokens = 0
+                token_bonus = 0.0
+                for qtok in query_tokens:
+                    if qtok in primary_tokens:
+                        matched_tokens += 1
+                        token_bonus += 120.0
+                    elif qtok in tokens_ascii:
+                        matched_tokens += 1
+                        token_bonus += 90.0
+                    elif _has_prefix(fields["sorted_tokens"], qtok):
+                        matched_tokens += 1
+                        token_bonus += 70.0
+                    elif qtok in blob_ascii:
+                        matched_tokens += 1
+                        token_bonus += 50.0
+                if matched_tokens == len(query_tokens):
+                    score = max(score, 500.0 + token_bonus)
 
         # 7. Substring match in primary names or keyword blobs (for queries >= 4 chars, or primary fields)
         if score == 0.0:
@@ -1037,30 +1179,25 @@ class SearchableTagRegistry:
         Args:
             query: Search string (e.g. "aria", "orichalcum", "pot", "iksir",
                 "scroll", "parşömen", "canavar", "skill", "filiz", "engel", "yol").
-                If empty, returns all classes in canonical order.
+                If empty, returns [] (no match) — use get_all_classes() to
+                list the catalog explicitly.
             limit: Optional maximum number of results to return.
             category: Optional super-category filter (e.g. "3d_material", "consumable", "hud_skill").
             include_consumables: Whether to include classes 22..24 (default True).
 
         Returns:
-            List of matching class metadata dicts, sorted by descending relevance score
-            and ascending class_id.
+            List of matching class metadata dicts, sorted by descending relevance score,
+            then shorter canonical name on ties, then ascending class_id.
         """
         raw_query = str(query or "").strip()
         cat_filter = _fold_ascii(category) if category else ""
 
         if not raw_query:
-            base = self.get_all_classes(include_consumables=include_consumables)
-            if cat_filter:
-                base = [
-                    item
-                    for item in base
-                    if _fold_ascii(item["super_category"]) == cat_filter
-                    or cat_filter in _fold_ascii(item["category_tr"])
-                ]
-            if limit is not None and limit > 0:
-                return base[: int(limit)]
-            return base
+            # P1-8 (K-21): an empty query matches nothing. It used to
+            # return all 27 classes, and through get_by_name() the first
+            # one (herb_aria) silently became the resolved class for an
+            # empty input. Listing the catalog is get_all_classes()' job.
+            return []
 
         query_tr = _normalize_tr(raw_query)
         query_ascii = _fold_ascii(raw_query)
@@ -1073,10 +1210,8 @@ class SearchableTagRegistry:
                 continue
             entry = self._entries_by_id[cid]
             if cat_filter:
-                if (
-                    _fold_ascii(entry["super_category"]) != cat_filter
-                    and cat_filter not in _fold_ascii(entry["category_tr"])
-                ):
+                fields = self._score_fields[cid]
+                if fields["super_fold"] != cat_filter and cat_filter not in fields["category_fold"]:
                     continue
 
             score = self._score_entry(cid, query_tr, query_ascii, query_tokens)
@@ -1085,8 +1220,12 @@ class SearchableTagRegistry:
                 item["score"] = round(float(score), 2)
                 scored_results.append((score, cid, item))
 
-        # Sort by descending score, then ascending canonical class_id
-        scored_results.sort(key=lambda pair: (-pair[0], pair[1]))
+        # Sort by descending score. F-0973: a score tie used to break on the
+        # raw class_id, so a generic query ("pot", "ot") ranked classes by
+        # their arbitrary numeric id. Ties now break on the shorter canonical
+        # name (the more specific match) and only then on class_id, which
+        # stays as the final deterministic fallback.
+        scored_results.sort(key=lambda pair: (-pair[0], len(pair[2]["class_name"]), pair[1]))
         results = [item for _, _, item in scored_results]
 
         if limit is not None and limit > 0:
@@ -1101,8 +1240,16 @@ class SearchableTagRegistry:
         query: str = "",
         include_consumables: bool = True,
     ) -> List[Tuple[int, str]]:
-        """Return `(class_id, display_label)` pairs matching `query` for UI dropdowns."""
-        matches = self.search(query=query, include_consumables=include_consumables)
+        """Return `(class_id, display_label)` pairs matching `query` for UI dropdowns.
+
+        An empty query lists the whole catalog (the dropdown's unfiltered
+        state) — this is explicit listing via get_all_classes(), not a
+        search: search("") itself returns [] (P1-8, K-21).
+        """
+        if not str(query or "").strip():
+            matches = self.get_all_classes(include_consumables=include_consumables)
+        else:
+            matches = self.search(query=query, include_consumables=include_consumables)
         return [(int(m["class_id"]), str(m["display_label"])) for m in matches]
 
     def create_manual_box(
@@ -1143,7 +1290,7 @@ def search_label_classes(
 
     Supports queries like:
     "aria", "orichalcum", "pot", "iksir", "scroll", "parşömen",
-    "canavar", "skill", "filiz", "engel", "yol", as well as numeric IDs (0..24)
+    "canavar", "skill", "filiz", "engel", "yol", as well as numeric IDs (0..26)
     and any Aion 2 catalog material name.
 
     Args:
@@ -1185,7 +1332,7 @@ def create_manual_annotation_box(
     for the approved training pool and golden benchmark anchor bank.
 
     Args:
-        class_id: Canonical integer class ID (0..24) or class name / search alias
+        class_id: Canonical integer class ID (0..26) or class name / search alias
             (e.g., 0, "herb_aria", "aria", 22, "hp_potion", "can iksiri").
         cx: Box center X coordinate (normalized 0..1, or pixel coordinate if image_width given).
         cy: Box center Y coordinate (normalized 0..1, or pixel coordinate if image_height given).
@@ -1203,7 +1350,7 @@ def create_manual_annotation_box(
 
     Raises:
         ValueError: If `class_id` / `class_name` cannot be resolved to a valid canonical
-            class (0..24) or if coordinates are non-numeric.
+            class (0..26) or if coordinates are non-numeric.
     """
     registry = get_tag_registry()
 
@@ -1237,25 +1384,41 @@ def create_manual_annotation_box(
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid box coordinates: cx={cx!r}, cy={cy!r}, w={w!r}, h={h!r}") from exc
 
-    if image_width is not None and int(image_width) > 0 and (fcx > 1.0 or fw > 1.0):
-        fcx = fcx / float(image_width)
-        fw = fw / float(image_width)
-    if image_height is not None and int(image_height) > 0 and (fcy > 1.0 or fh > 1.0):
-        fcy = fcy / float(image_height)
-        fh = fh / float(image_height)
+    # Her koordinat kendi birimine göre dönüştürülür: eski kod (fcx > 1.0
+    # veya fw > 1.0) koşulunda cx ve w'yi birlikte bölüyordu; karışık
+    # girdide (örn. cx piksel, w normalize) normalize olan taraf da
+    # bölünüp kutu bozuluyordu (cx=960px, w=0.1 -> w=0.0001; cx=0.5,
+    # w=200px -> cx=0.052). Tutarlı girdide (dördü de piksel veya dördü
+    # de normalize) davranış aynen korunur.
+    if image_width is not None and int(image_width) > 0:
+        if fcx > 1.0:
+            fcx = fcx / float(image_width)
+        if fw > 1.0:
+            fw = fw / float(image_width)
+    if image_height is not None and int(image_height) > 0:
+        if fcy > 1.0:
+            fcy = fcy / float(image_height)
+        if fh > 1.0:
+            fh = fh / float(image_height)
 
     if clamp:
         fcx = max(0.0, min(1.0, fcx))
         fcy = max(0.0, min(1.0, fcy))
         fw = max(1e-4, min(1.0, fw))
         fh = max(1e-4, min(1.0, fh))
-        # Ensure box edges stay within [0.0, 1.0]
-        half_w = min(fw * 0.5, fcx, 1.0 - fcx)
-        half_h = min(fh * 0.5, fcy, 1.0 - fcy)
-        if half_w > 1e-4:
-            fw = half_w * 2.0
-        if half_h > 1e-4:
-            fh = half_h * 2.0
+        # Ensure box edges stay within [0.0, 1.0] (F-0971): the old code
+        # shrank the width toward the nearest edge but left it unchanged
+        # when the centre sat exactly on the edge (fcx == 0.0/1.0), so the
+        # box still stuck out of the frame. Clamp the centre itself so the
+        # half-extent always fits: fcx in [fw/2, 1 - fw/2].
+        if fw >= 1.0:
+            fcx = 0.5
+        else:
+            fcx = max(fw * 0.5, min(1.0 - fw * 0.5, fcx))
+        if fh >= 1.0:
+            fcy = 0.5
+        else:
+            fcy = max(fh * 0.5, min(1.0 - fh * 0.5, fcy))
 
     fcx = round(fcx, 6)
     fcy = round(fcy, 6)
@@ -1298,6 +1461,13 @@ def create_manual_annotation_box(
     }
 
     if isinstance(extra_metadata, dict) and extra_metadata:
+        # F-0972: extra_metadata must never override the trust/identity
+        # fields the builder guarantees. The old blocklist missed the
+        # aliases and derived fields ("conf" duplicates "confidence";
+        # "manual"/"is_manual"/"approved"/"verified" restate the trust
+        # flags; "source"/"yolo_line"/"created_at" and the label/color
+        # fields are computed from the canonical entry), so a caller could
+        # smuggle in conf=0.0 or approved=False through the back door.
         for k, v in extra_metadata.items():
             if k not in (
                 "class_id",
@@ -1311,6 +1481,19 @@ def create_manual_annotation_box(
                 "hand_label",
                 "human_approved",
                 "confidence",
+                "conf",
+                "manual",
+                "is_manual",
+                "approved",
+                "verified",
+                "source",
+                "yolo_line",
+                "created_at",
+                "label_tr",
+                "short_label_tr",
+                "super_category",
+                "color_hex",
+                "color_bgr",
             ):
                 box[k] = v
 

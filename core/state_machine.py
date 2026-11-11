@@ -12,11 +12,16 @@ import random
 import threading
 import time
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
+
+# F-0540 tek kaynak: HP/MP iksir eşik yedek değerleri config/schema.py
+# sabitlerinden okunur (sözleşme no 10: HP 65 / MP 45).
+from config.schema import HP_POTION_THRESHOLD_PCT, MP_POTION_THRESHOLD_PCT
+from version import __version__, normalize_version
 
 logger = logging.getLogger("Gatherion.StateMachine")
 if not logger.handlers:
@@ -68,6 +73,293 @@ MODE_BADGE_MAP: Dict[str, str] = {
 }
 
 
+# D30: hoisted out of BotWorker._get_cfg, which rebuilt this mapping on
+# every call. The mapping is only ever read (via .get), so a single
+# module-level copy is behaviour-identical.
+_CFG_ALIASES: Dict[str, Tuple[Tuple[Optional[str], str], ...]] = {
+    "f_interval_min": (
+        (None, "f_interval_min"),
+        ("gathering", "f_interval_min"),
+        ("gathering", "min_f_interval"),
+    ),
+    "f_interval_max": (
+        (None, "f_interval_max"),
+        ("gathering", "f_interval_max"),
+        ("gathering", "max_f_interval"),
+    ),
+    "test_mode": (
+        (None, "test_mode"),
+        ("gathering", "test_mode"),
+    ),
+    "show_overlay": (
+        (None, "show_overlay"),
+        ("gathering", "show_overlay"),
+    ),
+    "harvests_per_node": (
+        (None, "harvests_per_node"),
+        ("gathering", "harvests_per_node"),
+        ("route", "harvests_per_node"),
+    ),
+    "inter_harvest_delay_min": (
+        (None, "inter_harvest_delay_min"),
+        ("gathering", "inter_harvest_delay_min"),
+    ),
+    "inter_harvest_delay_max": (
+        (None, "inter_harvest_delay_max"),
+        ("gathering", "inter_harvest_delay_max"),
+    ),
+    "retry_on_extraction_fail": (
+        (None, "retry_on_extraction_fail"),
+        ("gathering", "retry_on_extraction_fail"),
+    ),
+    "max_retries_per_harvest_stage": (
+        (None, "max_retries_per_harvest_stage"),
+        ("gathering", "max_retries_per_harvest_stage"),
+    ),
+    "gather_key": (
+        (None, "gather_key"),
+        ("gathering", "gather_key"),
+    ),
+    "post_harvest_prompt_timeout": (
+        (None, "post_harvest_prompt_timeout"),
+        ("gathering", "post_harvest_prompt_timeout"),
+        ("gathering", "prompt_reappear_timeout"),
+    ),
+    "gather_cast_duration_sec": (
+        (None, "gather_cast_duration_sec"),
+        ("gathering", "gather_cast_duration_sec"),
+        ("gathering", "cast_duration_sec"),
+    ),
+    # P1-13: pause_on_keyboard_input KALDIRILDI — bu anahtarın şemada
+    # (config/schema.py) alanı, UI'da denetimi ve üretimde okuyucusu yoktu;
+    # klavye girdisiyle duraklatma mekanizması da yok (yalnızca kısayol
+    # ctrl+alt+f10 ile duraklatma ve Alt-Tab koruması var). Takma-ad
+    # girdisi tek başına ayarın okunabilir olduğu izlenimi veriyordu.
+    "pause_on_alt_tab": (
+        # P1-13: okuyucular route'u önce okur (main._resolve_pause_on_alt_tab,
+        # BotWorker._get_cfg); UI gathering yazar, _cfg_set route'a aynalar.
+        (None, "pause_on_alt_tab"),
+        ("route", "pause_on_alt_tab"),
+        ("gathering", "pause_on_alt_tab"),
+    ),
+    "rest_minutes": (
+        (None, "rest_minutes"),
+        ("route", "rest_minutes"),
+        ("route", "rest_after_visit_min"),
+    ),
+    "gathered_join_route": (
+        (None, "gathered_join_route"),
+        (None, "gathered_join_active_route"),
+        ("route", "gathered_join_active_route"),
+        ("route", "gathered_join_route"),
+        ("route", "gathered_nodes_join_route"),
+    ),
+    "time_to_reach_sec": (
+        (None, "time_to_reach_sec"),
+        ("route", "time_to_reach_sec"),
+        ("route", "time_to_reach_node_sec"),
+    ),
+    "reclick_node_sec": (
+        (None, "reclick_node_sec"),
+        ("route", "reclick_node_sec"),
+        ("route", "reclick_interval_sec"),
+    ),
+    "selective_gather_enabled": (
+        (None, "selective_gather_enabled"),
+        ("gathering", "selective_gather_enabled"),
+        ("gathering", "selective_gather"),
+    ),
+    # F-0573: oto-iksir anahtarı — config/schema.py `gathering.auto_consumables`
+    # (ayar R01'de ekleniyor); UI onay kutusu worker özniteliğini yazar.
+    "auto_consumables": (
+        (None, "auto_consumables"),
+        ("gathering", "auto_consumables"),
+    ),
+    "selected_materials": (
+        (None, "selected_materials"),
+        ("gathering", "selected_materials"),
+        (None, "selected_gather_materials"),
+        ("gathering", "selected_gather_materials"),
+    ),
+    "gather_on_the_way": (
+        (None, "gather_on_the_way"),
+        ("route", "gather_on_the_way"),
+        ("route", "exploration_gather"),
+    ),
+    "minimap_auto_record": (
+        (None, "minimap_auto_record"),
+        ("route", "minimap_auto_record"),
+    ),
+    "minimap_ignore_monsters": (
+        (None, "minimap_ignore_monsters"),
+        ("route", "minimap_ignore_monsters"),
+    ),
+    "hybrid_3d_and_minimap_record": (
+        (None, "hybrid_3d_and_minimap_record"),
+        ("route", "hybrid_3d_and_minimap_record"),
+    ),
+    "auto_record_3d_crests": (
+        (None, "auto_record_3d_crests"),
+        ("route", "auto_record_3d_crests"),
+    ),
+    "max_failed_in_row": (
+        (None, "max_failed_in_row"),
+        ("route", "max_failed_in_row"),
+        ("route", "max_failures_before_wait"),
+    ),
+    "remove_node_after_failures": (
+        (None, "remove_node_after_failures"),
+        ("route", "remove_node_after_failures"),
+    ),
+    "wait_min_after_failed": (
+        (None, "wait_min_after_failed"),
+        ("route", "wait_min_after_failed"),
+    ),
+    "pause_after_no_gather_min": (
+        (None, "pause_after_no_gather_min"),
+        ("route", "pause_after_no_gather_min"),
+        ("route", "pause_after_idle_min"),
+    ),
+    "fight_back": (
+        (None, "fight_back"),
+        (None, "fight_back_when_attacked"),
+        ("route", "fight_back"),
+        ("route", "fight_back_when_attacked"),
+    ),
+    "fight_stop_gather_sec": (
+        (None, "fight_stop_gather_sec"),
+        ("route", "fight_stop_gather_sec"),
+    ),
+    "combat_skill_burst_sec": (
+        (None, "combat_skill_burst_sec"),
+        ("input", "skill_burst_sec"),
+        ("combat", "skill_burst_sec"),
+        ("route", "skill_burst_sec"),
+    ),
+    "skills_per_burst": (
+        (None, "skills_per_burst"),
+        ("input", "skills_per_burst"),
+        ("combat", "skills_per_burst"),
+        ("route", "skills_per_burst"),
+    ),
+    "combat_skill_gcd_sec": (
+        (None, "combat_skill_gcd_sec"),
+        ("input", "skill_gcd_sec"),
+        ("combat", "skill_gcd_sec"),
+        ("route", "skill_gcd_sec"),
+    ),
+    "mp_full_threshold": (
+        (None, "mp_full_threshold"),
+        ("route", "mp_full_threshold"),
+        ("combat", "mp_full_threshold"),
+    ),
+    # F-23-01: iksir eşik/tuş anahtarlarının takma adı yoktu — _get_cfg
+    # düz (None, key) adayıyla route.hp/mp_potion_threshold_pct değerini
+    # hiç çözemiyor, her zaman çağrı-yeri varsayılanını (65/45) dönüyordu.
+    # Bu girdiler olmadan ManaPhaseCombat'a ayar geçirmek sahte bağlama
+    # olurdu (kullanıcı 50 yazsa bile bot 65 kullanırdı).
+    "hp_potion_threshold_pct": (
+        (None, "hp_potion_threshold_pct"),
+        ("route", "hp_potion_threshold_pct"),
+    ),
+    "mp_potion_threshold_pct": (
+        (None, "mp_potion_threshold_pct"),
+        ("route", "mp_potion_threshold_pct"),
+    ),
+    # F-23-01: tuş anahtarları J dalında şemaya eklendi (RouteSettings);
+    # bu dalda _get_cfg varsayılanı (F1/F2) geçerli, J merge'inden sonra
+    # dosyadaki değer çözülür.
+    "hp_potion_key": (
+        (None, "hp_potion_key"),
+        ("route", "hp_potion_key"),
+    ),
+    "mp_potion_key": (
+        (None, "mp_potion_key"),
+        ("route", "mp_potion_key"),
+    ),
+    # P1-13: HP/MP/buff anahtarları şemada (route.*) ve UI'da vardı ama
+    # _get_cfg takma adı yoktu — düz (None, key) adayı BotSettings
+    # üzerinde çözülemiyor, her zaman çağrı-yeri varsayılanı dönüyordu.
+    # F-23-01'deki eşik/tuş deseniyle aynı: takma ad olmadan ayar
+    # geçirmek sahte bağlama olurdu (kullanıcı kapatsa bile bot
+    # kullanmaya devam ederdi).
+    "auto_use_hp_potion": (
+        (None, "auto_use_hp_potion"),
+        ("route", "auto_use_hp_potion"),
+    ),
+    "auto_use_mp_potion": (
+        (None, "auto_use_mp_potion"),
+        ("route", "auto_use_mp_potion"),
+    ),
+    "auto_refresh_buff_scroll": (
+        (None, "auto_refresh_buff_scroll"),
+        ("route", "auto_refresh_buff_scroll"),
+    ),
+    "buff_scroll_interval_sec": (
+        (None, "buff_scroll_interval_sec"),
+        ("route", "buff_scroll_interval_sec"),
+    ),
+    "buff_scroll_key": (
+        (None, "buff_scroll_key"),
+        ("route", "buff_scroll_key"),
+    ),
+    "ucb_explore_ratio": (
+        (None, "ucb_explore_ratio"),
+        ("route", "ucb_explore_ratio"),
+    ),
+    "skill_discovery_enabled": (
+        (None, "skill_discovery_enabled"),
+        ("route", "skill_discovery_enabled"),
+        ("combat", "skill_discovery_enabled"),
+    ),
+    "combat_skill_keys": (
+        (None, "combat_skill_keys"),
+        (None, "skill_keys"),
+        ("combat", "combat_skill_keys"),
+        ("combat", "skill_keys"),
+        ("route", "combat_skill_keys"),
+        ("route", "skill_keys"),
+    ),
+    "skill_keys": (
+        (None, "skill_keys"),
+        (None, "combat_skill_keys"),
+        ("combat", "skill_keys"),
+        ("combat", "combat_skill_keys"),
+        ("route", "skill_keys"),
+        ("route", "combat_skill_keys"),
+    ),
+    "break_every_min": (
+        (None, "break_every_min"),
+        ("breaks", "break_every_min"),
+        ("breaks", "interval_min"),
+    ),
+    "break_every_variance": (
+        (None, "break_every_variance"),
+        ("breaks", "break_every_variance"),
+        ("breaks", "interval_jitter_min"),
+    ),
+    "break_lasts_min": (
+        (None, "break_lasts_min"),
+        ("breaks", "break_lasts_min"),
+        ("breaks", "duration_min"),
+    ),
+    "break_lasts_variance": (
+        (None, "break_lasts_variance"),
+        ("breaks", "break_lasts_variance"),
+        ("breaks", "duration_jitter_min"),
+    ),
+    "prompt_threshold": (
+        (None, "prompt_threshold"),
+        ("gathering", "prompt_threshold"),
+        ("vision", "prompt_threshold"),
+    ),
+    "version": (
+        (None, "version"),
+        ("app", "version"),
+    ),
+}
+
+
 class BotWorker(QThread):
     """
     Main non-blocking orchestration thread (QThread) for the Gatherion A2 Bot.
@@ -80,6 +372,10 @@ class BotWorker(QThread):
     node_recorded = pyqtSignal(dict)
     state_changed = pyqtSignal(str, str)
     status_updated = pyqtSignal(str)
+    # Harvest aşama sinyali (stage, max_harvests): main.py bunu hasattr ile
+    # arayıp OverlayHUD.update_harvest_stage'e bağlar; sinyal yoksa rozet
+    # hiç güncellenemezdi (Harvest 0/3 hep 0 kalırdı).
+    harvest_stage_changed = pyqtSignal(int, int)
 
     def __init__(
         self,
@@ -95,6 +391,7 @@ class BotWorker(QThread):
         hud_reader: Any = None,
         minimap_scanner: Any = None,
         material_scanner: Any = None,
+        yolo_detector: Any = None,
     ) -> None:
         super().__init__(parent)
 
@@ -129,6 +426,28 @@ class BotWorker(QThread):
             else self._init_default_combat_recovery()
         )
         self.combat = self.combat_recovery
+
+        # F-0198: a None core dependency must be visible, not silently carried.
+        # run() refuses to start the loop while any of these is missing.
+        self._core_deps_missing = [
+            name
+            for name, dep in (
+                ("vision", self.vision),
+                ("input_driver", self.input_driver),
+                ("route_manager", self.route_manager),
+                ("combat_recovery", self.combat_recovery),
+            )
+            if dep is None
+        ]
+        if self._core_deps_missing:
+            logger.error(
+                "Core dependencies missing, bot will not run: %s",
+                ", ".join(self._core_deps_missing),
+            )
+        self._pending_route_sort = False
+        self._last_gather_prompt = None
+        self._gathered_nodes_count = 0
+        self._stage_cast_bar_seen = False
 
         # Core state & mode flags
         self._mode: str = BotMode.ROUTE_MODE.value
@@ -165,8 +484,38 @@ class BotWorker(QThread):
         self._route_saw_target_bar: bool = False
         self._route_saw_hp_drop: bool = False
         self._route_prev_hp_ratio: Optional[float] = None
+        # P1-10 (K-14): watchdog'un okuduğu vitaller. BotWorker'da
+        # hp_ratio/current_hp hiç yayınlanmıyordu — watchdog'un
+        # _check_worker_vitals'ı (check_health ← monitor loop) her
+        # saniye çalışıyor ama her zaman no-op kalıyordu (WORKER_DEAD /
+        # WORKER_LOW_HP / WORKER_REVIVED hiç ateşlenemiyordu).
+        # Son bilinen oyuncu HP oranı burada yayınlanır; ölüm/hayatta
+        # kalma kararı _publish_worker_hp_ratio'nun debounce'una göre
+        # verilir (tek karelik 0.0 okuma hatası ölüm sayılmaz).
+        self.hp_ratio: Optional[float] = None
+        self._worker_hp_prev_ratio: Optional[float] = None
+        self._worker_hp_near_zero_streak: int = 0
+        self._worker_hp_pre_collapse: Optional[float] = None
         self._route_last_loot_ts: float = 0.0
         self._route_bar_since_loot: bool = False
+        # ROTA-İPTAL-ZİNCİRİ (Görev 2): doğrulanmış savaş kapısı.
+        # Tek karelik bar/HP sinyali FIGHTING'e sokmaz — sinyal ardışık
+        # tick'lerde tekrarlanmalı (streak); bir savaş bayrağı
+        # temizlendikten sonra histerezis penceresi içinde FIGHTING'e
+        # tekrar girilmez.
+        self._route_bar_streak: int = 0
+        self._route_hp_streak: int = 0
+        # fix/v20-panic-combat: bar penceresi içinde saldıran-düşman
+        # kanıtı görüldü mü (HP düşüşü veya ToT aggro). Bar tek başına
+        # FIGHTING'e sokmaz — bkz. _route_combat_signal_confirmed.
+        self._route_bar_corroborated: bool = False
+        self._route_fight_last_cleared_ts: float = 0.0
+        self._route_fight_suspended: bool = False
+        # W54/v19: aktif hasat sirasinda dogrulanmis saldiri sinyalinin
+        # ilk goruldugu an (time.time — _handle_combat_and_death'teki
+        # now_ts ile ayni saat). fight_stop_gather_sec dolmadan savas
+        # toplamayi bolmez; bkz. _handle_combat_and_death.
+        self._gather_under_attack_since: float = 0.0
         self._map_open_backoff_until: float = 0.0
         self._map_open_fail_announced: bool = False
         self._last_nav_block: str = ""
@@ -183,15 +532,34 @@ class BotWorker(QThread):
         self._stage_cast_in_progress: bool = False
         self._stage_cast_start_time: float = 0.0
         self._stage_cast_end_time: float = 0.0
+        # Cast ilerleme kanıtı (Y2/Y3): barın dolduğu, tek karede %90
+        # görülmesiyle değil, ardışık okumalarda YÜKSELDİĞİYLE kanıtlanır.
+        self._stage_cast_prev_pct: Optional[float] = None
+        self._stage_cast_rose: bool = False
+        # Son renkli karenin yaşı (O6): bayat kareyle cast kararı verilmez.
+        self._last_color_frame_ts: float = 0.0
+        # Düğüm mesafesinin tazeliği (16/1, 16/2): mesafe yalnızca harita
+        # reclick'inde güncellenir; bayat mesafe varış/takılma kararı verdirmez.
+        self._active_node_distance_updated_ts: float = 0.0
+        # Barsız fight-back adım sayacı (17/B7 — P3-4: eski metin bayattı).
+        # Eskiden "L3 (fight_back_step) loot F'si sayacı" deniyordu; L3
+        # Y2/P1-11 düzeltmesinden beri kör loot F basmıyor
+        # (combat_recovery.py fight_back_step, Y2 bloğu) — sayılan artık
+        # yalnızca ardışık barsız fight-back adımıdır. Sayaç korunur:
+        # _loot_confirmed_fight onu streak>=2 eşiğiyle (l3_looted) okur.
+        self._route_fightback_no_bar_streak: int = 0
+        # Oto-kayıt modu aşama takibi (15/O2): manuel modda da gerçek aşama
+        # yazılsın diye aynı prompt'ta art arda toplananlar sayılır.
+        self._auto_record_stage: int = 0
+        self._auto_record_prompt_name: str = ""
+        # Kartografi hata görünürlüğü (16/12): sessiz bozulma olmasın.
+        self._carto_error_count: int = 0
         self._last_detected_prompt_key: str = "f"
 
         # Strict sequential node commitment & cursor (prevents jumping 40 -> 84)
         self._current_target_node_id: Optional[Any] = None
         self._sequential_cursor_idx: int = 0
         self._current_seq_pos: int = 0
-
-        # Death confirmation tick counter (requires >= 3 consecutive ticks + revive_dialog check)
-        self._death_confirm_ticks: int = 0
 
         # Mechanic 2: Continuous Hybrid 3D World + Top-Right Minimap Auto-Recording
         self._last_minimap_auto_record_ts: float = 0.0
@@ -214,6 +582,9 @@ class BotWorker(QThread):
         self.sequential_planner: Any = self._init_optional_subsystem(
             "core.sequential_router", "SequentialRoutePlanner"
         )
+        # H-sweep (dilim 12 K-1): Harvest/Navigation/Corridor üretim
+        # kurulumu — navigator + planner kurulduktan sonra.
+        self._init_navigation_helpers()
         self.hud_reader: Any = (
             hud_reader
             if hud_reader is not None
@@ -228,6 +599,11 @@ class BotWorker(QThread):
             material_scanner
             if material_scanner is not None
             else self._init_optional_subsystem("core.material_scanner", "MaterialScanner")
+        )
+        # Dataset factory ÖNCE kurulmalı: explorer kurulurken factory'yi alır
+        # (eski sırada explorer hep None alıp her kartografi tick'inde yamaya muhtaçtı).
+        self.dataset_factory: Any = self._init_optional_subsystem(
+            "dataset_factory.factory_controller", "AutoLabelingDatasetFactory"
         )
         self.explorer_controller: Any = self._init_explorer_controller()
         self.explorer_ctrl: Any = self.explorer_controller
@@ -257,9 +633,26 @@ class BotWorker(QThread):
         self.panic_system: Any = self._init_optional_subsystem(
             "core.opsec_crypto", "PanicAlertSystem"
         )
-        self.dataset_factory: Any = self._init_optional_subsystem(
-            "dataset_factory.factory_controller", "AutoLabelingDatasetFactory"
-        )
+        if self.dataset_factory is None:
+            _df_err = ""
+            try:
+                _df_err = str(
+                    self.__dict__.get("_optional_subsystem_errors", {}).get(
+                        "dataset_factory.factory_controller.AutoLabelingDatasetFactory", ""
+                    )
+                    or ""
+                )
+            except Exception:
+                _df_err = ""
+            _df_msg = (
+                "DATASET FACTORY YOK — YZ kare çekimi (oto-kayıt) çalışmayacak. "
+                f"Sebep: {_df_err or 'bilinmiyor (import/kurulum hatası)'}"
+            )
+            logger.error(_df_msg)
+            try:
+                self._emit_log(_df_msg)
+            except Exception:
+                pass
         self.game_learner: Any = None
         try:
             from core.omni_game_learner import OmniGameLearner
@@ -396,8 +789,29 @@ class BotWorker(QThread):
         try:
             from core.mana_phase_combat import ManaPhaseCombat
 
+            # F-23-01: HP/MP iksir eşikleri artık ayardan besleniyor
+            # (route.hp/mp_potion_threshold_pct, şema varsayılanı 65/45 —
+            # no10 kararı HP 65). Eskiden kurucuya yalnızca
+            # mp_full_threshold geçiliyor, savaş yolu 0.50/0.30 sabitini,
+            # rota yolu smart 0.65/0.45 sabitini kullanıyordu; kullanıcı
+            # ayarı değiştirse bile hiçbir şey değişmiyordu. Düz + smart
+            # eşik tek değere indirildi: ayar neyse o.
             self.mana_phase_combat = ManaPhaseCombat(
                 mp_full_threshold=float(self._get_cfg("mp_full_threshold", 0.95) or 0.95),
+                hp_potion_threshold=float(self._get_cfg("hp_potion_threshold_pct", HP_POTION_THRESHOLD_PCT) or HP_POTION_THRESHOLD_PCT) / 100.0,
+                mp_potion_threshold=float(self._get_cfg("mp_potion_threshold_pct", MP_POTION_THRESHOLD_PCT) or MP_POTION_THRESHOLD_PCT) / 100.0,
+                smart_hp_potion_threshold=float(self._get_cfg("hp_potion_threshold_pct", HP_POTION_THRESHOLD_PCT) or HP_POTION_THRESHOLD_PCT) / 100.0,
+                smart_mp_potion_threshold=float(self._get_cfg("mp_potion_threshold_pct", MP_POTION_THRESHOLD_PCT) or MP_POTION_THRESHOLD_PCT) / 100.0,
+                hp_potion_key=str(self._get_cfg("hp_potion_key", "F1") or "F1"),
+                mp_potion_key=str(self._get_cfg("mp_potion_key", "F2") or "F2"),
+                # P1-13: iksir/buff anahtarları artık ayardan besleniyor
+                # (route.auto_use_hp/mp_potion, auto_refresh_buff_scroll,
+                # buff_scroll_interval_sec, buff_scroll_key).
+                auto_use_hp_potion=bool(self._get_cfg("auto_use_hp_potion", True)),
+                auto_use_mp_potion=bool(self._get_cfg("auto_use_mp_potion", True)),
+                auto_refresh_buff_scroll=bool(self._get_cfg("auto_refresh_buff_scroll", True)),
+                buff_scroll_interval_sec=float(self._get_cfg("buff_scroll_interval_sec", 300) or 300),
+                buff_scroll_key=str(self._get_cfg("buff_scroll_key", "F7") or "F7"),
                 on_log=self._emit_log,
             )
         except Exception as mana_exc:
@@ -450,9 +864,24 @@ class BotWorker(QThread):
         self.economy_calculator: Any = self._init_optional_subsystem(
             "core.economy_broker", "SessionProfitSimulator"
         )
-        self.yolo_detector: Any = self._init_optional_subsystem(
-            "core.neural_audio_perception", "ONNXYolo3DDetector"
-        )
+        # v20-onnx-reload: main may inject one shared ONNXYolo3DDetector so
+        # BotWorker does not build a second CUDA session that hub/reflex keep
+        # after a later attribute overwrite.
+        if yolo_detector is not None:
+            self.yolo_detector = yolo_detector
+        else:
+            self.yolo_detector = self._init_optional_subsystem(
+                "core.neural_audio_perception", "ONNXYolo3DDetector"
+            )
+        if (
+            self.material_scanner is not None
+            and self.yolo_detector is not None
+            and hasattr(self.material_scanner, "set_yolo_detector")
+        ):
+            try:
+                self.material_scanner.set_yolo_detector(self.yolo_detector)
+            except Exception:
+                pass
         if self.perception_hub is not None and hasattr(self.perception_hub, "bind"):
             try:
                 self.perception_hub.bind(
@@ -502,22 +931,55 @@ class BotWorker(QThread):
             self.selective_gather_enabled = bool(cfg_sel_en)
 
     def _rehydrate_saved_nodes_count(self) -> None:
-        """Rehydrate self.saved_nodes_count from route_manager across restarts."""
+        """Rehydrate self.saved_nodes_count from route_manager across restarts.
+
+        Görev 4: sayı yeniden yükleniyordu ama last_saved_str "None"da
+        kalıyordu (170 AUTO MAPPED düğüm varken panelde "LAST MAPPED: None"
+        görünmesinin nedeni buydu — otomatik haritalama :1967'de zaten
+        güncelliyor, eksik olan yalnızca yeniden başlatma sonrası
+        rehidrasyondu). Kayıtlı en büyük düğüm kimliğinden "Node <id>"
+        olarak doldurulur; bu oturumda zaten kaydedilmişse değiştirilmez.
+        """
         try:
             rm = self._plain_attr("route_manager")
             if rm is None:
                 return
             count = 0
+            nodes: Optional[list] = None
+            # Açık bölge argümanı: bölge-uyumsuzluğu engeli yalnızca
+            # aktif-rotayı çalıştıran (argümansız) çağrıları durdurur;
+            # bu okuma kayıtlı veriyi gösterir, engellenmemelidir.
+            active_region = getattr(rm, "active_region", None)
             if hasattr(rm, "get_nodes"):
-                nodes = rm.get_nodes()
+                try:
+                    nodes = rm.get_nodes(region=active_region)
+                except TypeError:
+                    nodes = rm.get_nodes()
                 if isinstance(nodes, list):
                     count = len(nodes)
             elif hasattr(rm, "get_route_nodes"):
-                nodes = rm.get_route_nodes()
+                try:
+                    nodes = rm.get_route_nodes(region_name=active_region)
+                except TypeError:
+                    nodes = rm.get_route_nodes()
                 if isinstance(nodes, list):
                     count = len(nodes)
             if count > 0:
                 self.saved_nodes_count = max(int(self._plain_attr("saved_nodes_count", 0) or 0), count)
+                if str(self._plain_attr("last_saved_str", "None") or "None") == "None":
+                    max_id = 0
+                    for n in nodes or []:
+                        try:
+                            if isinstance(n, dict):
+                                nid = int(n.get("id", 0) or 0)
+                            else:
+                                nid = int(getattr(n, "id", 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if nid > max_id:
+                            max_id = nid
+                    if max_id > 0:
+                        self.last_saved_str = f"Node {max_id}"
         except Exception as exc:
             logger.debug("Failed to rehydrate saved_nodes_count: %s", exc)
 
@@ -580,6 +1042,31 @@ class BotWorker(QThread):
         """Return the list of currently selected materials for gathering."""
         return list(getattr(self, "selected_gather_materials", []))
 
+    def _normalized_selected_materials(self) -> frozenset:
+        """Normalized selected-material set, cached per selection contents.
+
+        D30: ``is_material_selected_for_gather`` used to re-run the full
+        ``match_material_names`` loop (regex normalisation + alias-table
+        rebuild + catalog lookup per target) for every candidate. The
+        cache key is the current selection tuple, so it stays correct
+        even if ``selected_gather_materials`` is assigned directly
+        instead of via ``set_selected_gather_materials``.
+        """
+        from core.material_scanner import normalize_material_name
+
+        selected = getattr(self, "selected_gather_materials", []) or []
+        key = tuple(selected)
+        cache = self.__dict__.get("_selected_materials_norm_cache")
+        if isinstance(cache, tuple) and len(cache) == 2 and cache[0] == key:
+            return cache[1]
+        norm_set = {
+            normalize_material_name(str(s)) for s in key
+        }
+        norm_set.discard("")
+        norm = frozenset(norm_set)
+        self.__dict__["_selected_materials_norm_cache"] = (key, norm)
+        return norm
+
     def is_material_selected_for_gather(self, mat_or_node: Any) -> bool:
         """
         Check if a given material string, DetectedMaterial, or route node matches
@@ -592,7 +1079,7 @@ class BotWorker(QThread):
         if not selected:
             return True
 
-        from core.material_scanner import match_material_names
+        from core.material_scanner import match_material_names, normalize_material_name
 
         mat_str = ""
         if isinstance(mat_or_node, str):
@@ -616,8 +1103,32 @@ class BotWorker(QThread):
         if not mat_str:
             return False
 
+        # D30 fast path: exact equality after normalisation is step 1 of
+        # match_material_names, so a hit here is exactly what the loop
+        # would return — answered with one normalise + one set lookup.
+        norm_cand = normalize_material_name(mat_str)
+        if norm_cand and norm_cand in self._normalized_selected_materials():
+            return True
+
+        # D30 memo: match_material_names(target, candidate) is a pure
+        # function of its two string inputs (normalisation + a literal
+        # alias table + a static catalog lookup), and the same
+        # (target, candidate) pairs are re-checked on every route tick
+        # (_get_next_ready_node / _get_ready_and_resting_counts /
+        # _check_nearby_materials). Memoise per worker, bounded so the
+        # table cannot grow without limit.
+        memo = self.__dict__.get("_match_names_memo")
+        if not isinstance(memo, dict):
+            memo = self.__dict__["_match_names_memo"] = {}
         for target in selected:
-            if match_material_names(target, mat_str):
+            memo_key = (target, mat_str)
+            cached = memo.get(memo_key)
+            if cached is None:
+                cached = bool(match_material_names(target, mat_str))
+                if len(memo) >= 1024:
+                    memo.clear()
+                memo[memo_key] = cached
+            if cached:
                 return True
         return False
 
@@ -680,6 +1191,8 @@ class BotWorker(QThread):
                     continue
             valid_targets.append(cand)
 
+        # F-0392: "nearest" means sorted by estimated distance, not list order.
+        valid_targets.sort(key=lambda c: float(getattr(c, "estimated_distance_m", 0.0) or 0.0))
         return valid_targets[0] if valid_targets else None
 
     def _should_bypass_unselected_gather(
@@ -736,6 +1249,43 @@ class BotWorker(QThread):
         # In selective mode without active node or confirmed match, bypass unknown prompt
         return True
 
+    def adopt_shared_yolo_detector(self, detector: Any) -> None:
+        """Point worker/hub/reflex/scanner at one detector; close a discarded peer.
+
+        main.py used to assign ``worker.yolo_detector = shared`` after
+        BotWorker already built (and bound) its own instance — hub/reflex
+        kept the first CUDA session alive. This method rebinds dependents
+        and closes the orphan so RSS does not climb by ~300-500MB each time.
+        """
+        old = getattr(self, "yolo_detector", None)
+        self.yolo_detector = detector
+        ms = getattr(self, "material_scanner", None)
+        if ms is not None and hasattr(ms, "set_yolo_detector"):
+            try:
+                ms.set_yolo_detector(detector)
+            except Exception as exc:
+                logger.debug("material_scanner set_yolo_detector skipped: %s", exc)
+        hub = getattr(self, "perception_hub", None)
+        if hub is not None and hasattr(hub, "bind"):
+            try:
+                hub.bind(yolo_detector=detector)
+            except Exception as exc:
+                logger.debug("perception_hub yolo rebind skipped: %s", exc)
+        reflex = getattr(self, "reflex", None)
+        bind = getattr(reflex, "_bind_detector", None) if reflex is not None else None
+        if callable(bind):
+            try:
+                bind(detector)
+            except Exception as exc:
+                logger.debug("reflex yolo rebind skipped: %s", exc)
+        if old is not None and old is not detector:
+            closer = getattr(old, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as exc:
+                    logger.debug("discarded yolo_detector.close skipped: %s", exc)
+
     def _init_reflex_scanner(self) -> Any:
         """Reflex scan thread. A missing yolo11/rtdetr file keeps the yolov8 onnx."""
         try:
@@ -758,7 +1308,13 @@ class BotWorker(QThread):
             cls = getattr(mod, class_name)
             return cls()
         except Exception as exc:
-            logger.debug("Optional subsystem %s.%s skipped: %s", module_name, class_name, exc)
+            # Sebebi sakla: sessizce None dönmek, dataset factory gibi kritik
+            # alt sistemlerin neden ölü olduğunu logda görünmez yapıyordu.
+            try:
+                self.__dict__.setdefault("_optional_subsystem_errors", {})[f"{module_name}.{class_name}"] = str(exc)
+            except Exception:
+                pass
+            logger.warning("Optional subsystem %s.%s skipped: %s", module_name, class_name, exc)
             return None
 
     def _init_auto_cartographer(self) -> Any:
@@ -769,8 +1325,25 @@ class BotWorker(QThread):
                 vision_engine=self.vision,
             )
         except Exception as exc:
-            logger.debug("AutoCartographer init skipped: %s", exc)
+            # S-0102: sessiz debug + None, sağlık özetinde görünmüyordu.
+            # _init_optional_subsystem deseniyle aynı: sebebi kaydet + warning.
+            try:
+                self.__dict__.setdefault("_optional_subsystem_errors", {})["core.auto_cartographer.AutoCartographer"] = str(exc)
+            except Exception:
+                pass
+            logger.warning("AutoCartographer init skipped: %s", exc)
             return None
+
+    def heartbeat(self) -> None:
+        """Explorer heartbeat (F-0393): the explorer calls this callback
+        while mapping; previously getattr(self, "heartbeat", None) was
+        always None, so it never fired."""
+        try:
+            watchdog = self._plain_attr("watchdog")
+            if watchdog is not None and hasattr(watchdog, "record_heartbeat"):
+                watchdog.record_heartbeat(self.state, self.mode)
+        except Exception as exc:
+            logger.debug("heartbeat error: %s", exc)
 
     def _init_explorer_controller(self) -> Any:
         try:
@@ -784,7 +1357,12 @@ class BotWorker(QThread):
                 test_mode=False,
             )
         except Exception as exc:
-            logger.debug("ExplorerModeController init skipped: %s", exc)
+            # S-0102: _init_optional_subsystem deseniyle aynı — sebebi kaydet + warning.
+            try:
+                self.__dict__.setdefault("_optional_subsystem_errors", {})["core.explorer_mode.ExplorerModeController"] = str(exc)
+            except Exception:
+                pass
+            logger.warning("ExplorerModeController init skipped: %s", exc)
             return None
 
     # =========================================================================
@@ -841,6 +1419,70 @@ class BotWorker(QThread):
             logger.debug("MapNavigator initialization skipped: %s", exc)
         return None
 
+    def _init_navigation_helpers(self) -> None:
+        """H-sweep kurulumları (dilim 12 K-1): ThreeStageHarvestController,
+        NavigationIntel ve CorridorNavigator üretim kurulumu.
+
+        install_* yardımcıları H dalında (fix/sweep-nav-minimap) tanımlı;
+        bu dalda yoksa kurulum atlanır (warning) — entegrasyonda
+        yardımcılar gelince aynı çağrı noktaları çalışır. Dönen örnekler
+        self.harvest_controller / self.navigation_intel /
+        self.corridor_navigator olarak saklanır. NOT: execute_harvest_loop
+        bloklayan (sleep/poll) tam döngüdür — tick döngüsünden ASLA
+        çağrılmaz; olay arayüzü (start_node/on_cast_completed) bağlantısı
+        ayrı tasarım kararıdır (açık soru).
+        """
+        self.harvest_controller: Any = None
+        self.navigation_intel: Any = None
+        self.corridor_navigator: Any = None
+        try:
+            from core.navigation_intel import (
+                install_navigation_intel,
+                install_three_stage_harvest_controller,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Harvest/navigation kurulum yardımcıları yok (H dalı henüz entegre değil): %s",
+                exc,
+            )
+            install_navigation_intel = None  # type: ignore[assignment]
+            install_three_stage_harvest_controller = None  # type: ignore[assignment]
+        if install_navigation_intel is not None:
+            try:
+                self.navigation_intel = install_navigation_intel(
+                    input_controller=self.input_driver,
+                    route_manager=self.route_manager,
+                    vision_engine=self.vision,
+                )
+            except Exception as exc:
+                logger.warning("NavigationIntel kurulumu başarısız: %s", exc)
+                self.navigation_intel = None
+        if install_three_stage_harvest_controller is not None:
+            try:
+                self.harvest_controller = install_three_stage_harvest_controller(
+                    route_manager=self.route_manager,
+                    input_controller=self.input_driver,
+                )
+            except Exception as exc:
+                logger.warning("ThreeStageHarvestController kurulumu başarısız: %s", exc)
+                self.harvest_controller = None
+        try:
+            from core.corridor_navigator import install_corridor_navigator
+        except Exception as exc:
+            logger.warning(
+                "CorridorNavigator kurulum yardımcısı yok (H dalı henüz entegre değil): %s",
+                exc,
+            )
+            install_corridor_navigator = None  # type: ignore[assignment]
+        if install_corridor_navigator is not None:
+            try:
+                self.corridor_navigator = install_corridor_navigator(
+                    planner=getattr(self, "sequential_planner", None),
+                )
+            except Exception as exc:
+                logger.warning("CorridorNavigator kurulumu başarısız: %s", exc)
+                self.corridor_navigator = None
+
     def _init_default_recorder(self) -> Any:
         try:
             from modules.recorder import NodeRecorder
@@ -860,9 +1502,20 @@ class BotWorker(QThread):
     def _init_default_combat_recovery(self) -> Any:
         try:
             from core.combat_recovery import CombatRecovery  # type: ignore
-            return CombatRecovery(self.vision, self.input_driver)
+
+            # F-23-07 (v11): fly_unreachable ayarı bağlandı (varsayılan True).
+            return CombatRecovery(
+                fly_unreachable=bool(self._get_cfg("fly_unreachable", True)),
+                vision=self.vision,
+                input_ctrl=self.input_driver,
+            )
         except Exception as exc_rec:
-            logger.debug("core.combat_recovery not found (%s), trying core.combat", exc_rec)
+            # 17/B13: kör loot yolu (CombatSystem F+Tab) artık sessiz debug
+            # değil — fallback devredeyken warning verilir.
+            logger.warning(
+                "core.combat_recovery yok (%s) — kör loot yolu (CombatSystem F+Tab) devrede, loot doğrulaması yok",
+                exc_rec,
+            )
             try:
                 from core.combat import CombatSystem
                 if self.vision is not None and self.input_driver is not None:
@@ -880,252 +1533,23 @@ class BotWorker(QThread):
         Reads a configuration key from SettingsManager (config/schema.py),
         BotSettings dataclass, ConfigManager (core/config.py), or plain dicts.
         """
-        aliases: Dict[str, Sequence[Tuple[Optional[str], str]]] = {
-            "f_interval_min": (
-                (None, "f_interval_min"),
-                ("gathering", "f_interval_min"),
-                ("gathering", "min_f_interval"),
-            ),
-            "f_interval_max": (
-                (None, "f_interval_max"),
-                ("gathering", "f_interval_max"),
-                ("gathering", "max_f_interval"),
-            ),
-            "test_mode": (
-                (None, "test_mode"),
-                ("gathering", "test_mode"),
-            ),
-            "show_overlay": (
-                (None, "show_overlay"),
-                ("gathering", "show_overlay"),
-            ),
-            "harvests_per_node": (
-                (None, "harvests_per_node"),
-                ("gathering", "harvests_per_node"),
-                ("route", "harvests_per_node"),
-            ),
-            "inter_harvest_delay_min": (
-                (None, "inter_harvest_delay_min"),
-                ("gathering", "inter_harvest_delay_min"),
-            ),
-            "inter_harvest_delay_max": (
-                (None, "inter_harvest_delay_max"),
-                ("gathering", "inter_harvest_delay_max"),
-            ),
-            "retry_on_extraction_fail": (
-                (None, "retry_on_extraction_fail"),
-                ("gathering", "retry_on_extraction_fail"),
-            ),
-            "max_retries_per_harvest_stage": (
-                (None, "max_retries_per_harvest_stage"),
-                ("gathering", "max_retries_per_harvest_stage"),
-            ),
-            "gather_key": (
-                (None, "gather_key"),
-                ("gathering", "gather_key"),
-            ),
-            "post_harvest_prompt_timeout": (
-                (None, "post_harvest_prompt_timeout"),
-                ("gathering", "post_harvest_prompt_timeout"),
-                ("gathering", "prompt_reappear_timeout"),
-            ),
-            "gather_cast_duration_sec": (
-                (None, "gather_cast_duration_sec"),
-                ("gathering", "gather_cast_duration_sec"),
-                ("gathering", "cast_duration_sec"),
-            ),
-            "pause_on_keyboard_input": (
-                (None, "pause_on_keyboard_input"),
-                ("gathering", "pause_on_keyboard_input"),
-            ),
-            "pause_on_alt_tab": (
-                (None, "pause_on_alt_tab"),
-                ("route", "pause_on_alt_tab"),
-                ("gathering", "pause_on_alt_tab"),
-            ),
-            "rest_minutes": (
-                (None, "rest_minutes"),
-                ("route", "rest_minutes"),
-                ("route", "rest_after_visit_min"),
-            ),
-            "gathered_join_route": (
-                (None, "gathered_join_route"),
-                (None, "gathered_join_active_route"),
-                ("route", "gathered_join_active_route"),
-                ("route", "gathered_join_route"),
-                ("route", "gathered_nodes_join_route"),
-            ),
-            "time_to_reach_sec": (
-                (None, "time_to_reach_sec"),
-                ("route", "time_to_reach_sec"),
-                ("route", "time_to_reach_node_sec"),
-            ),
-            "reclick_node_sec": (
-                (None, "reclick_node_sec"),
-                ("route", "reclick_node_sec"),
-                ("route", "reclick_interval_sec"),
-            ),
-            "selective_gather_enabled": (
-                (None, "selective_gather_enabled"),
-                ("gathering", "selective_gather_enabled"),
-                ("gathering", "selective_gather"),
-            ),
-            "selected_materials": (
-                (None, "selected_materials"),
-                ("gathering", "selected_materials"),
-                (None, "selected_gather_materials"),
-                ("gathering", "selected_gather_materials"),
-            ),
-            "gather_on_the_way": (
-                (None, "gather_on_the_way"),
-                ("route", "gather_on_the_way"),
-                ("route", "exploration_gather"),
-            ),
-            "minimap_auto_record": (
-                (None, "minimap_auto_record"),
-                ("route", "minimap_auto_record"),
-            ),
-            "minimap_ignore_monsters": (
-                (None, "minimap_ignore_monsters"),
-                ("route", "minimap_ignore_monsters"),
-            ),
-            "minimap_auto_filter_check": (
-                (None, "minimap_auto_filter_check"),
-                ("route", "minimap_auto_filter_check"),
-            ),
-            "minimap_cluster_stack_bonus": (
-                (None, "minimap_cluster_stack_bonus"),
-                ("route", "minimap_cluster_stack_bonus"),
-            ),
-            "hybrid_3d_and_minimap_record": (
-                (None, "hybrid_3d_and_minimap_record"),
-                ("route", "hybrid_3d_and_minimap_record"),
-            ),
-            "auto_record_3d_crests": (
-                (None, "auto_record_3d_crests"),
-                ("route", "auto_record_3d_crests"),
-            ),
-            "max_failed_in_row": (
-                (None, "max_failed_in_row"),
-                ("route", "max_failed_in_row"),
-                ("route", "max_failures_before_wait"),
-            ),
-            "remove_node_after_failures": (
-                (None, "remove_node_after_failures"),
-                ("route", "remove_node_after_failures"),
-            ),
-            "wait_min_after_failed": (
-                (None, "wait_min_after_failed"),
-                ("route", "wait_min_after_failed"),
-            ),
-            "pause_after_no_gather_min": (
-                (None, "pause_after_no_gather_min"),
-                ("route", "pause_after_no_gather_min"),
-                ("route", "pause_after_idle_min"),
-            ),
-            "fight_back": (
-                (None, "fight_back"),
-                (None, "fight_back_when_attacked"),
-                ("route", "fight_back"),
-                ("route", "fight_back_when_attacked"),
-            ),
-            "fight_stop_gather_sec": (
-                (None, "fight_stop_gather_sec"),
-                ("route", "fight_stop_gather_sec"),
-            ),
-            "combat_skill_burst_sec": (
-                (None, "combat_skill_burst_sec"),
-                ("input", "skill_burst_sec"),
-                ("combat", "skill_burst_sec"),
-                ("route", "skill_burst_sec"),
-            ),
-            "skills_per_burst": (
-                (None, "skills_per_burst"),
-                ("input", "skills_per_burst"),
-                ("combat", "skills_per_burst"),
-                ("route", "skills_per_burst"),
-            ),
-            "combat_skill_gcd_sec": (
-                (None, "combat_skill_gcd_sec"),
-                ("input", "skill_gcd_sec"),
-                ("combat", "skill_gcd_sec"),
-                ("route", "skill_gcd_sec"),
-            ),
-            "mp_full_threshold": (
-                (None, "mp_full_threshold"),
-                ("route", "mp_full_threshold"),
-                ("combat", "mp_full_threshold"),
-            ),
-            "ucb_explore_ratio": (
-                (None, "ucb_explore_ratio"),
-                ("route", "ucb_explore_ratio"),
-            ),
-            "skill_discovery_enabled": (
-                (None, "skill_discovery_enabled"),
-                ("route", "skill_discovery_enabled"),
-                ("combat", "skill_discovery_enabled"),
-            ),
-            "combat_skill_keys": (
-                (None, "combat_skill_keys"),
-                (None, "skill_keys"),
-                ("combat", "combat_skill_keys"),
-                ("combat", "skill_keys"),
-                ("route", "combat_skill_keys"),
-                ("route", "skill_keys"),
-            ),
-            "skill_keys": (
-                (None, "skill_keys"),
-                (None, "combat_skill_keys"),
-                ("combat", "skill_keys"),
-                ("combat", "combat_skill_keys"),
-                ("route", "skill_keys"),
-                ("route", "combat_skill_keys"),
-            ),
-            "break_every_min": (
-                (None, "break_every_min"),
-                ("breaks", "break_every_min"),
-                ("breaks", "interval_min"),
-            ),
-            "break_every_variance": (
-                (None, "break_every_variance"),
-                ("breaks", "break_every_variance"),
-                ("breaks", "interval_jitter_min"),
-            ),
-            "break_lasts_min": (
-                (None, "break_lasts_min"),
-                ("breaks", "break_lasts_min"),
-                ("breaks", "duration_min"),
-            ),
-            "break_lasts_variance": (
-                (None, "break_lasts_variance"),
-                ("breaks", "break_lasts_variance"),
-                ("breaks", "duration_jitter_min"),
-            ),
-            "prompt_threshold": (
-                (None, "prompt_threshold"),
-                ("gathering", "prompt_threshold"),
-                ("vision", "prompt_threshold"),
-            ),
-            "version": (
-                (None, "version"),
-                ("app", "version"),
-            ),
-        }
 
         try:
             if self.config is None:
                 return default
 
             if key == "break_every_min":
+                # F-23-06: breaks.enabled=false molayı kapatır — break_every_min
+                # değeri dosyada duruyor diye yok sayılmaz. Eskiden yalnızca
+                # break_every_min anahtarı hem düz hem breaks. altında None
+                # ise 0 dönülüyordu; kullanıcı enabled=false + 30 yazsa mola
+                # çalışmaya devam ediyordu. Açıkça False değilse (None/eksik)
+                # normal aramaya düşülür.
                 breaks_enabled = self._raw_cfg_lookup("breaks", "enabled")
-                if (
-                    breaks_enabled is False
-                    and self._raw_cfg_lookup(None, "break_every_min") is None
-                    and self._raw_cfg_lookup("breaks", "break_every_min") is None
-                ):
+                if breaks_enabled is False:
                     return 0
 
-            search_candidates = aliases.get(key, ((None, key),))
+            search_candidates = _CFG_ALIASES.get(key, ((None, key),))
             for section, k in search_candidates:
                 val = self._raw_cfg_lookup(section, k)
                 if val is not None:
@@ -1178,9 +1602,51 @@ class BotWorker(QThread):
                 except TypeError:
                     if section is None:
                         return self.config.get(key)
+
+            # F-0179: SettingsManager.from_dict drops unknown keys (e.g.
+            # breaks.enabled), so a value the user wrote in settings.json
+            # would silently vanish. Fall back to the raw file (cached).
+            raw = self._raw_settings_file_dict()
+            if isinstance(raw, dict):
+                if section is None:
+                    if key in raw:
+                        return raw[key]
+                else:
+                    sec = raw.get(section)
+                    if isinstance(sec, dict) and key in sec:
+                        return sec[key]
         except Exception as exc:
             logger.debug("Raw config lookup failed (%s.%s): %s", section, key, exc)
         return None
+
+    def _raw_settings_file_dict(self) -> Optional[Dict[str, Any]]:
+        """Raw settings.json content, cached by mtime. None when unavailable."""
+        try:
+            import json
+            import os
+            from pathlib import Path
+
+            path = getattr(self.config, "settings_path", None)
+            if path is None:
+                return None
+            mtime = os.path.getmtime(path)
+            cache = self.__dict__.get("_cfg_file_cache")
+            if (
+                isinstance(cache, dict)
+                and cache.get("mtime") == mtime
+                and cache.get("path") == str(path)
+            ):
+                data = cache.get("data")
+                return data if isinstance(data, dict) else None
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.__dict__["_cfg_file_cache"] = {
+                "path": str(path),
+                "mtime": mtime,
+                "data": data,
+            }
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
 
     def _sync_input_driver_state(self) -> None:
         """Synchronizes route_active and test_mode flags with InputController if supported."""
@@ -1261,6 +1727,9 @@ class BotWorker(QThread):
                 self._stage_cast_in_progress = False
                 self._waiting_for_next_stage_prompt = False
                 self._current_node_harvest_stage = 0
+                self._current_target_node_id = None
+                self._sequential_cursor_idx = 0
+                self._current_seq_pos = 0
                 self._gather_lost_frames = 0
                 self._walk_start_time = 0.0
                 self._last_gather_time = time.time()
@@ -1298,11 +1767,16 @@ class BotWorker(QThread):
                         self._set_state_internal(BotState.WALKING.value)
 
             # pause() calls abort_motion(); modes that force-run must clear the input gate again.
+            # v20-loop: ROUTE_MODE eksikti — duraklatma sonrası TOPLAMA'ya
+            # geçince girdi kapısı (motion_abort/aim_blocked) kilitli
+            # kalıyor, hold_movement_key hep False dönüyor, karakter hiç
+            # yürümüyordu. Rota da force-run modudur.
             if normalized in (
                 BotMode.MANUAL_RECORD.value,
                 BotMode.AUTO_RECORD.value,
                 BotMode.EXPLORER_MODE.value,
                 BotMode.COMBAT_MODE.value,
+                BotMode.ROUTE_MODE.value,
             ):
                 driver = self.input_driver
                 if driver is not None:
@@ -1341,6 +1815,28 @@ class BotWorker(QThread):
         except Exception as exc:
             logger.debug("Sequential auto-sort skipped: %s", exc)
 
+    def _notify_panic_paused(self, paused: bool) -> None:
+        """Panik sistemine botun duraklatıldığını/devam ettiğini bildirir.
+
+        fix/v20-panic-combat: PanicAlertSystem.set_paused() savaş
+        sayacını sıfırlar/dondurur (duraklatılmış bot savaşmaz — canlı
+        v19'da bot DURAKLATILMIŞKEN COMBAT_TIMEOUT_2M tetikleniyordu).
+        Panik KİLİDİNE dokunmaz (kilit yalnızca reset_panic ile açılır).
+        panic_system yoksa/eskiyse (set_paused yok) sessizce geçilir —
+        pause()/resume()/stop() asla bu bildirim yüzünden bozulmaz.
+        Tüm duraklatma/durdurma yolları pause()/stop() üzerinden geçtiği
+        için tek kanca noktası burasıdır.
+        """
+        try:
+            panic = self._plain_attr("panic_system", None)
+            if panic is None:
+                return
+            fn = getattr(panic, "set_paused", None)
+            if callable(fn):
+                fn(bool(paused))
+        except Exception as exc:
+            logger.debug("panic_system.set_paused bildirimi atlandı: %s", exc)
+
     def pause(self, reason: str = "Paused by user") -> None:
         """Pauses the bot execution and sets HUD badge to PAUSED."""
         try:
@@ -1349,7 +1845,12 @@ class BotWorker(QThread):
                 already_paused = self._paused and self._state == BotState.PAUSED.value
                 self._paused = True
                 self._pause_reason = reason or "Paused by user"
-                self.active_node = None
+                # 16/10: pause aktif bacağı silmez — Alt+Tab'da (odak kaybı)
+                # yürüme emeği çöpe gitmez; resume aynı düğüme devam eder.
+                # (Savaş askısı "active_node korunur" diyordu ama pause
+                # siliyordu — çelişki buydu.) Yalnızca anlık toplama/cast
+                # durumu sıfırlanır; yarım aşama kaldığı yerden değil,
+                # düğüm başından yeniden denenir.
                 self._is_gathering_active = False
                 self._stage_cast_in_progress = False
                 self._waiting_for_next_stage_prompt = False
@@ -1357,6 +1858,9 @@ class BotWorker(QThread):
                 self._gather_lost_frames = 0
                 self._set_state_internal(BotState.PAUSED.value)
 
+            # fix/v20-panic-combat: duraklatma savaş sayacını sıfırlar/
+            # dondurur (panik sistemine bildirilir).
+            self._notify_panic_paused(True)
             self._sync_input_driver_state()
             if not already_paused:
                 self._emit_log(reason)
@@ -1380,26 +1884,182 @@ class BotWorker(QThread):
             BotMode.AUTO_RECORD.value,
         )
 
+    def _unlock_panic_lock(self) -> Optional[Union[Dict[str, Any], bool]]:
+        """
+        Panik kilidini GERÇEKTEN açar (fix/panic-lock).
+
+        Eski resume() yalnızca panic_system._inputs_halted /
+        _panic_triggered bayraklarını temizliyordu; emergency_halt_inputs
+        maymun-yamaladığı girdi metotlarını (press_key, key_down, key_up,
+        click, ...) _blocked_input no-op ile değiştirdiği için bayraklar
+        "açık" görünürken bot girdi-ölü kalıyordu (canlı log 20:15:13'te
+        3x "[PANIC-LOCK] Girdi engellendi"). Tek gerçek açma yolu
+        reset_panic()/unlock_inputs — saklanan orijinal metotları geri
+        yükler ve zamanlayıcıları sıfırlar (koşul sürüyorsa watchdog hemen
+        yeniden tetiklemez).
+
+        Döner (B-09, üç durumlu): kilit aktifti ve açma doğrulandıysa
+        tetikleyen olay kaydı (dict; olay kaydı yoksa boş dict); kilit
+        aktif değilse ya da panik sistemi yoksa None; kilit aktif ama
+        açılamadı/doğrulanamadıysa False (başarısızlık ayrıca error
+        loglanır). reset_panic() olmayan (eski/test) panic nesnelerinde
+        bayrak temizliğine düşer ve bunu warning ile açıkça söyler.
+        """
+        panic = self._plain_attr("panic_system")
+        if panic is None:
+            return None
+
+        def _bool_flag(name: str) -> bool:
+            # Gerçek bool olmayan değerler (örn. MagicMock) "bilinmiyor"
+            # sayılır — sahte pozitif/negatif doğrulama yapılmaz.
+            try:
+                return getattr(panic, name, None) is True
+            except Exception:
+                return False
+
+        # reset_panic() _last_panic_event'i siler — sebebi ÖNCE oku.
+        event: Optional[Dict[str, Any]] = None
+        try:
+            getter = getattr(panic, "get_last_panic_event", None)
+            if callable(getter):
+                maybe_event = getter()
+                if isinstance(maybe_event, dict):
+                    event = maybe_event
+        except Exception:
+            event = None
+        if event is None:
+            try:
+                raw = getattr(panic, "_last_panic_event", None)
+                if isinstance(raw, dict):
+                    event = dict(raw)
+            except Exception:
+                event = None
+
+        saved_state = getattr(panic, "_halted_input_state", None)
+        lock_active = (
+            _bool_flag("_panic_triggered")
+            or _bool_flag("_inputs_halted")
+            or _bool_flag("panic_triggered")
+            or _bool_flag("inputs_halted")
+            or isinstance(saved_state, dict)
+        )
+        if not lock_active:
+            return None
+
+        reset_fn = None
+        for _name in ("reset_panic", "unlock_inputs", "resume_from_panic"):
+            _fn = getattr(panic, _name, None)
+            if callable(_fn):
+                reset_fn = _fn
+                break
+
+        if reset_fn is None:
+            try:
+                if hasattr(panic, "_inputs_halted"):
+                    panic._inputs_halted = False
+                if hasattr(panic, "_panic_triggered"):
+                    panic._panic_triggered = False
+            except Exception:
+                pass
+            logger.warning(
+                "[PANIC] Panik bayrakları temizlendi ama reset_panic()/unlock_inputs "
+                "yok — maymun-yamalı girdi metotları geri yüklenememiş olabilir."
+            )
+            self._emit_log(
+                "Panik bayrakları temizlendi ama girdi metotları geri yüklenememiş olabilir"
+            )
+            # B-09: kilit aktifti ama açma doğrulanamadı -> False.
+            return False
+
+        try:
+            # Argümansız: reset_panic kilitlerken saklanan denetleyiciyi
+            # (halt edilen nesnenin kendisini) geri yükler.
+            result = reset_fn()
+        except Exception as exc:
+            logger.error("[PANIC] Panik kilidi açılamadı (reset_panic hatası): %s", exc)
+            self._emit_log(f"Panik kilidi AÇILAMADI: {exc}")
+            return False
+        if result is False:
+            logger.error(
+                "[PANIC] Panik kilidi kısmen açıldı (reset_panic False döndü) — "
+                "bazı girdi metotları kilitli kalmış olabilir."
+            )
+            self._emit_log("Panik kilidi kısmen açıldı — bazı girdiler kilitli kalmış olabilir")
+            return False
+        if (
+            _bool_flag("_panic_triggered")
+            or _bool_flag("_inputs_halted")
+            or _bool_flag("panic_triggered")
+            or _bool_flag("inputs_halted")
+        ):
+            logger.error(
+                "[PANIC] reset_panic() başarılı döndü ama panik bayrakları hâlâ "
+                "aktif — girdi kilidi sürüyor olabilir."
+            )
+            self._emit_log("Panik kilidi açılamadı — bayraklar hâlâ aktif")
+            return False
+
+        reason = ""
+        details = ""
+        if event is not None:
+            reason = str(event.get("reason") or "")
+            details = str(event.get("details") or "")
+        msg = f"Panik kilidi açıldı (sebep: {reason or 'bilinmiyor'}" + (
+            f" — {details}" if details else ""
+        ) + ")"
+        logger.info("[PANIC] %s", msg)
+        self._emit_log(msg)
+        # B-09: açma doğrulandı ama olay kaydı yoksa boş dict döner — None
+        # 'kilit yok' anlamında saklıdır, başarıyla karışmaz.
+        return event if event is not None else {}
+
     def resume(self) -> None:
         """Resumes the bot from PAUSED or BREAK state."""
         try:
+            # fix/panic-lock (F-0049): panik kilidi yalnızca bayrak
+            # temizliğiyle açılmaz — _unlock_panic_lock() reset_panic()
+            # çağırıp maymun-yamalı girdi metotlarını geri yükler ve
+            # açmayı doğrular. Dönen olay kaydı HUD altyazısına yazılır.
+            cleared_event = self._unlock_panic_lock()
+            if cleared_event is False:
+                # B-09: kilit aktif ama açılamadı — resume duraklatılmış
+                # kalır (resume_motion çalışmaz, _paused False yapılmaz).
+                logger.error("[PANIC] resume durduruldu: panik kilidi açılamadı, bot duraklatılmış kalıyor")
+                self._emit_log("Panik kilidi açılamadı — bot duraklatılmış kalıyor")
+                self._emit_hud_snapshot(subtitle="Panik kilidi açılamadı — girdiler kilitli")
+                return
+            # fix/v20-panic-combat: kilit açıldı, devam ediliyor — savaş
+            # sayacının donması kalkar (sıfırdan başlar).
+            self._notify_panic_paused(False)
             driver = self.input_driver
             if driver is not None and hasattr(driver, "resume_motion"):
                 driver.resume_motion()
+            if driver is not None:
+                for _flag in ("halted", "locked", "is_halted", "disabled"):
+                    try:
+                        if getattr(driver, _flag, False) is True:
+                            setattr(driver, _flag, False)
+                    except Exception:
+                        pass
             with self._lock:
                 self._paused = False
                 self._pause_reason = ""
-                self._last_gather_time = time.time()
-                self._failure_wait_until = 0.0
+                # O5: resume, 15 dk toplamasızlık sayacını (_last_gather_time)
+                # ve failure-cooldown'u (_failure_wait_until) sıfırlamaz —
+                # sıfırlamak "15 dk toplama yoksa dur" korumasını her
+                # devamda erteler ve 10-fail beklemesini atlatır. Sayaç
+                # yalnızca gerçek toplamada (ve oturum başlangıcında) yazılır.
                 self._break_end_timestamp = 0.0
                 self._schedule_next_break()
 
                 if self._mode == BotMode.MANUAL_RECORD.value:
                     target_state = BotState.WAITING.value
+                elif self._mode == BotMode.COMBAT_MODE.value:
+                    # F-0499: combat must win over walking — otherwise a
+                    # combat-mode resume lands in WALKING and never fights.
+                    target_state = BotState.FIGHTING.value
                 elif self._player_driven_mapping_mode() or self._walking_is_real():
                     target_state = BotState.WALKING.value
-                elif self._mode == BotMode.COMBAT_MODE.value:
-                    target_state = BotState.FIGHTING.value
                 else:
                     target_state = (
                         BotState.WALKING.value
@@ -1410,7 +2070,13 @@ class BotWorker(QThread):
 
             self._sync_input_driver_state()
             self._emit_log(f"Resumed ({MODE_BADGE_MAP.get(self._mode, 'ROUTE')})")
-            self._emit_hud_snapshot()
+            if isinstance(cleared_event, dict):
+                _reason = str(cleared_event.get("reason") or "bilinmiyor")
+                self._emit_hud_snapshot(
+                    subtitle=f"Panik kilidi açıldı: {_reason} · girdiler yeniden açık"
+                )
+            else:
+                self._emit_hud_snapshot()
         except Exception as exc:
             logger.error("Error in resume(): %s", exc, exc_info=True)
 
@@ -1443,6 +2109,26 @@ class BotWorker(QThread):
         """Stops the loop and joins the thread so it cannot keep pythonw alive after quit()."""
         try:
             self._halt_motion()
+            # fix/panic-lock: durdurulan bot panik kilitli metotlarla
+            # kalmasın — stop() da kilidi gerçekten açar (reset_panic).
+            # Önce kilit açılır (metotlar geri yüklenir), sonra giriş
+            # mandalı kurulur (son bırakma + stop sonrası sessizlik).
+            self._unlock_panic_lock()
+            # fix/v20-panic-combat: durdurulan botun savaş sayacı da
+            # dondurulur (poll thread'i kısa süre daha yaşayabilir).
+            self._notify_panic_paused(True)
+            # F-durdur: son bırakma (_halt_motion) ardından giriş mandalını
+            # kur — stop sonrası F10 abort'u / periyodik guard'lar artık
+            # hiçbir sentetik girdi gönderemez. resume_motion() kaldırır
+            # (F-0049 deseni: resume mandalları tek yoldan temizler).
+            driver = self.input_driver
+            if driver is not None:
+                mark = getattr(driver, "mark_input_stopped", None)
+                if callable(mark):
+                    try:
+                        mark()
+                    except Exception:
+                        logger.debug("mark_input_stopped skipped", exc_info=True)
             with self._lock:
                 self._running = False
                 self._paused = True
@@ -1457,8 +2143,24 @@ class BotWorker(QThread):
             if self.isRunning():
                 self.wait(4000)
             if self.isRunning():
-                self.terminate()
-                self.wait(2000)
+                # P2-8 (K-17): ikinci grace penceresi — uzun bir tick
+                # (yakalama / rota adımı) hâlâ bitiyor olabilir.
+                # `QThread.terminate()` ani öldürmedir: kilit, dosya ve
+                # HID durumu yarıda bırakır, bir daha kullanılmaz.
+                logger.warning(
+                    "BotWorker 4 sn'de durmadı; 4 sn daha bekleniyor (terminate yok)."
+                )
+                self.wait(4000)
+            if self.isRunning():
+                # P2-8: durmadıysa bile terminate() YOK. Thread referansı
+                # korunur (düşürülürse hayalet thread olur, P2-4); sonraki
+                # stop() çağrısı tekrar dener. Süreç çıkışı bu thread'e
+                # takılırsa logda bu satır görülür.
+                logger.error(
+                    "BotWorker stop() sonrası hâlâ çalışıyor; terminate() "
+                    "uygulanmadı (P2-8) — thread referansı korunuyor, "
+                    "sonraki stop() tekrar dener."
+                )
         except Exception as exc:
             logger.error("Error stopping BotWorker: %s", exc, exc_info=True)
 
@@ -1484,17 +2186,17 @@ class BotWorker(QThread):
                 except Exception as exc:
                     logger.debug("is_bot_pressing check failed: %s", exc)
 
-            if time.time() - self._last_bot_key_time < 0.25:
-                return
-
+            # F-0372: the 0.25 s window dropped real user input during busy
+            # combat, and the route-only check ignored other modes. Synthetic
+            # bot presses are already filtered by is_bot_pressing above, so
+            # no time window is needed here.
             with self._lock:
-                is_active_route = (
+                is_active = (
                     not self._paused
-                    and self._mode == BotMode.ROUTE_MODE.value
                     and self._state != BotState.PAUSED.value
                 )
 
-            if is_active_route:
+            if is_active:
                 self.pause(f"Paused: user pressed {clean_key.upper()}")
         except Exception as exc:
             logger.error("Error in on_user_key_pressed('%s'): %s", key_name, exc, exc_info=True)
@@ -1541,7 +2243,22 @@ class BotWorker(QThread):
             return True
         focus_mon = getattr(self, "focus_monitor", None)
         if focus_mon is None or not hasattr(focus_mon, "is_game_window_focused"):
-            return True
+            # F-0180/F-0373: no focus monitor means the check cannot verify
+            # the game is focused — fail closed in live mode. test_mode is
+            # exempt, and so are skeleton workers built via __new__ (unit
+            # tests) that never went through __init__ at all: for a real
+            # worker __init__ always records _core_deps_missing, so its
+            # absence proves this is not a live bot.
+            if bool(self._get_cfg("test_mode", False)):
+                return True
+            if "_core_deps_missing" not in self.__dict__:
+                return True
+            if not bool(self._plain_attr("_focus_guard_missing_warned", False)):
+                self._focus_guard_missing_warned = True
+                logger.error(
+                    "Game focus cannot be verified: focus monitor unavailable — ticks paused"
+                )
+            return False
         try:
             focused, reason = focus_mon.is_game_window_focused(allow_gatherion_ui=True)
             if not focused:
@@ -1549,6 +2266,14 @@ class BotWorker(QThread):
                 return False
         except Exception as exc:
             logger.debug("Error checking game focus: %s", exc)
+            # F-0373: an erroring focus check is not a passed check — for a
+            # real (init-completed) worker in live mode. test_mode and
+            # __new__ skeleton workers keep the old permissive path.
+            if (
+                not bool(self._get_cfg("test_mode", False))
+                and "_core_deps_missing" in self.__dict__
+            ):
+                return False
         return True
 
     # =========================================================================
@@ -1558,6 +2283,15 @@ class BotWorker(QThread):
     def run(self) -> None:
         """Main QThread execution loop."""
         logger.info("BotWorker thread started.")
+        # F-0198: never run the loop with a missing core dependency.
+        if getattr(self, "_core_deps_missing", None):
+            missing = ", ".join(self._core_deps_missing)
+            logger.error("BotWorker not started: missing core dependencies: %s", missing)
+            try:
+                self._emit_log(f"Başlatılamadı: eksik bağımlılık: {missing}")
+            except Exception:
+                pass
+            return
         try:
             current = threading.current_thread()
             if current is not threading.main_thread() and not current.daemon:
@@ -1658,6 +2392,10 @@ class BotWorker(QThread):
                     logger.error("Error inside BotWorker iteration: %s", loop_exc, exc_info=True)
                     self.msleep(250)
         finally:
+            # P2-8: thread çıktıktan sonra `_running` True kalmasın —
+            # `_is_running()` aksi hâlde ölmüş thread'i çalışıyor sanır.
+            with self._lock:
+                self._running = False
             if self.focus_monitor is not None and hasattr(self.focus_monitor, "stop_monitoring"):
                 try:
                     self.focus_monitor.stop_monitoring()
@@ -1706,12 +2444,24 @@ class BotWorker(QThread):
         """
         # Renkli kareyi kartograf kapısından önce al: YZ öğrenimi gezinirken de beslensin.
         frame_bgr = self._grab_frame(grayscale=False)
-        if not self.auto_cartography_enabled or self.explorer_controller is None:
+        # v20-yz: gezinme YZ kare çekimi — fabrika yalnızca hasat bitince
+        # çalışıyordu; yürüyüş/keşif sırasında 0 kare kaydediliyordu.
+        # Kanca renkli kareden hemen sonra, kartografi kapısından bağımsız
+        # çalışır (kapı kapalı olsa bile çekim yapılır; kısma içeridedir).
+        self._maybe_capture_yz_roaming_frame(frame_bgr)
+        # __new__ ile kurulan worker'larda (__init__ atlanmış) bu iki öznitelik
+        # yoktur — doğrudan okuma AttributeError verir. Üretimde __init__
+        # kurduğu için davranış aynen kalır (kapalıysa dön, açıksa devam).
+        # (16/12a REDDEDİLDİ: kare kapıdan önce alınır çünkü _grab_frame'in
+        # yan etkisi _last_color_frame'i besler — kasıtlı, yorumda belgeli.)
+        if not getattr(self, "auto_cartography_enabled", False) or getattr(
+            self, "explorer_controller", None
+        ) is None:
             return
         if getattr(self.explorer_controller, "dataset_factory", None) is None and getattr(self, "dataset_factory", None) is not None:
             self.explorer_controller.dataset_factory = self.dataset_factory
         if getattr(self.explorer_controller, "heartbeat_callback", None) is None:
-            self.explorer_controller.heartbeat_callback = getattr(self, "heartbeat", None)
+            self.explorer_controller.heartbeat_callback = self.heartbeat
         try:
             if frame_bgr is None or not isinstance(frame_bgr, np.ndarray) or frame_bgr.size == 0:
                 return
@@ -1729,15 +2479,25 @@ class BotWorker(QThread):
             result = self.explorer_controller.step_passive_cartography(
                 frame_bgr, gather_while_exploring=gather_while_exploring
             )
+            # 16/4 bitişiği: keşif toplaması da gerçek toplamadır — idle
+            # sayacına işlenir (ileride keşif auto-pause kararı için).
+            try:
+                if isinstance(result, dict) and int(result.get("harvests_completed_in_step", 0) or 0) > 0:
+                    self._last_gather_time = time.time()
+            except (TypeError, ValueError):
+                pass
             if isinstance(result, dict):
                 new_nodes = result.get("new_nodes", []) or []
                 for nd in new_nodes:
                     nd_dict = self._node_to_dict(nd) or (nd if isinstance(nd, dict) else {})
                     self.saved_nodes_count += 1
-                    nid = nd_dict.get("id", self.saved_nodes_count)
+                    # 16/12c: kimliği yoksa "Node <sayaç>" uydurulmaz —
+                    # last_saved_str eski değerinde kalır.
+                    nid = nd_dict.get("id")
                     rtype = nd_dict.get("resource_type", "Material")
-                    self.last_saved_str = f"Node {nid}"
-                    self._emit_log(f"Auto-mapped #{nid} ({rtype}) in sequence")
+                    if nid is not None:
+                        self.last_saved_str = f"Node {nid}"
+                    self._emit_log(f"Auto-mapped #{nid if nid is not None else '?'} ({rtype}) in sequence")
                     self.node_recorded.emit(nd_dict)
                 yz_n = int(result.get("yz_count", 0) or 0)
                 det_n = int(result.get("detected_count", 0) or 0)
@@ -1749,8 +2509,75 @@ class BotWorker(QThread):
                         len(new_nodes),
                         result.get("gate_rejected_total"),
                     )
+            self._carto_error_count = 0
         except Exception as exc:
-            logger.debug("Passive auto-cartography error: %s", exc)
+            # 16/12b: kartografi hatası artık sessiz debug değil — ilk hata
+            # warning, tekrarlar sayaçlı debug (her tick warning spam'i yok).
+            self._carto_error_count = int(getattr(self, "_carto_error_count", 0) or 0) + 1
+            if self._carto_error_count <= 1:
+                logger.warning(
+                    "Passive auto-cartography error (x%d, HUD 'Auto-mapping' göstermeye devam eder): %s",
+                    self._carto_error_count,
+                    exc,
+                )
+            else:
+                logger.debug(
+                    "Passive auto-cartography error (x%d): %s", self._carto_error_count, exc
+                )
+
+    def _maybe_capture_yz_roaming_frame(self, frame_bgr: Any) -> None:
+        """Periyodik YZ kare çekimi (v20-yz): yürüyüş/keşif sırasında.
+
+        Kök neden: dataset factory yalnızca hasat bitince çalışıyordu
+        (on_gather_success — 3 çağrı noktası da hasat bitişi); yürüyüş
+        ve oto keşif sırasında fabrika hiç kare kaydetmiyordu. Bu kanca
+        her kartografi tick'inde çağrılır ama çekimi kısar (varsayılan
+        30 sn, ayar: yz_roaming_capture_interval_sec, 10..300 sn).
+
+        Savaşta çağrılmaz (_run_passive_auto_cartography savaşta hiç
+        çalışmaz); duraklatmada çekim yapılmaz. Kanca asla ana döngüyü
+        bozamaz — tüm hatalar yutulur. Fabrika bağlı değilse tek
+        seferlik uyarı verilir (kurulum hatasının kendisi
+        state_machine:647'deki ERROR satırındadır).
+        """
+        try:
+            factory = self._plain_attr("dataset_factory", None)
+            if factory is None or not hasattr(factory, "on_gather_success"):
+                if not self._plain_attr("_yz_roaming_factory_warned", False):
+                    self._yz_roaming_factory_warned = True
+                    logger.warning(
+                        "YZ gezinme çekimi atlandı: dataset factory bağlı değil "
+                        "(başlangıçtaki 'DATASET FACTORY YOK' satırına bakın)"
+                    )
+                return
+            if str(getattr(self, "state", "") or "").upper() == "PAUSED":
+                return
+            mode = str(getattr(self, "mode", "") or "").lower()
+            if mode not in ("route", "explorer", "auto_record", "manual_record"):
+                return
+            try:
+                interval = float(self._get_cfg("yz_roaming_capture_interval_sec", 30.0) or 30.0)
+            except (TypeError, ValueError):
+                interval = 30.0
+            interval = min(max(interval, 10.0), 300.0)
+            now = time.time()
+            last = float(self._plain_attr("_last_yz_roaming_capture_ts", 0.0) or 0.0)
+            if now - last < interval:
+                return
+            self._last_yz_roaming_capture_ts = now
+            try:
+                factory.on_gather_success(
+                    current_frame=frame_bgr,
+                    material_name="",
+                    harvest_stage=1,
+                    max_harvests=1,
+                    roaming=True,
+                )
+            except Exception as exc:
+                logger.debug("YZ gezinme çekimi hatası: %s", exc)
+        except Exception:
+            # Tanı/kayıt kancası ana döngüyü asla bozamaz.
+            logger.debug("YZ gezinme çekimi kancası atlandı", exc_info=True)
 
     # =========================================================================
     # Mode -1: COMBAT_MODE ("combat" - Savaşma Modu / Otomatik Mob Avı)
@@ -1829,10 +2656,13 @@ class BotWorker(QThread):
             return []
 
     def _configured_combat_skill_keys(self) -> list:
-        """Settings keys when present, otherwise full hotbar (1/2/3/4/q/e/r).
+        """Settings keys when present, otherwise full hotbar (1/2/3/4/q/e/r/t).
 
         Do NOT prefer NaturalCombatRotation.DEFAULT_COOLDOWNS keys — that list is
-        only 1–4 and made live combat stick on a short subset (often just '2').
+        only 1–5/Q/E (r/t yok) and is not wired into any live rotation path at
+        all, so it cannot be the live '2' lock. v20/madde 2 kök neden: hazır
+        listesiyle havuzun bire bir değiştirilmesi (tekil hazır set) +
+        30-50 ms basımın oyunda kayda geçmemesi.
         """
         for name in ("combat_skill_keys", "skill_keys"):
             keys = self._normalize_combat_skill_keys(self._get_cfg(name, None))
@@ -1841,7 +2671,7 @@ class BotWorker(QThread):
         known = self._known_combat_skill_slots()
         if known:
             return known
-        return ["1", "2", "3", "4", "q", "e", "r"]
+        return ["1", "2", "3", "4", "q", "e", "r", "t"]
 
     def _log_combat_skill_knobs_once(self) -> None:
         """Emit effective burst/gcd so live sessions prove settings were applied."""
@@ -1877,6 +2707,23 @@ class BotWorker(QThread):
             return False
         return False
 
+    def _warn_bad_config_once(self, name: str, raw: Any) -> None:
+        """Bozuk savaş/toplama ayarını her farklı değer için bir kez uyar (B-06).
+
+        Ayrıştırılamayan ayar eskiden sessizce varsayılana dönüyordu;
+        kullanıcı ayarının uygulandığını sanıyordu. Uyarı, aynı bozuk
+        değer tekrarlanınca spam yapmaz — yalnızca ilk görüldüğünde loglanır.
+        """
+        warned = self.__dict__.setdefault("_bad_config_warned", set())
+        key = (str(name), repr(raw))
+        if key in warned:
+            return
+        warned.add(key)
+        logger.warning(
+            "Savaş/toplama ayarı ayrıştırılamadı (%s=%r); varsayılan kullanılıyor.",
+            name, raw,
+        )
+
     def _combat_skill_burst_sec(self) -> float:
         """Min seconds between skill bursts. Trusted Interception defaults fast (ms scale)."""
         env = str(os.environ.get("GATHERION_SKILL_BURST_SEC", "") or "").strip()
@@ -1884,14 +2731,14 @@ class BotWorker(QThread):
             try:
                 return max(0.02, float(env))
             except (TypeError, ValueError):
-                pass
+                self._warn_bad_config_once("GATHERION_SKILL_BURST_SEC", env)
         for name in ("combat_skill_burst_sec", "skill_burst_sec"):
             raw = self._get_cfg(name, None)
             if raw is not None:
                 try:
                     return max(0.02, float(raw))
                 except (TypeError, ValueError):
-                    pass
+                    self._warn_bad_config_once(name, raw)
         return 0.08 if self._keyboard_trusted_for_combat() else 0.15
 
     def _combat_skills_per_burst(self) -> int:
@@ -1900,18 +2747,21 @@ class BotWorker(QThread):
             try:
                 return max(1, min(8, int(env)))
             except (TypeError, ValueError):
-                pass
+                self._warn_bad_config_once("GATHERION_SKILLS_PER_BURST", env)
         raw = self._get_cfg("skills_per_burst", None)
         if raw is not None:
             try:
                 return max(1, min(8, int(raw)))
             except (TypeError, ValueError):
-                pass
+                self._warn_bad_config_once("skills_per_burst", raw)
         return 4 if self._keyboard_trusted_for_combat() else 2
 
     def _combat_skill_hold_range(self) -> Tuple[float, float]:
+        # v20/madde 2: 0.03-0.05 sn basım logda görünür ama oyunun giriş
+        # yoklamasına takılmayıp kayda geçmeyebilir — güvenli alt sınır
+        # 0.08-0.12 sn (insan basımı ölçeği; bus yoluyla aynı).
         if self._keyboard_trusted_for_combat():
-            return 0.03, 0.05
+            return 0.08, 0.12
         return 0.06, 0.10
 
     def _combat_skill_cooldown_sec(self, key: str) -> float:
@@ -1921,14 +2771,14 @@ class BotWorker(QThread):
             try:
                 return max(0.02, float(env))
             except (TypeError, ValueError):
-                pass
+                self._warn_bad_config_once("GATHERION_SKILL_GCD_SEC", env)
         for name in ("combat_skill_gcd_sec", "skill_gcd_sec"):
             raw = self._get_cfg(name, None)
             if raw is not None:
                 try:
                     return max(0.02, float(raw))
                 except (TypeError, ValueError):
-                    pass
+                    self._warn_bad_config_once(name, raw)
         # Short ms-level bot-side floors so skills fire rapidly in round-robin sequence
         if self._keyboard_trusted_for_combat():
             return 0.12
@@ -1951,14 +2801,14 @@ class BotWorker(QThread):
                 return bool(cfg.get("route_fight_back"))
         elif cfg is not None and hasattr(cfg, "get"):
             try:
-                val = cfg.get("route", "fight_back", fallback=None)
+                val = cfg.get("route", "fight_back", default=None)
                 if val is not None:
                     return bool(val)
-                val2 = cfg.get("route", "fight_back_when_attacked", fallback=None)
+                val2 = cfg.get("route", "fight_back_when_attacked", default=None)
                 if val2 is not None:
                     return bool(val2)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._warn_bad_config_once("route:fight_back", f"cfg.get failed: {exc}")
         return False
 
     def is_combat_authorized(self, action: str = "skill") -> bool:
@@ -2007,7 +2857,8 @@ class BotWorker(QThread):
             if not self._is_route_fight_back_enabled():
                 # Zero SKILL KEY leakage during Toplama when route.fight_back=False
                 return False
-        elif not bool(self._get_cfg("fight_back", False)):
+        # F-23-05: şema varsayılanı True (config/schema.py RouteSettings).
+        elif not bool(self._get_cfg("fight_back", True)):
             return False
 
         # When fight_back is enabled in route/other mode: authorized ONLY when character is confirmed in aggro defense
@@ -2022,7 +2873,10 @@ class BotWorker(QThread):
             return False
 
         if action == "target":
-            return in_fighting_state and has_aggro_signal and not bool(self._plain_attr("_route_was_fighting", False) and not self._enemy_target_bar_visible(None))
+            # F-0181: the old clause denied Tab when _route_was_fighting was
+            # set but the target bar was gone — exactly the moment Tab is
+            # needed to re-acquire. A confirmed fight authorizes Tab.
+            return in_fighting_state and has_aggro_signal
 
         return True
 
@@ -2087,30 +2941,60 @@ class BotWorker(QThread):
         self._combat_last_target_ts = 0.0
         self._mark_right_button(False)
 
-    def _cast_one_combat_skill(self, key: str, frame: Any = None) -> None:
+    @staticmethod
+    def _bus_cast_ok(result: Any) -> Optional[bool]:
+        """GameActionBus.cast_skill dönüşünü 'tuş gönderildi mi' kararına çevirir.
+
+        dict -> "ok" alanı (yoksa bilinmiyor=None); bool -> kendisi;
+        None/dönüşsüz sürücü -> None (bilinmiyor; çağıran eski davranışı
+        korur, yani damgalar). Yalnızca açık False "gönderilmedi" sayılır.
+        """
+        if result is None:
+            return None
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, dict):
+            if "ok" not in result:
+                return None
+            return bool(result.get("ok"))
+        return None
+
+    def _cast_one_combat_skill(self, key: str, frame: Any = None) -> Optional[bool]:
+        """One combat skill key. Returns True when the key was actually sent,
+        False when it was suppressed (AutoGate/CombatGate) or the press
+        failed, None when the bus gave no usable verdict (P0-6: callers
+        must only stamp the per-key cooldown on a send — a False here
+        means no stamp, so the key stays eligible for the next tick)."""
         key_str = str(key).strip().lower()
         if key_str in ("x", "f6", "b"):
             logger.debug("[AutoGate] _cast_one_combat_skill('%s') suppressed (automatic client function)", key)
-            return
+            return False
         if not self.is_combat_authorized("skill"):
             logger.debug("[CombatGate] _cast_one_combat_skill('%s') suppressed", key)
-            return
+            return False
         hold_min, hold_max = self._combat_skill_hold_range()
         bus = self._plain_attr("action_bus")
         if bus is not None and hasattr(bus, "cast_skill"):
             try:
-                bus.cast_skill(key, frame=frame)
-                return
+                return self._bus_cast_ok(bus.cast_skill(key, frame=frame))
             except Exception:
                 logger.debug("action_bus.cast_skill failed", exc_info=True)
                 self._release_combat_right_button()
-                self._press_key(key, min_hold=hold_min, max_hold=hold_max, release_mouse=True)
-                return
+                return self._press_key(key, min_hold=hold_min, max_hold=hold_max, release_mouse=True)
         self._release_combat_right_button()
-        self._press_key(key, min_hold=hold_min, max_hold=hold_max, release_mouse=True)
+        return self._press_key(key, min_hold=hold_min, max_hold=hold_max, release_mouse=True)
 
-    def _send_configured_combat_skill(self) -> bool:
-        """Rotate hotbar skills. Trusted Interception: fast multi-key bursts (no sticky 'best')."""
+    def _send_configured_combat_skill(self, ready_skills: Any = None) -> bool:
+        """Rotate hotbar skills. Trusted Interception: fast multi-key bursts (no sticky 'best').
+
+        F-0047: when the caller knows which skills are ready (cooldown-free),
+        those go first. A ready list that intersects nothing means
+        "nothing is ready" — never fall back to round-robin spam.
+        v20/madde 2: kesişim tek tuşa indiyse (okuyucu yalnızca '2'yi hazır
+        görüyorsa) havuz o tuşa çökmesin diye hazır tuşların ardından
+        configured tuşlar eklenir (ManaPhase BURST harmanıyla aynı) —
+        aksi halde rotasyon tek tuşa kilitlenir.
+        """
         if self.is_paused:
             return False
         if bool(self._get_cfg("test_mode", False)):
@@ -2118,6 +3002,13 @@ class BotWorker(QThread):
         if not self.is_combat_authorized("skill"):
             return False
         keys = self._configured_combat_skill_keys()
+        if ready_skills is not None:
+            ready = self._normalize_combat_skill_keys(ready_skills)
+            if ready:
+                in_ready = [k for k in keys if k in ready]
+                if not in_ready:
+                    return False
+                keys = in_ready + [k for k in keys if k not in ready]
         if not keys:
             return False
         now = time.time()
@@ -2135,6 +3026,7 @@ class BotWorker(QThread):
         trusted = self._keyboard_trusted_for_combat()
         frame = self.__dict__.get("_last_color_frame")
         pressed = 0
+        pressed_keys: list = []
         last_offset = -1
         for offset in range(len(keys)):
             if pressed >= per_burst:
@@ -2143,19 +3035,74 @@ class BotWorker(QThread):
             last = float(used.get(key, 0.0) or 0.0)
             if last > 0.0 and (now - last) < self._combat_skill_cooldown_sec(key):
                 continue
+            # P0-6: cooldown damgası gönderimden SONRA — _cast_one False
+            # dönerse (kapı engeli / basış başarısız) damga yok, burst
+            # sayılmaz; tuş bir sonraki tick'te tekrar denenir. None
+            # (dönüşsüz bus) eski davranışı korur: damgalanır.
+            sent = self._cast_one_combat_skill(key, frame=frame)
+            if sent is False:
+                continue
             used[key] = now
             last_offset = offset
-            self._cast_one_combat_skill(key, frame=frame)
             pressed += 1
+            pressed_keys.append(key)
             if pressed < per_burst:
                 # Inter-skill settle: ~35–50ms trusted, slightly slower soft path.
                 time.sleep(0.035 if trusted else 0.06)
+        # v20/madde 2 tanı: her burst'te hazır liste + havuz sırası +
+        # gerçekten basılan tuşlar (tek tuşa kilitlenme canlı logdan okunur).
+        logger.debug(
+            "ROTATION ready=%r keys=%s pressed=%s",
+            ready_skills,
+            keys,
+            pressed_keys,
+        )
         if pressed <= 0:
             return False
         advance = last_offset + 1 if last_offset >= 0 else 1
         self._combat_skill_idx = (start + advance) % len(keys)
+        # P0-6: burst damgası yalnızca >=1 tuş gerçekten gönderildiyse
+        # yazılır (pressed artık yalnızca gönderilen/bilinmeyen basışları
+        # sayar; hepsi başarısızsa yukarıda False dönüldü).
         self._combat_last_skill_burst_ts = now
         return True
+
+    def _consume_mana_decision_via_bus(self, decision: Any, action_bus: Any) -> bool:
+        """F-0122: mana_brain.decide() çıktısını apply_to_bus üzerinden tüket.
+
+        decision.skill_keys / potion_keys / kiting bugüne dek üretimde hiç
+        tüketilmiyordu (yalnızca phase okunuyordu). Bus yoksa, skill yetkisi
+        yoksa veya kararın skill listesi boşsa False döner — çağıran o zaman
+        eski _send_configured_combat_skill yoluna düşer (çift basım yok).
+        F-0573: oto-iksir kapalıyken decision.potion_keys atılmaz.
+        Hold senkronizasyonu apply_to_bus içinde de yapılır ama değerler
+        _spam_combat_mouse/_sync_* ile aynıdır (hold çağrıları durum
+        takipli/idempotent) — çift hold olmaz."""
+        if decision is None or action_bus is None:
+            return False
+        if self.is_paused or bool(self._get_cfg("test_mode", False)):
+            return False
+        if not self.is_combat_authorized("skill"):
+            return False
+        skill_keys = list(getattr(decision, "skill_keys", None) or [])
+        if not skill_keys:
+            return False
+        if not (hasattr(action_bus, "cast_skill") or hasattr(action_bus, "press_key")):
+            return False
+        mana_brain = self._plain_attr("mana_phase_combat")
+        if mana_brain is None or not hasattr(mana_brain, "apply_to_bus"):
+            return False
+        try:
+            if not self._is_auto_consumables_enabled():
+                try:
+                    decision.potion_keys = []
+                except Exception:
+                    pass
+            mana_brain.apply_to_bus(decision, action_bus)
+            return True
+        except Exception as exc:
+            logger.debug("ManaPhase apply_to_bus failed: %s", exc)
+            return False
 
     def _real_target_for_skills(self, has_bar: bool) -> bool:
         """A skill is allowed when the target bar is up, or a monster already set the combat flag."""
@@ -2237,19 +3184,22 @@ class BotWorker(QThread):
                 is_flicker_grace = True
             else:
                 # Savaş gerçekten bitti veya hedef tamamen kayboldu.
-                death_ready = was_fighting and (not still_taking_damage or time_since_target >= 4.0)
+                # F-0182: a vanished bar alone is not a kill (flicker/flee).
+                # Require ALL: was fighting AND no damage incoming AND the
+                # target has been gone past the 2.5 s / 25-tick grace above.
+                # (4.0 s here left a 1.5 s limbo after grace expiry with no
+                # loot and no Tab; the grace boundary is the kill boundary.)
+                death_ready = (
+                    was_fighting
+                    and not still_taking_damage
+                    and time_since_target >= 2.5
+                )
                 if death_ready:
                     # Canavar öldü. Saldırı tuşlarını bırak; F ile ganimet topla ve sıradaki hedefe geç.
                     self._sync_combat_right_button(False)
                     self._release_combat_left_button()
                     setattr(self, "_combat_was_targeting", False)
                     setattr(self, "_combat_no_target_streak", 0)
-                    try:
-                        from core.lifetime_stats import get_lifetime_stats
-
-                        get_lifetime_stats().record_monster_kill(mob_key="combat_death")
-                    except Exception:
-                        logger.debug("lifetime combat death kill skipped", exc_info=True)
                     self._emit_log("⚔️ Canavar öldü -> Ganimet toplanıyor (F)...")
                     self._emit_hud_snapshot(
                         badge=BotState.FIGHTING.value,
@@ -2257,12 +3207,38 @@ class BotWorker(QThread):
                         title="Canavar Öldü: Ganimet Toplanıyor",
                         subtitle="F ile ganimet toplanıyor, ardından sıradaki canavar seçilecek...",
                     )
+                    # 17/B4: test_mode simüle gönderim sayılır (Y7 kuralı) —
+                    # test_death_ready_* testi kill'i test_mode'da bekler.
+                    f_sent = bool(test_mode)
                     if not test_mode:
-                        self._press_key("f")
+                        f_sent = bool(self._press_key("f"))
                         self.msleep(150)
                         self._emit_log("Sıradaki canavarı seçmek için Tab tuşuna basılıyor...")
                         self._press_combat_tab(soft_aim=False)
                         self.msleep(120)
+                    if f_sent:
+                        # Kill yalnızca loot F'i gerçekten gönderildiyse
+                        # sayılır — önce sayıp sonra F basmak, basılamayan
+                        # F'i de kill sayıyordu.
+                        try:
+                            from core.lifetime_stats import get_lifetime_stats
+
+                            get_lifetime_stats().record_monster_kill(mob_key="combat_death")
+                        except Exception:
+                            logger.debug("lifetime combat death kill skipped", exc_info=True)
+                        # sweep-29 K-2: doğrulanmış öldürme telemetriye yazılır
+                        # (C B4 ile birlikte hareket eder — kill yalnızca
+                        # F gönderildiyse sayılır).
+                        try:
+                            _tel = getattr(self, "telemetry", None)
+                            if _tel is not None and hasattr(_tel, "record_combat"):
+                                _tel.record_combat(
+                                    duration_sec=self._take_combat_duration_sec(),
+                                    outcome="CLEARED",
+                                    mob_key="combat_death",
+                                )
+                        except Exception as _tel_exc:
+                            logger.warning("Telemetri record_combat (combat kill) hatası: %s", _tel_exc)
                     fresh = self._grab_frame(grayscale=False)
                     if self._combat_has_hostile_lock(fresh):
                         frame_bgr = fresh
@@ -2334,6 +3310,9 @@ class BotWorker(QThread):
 
         # 4. Active enemy targeted!
         setattr(self, "_combat_was_targeting", True)
+        # sweep-29 K-2: savaş başlangıç damgası (record_combat süresi için).
+        if not was_fighting:
+            self._fight_started_mono = time.monotonic()
         self._combat_last_target_ts = now
         if not locals().get("is_flicker_grace", False) and self._combat_has_hostile_lock(frame_bgr):
             setattr(self, "_combat_no_target_streak", 0)
@@ -2342,12 +3321,20 @@ class BotWorker(QThread):
 
         # PerceptionHub snapshot (fallback: OmniGameLearner)
         # Use _plain_attr: unit tests skip QObject.__init__.
+        # Combat: do not re-observe every tick when `_grab_frame` already
+        # gated/throttled perception — that duplicate was a stall amplifier.
         frame_cog = self._plain_attr("_frame_cognition")
         perception_hub = self._plain_attr("perception_hub")
-        if frame_cog is None and perception_hub is not None and hasattr(perception_hub, "observe"):
+        if (
+            frame_cog is None
+            and perception_hub is not None
+            and hasattr(perception_hub, "observe")
+            and self._combat_perception_due()
+        ):
             try:
                 frame_cog = perception_hub.observe(frame_bgr)
                 self._frame_cognition = frame_cog
+                self._mark_combat_perception()
             except Exception:
                 frame_cog = None
         game_learner = self._plain_attr("game_learner")
@@ -2357,37 +3344,65 @@ class BotWorker(QThread):
                 cognition = game_learner.get_live_cognition_snapshot() or {}
             except Exception:
                 cognition = {}
+        # F-0046: algi yokken HP/MP/canavar cani %100 varsayilamaz.
+        # Bilinmeyen degerler None kalir; asagidaki iksir/skill/HUD adimlari
+        # None gorunce atlanir, sahte "tam canli" uzerinden karar verilmez.
+        perception_known = bool(cognition) or (
+            frame_cog is not None
+            and hasattr(frame_cog, "as_dict")
+            and bool(frame_cog.as_dict())
+        )
         if frame_cog is not None and hasattr(frame_cog, "as_dict"):
             hub = frame_cog.as_dict()
-            hp_pct = hub.get("monster_hp_percent", cognition.get("monster_hp_percent", 100))
-            p_hp = hub.get("player_hp_percent", cognition.get("player_hp_percent", 100))
-            p_mp = hub.get("player_mp_percent", cognition.get("player_mp_percent", 100))
-            ready_skills = hub.get("ready_skills") or cognition.get("ready_skills", ["1"])
-            combo_seq = hub.get("combo_sequence") or cognition.get("combo_sequence", ["1"])
+            hp_pct = hub.get("monster_hp_percent", cognition.get("monster_hp_percent"))
+            p_hp = hub.get("player_hp_percent", cognition.get("player_hp_percent"))
+            p_mp = hub.get("player_mp_percent", cognition.get("player_mp_percent"))
+            ready_skills = hub.get("ready_skills") or cognition.get("ready_skills") or []
+            combo_seq = hub.get("combo_sequence") or cognition.get("combo_sequence") or []
             learned_cnt = hub.get("learned_frames", cognition.get("total_learned_frames", 0))
-            player_mp_ratio = float(hub.get("player_mp", p_mp / 100.0))
-            player_hp_ratio = float(hub.get("player_hp", p_hp / 100.0))
-            monster_hp_ratio = float(hub.get("monster_hp", hp_pct / 100.0))
+            # v20 (HP yanlış okuma): hub HP/MP'yi ölçememişse
+            # (player_hp_valid / player_mp_valid False) 0.0 varsayılanı
+            # oran sayılmaz — None olur; yoksa okuma hatası iksir /
+            # kaçış tetikler ("CAN POTU %0", RETREAT_JUMP). Anahtar
+            # yoksa (eski snapshot) varsayılan True: davranış korunur.
+            _hp_known = bool(hub.get("player_hp_valid", True))
+            _mp_known = bool(hub.get("player_mp_valid", True))
+            player_mp_ratio = (
+                float(hub["player_mp"])
+                if hub.get("player_mp") is not None and _mp_known
+                else (float(p_mp) / 100.0 if p_mp is not None and _mp_known else None)
+            )
+            player_hp_ratio = (
+                float(hub["player_hp"])
+                if hub.get("player_hp") is not None and _hp_known
+                else (float(p_hp) / 100.0 if p_hp is not None and _hp_known else None)
+            )
+            monster_hp_ratio = (
+                float(hub["monster_hp"])
+                if hub.get("monster_hp") is not None
+                else (float(hp_pct) / 100.0 if hp_pct is not None else None)
+            )
             buff_count = int(hub.get("buff_count", 0) or 0)
         else:
-            hp_pct = cognition.get("monster_hp_percent", 100)
-            p_hp = cognition.get("player_hp_percent", 100)
-            p_mp = cognition.get("player_mp_percent", 100)
-            ready_skills = cognition.get("ready_skills", ["1"])
-            combo_seq = cognition.get("combo_sequence", ["1"])
+            hp_pct = cognition.get("monster_hp_percent")
+            p_hp = cognition.get("player_hp_percent")
+            p_mp = cognition.get("player_mp_percent")
+            ready_skills = cognition.get("ready_skills") or []
+            combo_seq = cognition.get("combo_sequence") or []
             learned_cnt = cognition.get("total_learned_frames", 0)
-            player_mp_ratio = float(p_mp) / 100.0
-            player_hp_ratio = float(p_hp) / 100.0
-            monster_hp_ratio = float(hp_pct) / 100.0
+            player_mp_ratio = float(p_mp) / 100.0 if p_mp is not None else None
+            player_hp_ratio = float(p_hp) / 100.0 if p_hp is not None else None
+            monster_hp_ratio = float(hp_pct) / 100.0 if hp_pct is not None else None
             buff_count = 0
 
-        # Skill discovery probe (safe target present)
-        self._maybe_run_skill_discovery(
-            frame_bgr,
-            player_hp_ratio=player_hp_ratio,
-            monster_hp_ratio=monster_hp_ratio,
-            buff_count=buff_count,
-        )
+        # Skill discovery probe (safe target present) — only with real vitals.
+        if player_hp_ratio is not None and monster_hp_ratio is not None:
+            self._maybe_run_skill_discovery(
+                frame_bgr,
+                player_hp_ratio=player_hp_ratio,
+                monster_hp_ratio=monster_hp_ratio,
+                buff_count=buff_count,
+            )
 
         phase_label = "B"
         mana_brain = self._plain_attr("mana_phase_combat")
@@ -2395,33 +3410,63 @@ class BotWorker(QThread):
         action_bus = self._plain_attr("action_bus")
         if mana_brain is not None and hasattr(mana_brain, "set_thresholds"):
             try:
+                # F-23-01: eşikler her savaş tick'inde ayardan tazelenir —
+                # yalnızca mp_full değil, HP/MP iksir eşikleri + tuşlar da.
+                # (Aynı tazeleme rota modunda _on_settings_saved üzerinden
+                # refresh_consumable_settings() ile yapılır.)
+                # P1-13: iksir/buff anahtarları da burada tazelenir.
                 mana_brain.set_thresholds(
-                    mp_full_threshold=float(self._get_cfg("mp_full_threshold", 0.95) or 0.95)
+                    mp_full_threshold=float(self._get_cfg("mp_full_threshold", 0.95) or 0.95),
+                    hp_potion_threshold=float(self._get_cfg("hp_potion_threshold_pct", HP_POTION_THRESHOLD_PCT) or HP_POTION_THRESHOLD_PCT) / 100.0,
+                    mp_potion_threshold=float(self._get_cfg("mp_potion_threshold_pct", MP_POTION_THRESHOLD_PCT) or MP_POTION_THRESHOLD_PCT) / 100.0,
+                    smart_hp_potion_threshold=float(self._get_cfg("hp_potion_threshold_pct", HP_POTION_THRESHOLD_PCT) or HP_POTION_THRESHOLD_PCT) / 100.0,
+                    smart_mp_potion_threshold=float(self._get_cfg("mp_potion_threshold_pct", MP_POTION_THRESHOLD_PCT) or MP_POTION_THRESHOLD_PCT) / 100.0,
+                    hp_potion_key=str(self._get_cfg("hp_potion_key", "F1") or "F1"),
+                    mp_potion_key=str(self._get_cfg("mp_potion_key", "F2") or "F2"),
+                    auto_use_hp_potion=bool(self._get_cfg("auto_use_hp_potion", True)),
+                    auto_use_mp_potion=bool(self._get_cfg("auto_use_mp_potion", True)),
+                    auto_refresh_buff_scroll=bool(self._get_cfg("auto_refresh_buff_scroll", True)),
+                    buff_scroll_interval_sec=float(self._get_cfg("buff_scroll_interval_sec", 300) or 300),
+                    buff_scroll_key=str(self._get_cfg("buff_scroll_key", "F7") or "F7"),
                 )
             except Exception:
                 pass
 
+        hp_txt = f"%{hp_pct}" if hp_pct is not None else "?"
+        p_hp_txt = f"%{p_hp}" if p_hp is not None else "?"
+        p_mp_txt = f"%{p_mp}" if p_mp is not None else "?"
         self._emit_hud_snapshot(
             badge=BotState.FIGHTING.value,
             mode_badge="SAVAŞ (COMBAT)",
-            title=f"⚔️ Savaş: Canavar [Can: %{hp_pct}] · YZ Öğrenimi ({learned_cnt} Kare)",
-            subtitle=f"Kombo: [{' → '.join(list(combo_seq)[:3])}] · Can: %{p_hp} · Mana: %{p_mp} · Ölünce Tab Basılacak",
+            title=f"⚔️ Savaş: Canavar [Can: {hp_txt}] · YZ Öğrenimi ({learned_cnt} Kare)",
+            subtitle=f"Kombo: [{' → '.join(list(combo_seq)[:3])}] · Can: {p_hp_txt} · Mana: {p_mp_txt} · Ölünce Tab Basılacak",
             col1_title="YZ KARELERİ",
             col1_val=str(learned_cnt),
             col2_title="CANAVAR CANI",
-            col2_val=f"%{hp_pct}",
+            col2_val=hp_txt,
             col3_title="OYUNCU CAN/MANA",
-            col3_val=f"%{p_hp}/%{p_mp}",
+            col3_val=f"{p_hp_txt}/{p_mp_txt}",
         )
 
         if not test_mode:
             # 1. Vitality check: drink HP/MP potions if vitals dropped (< 65%, emergency < 40%)
-            self._check_and_trigger_auto_potions(player_hp_ratio, player_mp_ratio, frame_bgr)
+            # F-0046: vitals unknown -> no potion decision on a fake 100%.
+            if player_hp_ratio is not None and player_mp_ratio is not None:
+                self._check_and_trigger_auto_potions(player_hp_ratio, player_mp_ratio, frame_bgr)
+
+            # P1-10 (K-14): savaş adımındaki canlı HP örneği watchdog'a
+            # yayınlanır (ölüm/düşük HP izlemesi bu vitale bakar).
+            self._publish_worker_hp_ratio(player_hp_ratio)
 
             allow_skills = self._real_target_for_skills(bool(has_enemy))
             decision = None
             self._log_combat_skill_knobs_once()
-            if mana_brain is not None and hasattr(mana_brain, "decide"):
+            if (
+                mana_brain is not None
+                and hasattr(mana_brain, "decide")
+                and player_mp_ratio is not None
+                and player_hp_ratio is not None
+            ):
                 try:
                     if skill_discovery is not None and hasattr(mana_brain, "set_lexicon"):
                         mana_brain.set_lexicon(skill_discovery.lexicon())
@@ -2439,12 +3484,16 @@ class BotWorker(QThread):
             # 2. Combat Mouse Attack Mode:
             # Low mana (Regen phase "A"): spam left click (sol tık) to recover mana
             # High mana (Burst phase "B"): spam right click (sağ tık) for burst damage
-            mp_thresh = float(self._get_cfg("mp_full_threshold", 0.90) or 0.90)
+            # F-23-05: şema varsayılanı 0.95 (kurulumdaki çağrıyla aynıydı,
+            # burası 0.90 diyordu — aynı ayarın iki varsayılanı vardı).
+            mp_thresh = float(self._get_cfg("mp_full_threshold", 0.95) or 0.95)
             if decision is not None:
                 from core.mana_phase_combat import ManaPhase
                 is_regen = (getattr(decision, "phase", None) == ManaPhase.REGEN)
             else:
-                is_regen = (player_mp_ratio < mp_thresh)
+                is_regen = (
+                    player_mp_ratio is not None and player_mp_ratio < mp_thresh
+                )
 
             combat_mouse_btn = "left" if is_regen else "right"
             self._spam_combat_mouse(combat_mouse_btn)
@@ -2465,19 +3514,39 @@ class BotWorker(QThread):
                     last_burst = float(self._plain_attr("_combat_last_skill_burst_ts", 0.0) or 0.0)
                     gate_ok = (last_burst <= 0.0) or ((now - last_burst) >= (burst_gap - 1e-4))
                     if mana_brain is not None and hasattr(mana_brain, "should_cast_skill"):
-                        gate_ok = gate_ok or bool(mana_brain.should_cast_skill(min_gap=burst_gap, now=now))
+                        # F-0183: both clocks must agree; OR let either one
+                        # override the other and spam skills.
+                        gate_ok = gate_ok and bool(mana_brain.should_cast_skill(min_gap=burst_gap, now=now))
                     if gate_ok:
-                        cast_done = self._send_configured_combat_skill()
-                        if cast_done and mana_brain is not None:
-                            mana_brain._last_skill_ts = now
+                        # F-0122: karar önce bus üzerinden tüketilir
+                        # (skill_keys / potion_keys / kiting); bus yoksa veya
+                        # tüketemezse eski rotasyon yoluna düşülür.
+                        bus_consumed = False
+                        if decision is not None:
+                            bus_consumed = self._consume_mana_decision_via_bus(
+                                decision, action_bus
+                            )
+                        if bus_consumed:
+                            if mana_brain is not None:
+                                mana_brain._last_skill_ts = now
+                        else:
+                            cast_done = self._send_configured_combat_skill(
+                                ready_skills=ready_skills
+                            )
+                            if cast_done and mana_brain is not None:
+                                mana_brain._last_skill_ts = now
                 except Exception:
                     logger.debug("Combat skill skipped", exc_info=True)
 
             # Economy / reward tick (lightweight)
+            # S-2601: bilinmeyen vitaller uydurulmaz — None olduğu gibi
+            # geçirilir; _zk_post_combat_tick bilinmeyen MP/canavar canı için
+            # ödül sinyali üretmez (HP'deki None -> 0.0/atla kuralıyla aynı).
             self._zk_post_combat_tick(
                 player_mp_ratio=player_mp_ratio,
                 monster_hp_ratio=monster_hp_ratio,
                 phase=phase_label,
+                player_hp_ratio=player_hp_ratio,
             )
 
     # =========================================================================
@@ -2490,6 +3559,13 @@ class BotWorker(QThread):
         every gem/material seen on 3D screen or minimap and orders them sequentially.
         """
         if not self._check_game_focus():
+            return
+        # F-0184: explorer mode previously skipped break/death checks entirely.
+        now = time.time()
+        if self._state == BotState.BREAK.value or self._should_enter_break(now):
+            self._handle_break_step(now)
+            return
+        if self._handle_combat_and_death():
             return
         self._run_passive_auto_cartography(gather_while_exploring=True)
         self._set_state_internal(BotState.WALKING.value)
@@ -2564,14 +3640,42 @@ class BotWorker(QThread):
             cast_dur = float(self._get_cfg("gather_cast_duration_sec", 3.0) or 3.0)
             if self._stage_cast_in_progress:
                 is_cast, pct = self._check_gather_cast_progress()
-                if (is_cast and pct >= 90.0) or (now - self._stage_cast_start_time >= cast_dur):
+                if is_cast:
+                    self._stage_cast_bar_seen = True
+                    self._observe_cast_progress(pct)
+                # F-0050 twin: a timeout with no cast bar ever seen is not a
+                # successful gather. Y2/Y3: %90 tek karede yetmez, barın
+                # yükseldiği de kanıtlanmalı; yoksa sayılmaz.
+                cast_proven = (is_cast and pct >= 90.0 and bool(self._plain_attr("_stage_cast_rose", False))) or (
+                    now - self._stage_cast_start_time >= cast_dur
+                    and bool(self._plain_attr("_stage_cast_bar_seen", False))
+                    and bool(self._plain_attr("_stage_cast_rose", False))
+                )
+                if cast_proven:
                     self._stage_cast_in_progress = False
                     self.gathered_count += 1
                     self._last_gather_time = now
+                    # O2: oto-kayıtta da gerçek aşama sayılır (sabit 1/3 değil).
+                    max_h_ar = self._configured_max_harvests(None)
+                    self._auto_record_stage = min(self._auto_record_stage + 1, max_h_ar)
                     self._emit_log(f"Resource gathered (#{self.gathered_count})")
+                elif (
+                    now - self._stage_cast_start_time >= cast_dur
+                    and bool(self._plain_attr("_stage_cast_bar_seen", False))
+                    and not bool(self._plain_attr("_stage_cast_rose", False))
+                ):
+                    # Bar görüldü ama hiç yükselmedi: statik bar, kanıtlanmış
+                    # cast değil — sayılmadan oturum bitirilir.
+                    self._stage_cast_in_progress = False
+                    self._is_gathering_active = False
+                    self._gather_lost_frames = 0
+                    self._auto_record_stage = 0
+                    self._auto_record_prompt_name = ""
+                    self._emit_log("Gather not confirmed (cast bar never rose): not counted")
             elif now - self._last_f_press_time >= self._next_f_interval:
                 self._press_gather_key()
                 self._stage_cast_in_progress = True
+                self._reset_cast_progress_tracking()
                 self._stage_cast_start_time = now
                 self._last_f_press_time = now
                 self._next_f_interval = self._sample_f_interval()
@@ -2593,24 +3697,38 @@ class BotWorker(QThread):
                 gather_finished = False
                 if self._stage_cast_in_progress:
                     is_cast, pct = self._check_gather_cast_progress()
+                    if is_cast:
+                        self._stage_cast_bar_seen = True
+                        self._observe_cast_progress(pct)
                     cast_dur = float(self._get_cfg("gather_cast_duration_sec", 3.0) or 3.0)
-                    if (is_cast and pct >= 90.0) or (now - self._stage_cast_start_time >= cast_dur):
+                    # Y2/Y3: %90 tek karede yetmez; barın yükseldiği de kanıtlanmalı.
+                    if (is_cast and pct >= 90.0 and bool(self._plain_attr("_stage_cast_rose", False))) or (
+                        now - self._stage_cast_start_time >= cast_dur
+                        and bool(self._plain_attr("_stage_cast_bar_seen", False))
+                        and bool(self._plain_attr("_stage_cast_rose", False))
+                    ):
                         self._stage_cast_in_progress = False
                         self._is_gathering_active = False
                         self._gather_lost_frames = 0
                         self.gathered_count += 1
                         self._last_gather_time = now
+                        # O2: oto-kayıtta da gerçek aşama sayılır.
+                        max_h_ar = self._configured_max_harvests(None)
+                        self._auto_record_stage = min(self._auto_record_stage + 1, max_h_ar)
                         self._emit_log(f"Resource gathered (#{self.gathered_count})")
                         gather_finished = True
                 else:
                     self._gather_lost_frames += 1
                     if self._gather_lost_frames >= 3:
+                        # F-0375: a prompt that merely vanished for 3 ticks
+                        # is not a completed gather — end the session without
+                        # counting it.
                         self._is_gathering_active = False
                         self._gather_lost_frames = 0
-                        self.gathered_count += 1
-                        self._last_gather_time = now
-                        self._emit_log(f"Resource gathered (#{self.gathered_count})")
-                        gather_finished = True
+                        self._auto_record_stage = 0
+                        self._auto_record_prompt_name = ""
+                        self._emit_log("Gather prompt lost: gather not confirmed, not counted")
+                        gather_finished = False
 
                 if gather_finished:
                     # Same as route mode: YOLO / dataset factory captures t-2.0s frame on gather end
@@ -2619,13 +3737,19 @@ class BotWorker(QThread):
                     ):
                         try:
                             prompt_name = ""
-                            if isinstance(self._last_gather_prompt, dict):
+                            if isinstance(getattr(self, "_last_gather_prompt", None), dict):
                                 prompt_name = str(self._last_gather_prompt.get("name", "") or "")
+                            # O2: aşama sabit 1/3 değil, bu ziyarette gerçekten
+                            # tamamlanan aşama; materyal boşsa "Unknown".
+                            max_h_ar = self._configured_max_harvests(None)
+                            stage_ar = min(max(1, int(self._auto_record_stage or 1)), max_h_ar)
                             self.dataset_factory.on_gather_success(
-                                material_name=prompt_name,
-                                harvest_stage=1,
-                                max_harvests=3,
+                                material_name=prompt_name or "Unknown",
+                                harvest_stage=stage_ar,
+                                max_harvests=max_h_ar,
                             )
+                            self._auto_record_stage = 0
+                            self._auto_record_prompt_name = ""
                         except Exception as df_exc:
                             logger.debug(
                                 "Dataset factory on_gather_success skipped: %s", df_exc
@@ -2694,7 +3818,12 @@ class BotWorker(QThread):
             self._emit_log("Failure wait finished: resuming route")
 
         # 3. Auto-pause if no resource gathered for pause_after_no_gather_min
-        pause_no_gather_min = float(self._get_cfg("pause_after_no_gather_min", 15) or 0)
+        # F-0503: an invalid setting must not raise every tick.
+        try:
+            pause_no_gather_min = float(self._get_cfg("pause_after_no_gather_min", 15) or 0)
+        except (TypeError, ValueError):
+            logger.warning("Invalid pause_after_no_gather_min; using 15")
+            pause_no_gather_min = 15.0
         if pause_no_gather_min > 0:
             idle_sec = now - self._last_gather_time
             if idle_sec >= pause_no_gather_min * 60.0:
@@ -2709,8 +3838,17 @@ class BotWorker(QThread):
         if self._handle_blocking_game_window():
             return
 
+        # 5b. Bölge tespiti (v10 entegrasyon): rota modunda pasif kartografi
+        # hiç çalışmıyordu — bölge uyumsuzluğu koruması beslenemiyordu.
+        # gather_while_exploring=False: rota modunun kendi toplama motoru
+        # (_handle_route_gathering) vardır; kartografi tick'i yalnızca
+        # konum/bölge besler, fırsatçı toplama yapmaz. Bölge tespiti
+        # 5 sn kısılmış olduğundan tekrarlayan çağrı ucuzdur.
+        self._run_passive_auto_cartography(gather_while_exploring=False)
+
         # 6. Check for gather prompt or continue active gathering cycle
-        gather_on_way = bool(self._get_cfg("gather_on_the_way", True))
+        # F-23-05: şema varsayılanı False (config/schema.py RouteSettings).
+        gather_on_way = bool(self._get_cfg("gather_on_the_way", False))
         if gather_on_way or self.active_node is not None or self._is_gathering_active:
             detected, conf = self._detect_gather_prompt()
             self.last_prompt_match = conf
@@ -2732,7 +3870,17 @@ class BotWorker(QThread):
                         self._handle_route_gathering(conf, now)
                         return
                     else:
-                        # Prompt did not reappear after stage completion -> early depletion
+                        # Prompt did not reappear after stage completion.
+                        # F-0186: a single missed frame / 4 s window must not
+                        # kill a 1/3 or 2/3 node. Re-detect once; only when
+                        # the prompt is really gone is the node depleted.
+                        redetected, _rconf = self._detect_gather_prompt()
+                        if redetected:
+                            self._post_harvest_prompt_deadline = now + float(
+                                self._get_cfg("post_harvest_prompt_timeout", 4.0) or 4.0
+                            )
+                            self._handle_route_gathering(_rconf, now)
+                            return
                         node_id = self._extract_node_id(self.active_node)
                         self._emit_log(
                             f"Node {node_id} prompt timeout ({self._current_node_harvest_stage}/{self._target_harvests_for_active_node}) · node depleted early"
@@ -2747,11 +3895,17 @@ class BotWorker(QThread):
 
         # 7. If no active node is selected, open map and navigate to next ready node
         if self.active_node is None:
+            # F-0088: düğümsüz tick = ekonomi turu fırsatı (seyrek, 600 sn).
+            self._maybe_run_economy_cycle(now)
             if gather_on_way:
                 nearby = self._check_nearby_materials(max_distance_m=18.0)
                 if nearby is not None and getattr(nearby, "screen_x", None) is not None:
-                    m_type = getattr(nearby, "material_type", "Material")
-                    self._emit_log(f"Opportunistic gather: detected nearby {m_type}")
+                    # 16/3: fırsatçı toplama artık sadece log değil — yakındaki
+                    # materyale gerçekten yürünür (geçici düğüm; harita
+                    # tıklaması yok, ekrandaki konumuna yönelinir). Prompt
+                    # çıkınca adım 6 toplama motorunu çalıştırır.
+                    self._start_opportunistic_walk(nearby, now)
+                    return
             self._select_and_navigate_next_node()
             return
 
@@ -2774,6 +3928,31 @@ class BotWorker(QThread):
     def _enemy_target_bar_visible(self, frame: Optional[np.ndarray]) -> bool:
         """True when a hostile lock is visible (target bar or AION2 soft reticle)."""
         return self._combat_has_hostile_lock(frame)
+
+    def _route_enemy_bar_visible(self, frame: Optional[np.ndarray]) -> bool:
+        """True only for a REAL enemy target bar (combat_recovery detector).
+
+        _enemy_target_bar_visible / _combat_has_hostile_lock ayrıca learner
+        (current_monster_targeted) ve _frame_cognition (has_target) kilitlerini
+        de sayar — keşif modunda botun kendi hedeflemesi / pasif kartografi
+        kilidi düşman kilidi sayılmaz; yoksa oto-keşif her kilitte savaşa
+        döner. Rota/keşif FIGHTING kapısı bu dar tanımı kullanır.
+        """
+        if frame is None:
+            return False
+        recovery = self.combat_recovery
+        if recovery is None:
+            return False
+        for name in ("_detect_enemy_target_bar", "detect_enemy_target_bar"):
+            fn = getattr(recovery, name, None)
+            if not callable(fn):
+                continue
+            try:
+                if bool(fn(frame)):
+                    return True
+            except Exception:
+                pass
+        return False
 
     def _combat_has_hostile_lock(self, frame: Optional[np.ndarray]) -> bool:
         """Hostile lock: real target bar / soft reticle / learner with HP > 0."""
@@ -2812,18 +3991,123 @@ class BotWorker(QThread):
                 pass
         return False
 
+    def _publish_worker_hp_ratio(self, hp_ratio: Optional[float]) -> None:
+        """Son bilinen oyuncu HP oranını watchdog'a yayınlar.
+
+        P1-10 (K-14): `core/watchdog.py::_check_worker_vitals`
+        worker üzerinde `hp_ratio` okur; bu yayın olmadan WORKER_DEAD /
+        WORKER_LOW_HP / WORKER_REVIVED ölü yoldu. Debounce,
+        `_note_player_hp_drop`'taki F-0067/F-0376 kuralının aynısıdır:
+        sağlıklı (> 0.02) örnek hemen yayınlanır; sıfıra-yakın (<= 0.02)
+        örnek yalnızca sağlıklı (>= 0.5) tabandan ardışık 2 örnekte
+        çöküş sayılır — tek karelik 0.0 okuma hatası (okunamayan bar)
+        ölüm sayılmaz. `None` (örnek yok) son bilinen değeri korur.
+        Rota ve savaş adımlarındaki iki canlı HP örnek noktasından
+        çağrılır; saldırı algılama sayaçlarına dokunmaz.
+        """
+        if hp_ratio is None:
+            return
+        try:
+            hp_f = float(hp_ratio)
+        except (TypeError, ValueError):
+            return
+        # getattr yerine _plain_attr: BotWorker.__new__ ile üretilmiş
+        # (QThread.__init__ çağrılmamış) nesnede eksik öznitelik için
+        # QObject getattr RuntimeError atar ("super-class __init__() ...
+        # was never called"); _plain_attr __dict__ okur.
+        prev = self._plain_attr("_worker_hp_prev_ratio", None)
+        self._worker_hp_prev_ratio = hp_f
+        if hp_f > 0.02:
+            self.hp_ratio = hp_f
+            self._worker_hp_near_zero_streak = 0
+            self._worker_hp_pre_collapse = None
+            return
+        if prev is None:
+            self._worker_hp_near_zero_streak = 1
+            self._worker_hp_pre_collapse = None
+        elif prev > 0.02:
+            self._worker_hp_near_zero_streak = 1
+            self._worker_hp_pre_collapse = prev
+        else:
+            self._worker_hp_near_zero_streak = (
+                getattr(self, "_worker_hp_near_zero_streak", 0) + 1
+            )
+        if (
+            getattr(self, "_worker_hp_near_zero_streak", 0) == 2
+            and getattr(self, "_worker_hp_pre_collapse", None) is not None
+            and self._worker_hp_pre_collapse >= 0.5
+        ):
+            self.hp_ratio = hp_f
+
     def _note_player_hp_drop(self, hp_ratio: Optional[float]) -> bool:
         """True when this sample is a real HP drop. A missing bar is not a drop."""
+        # P1-10 (K-14): rota adımındaki canlı HP örneği watchdog'a yayınlanır.
+        self._publish_worker_hp_ratio(hp_ratio)
         if hp_ratio is None:
+            # Örnek yok: ardışıklık bozulur ama sağlıklı taban korunur
+            # (sonraki geçerli örnek hâlâ o tabanla kıyaslanır).
+            self._route_near_zero_hp_streak = 0
             return False
-        prev = self._route_prev_hp_ratio
+        prev = getattr(self, "_route_prev_hp_ratio", None)
         self._route_prev_hp_ratio = hp_ratio
-        if prev is None or prev <= 0.02 or hp_ratio <= 0.02:
+        if hp_ratio <= 0.02:
+            # DÜZELTME (yanlış "saldırı altında"): hp_ratio <= 0.02
+            # "bilinmiyor" olabilir — check_under_attack HP barını
+            # okuyamadığında 0.0 döner (F-0067). Tek karelik 0.0 okuma
+            # hatası, sağlıklı bir bardan gelmiş gibi "düşüş" sayılmaz;
+            # canlıda bu, FIGHTING + "Saldırı altında" çıkarıyordu.
+            # Gerçek sıfıra çöküş (F-0376 niyeti korunur) ancak ardışık
+            # 2 sıfıra-yakın örnekle ve sağlıklı (>= 0.5) bir tabandan
+            # sayılır — ve OLAY olarak bir kez sayılır: çöküş sayıldıktan
+            # sonra HP ~0'da kalmaya devam ederse her karede True dönmez
+            # (yoksa okunamayan HP, FIGHTING'i kalıcı kilitler).
+            if prev is None:
+                self._route_near_zero_hp_streak = 1
+                self._route_pre_collapse_hp_ratio = None
+            elif prev > 0.02:
+                self._route_near_zero_hp_streak = 1
+                self._route_pre_collapse_hp_ratio = prev
+            else:
+                self._route_near_zero_hp_streak = (
+                    getattr(self, "_route_near_zero_hp_streak", 0) + 1
+                )
+            streak = getattr(self, "_route_near_zero_hp_streak", 0)
+            baseline = getattr(self, "_route_pre_collapse_hp_ratio", None)
+            return bool(
+                streak == 2 and baseline is not None and baseline >= 0.5
+            )
+        self._route_near_zero_hp_streak = 0
+        self._route_pre_collapse_hp_ratio = None
+        if prev is None or prev <= 0.02:
             return False
         return (prev - hp_ratio) >= 0.015
 
+    def _take_combat_duration_sec(self) -> float:
+        """Sweep-29 K-2: savaş süresini döndürür ve başlangıç damgasını tüketir.
+
+        Başlangıç _remember_real_combat_signal (rota) / _step_combat_mode
+        (savaş modu) içinde tutulur. Damga yoksa 0.0 döner — süre bilinmiyor
+        demektir, uydurulmaz; record_combat süreyi yalnızca ölçülebildiğinde
+        yazar.
+        """
+        started = getattr(self, "_fight_started_mono", None)
+        self._fight_started_mono = None
+        if started is None:
+            return 0.0
+        try:
+            return max(0.0, time.monotonic() - float(started))
+        except (TypeError, ValueError):
+            return 0.0
+
     def _remember_real_combat_signal(self, has_bar: bool, hp_dropped: bool) -> None:
         """A fight is real only after a target bar or an HP drop. Then the flag may stay set."""
+        # F-0187: with neither signal this must be a no-op — previously it
+        # unconditionally set all three flags.
+        if not (has_bar or hp_dropped):
+            return
+        # sweep-29 K-2: savaş başlangıç damgası (record_combat süresi için).
+        if not bool(getattr(self, "_route_was_fighting", False)):
+            self._fight_started_mono = time.monotonic()
         self._route_fight_had_signal = True
         self._route_combat_confirmed = True
         self._route_was_fighting = True
@@ -2833,27 +4117,126 @@ class BotWorker(QThread):
         if hp_dropped:
             self._route_saw_hp_drop = True
 
+    def _route_combat_signal_confirmed(
+        self, has_bar: bool, hp_dropped: bool, tot_agro: bool = False
+    ) -> bool:
+        """True once a real combat signal repeats on consecutive ticks.
+
+        fix/v20-panic-combat (canlı 14:48 hayalet-savaş: ortada saldıran
+        düşman yokken pasif mob barıyla "Fighting enemy"): düşman barı
+        TEK BAŞINA artık FIGHTING'e sokmaz — pasif mob hedeflendiğinde
+        barı ardışık tick'lerde de görünür. Bar, yalnızca bar
+        penceresinde saldıran-düşman kanıtı da görüldüyse doğrulanır:
+        HP düşüşü veya ToT aggro (mob oyuncuyu hedefliyor).
+        HP düşüşü tek başına (bar yokken) yalnızca ardışık
+        route_fight_confirm_frames tick'te de düşüyorsa doğrular —
+        tek karelik 0.0 okuma hatası _note_player_hp_drop'ta zaten
+        elenir (sağlıklı >= 0.5 taban + ardışık 2 örnek + tek seferlik),
+        burada da seviye değil SÜREKLİ düşüş istenir. Görev 1'in
+        ürettiği tek-kare sinyaller aynen tüketilir — burada ikinci bir
+        doğrulama mantığı YOK, sadece tekrar + bar-kanıtı sayılır.
+        Eşik: route_fight_confirm_frames (varsayılan 2).
+        """
+        try:
+            confirm_frames = int(self._get_cfg("route_fight_confirm_frames", 2) or 2)
+        except (TypeError, ValueError):
+            confirm_frames = 2
+        confirm_frames = max(1, confirm_frames)
+        if has_bar:
+            self._route_bar_streak = int(getattr(self, "_route_bar_streak", 0) or 0) + 1
+        else:
+            self._route_bar_streak = 0
+            self._route_bar_corroborated = False
+        if hp_dropped:
+            self._route_hp_streak = int(getattr(self, "_route_hp_streak", 0) or 0) + 1
+        else:
+            self._route_hp_streak = 0
+        # Bar penceresi içinde kanıt: bu tick'te bar + (HP düşüşü |
+        # ToT aggro) birlikte görüldüyse pencere kanıtlı sayılır; bar
+        # kesilince pencere kapanır (yukarıda sıfırlandı).
+        if has_bar and (hp_dropped or tot_agro):
+            self._route_bar_corroborated = True
+        return (
+            self._route_hp_streak >= confirm_frames
+            or (
+                self._route_bar_streak >= confirm_frames
+                and bool(getattr(self, "_route_bar_corroborated", False))
+            )
+        )
+
+    def _route_fight_reentry_blocked(self, now: float) -> bool:
+        """True while inside the cooldown after a route-fight teardown.
+
+        Bir savaş bayrağı temizlendikten sonra (gerçek bitiş de olsa,
+        yanlış-alarm da olsa) N saniye FIGHTING'e tekrar girilmez — 2
+        karelik yanlış sinyalin bile döngüyü yeniden başlatmasını engeller.
+        Süre: route_fight_reentry_cooldown_sec (varsayılan 8 sn; 0 =
+        histerezis kapalı, sadece doğrulama kapısı çalışır).
+        """
+        try:
+            cooldown = float(self._get_cfg("route_fight_reentry_cooldown_sec", 8.0) or 0.0)
+        except (TypeError, ValueError):
+            cooldown = 8.0
+        if cooldown <= 0.0:
+            return False
+        last = float(getattr(self, "_route_fight_last_cleared_ts", 0.0) or 0.0)
+        if last <= 0.0:
+            return False
+        return (now - last) < cooldown
+
     def _confirmed_fight_ended(self, has_bar: bool, hp_dropped: bool) -> bool:
         """Loot only after a real signal was present and has now ended."""
         if has_bar or hp_dropped:
             return False
-        had_real = bool(self._route_saw_target_bar or self._route_saw_hp_drop)
-        return bool(self._route_was_fighting and self._route_fight_had_signal and had_real)
+        # __new__ worker'ında (__init__ atlanmış) bu bayraklar yoktur —
+        # doğrudan okuma AttributeError verir; varsayılanlar __init__
+        # değerleriyle aynıdır (False).
+        had_real = bool(
+            getattr(self, "_route_saw_target_bar", False)
+            or getattr(self, "_route_saw_hp_drop", False)
+        )
+        return bool(
+            getattr(self, "_route_was_fighting", False)
+            and getattr(self, "_route_fight_had_signal", False)
+            and had_real
+        )
 
     def _loot_suppressed_empty_bar(self) -> bool:
         """An empty bar cannot press F again inside 30s unless a new target bar or HP drop was seen."""
-        last = float(self._route_last_loot_ts or 0.0)
+        last = float(getattr(self, "_route_last_loot_ts", 0.0) or 0.0)
         if last <= 0.0 or (time.time() - last) >= 30.0:
             return False
-        return not (self._route_bar_since_loot or self._route_saw_hp_drop)
+        return not (
+            getattr(self, "_route_bar_since_loot", False)
+            or getattr(self, "_route_saw_hp_drop", False)
+        )
 
     def _clear_route_combat(self) -> None:
         """Drop a combat flag that has no target bar and no HP drop, so the route can walk."""
+        was_fighting = bool(getattr(self, "_route_was_fighting", False))
         self._route_was_fighting = False
         self._route_fight_had_signal = False
         self._route_combat_confirmed = False
         self._route_saw_target_bar = False
         self._route_saw_hp_drop = False
+        # ROTA-İPTAL-ZİNCİRİ: doğrulama streak'leri ve askı bayrağı da
+        # sıfırlanır — yeni sinyal sıfırdan doğrulansın.
+        self._route_bar_streak = 0
+        self._route_hp_streak = 0
+        # fix/v20-panic-combat: bar-kanıt penceresi de sıfırlanır.
+        self._route_bar_corroborated = False
+        # W54/v19: hasat-sirasi saldiri damgasi da sifirlanir — sinyal
+        # kesildiyse sure bir sonraki saldirida sifirdan baslar.
+        self._gather_under_attack_since = 0.0
+        # 17/B7: L3 fight-back aynası da sıfırlanır (loot sonrası yeni
+        # savaşta eski streak F atlatmasın).
+        self._route_fightback_no_bar_streak = 0
+        self._route_fight_suspended = False
+        if was_fighting:
+            # Histerezis: bir savaş bayrağı temizlendi — N saniye boyunca
+            # FIGHTING'e tekrar girilmez (kalıcı yanlış-alarm döngüsünü
+            # kırar). Süre route_fight_reentry_cooldown_sec (varsayılan 8 sn).
+            self._route_fight_last_cleared_ts = time.time()
         recovery = getattr(self, "combat_recovery", None)
         if recovery is not None and getattr(recovery, "in_combat", False):
             recovery.in_combat = False
@@ -2869,22 +4252,114 @@ class BotWorker(QThread):
         if self.is_paused:
             return
         if self._loot_suppressed_empty_bar():
+            # 17/B11: baskı artık sessiz değil.
+            logger.warning(
+                "Loot F bastırıldı: son loot'tan beri yeni hedef barı/HP düşüşü yok (30 sn kuralı)"
+            )
             self._clear_route_combat()
             self._route_bar_since_loot = False
             return
-        self._route_last_loot_ts = time.time()
+        # F-0377: a kill is only recorded when a target bar was seen and has
+        # now ended. An HP-drop-only fight proves damage, not a kill.
+        had_target_bar = bool(
+            getattr(self, "_route_saw_target_bar", False)
+            or getattr(self, "_route_bar_since_loot", False)
+        )
+        if not had_target_bar:
+            # 17/B5: yalnızca HP düşüşüyle biten savaşta loot F basılmaz —
+            # bar görülmeden basılan F kör loot'tur (no27).
+            logger.warning("Loot F basılmadı: hedef barı hiç görülmedi (yalnızca HP düşüşü)")
+            self._clear_route_combat()
+            self._route_bar_since_loot = False
+            return
+        # F16: atlama SADECE CombatSystem fallback'inde geçerlidir.
+        # Eskiden "L3 barsız 2. adımda zaten loot F bastı, L2 F'i
+        # atlanır" deniyordu; canlı L3 (CombatRecovery.fight_back_step,
+        # Y2/P1-11) barsız 2. adımda kör loot F basmıyor (ne F basılır
+        # ne Tab çevrilir ne kesim yazılır) — streak>=2 orada yalnızca
+        # "2 ardışık barsız fight-back adımı" demektir ve L2 F'ini
+        # atlamak SIFIR F bırakıyordu (kill yine de sayılıyordu).
+        # F basan tek L3, combat_recovery import edilemezse devreye
+        # giren CombatSystem fallback'idir (core/combat.py
+        # fight_back_step, ölümde F+Tab — F13 v18). O yüzden atlama,
+        # recovery CombatSystem ise uygulanır; canlı yolda (ve
+        # mock/fake recovery'de) L2 her zaman tek F'i basar (no27:
+        # ölüm başına tek F; çift F yok çünkü canlı L3 F basmaz).
+        try:
+            from core.combat import CombatSystem
+
+            _l3_presses_loot_f = isinstance(
+                getattr(self, "combat_recovery", None), CombatSystem
+            )
+        except Exception:
+            _l3_presses_loot_f = False
+        l3_looted = _l3_presses_loot_f and (
+            int(getattr(self, "_route_fightback_no_bar_streak", 0) or 0) >= 2
+        )
+        if l3_looted:
+            logger.info("Loot F atlandı: barsız fight-back streak>=2 (no27 — ikinci F yok)")
+        # 17/B9: rota modunda düğüm varken toplama istemi görünüyorsa F
+        # toplamayı başlatırdı — loot F atlanır (yalnızca L2; combat
+        # modunda düğüm bağlamı yok, guardsız bırakılır — açık soru:
+        # gerçek loot-istemi detektörü lazım).
+        prompt_blocks_loot = False
+        if not l3_looted:
+            is_route = str(self._plain_attr("_mode", "")).strip().lower() in (
+                BotMode.ROUTE_MODE.value.lower(),
+                "route",
+                "toplama",
+                "route_mode",
+            )
+            if is_route and getattr(self, "active_node", None) is not None:
+                try:
+                    prompt_seen, _prompt_conf = self._detect_gather_prompt()
+                except Exception as exc:
+                    logger.debug("Loot gather-prompt kontrolü atlandı: %s", exc)
+                    prompt_seen = False
+                if prompt_seen:
+                    prompt_blocks_loot = True
+                    logger.warning("Loot F atlandı: toplama istemi var (F toplamayı başlatırdı)")
+        test_mode = bool(self._get_cfg("test_mode", False))
+        # test_mode simüle gönderim sayılır (Y7 kuralı; L1 ile aynı).
+        f_sent = bool(l3_looted or test_mode) and not prompt_blocks_loot
+        if not l3_looted and not prompt_blocks_loot and not test_mode:
+            f_sent = bool(self._press_key("f"))
+            self.msleep(200)
+        # 17/B11: zaman damgası yalnızca F gönderildiyse yazılır.
+        if f_sent:
+            self._route_last_loot_ts = time.time()
         self._route_bar_since_loot = False
         self._clear_route_combat()
-        try:
-            from core.lifetime_stats import get_lifetime_stats
+        if f_sent:
+            # 17/B4: kill yalnızca loot F'i gönderildiyse sayılır (L2 F'i
+            # ya da L3 fight-back F'i). Basış başarısızlığı / prompt engeli
+            # -> kill sayılmaz. (had_target_bar B5 kapısından geçti.)
+            try:
+                from core.lifetime_stats import get_lifetime_stats
 
-            get_lifetime_stats().record_monster_kill(mob_key="route_loot")
-        except Exception:
-            logger.debug("lifetime route loot kill skipped", exc_info=True)
-        self._emit_log("Saldırgan canavar öldü -> Ganimet alınıyor (F)...")
-        if not bool(self._get_cfg("test_mode", False)):
-            self._press_key("f")
-            self.msleep(200)
+                get_lifetime_stats().record_monster_kill(mob_key="route_loot")
+            except Exception:
+                logger.debug("lifetime route loot kill skipped", exc_info=True)
+            # sweep-29 K-2: doğrulanmış savaş sonu telemetriye yazılır —
+            # eskiden record_combat hiç çağrılmıyordu, savaş sayacı hep 0'dı.
+            # F-0377 ile tutarlı: yalnızca bar görülüp bittiyse öldürme sayılır.
+            try:
+                _tel = getattr(self, "telemetry", None)
+                if _tel is not None and hasattr(_tel, "record_combat"):
+                    _tel.record_combat(
+                        duration_sec=self._take_combat_duration_sec(),
+                        outcome="CLEARED",
+                        mob_key="route_loot",
+                    )
+            except Exception as _tel_exc:
+                logger.warning("Telemetri record_combat (route loot) hatası: %s", _tel_exc)
+        if f_sent:
+            self._emit_log("Saldırgan canavar öldü -> Ganimet alınıyor (F)...")
+        elif prompt_blocks_loot:
+            self._emit_log("Loot F atlandı (toplama istemi) -> rotaya dönülüyor...")
+        else:
+            self._emit_log("Loot F gönderilemedi — kill sayılmadı.")
+        if not test_mode:
             is_combat_mode = str(self._plain_attr("_mode", "")).strip().lower() in (
                 BotMode.COMBAT_MODE.value.lower(),
                 "combat",
@@ -2914,6 +4389,9 @@ class BotWorker(QThread):
     def _mark_right_button(self, held: bool) -> None:
         try:
             self.__dict__["_combat_right_button_down"] = bool(held)
+            # F-0378: timestamp the hold so a stale flag cannot claim "held"
+            # forever if the driver lost the key (focus loss, driver reset).
+            self.__dict__["_combat_right_button_since"] = time.time() if held else 0.0
         except Exception:
             try:
                 self._combat_right_button_down = bool(held)
@@ -2921,46 +4399,45 @@ class BotWorker(QThread):
                 logger.debug("Right-button flag was not stored", exc_info=True)
 
     def _sync_combat_right_button(self, target_selected: bool, force: bool = False) -> None:
-        """Hold right click while a real target is selected. Release when it is gone or the user pauses."""
+        """Hold T key while a real target is selected (right-click attack = T, per user mapping).
+        Release when the target is gone or the user pauses. No mouse movement/click."""
         if not target_selected or self._combat_attack_paused() or not self.is_combat_authorized("attack"):
             self._release_combat_right_button()
             return
         if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:
             return
         driver = self.input_driver
-        held = getattr(driver, "_mouse_buttons_down", None)
-        already = isinstance(held, (set, frozenset)) and "right" in held
-        if already and not force:
-            self._mark_right_button(True)
-            return
-        if (
-            not force
-            and self._right_button_is_tracked()
-            and not isinstance(held, (set, frozenset))
-        ):
-            return
-        # force=True: skill sonrası set bayrağı yanlış kalsa bile OS'e tekrar RIGHTDOWN yolla.
-        if force and already:
-            up = getattr(driver, "_hw_mouse_up", None)
+        if self._right_button_is_tracked() and not force:
+            # F-0378: a hold older than 30 s without re-confirmation is stale
+            # — re-press instead of trusting the flag forever.
+            since = float(self._plain_attr("_combat_right_button_since", 0.0) or 0.0)
+            if since > 0.0 and (time.time() - since) < 30.0:
+                return
+            self._mark_right_button(False)
+        # force=True: skill sonrası bayrak yanlış kalsa bile T'yi bırakıp tekrar bas.
+        if force and self._right_button_is_tracked():
+            up = getattr(driver, "key_up", None)
             if callable(up):
-                up("right")
-        down = getattr(driver, "_hw_mouse_down", None)
+                try:
+                    up("t")
+                except Exception:
+                    pass
+        down = getattr(driver, "key_down", None)
         if callable(down):
-            down("right")
-            self._mark_right_button(True)
-            return
-        send = getattr(driver, "_sendinput_mouse_button", None)
-        if callable(send):
-            send("right", True)
-            self._mark_right_button(True)
-            return
-        click = getattr(driver, "human_click", None)
-        if not callable(click):
-            return
-        try:
-            click(button="right")
-        except TypeError:
-            click(None, None, "right")
+            try:
+                if down("t"):
+                    self._mark_right_button(True)
+                    return
+            except Exception:
+                pass
+        # Fallback: press_key pulse (routes through the same hardware-key gate).
+        press = getattr(driver, "press_key", None)
+        if callable(press):
+            try:
+                press("t", min_hold=0.05, max_hold=0.09)
+                self._mark_right_button(True)
+            except Exception:
+                pass
 
     def _combat_attack_paused(self) -> bool:
         try:
@@ -2978,21 +4455,75 @@ class BotWorker(QThread):
         except Exception:
             return False
 
-    def _release_combat_right_button(self) -> None:
+    def _release_held_mouse_button(self, button: str) -> bool:
+        """Safety net: release a physically held mouse button, if any.
+        Release/cleanup only — never presses or clicks. Used by the combat
+        release paths so a button held by older code (or the user) cannot
+        stay stuck down after combat ends.
+
+        P0-5/K-04: yumuşak SendInput yedeği KALDIRILDI ve `except: pass`
+        kaldırıldı — bırakma yalnızca güvenilir `_hw_mouse_up` yolundan
+        denenir; reddedilirse/hata verirse log + HUD alarmı üretilir ve
+        False döner (tuş `_mouse_buttons_down` kaydında kalır ki sonraki
+        süpürme yeniden deneyebilsin). True = bırakılacak tuş yok ya da
+        bırakma kabul edildi.
+        """
         driver = getattr(self, "input_driver", None)
-        held = getattr(driver, "_mouse_buttons_down", None) if driver is not None else None
+        if driver is None:
+            return False
+        held = getattr(driver, "_mouse_buttons_down", None)
+        if not (isinstance(held, (set, frozenset)) and button in held):
+            return True
+        mouse_up = getattr(driver, "_hw_mouse_up", None)
+        if not callable(mouse_up):
+            msg = (
+                f"FARE BIRAKMA HATASI: '{button}' tuşu basılı kayıtta ama "
+                "sürücüde _hw_mouse_up yok — tuş bırakılamadı."
+            )
+            logger.error(msg)
+            self._emit_log(msg)
+            return False
+        try:
+            released = mouse_up(button)
+        except Exception as exc:
+            msg = (
+                f"FARE BIRAKMA HATASI: '{button}' tuşu bırakılamadı ({exc}) — "
+                "güvenilir fare yolu reddetti/hata verdi, yumuşak yedek yok. "
+                "Tuş basılı kalmış olabilir."
+            )
+            logger.error(msg)
+            self._emit_log(msg)
+            return False
+        if released is False:
+            msg = (
+                f"FARE BIRAKMA HATASI: '{button}' tuşu bırakılamadı — "
+                "güvenilir fare yolu (Interception/Faker) reddetti, yumuşak "
+                "yedek yok. Tuş basılı kalmış olabilir."
+            )
+            logger.error(msg)
+            self._emit_log(msg)
+            return False
+        return True
+
+    def _release_combat_right_button(self) -> None:
+        """Release the held T key (right-click attack = T) and, as a safety
+        net, any physically held right mouse button (baseline behaviour).
+        Release/cleanup only — no mouse click is issued on the attack path."""
+        driver = getattr(self, "input_driver", None)
         tracked = self._right_button_is_tracked()
+        held = getattr(driver, "_mouse_buttons_down", None) if driver is not None else None
         button_down = isinstance(held, (set, frozenset)) and "right" in held
         if driver is None or not (button_down or tracked):
             self._mark_right_button(False)
             return
-        up = getattr(driver, "_hw_mouse_up", None)
+        up = getattr(driver, "key_up", None)
         if callable(up):
-            up("right")
-        else:
-            send = getattr(driver, "_sendinput_mouse_button", None)
-            if callable(send):
-                send("right", False)
+            try:
+                up("t")
+            except Exception:
+                pass
+        if button_down:
+            self._release_held_mouse_button("right")
         self._mark_right_button(False)
 
     def _warn_combat_input_blocked(self, tab_misses: int) -> None:
@@ -3027,7 +4558,9 @@ class BotWorker(QThread):
         logger.warning(msg)
 
     def _sync_combat_left_button(self, hold: bool) -> None:
-        """Mana regen phase left-click hold (via GameActionBus / SoftInput)."""
+        """Mana regen phase R-key hold (left-click attack = R, via GameActionBus / driver).
+        On release, also releases a physically held left mouse button as a
+        safety net (same defensive double-release as the right side)."""
         if bool(self._get_cfg("test_mode", False)):
             return
         if hold and not self.is_combat_authorized("attack"):
@@ -3037,40 +4570,35 @@ class BotWorker(QThread):
         if bus is not None and hasattr(bus, "hold_left_attack"):
             try:
                 bus.hold_left_attack(bool(hold))
+                if not hold:
+                    self._release_held_mouse_button("left")
                 return
             except Exception as exc:
                 logger.debug("hold_left_attack via bus failed: %s", exc)
-        port = self._plain_attr("input_port")
-        if port is not None and hasattr(port, "mouse_button"):
-            try:
-                port.mouse_button("left", bool(hold))
-                return
-            except Exception:
-                pass
         driver = getattr(self, "input_driver", None)
         if driver is None:
             return
         try:
             if hold:
-                down = getattr(driver, "_hw_mouse_down", None)
+                down = getattr(driver, "key_down", None)
                 if callable(down):
-                    down("left")
+                    down("r")
             else:
-                up = getattr(driver, "_hw_mouse_up", None)
+                up = getattr(driver, "key_up", None)
                 if callable(up):
-                    up("left")
+                    up("r")
+                self._release_held_mouse_button("left")
         except Exception as exc:
-            logger.debug("left button sync failed: %s", exc)
+            logger.debug("left attack key sync failed: %s", exc)
 
     def _release_combat_left_button(self) -> None:
         self._sync_combat_left_button(False)
 
     def _spam_combat_mouse(self, button: str) -> None:
         """
-        Combat mouse spam: continuously clicks the designated attack button
-        ('left' for low-mana regen, 'right' for high-mana burst) alongside skills.
-        Ensures opposite button is released, applies human timing (~75-110ms),
-        and avoids moving cursor/camera in mouse-look mode.
+        Combat attack spam via keys (name kept for callers/tests): 'left' (low-mana
+        regen) presses R, 'right' (high-mana burst) presses T. No mouse movement,
+        no clicks — mouse-look camera never drifts.
         """
         btn = str(button or "left").strip().lower()
         if btn not in ("left", "right"):
@@ -3086,32 +4614,101 @@ class BotWorker(QThread):
         if (now - last_spam) < spam_gap:
             return
 
-        # Ensure opposite button is released
+        # Ensure opposite attack key is released
         other = "right" if btn == "left" else "left"
         if other == "right":
             self._sync_combat_right_button(False)
         else:
             self._release_combat_left_button()
 
+        # right-click attack = T, left-click attack = R (user mapping).
+        key = "t" if btn == "right" else "r"
         driver = getattr(self, "input_driver", None)
         port = self._plain_attr("input_port")
         try:
-            if driver is not None and hasattr(driver, "human_click"):
-                # Click in-place without x,y args so mouse-look camera doesn't drift
-                driver.human_click(button=btn, min_hold=0.025, max_hold=0.045)
-            elif port is not None and hasattr(port, "mouse_button"):
-                port.mouse_button(btn, True)
+            if driver is not None and hasattr(driver, "press_key"):
+                driver.press_key(key, min_hold=0.025, max_hold=0.045)
+            elif port is not None and hasattr(port, "send_key"):
+                port.send_key(key, min_hold=0.025, max_hold=0.045)
+            elif driver is not None and hasattr(driver, "key_down"):
+                driver.key_down(key)
                 time.sleep(0.025)
-                port.mouse_button(btn, False)
-            elif driver is not None and hasattr(driver, "_hw_mouse_down"):
-                driver._hw_mouse_down(btn)
-                time.sleep(0.025)
-                driver._hw_mouse_up(btn)
+                driver.key_up(key)
         except Exception as exc:
-            logger.debug("combat mouse click spam failed for %s: %s", btn, exc)
+            logger.debug("combat key spam failed for %s: %s", btn, exc)
 
         self._last_combat_mouse_spam_ts = time.time()
         self._combat_mouse_spam_gap = random.uniform(0.075, 0.110)
+
+    def _is_auto_consumables_enabled(self) -> bool:
+        """F-0573: oto-iksir anahtarı. UI (ui/f9_menu.py) önce
+        worker.auto_consumables_enabled özniteliğini yazar; yoksa
+        config/schema.py `gathering.auto_consumables` okunur. Ayar henüz
+        yoksa varsayılan açık — eski davranış korunur. Kapalıyken iksir atılmaz."""
+        try:
+            override = self.__dict__.get("auto_consumables_enabled", None)
+            if override is not None:
+                return bool(override)
+        except Exception:
+            pass
+        try:
+            return bool(self._get_cfg("auto_consumables", True))
+        except Exception:
+            return True
+
+    def set_auto_consumables_enabled(self, enabled: bool) -> None:
+        """F-0573: UI onay kutusunun (ui/f9_menu.py) worker'a yazma yolu."""
+        try:
+            self.__dict__["auto_consumables_enabled"] = bool(enabled)
+        except Exception:
+            pass
+
+    def refresh_consumable_settings(self) -> None:
+        """F-23-01/F-23-11: canlı ayar tazeleme (main._on_settings_saved).
+
+        Ayar kaydedilince SettingsManager yeniden yüklenir; bu metod o
+        değerleri başlangıçta bir kez kurulan canlı nesnelere yazar:
+        ManaPhaseCombat eşik/tuşları (set_thresholds) ve SlotEconomy keşif
+        oranı (set_explore_ratio). Savaş tick'i eşikleri zaten her tick
+        tazeler (bkz. set_thresholds çağrısı); bu yol rota modunda da
+        tazelenmeyi sağlar. P1-13: iksir/buff anahtarları da burada
+        tazelenir (auto_use_hp/mp_potion, auto_refresh_buff_scroll,
+        buff_scroll_interval_sec, buff_scroll_key). Hiçbir alt adımda hata
+        fırlatmaz — bir modül yoksa/hatalıysa diğerleri yine uygulanır.
+        """
+        try:
+            hp_pct = float(self._get_cfg("hp_potion_threshold_pct", HP_POTION_THRESHOLD_PCT) or HP_POTION_THRESHOLD_PCT) / 100.0
+            mp_pct = float(self._get_cfg("mp_potion_threshold_pct", MP_POTION_THRESHOLD_PCT) or MP_POTION_THRESHOLD_PCT) / 100.0
+            mana_brain = self._plain_attr("mana_phase_combat")
+            if mana_brain is not None and hasattr(mana_brain, "set_thresholds"):
+                try:
+                    mana_brain.set_thresholds(
+                        mp_full_threshold=float(self._get_cfg("mp_full_threshold", 0.95) or 0.95),
+                        hp_potion_threshold=hp_pct,
+                        mp_potion_threshold=mp_pct,
+                        smart_hp_potion_threshold=hp_pct,
+                        smart_mp_potion_threshold=mp_pct,
+                        hp_potion_key=str(self._get_cfg("hp_potion_key", "F1") or "F1"),
+                        mp_potion_key=str(self._get_cfg("mp_potion_key", "F2") or "F2"),
+                        auto_use_hp_potion=bool(self._get_cfg("auto_use_hp_potion", True)),
+                        auto_use_mp_potion=bool(self._get_cfg("auto_use_mp_potion", True)),
+                        auto_refresh_buff_scroll=bool(self._get_cfg("auto_refresh_buff_scroll", True)),
+                        buff_scroll_interval_sec=float(self._get_cfg("buff_scroll_interval_sec", 300) or 300),
+                        buff_scroll_key=str(self._get_cfg("buff_scroll_key", "F7") or "F7"),
+                    )
+                except Exception as exc:
+                    logger.debug("ManaPhase eşik tazeleme hatası: %s", exc)
+        except Exception as exc:
+            logger.debug("Tüketim eşiği okuma hatası: %s", exc)
+        try:
+            eco = self._plain_attr("slot_economy")
+            if eco is not None and hasattr(eco, "set_explore_ratio"):
+                try:
+                    eco.set_explore_ratio(float(self._get_cfg("ucb_explore_ratio", 0.20) or 0.20))
+                except Exception as exc:
+                    logger.debug("SlotEconomy oran tazeleme hatası: %s", exc)
+        except Exception as exc:
+            logger.debug("Keşif oranı okuma hatası: %s", exc)
 
     def _check_and_trigger_auto_potions(
         self,
@@ -3123,19 +4720,35 @@ class BotWorker(QThread):
         Monitors player HP and MP during combat and route travel:
         - HP < hp_potion_threshold (default 0.65 / 65%): triggers HP potion (e.g. F1, F3, 7).
         - Emergency HP < emergency_hp_threshold (0.40): immediate priority HP recovery.
-        - MP < mp_potion_threshold (default 0.35 / 35%): triggers MP potion (e.g. F2, F4, 8).
+        - MP < mp_potion_threshold (default 0.45 / 45%): triggers MP potion (e.g. F2, F4, 8).
         - Strictly forbids and suppresses keys X, F6, and B (managed automatically by client).
         Respects per-potion cooldowns (default 8.0s).
         """
         if self.is_paused or bool(self._get_cfg("test_mode", False)):
             return False
 
+        # F-0573: oto-iksir kapalıyken (UI onay kutusu / config) iksir atılmaz.
+        if not self._is_auto_consumables_enabled():
+            return False
+
+        # P1-13: iksir başına anahtar (route.auto_use_hp/mp_potion) —
+        # ana şalter açıkken bile tek iksir kapatılabilir.
+        hp_enabled = bool(self._get_cfg("auto_use_hp_potion", True))
+        mp_enabled = bool(self._get_cfg("auto_use_mp_potion", True))
+
         now = time.time()
         try:
             hp = max(0.0, min(1.0, float(player_hp_ratio)))
-            mp = max(0.0, min(1.0, float(player_mp_ratio)))
         except (TypeError, ValueError):
             return False
+        # F-0194: MP may be unknown (None) in route mode — skip the MP potion
+        # instead of pretending MP is full (1.0).
+        mp: Optional[float] = None
+        if player_mp_ratio is not None:
+            try:
+                mp = max(0.0, min(1.0, float(player_mp_ratio)))
+            except (TypeError, ValueError):
+                return False
 
         # If HP is near zero (e.g. death or invalid frame), death handler manages it
         if hp <= 0.01:
@@ -3143,7 +4756,9 @@ class BotWorker(QThread):
 
         mana_brain = self._plain_attr("mana_phase_combat")
         hp_thresh = float(getattr(mana_brain, "smart_hp_potion_threshold", 0.65) if mana_brain else 0.65)
-        mp_thresh = float(getattr(mana_brain, "smart_mp_potion_threshold", 0.35) if mana_brain else 0.35)
+        # F-23-01: mana_brain yokken MP yedeği 0.35'ti; smart varsayılan
+        # (0.45) ve şema (mp_potion_threshold_pct 45) ile çelişiyordu.
+        mp_thresh = float(getattr(mana_brain, "smart_mp_potion_threshold", 0.45) if mana_brain else 0.45)
         emerg_thresh = float(getattr(mana_brain, "emergency_hp_threshold", 0.40) if mana_brain else 0.40)
 
         hp_cd = float(getattr(mana_brain, "hp_potion_cd_sec", 8.0) if mana_brain else 8.0)
@@ -3160,7 +4775,7 @@ class BotWorker(QThread):
         pot_triggered = False
 
         # 1. HP Potion Check
-        if hp < hp_thresh:
+        if hp_enabled and hp < hp_thresh:
             if (now - last_hp) >= hp_cd:
                 chosen_key = None
                 consumable_mgr = getattr(mana_brain, "consumable_manager", None) if mana_brain else None
@@ -3173,29 +4788,43 @@ class BotWorker(QThread):
                         chosen_key = None
 
                 if not chosen_key:
-                    fallback_key = getattr(mana_brain, "hp_potion_key", "F1") if mana_brain else "F1"
-                    if str(fallback_key).strip().lower() not in FORBIDDEN:
+                    # F-0380: never blind-press F1 when no potion slot is
+                    # known. Only an explicitly configured key may be used.
+                    fallback_key = getattr(mana_brain, "hp_potion_key", None) if mana_brain else None
+                    if fallback_key and str(fallback_key).strip().lower() not in FORBIDDEN:
                         chosen_key = str(fallback_key).strip()
                     else:
-                        chosen_key = "F1"
+                        logger.debug("HP potion skipped: no known potion slot (no blind F1)")
+                        chosen_key = None
 
                 if chosen_key and str(chosen_key).strip().lower() not in FORBIDDEN:
                     is_emerg = hp < emerg_thresh
                     tag = "🚨 ACİL CAN POTU" if is_emerg else "🧪 CAN POTU"
                     self._emit_log(f"{tag}: Can %{int(round(hp * 100))} < %{int(round(hp_thresh * 100))} -> [{chosen_key}] basılıyor...")
-                    self._press_key(chosen_key, min_hold=0.06, max_hold=0.12, release_mouse=False)
-                    self._last_hp_potion_ts = now
-                    if mana_brain and hasattr(mana_brain, "_last_hp_potion_ts"):
-                        mana_brain._last_hp_potion_ts = now
-                    if consumable_mgr and hasattr(consumable_mgr, "mark_used"):
-                        try:
-                            consumable_mgr.mark_used(chosen_key, now=now)
-                        except Exception:
-                            pass
-                    pot_triggered = True
+                    # B-02: basış onaylanmazsa (sürücü 0.0/False) zaman damgası
+                    # ve "kullanıldı" kaydı yazılmaz — cooldown başlamaz, retry
+                    # engellenmez; aksi halde iksir hiç gitmediği halde
+                    # "basıldı" sayılırdı.
+                    pressed = self._press_potion_key(chosen_key, min_hold=0.06, max_hold=0.12)
+                    if not pressed:
+                        logger.warning(
+                            "HP iksiri basılamadı (tuş gönderilmedi): [%s] — cooldown "
+                            "başlatılmadı, bir sonraki tick'te tekrar denenecek.",
+                            chosen_key,
+                        )
+                    else:
+                        self._last_hp_potion_ts = now
+                        if mana_brain and hasattr(mana_brain, "_last_hp_potion_ts"):
+                            mana_brain._last_hp_potion_ts = now
+                        if consumable_mgr and hasattr(consumable_mgr, "mark_used"):
+                            try:
+                                consumable_mgr.mark_used(chosen_key, now=now)
+                            except Exception:
+                                pass
+                        pot_triggered = True
 
-        # 2. MP Potion Check
-        if mp < mp_thresh:
+        # 2. MP Potion Check (skipped when MP is unknown)
+        if mp_enabled and mp is not None and mp < mp_thresh:
             if (now - last_mp) >= mp_cd:
                 chosen_mp = None
                 consumable_mgr = getattr(mana_brain, "consumable_manager", None) if mana_brain else None
@@ -3208,24 +4837,35 @@ class BotWorker(QThread):
                         chosen_mp = None
 
                 if not chosen_mp:
-                    fallback_mp = getattr(mana_brain, "mp_potion_key", "F2") if mana_brain else "F2"
-                    if str(fallback_mp).strip().lower() not in FORBIDDEN:
+                    # F-0380: same rule as HP — no blind F2.
+                    fallback_mp = getattr(mana_brain, "mp_potion_key", None) if mana_brain else None
+                    if fallback_mp and str(fallback_mp).strip().lower() not in FORBIDDEN:
                         chosen_mp = str(fallback_mp).strip()
                     else:
-                        chosen_mp = "F2"
+                        logger.debug("MP potion skipped: no known potion slot (no blind F2)")
+                        chosen_mp = None
 
                 if chosen_mp and str(chosen_mp).strip().lower() not in FORBIDDEN:
                     self._emit_log(f"💧 MANA POTU: Mana %{int(round(mp * 100))} < %{int(round(mp_thresh * 100))} -> [{chosen_mp}] basılıyor...")
-                    self._press_key(chosen_mp, min_hold=0.06, max_hold=0.12, release_mouse=False)
-                    self._last_mp_potion_ts = now
-                    if mana_brain and hasattr(mana_brain, "_last_mp_potion_ts"):
-                        mana_brain._last_mp_potion_ts = now
-                    if consumable_mgr and hasattr(consumable_mgr, "mark_used"):
-                        try:
-                            consumable_mgr.mark_used(chosen_mp, now=now)
-                        except Exception:
-                            pass
-                    pot_triggered = True
+                    # B-02: HP ile aynı kural — basış onaylanmazsa zaman
+                    # damgası / "kullanıldı" kaydı yazılmaz, retry engellenmez.
+                    pressed = self._press_potion_key(chosen_mp, min_hold=0.06, max_hold=0.12)
+                    if not pressed:
+                        logger.warning(
+                            "MP iksiri basılamadı (tuş gönderilmedi): [%s] — cooldown "
+                            "başlatılmadı, bir sonraki tick'te tekrar denenecek.",
+                            chosen_mp,
+                        )
+                    else:
+                        self._last_mp_potion_ts = now
+                        if mana_brain and hasattr(mana_brain, "_last_mp_potion_ts"):
+                            mana_brain._last_mp_potion_ts = now
+                        if consumable_mgr and hasattr(consumable_mgr, "mark_used"):
+                            try:
+                                consumable_mgr.mark_used(chosen_mp, now=now)
+                            except Exception:
+                                pass
+                        pot_triggered = True
 
         return pot_triggered
 
@@ -3257,13 +4897,22 @@ class BotWorker(QThread):
             last = float(used.get(key, 0.0) or 0.0)
             if last > 0.0 and (now - last) < self._combat_skill_cooldown_sec(key):
                 continue
+            # P0-6: cooldown damgası gönderimden SONRA — _cast_one False
+            # dönerse (kapı engeli / basış başarısız) damga yok, burst
+            # sayılmaz; tuş bir sonraki tick'te tekrar denenir. None
+            # (dönüşsüz bus) eski davranışı korur: damgalanır.
+            sent = self._cast_one_combat_skill(key, frame=frame)
+            if sent is False:
+                continue
             used[key] = now
-            self._cast_one_combat_skill(key, frame=frame)
             pressed += 1
             if pressed < per_burst:
                 time.sleep(0.035 if trusted else 0.06)
         if pressed <= 0:
             return False
+        # P0-6: burst damgası yalnızca >=1 tuş gerçekten gönderildiyse
+        # yazılır (pressed artık yalnızca gönderilen/bilinmeyen basışları
+        # sayar; hepsi başarısızsa yukarıda False dönüldü).
         self._combat_last_skill_burst_ts = now
         return True
 
@@ -3314,8 +4963,9 @@ class BotWorker(QThread):
         # First tick: optional Alt+hover tooltip (AION2 cursor), then keyboard cast.
         bus = self._plain_attr("action_bus")
         try:
-            # Alt-hover disabled while diagnosing dead keys (stuck Alt -> cursor mode).
-            # self._maybe_alt_tooltip_hint(disc, slot, frame_bgr)
+            # Alt-hover disabled while diagnosing dead keys (stuck Alt ->
+            # cursor mode). The tooltip helpers were dead code (F-0505) and
+            # have been removed.
             if bus is not None and hasattr(bus, "cast_skill"):
                 bus.cast_skill(slot, frame=frame_bgr)
             else:
@@ -3324,100 +4974,12 @@ class BotWorker(QThread):
         except Exception as exc:
             logger.debug("skill discovery cast: %s", exc)
 
-    def _maybe_alt_tooltip_hint(self, disc: Any, slot: str, frame_bgr: Any) -> None:
-        """AION2: Alt hold shows cursor — hover skill to read tooltip (no cast)."""
-        if disc is None or not hasattr(disc, "confirm_tooltip_hint"):
-            return
-        now = time.time()
-        last = float(self._plain_attr("_last_alt_tooltip_ts", 0.0) or 0.0)
-        if now - last < 8.0:
-            return
-        bus = self._plain_attr("action_bus")
-        if bus is None or not hasattr(bus, "hover_skill_with_alt"):
-            return
-        try:
-            def _while_alt(sx: int, sy: int) -> str:
-                return self._ocr_skill_tooltip_near_slot(None, sx, sy)
-
-            hovered = bus.hover_skill_with_alt(
-                slot,
-                frame=frame_bgr,
-                hold_sec=0.45,
-                on_hover=_while_alt,
-            )
-            self._last_alt_tooltip_ts = now
-            tip = str(hovered.get("hover_payload") or "").strip()
-            if hovered.get("ok") and tip:
-                disc.confirm_tooltip_hint(slot, tip)
-                mana_brain = self._plain_attr("mana_phase_combat")
-                if mana_brain is not None and hasattr(mana_brain, "set_lexicon"):
-                    mana_brain.set_lexicon(disc.lexicon())
-        except Exception as exc:
-            logger.debug("alt tooltip hint skipped: %s", exc)
-
-    def _ocr_skill_tooltip_near_slot(
-        self,
-        frame_bgr: Any,
-        slot_x: Any,
-        slot_y: Any,
-    ) -> str:
-        """OCR tooltip above hotbar — call while Alt is still held."""
-        if slot_x is None or slot_y is None:
-            return ""
-        try:
-            import numpy as np
-
-            # Grab while Alt+hover is active (direct vision — avoid learner/disk side effects).
-            frame = None
-            vision = self._plain_attr("vision")
-            if vision is not None and hasattr(vision, "grab_screen"):
-                try:
-                    frame = vision.grab_screen(grayscale=False)
-                except Exception:
-                    frame = None
-            if frame is None:
-                frame = frame_bgr
-            if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
-                return ""
-            h, w = frame.shape[:2]
-            sx, sy = int(slot_x), int(slot_y)
-            x1 = max(0, sx - int(w * 0.12))
-            x2 = min(w, sx + int(w * 0.12))
-            y1 = max(0, sy - int(h * 0.28))
-            y2 = min(h, sy - int(h * 0.04))
-            if y2 <= y1 or x2 <= x1:
-                return ""
-            roi = frame[y1:y2, x1:x2]
-            for name in ("ocr_text", "read_text", "ocr_roi"):
-                fn = getattr(vision, name, None) if vision is not None else None
-                if callable(fn):
-                    try:
-                        out = fn(roi)
-                        if isinstance(out, str) and out.strip():
-                            return out.strip()
-                        if isinstance(out, dict):
-                            t = str(out.get("text") or out.get("ocr") or "").strip()
-                            if t:
-                                return t
-                    except Exception:
-                        continue
-            try:
-                from core.ocr_distance import quick_ocr_text  # type: ignore
-
-                t = quick_ocr_text(roi)
-                if t:
-                    return str(t).strip()
-            except Exception:
-                pass
-        except Exception:
-            return ""
-        return ""
-
     def _zk_post_combat_tick(
         self,
-        player_mp_ratio: float,
-        monster_hp_ratio: float,
+        player_mp_ratio: Any = None,
+        monster_hp_ratio: Any = None,
         phase: str = "B",
+        player_hp_ratio: Any = None,
     ) -> None:
         """Record reward + chat loot into slot economy; refresh UCB hint occasionally."""
         cog = self._plain_attr("_frame_cognition")
@@ -3463,8 +5025,44 @@ class BotWorker(QThread):
                     except Exception:
                         pass
 
-        wasted = max(0.0, 1.0 - float(player_mp_ratio)) if str(phase) == "B" else 0.0
-        dmg = max(0.0, 1.0 - float(monster_hp_ratio)) * 100.0
+        # F-0188: the only production log_tick call dropped kina and
+        # damage_taken (both default to 0.0 in the log). Kina comes from the
+        # chat events already parsed above; damage taken is the HP drop
+        # since the previous combat tick.
+        # S-2601: bilinmeyen vital uydurulmaz. MP bilinmiyorsa israf
+        # hesaplanamaz (0.0 yazılır, "tam mana" varsayılmaz); canavar canı
+        # bilinmiyorsa hasar iddia edilmez (0.0 yazılır, "100 hasar"
+        # varsayılmaz). HP'de zaten uygulanan None -> 0.0/atla kuralıyla aynı.
+        try:
+            mp_f = float(player_mp_ratio) if player_mp_ratio is not None else None
+        except (TypeError, ValueError):
+            mp_f = None
+        try:
+            mon_f = float(monster_hp_ratio) if monster_hp_ratio is not None else None
+        except (TypeError, ValueError):
+            mon_f = None
+        wasted = max(0.0, 1.0 - mp_f) if (str(phase) == "B" and mp_f is not None) else 0.0
+        dmg = max(0.0, 1.0 - mon_f) * 100.0 if mon_f is not None else 0.0
+        kina_total = 0.0
+        for _ev in chat_events:
+            if isinstance(_ev, dict) and str(_ev.get("type", "")) == "kina":
+                try:
+                    kina_total += float(_ev.get("amount", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+        damage_taken = 0.0
+        try:
+            hp_f = float(player_hp_ratio) if player_hp_ratio is not None else None
+        except (TypeError, ValueError):
+            hp_f = None
+        prev_hp = self._plain_attr("_zk_prev_player_hp", None)
+        if hp_f is not None and prev_hp is not None:
+            try:
+                damage_taken = max(0.0, float(prev_hp) - hp_f) * 100.0
+            except (TypeError, ValueError):
+                damage_taken = 0.0
+        if hp_f is not None:
+            self._zk_prev_player_hp = hp_f
         reward_log = self._plain_attr("rl_reward_log")
         if reward_log is not None and hasattr(reward_log, "log_tick"):
             try:
@@ -3472,7 +5070,9 @@ class BotWorker(QThread):
                 if eco is not None:
                     slot_id = str(getattr(eco, "_current_slot", "") or "")
                 reward_log.log_tick(
+                    kina=kina_total,
                     damage_dealt=dmg,
+                    damage_taken=damage_taken,
                     wasted_mana=wasted * 0.1,
                     slot_id=slot_id,
                     meta={"phase": phase},
@@ -3500,9 +5100,17 @@ class BotWorker(QThread):
         reward_log = self._plain_attr("rl_reward_log")
         if stuck_for and reward_log is not None:
             try:
-                reward_log.log_tick(stuck_time=float(stuck_for), meta={"event": "stuck"})
+                # F-0381: note_position returns a CUMULATIVE stuck duration;
+                # logging it every tick double-counts. Log only the delta.
+                last_logged = float(self._plain_attr("_zk_last_stuck_logged", 0.0) or 0.0)
+                delta = float(stuck_for) - last_logged
+                if delta > 0.0:
+                    reward_log.log_tick(stuck_time=delta, meta={"event": "stuck"})
+                    self._zk_last_stuck_logged = float(stuck_for)
             except Exception:
                 pass
+        elif not stuck_for:
+            self._zk_last_stuck_logged = 0.0
         if not stuck_for:
             return
         frame = self.__dict__.get("_last_color_frame")
@@ -3525,18 +5133,28 @@ class BotWorker(QThread):
                 logger.debug("depth avoid on stuck: %s", exc)
         glide_pilot = self._plain_attr("glide_pilot")
         if glide_pilot is not None and hasattr(glide_pilot, "execute_glide_maneuver"):
-            try:
-                glide_pilot.execute_glide_maneuver(
-                    self._plain_attr("active_node"),
-                    input_ctrl=self._plain_attr("input_driver"),
-                )
-            except TypeError:
+            # F-0048: execute_glide_maneuver defaults to test_mode=True, which
+            # sends no input yet returns success=True. Pass the real mode
+            # explicitly and never claim a glide when there is no driver.
+            driver = self._plain_attr("input_driver")
+            if driver is None:
+                logger.warning("Glide maneuver skipped: no input driver")
+            else:
                 try:
-                    glide_pilot.execute_glide_maneuver(self._plain_attr("active_node"))
+                    result = glide_pilot.execute_glide_maneuver(
+                        self._plain_attr("active_node"),
+                        input_ctrl=driver,
+                        test_mode=bool(self._get_cfg("test_mode", False)),
+                    )
+                    if isinstance(result, dict) and not result.get("success", True):
+                        logger.warning("Glide maneuver reported failure: %s", result)
+                except TypeError:
+                    try:
+                        glide_pilot.execute_glide_maneuver(self._plain_attr("active_node"))
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-            except Exception:
-                pass
         # Enter current area as a slot sample for UCB when stuck resolved path continues
         eco = self._plain_attr("slot_economy")
         if eco is not None and hasattr(eco, "enter_slot"):
@@ -3546,9 +5164,35 @@ class BotWorker(QThread):
             except Exception:
                 pass
 
+    def _route_mp_ratio_from_cognition(self) -> Optional[float]:
+        """Best-effort real MP ratio from the learner snapshot; None if unknown."""
+        try:
+            learner = self._plain_attr("game_learner")
+            if learner is not None and hasattr(learner, "get_live_cognition_snapshot"):
+                snap = learner.get_live_cognition_snapshot() or {}
+                if isinstance(snap, dict) and snap.get("player_mp_percent") is not None:
+                    return max(0.0, min(1.0, float(snap["player_mp_percent"]) / 100.0))
+                if isinstance(snap, dict) and snap.get("player_mp") is not None:
+                    return max(0.0, min(1.0, float(snap["player_mp"])))
+        except Exception:
+            pass
+        return None
+
     def _handle_combat_and_death(self) -> bool:
         """Checks for character death or enemy attack and responds accordingly."""
         if self.combat_recovery is None:
+            # F-0189: death/attack checks silently absent is dangerous — warn
+            # once and surface it on the HUD instead of returning quietly.
+            if not bool(self._plain_attr("_combat_recovery_missing_warned", False)):
+                self._combat_recovery_missing_warned = True
+                logger.warning(
+                    "Combat/death check skipped: combat_recovery is None — "
+                    "death and under-attack detection are OFF"
+                )
+                try:
+                    self._emit_log("⚠️ Ölüm/saldırı denetimi kapalı: combat_recovery yok")
+                except Exception:
+                    pass
             return False
         if self.is_paused:
             self._sync_combat_right_button(False)
@@ -3558,18 +5202,33 @@ class BotWorker(QThread):
             frame_bgr = self._grab_frame(grayscale=False)
 
             # Character death check (passes frame safely; supports both frame-accepting and 0-arg mocks)
+            # F-0190: passing a frame makes the callee use confirm_frames=1
+            # (single frame). Pass 5 explicitly so one bad frame cannot
+            # declare death; mocks that do not accept the kwarg fall back.
             is_dead = False
             if hasattr(self.combat_recovery, "check_character_dead"):
                 try:
                     if frame_bgr is not None:
-                        is_dead = bool(self.combat_recovery.check_character_dead(frame_bgr))
+                        is_dead = bool(
+                            self.combat_recovery.check_character_dead(
+                                frame_bgr, confirm_frames=5
+                            )
+                        )
                     else:
-                        is_dead = bool(self.combat_recovery.check_character_dead())
+                        is_dead = bool(
+                            self.combat_recovery.check_character_dead(confirm_frames=5)
+                        )
                 except TypeError:
                     try:
-                        is_dead = bool(self.combat_recovery.check_character_dead())
+                        if frame_bgr is not None:
+                            is_dead = bool(self.combat_recovery.check_character_dead(frame_bgr))
+                        else:
+                            is_dead = bool(self.combat_recovery.check_character_dead())
                     except TypeError:
-                        is_dead = False
+                        try:
+                            is_dead = bool(self.combat_recovery.check_character_dead())
+                        except TypeError:
+                            is_dead = False
             elif hasattr(self.combat_recovery, "is_dead"):
                 try:
                     is_dead = bool(self.combat_recovery.is_dead(frame_bgr))
@@ -3578,21 +5237,76 @@ class BotWorker(QThread):
 
             if is_dead:
                 self._emit_log("Character death detected")
+                recovered = False
                 if hasattr(self.combat_recovery, "recover_from_death"):
                     try:
                         recovered = self.combat_recovery.recover_from_death(frame_bgr)
                     except TypeError:
                         recovered = self.combat_recovery.recover_from_death()
-                    if not recovered:
-                        self.pause("Paused: character died")
-                    else:
-                        self.active_node = None
                 elif hasattr(self.combat_recovery, "handle_death"):
-                    self.combat_recovery.handle_death()
+                    try:
+                        recovered = bool(self.combat_recovery.handle_death())
+                    except TypeError:
+                        recovered = bool(self.combat_recovery.handle_death())
+                if recovered:
+                    # F-0191/F-0192: a revived character must not resume with
+                    # a stale harvest session (old node/stage/cast flags).
                     self.active_node = None
+                    self._is_gathering_active = False
+                    self._stage_cast_in_progress = False
+                    self._stage_cast_bar_seen = False
+                    self._waiting_for_next_stage_prompt = False
+                    self._current_node_harvest_stage = 0
+                    self._current_node_stage_retries = 0
+                    self._gather_lost_frames = 0
+                    self._route_prev_hp_ratio = None
+                    self._combat_was_targeting = False
+                    self._clear_route_combat()
+                    self._death_wait_until = 0.0
+                    self._emit_log("Character revived: harvest state reset")
                 else:
+                    # F-0382: recover_from_death only reports an already-done
+                    # revive; it never tries one. Wait (tick-based, bounded)
+                    # for the game/player revive before giving up and pausing.
+                    wait_sec = float(self._get_cfg("death_revive_wait_sec", 60) or 60)
+                    now_ts = time.time()
+                    deadline = float(self._plain_attr("_death_wait_until", 0.0) or 0.0)
+                    if deadline <= 0.0:
+                        deadline = now_ts + max(0.0, wait_sec)
+                        self._death_wait_until = deadline
+                        self._emit_log(
+                            f"Character died: waiting up to {int(wait_sec)}s for revive"
+                        )
+                        # sweep-29 K-2/K-1: ölüm ilk kez doğrulandığında
+                        # telemetriye yazılır + sesli uyarı verilir. Bu dal
+                        # deadline kurulurken (epizot başına bir kez) çalışır.
+                        try:
+                            _tel = getattr(self, "telemetry", None)
+                            if _tel is not None and hasattr(_tel, "record_combat"):
+                                _tel.record_combat(
+                                    duration_sec=self._take_combat_duration_sec(),
+                                    outcome="DIED",
+                                    mob_key="",
+                                )
+                        except Exception as _tel_exc:
+                            logger.warning("Telemetri record_combat (ölüm) hatası: %s", _tel_exc)
+                        try:
+                            _tel = getattr(self, "telemetry", None)
+                            if _tel is not None and hasattr(_tel, "send_alert"):
+                                # Webhook yok (bildirim kanalı kararı Selçuk'ta,
+                                # AÇIK SORU); Windows'ta sesli uyarı çalar.
+                                _tel.send_alert(
+                                    "DEATH", "Karakter öldü — dirilme bekleniyor."
+                                )
+                        except Exception as _alert_exc:
+                            logger.warning("Telemetri send_alert (ölüm) hatası: %s", _alert_exc)
+                    if now_ts < deadline:
+                        return True
+                    self._death_wait_until = 0.0
                     self.pause("Paused: character died")
                 return True
+            else:
+                self._death_wait_until = 0.0
 
             # Dedicated combat mode runs its own targeting/skills/tab loop below.
             if (
@@ -3606,17 +5320,22 @@ class BotWorker(QThread):
             gathering_now = bool(self._plain_attr("_is_gathering_active", False)) or (
                 str(self._plain_attr("_state", "")) == BotState.GATHERING.value
             )
-            stop_gather_sec = int(self._get_cfg("fight_stop_gather_sec", 0) or 0)
+            # F-23-05: şema varsayılanı 3 (config/schema.py RouteSettings).
+            # Açık 0, "toplamayı hiç bölme" demektir: `or 3` onu 3'e
+            # çevirip aşağıdaki `<= 0` kısa devresini ölü koda
+            # dönüştürüyordu — yalnızca None varsayılana düşer.
+            _stop_gather_raw = self._get_cfg("fight_stop_gather_sec", 3)
+            stop_gather_sec = 3 if _stop_gather_raw is None else int(_stop_gather_raw)
             if gathering_now and stop_gather_sec <= 0:
                 self._sync_combat_right_button(False)
                 return False
-            if self._player_driven_mapping_mode() and not bool(self._get_cfg("fight_back", False)):
+            if self._player_driven_mapping_mode() and not bool(self._get_cfg("fight_back", True)):
                 self._sync_combat_right_button(False)
                 return False
 
             # Under attack check. A missing target bar is not a death and is not a fight.
-            # Default False: Toplama stays gather-only unless user enables fight_back.
-            if bool(self._get_cfg("fight_back", False)):
+            # F-23-05: şema varsayılanı True (config/schema.py RouteSettings).
+            if bool(self._get_cfg("fight_back", True)):
                 atk_res: Any = False
                 if hasattr(self.combat_recovery, "check_under_attack"):
                     try:
@@ -3631,17 +5350,73 @@ class BotWorker(QThread):
                             atk_res = False
 
                 _under_ignored, hp_ratio = self._parse_attack_result(atk_res)
-                has_bar = self._enemy_target_bar_visible(frame_bgr)
+                # ROTA-İPTAL-ZİNCİRİ: FIGHTING kapısı SADECE gerçek düşman
+                # barını sayar — keşif/öğrenici kilidi (learner
+                # current_monster_targeted, _frame_cognition.has_target) ve
+                # çıplak "saldırı altında" (vignette/boş bar) sayılmaz.
+                # (Geniş _enemy_target_bar_visible burada artık okunmaz;
+                # savaş modu kendi döngüsünde kullanmaya devam eder.)
+                # fix/v20-panic-combat: bar tek başına yetmez — bar
+                # penceresinde HP düşüşü veya ToT aggro da gerekir
+                # (hayalet-savaş: pasif mob barı FIGHTING'e sokmaz).
+                route_bar = self._route_enemy_bar_visible(frame_bgr)
                 hp_dropped = self._note_player_hp_drop(hp_ratio)
-                if has_bar or hp_dropped:
-                    self._remember_real_combat_signal(has_bar=has_bar, hp_dropped=hp_dropped)
+                # fix/v20-panic-combat: ToT aggro işareti — check_under_attack
+                # bu tick'te combat_recovery.last_target_of_target_agro'ya
+                # yazdı. `is True` koruması: recovery yoksa / mock ise
+                # kanıt yok sayılır (MagicMock özniteliği True sayılmaz).
+                tot_agro = (
+                    getattr(
+                        self.combat_recovery,
+                        "last_target_of_target_agro",
+                        None,
+                    )
+                    is True
+                )
+                # Doğrulama: Görev 1'in ürettiği tek-kare sinyali (bar / HP
+                # düşüşü) aynen tüketilir; FIGHTING'e giriş için sinyalin
+                # ardışık tick'lerde tekrarlanması gerekir. fix/v20:
+                # bar tek başına yetmez — bar penceresinde HP düşüşü
+                # veya ToT aggro da gerekir (hayalet-savaş düzeltmesi).
+                now_ts = time.time()
+                confirmed = self._route_combat_signal_confirmed(
+                    route_bar, hp_dropped, tot_agro
+                )
 
                 # Auto-potion check when taking damage or under attack
-                if hp_ratio > 0.01:
-                    self._check_and_trigger_auto_potions(hp_ratio, 1.0, frame_bgr)
+                # F-0193/F-0194: hp_ratio is None for a bare bool result, and
+                # MP 1.0 is a fabrication — use the real MP when known.
+                if hp_ratio is not None and hp_ratio > 0.01:
+                    mp_ratio = self._route_mp_ratio_from_cognition()
+                    self._check_and_trigger_auto_potions(hp_ratio, mp_ratio, frame_bgr)
 
                 # Bare "under attack" (vignette / empty bar) does not start a counterattack.
-                if has_bar or hp_dropped:
+                # ROTA-İPTAL-ZİNCİRİ: tek karelik sinyal de başlatmaz — önce
+                # doğrulama (ardışık tick), sonra histerezis penceresi.
+                # W54/test_4 (v19 KOK NEDEN): aktif hasat sirasinda
+                # dogrulanmis saldiri (2 ardisik tick) dogrudan FIGHTING'e
+                # sapiyordu — cast / asama-arasi bekleme tick'i hic
+                # surulemiyor, asama asla bitmiyordu. fight_stop_gather_sec
+                # "savas toplamayi N sn SUREKLI saldiridan sonra boler"
+                # demektir (0 = asla bolme, test_1 kilidi); oysa kodda
+                # sure olculmuyordu — yalnizca `<= 0` kisa devresi vardi.
+                # Hasat surerken sapma, sinyal SUREKLI N sn'yi
+                # doldurunca olur; o zamana dek tick rotaya (toplamaya)
+                # doner. Olum denetimi ve oto-iksir bu kapinin USTUNDE
+                # calisir, etkilenmez. Damga sinyal kesilince
+                # _clear_route_combat ile, oturum basinda/sonunda
+                # sifirlanir.
+                if gathering_now and stop_gather_sec > 0:
+                    if route_bar or hp_dropped:
+                        if float(self._plain_attr("_gather_under_attack_since", 0.0) or 0.0) <= 0.0:
+                            self._gather_under_attack_since = now_ts
+                    if confirmed:
+                        _since = float(self._plain_attr("_gather_under_attack_since", 0.0) or 0.0)
+                        if (now_ts - _since) < stop_gather_sec:
+                            self._sync_combat_right_button(False)
+                            return False
+                if confirmed and not self._route_fight_reentry_blocked(now_ts):
+                    self._remember_real_combat_signal(has_bar=route_bar, hp_dropped=hp_dropped)
                     if self._state != BotState.FIGHTING.value:
                         self._emit_log("Saldırı altında: Karşı saldırı yapılıyor")
                     self._set_state_internal(BotState.FIGHTING.value)
@@ -3653,7 +5428,7 @@ class BotWorker(QThread):
 
                     if not bool(self._get_cfg("test_mode", False)):
                         self._last_bot_key_time = time.time()
-                        if has_bar:
+                        if route_bar:
                             self._combat_was_targeting = True
                             self._combat_no_target_streak = 0
                         is_route = str(self._plain_attr("_mode", "")).strip().lower() in (
@@ -3666,30 +5441,80 @@ class BotWorker(QThread):
                         allow_fight_back = (not is_route) or route_fb
                         if allow_fight_back:
                             try:
-                                if self._real_target_for_skills(has_bar):
+                                if self._real_target_for_skills(route_bar):
                                     self._send_configured_combat_skill()
                             except Exception:
                                 logger.debug("Combat skill skipped", exc_info=True)
                             if hasattr(self.combat_recovery, "fight_back_step"):
+                                # 17/B7 (P3-4: eski metin bayattı):
+                                # fight_back_step barsız 2. adımda ARTIK loot
+                                # F basmaz — Y2/P1-11 düzeltmesi kör F'i (ve
+                                # kör Tab/kesim yazımını) kaldırdı
+                                # (combat_recovery.py fight_back_step, Y2
+                                # bloğu ~2136); o dal True döner ama dönüş
+                                # hep True değildir (girdi yoksa / basım
+                                # başarısızsa / istisnada False). Ayna sayaç
+                                # burada tutulur: route_bar False ise streak
+                                # artar, True ise sıfırlanır. F16: streak>=2
+                                # L2 F'ini YALNIZCA CombatSystem
+                                # fallback'inde atlatır (o L3 ölümde F
+                                # basar); canlı CombatRecovery yolunda L2
+                                # tek F'i basar — bkz. _loot_confirmed_fight.
+                                if route_bar:
+                                    self._route_fightback_no_bar_streak = 0
+                                else:
+                                    self._route_fightback_no_bar_streak = int(getattr(self, "_route_fightback_no_bar_streak", 0) or 0) + 1
                                 self.combat_recovery.fight_back_step(input_ctrl=self.input_driver, frame=frame_bgr)
                             elif hasattr(self.combat_recovery, "fight_back"):
                                 self.combat_recovery.fight_back(input_ctrl=self.input_driver, frame=frame_bgr)
                             elif hasattr(self.combat_recovery, "execute_combat_step"):
                                 self.combat_recovery.execute_combat_step(input_ctrl=self.input_driver, frame=frame_bgr)
                             # Hold after the skill tick so a click inside it cannot release the button.
-                            self._sync_combat_right_button(bool(has_bar))
+                            self._sync_combat_right_button(bool(route_bar))
                         else:
                             # In ROUTE_MODE ("TOPLAMA") when route.fight_back=False, strictly suppress combat skills and fight_back (no SKILL KEY leak)
                             self._sync_combat_right_button(False)
+                    # Doğrulanmış savaş rotayı askıya aldı: active_node
+                    # korunur; savaş bitince rota kendiliğinden devam eder.
+                    self._route_fight_suspended = True
                     return True
 
+                if confirmed:
+                    # Histerezis: sinyal doğrulandı ama bayrak yeni
+                    # temizlendi — FIGHTING'e girme; rotayı da iptal etme
+                    # (False dön, route step yürümeye devam etsin).
+                    self._sync_combat_right_button(False)
+                    return False
+
                 self._sync_combat_right_button(False)
-                if self._confirmed_fight_ended(has_bar, hp_dropped):
+                if self._confirmed_fight_ended(route_bar, hp_dropped):
                     self._loot_confirmed_fight()
-                else:
-                    # No target bar and no HP drop. A stuck combat flag must not hold the route.
+                elif not route_bar and not hp_dropped:
+                    # Hiç sinyal yok (ne hedef barı ne HP düşüşü): takılı
+                    # savaş bayrağı rotayı tutmasın diye temizlenir.
                     self._clear_route_combat()
+                # Sinyal var ama henüz doğrulanmadı: hiçbir şey
+                # temizlenmez — _route_bar_streak / _route_hp_streak
+                # biriksin diye korunur, yoksa doğrulama eşiğine
+                # (route_fight_confirm_frames) asla ulaşılamaz.
+                # False dönülür, rota yürümeye devam eder.
             else:
+                # F-0194: potions are survival, not fight-back. Check them
+                # even when counter-attack is disabled.
+                try:
+                    _atk2: Any = False
+                    if hasattr(self.combat_recovery, "check_under_attack"):
+                        if frame_bgr is not None:
+                            _atk2 = self.combat_recovery.check_under_attack(frame_bgr)
+                        else:
+                            _atk2 = self.combat_recovery.check_under_attack()
+                    _u2, _hp2 = self._parse_attack_result(_atk2)
+                    if _hp2 is not None and _hp2 > 0.01:
+                        self._check_and_trigger_auto_potions(
+                            _hp2, self._route_mp_ratio_from_cognition(), frame_bgr
+                        )
+                except Exception:
+                    pass
                 self._sync_combat_right_button(False)
                 self._clear_route_combat()
         except Exception as exc:
@@ -3744,12 +5569,29 @@ class BotWorker(QThread):
         3. Chat feedback for 'inventory full' or 'envanter dolu'
         """
         # 1. Behavioral guard check
+        # S005 (v19/P3-8): prompt görünürlüğü önceden sabit `True`
+        # varsayılıyordu — görünmeyen prompt için de 10 sn sayacı
+        # başlıyor, envanter dolu değilken bile bot durabiliyordu.
+        # Görünürlük VisionEngine.detect_gather_prompt ile ölçülür;
+        # ölçülemiyorsa False verilir (sayaç sıfırlanır, uydurma sinyal yok).
         node_id = self._extract_node_id(self.active_node)
+        prompt_visible = False
+        _vision_probe = self._plain_attr("vision")
+        if _vision_probe is not None and hasattr(_vision_probe, "detect_gather_prompt"):
+            try:
+                if frame_bgr is None:
+                    frame_bgr = self.__dict__.get("_last_color_frame")
+                if frame_bgr is None:
+                    frame_bgr = self._grab_frame(grayscale=False)
+                if frame_bgr is not None:
+                    prompt_visible = bool(_vision_probe.detect_gather_prompt(frame_bgr)[0])
+            except Exception as exc:
+                logger.debug("Gather prompt visibility probe error: %s", exc)
         guard = self._plain_attr("behavioral_guard")
         if guard is not None and hasattr(guard, "check_prompt_stuck"):
             try:
                 is_stuck, stuck_msg = guard.check_prompt_stuck(
-                    True,
+                    prompt_visible,
                     current_node_id=node_id if isinstance(node_id, int) else None,
                     max_stuck_sec=10.0,
                 )
@@ -3784,12 +5626,11 @@ class BotWorker(QThread):
                     frame_bgr = self.__dict__.get("_last_color_frame")
                 if frame_bgr is None:
                     frame_bgr = self._grab_frame(grayscale=False)
-                if frame_bgr is None:
-                    frame_bgr = np.zeros((100, 100, 3), dtype=np.uint8)
-                if frame_bgr is not None:
-                    fb = hud_reader.parse_chat_feedback_fast(frame_bgr)
-                    if isinstance(fb, dict) and (fb.get("inventory_full") or fb.get("cube_full")):
-                        return True, "Envanter dolu (Chat feedback: Inventory full)"
+                # F-0506: no fabricated black frame. parse_chat_feedback_fast
+                # accepts None, so the check still runs without a frame.
+                fb = hud_reader.parse_chat_feedback_fast(frame_bgr)
+                if isinstance(fb, dict) and (fb.get("inventory_full") or fb.get("cube_full")):
+                    return True, "Envanter dolu (Chat feedback: Inventory full)"
             except Exception as exc:
                 logger.debug("Chat feedback inventory error: %s", exc)
 
@@ -3806,10 +5647,18 @@ class BotWorker(QThread):
             try:
                 if frame_bgr is None:
                     frame_bgr = self.__dict__.get("_last_color_frame")
+                    # O6: önbellek kare bayatsa (1 sn'den eski) onunla cast
+                    # kararı verilmez — taze kare çekilir.
+                    frame_ts = float(self.__dict__.get("_last_color_frame_ts", 0.0) or 0.0)
+                    if frame_bgr is not None and frame_ts > 0.0 and (time.time() - frame_ts) > 1.0:
+                        fresh = self._grab_frame(grayscale=False)
+                        if fresh is not None:
+                            frame_bgr = fresh
                 if frame_bgr is None:
                     frame_bgr = self._grab_frame(grayscale=False)
                 if frame_bgr is None:
-                    frame_bgr = np.zeros((100, 100, 3), dtype=np.uint8)
+                    # F-0506: no frame -> no cast bar, not a black square.
+                    return False, 0.0
 
                 if frame_bgr is not None and hasattr(hud_reader, "verify_gather_cast_bar"):
                     is_pres, pct = hud_reader.verify_gather_cast_bar(frame_bgr)
@@ -3842,18 +5691,23 @@ class BotWorker(QThread):
         # 1. Check for inventory full or prompt stuck
         is_full, full_reason = self._check_inventory_full()
         if is_full:
-            panic = self._plain_attr("panic_system")
-            if panic is not None and hasattr(panic, "trigger_panic"):
-                try:
-                    panic.trigger_panic("INVENTORY_FULL_OR_PROMPT_STUCK", full_reason, input_ctrl=self.input_driver)
-                except Exception:
-                    pass
+            # F-0049: a full inventory / stuck prompt is a routine pause, not a
+            # security panic. trigger_panic() halts inputs with no unlock path
+            # in this worker, so it must never fire here — pause only.
+            self._emit_log(f"Inventory full / prompt stuck: {full_reason}")
             self.pause(full_reason)
             return
 
         # 2. Selective gathering check: bypass if unselected
         if not self._is_gathering_active and self._should_bypass_unselected_gather():
+            # F-0383: leaving active_node set makes the next tick bypass the
+            # same node again forever and pollutes the fail counters. Clear
+            # it so the selector can move on (it returns None when no
+            # selected material is ready).
             self._emit_log(f"Node {node_id or 'unselected'} bypassed: material does not match selective gather")
+            self.active_node = None
+            self._is_gathering_active = False
+            self._current_node_harvest_stage = 0
             return
 
         # 3. Halt player movement so character stands still for interaction
@@ -3865,12 +5719,17 @@ class BotWorker(QThread):
         if not self._is_gathering_active:
             self._release_all_combat_inputs()
             self._is_gathering_active = True
-            max_h = int(self._get_node_field(self.active_node, "max_harvests", 3) or 3)
+            # W54/v19: yeni hasat oturumu — onceki oturumdan kalma
+            # saldiri damgasi yeni dugumde erken savasa sapmasin.
+            self._gather_under_attack_since = 0.0
+            max_h = self._configured_max_harvests(self.active_node)
             self._target_harvests_for_active_node = max_h
             self._current_node_harvest_stage = 0
             self._current_node_stage_retries = 0
             self._stage_cast_in_progress = False
             self._waiting_for_next_stage_prompt = False
+            self._reset_cast_progress_tracking()
+            self._emit_harvest_stage()
             self._emit_log(f"Gather prompt found ({conf}%) · Stage 1/{max_h}")
 
             # Human visual reaction delay before initial interaction
@@ -3897,23 +5756,59 @@ class BotWorker(QThread):
                 )
                 return
             else:
-                # Delay elapsed: ready for next stage interaction
+                # Delay elapsed: prompt'u TEKRAR doğrula — aşama-arası F
+                # zaman-güdümlü kör basılmaz (Y4). Prompt yoksa ve süre
+                # dolduysa node erken tükendi sayılır; süre dolmadıysa
+                # beklemeye devam edilir.
                 self._waiting_for_next_stage_prompt = False
                 self._last_f_press_time = 0.0
+                redetected, _rconf = self._detect_gather_prompt()
+                if not redetected:
+                    deadline = float(
+                        self._plain_attr("_post_harvest_prompt_deadline", 0.0) or 0.0
+                    )
+                    if deadline <= 0.0 or now > deadline:
+                        self._emit_log(
+                            f"Node {node_id} next-stage prompt gone "
+                            f"({self._current_node_harvest_stage}/{self._target_harvests_for_active_node}) · node depleted early"
+                        )
+                        self._complete_route_gathering(now, depleted=True)
+                        return
+                    self._waiting_for_next_stage_prompt = True
+                    self._inter_harvest_wait_until = min(deadline, now + 0.3)
+                    self._emit_hud_snapshot(
+                        badge=BotState.GATHERING.value,
+                        title=f"Gathering node {node_id} ({current_stage_display}/{target_h})",
+                        subtitle="Waiting for next-stage prompt...",
+                    )
+                    return
 
         # 5. Check if casting is in progress (Progress bar monitoring)
         if self._stage_cast_in_progress:
             is_cast_bar, progress_pct = self._check_gather_cast_progress()
+            if is_cast_bar:
+                self._stage_cast_bar_seen = True
+                self._observe_cast_progress(progress_pct)
             cast_dur = float(self._get_cfg("gather_cast_duration_sec", 3.0) or 3.0)
             elapsed_cast = now - self._stage_cast_start_time
 
             # Cast completion detection
+            # Y2/Y3: aşama, barın İLERLEDİĞİ kanıtlanmadan bitmez. Tek
+            # karede %90 görmek yetmez — üst hedef barı dolu başlayan
+            # statik bir bar da %90 görünür. İlerleme kanıtı: ardışık
+            # okumalarda yükselme (_stage_cast_rose). Bar hiç yükselmeden
+            # %90'da takılırsa aşama sayılmaz; süre dolunca retry/abandon
+            # yoluna düşer (F-0050). CANLI NOT: gerçek cast barı oyunda
+            # dolu başlayıp hiç yükselmiyorsa bu kapı aşamaları hep
+            # abandon eder — PC karesiyle hangi barın gerçek cast barı
+            # olduğu doğrulanmalı (açık soru).
             cast_finished = False
             if is_cast_bar:
-                if progress_pct >= 90.0:
+                if progress_pct >= 90.0 and bool(self._plain_attr("_stage_cast_rose", False)):
                     cast_finished = True
                 else:
                     # Still actively filling progress bar: update HUD and DO NOT press F!
+                    # (%90 ama yükselme yoksa da burada beklenir — sayılmaz.)
                     self._emit_hud_snapshot(
                         badge=BotState.GATHERING.value,
                         title=f"Gathering node {node_id} ({current_stage_display}/{target_h}) · {int(progress_pct)}%",
@@ -3922,8 +5817,35 @@ class BotWorker(QThread):
                     return
             else:
                 # Cast bar not present on this frame:
-                if test_mode or elapsed_cast >= cast_dur:
+                # F-0050: a timeout alone is NOT a successful cast. If the bar
+                # was never seen, F probably missed — retry the press instead
+                # of counting a harvest that never happened.
+                if test_mode:
                     cast_finished = True
+                elif (
+                    elapsed_cast >= cast_dur
+                    and bool(self._plain_attr("_stage_cast_bar_seen", False))
+                    and bool(self._plain_attr("_stage_cast_rose", False))
+                ):
+                    cast_finished = True
+                elif elapsed_cast >= cast_dur:
+                    self._current_node_stage_retries += 1
+                    # F-23-05: şema varsayılanı 2 (config/schema.py).
+                    max_retries = int(self._get_cfg("max_retries_per_harvest_stage", 2) or 2)
+                    if self._current_node_stage_retries > max_retries:
+                        self._emit_log(
+                            f"Cast bar never appeared on node {node_id}: abandoning stage"
+                        )
+                        self._complete_route_gathering(now, depleted=False)
+                        return
+                    self._emit_log(
+                        f"Cast bar never appeared on node {node_id}: retrying F "
+                        f"({self._current_node_stage_retries}/{max_retries})"
+                    )
+                    self._stage_cast_in_progress = False
+                    self._stage_cast_bar_seen = False
+                    self._last_f_press_time = 0.0
+                    return
                 else:
                     # Still within expected cast time window
                     self._emit_hud_snapshot(
@@ -3942,6 +5864,8 @@ class BotWorker(QThread):
         if now - self._last_f_press_time >= self._next_f_interval:
             self._press_gather_key()
             self._stage_cast_in_progress = True
+            self._stage_cast_bar_seen = False
+            self._reset_cast_progress_tracking()
             self._stage_cast_start_time = time.time()
             self._last_f_press_time = time.time()
             self._next_f_interval = self._sample_f_interval()
@@ -3969,36 +5893,47 @@ class BotWorker(QThread):
                 frame_bgr = self._grab_frame(grayscale=False)
                 if frame_bgr is None:
                     frame_bgr = self.__dict__.get("_last_color_frame")
-                if frame_bgr is None:
-                    frame_bgr = np.zeros((100, 100, 3), dtype=np.uint8)
-                if frame_bgr is not None:
-                    fb = self.hud_reader.parse_chat_feedback_fast(frame_bgr)
-                    if isinstance(fb, dict) and fb.get("extraction_failed"):
-                        max_retries = int(self._get_cfg("max_retries_per_harvest_stage", 3) or 3)
-                        self._current_node_stage_retries += 1
-                        if self._current_node_stage_retries <= max_retries:
-                            self._emit_log(
-                                f"Essence Extraction failed on node {node_id}: retrying stage "
-                                f"{self._current_node_harvest_stage + 1}/{max_h} "
-                                f"({self._current_node_stage_retries}/{max_retries})"
-                            )
-                            self._stage_cast_in_progress = False
-                            self._last_f_press_time = 0.0
-                            return
-                        else:
-                            self._emit_log(f"Max extraction retries exceeded on node {node_id}")
-                            self._complete_route_gathering(now, depleted=True)
-                            return
+                # F-0506: no fabricated black frame. parse_chat_feedback_fast
+                # accepts None (real reader returns empty; mocks read their
+                # own flags), so the check still runs without a frame.
+                fb = self.hud_reader.parse_chat_feedback_fast(frame_bgr)
+                if isinstance(fb, dict) and fb.get("extraction_failed"):
+                    # F-23-05: şema varsayılanı 2 (config/schema.py).
+                    max_retries = int(self._get_cfg("max_retries_per_harvest_stage", 2) or 2)
+                    # O4: retry_on_extraction_fail ayarı artık okunur — false
+                    # ise başarısız extraction'da retry yapılmaz.
+                    retry_allowed = bool(self._get_cfg("retry_on_extraction_fail", True))
+                    self._current_node_stage_retries += 1
+                    if retry_allowed and self._current_node_stage_retries <= max_retries:
+                        self._emit_log(
+                            f"Essence Extraction failed on node {node_id}: retrying stage "
+                            f"{self._current_node_harvest_stage + 1}/{max_h} "
+                            f"({self._current_node_stage_retries}/{max_retries})"
+                        )
+                        self._stage_cast_in_progress = False
+                        self._last_f_press_time = 0.0
+                        return
+                    else:
+                        reason = (
+                            "Essence Extraction failed, retry disabled (retry_on_extraction_fail=false)"
+                            if not retry_allowed
+                            else "Max extraction retries exceeded"
+                        )
+                        self._emit_log(f"{reason} on node {node_id}")
+                        self._complete_route_gathering(now, depleted=True)
+                        return
             except Exception as fb_exc:
                 logger.debug("Chat feedback check error: %s", fb_exc)
 
         # Successful harvest stage!
         self._current_node_harvest_stage += 1
         self._current_node_stage_retries = 0
+        self._emit_harvest_stage()
         self.gathered_count += 1
         self.failed_in_row = 0
         self._last_gather_time = now
-        rtype = self._get_node_field(self.active_node, "resource_type", "Orichalcum Ore") or "Orichalcum Ore"
+        # O1: materyal bilinmiyorsa "Orichalcum Ore" uydurulmaz — Unknown.
+        rtype = self._get_node_field(self.active_node, "resource_type", "Unknown") or "Unknown"
         rest_min = float(self._get_cfg("rest_minutes", 5) or 5)
 
         # Trigger Self-Training YOLO Dataset Factory (Time Machine t - 2.0s capture)
@@ -4014,7 +5949,15 @@ class BotWorker(QThread):
 
         if self.route_manager is not None and hasattr(self.route_manager, "record_harvest_stage") and node_id is not None:
             try:
-                self.route_manager.record_harvest_stage(node_id, rest_duration_sec=int(rest_min * 60))
+                # F-0051: the real signature takes rest_minutes. Older
+                # callers/mocks still use rest_duration_sec — fall back to
+                # it on TypeError instead of silently swallowing the call.
+                try:
+                    self.route_manager.record_harvest_stage(node_id, rest_minutes=float(rest_min))
+                except TypeError:
+                    self.route_manager.record_harvest_stage(
+                        node_id, rest_duration_sec=int(rest_min * 60)
+                    )
             except Exception:
                 pass
 
@@ -4026,8 +5969,9 @@ class BotWorker(QThread):
             # Prepare for next harvest stage in the 3x cycle
             self._stage_cast_in_progress = False
             self._waiting_for_next_stage_prompt = True
-            delay_min = float(self._get_cfg("inter_harvest_delay_min", 0.4) or 0.4)
-            delay_max = float(self._get_cfg("inter_harvest_delay_max", 1.2) or 1.2)
+            # F-23-05: şema varsayılanı 0.6/1.4 (config/schema.py).
+            delay_min = float(self._get_cfg("inter_harvest_delay_min", 0.6) or 0.6)
+            delay_max = float(self._get_cfg("inter_harvest_delay_max", 1.4) or 1.4)
             if delay_max < delay_min:
                 delay_max = delay_min
             inter_delay = 0.05 if test_mode else random.uniform(delay_min, delay_max)
@@ -4074,28 +6018,61 @@ class BotWorker(QThread):
             return
 
         walk_dur = max(0.0, now - self._walk_start_time) if self._walk_start_time > 0 else 0.0
+        completed_stages = int(self._current_node_harvest_stage)
         self._is_gathering_active = False
         self._stage_cast_in_progress = False
         self._waiting_for_next_stage_prompt = False
+        # W54/v19: oturum bitti — saldiri damgasi temizlenir.
+        self._gather_under_attack_since = 0.0
         self._current_node_harvest_stage = 0
         self._current_node_stage_retries = 0
         self._gather_lost_frames = 0
 
         rest_min = float(self._get_cfg("rest_minutes", 5) or 5)
-        rtype = self._get_node_field(self.active_node, "resource_type", "Orichalcum Ore") or "Orichalcum Ore"
+        # O1: materyal bilinmiyorsa "Orichalcum Ore" uydurulmaz — Unknown.
+        rtype = self._get_node_field(self.active_node, "resource_type", "Unknown") or "Unknown"
+        # Y5: 0 aşamayla biten toplama "toplandı" sayılmaz — ne node
+        # dinlendirilir ne telemetri/ekonomi/respawn/alt kayda girer.
+        gathered_any = completed_stages > 0
 
         if node_id is not None:
-            self._mark_node_gathered(node_id, rest_min)
-            self._emit_log(f"Node {node_id} gathered (resting {int(rest_min)}m)")
+            if depleted and gathered_any:
+                # F-0385: gathered_count counts STAGES (1/3, 2/3, 3/3);
+                # telemetry/economy count NODES. Track nodes separately so
+                # the two are never confused again.
+                self._gathered_nodes_count = int(getattr(self, "_gathered_nodes_count", 0) or 0) + 1
+                self._mark_node_gathered(node_id, rest_min)
+                self._emit_log(f"Node {node_id} gathered (resting {int(rest_min)}m)")
+            elif depleted:
+                self._emit_log(
+                    f"Node {node_id} depleted early with 0 stages — not rested, not counted"
+                )
+            else:
+                # F-0050 abandon: no harvest happened, so the node must not
+                # be rested as if it were gathered.
+                self._emit_log(f"Node {node_id} abandoned without harvest (not rested)")
         else:
-            self._emit_log(f"Resource gathered (#{self.gathered_count})")
+            if gathered_any:
+                self._emit_log(f"Resource gathered (#{self.gathered_count})")
+            else:
+                self._emit_log("Gather ended with 0 stages — not counted")
 
-        if self.telemetry is not None and hasattr(self.telemetry, "record_gather"):
+        if gathered_any and self.telemetry is not None and hasattr(self.telemetry, "record_gather"):
             try:
-                reg = getattr(self.route_manager, "active_region", "Altgard") or "Altgard"
-                rt = getattr(self.route_manager, "active_route", "All") or "All"
+                reg = getattr(self.route_manager, "active_region", None) or "unknown"
+                rt = getattr(self.route_manager, "active_route", None) or "All"
+                # P1-6 (K-06): node_id bilinmiyorsa 0 (bilinmeyen düğüm)
+                # gönderilir. Eskiden yedek değer `self.gathered_count`
+                # idi — o bir AŞAMA sayacıdır (F-0385: 1/3, 2/3, 3/3),
+                # düğüm kimliği değildir; telemetriye düğüm diye aşama
+                # sayısı yazılıyordu. Düğüm sayısı (`_gathered_nodes_count`)
+                # da kimlik değildir, o yüzden yedek olarak kullanılmaz.
+                try:
+                    tel_node_id = int(node_id) if node_id is not None else 0
+                except (TypeError, ValueError):
+                    tel_node_id = 0
                 self.telemetry.record_gather(
-                    node_id=int(node_id) if isinstance(node_id, int) else self.gathered_count,
+                    node_id=tel_node_id,
                     region=str(reg),
                     route=str(rt),
                     resource_type=str(rtype),
@@ -4103,33 +6080,62 @@ class BotWorker(QThread):
                     match_pct=self.last_prompt_match,
                 )
             except Exception as tel_exc:
-                logger.debug("Telemetry record_gather error: %s", tel_exc)
+                # Y-5: kayıt hatası debug'da kaybolmasın — toplanan aşama
+                # telemetriye yazılamadıysa görünür olmalı.
+                logger.warning("Telemetry record_gather error: %s", tel_exc)
 
         # Enterprise Economy Calculator, Respawn Predictor & Multi-Character Quota Tracking
+        if not gathered_any:
+            self._emit_harvest_stage()
+            if depleted:
+                self.active_node = None
+                self._walk_start_time = 0.0
+            return
         eco = getattr(self, "economy_calculator", None)
         if eco is not None and hasattr(eco, "record_gather"):
             try:
                 eco.record_gather(str(rtype), count=1)
             except Exception as eco_exc:
-                logger.debug("Economy calculator record_gather skipped: %s", eco_exc)
+                logger.warning("Economy calculator record_gather skipped: %s", eco_exc)
 
         respawn = getattr(self, "respawn_predictor", None)
         if respawn is not None and node_id is not None and hasattr(respawn, "record_gather"):
             try:
                 respawn.record_gather(int(node_id))
             except Exception as rsp_exc:
-                logger.debug("Respawn predictor record_gather skipped: %s", rsp_exc)
+                logger.warning("Respawn predictor record_gather skipped: %s", rsp_exc)
 
         alt_mgr = getattr(self, "alt_char_mgr", None)
         if alt_mgr is not None and hasattr(alt_mgr, "record_gather"):
             try:
                 alt_mgr.record_gather(count=1)
             except Exception as alt_exc:
-                logger.debug("Alt character record_gather skipped: %s", alt_exc)
+                logger.warning("Alt character record_gather skipped: %s", alt_exc)
 
+        self._emit_harvest_stage()
         if depleted:
             self.active_node = None
             self._walk_start_time = 0.0
+
+    def _drop_node_on_walk_refusal(self, node_id: Any, reason: str) -> None:
+        """Yürüme komutu reddedildiğinde düğümü bırakır (16/15).
+
+        Geçici durumlarda (pause, sürücü yok) failure sayılmaz — yoksa
+        sürücüsüz her tick tüm düğümleri fail eder. Gerçek rette failure
+        sayılır ki sessiz seçim-haritalama döngüsüne girilmesin ve 10-fail
+        koruması devreye girebilsin. (A grubunun _register_node_failure
+        içindeki record_failure çağrısı da burada tetiklenir — aynı olay
+        için tek kayıt, çift sayım yok.)
+        """
+        self._emit_log(f"Node {node_id} dropped: {reason}")
+        if self.is_paused or self.input_driver is None:
+            self.active_node = None
+            self._walk_start_time = 0.0
+            return
+        self._mark_node_failed(node_id)
+        self._register_node_failure()
+        self.active_node = None
+        self._walk_start_time = 0.0
 
     def _select_and_navigate_next_node(self) -> None:
         """Finds the next ready node, opens the map, clicks the node, and transitions to WALKING."""
@@ -4151,16 +6157,36 @@ class BotWorker(QThread):
         if next_node is None:
             self._set_state_internal(BotState.WAITING.value)
             ready_cnt, resting_cnt = self._get_ready_and_resting_counts()
+            # F-0507: in selective mode a ready node may exist that simply
+            # does not match the selected materials — "all resting" would lie.
+            subtitle = f"All {resting_cnt} route nodes are currently resting"
+            if getattr(self, "selective_gather_enabled", False):
+                try:
+                    _nodes = []
+                    if self.route_manager is not None and hasattr(
+                        self.route_manager, "get_route_nodes"
+                    ):
+                        _nodes = self.route_manager.get_route_nodes() or []
+                    if any(
+                        self._is_node_ready_local(n, int(rest_min * 60))
+                        and not self.is_material_selected_for_gather(n)
+                        for n in _nodes
+                    ):
+                        subtitle = "Ready nodes exist but none match the selected materials"
+                except Exception:
+                    pass
             self._emit_hud_snapshot(
                 badge=BotState.WAITING.value,
                 title="Waiting for ready nodes",
-                subtitle=f"All {resting_cnt} route nodes are currently resting",
+                subtitle=subtitle,
             )
             self.msleep(500)
             return
 
         self.active_node = next_node
         node_id = self._extract_node_id(next_node)
+        # v20-loop: yeni yürüyüşte mesafe-tazelik bayrağı sıfırlanır.
+        self._walk_distance_ever_fresh = False
 
         nav_ok, dist_m, under_overlay = self._open_map_and_click_node(next_node)
         if under_overlay:
@@ -4182,25 +6208,29 @@ class BotWorker(QThread):
                     and not self.is_paused
                     and self._command_walk_toward(next_node)
                 ):
-                    self.active_node_distance_m = max(1, int(dist_m or 1))
+                    # F-0052: dist_m is 0 when the map never opened. A fake
+                    # 1 m makes _monitor_walking_to_node treat the node as
+                    # arrived and fail it after 1.5 s. Unknown stays 0 (the
+                    # monitor reads 0 as 999 m via `or 999`).
+                    self._set_active_node_distance(dist_m)
                     self._walk_start_time = time.time()
                     self._last_reclick_time = time.time()
                     self._set_state_internal(BotState.WALKING.value)
                     self._emit_hud_snapshot(
                         badge=BotState.WALKING.value,
-                        title=f"Walking to node {node_id} · {self.active_node_distance_m} m",
+                        title=f"Walking to node {node_id} · distance unknown (map closed)",
                         subtitle="On arrival: F, or a click on the gathering icon",
                     )
                 return
             self._emit_log(f"Could not locate node {node_id} on map")
             if self._command_walk_toward(next_node):
-                self.active_node_distance_m = max(1, int(dist_m or 1))
+                self._set_active_node_distance(dist_m)
                 self._walk_start_time = time.time()
                 self._last_reclick_time = time.time()
                 self._set_state_internal(BotState.WALKING.value)
                 self._emit_hud_snapshot(
                     badge=BotState.WALKING.value,
-                    title=f"Walking to node {node_id} · {self.active_node_distance_m} m",
+                    title=f"Walking to node {node_id} · distance unknown (map closed)",
                     subtitle="On arrival: F, or a click on the gathering icon",
                 )
                 return
@@ -4209,11 +6239,13 @@ class BotWorker(QThread):
             self.active_node = None
             return
 
-        self.active_node_distance_m = dist_m
+        self._set_active_node_distance(dist_m)
         self._walk_start_time = time.time()
         self._last_reclick_time = time.time()
         if not self._command_walk_toward(next_node):
-            self.active_node = None
+            # 16/15: yürüme komutu reddedildiyse düğüm sessizce düşürülmez
+            # — failure sayılır (geçici durumdaysa: pause/sürücü yoksa sayılmaz).
+            self._drop_node_on_walk_refusal(node_id, "walk command refused after map click")
             return
         self._set_state_internal(BotState.WALKING.value)
         self._emit_log(f"Route: going to node {node_id} ({dist_m} m)")
@@ -4238,17 +6270,10 @@ class BotWorker(QThread):
                     return float(carto.map_x), float(carto.map_y)
             except Exception:
                 pass
-        act = self._plain_attr("active_node")
-        if act is not None:
-            try:
-                nx = float(self._get_node_field(act, "map_x", 0.0) or 0.0)
-                ny = float(self._get_node_field(act, "map_y", 0.0) or 0.0)
-                dist = float(self._plain_attr("active_node_distance_m", 0.0) or 0.0)
-                elapsed = max(0.0, time.time() - float(self._plain_attr("_walk_start_time", 0.0) or 0.0))
-                # Dead reckoning position shifts smoothly as walking time progresses
-                return round(nx - dist + elapsed * 1.5, 1), round(ny - dist + elapsed * 1.5, 1)
-            except Exception:
-                pass
+        # F-0386: with no cartographer/odometry there is NO known player
+        # position. The old formula invented one from the node coords
+        # (same +elapsed*1.5 on both axes). Return "unknown" (0, 0); callers
+        # already treat (0, 0) as "no position".
         return 0.0, 0.0
 
     def _execute_unstick_maneuver(self) -> None:
@@ -4286,6 +6311,182 @@ class BotWorker(QThread):
         except Exception as exc:
             logger.debug("Unstick maneuver error: %s", exc)
 
+    def _run_corridor_navigation_step(self, now: float) -> bool:
+        """F-0075: CorridorNavigator.step_navigation tick bağlantısı.
+
+        WALKING tick'inde en fazla ``corridor_nav_step_sec`` (varsayılan
+        2 sn) sıklıkla çalışır: uçurum filtresi / contested kilidi aktif
+        düğümü dışlıyorsa sıradaki düğüme geçilir, takılma manevrası ve
+        koridor değerlendirmesi çalışır. Düğüm değiştiyse / düştüyse True
+        döner (bu tick burada biter); aksi hâlde False.
+        """
+        nav = self.__dict__.get("corridor_navigator")
+        if nav is None or self.active_node is None:
+            return False
+        if bool(self._get_cfg("test_mode", False)):
+            return False
+        try:
+            motion_stop = self._motion_should_stop()
+        except Exception:
+            # __init__ atlanmış iskelette (test) belirlenemez — fail-closed.
+            return False
+        if motion_stop:
+            return False
+        try:
+            interval = float(self._get_cfg("corridor_nav_step_sec", 2.0) or 2.0)
+        except (TypeError, ValueError):
+            interval = 2.0
+        last = float(self.__dict__.get("_last_corridor_nav_step_ts", 0.0) or 0.0)
+        if interval > 0 and (now - last) < interval:
+            return False
+        self._last_corridor_nav_step_ts = now
+        try:
+            nodes: list = []
+            route_mgr = self.__dict__.get("route_manager")
+            if route_mgr is not None and hasattr(route_mgr, "get_route_nodes"):
+                try:
+                    nodes = list(route_mgr.get_route_nodes() or [])
+                except Exception:
+                    nodes = []
+            active_id = self._extract_node_id(self.active_node)
+            seq_pos = int(self.__dict__.get("_current_seq_pos", 0) or 0)
+            if nodes:
+                matches = [
+                    i
+                    for i, n in enumerate(nodes)
+                    if self._extract_node_id(n) == active_id
+                ]
+                if matches:
+                    seq_pos = matches[0]
+                else:
+                    nodes = [self.active_node]
+                    seq_pos = 0
+            else:
+                nodes = [self.active_node]
+                seq_pos = 0
+            coords_x, coords_y = self._get_player_movement_coords()
+            player_pos = (
+                (coords_x, coords_y)
+                if (coords_x != 0.0 or coords_y != 0.0)
+                else None
+            )
+            # Kare önbellekten alınır (taze kare yoksa kare gerektiren
+            # dallar atlanır; uçurum + kilitli-contested + prewalk yine
+            # çalışır) — her 2 sn'de ek ekran yakalama yapılmaz.
+            result = nav.step_navigation(
+                frame=self.__dict__.get("_last_color_frame"),
+                nodes=nodes,
+                current_seq_pos=seq_pos,
+                player_pos=player_pos,
+                is_walking=True,
+                input_controller=self.input_driver,
+                now=now,
+            )
+            if not isinstance(result, dict):
+                return False
+            if result.get("unstuck_triggered"):
+                # Çift kurtulma manevrası olmasın: monitörün kendi
+                # takılma saatleri sıfırlanır.
+                self._stuck_coords_ts = now
+                self._stuck_dist_decrease_ts = now
+            status = str(result.get("status") or "")
+            if status in (
+                "cliff_skipped",
+                "contested_skipped",
+                "node_no_coordinates",
+            ) or result.get("repath_requested"):
+                selected = result.get("selected_node")
+                if selected is None:
+                    self._emit_log(
+                        f"CorridorNavigator: node {active_id} atlandı ({status}), sıradaki düğüm yok"
+                    )
+                    self._mark_node_failed(active_id)
+                    self._register_node_failure()
+                    self.active_node = None
+                    self._walk_start_time = 0.0
+                    self._arrival_at_node_ts = 0.0
+                    return True
+                if self._extract_node_id(selected) != active_id:
+                    self._emit_log(
+                        f"CorridorNavigator: node {active_id} -> {self._extract_node_id(selected)} ({status})"
+                    )
+                    self.active_node = selected
+                    self._walk_start_time = now
+                    self._last_reclick_time = now
+                    self._arrival_at_node_ts = 0.0
+                    self._set_active_node_distance(0)
+                    return True
+            return False
+        except Exception as exc:
+            logger.debug("CorridorNavigator step skipped: %s", exc)
+            return False
+
+    def _maybe_run_economy_cycle(self, now: float) -> None:
+        """F-0088: periyodik ekonomi turu (tek giriş: run_economy_cycle).
+
+        Yalnızca rota modunda, düğümsüz tick'te ve en fazla
+        ``economy_cycle_sec`` (varsayılan 600 sn) sıklıkla çalışır:
+        pazar tarama (karede broker penceresi açıksa) -> en kârlı rota
+        seçimi -> üretim kuyruğu. Rota değişimi yürüyüş ortasında
+        yapılmaz; düğüm seçimi turdan sonra geldiği için yeni rota
+        bir sonraki seçimde devreye girer.
+        """
+        if getattr(self, "is_paused", False):
+            return
+        try:
+            if self._motion_should_stop():
+                return
+        except Exception:
+            # __init__ atlanmış iskelette (test) belirlenemez — fail-closed.
+            return
+        broker_scanner = self.__dict__.get("broker_scanner")
+        crafting_controller = self.__dict__.get("crafting_controller")
+        route_mgr = self.__dict__.get("route_manager")
+        if (
+            broker_scanner is None
+            and crafting_controller is None
+            and route_mgr is None
+        ):
+            return
+        try:
+            interval = float(self._get_cfg("economy_cycle_sec", 600) or 600)
+        except (TypeError, ValueError):
+            interval = 600.0
+        if interval <= 0:
+            return
+        last = float(self.__dict__.get("_last_economy_cycle_ts", 0.0) or 0.0)
+        if (now - last) < interval:
+            return
+        self._last_economy_cycle_ts = now
+        try:
+            from core.economy_broker import run_economy_cycle
+        except Exception as exc:
+            logger.debug("Economy cycle import skipped: %s", exc)
+            return
+        try:
+            region = None
+            if route_mgr is not None:
+                region = getattr(route_mgr, "active_region", None)
+            result = run_economy_cycle(
+                scanner=broker_scanner,
+                route_manager=route_mgr,
+                crafting_queue=crafting_controller,
+                input_ctrl=self.input_driver,
+                frame=self.__dict__.get("_last_color_frame"),
+                region=(str(region) if region else None),
+                test_mode=bool(self._get_cfg("test_mode", False)),
+            )
+            route = (result or {}).get("route") or {}
+            crafted = (result or {}).get("crafted_jobs") or []
+            self._emit_log(
+                "Ekonomi turu: rota "
+                f"{route.get('best_region')}/{route.get('best_route')} "
+                f"({route.get('formatted_kinah_per_hour', '0')} Kinah/saat) · "
+                f"{len(crafted)} üretim"
+            )
+        except Exception as exc:
+            logger.debug("Economy cycle skipped: %s", exc)
+
     def _monitor_walking_to_node(self, now: float) -> None:
         """
         Monitors travel towards active_node:
@@ -4304,9 +6505,50 @@ class BotWorker(QThread):
         reclick_sec = float(self._get_cfg("reclick_node_sec", 10) or 0)
         elapsed_walk = now - self._walk_start_time
 
+        # v20-loop: harita açılamadığında mesafeyi odometriden tazele
+        # (kartograf oyuncu konumu ↔ düğüm harita koordinatı). Stall
+        # altında da çalışır — harita/reclick'e bağımlı değildir.
+        self._refresh_node_distance_from_odometry(now)
+        # Yürüyüş boyunca mesafe hiç tazelendi mi? (timeout kararı için.)
+        if self._active_node_distance_fresh(now):
+            self._walk_distance_ever_fresh = True
+
         # Timeout check
         if elapsed_walk >= time_to_reach:
-            self._emit_log(f"Node {node_id} not reached in {int(time_to_reach)}s: skipping")
+            if self._is_opportunistic_node(self.active_node):
+                # Fırsatçı düğüm rota düğümü değildir — failure sayılmaz.
+                self._emit_log(f"Opportunistic node not reached in {int(time_to_reach)}s: dropping")
+                self.active_node = None
+                self._walk_start_time = 0.0
+                self._arrival_at_node_ts = 0.0
+                return
+            # v20-loop: yürüyüş boyunca mesafe HİÇ tazelenmediyse bu
+            # düğüm hatası değil, NAVİGASYON hatasıdır (harita açılmadı /
+            # odometri yok / karakter hiç yürümedi). Düğüm failure
+            # sayılmaz, kara listeye girmez, silinmez — dinlenmeye alınır
+            # ve bir sonraki turda tekrar denenir. Eskiden sessizce fail
+            # sayılıp 3 tekrarda kalıcı siliniyordu (canlı: Node 40/14).
+            if not bool(getattr(self, "_walk_distance_ever_fresh", False)):
+                self._emit_log(
+                    f"⚠️ NAVİGASYON HATASI: Node {node_id} {int(time_to_reach)} sn'de "
+                    "ulaşılamadı, mesafe hiç tazelenmedi — düğüm SİLİNMEDİ, "
+                    "dinlenmeye alındı (harita/odometri kontrol edin)"
+                )
+                logger.warning(
+                    "NAVIGATION FAILURE (no fresh distance) node %s: rested, not failed",
+                    node_id,
+                )
+                self._rest_node_after_nav_failure(node_id)
+                self.active_node = None
+                self._walk_start_time = 0.0
+                self._arrival_at_node_ts = 0.0
+                return
+            stale_note = (
+                " (mesafe hiç tazelenmedi — varış prompt ile doğrulanamadı)"
+                if not self._active_node_distance_fresh(now)
+                else ""
+            )
+            self._emit_log(f"Node {node_id} not reached in {int(time_to_reach)}s: skipping{stale_note}")
             self._mark_node_failed(node_id)
             self._register_node_failure()
             self.active_node = None
@@ -4315,7 +6557,15 @@ class BotWorker(QThread):
             return
 
         # Hedefe varış ve toplanacak kaynak kontrolü
-        curr_dist = float(getattr(self, "active_node_distance_m", 999.0) or 999.0)
+        # 16/2: varış kararı yalnızca TAZE mesafeye bakılır. Bayat mesafe
+        # (reclick başarısızken donan değer) 999 sayılır — prompt kontrolü
+        # (adım 6) zaten varışı prompt ile yakalar.
+        dist_fresh = self._active_node_distance_fresh(now)
+        curr_dist = (
+            float(getattr(self, "active_node_distance_m", 999.0) or 999.0)
+            if dist_fresh
+            else 999.0
+        )
         if curr_dist <= 3.0:
             arr_ts = float(getattr(self, "_arrival_at_node_ts", 0.0) or 0.0)
             if arr_ts <= 0.0:
@@ -4323,6 +6573,11 @@ class BotWorker(QThread):
             elif (now - arr_ts) >= 1.5:
                 # Düğüm noktasına gelindi fakat toplanacak prompt çıkmadı
                 self._emit_log(f"⚠️ Düğüm #{node_id} noktasına gelindi fakat toplanacak kaynak bulunamadı!")
+                if self._is_opportunistic_node(self.active_node):
+                    self.active_node = None
+                    self._walk_start_time = 0.0
+                    self._arrival_at_node_ts = 0.0
+                    return
                 self._mark_node_failed(node_id)
                 self._register_node_failure()
                 self.active_node = None
@@ -4332,12 +6587,19 @@ class BotWorker(QThread):
         else:
             self._arrival_at_node_ts = 0.0
 
+        # F-0075: CorridorNavigator tick bağlantısı (2 sn'de bir). Düğüm
+        # değiştiyse / düştüyse bu tick burada biter.
+        if self._run_corridor_navigation_step(now):
+            return
+
         # Periodic map target refresh (reclick_node_sec). A failed open backs off.
+        # Fırsatçı düğümün harita konumu yoktur — reclick yapılmaz.
         if (
             reclick_sec > 0
             and (now - self._last_reclick_time) >= reclick_sec
             and self._walking_is_real()
             and not self._map_open_in_backoff()
+            and not self._is_opportunistic_node(self.active_node)
         ):
             nav_ok, dist_m, under_overlay = self._open_map_and_click_node(
                 self.active_node, is_reclick=True
@@ -4354,18 +6616,18 @@ class BotWorker(QThread):
                 self.active_node = None
                 return
             if nav_ok:
-                self.active_node_distance_m = dist_m
+                self._set_active_node_distance(dist_m)
                 self._emit_log(f"Route: going to node {node_id} ({dist_m} m)")
         else:
             if self._map_open_in_backoff() and not self._walking_is_real() and not self._command_walk_toward(self.active_node):
-                self.active_node = None
-                self._walk_start_time = 0.0
+                # 16/15: sessiz düşürme yok — ret failure sayılır (geçici
+                # durumdaysa _drop_node_on_walk_refusal saymaz).
+                self._drop_node_on_walk_refusal(node_id, "walk refused while map in backoff")
                 self._release_route_motion()
                 self._set_state_internal(BotState.WAITING.value)
                 return
             if not self._walking_is_real() and not self._command_walk_toward(self.active_node):
-                self.active_node = None
-                self._walk_start_time = 0.0
+                self._drop_node_on_walk_refusal(node_id, "walk refused while not walking")
                 return
             if not self._walking_is_real():
                 self._set_state_internal(BotState.WAITING.value)
@@ -4379,30 +6641,58 @@ class BotWorker(QThread):
                     steer_deg = float(cognition.get("recommended_steer_deg", 0.0))
                     self._apply_active_obstacle_evasion(obs_type, steer_deg, now)
 
-            # Active stuck recovery: if walk distance hasn't decreased over 5s while walking,
-            # execute physical unstick maneuver (release W, tap S, tap Space, wiggle A/D) rather than locking into WAITING.
-            curr_dist = float(self._plain_attr("active_node_distance_m", 0.0) or 0.0)
-            last_check_dist = self._plain_attr("_stuck_last_dist", None)
-            last_decrease_ts = self._plain_attr("_stuck_dist_decrease_ts", None)
-            if (
-                last_decrease_ts is None
-                or last_check_dist is None
-                or self._plain_attr("active_node") != self._plain_attr("_stuck_monitored_node", None)
-            ):
-                self._stuck_monitored_node = self._plain_attr("active_node")
-                self._stuck_last_dist = curr_dist
-                self._stuck_dist_decrease_ts = now
-            elif curr_dist < (last_check_dist - 0.5):
-                self._stuck_last_dist = curr_dist
-                self._stuck_dist_decrease_ts = now
-            elif self._walking_is_real() and (now - last_decrease_ts) >= 5.0:
-                self._execute_unstick_maneuver()
-                self._stuck_dist_decrease_ts = now
-                self._stuck_last_dist = curr_dist
+            # Active stuck recovery (16/1): birincil sinyal oyuncu
+            # koordinat hareketidir — mesafe yalnızca reclick'te (10 sn)
+            # güncellenir, ona bakmak düzgün yürüyüşte ~5 sn'de bir
+            # yanlış unstick patlatırdı. Mesafe dalı yalnızca TAZE
+            # mesafede çalışır; koordinat bilinmiyorsa ve mesafe bayatsa
+            # takılma kararı verilmez (fail-closed: yanlış unstick yok).
+            coords_x, coords_y = self._get_player_movement_coords()
+            coords_known = (coords_x != 0.0 or coords_y != 0.0)
+            stuck_fired = False
+            if coords_known:
+                last_coords = self._plain_attr("_stuck_last_coords", None)
+                last_coords_ts = self._plain_attr("_stuck_coords_ts", None)
+                if (
+                    last_coords_ts is None
+                    or last_coords is None
+                    or self._plain_attr("active_node") != self._plain_attr("_stuck_monitored_node", None)
+                ):
+                    self._stuck_monitored_node = self._plain_attr("active_node")
+                    self._stuck_last_coords = (coords_x, coords_y)
+                    self._stuck_coords_ts = now
+                else:
+                    moved = math.hypot(coords_x - float(last_coords[0]), coords_y - float(last_coords[1]))
+                    if moved > 3.0:
+                        self._stuck_last_coords = (coords_x, coords_y)
+                        self._stuck_coords_ts = now
+                    elif self._walking_is_real() and (now - float(last_coords_ts)) >= 5.0:
+                        self._execute_unstick_maneuver()
+                        self._stuck_coords_ts = now
+                        self._stuck_last_coords = (coords_x, coords_y)
+                        stuck_fired = True
+            if not stuck_fired and self._active_node_distance_fresh(now):
+                curr_dist = float(self._plain_attr("active_node_distance_m", 0.0) or 0.0)
+                last_check_dist = self._plain_attr("_stuck_last_dist", None)
+                last_decrease_ts = self._plain_attr("_stuck_dist_decrease_ts", None)
+                if (
+                    last_decrease_ts is None
+                    or last_check_dist is None
+                    or self._plain_attr("active_node") != self._plain_attr("_stuck_monitored_node", None)
+                ):
+                    self._stuck_monitored_node = self._plain_attr("active_node")
+                    self._stuck_last_dist = curr_dist
+                    self._stuck_dist_decrease_ts = now
+                elif curr_dist < (last_check_dist - 0.5):
+                    self._stuck_last_dist = curr_dist
+                    self._stuck_dist_decrease_ts = now
+                elif self._walking_is_real() and (now - last_decrease_ts) >= 5.0:
+                    self._execute_unstick_maneuver()
+                    self._stuck_dist_decrease_ts = now
+                    self._stuck_last_dist = curr_dist
 
             # ZK: stuck memory with real player movement coordinates / odometry (never constant node_id)
-            coords_x, coords_y = self._get_player_movement_coords()
-            if coords_x != 0.0 or coords_y != 0.0:
+            if coords_known:
                 self._zk_note_stuck_and_avoid(coords_x, coords_y, moving=self._walking_is_real())
             hint = self._plain_attr("_ucb_slot_hint")
             if hint and str(self.mode).lower() in ("combat", "farm"):
@@ -4412,17 +6702,16 @@ class BotWorker(QThread):
             if not self._command_walk_toward(self.active_node):
                 return
 
-            # Estimate decreasing distance smoothly while walking
-            if self.active_node_distance_m > 1 and time_to_reach > 0:
-                progress = min(0.95, elapsed_walk / time_to_reach)
-                est_dist = max(1, int(round(self.active_node_distance_m * (1.0 - progress * 0.35))))
-            else:
-                est_dist = max(1, self.active_node_distance_m)
+            # 16/18: HUD'daki mesafe ölçülendir — geçen süreye göre %35'e
+            # kadar azaltan formül kaldırıldı; operatör gerçek (son
+            # ölçülen) mesafeyi görür, bilinmiyorsa "unknown" yazar.
+            measured_dist = int(getattr(self, "active_node_distance_m", 0) or 0)
+            dist_txt = f"{measured_dist} m" if measured_dist > 0 else "distance unknown"
 
             self._set_state_internal(BotState.WALKING.value)
             self._emit_hud_snapshot(
                 badge=BotState.WALKING.value,
-                title=f"Walking to node {node_id} · {est_dist} m",
+                title=f"Walking to node {node_id} · {dist_txt}",
                 subtitle="On arrival: F, or a click on the gathering icon",
             )
 
@@ -4557,6 +6846,20 @@ class BotWorker(QThread):
     def _register_node_failure(self) -> None:
         """Increments failed_in_row, captures incident snapshot, and triggers wait_min_after_failed cooldown if limit reached."""
         self.failed_in_row += 1
+        # sweep-29 K-2: node başarısızlığı telemetriye yazılır — eskiden
+        # yalnızca incident snapshot alınıyordu; success_rate hep %100,
+        # failed_total hep 0 görünüyordu.
+        try:
+            node_id = self._extract_node_id(self.active_node)
+            _tel = getattr(self, "telemetry", None)
+            if (
+                _tel is not None
+                and hasattr(_tel, "record_failure")
+                and isinstance(node_id, int)
+            ):
+                _tel.record_failure(node_id=node_id, reason="node_failure")
+        except Exception as _tel_exc:
+            logger.warning("Telemetri record_failure hatası: %s", _tel_exc)
         max_failed = int(self._get_cfg("max_failed_in_row", 10) or 10)
         wait_min = float(self._get_cfg("wait_min_after_failed", 5) or 5)
 
@@ -4619,16 +6922,20 @@ class BotWorker(QThread):
                         # A later map retry must not cancel the on-foot walk.
                         self._last_nav_block = ""
                     return False, 0, False
+                # Sweep G: doğrulama kapısı — harita tıklaması yalnızca kesin
+                # açıkken yapılır; bilinmiyor (None) da backoff'a düşer.
+                # (`not ...` üç durumda da doğrudur: True→devam, False/None→backoff.)
                 if self.vision is not None and hasattr(self.vision, "is_map_open") and not self._vision_map_is_open():
                     self._begin_map_open_backoff(node_id)
                     if is_reclick:
                         self._last_nav_block = ""
                     return False, 0, False
             self._set_state_internal(BotState.MAP.value)
+            # F-0508: in test_mode the map is never opened — say so.
             self._emit_hud_snapshot(
                 badge=BotState.MAP.value,
-                title="Looking at the map",
-                subtitle="Don't touch the mouse or keyboard",
+                title="Looking at the map" if not test_mode else "Map (test mode — not opened)",
+                subtitle="Don't touch the mouse or keyboard" if not test_mode else "Test mode: map open skipped",
             )
 
             # Locate node coordinates & distance on the open map
@@ -4723,7 +7030,32 @@ class BotWorker(QThread):
                     if patch_gray is not None and map_gray is not None:
                         res = cv2.matchTemplate(map_gray, patch_gray, cv2.TM_CCOEFF_NORMED)
                         _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                        if max_val >= 0.70:
+                        # F-0082: SelfHealingTemplateTuner — her şablon
+                        # eşleşme denemesi bir düğüm ziyaretidir: skor
+                        # kaydedilir ve eşik düğümün kendi iyileşen
+                        # eşiğinden alınır (sabit 0.70 yerine). Tuner yoksa
+                        # veya düğüm kimliği yoksa varsayılan 0.70 geçerli.
+                        node_threshold = 0.70
+                        _tuner_node_id = self._extract_node_id(node, default=None)
+                        if _tuner_node_id is not None:
+                            tuner = getattr(self, "template_tuner", None)
+                            if tuner is not None:
+                                try:
+                                    node_threshold = float(
+                                        tuner.get_node_threshold(_tuner_node_id)
+                                    )
+                                except Exception:
+                                    node_threshold = 0.70
+                                try:
+                                    tuner.record_visit_score(
+                                        _tuner_node_id,
+                                        float(max_val),
+                                        patch_gray,
+                                        patch_save_path=patch_path,
+                                    )
+                                except Exception as tun_exc:
+                                    logger.debug("Template tuner kaydı atlandı: %s", tun_exc)
+                        if max_val >= node_threshold:
                             ph, pw = patch_gray.shape[:2]
                             target_x = int(max_loc[0] + pw // 2)
                             target_y = int(max_loc[1] + ph // 2)
@@ -4738,6 +7070,47 @@ class BotWorker(QThread):
         under_ov = self._is_point_under_overlay(tx, ty)
         return tx, ty, dist_m, under_ov
 
+    def _start_opportunistic_walk(self, nearby: Any, now: float) -> None:
+        """Yakındaki materyale geçici düğümle yürür (16/3).
+
+        Geçici düğüm rota düğümü değildir: harita konumu yoktur (map_x'e
+        EKRAN x'i yazılır — _turn_key_for_node ekranda sağ/sol direksiyon
+        için zaten ekran merkezini kullanır), mesafesi tarayıcının tahmini
+        mesafesidir. Monitör bu düğümde reclick yapmaz ve timeout/fail
+        saymaz; prompt çıkınca normal toplama motoru devralır.
+        """
+        m_type = getattr(nearby, "material_type", "Material") or "Material"
+        screen_x = getattr(nearby, "screen_x", None)
+        screen_y = getattr(nearby, "screen_y", None)
+        est_dist = getattr(nearby, "estimated_distance_m", 0.0) or 0.0
+        transient: Dict[str, Any] = {
+            "id": None,
+            "resource_type": str(m_type),
+            "map_x": int(screen_x) if screen_x is not None else None,
+            "map_y": int(screen_y) if screen_y is not None else None,
+            "distance_m": float(est_dist),
+            "_opportunistic": True,
+        }
+        self.active_node = transient
+        self._set_active_node_distance(est_dist)
+        self._walk_start_time = now
+        self._last_reclick_time = now
+        self._arrival_at_node_ts = 0.0
+        self._emit_log(f"Opportunistic gather: approaching nearby {m_type} (~{float(est_dist):.0f} m)")
+        if self._command_walk_toward(transient):
+            self._set_state_internal(BotState.WALKING.value)
+            self._emit_hud_snapshot(
+                badge=BotState.WALKING.value,
+                title=f"Walking to nearby {m_type}",
+                subtitle="On arrival: F, or a click on the gathering icon",
+            )
+        else:
+            # Yürüme reddedildiyse geçici düğüm sessizce düşer (rota
+            # düğümü olmadığı için failure sayılmaz).
+            self._emit_log("Opportunistic walk refused: dropping transient node")
+            self.active_node = None
+            self._walk_start_time = 0.0
+
     def _parse_locate_result(
         self, raw: Any, node: Any
     ) -> Optional[Tuple[int, int, int, bool]]:
@@ -4749,10 +7122,23 @@ class BotWorker(QThread):
             raw = raw.to_dict()
 
         if isinstance(raw, dict):
-            if raw.get("found", True) is False:
+            # 16/5: boş dict "bulundu, hedef (0,0)" sayılmaz. found yoksa ve
+            # koordinat da yoksa (ne dict'te ne düğümde) bulunamadı döner.
+            node_map_x = self._get_node_field(node, "map_x", 0) or 0
+            node_map_y = self._get_node_field(node, "map_y", 0) or 0
+            has_coord = (
+                any(k in raw for k in ("x", "y", "map_x", "map_y"))
+                or node_map_x != 0
+                or node_map_y != 0
+            )
+            if raw.get("found", None) is False:
+                return None
+            if raw.get("found", None) is None and not has_coord:
                 return None
             tx = int(raw.get("x", raw.get("map_x", self._get_node_field(node, "map_x", 0) or 0)))
             ty = int(raw.get("y", raw.get("map_y", self._get_node_field(node, "map_y", 0) or 0)))
+            if tx == 0 and ty == 0 and not has_coord:
+                return None
             dist_raw = raw.get("distance_m", raw.get("distance", None))
             if isinstance(dist_raw, str):
                 digits = "".join(ch for ch in dist_raw if ch.isdigit() or ch == ".")
@@ -4811,7 +7197,15 @@ class BotWorker(QThread):
         screen_h = int(getattr(self.vision, "screen_h", 1080) or 1080)
         cx, cy = screen_w // 2, screen_h // 2
         pixel_dist = math.hypot(target_x - cx, target_y - cy)
-        meters = max(2, int(round(pixel_dist * 0.28)))
+        # v19 P1-7/P1-12: literal 0.28 yerine tek kaynak
+        # `core/corridor_navigator.py::WORLD_MAP_METERS_PER_PX` (0.28).
+        # DİKKAT — uzay varsayımı kalibre edilmedi: buradaki piksel ekran
+        # merkezine göre ekran pikselidir, dünya-haritası pikseli değil;
+        # WORLD_MAP ölçeğiyle çarpılması v18'den beri korunan yaklaşımdır,
+        # "ölçüldü" sayılmaz (bkz. corridor_navigator kalibrasyon kancası).
+        from core.corridor_navigator import WORLD_MAP_METERS_PER_PX
+
+        meters = max(2, int(round(pixel_dist * WORLD_MAP_METERS_PER_PX)))
         return meters
 
     def _get_overlay_rect(self) -> Optional[Tuple[int, int, int, int]]:
@@ -4865,7 +7259,12 @@ class BotWorker(QThread):
             logger.debug("Game focus before map key skipped: %s", exc)
             return False
 
-    def _vision_map_is_open(self) -> bool:
+    def _vision_map_is_open(self) -> Optional[bool]:
+        """Üç durumlu harita kontrolü (Sweep G): True (harita açık), False
+        (harita kapalı), None (bilinmiyor — bozuk kare / doğrulama hatası).
+        None 'harita açık olabilir' sayılır — bool() ile False'a indirgenmez
+        (fail-open). Vision yoksa False döner (eski davranış: doğrulayıcı
+        yokken kapalı varsayılır)."""
         vision = getattr(self, "vision", None)
         if vision is None or not hasattr(vision, "is_map_open"):
             return False
@@ -4884,12 +7283,14 @@ class BotWorker(QThread):
         try:
             if frame is not None:
                 try:
-                    return bool(vision.is_map_open(frame))
+                    result = vision.is_map_open(frame)
                 except TypeError:
-                    return bool(vision.is_map_open())
-            return bool(vision.is_map_open())
+                    result = vision.is_map_open()
+            else:
+                result = vision.is_map_open()
         except Exception:
-            return False
+            return None
+        return None if result is None else bool(result)
 
     def _ensure_map_open(self) -> bool:
         """Focus the game, press the map key once, then wait until the map is visible.
@@ -4900,16 +7301,22 @@ class BotWorker(QThread):
         try:
             if self._motion_should_stop():
                 return False
-            if self._vision_map_is_open():
+            # Sweep G: bilinmiyor (None) açık sayılır — M'ye basmak açık
+            # haritayı kapatırdı, o yüzden basmadan "açık" dönülür.
+            if self._vision_map_is_open() is not False:
                 return True
             self._focus_game_window()
             self._toggle_map_key()
             for _ in range(6):
                 if not self._msleep_abortable(140):
                     return False
-                if self._vision_map_is_open():
+                # Doğrulama kapısı: yalnızca kesin açık sayılır; bilinmiyor
+                # yoklamaya devam eder (kör harita tıklaması yapılmaz).
+                if self._vision_map_is_open() is True:
                     return self._msleep_abortable(80)
-            return self._vision_map_is_open()
+            # M basışı doğrulanmadı sayılır (önceki durum kesin kapalıydı) —
+            # bilinmiyor burada "açıldı" sayılmaz, backoff/yürüme yoluna düşülür.
+            return self._vision_map_is_open() is True
         except Exception as exc:
             logger.debug("Error opening map: %s", exc)
             return False
@@ -4921,11 +7328,13 @@ class BotWorker(QThread):
             if self.route_manager is not None and hasattr(self.route_manager, "close_map"):
                 return bool(self.route_manager.close_map())
             if self.vision is not None and hasattr(self.vision, "is_map_open"):
-                if self.vision.is_map_open():
+                # Sweep G: M'ye yalnızca kesin açıkken basılır; "kapalı"
+                # yalnızca kesin kapalıyken raporlanır (bilinmiyor → False).
+                if self.vision.is_map_open() is True:
                     self._toggle_map_key()
                     if not self._msleep_abortable(180):
                         return False
-                return not bool(self.vision.is_map_open())
+                return self.vision.is_map_open() is False
             self._toggle_map_key()
             return self._msleep_abortable(180)
         except Exception as exc:
@@ -4965,6 +7374,10 @@ class BotWorker(QThread):
         Executes a scheduled break with orange BREAK badge and subtle Anti-AFK actions,
         then automatically resumes ROUTE_MODE when the break timer expires.
         """
+        # F-0387: entering a break must drop W immediately — otherwise the
+        # character keeps walking through the whole break.
+        self._halt_motion()
+        self._release_route_motion()
         if self._state != BotState.BREAK.value or self._break_end_timestamp <= 0.0:
             lasts_min = float(self._get_cfg("break_lasts_min", 5) or 5)
             lasts_var = float(self._get_cfg("break_lasts_variance", 1) or 0)
@@ -4978,7 +7391,9 @@ class BotWorker(QThread):
         remaining_sec = self._break_end_timestamp - now
         if remaining_sec <= 0:
             self._break_end_timestamp = 0.0
-            self._last_gather_time = now
+            # O5: mola sonu da _last_gather_time'ı sıfırlamaz — mola zaten
+            # toplamasız geçen sürenin üstüne gelir; sıfırlamak 15 dk
+            # korumasını erteler.
             self._schedule_next_break()
             self._set_state_internal(BotState.WALKING.value)
             self._emit_log("Break finished: resuming route mode")
@@ -4999,10 +7414,71 @@ class BotWorker(QThread):
             subtitle="Anti-AFK active · Will resume route automatically",
         )
 
+    def _get_human_timing_coordinator(self) -> Any:
+        """F-0103: HumanTimingCoordinator'ı mevcut alt sistemlerden kurar
+        (HumanTimingEngine + OrganicAntiAFK zaten __init__'te kuruluyor;
+        break scheduler koordinatörün kendi varsayılanıdır). Kurulamazsa
+        None döner — çağıran eski anti-AFK yoluna düşer."""
+        coord = self._plain_attr("_human_timing_coordinator")
+        if coord is not None:
+            return coord
+        try:
+            from core.human_timing import HumanTimingCoordinator
+
+            coord = HumanTimingCoordinator(
+                timing_engine=self._plain_attr("human_timing"),
+                anti_afk=self._plain_attr("organic_anti_afk"),
+            )
+        except Exception as exc:
+            logger.debug("HumanTimingCoordinator kurulamadı: %s", exc)
+            return None
+        try:
+            self.__dict__["_human_timing_coordinator"] = coord
+        except Exception:
+            pass
+        return coord
+
     def _perform_anti_afk_step(self) -> None:
-        """Executes a subtle camera/mouse micro-movement or anti-AFK step during BREAK."""
+        """Executes a subtle camera/mouse micro-movement or anti-AFK step during BREAK.
+
+        F-0103: HumanTimingCoordinator.tick() bu adımın sahibidir — koordinatör
+        varsa kadansı o yönetir (140-260 sn aralık): zamanı gelmediyse ("waiting")
+        hiçbir şey yapılmaz, eylem uygulandıysa ("executed") adım biter.
+        Koordinatör yoksa / beklemedeyse / başarısızsa eski input_driver
+        yoluna düşülür. Mola sinyalleri (macro_break/micro_pause) burada
+        tüketilmez — mola zamanlaması _should_enter_break/_handle_break_step'tedir.
+        """
         if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:
             return
+        try:
+            coord = self._get_human_timing_coordinator()
+            if coord is not None and hasattr(coord, "tick"):
+                # P1-10 (K-14): tick artık tek çağrılık kablolama noktası
+                # run_human_timing_tick üzerinden akar (önceden doğrudan
+                # coord.tick() çağrılıyordu; sarmalayıcı hiç çağrılmıyordu).
+                # coordinator verilerek botun kendi alt sistemleri
+                # (self.human_timing / self.organic_anti_afk) korunur —
+                # tekil global koordinatöre geçilmez.
+                from core.human_timing import run_human_timing_tick
+
+                res = run_human_timing_tick(
+                    self.input_driver, now=time.monotonic(), coordinator=coord
+                )
+                if isinstance(res, dict):
+                    if res.get("macro_break") or res.get("micro_pause"):
+                        logger.debug(
+                            "HumanTimingCoordinator mola sinyali (break adımı yönetir): %s",
+                            {k: res.get(k) for k in ("macro_break", "micro_pause")},
+                        )
+                    afk = res.get("anti_afk") or {}
+                    if isinstance(afk, dict):
+                        if afk.get("action") == "waiting":
+                            return
+                        if afk.get("executed"):
+                            return
+                        # pending / busy / error / uygulanamadı -> eski yola düş.
+        except Exception as exc:
+            logger.debug("HumanTimingCoordinator tick hatası, eski yola düşülüyor: %s", exc)
         try:
             self._last_bot_key_time = time.time()
             if hasattr(self.input_driver, "anti_afk_step"):
@@ -5043,6 +7519,24 @@ class BotWorker(QThread):
             return getattr(node, "id")
         return default
 
+    def _configured_max_harvests(self, node: Any) -> int:
+        """Node max_harvests wins; otherwise the harvests_per_node setting
+        (F-0199/F-0384: the alias existed but was never read)."""
+        # O7: oyunda düğüm başına en fazla 3 aşama var — bozuk bir kayıttaki
+        # max_harvests=99 botu 99 aşama denemeye zorlamasın.
+        field = self._get_node_field(node, "max_harvests", None)
+        if field is not None:
+            try:
+                return max(1, min(3, int(field)))
+            except (TypeError, ValueError):
+                self._warn_bad_config_once("node:max_harvests", field)
+        raw_cfg = self._get_cfg("harvests_per_node", 3)
+        try:
+            return max(1, min(3, int(raw_cfg or 3)))
+        except (TypeError, ValueError):
+            self._warn_bad_config_once("harvests_per_node", raw_cfg)
+            return 3
+
     @staticmethod
     def _get_node_field(node: Any, field_name: str, default: Any = None) -> Any:
         if node is None:
@@ -5072,9 +7566,45 @@ class BotWorker(QThread):
                 self.route_manager, "record_current_node"
             ):
                 fn = self.route_manager.record_current_node
+                # F-0388 (P3-4 düzeltmesi): a TypeError from INSIDE fn must
+                # not trigger a second call with a different arity. The
+                # dispatch calls used to sit INSIDE the inspection try, so
+                # an internal TypeError was caught and fn was called AGAIN
+                # with (input_driver, vision) — double recording / masked
+                # error. Only the signature inspection is inside the try
+                # now; the single dispatch call below runs outside it, so
+                # an error raised inside fn propagates once, unretried.
                 try:
+                    import inspect as _inspect
+
+                    _params = list(_inspect.signature(fn).parameters.values())
+                    _positional = [
+                        p
+                        for p in _params
+                        if p.kind
+                        in (
+                            _inspect.Parameter.POSITIONAL_ONLY,
+                            _inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        )
+                    ]
+                    _has_varargs = any(
+                        p.kind == _inspect.Parameter.VAR_POSITIONAL for p in _params
+                    )
+                    if _has_varargs or len(_positional) >= 2:
+                        _arity = 2
+                    elif len(_positional) == 1:
+                        _arity = 1
+                    else:
+                        _arity = 0
+                except (TypeError, ValueError):
+                    # Signature unreadable (builtin/partial/Mock): fall back
+                    # to the 2-arg call, as before.
+                    _arity = 2
+                if _arity >= 2:
                     raw_node = fn(self.input_driver, self.vision)
-                except TypeError:
+                elif _arity == 1:
+                    raw_node = fn(self.input_driver)
+                else:
                     raw_node = fn()
             elif self.recorder is not None and hasattr(self.recorder, "record_current_node"):
                 raw_node = self.recorder.record_current_node()
@@ -5118,6 +7648,42 @@ class BotWorker(QThread):
         except Exception as exc:
             logger.debug("Route cooldown refresh error: %s", exc)
 
+    def _is_node_ready_local(self, node: Any, rest_sec: float) -> bool:
+        """Ready check mirroring SequentialRoutePlanner._is_node_ready
+        (F-0195/F-0509: the planner's pick must be re-verified here)."""
+        try:
+            if self._node_not_gatherable(node):
+                return False
+            if hasattr(node, "is_ready") and callable(node.is_ready):
+                try:
+                    return bool(node.is_ready(now=time.time(), rest_duration_sec=int(rest_sec)))
+                except TypeError:
+                    return bool(node.is_ready())
+            if isinstance(node, dict):
+                if "ready" in node:
+                    return bool(node["ready"])
+                if node.get("rest_remaining_sec") is not None:
+                    return float(node["rest_remaining_sec"]) <= 0.0
+                last = float(node.get("last_visited_timestamp", node.get("last_visited", 0.0)) or 0.0)
+                if last <= 0.0:
+                    return True
+                return (time.time() - last) >= float(rest_sec)
+            rem = getattr(node, "rest_remaining_sec", None)
+            if rem is not None:
+                return float(rem) <= 0.0
+            last = float(
+                getattr(node, "last_visited_timestamp", getattr(node, "last_visited", 0.0)) or 0.0
+            )
+            if last <= 0.0:
+                return True
+            return (time.time() - last) >= float(rest_sec)
+        except Exception:
+            # P1-3 (K-07): hazırlık kararı verilemedi — fail-closed.
+            # Eskiden istisnada True ("hazır") dönülüyordu: bozuk düğüm
+            # kaydı dinlenme süresi dolmamış bir düğüme botu gönderirdi.
+            # Belirsiz düğüm hazır sayılmaz; rota onu atlar.
+            return False
+
     def _get_next_ready_node(self, rest_minutes: float) -> Optional[Any]:
         if self.route_manager is None:
             return None
@@ -5140,13 +7706,9 @@ class BotWorker(QThread):
 
                     now = time.time()
                     rest_sec = int(round(rest_minutes * 60.0))
-                    ready_nodes = []
-                    for n in matched_nodes:
-                        if hasattr(n, "is_ready"):
-                            if n.is_ready(now=now, rest_duration_sec=rest_sec):
-                                ready_nodes.append(n)
-                        else:
-                            ready_nodes.append(n)
+                    ready_nodes = [
+                        n for n in matched_nodes if self._is_node_ready_local(n, rest_sec)
+                    ]
 
                     if not ready_nodes:
                         return None
@@ -5161,30 +7723,42 @@ class BotWorker(QThread):
                                     allow_wrap=True,
                                 )
                             )
-                            if selected_node is not None:
+                            if selected_node is not None and self._is_node_ready_local(
+                                selected_node, rest_sec
+                            ):
                                 self._current_seq_pos = int(next_idx)
                                 return selected_node
                         except Exception as seq_exc:
                             logger.debug("Sequential planner selective fallback: %s", seq_exc)
 
-                    return ready_nodes[0]
+                    if ready_nodes:
+                        return ready_nodes[0]
+                    return None
                 except Exception as sel_exc:
                     logger.debug("Selective route node retrieval error: %s", sel_exc)
 
             # Layer IV & Agent 18: Anti-Ping-Pong Sequential Corridor Selection
+            # F-0195/F-0509: only READY nodes go into the planner, and the pick
+            # is re-verified — a resting node must never be returned here.
             if self.sequential_planner is not None and hasattr(
                 self.route_manager, "get_route_nodes"
             ):
                 try:
                     route_nodes = self.route_manager.get_route_nodes() or []
-                    if len(route_nodes) >= 2:
+                    rest_sec_all = int(rest_minutes * 60)
+                    ready_route_nodes = [
+                        n for n in route_nodes if self._is_node_ready_local(n, rest_sec_all)
+                    ]
+                    if len(ready_route_nodes) >= 2:
                         selected_node, next_idx = self.sequential_planner.get_next_in_sequence(
-                            route_nodes,
+                            ready_route_nodes,
                             current_seq_pos=self._current_seq_pos,
                             forward_window=12,
                             allow_wrap=True,
                         )
-                        if selected_node is not None and not self._node_not_gatherable(selected_node):
+                        if selected_node is not None and self._is_node_ready_local(
+                            selected_node, rest_sec_all
+                        ):
                             if not is_selective or self.is_material_selected_for_gather(selected_node):
                                 self._current_seq_pos = int(next_idx)
                                 return selected_node
@@ -5203,6 +7777,11 @@ class BotWorker(QThread):
                         node = fn()
                 if node is not None:
                     if is_selective and not self.is_material_selected_for_gather(node):
+                        return None
+                    # 16/11: fallback dalı da re-verification yapar — yorum
+                    # "dinlenen düğüm buradan asla dönmez" diyordu ama kod
+                    # doğrulamıyordu. Hazır değilse None (bekleme durumu).
+                    if not self._is_node_ready_local(node, int(rest_minutes * 60)):
                         return None
                     return node
         except Exception as exc:
@@ -5256,6 +7835,9 @@ class BotWorker(QThread):
             if getattr(self, "selective_gather_enabled", False) and getattr(
                 self, "selected_gather_materials", None
             ):
+                # 16/13: düğüm başına try/except — bir düğümün is_ready
+                # imzası farklıysa TÜM sayım filtresiz get_route_stats'a
+                # düşmez; o düğüm tek başına atlanır.
                 try:
                     nodes = []
                     if hasattr(self.route_manager, "get_route_nodes"):
@@ -5269,12 +7851,13 @@ class BotWorker(QThread):
                         and not self._node_not_gatherable(n)
                     ]
                     now = time.time()
-                    ready = sum(
-                        1
-                        for n in matched
-                        if not hasattr(n, "is_ready")
-                        or n.is_ready(now=now, rest_duration_sec=rest_sec)
-                    )
+                    ready = 0
+                    for n in matched:
+                        try:
+                            if self._is_node_ready_local(n, rest_sec):
+                                ready += 1
+                        except Exception:
+                            continue
                     return ready, len(matched) - ready
                 except Exception:
                     pass
@@ -5323,6 +7906,16 @@ class BotWorker(QThread):
                         resting_cnt += 1
                     else:
                         ready_cnt += 1
+                else:
+                    # 16/13: is_ready'siz dict-dışı düğüm artık hiçbir
+                    # kovaya girmemek yerine aynı hazır kuralıyla sayılır.
+                    try:
+                        if self._is_node_ready_local(n, rest_sec):
+                            ready_cnt += 1
+                        else:
+                            resting_cnt += 1
+                    except Exception:
+                        continue
             return ready_cnt, resting_cnt
         except Exception as exc:
             logger.debug("Error computing ready/resting counts: %s", exc)
@@ -5331,7 +7924,14 @@ class BotWorker(QThread):
     def _get_route_header_title(self) -> str:
         """Formats 'REGION · ROUTE' in uppercase for the second telemetry column."""
         try:
-            region = "ALTGARD"
+            # 16/19: varsayılan bölge tek kaynaktan — route_manager'ın
+            # DEFAULT_REGION'ı ("Verteron"); eskiden burada "ALTGARD"
+            # yazılıydı, route_manager ise "Verteron" varsayıyordu.
+            try:
+                from core.route_manager import DEFAULT_REGION as _DEFAULT_REGION
+            except Exception:
+                _DEFAULT_REGION = "Verteron"
+            region = _DEFAULT_REGION
             route = "ALL"
             if self.route_manager is not None:
                 reg_attr = getattr(self.route_manager, "active_region", None)
@@ -5362,8 +7962,10 @@ class BotWorker(QThread):
 
     def _detect_gather_prompt(self) -> Tuple[bool, int]:
         """
-        Detects the 'F Gather' or 'E' interaction prompt via Vision and AI inference (PerceptionHub/ReflexScanner),
+        Detects the 'F Gather' interaction prompt via Vision and AI inference (PerceptionHub/ReflexScanner),
         returning (detected: bool, confidence_pct: 0..100).
+        (Wiki: Essence Extraction is F for every material — there is no E
+        gather prompt in the game; prompt keys are always 'f'.)
         """
         threshold = float(self._get_cfg("prompt_threshold", 0.75) or 0.75)
 
@@ -5386,9 +7988,10 @@ class BotWorker(QThread):
                     raw = vision.find_gather_prompt()
 
                 if raw is not None:
+                    # Y6: vision 'e' kararı yoksayılır — E ile toplama oyunda yok.
                     last_k = str(getattr(vision, "last_detected_gather_key", "") or "").lower()
-                    if last_k in ("f", "e"):
-                        self._last_detected_prompt_key = last_k
+                    if last_k == "f":
+                        self._last_detected_prompt_key = "f"
                     if isinstance(raw, dict):
                         det = bool(raw.get("detected", raw.get("found", False)))
                         conf_val = float(raw.get("confidence", raw.get("match_pct", 0)))
@@ -5399,8 +8002,14 @@ class BotWorker(QThread):
                         )
                         if det:
                             k = str(raw.get("key", "")).lower()
-                            if k in ("f", "e"):
-                                self._last_detected_prompt_key = k
+                            if k == "f":
+                                self._last_detected_prompt_key = "f"
+                            # F-0185: remember the prompt that was just seen.
+                            self._last_gather_prompt = {
+                                "name": str(raw.get("name", raw.get("material", "gather_prompt")) or "gather_prompt"),
+                                "key": self._last_detected_prompt_key,
+                                "confidence": max(0, min(100, conf_pct)),
+                            }
                             return True, max(0, min(100, conf_pct))
 
                     elif isinstance(raw, (tuple, list)) and len(raw) >= 2:
@@ -5415,7 +8024,16 @@ class BotWorker(QThread):
                             return True, max(0, min(100, conf_pct))
 
                     elif isinstance(raw, bool) and raw:
-                        return True, 100
+                        # F-0389: a bare bool carries no confidence; do not
+                        # fabricate 100%. Use the prompt threshold as the
+                        # honest (low) confidence for an unmeasured hit.
+                        conf_pct = int(round(float(threshold) * 100)) if 0.0 < float(threshold) <= 1.0 else int(round(float(threshold)))
+                        self._last_gather_prompt = {
+                            "name": "gather_prompt",
+                            "key": self._last_detected_prompt_key,
+                            "confidence": max(1, min(100, conf_pct)),
+                        }
+                        return True, max(1, min(100, conf_pct))
             except Exception as exc:
                 logger.debug("Gather prompt vision detection error: %s", exc)
 
@@ -5426,23 +8044,28 @@ class BotWorker(QThread):
                 cog = hub.last() if hasattr(hub, "last") else self._plain_attr("_frame_cognition")
                 if cog is not None:
                     if getattr(cog, "gather_prompt", False):
-                        conf = int(getattr(cog, "gather_conf", 85) or 85)
+                        # F-0389: no measured confidence -> 50 (unknown),
+                        # never a fabricated 85.
+                        conf = int(getattr(cog, "gather_conf", 50) or 50)
                         k = str(getattr(cog, "gather_key", "") or "").lower()
-                        if k in ("f", "e"):
-                            self._last_detected_prompt_key = k
+                        if k == "f":
+                            self._last_detected_prompt_key = "f"
                         return True, max(1, min(100, conf))
                     targets = getattr(cog, "targets", None) or []
                     for t in targets:
                         if isinstance(t, dict):
                             cid = t.get("class_id")
                             cname = str(t.get("class_name", t.get("name", ""))).lower()
-                            if cid in (7, 8) or any(k in cname for k in ("f_gather", "f_prompt", "e_gather", "e_prompt", "gather_prompt")):
-                                conf = float(t.get("confidence", t.get("conf", 0.85)) or 0.85)
+                            # D2: alt-string değil tam isim eşleşmesi — adı
+                            # 'gather_prompt' içeren gelecekteki bir sınıf
+                            # yanlış eşleşmesin. (cid 7/8 eşlemesi taksonomi
+                            # kararı beklediği için aynen duruyor.)
+                            if cid in (7, 8) or cname in ("f_gather", "f_prompt", "e_gather", "e_prompt", "gather_prompt"):
+                                # Y1: güven ölçülmediyse 50 (bilinmiyor),
+                                # asla uydurma 85 değil.
+                                conf = float(t.get("confidence", t.get("conf", 0.50)) or 0.50)
                                 conf_pct = int(round(conf * 100)) if conf <= 1.0 else int(round(conf))
-                                if cid == 8 or "e_gather" in cname or "e_prompt" in cname:
-                                    self._last_detected_prompt_key = "e"
-                                else:
-                                    self._last_detected_prompt_key = "f"
+                                self._last_detected_prompt_key = "f"
                                 return True, max(1, min(100, conf_pct))
             except Exception as exc:
                 logger.debug("PerceptionHub gather prompt check skipped: %s", exc)
@@ -5464,30 +8087,51 @@ class BotWorker(QThread):
                                 except Exception:
                                     cid = -1
                             cname = str(b.get("class_name", b.get("name", ""))).lower()
-                            if cid in (7, 8) or any(k in cname for k in ("f_gather", "f_prompt", "e_gather", "e_prompt", "gather_prompt")):
-                                conf = float(b.get("confidence", b.get("conf", 0.85)) or 0.85)
+                            if cid in (7, 8) or cname in ("f_gather", "f_prompt", "e_gather", "e_prompt", "gather_prompt"):
+                                # Y1: güven ölçülmediyse 50 (bilinmiyor), asla uydurma 85 değil.
+                                conf = float(b.get("confidence", b.get("conf", 0.50)) or 0.50)
                                 conf_pct = int(round(conf * 100)) if conf <= 1.0 else int(round(conf))
-                                if cid == 8 or "e_gather" in cname or "e_prompt" in cname:
-                                    self._last_detected_prompt_key = "e"
-                                else:
-                                    self._last_detected_prompt_key = "f"
+                                self._last_detected_prompt_key = "f"
                                 return True, max(1, min(100, conf_pct))
             except Exception as exc:
                 logger.debug("ReflexScanner gather prompt check skipped: %s", exc)
 
         # 4. MaterialScanner fallback
+        # K1: scan_gather_prompt dict DEĞİL list[DetectedMaterial] döner
+        # (core/material_scanner.py:2929-3052) — eski `isinstance(dict)`
+        # kontrolü hiçbir zaman True olamazdı, katman ölüydü.
         mat_scan = self._plain_attr("material_scanner")
         if mat_scan is not None and hasattr(mat_scan, "scan_gather_prompt"):
             try:
                 frame = self.__dict__.get("_last_color_frame")
                 if frame is not None:
                     prompt_res = mat_scan.scan_gather_prompt(frame)
+                    best_conf: Optional[float] = None
                     if isinstance(prompt_res, dict) and prompt_res.get("found"):
-                        conf = float(prompt_res.get("confidence", 0.85) or 0.85)
+                        # Eski/mock sözleşmesiyle uyumluluk (dict dönerse).
+                        raw_conf = prompt_res.get("confidence", prompt_res.get("conf"))
+                        try:
+                            best_conf = float(raw_conf) if raw_conf is not None else None
+                        except (TypeError, ValueError):
+                            best_conf = None
+                    elif isinstance(prompt_res, (list, tuple)):
+                        for item in prompt_res:
+                            if isinstance(item, dict):
+                                raw_conf = item.get("confidence", item.get("conf"))
+                            else:
+                                raw_conf = getattr(item, "confidence", None)
+                            try:
+                                c = float(raw_conf) if raw_conf is not None else None
+                            except (TypeError, ValueError):
+                                c = None
+                            if c is not None and (best_conf is None or c > best_conf):
+                                best_conf = c
+                    if best_conf is not None:
+                        # Y1: güven ölçülmediyse (None/0) 50 bilinmiyor.
+                        conf = float(best_conf) if best_conf > 0 else 0.50
                         conf_pct = int(round(conf * 100)) if conf <= 1.0 else int(round(conf))
-                        k = str(prompt_res.get("key", "")).lower()
-                        if k in ("f", "e"):
-                            self._last_detected_prompt_key = k
+                        # Bu tarayıcı 'F Gather' istemini bulur — tuş hep 'f'.
+                        self._last_detected_prompt_key = "f"
                         return True, max(1, min(100, conf_pct))
             except Exception as exc:
                 logger.debug("MaterialScanner gather prompt check skipped: %s", exc)
@@ -5524,6 +8168,36 @@ class BotWorker(QThread):
             mix["minimap"] = minimap
         return mix or None
 
+    def _in_combat_grab_gate(self) -> bool:
+        """True while combat mode/state should skip heavy per-frame learning.
+
+        Matches the dataset_factory combat skip in `_grab_frame` so learner /
+        perception hitch the same way. Learning resumes when mode/state leave
+        combat (gate is evaluated each grab — not a sticky disable).
+        """
+        mode_now = str(getattr(self, "mode", "") or "")
+        state_now = str(getattr(self, "state", "") or "").upper()
+        return mode_now == "combat" or state_now in (
+            "FIGHTING",
+            "COMBAT",
+            "ATTACKING",
+        )
+
+    # Combat perception throttle: vitals still refresh, but not every grab.
+    _COMBAT_PERCEPTION_INTERVAL_SEC: float = 1.5
+
+    def _combat_perception_due(self) -> bool:
+        """Outside combat: always due. In combat: at most once per interval."""
+        if not self._in_combat_grab_gate():
+            return True
+        now = time.monotonic()
+        last = float(getattr(self, "_last_combat_perception_mono", 0.0) or 0.0)
+        return (now - last) >= float(self._COMBAT_PERCEPTION_INTERVAL_SEC)
+
+    def _mark_combat_perception(self) -> None:
+        if self._in_combat_grab_gate():
+            self._last_combat_perception_mono = time.monotonic()
+
     def _grab_frame(self, grayscale: bool = True) -> Optional[np.ndarray]:
         if self.vision is None:
             return None
@@ -5535,12 +8209,19 @@ class BotWorker(QThread):
                 frame = self.vision.capture_screen(grayscale=grayscale)
             if frame is not None and not grayscale:
                 self._last_color_frame = frame
+                self._last_color_frame_ts = time.time()
             if (
                 not grayscale
                 and frame is not None
                 and isinstance(frame, np.ndarray)
                 and frame.ndim == 3
             ):
+                # Skip heavy dataset ingest / learner / perception while fighting —
+                # live evidence 2026-11-11 19:23:50 COMBAT → 19:24:05 stall 15.18s
+                # (fps 2.44, avg_latency 409ms). dataset_factory was already gated;
+                # observe_frame + perception_hub.observe were not.
+                _in_combat = self._in_combat_grab_gate()
+
                 # OmniGameLearner: Oyunun tamamını öğrenmek için sürekli algı ve ekran yakalama
                 if self.reflex is not None and hasattr(self.reflex, "submit_frame"):
                     try:
@@ -5548,7 +8229,7 @@ class BotWorker(QThread):
                     except Exception as reflex_exc:
                         logger.debug("reflex submit skipped: %s", reflex_exc)
 
-                if self.game_learner is not None:
+                if self.game_learner is not None and not _in_combat:
                     try:
                         self.game_learner.observe_frame(
                             frame,
@@ -5559,21 +8240,19 @@ class BotWorker(QThread):
                     except Exception as gl_exc:
                         logger.debug("game_learner.observe_frame error: %s", gl_exc)
 
-                # PerceptionHub: tek kare snapshot (combat/discovery/economy paylaşır)
-                if self.perception_hub is not None and hasattr(self.perception_hub, "observe"):
+                # PerceptionHub: tek kare snapshot (combat/discovery/economy paylaşır).
+                # Combat: throttle ≤1.5s so vitals refresh without per-frame hitch.
+                if (
+                    self.perception_hub is not None
+                    and hasattr(self.perception_hub, "observe")
+                    and self._combat_perception_due()
+                ):
                     try:
                         self._frame_cognition = self.perception_hub.observe(frame)
+                        self._mark_combat_perception()
                     except Exception as hub_exc:
                         logger.debug("perception_hub.observe skipped: %s", hub_exc)
 
-                # Skip heavy dataset ingest while fighting — major hitch source.
-                _mode_now = str(getattr(self, "mode", "") or "")
-                _state_now = str(getattr(self, "state", "") or "").upper()
-                _in_combat = _mode_now == "combat" or _state_now in (
-                    "FIGHTING",
-                    "COMBAT",
-                    "ATTACKING",
-                )
                 if self.dataset_factory is not None and not _in_combat:
                     if hasattr(self.dataset_factory, "feed_live_frame"):
                         try:
@@ -5605,41 +8284,30 @@ class BotWorker(QThread):
         return random.uniform(f_min, f_max)
 
     def _get_active_interaction_key(self) -> str:
-        """Determines the active interaction key ('f' or 'e') based on config, prompt detection, or dynamic reader."""
-        cfg_key = str(self._get_cfg("gather_key", "f") or "f").strip().lower()
-        if cfg_key in ("f", "e"):
-            return cfg_key
+        """Toplama etkileşim tuşu: her zaman 'f'.
 
-        # If cfg is "auto" or anything else:
-        prompt_key = getattr(self, "_last_detected_prompt_key", None)
-        if prompt_key in ("f", "e"):
-            return prompt_key
-
-        vision = self._plain_attr("vision")
-        if vision is not None:
-            v_key = str(getattr(vision, "last_detected_gather_key", "") or "").strip().lower()
-            if v_key in ("f", "e"):
-                return v_key
-
-        frame_bgr = self.__dict__.get("_last_color_frame")
-        if frame_bgr is not None and self.dynamic_key_reader is not None and hasattr(self.dynamic_key_reader, "decide_interaction_key"):
-            try:
-                decided = self.dynamic_key_reader.decide_interaction_key(frame_bgr)
-                if isinstance(decided, dict):
-                    k = str(decided.get("key", "f")).lower()
-                    if k in ("f", "e"):
-                        return k
-                elif isinstance(decided, str) and decided.lower() in ("f", "e"):
-                    return decided.lower()
-            except Exception as exc:
-                logger.debug("dynamic_key_reader error: %s", exc)
-
+        Wiki (Gathering/Essence Extraction): oyunda HER materyal F ile
+        toplanır; E ile toplama yoktur. Bu yüzden config'teki 'e'/'auto'
+        ve prompt zincirinin 'e' kararı artık tuşu değiştiremez — 'e'
+        tespiti ölü koddur, kaldırıldı. (config/schema.py'deki
+        VALID_GATHER_KEYS hâlâ 'e'/'auto' kabul eder; şema J grubunun,
+        worker tarafı burada F'e kilitlendi.)
+        """
         return "f"
 
-    def _press_gather_key(self) -> None:
-        self.f_pressed_count += 1
+    def _press_gather_key(self) -> bool:
+        # F-0390: the counter/log used to run before any key was sent, so a
+        # missing driver still counted a press. Count only a real send
+        # (test_mode counts as a simulated send).
+        # Y7: bus'un {"ok": False, "method": "failed"} dönüşü artık okunur —
+        # başarısız basış sayaçta "basıldı" görünmez. Döner: gönderim
+        # gerçekten denendiyse True, aksi halde False.
         target_key = self._get_active_interaction_key()
         frame_bgr = self.__dict__.get("_last_color_frame")
+        if not bool(self._get_cfg("test_mode", False)) and self.input_driver is None:
+            logger.debug("Gather key not pressed: no input driver")
+            return False
+        sent = bool(self._get_cfg("test_mode", False))
         if not bool(self._get_cfg("test_mode", False)) and self.input_driver is not None:
             try:
                 if frame_bgr is None:
@@ -5650,21 +8318,31 @@ class BotWorker(QThread):
                 if bus is not None and hasattr(bus, "gather_interact"):
                     outcome = bus.gather_interact(frame=frame_bgr, preferred_key=target_key)
                     method = str((outcome or {}).get("method", "") or "")
-                    self._emit_log(
-                        f"Gather {method or 'bus'} '{target_key}'"
-                        if target_key == "e"
-                        else f"Gather {method or 'bus'} F"
-                    )
-                    return
-                if target_key == "e" and hasattr(self.input_driver, "press_key"):
-                    self.input_driver.press_key("e", frame=frame_bgr, release_mouse=True, post_to_window=False)
-                elif hasattr(self.input_driver, "send_gather_key"):
-                    self.input_driver.send_gather_key(frame=frame_bgr)
+                    ok = bool((outcome or {}).get("ok", False))
+                    if not ok:
+                        logger.error(
+                            "Gather interact failed (bus method=%s): F not counted",
+                            method or "failed",
+                        )
+                        return False
+                    self._emit_log(f"Gather {method or 'bus'} F")
+                    self.f_pressed_count += 1
+                    return True
+                if hasattr(self.input_driver, "send_gather_key"):
+                    res = self.input_driver.send_gather_key(frame=frame_bgr)
+                    sent = res is not False
                 elif hasattr(self.input_driver, "press_key"):
-                    self.input_driver.press_key(target_key, frame=frame_bgr, release_mouse=True, post_to_window=False)
+                    res = self.input_driver.press_key(target_key, frame=frame_bgr, release_mouse=True, post_to_window=False)
+                    sent = res is not False
+                else:
+                    sent = False
             except Exception as exc:
                 logger.error("Failed to send gather interact: %s", exc)
-        self._emit_log(f"Pressed {target_key.upper()}")
+                sent = False
+        if sent:
+            self.f_pressed_count += 1
+            self._emit_log(f"Pressed {target_key.upper()}")
+        return bool(sent)
 
     def _combat_soft_aim_attack(self) -> None:
         """AION2 mouse-look: nameplate Alt+click / soft-aim when Tab fails. Skills only after lock."""
@@ -5698,17 +8376,17 @@ class BotWorker(QThread):
                         pass
                 return
             nudge = getattr(driver, "nudge_camera", None)
-            if callable(nudge) and hasattr(driver, "_hw_mouse_down"):
+            if callable(nudge) and hasattr(driver, "press_key"):
                 for dx in (40, -80, 60, -30):
                     nudge(int(dx), 0)
                     self.msleep(50)
-                    driver._hw_mouse_up("right")
-                    driver._hw_mouse_down("left")
-                    self.msleep(45)
-                    driver._hw_mouse_up("left")
+                    # Sol tık saldırısı yerine R tuşu (sol tık = R).
+                    try:
+                        driver.press_key("r", min_hold=0.045, max_hold=0.09)
+                    except TypeError:
+                        driver.press_key("r")
                     self.msleep(50)
-                driver._hw_mouse_up("right")
-                self._emit_log("SOFT AIM (mouse-look) — kamera süpürme + sol tık")
+                self._emit_log("SOFT AIM (mouse-look) — kamera süpürme + R tuşu")
         except Exception:
             logger.debug("combat soft aim failed", exc_info=True)
 
@@ -5754,45 +8432,89 @@ class BotWorker(QThread):
         if soft_aim:
             self._combat_soft_aim_attack()
 
+    def _press_potion_key(self, key: str, min_hold: float = 0.06, max_hold: float = 0.12) -> bool:
+        """Press a potion key (F1/F2/7/8...). Potions are survival, not combat
+        skills, so they must not be swallowed by the combat-skill gate
+        (F-0391: in route mode _press_key dropped 7/8 as 'skills'). Routes
+        through _press_key with potion=True so mocks/hooks on _press_key
+        still see the press.
+
+        Returns True only if the driver confirms the key was sent (B-02).
+        """
+        return self._press_key(key, min_hold=min_hold, max_hold=max_hold, potion=True)
+
+    @staticmethod
+    def _driver_press_ok(result: Any) -> bool:
+        """Sürücü dönüşünü 'tuş gönderildi mi' kararına çevirir (B-02).
+
+        InputController.press_key float döner: 0.0 = gönderilmedi,
+        >0.0 = basılı tutma süresi (gönderildi). Kayıt/test sürücüleri
+        bool döner (True = gönderildi). None / False / 0.0 = gönderilmedi;
+        dönüşü raporlamayan sürücü 'gönderildi' sayılmaz (fail-closed).
+        """
+        if result is None or result is False:
+            return False
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, (int, float)):
+            return float(result) > 0.0
+        return bool(result)
+
     def _press_key(
         self,
         key: str,
         min_hold: float = None,
         max_hold: float = None,
         release_mouse: bool = False,
-    ) -> None:
+        potion: bool = False,
+    ) -> bool:
+        """Tuş basar; sürücü gönderimi onaylarsa True, yoksa False doner (B-02).
+
+        False halleri: duraklatıldı / test_mode / sürücü yok / kapı
+        engeli (X/F6/B, combat gate) / sürücü 0.0/False döndürdü / istisna.
+        Çağıran False'ta 'basıldı' sayamaz (cooldown/zaman damgası yazılmaz).
+        """
         if self.is_paused:
-            return
+            return False
         if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:
-            return
+            return False
         key_str = str(key).strip().lower()
         if key_str in ("x", "f6", "b"):
             logger.debug("[AutoGate] Key '%s' suppressed (automatic client function)", key_str)
-            return
-        if key_str in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "q", "r"):
+            return False
+        # F-0391: potion=True bypasses the combat-skill gate — potions are
+        # survival, and 7/8 must work in route mode too.
+        # F-1358 [O1]: "e" (skill) and "t" (right-click attack key) are combat
+        # keys too - without them they leaked through in ROUTE_MODE.
+        if not potion and key_str in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "q", "r", "e", "t"):
             if not self.is_combat_authorized("skill"):
                 logger.debug("[CombatGate] Combat key '%s' suppressed (mode=%s, state=%s)", key_str, self._mode, self._state)
-                return
+                return False
         elif key_str == "tab":
             if not self.is_combat_authorized("target"):
-                logger.debug("[CombatGate] Tab target key suppressed (mode=%s, state=%s)", self._mode, self._state)
-                return
+                logger.debug("[CombatGate] Tab target key '%s' suppressed (mode=%s, state=%s)", key_str, self._mode, self._state)
+                return False
         try:
             self._last_bot_key_time = time.time()
             frame = self.__dict__.get("_last_color_frame")
             if key.lower() == "esc" and hasattr(self.input_driver, "press_esc"):
-                self.input_driver.press_esc()
+                return self._driver_press_ok(self.input_driver.press_esc())
             elif hasattr(self.input_driver, "press_key"):
                 kwargs = {"frame": frame, "release_mouse": bool(release_mouse)}
                 if min_hold is not None:
                     kwargs["min_hold"] = min_hold
                 if max_hold is not None:
                     kwargs["max_hold"] = max_hold
-                self.input_driver.press_key(key, **kwargs)
+                sent = self._driver_press_ok(self.input_driver.press_key(key, **kwargs))
+                if not sent:
+                    logger.warning("Tuş gönderilemedi (sürücü 0.0/False döndü): '%s'", key)
+                return sent
             elif hasattr(self.input_driver, "send_key"):
-                self.input_driver.send_key(key)
+                return self._driver_press_ok(self.input_driver.send_key(key))
+            return False
         except Exception as exc:
             logger.error("Failed to press key '%s': %s", key, exc)
+            return False
 
     def _toggle_map_key(self) -> None:
         if bool(self._get_cfg("test_mode", False)) or self.input_driver is None:
@@ -5816,6 +8538,26 @@ class BotWorker(QThread):
         try:
             self._last_bot_key_time = time.time()
             tx, ty = int(x), int(y)
+            # F-1695: arayüz tıklaması önce WindMouse click_humanized
+            # zincirinden gönderilir (imleç-açma + dwell + jitter); zincir
+            # Interception üzerinden input_ctrl.click_map ile biter ve
+            # yumuşak yola düşmez. Başarısız olursa aşağıdaki mevcut
+            # yola düşülür. Harita tıklaması skill değildir
+            # (use_skill_key=False — R/T kuralı etkilenmez).
+            if self.windmouse is not None and hasattr(
+                self.windmouse, "click_humanized"
+            ):
+                try:
+                    if self.windmouse.click_humanized(
+                        self.input_driver, tx, ty, button="left"
+                    ):
+                        return
+                    logger.debug(
+                        "click_humanized False döndü; doğrudan harita tıklamasına düşülüyor"
+                    )
+                except Exception as wm_exc:
+                    logger.debug("click_humanized fallback: %s", wm_exc)
+
             # Layer I: 2D Gaussian Spatial Jitter (±3..6px) + WindMouse Bezier Trajectory
             if self.biometric_clicker is not None and hasattr(
                 self.biometric_clicker, "apply_2d_gaussian_jitter"
@@ -5870,9 +8612,12 @@ class BotWorker(QThread):
     def _motion_should_stop(self) -> bool:
         if self.is_paused:
             return True
-        if getattr(self, "pause_on_alt_tab", True) and self.focus_monitor is not None and hasattr(self.focus_monitor, "is_game_window_focused"):
+        # D87 [O1]: getattr — __init__ atlanmış bir çağırıcıda doğrudan
+        # self.focus_monitor okuması AttributeError veriyordu.
+        focus_mon = getattr(self, "focus_monitor", None)
+        if getattr(self, "pause_on_alt_tab", True) and focus_mon is not None and hasattr(focus_mon, "is_game_window_focused"):
             try:
-                focused, _ = self.focus_monitor.is_game_window_focused(allow_gatherion_ui=True)
+                focused, _ = focus_mon.is_game_window_focused(allow_gatherion_ui=True)
                 if not focused:
                     return True
             except Exception:
@@ -5915,9 +8660,21 @@ class BotWorker(QThread):
         if vision is None or not hasattr(vision, "is_map_open"):
             return False
         try:
-            return bool(vision.is_map_open())
+            result = vision.is_map_open()
         except Exception:
-            return False
+            # Sweep G: doğrulama hatası = bilinmiyor = engelliyor say.
+            return True
+        # v20-loop: None (bilinmiyor: bozuk/eksik kare) tek karede
+        # engelliyor sayılmaz — 1 FPS stall'da kareler bayat/bozuk
+        # geldiği için her yürüme komutu "Map UI blocks movement" diye
+        # reddediliyor, karakter sabit kalıyordu. Son BİLİNEN durum
+        # kullanılır; hiç bilinmiyorsa harita kapalı varsayılır (bot
+        # haritasız başlar). (Gather prompt tarafı None'u açık saymaya
+        # devam eder — orası ayrı kapıdır.)
+        if result is None:
+            return bool(getattr(self, "_last_known_map_open", False))
+        self._last_known_map_open = bool(result)
+        return bool(result)
 
     def _turn_key_for_node(self, node: Any) -> Optional[str]:
         x_val = self._get_node_field(node, "map_x", self._get_node_field(node, "x"))
@@ -6073,6 +8830,139 @@ class BotWorker(QThread):
         except Exception as exc:
             logger.debug("log_added emit error: %s", exc)
 
+    def _emit_harvest_stage(self) -> None:
+        """Harvest aşamasını (stage, max) harvest_stage_changed ile yayar.
+
+        main.py bu sinyali hasattr ile arayıp OverlayHUD.update_harvest_stage
+        fonksiyonuna bağlar — sinyal tanımlı ama hiç emit edilmezse rozet
+        yine 0/3'te kalır. Aynı değer tekrar emit edilmez.
+        """
+        try:
+            stage = int(getattr(self, "_current_node_harvest_stage", 0) or 0)
+            mx = max(1, int(getattr(self, "_target_harvests_for_active_node", 3) or 3))
+        except (TypeError, ValueError):
+            return
+        last = self.__dict__.get("_last_emitted_harvest")
+        if last == (stage, mx):
+            return
+        self.__dict__["_last_emitted_harvest"] = (stage, mx)
+        try:
+            self.harvest_stage_changed.emit(stage, mx)
+        except Exception as exc:
+            logger.debug("harvest_stage_changed emit error: %s", exc)
+
+    def _reset_cast_progress_tracking(self) -> None:
+        """Yeni cast aşaması: ilerleme kanıtını sıfırla."""
+        self._stage_cast_prev_pct = None
+        self._stage_cast_rose = False
+
+    def _observe_cast_progress(self, pct: float) -> bool:
+        """Bir cast okumasını ilerleme kanıtına işler.
+
+        Barın ardışık iki okumada yükseldiği görülürse True döner (ve
+        _stage_cast_rose kalıcı olur). Tek karede %90 görmek yükselme
+        sayılmaz — dolu başlayan statik bir hedef barı da %90 görünür.
+        """
+        try:
+            pct_f = float(pct)
+        except (TypeError, ValueError):
+            return bool(getattr(self, "_stage_cast_rose", False))
+        prev = getattr(self, "_stage_cast_prev_pct", None)
+        if prev is not None and pct_f > float(prev) + 1.0:
+            self._stage_cast_rose = True
+        self._stage_cast_prev_pct = pct_f
+        return bool(self._stage_cast_rose)
+
+    def _set_active_node_distance(self, dist_m: Any) -> None:
+        """Düğüm mesafesini tazelik damgasıyla birlikte yazar.
+
+        dist <= 0 "bilinmiyor" demektir (harita hiç açılmadı) — o zaman
+        damga 0 kalır ki bayat/ölçülmemiş mesafe taze sanılmasın.
+        """
+        try:
+            dist = int(dist_m) if dist_m else 0
+        except (TypeError, ValueError):
+            dist = 0
+        self.active_node_distance_m = max(0, dist)
+        self._active_node_distance_updated_ts = (
+            time.time() if self.active_node_distance_m > 0 else 0.0
+        )
+
+    def _active_node_distance_fresh(self, now: float) -> bool:
+        """Mesafe son reclick aralığı içinde ölçüldü mü?"""
+        ts = float(getattr(self, "_active_node_distance_updated_ts", 0.0) or 0.0)
+        if ts <= 0.0:
+            return False
+        try:
+            reclick_sec = float(self._get_cfg("reclick_node_sec", 10) or 10)
+        except (TypeError, ValueError):
+            reclick_sec = 10.0
+        return (now - ts) <= max(10.0, reclick_sec) + 5.0
+
+    def _refresh_node_distance_from_odometry(self, now: float) -> None:
+        """Harita açılamadığında mesafeyi odometriden tazele (v20-loop).
+
+        Kartografın oyuncu konumu (map_x, map_y) ile düğümün harita
+        koordinatı arası mesafe × WORLD_MAP_METERS_PER_PX (0.28).
+        Harita/reclick'e bağımlı değildir — stall altında da çalışır.
+        Yalnızca konum biliniyorsa ve en fazla 2 sn'de bir tazelenir.
+        Varış kararı hâlâ prompt + taze mesafe ile verilir; bu yalnızca
+        mesafenin bayat kalıp yürüyüşü 60 sn'de öldürmesini engeller.
+        """
+        if self.active_node is None:
+            return
+        if self._active_node_distance_fresh(now):
+            return
+        last = float(getattr(self, "_odometry_dist_ts", 0.0) or 0.0)
+        if (now - last) < 2.0:
+            return
+        try:
+            coords_x, coords_y = self._get_player_movement_coords()
+        except Exception:
+            return
+        if (coords_x == 0.0 and coords_y == 0.0) or coords_x is None or coords_y is None:
+            return
+        node = self.active_node
+        nx = self._get_node_field(node, "map_x")
+        ny = self._get_node_field(node, "map_y")
+        if nx is None or ny is None:
+            return
+        try:
+            px_dist = math.hypot(float(nx) - float(coords_x), float(ny) - float(coords_y))
+        except (TypeError, ValueError):
+            return
+        try:
+            from core.corridor_navigator import WORLD_MAP_METERS_PER_PX
+        except Exception:
+            return
+        dist_m = max(1, int(round(px_dist * WORLD_MAP_METERS_PER_PX)))
+        self._odometry_dist_ts = now
+        self._set_active_node_distance(dist_m)
+
+    def _rest_node_after_nav_failure(self, node_id: Any) -> None:
+        """Navigasyon hatası sonrası düğümü dinlenmeye al (v20-loop).
+
+        Mesafe hiç tazelenmediği için zaman aşımına uğrayan düğümün
+        suçu yoktur: consecutive_failures artırılmaz, kara listeye
+        girmez, silinmez. Dinlenme süresi dolunca tekrar denenir.
+        """
+        if self.route_manager is None:
+            return
+        try:
+            node = self.route_manager.get_node(node_id)
+            if node is None:
+                return
+            node.state = "resting"
+            node.last_visited_timestamp = time.time()
+            self.route_manager.save_region(node.region)
+        except Exception as exc:
+            logger.debug("nav-failure rest skipped for node %s: %s", node_id, exc)
+
+    @staticmethod
+    def _is_opportunistic_node(node: Any) -> bool:
+        """Fırsatçı yaklaşma düğümü mü (rota düğümü değil, haritası yok)?"""
+        return isinstance(node, dict) and bool(node.get("_opportunistic", False))
+
     def _emit_hud_snapshot(
         self,
         badge: Optional[str] = None,
@@ -6109,7 +8999,9 @@ class BotWorker(QThread):
         resolved_mode_badge = mode_badge or MODE_BADGE_MAP.get(curr_mode, "ROUTE")
         ready_cnt, resting_cnt = self._get_ready_and_resting_counts()
         max_failed = int(self._get_cfg("max_failed_in_row", 10) or 10)
-        version_str = str(self._get_cfg("version", "v1.6.15") or "v1.6.15")
+        # P3-1: HUD yükündeki sürüm tek kaynaktan (version.__version__);
+        # ayar dosyasındaki eski "v2.0" yazımı schema'da normalize edilir.
+        version_str = normalize_version(str(self._get_cfg("version", __version__) or __version__))
 
         if curr_mode == BotMode.MANUAL_RECORD.value:
             default_title = "Manual record"
@@ -6131,14 +9023,23 @@ class BotWorker(QThread):
             c3_t, c3_v = "PROMPT MATCH", f"{self.last_prompt_match}%"
         elif curr_mode == BotMode.COMBAT_MODE.value:
             cognition = self.game_learner.get_live_cognition_snapshot() if self.game_learner else {}
-            hp_pct = cognition.get("monster_hp_percent", 0)
-            ready_skills = cognition.get("ready_skills", ["1"])
+            # S-0103: bilinmeyen HP / hazır skill için sahte varsayılan yok
+            # (F-0046 ile aynı kural). Önceki varsayılanlar (0 ve ["1"]) HUD'a
+            # "Canavar Canı: %0 · Hazır Skiller: 1" yalanını yazdırıyordu.
+            hp_pct = cognition.get("monster_hp_percent")
+            ready_skills = cognition.get("ready_skills") or []
             learned_cnt = cognition.get("total_learned_frames", 0)
+            try:
+                _hp_num = float(hp_pct) if hp_pct is not None else None
+            except (TypeError, ValueError):
+                _hp_num = None
+            hp_txt = f"%{hp_pct}" if _hp_num is not None else "?"
+            skills_txt = ", ".join(str(s) for s in ready_skills) if ready_skills else "—"
             default_title = f"Savaş Modu: {'Canavarla Savaşılıyor' if cognition.get('monster_targeted') else 'Canavar Aranıyor'}"
-            default_sub = f"Canavar Canı: %{hp_pct} · Hazır Skiller: {', '.join(ready_skills)} · Tab ile Seç"
+            default_sub = f"Canavar Canı: {hp_txt} · Hazır Skiller: {skills_txt} · Tab ile Seç"
             c1_t, c1_v = "YZ KARELERİ", str(learned_cnt)
-            c2_t, c2_v = "CANAVAR CANI", f"%{hp_pct}" if hp_pct > 0 else "HEDEF YOK"
-            c3_t, c3_v = "HAZIR SKİL", ",".join(ready_skills[:3])
+            c2_t, c2_v = "CANAVAR CANI", f"%{hp_pct}" if (_hp_num is not None and _hp_num > 0) else "HEDEF YOK"
+            c3_t, c3_v = "HAZIR SKİL", ",".join(str(s) for s in ready_skills[:3]) if ready_skills else "—"
         else:
             node_id = self._extract_node_id(self.active_node)
             default_title = (
@@ -6154,10 +9055,17 @@ class BotWorker(QThread):
         # Canlı öğrenilen kare sayısını al
         learned_cnt = self.game_learner.total_learned_frames if self.game_learner else 0
 
+        # F-0500: _state_enter_time was write-only; expose the state age.
+        try:
+            _entered = float(self._plain_attr("_state_enter_time", time.time()) or time.time())
+            state_age_sec = round(max(0.0, time.time() - _entered), 1)
+        except Exception:
+            state_age_sec = 0.0
         payload: Dict[str, Any] = {
             "badge": curr_state,
             "mode_badge": resolved_mode_badge,
             "elapsed_str": self._format_elapsed(),
+            "state_age_sec": state_age_sec,
             "title": title if title is not None else default_title,
             "subtitle": subtitle if subtitle is not None else default_sub,
             "col1_title": col1_title if col1_title is not None else c1_t,
@@ -6175,6 +9083,19 @@ class BotWorker(QThread):
             "gathered": self.gathered_count,
             "f_pressed": self.f_pressed_count,
             "match_pct": self.last_prompt_match,
+            # Harvest beslemesi (O3 + sinyal tamamlayıcısı): aşama sayacı ve
+            # düğüm sayacı HUD/panel tarafından bu anahtarlardan okunur.
+            # _current_node_harvest_stage node bitince sıfırlanır; bu anlık
+            # değerdir, kümülatif değil.
+            "harvest_stage": int(getattr(self, "_current_node_harvest_stage", 0) or 0),
+            "harvest_max": max(
+                1, int(getattr(self, "_target_harvests_for_active_node", 3) or 3)
+            ),
+            "harvest_stage_display": (
+                f"{int(getattr(self, '_current_node_harvest_stage', 0) or 0)}/"
+                f"{max(1, int(getattr(self, '_target_harvests_for_active_node', 3) or 3))}"
+            ),
+            "gathered_nodes": int(getattr(self, "_gathered_nodes_count", 0) or 0),
         }
 
         try:
@@ -6184,20 +9105,55 @@ class BotWorker(QThread):
 
         return payload
 
+    def _core_dependency_status(self) -> Tuple[bool, List[str]]:
+        """Live core-dependency check (only meaningful for workers that went
+        through __init__; skeleton workers built via __new__ report unknown
+        as ready instead of fabricating a failure)."""
+        if "_core_deps_missing" not in self.__dict__:
+            return True, []
+        missing = [
+            name
+            for name in ("vision", "input_driver", "route_manager", "combat_recovery")
+            if self._plain_attr(name) is None
+        ]
+        return (not missing), missing
+
     def get_state_machine_health_summary(self) -> dict:
+        # F-0196: no more hardcoded worker_ready=True. Readiness is the live
+        # core-dependency status plus the real mode/state.
         try:
-            return {"worker_ready": True, "mode": str(getattr(self, "mode", "route"))}
+            ready, missing = self._core_dependency_status()
+            return {
+                "worker_ready": bool(ready),
+                "mode": str(getattr(self, "mode", "route")),
+                "state": str(getattr(self, "state", "")),
+                "paused": bool(getattr(self, "is_paused", True)),
+                "missing_core_dependencies": missing,
+                "optional_subsystem_errors": dict(
+                    self.__dict__.get("_optional_subsystem_errors", {}) or {}
+                ),
+            }
         except Exception:
-            return {"worker_ready": True, "mode": "route"}
+            return {"worker_ready": False, "mode": "route", "missing_core_dependencies": ["unknown"]}
 
     def get_state_machine_ready_flag(self) -> dict:
-        return {"module": "state_machine", "ready": True}
+        ready, missing = self._core_dependency_status()
+        return {"module": "state_machine", "ready": bool(ready), "missing": missing}
 
     def get_state_machine_version_info(self) -> dict:
-        return {"module": "state_machine", "version": "2.0.0", "ready": True}
+        # F-0510 / P3-1: tek sürüm — version.__version__. Ayar dosyasındaki
+        # sürüm de config.schema'da normalize edildiği için HUD ile aynıdır.
+        ready, _missing = self._core_dependency_status()
+        return {"module": "state_machine", "version": __version__, "ready": bool(ready)}
 
     def get_state_machine_diagnostic_snapshot(self) -> dict:
-        return {"module": "state_machine", "status": "ok", "ready": True}
+        ready, missing = self._core_dependency_status()
+        return {
+            "module": "state_machine",
+            "status": "ok" if ready else "degraded",
+            "ready": bool(ready),
+            "missing": missing,
+        }
 
     def get_state_machine_capabilities(self) -> list:
         return ["state_machine", "diagnostic_snapshot", "version_info"]

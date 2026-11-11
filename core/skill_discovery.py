@@ -19,7 +19,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger("Gatherion.SkillDiscovery")
 
-DEFAULT_SLOTS = ("1", "2", "3", "4", "5", "Q", "E", "R")
+# R/T mapping (2026-11-08): right-click attack = T, left-click attack = R.
+# T is a basic-attack key, not a hotbar icon: it belongs in the probe list
+# (DEFAULT_SLOTS) but NOT in COMBAT_ROW_SLOTS (HUD geometry has no T slot).
+DEFAULT_SLOTS = ("1", "2", "3", "4", "5", "Q", "E", "R", "T")
 CONSUMABLE_ROW_SLOTS = ("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "X", "B")
 COMBAT_ROW_SLOTS = ("1", "2", "3", "4", "5", "6", "7", "8", "Q", "E", "R")
 CENTER_EMBLEM_X_RANGE = (0.44, 0.56)
@@ -93,7 +96,8 @@ def discover_hud_rows_layout(frame_bgr: Any) -> Dict[str, Any]:
             py2 = max(py1 + 1, min(height, int(round(y2_n * height))))
 
             mean_luma = 0.0
-            occupied = True
+            # No frame → no measurement: never report the slot as occupied.
+            occupied = False
             if has_frame:
                 try:
                     patch = frame_bgr[py1:py2, px1:px2]
@@ -130,6 +134,7 @@ def discover_hud_rows_layout(frame_bgr: Any) -> Dict[str, Any]:
 
     return {
         "frame_size": (width, height),
+        "frame_present": has_frame,
         "excluded_center_emblem": {
             "label": "level_45_emblem",
             "x_range_norm": CENTER_EMBLEM_X_RANGE,
@@ -263,24 +268,38 @@ class SkillDiscovery:
         player_hp_after: float,
         buffs_before: int = 0,
         buffs_after: int = 0,
+        mana_before: Optional[float] = None,
+        mana_after: Optional[float] = None,
     ) -> SkillProbeResult:
         d_m = float(monster_hp_before) - float(monster_hp_after)
         d_p = float(player_hp_after) - float(player_hp_before)
         d_b = int(buffs_after) - int(buffs_before)
+        # "Low mana" needs an actual mana measurement — never infer it from
+        # low damage alone.
+        mana_low = False
+        if mana_before is not None and mana_after is not None:
+            try:
+                mana_low = float(mana_after) <= 0.01
+            except (TypeError, ValueError):
+                mana_low = False
         label = "unknown"
         conf = 0.3
         if d_b >= 1 and d_m < 0.05:
             label = "scroll_buff"
             conf = 0.7 + min(0.25, 0.1 * d_b)
+        elif d_m >= 0.02:
+            # Damage was dealt, so this is an attack even if the player also
+            # healed (lifesteal) — the old order labelled that defense_heal.
+            label = "attack"
+            conf = 0.6 + min(0.35, d_m)
         elif d_p >= 0.03:
             label = "defense_heal"
             conf = 0.65 + min(0.3, d_p)
-        elif d_m >= 0.02:
-            label = "attack"
-            conf = 0.6 + min(0.35, d_m)
-            if d_m < 0.05:
-                label = "attack_low_mana"
         elif d_m > 0.005:
+            # Weak hit with no mana data: plain attack, never "low mana".
+            label = "attack"
+            conf = 0.45
+        elif mana_low:
             label = "attack_low_mana"
             conf = 0.5
         result = SkillProbeResult(
@@ -352,11 +371,27 @@ class SkillDiscovery:
         """Secondary OCR/tooltip hint — never overwrites a dynamic label."""
         text = str(tooltip_text or "").lower()
         hint = None
-        if any(w in text for w in ("damage", "hasar", "deals", "strike", "attack")):
+        # "attack speed" contains "attack" — check buff phrasing before the
+        # generic attack branch, or every attack-speed/physical-attack buff
+        # is misclassified as an attack (S-1303 / D24). The later buff branch's
+        # "physical attack" key was dead code: "increases physical attack"
+        # fell into the attack branch first. Buff context words
+        # ("increases"/"scroll"/"buff") distinguish a buff scroll
+        # ("Increases physical attack") from an attack skill
+        # ("Deals physical attack damage"), which still hits the attack
+        # branch below. Note: a bare "physical attack" without buff context
+        # must NOT be forced to scroll_buff — it is an attack.
+        if "attack speed" in text:
+            hint = "scroll_buff"
+        elif "physical attack" in text and any(
+            w in text for w in ("increases", "increase", "scroll", "buff")
+        ):
+            hint = "scroll_buff"
+        elif any(w in text for w in ("damage", "hasar", "deals", "strike", "attack")):
             hint = "attack"
         elif any(w in text for w in ("restore", "heal", "shield", "removes stun", "defiance")):
             hint = "defense_heal"
-        elif any(w in text for w in ("attack speed", "physical attack", "increases", "scroll", "buff")):
+        elif any(w in text for w in ("increases", "scroll", "buff")):
             hint = "scroll_buff"
         if hint is None:
             return None

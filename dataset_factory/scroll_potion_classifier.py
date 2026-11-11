@@ -70,6 +70,22 @@ HUD_SOURCE_TAGS: Dict[str, str] = {
     "skill_slot": "hud_skill_slot",
 }
 
+# HSV threshold bounds, built once at import. compute_consumable_pixel_counts
+# runs per slot (per frame in scan_hud_slots); allocating 10 fresh uint8
+# arrays per call was pure overhead — the bounds never change.
+_HSV_HP_RED_LO1 = np.array([0, 105, 75], dtype=np.uint8)
+_HSV_HP_RED_HI1 = np.array([12, 255, 255], dtype=np.uint8)
+_HSV_HP_RED_LO2 = np.array([165, 105, 75], dtype=np.uint8)
+_HSV_HP_RED_HI2 = np.array([180, 255, 255], dtype=np.uint8)
+_HSV_MP_BLUE_LO = np.array([95, 85, 75], dtype=np.uint8)
+_HSV_MP_BLUE_HI = np.array([135, 255, 255], dtype=np.uint8)
+_HSV_MP_YELLOW_LO = np.array([20, 95, 95], dtype=np.uint8)
+_HSV_MP_YELLOW_HI = np.array([35, 255, 255], dtype=np.uint8)
+_HSV_SCROLL_LO = np.array([12, 30, 85], dtype=np.uint8)
+_HSV_SCROLL_HI = np.array([28, 175, 235], dtype=np.uint8)
+# 3x3 rect kernel for the edge dilation in scan_hud_slots (one per scan).
+_MORPH_KERNEL_3X3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
 
 @dataclass(frozen=True)
 class SlotClassificationResult:
@@ -185,14 +201,18 @@ class HUDConsumableClassifier:
         val_std = float(np.std(inner_hsv[:, :, 2]))
         val_mean = float(np.mean(inner_hsv[:, :, 2]))
 
-        full_sat_mean = float(np.mean(slot_hsv[:, :, 1]))
-        full_val_std = float(np.std(slot_hsv[:, :, 2]))
-
-        is_low_chroma = (
-            (sat_mean < self.empty_sat_mean_max and val_std < self.empty_val_std_max)
-            or (full_sat_mean < self.empty_sat_mean_max and full_val_std < self.empty_val_std_max)
-            or (sat_mean < 18.0 and val_mean < 52.0)
-        )
+        # Short-circuit: if the inner crop is already low-chroma, the result
+        # is empty no matter what the full-frame stats say, so skip the two
+        # extra full-frame reductions (the common empty-slot case).
+        if sat_mean < self.empty_sat_mean_max and val_std < self.empty_val_std_max:
+            is_low_chroma = True
+        else:
+            full_sat_mean = float(np.mean(slot_hsv[:, :, 1]))
+            full_val_std = float(np.std(slot_hsv[:, :, 2]))
+            is_low_chroma = (
+                (full_sat_mean < self.empty_sat_mean_max and full_val_std < self.empty_val_std_max)
+                or (sat_mean < 18.0 and val_mean < 52.0)
+            )
 
         metrics = {
             "sat_mean": round(sat_mean, 3),
@@ -206,7 +226,10 @@ class HUDConsumableClassifier:
                 inner_edges = slot_edges
             edge_ratio = float(np.count_nonzero(inner_edges)) / float(max(1, inner_edges.size))
             metrics["inner_edge_ratio"] = round(edge_ratio, 4)
-            if edge_ratio < 0.025 and sat_mean < 32.0:
+            # A nearly edge-free, low-saturation AND low-contrast interior is empty.
+            # The value-variance guard matters: a flat but textured/filled icon
+            # (bright/dark patches, no Canny edges) must not be called empty.
+            if edge_ratio < 0.025 and sat_mean < 32.0 and val_std < self.empty_val_std_max:
                 return True, metrics
 
         return bool(is_low_chroma), metrics
@@ -234,23 +257,23 @@ class HUDConsumableClassifier:
             }
 
         # HP Potion (red liquid)
-        r1 = cv2.inRange(slot_hsv, np.array([0, 105, 75], dtype=np.uint8), np.array([12, 255, 255], dtype=np.uint8))
-        r2 = cv2.inRange(slot_hsv, np.array([165, 105, 75], dtype=np.uint8), np.array([180, 255, 255], dtype=np.uint8))
+        r1 = cv2.inRange(slot_hsv, _HSV_HP_RED_LO1, _HSV_HP_RED_HI1)
+        r2 = cv2.inRange(slot_hsv, _HSV_HP_RED_LO2, _HSV_HP_RED_HI2)
         hp_red_px = int(np.count_nonzero(r1 | r2))
 
         # MP Potion (blue or yellow liquid)
-        b_mask = cv2.inRange(slot_hsv, np.array([95, 85, 75], dtype=np.uint8), np.array([135, 255, 255], dtype=np.uint8))
-        y_mask = cv2.inRange(slot_hsv, np.array([20, 95, 95], dtype=np.uint8), np.array([35, 255, 255], dtype=np.uint8))
+        b_mask = cv2.inRange(slot_hsv, _HSV_MP_BLUE_LO, _HSV_MP_BLUE_HI)
+        y_mask = cv2.inRange(slot_hsv, _HSV_MP_YELLOW_LO, _HSV_MP_YELLOW_HI)
         mp_blue_px = int(np.count_nonzero(b_mask))
         mp_yellow_px = int(np.count_nonzero(y_mask))
         mp_blue_yellow_px = int(np.count_nonzero(b_mask | y_mask))
 
         # Buff Scroll (rolled parchment icon: tan/golden/cream)
-        scroll_mask = cv2.inRange(
-            slot_hsv,
-            np.array([12, 30, 85], dtype=np.uint8),
-            np.array([28, 175, 235], dtype=np.uint8),
-        )
+        # NOTE: the parchment HSV range overlaps the yellow MP-potion range
+        # (H 20..28, S >= 95). Yellow-potion pixels are potion evidence, not
+        # parchment, so they are excluded from the scroll count.
+        scroll_mask = cv2.inRange(slot_hsv, _HSV_SCROLL_LO, _HSV_SCROLL_HI)
+        scroll_mask = cv2.bitwise_and(scroll_mask, cv2.bitwise_not(y_mask))
         scroll_px = int(np.count_nonzero(scroll_mask))
 
         slot_area = int(slot_hsv.shape[0] * slot_hsv.shape[1])
@@ -337,8 +360,21 @@ class HUDConsumableClassifier:
 
         empty_flag, empty_metrics = self.is_empty_slot(slot_hsv, slot_edges=slot_edges)
 
+        # Row membership. The published row constants leave a sub-pixel gap
+        # (0.938 < norm_cy < 0.939, ~1 px at 1080p) that belongs to neither
+        # row; classify_slot routes that gap to the nearest row at its
+        # midpoint so no slot center is ever unclassifiable. The predicate
+        # methods keep their pinned boundary semantics.
+        _gap_mid = (self.upper_row_y_max + self.lower_row_y_min) / 2.0
+        in_upper = self.is_upper_consumable_row(norm_cy_f) or (
+            self.upper_row_y_max < norm_cy_f < _gap_mid
+        )
+        in_lower = self.is_lower_skill_row(norm_cy_f) or (
+            _gap_mid <= norm_cy_f < self.lower_row_y_min
+        )
+
         # 2. Upper Consumable Row (0.865 <= norm_cy <= 0.938)
-        if self.is_upper_consumable_row(norm_cy_f):
+        if in_upper:
             if empty_flag:
                 return SlotClassificationResult(
                     category="empty_slot",
@@ -372,15 +408,25 @@ class HUDConsumableClassifier:
                 "scroll_ratio": round(scroll_px / float(slot_area), 4),
             }
 
+            # Confidence is derived from the evidence margin: how far the
+            # winning colour count stands above the runner-up, relative to
+            # the winner. A bare win scores near the 0.60 floor; a
+            # dominating win approaches 0.95. No fixed per-category score.
+            def _margin_conf(winner: int, runner_up: int) -> float:
+                if winner <= 0:
+                    return 0.60
+                margin = max(0.0, (winner - runner_up) / float(winner))
+                return round(min(0.95, max(0.60, 0.60 + 0.35 * margin)), 3)
+
             if hp_red_px >= min_colored and hp_red_px > mp_blue_yellow_px and hp_red_px > scroll_px:
                 category = "hp_potion"
-                conf = 0.70
+                conf = _margin_conf(hp_red_px, max(mp_blue_yellow_px, scroll_px))
             elif mp_blue_yellow_px >= min_colored and mp_blue_yellow_px > scroll_px:
                 category = "mp_potion"
-                conf = 0.70
+                conf = _margin_conf(mp_blue_yellow_px, scroll_px)
             elif scroll_px >= min_scroll:
                 category = "buff_scroll"
-                conf = 0.68
+                conf = _margin_conf(scroll_px, max(hp_red_px, mp_blue_yellow_px))
             else:
                 return SlotClassificationResult(
                     category="unclassified",
@@ -415,7 +461,7 @@ class HUDConsumableClassifier:
             )
 
         # 3. Lower Combat Skills Row (norm_cy >= 0.939)
-        if self.is_lower_skill_row(norm_cy_f):
+        if in_lower:
             if empty_flag:
                 return SlotClassificationResult(
                     category="empty_slot",
@@ -459,13 +505,45 @@ class HUDConsumableClassifier:
                     metrics=metrics,
                 )
 
+            # Edges alone do not make a skill slot: a flat, desaturated box
+            # (uniform grey panel, empty slot frame) has frame edges but no
+            # icon content. Require chromatic or contrast evidence as well.
+            slot_sat_mean = float(np.mean(slot_hsv[:, :, 1])) if slot_hsv.size else 0.0
+            slot_val_std = float(np.std(slot_hsv[:, :, 2])) if slot_hsv.size else 0.0
+            metrics["slot_sat_mean"] = round(slot_sat_mean, 3)
+            metrics["slot_val_std"] = round(slot_val_std, 3)
+            if slot_sat_mean < 15.0 and slot_val_std < 10.0:
+                return SlotClassificationResult(
+                    category="unclassified",
+                    class_id=None,
+                    canonical_class_id=None,
+                    label_tr=HUD_CLASS_LABELS_TR["unclassified"],
+                    confidence=0.0,
+                    should_label=False,
+                    row_type="lower_skill_row",
+                    is_empty=False,
+                    is_center_emblem=False,
+                    norm_cx=norm_cx_f,
+                    norm_cy=norm_cy_f,
+                    source="flat_skill_slot_filter",
+                    metrics=metrics,
+                )
+
             category = "skill_slot"
+            # Confidence from measured evidence (edge strength + icon
+            # saturation), not a fixed constant.
+            edge_evidence = min(1.0, edge_cnt / float(max(1, min_edges * 3)))
+            sat_evidence = min(1.0, slot_sat_mean / 150.0)
+            skill_conf = round(
+                min(0.92, max(0.60, 0.60 + 0.32 * (0.5 * edge_evidence + 0.5 * sat_evidence))),
+                3,
+            )
             return SlotClassificationResult(
                 category=category,
                 class_id=self._resolve_class_id(category),
                 canonical_class_id=CANONICAL_HUD_CLASS_IDS[category],
                 label_tr=HUD_CLASS_LABELS_TR[category],
-                confidence=0.68,
+                confidence=skill_conf,
                 should_label=True,
                 row_type="lower_skill_row",
                 is_empty=False,
@@ -516,10 +594,35 @@ class HUDConsumableClassifier:
 
         img_h, img_w = frame_bgr.shape[:2]
         x, y, w, h = [int(round(float(v))) for v in bbox_xywh]
-        x1 = max(0, min(img_w - 1, x))
-        y1 = max(0, min(img_h - 1, y))
-        x2 = max(x1 + 1, min(img_w, x + max(1, w)))
-        y2 = max(y1 + 1, min(img_h, y + max(1, h)))
+        # A bbox with no overlap with the frame carries no pixels to
+        # classify; a 1-px sliver left after clamping is not a slot either.
+        # Reject both instead of classifying a clipped strip.
+        if x + w <= 0 or y + h <= 0 or x >= img_w or y >= img_h:
+            return SlotClassificationResult(
+                category="unclassified",
+                class_id=None,
+                canonical_class_id=None,
+                label_tr=HUD_CLASS_LABELS_TR["unclassified"],
+                confidence=0.0,
+                should_label=False,
+                row_type="out_of_frame",
+                is_empty=False,
+            )
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(img_w, x + max(1, w))
+        y2 = min(img_h, y + max(1, h))
+        if (x2 - x1) < 8 or (y2 - y1) < 8:
+            return SlotClassificationResult(
+                category="unclassified",
+                class_id=None,
+                canonical_class_id=None,
+                label_tr=HUD_CLASS_LABELS_TR["unclassified"],
+                confidence=0.0,
+                should_label=False,
+                row_type="out_of_frame",
+                is_empty=False,
+            )
 
         norm_cx = (x1 + x2) * 0.5 / float(max(1, img_w))
         norm_cy = (y1 + y2) * 0.5 / float(max(1, img_h))
@@ -574,9 +677,13 @@ class HUDConsumableClassifier:
 
         scale_x = float(img_w) / 2000.0
         y1, y2 = int(img_h * 0.80), int(img_h * 0.98)
-        x1, x2 = int(img_w * 0.18), int(img_w * 0.82)
+        # Scan the full bottom-HUD width. The old 0.18..0.82 window (and the
+        # extra 20% skill-ROI inset on top of it) never saw consumable slots
+        # in the left strip of the HUD; row/emblem filtering in
+        # classify_slot already rejects non-slot candidates.
+        x1, x2 = int(img_w * 0.05), int(img_w * 0.95)
         roi_w = x2 - x1
-        skill_roi_x1 = x1 + int(roi_w * 0.20)
+        skill_roi_x1 = x1
         skill_roi_x2 = x2
 
         skill_roi_gray = gray[y1:y2, skill_roi_x1:skill_roi_x2]
@@ -588,7 +695,7 @@ class HUDConsumableClassifier:
         else:
             roi_edges = cv2.Canny(skill_roi_gray, 50, 150)
 
-        sq_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        sq_kernel = _MORPH_KERNEL_3X3
         edges_dil = cv2.dilate(roi_edges, sq_kernel)
         cnts, _ = cv2.findContours(edges_dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -606,6 +713,10 @@ class HUDConsumableClassifier:
                     if int(np.count_nonzero(slot_edges)) >= min_edge_px:
                         valid_slots.append((bx, by, bw, bh))
 
+        # Row-major order (top row first, left to right) before the
+        # max_slots cut, so truncation drops the last slots, not arbitrary
+        # contour-detection order.
+        valid_slots.sort(key=lambda b: (b[1], b[0]))
         results: List[Dict[str, Any]] = []
         for bx, by, bw, bh in valid_slots[:max_slots]:
             abs_x = skill_roi_x1 + bx
@@ -650,6 +761,39 @@ class HUDConsumableClassifier:
         return results
 
 
+def classify_hud_slot_crop(
+    crop_bgr: np.ndarray,
+    *,
+    norm_cx: float,
+    norm_cy: float,
+    classifier: Optional["HUDConsumableClassifier"] = None,
+) -> Dict[str, Any]:
+    """Classify one HUD slot crop with the real classifier.
+
+    This is the function :meth:`CalibrationWizard.auto_calibrate_consumables_and_hud`
+    imports. It returns a plain dict (never a fabricated default): ``valid``
+    is True only when the classifier actually labels the crop
+    (``should_label``); empty / unclassified / out-of-row crops report
+    ``valid=False`` with ``class_id=None`` so callers cannot mistake them
+    for a potion.
+    """
+    clf = classifier or HUDConsumableClassifier()
+    res = clf.classify_slot(crop_bgr, norm_cx=float(norm_cx), norm_cy=float(norm_cy))
+    return {
+        "class_id": res.class_id,
+        "canonical_class_id": res.canonical_class_id,
+        "class_name": res.category,
+        "label_tr": res.label_tr,
+        "confidence": float(res.confidence),
+        "valid": bool(res.should_label),
+        "should_label": bool(res.should_label),
+        "is_empty": bool(res.is_empty),
+        "row_type": res.row_type,
+        "source": res.source,
+        "metrics": dict(res.metrics or {}),
+    }
+
+
 __all__ = [
     "UPPER_CONSUMABLE_ROW_Y_MIN",
     "UPPER_CONSUMABLE_ROW_Y_MAX",
@@ -664,4 +808,5 @@ __all__ = [
     "HUD_SOURCE_TAGS",
     "SlotClassificationResult",
     "HUDConsumableClassifier",
+    "classify_hud_slot_crop",
 ]

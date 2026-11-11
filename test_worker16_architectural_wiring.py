@@ -11,8 +11,13 @@ Verifies:
 
 import os
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 import pytest
+
+# Headless Linux (CI/VM without $DISPLAY): run Qt offscreen instead of failing
+# to connect to a display. Leaves real displays and Windows/macOS alone.
+if os.environ.get("QT_QPA_PLATFORM") is None and os.name == "posix" and not os.environ.get("DISPLAY"):
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QWidget
@@ -43,6 +48,11 @@ class MockShell(QObject):
         super().__init__()
         self.pages = {}
         self._opened_tools = []
+
+    def _mount(self, key: str, widget):
+        """Minimal stand-in for GatherionShell._mount: store + return the widget."""
+        self.pages[key] = widget
+        return widget
 
     def open_tool(self, key: str):
         self._opened_tools.append(key)
@@ -109,10 +119,108 @@ class MockYoloWidget(QObject):
         self.training_clicked = True
 
 
+class _StubRouteManager:
+    """Real-attribute stand-in for the route manager (no MagicMock).
+
+    A wrong attribute name (e.g. ``activeRegion``) raises AttributeError
+    instead of silently creating a new mock attribute, so the wiring test
+    actually proves which attributes production code writes.
+    """
+
+    def __init__(self):
+        self.active_region = ""
+        self.active_route = ""
+
+
+class _StubSettings:
+    def __init__(self):
+        self.active_region = ""
+        self.active_route = ""
+
+
+class _StubSettingsManager:
+    def __init__(self):
+        self.saved = []
+
+    def save(self, settings):
+        self.saved.append(settings)
+
+
+class _StubF9Menu:
+    """Records set_active_state calls instead of swallowing them."""
+
+    def __init__(self):
+        self.set_active_state_calls = []
+        self.set_active_route_calls = []
+
+    def set_active_state(self, **kwargs):
+        self.set_active_state_calls.append(kwargs)
+
+    def set_active_route(self, region, route):
+        self.set_active_route_calls.append((region, route))
+
+
+class _StubWorker:
+    def __init__(self):
+        self.mode = "ROUTE"
+        self.auto_cartography_enabled = True
+        self.minimap_scanner = None
+        self.dataset_factory = None
+        self.yolo_detector = _StubDetector()
+        self.hud_snapshot_calls = 0
+
+    def _emit_hud_snapshot(self):
+        self.hud_snapshot_calls += 1
+
+
+class _StubDetector:
+    def __init__(self):
+        self.model_path = None
+        self.load_calls = 0
+
+    def _load_model_if_available(self):
+        self.load_calls += 1
+        # D4/F-1137: the real loader returns bool; a stub returning None
+        # makes reload_ai_model honestly report failure.
+        return True
+
+
+class _RecordingVision:
+    def __init__(self):
+        self.load_templates_calls = 0
+
+    def load_templates(self):
+        self.load_templates_calls += 1
+
+
+class _RecordingMinimapScanner:
+    def __init__(self):
+        self.load_calls = 0
+
+    def _load_optional_templates(self):
+        self.load_calls += 1
+
+
+class _RecordingMaterialScanner:
+    def __init__(self):
+        self.reload_calls = 0
+
+    def reload_templates(self):
+        self.reload_calls += 1
+
+
+class _RecordingOverlay:
+    def __init__(self):
+        self.logs = []
+
+    def add_log(self, message):
+        self.logs.append(message)
+
+
 class FakeOrchestrator(QObject):
     def __init__(self):
         super().__init__()
-        self.overlay = MagicMock()
+        self.overlay = _RecordingOverlay()
         self.radar_win = None
         self.settings_win = None
         self.calibration_win = None
@@ -121,16 +229,15 @@ class FakeOrchestrator(QObject):
         self.analytics_win = None
         self.guide_win = None
         self.mobile_connect_win = None
-        self.route_mgr = MagicMock()
-        self.settings = MagicMock()
-        self.settings_mgr = MagicMock()
-        self.f9_menu = MagicMock()
-        self.worker = MagicMock()
-        self.worker.mode = "ROUTE"
-        self.vision = MagicMock()
-        self.minimap_scanner = MagicMock()
-        self.material_scanner = MagicMock()
-        self.yolo_detector = MagicMock()
+        self.route_mgr = _StubRouteManager()
+        self.settings = _StubSettings()
+        self.settings_mgr = _StubSettingsManager()
+        self.f9_menu = _StubF9Menu()
+        self.worker = _StubWorker()
+        self.vision = _RecordingVision()
+        self.minimap_scanner = _RecordingMinimapScanner()
+        self.material_scanner = _RecordingMaterialScanner()
+        self.yolo_detector = _StubDetector()
         self.shell = None
 
     _on_shell_page_created = main.GatherionOrchestrator._on_shell_page_created
@@ -138,6 +245,14 @@ class FakeOrchestrator(QObject):
     _connect_yolo_factory_signals = main.GatherionOrchestrator._connect_yolo_factory_signals
     _on_template_updated = main.GatherionOrchestrator._on_template_updated
     _on_settings_route_changed = main.GatherionOrchestrator._on_settings_route_changed
+    # R22: _on_shell_page_created "settings" dali bu uc slotu da baglar
+    # (main.py:1316 settings_saved, :1318 quit_requested,
+    # :1322 selective_gather_changed). Fake, odunc alinan handler'in
+    # eristigi her metodu yansitmak zorunda; eksik olunca AttributeError
+    # verir (v2 FAILED). Yalnizca baglanirlar, bu testte cagrilmazlar.
+    _on_settings_saved = main.GatherionOrchestrator._on_settings_saved
+    shutdown = main.GatherionOrchestrator.shutdown
+    handle_selective_gather_changed = main.GatherionOrchestrator.handle_selective_gather_changed
     _on_map_node_toggled = main.GatherionOrchestrator._on_map_node_toggled
     _on_map_node_deleted = main.GatherionOrchestrator._on_map_node_deleted
     _on_canvas_node_added = main.GatherionOrchestrator._on_canvas_node_added
@@ -170,9 +285,11 @@ def test_lazy_page_dynamic_wiring_calibration():
 
     # Trigger template_updated
     calib_widget.template_updated.emit("new_template.png")
-    orchestrator.vision.load_templates.assert_called_once()
-    orchestrator.minimap_scanner._load_optional_templates.assert_called_once()
-    orchestrator.overlay.add_log.assert_called_once()
+    assert orchestrator.vision.load_templates_calls == 1
+    assert orchestrator.minimap_scanner.load_calls == 1
+    assert orchestrator.material_scanner.reload_calls == 1
+    assert len(orchestrator.overlay.logs) == 1
+    assert "new_template.png" in orchestrator.overlay.logs[0]
 
 
 def test_lazy_page_dynamic_wiring_map_viewer():
@@ -185,11 +302,11 @@ def test_lazy_page_dynamic_wiring_map_viewer():
 
     # Test node_toggled emission
     map_widget.node_toggled.emit(42)
-    orchestrator.overlay.add_log.assert_called_with("Harita: Nokta #42 durumu güncellendi")
+    assert "Harita: Nokta #42 durumu güncellendi" in orchestrator.overlay.logs
 
     # Test node_deleted emission
     map_widget.node_deleted.emit(42)
-    orchestrator.overlay.add_log.assert_called_with("Harita: Nokta #42 silindi")
+    assert "Harita: Nokta #42 silindi" in orchestrator.overlay.logs
 
 
 def test_settings_route_changed_sync():
@@ -223,15 +340,24 @@ def test_settings_route_changed_sync():
     assert radar_win.reloaded is True
     assert radar_win.updated is True
 
-    # Verify f9_menu updated
-    orchestrator.f9_menu.set_active_state.assert_called_once()
+    # Worker must have emitted a HUD snapshot as part of the sync
+    assert orchestrator.worker.hud_snapshot_calls == 1
+
+    # Verify f9_menu updated with the real region/route values (not just "called")
+    assert len(orchestrator.f9_menu.set_active_state_calls) == 1
+    f9_kwargs = orchestrator.f9_menu.set_active_state_calls[0]
+    assert f9_kwargs["active_region"] == "Verteron"
+    assert f9_kwargs["active_route"] == "Verteron Route 1"
+
+    # Settings manager must have persisted the same settings object
+    assert orchestrator.settings_mgr.saved == [orchestrator.settings]
 
 
 def test_trigger_ai_training_safe_retrieval():
     """Verify trigger_ai_training_and_open_dialog retrieves lazy page without crashing if initially None."""
     orchestrator = FakeOrchestrator()
     orchestrator.shell = MockShell()
-    orchestrator._show_shell_tab = MagicMock(return_value=True)
+    orchestrator._show_shell_tab = lambda key: True  # UI tab switch shim
 
     yolo_widget = MockYoloWidget()
     orchestrator.shell.pages["yolo"] = yolo_widget
@@ -246,37 +372,71 @@ def test_trigger_ai_training_safe_retrieval():
 
 
 def test_reload_ai_model_mechanism(tmp_path):
-    """Verify reload_ai_model hot-reloads model in yolo_detector and self.worker."""
-    fake_model = tmp_path / "models" / "best.onnx"
-    fake_model.parent.mkdir(parents=True, exist_ok=True)
-    fake_model.write_bytes(b"ONNX{fake_model_bytes}")
+    """Verify reload_ai_model hot-reloads a REAL ONNX model in yolo_detector and self.worker.
+
+    F-1442: the old test wrote fake bytes (b"ONNX{...}") and claimed the model
+    was reloaded although no ONNX parser ever saw the file. This test copies
+    the repo's genuine yolov8n_gatherion.onnx (PyTorch-exported ModelProto)
+    and reloads that copy, so the reload path handles a real model file.
+    """
+    import shutil
+    from pathlib import Path as _Path
+
+    real_model = _Path(main.MODELS_DIR) / "yolov8n_gatherion.onnx"
+    assert real_model.is_file(), "repo models/yolov8n_gatherion.onnx is missing"
+    header = real_model.read_bytes()[:64]
+    assert header[:1] == b"\x08" and b"pytorch" in header, "not a genuine ONNX ModelProto"
+
+    fake_dir = tmp_path / "models"
+    fake_dir.mkdir(parents=True, exist_ok=True)
+    real_copy = fake_dir / "best.onnx"
+    shutil.copy(real_model, real_copy)
 
     orchestrator = FakeOrchestrator()
-    orchestrator.worker.yolo_detector = MagicMock()
 
-    with patch.object(main, "MODELS_DIR", str(fake_model.parent)):
-        res = orchestrator.reload_ai_model(str(fake_model))
+    with patch.object(main, "MODELS_DIR", str(fake_dir)):
+        res = orchestrator.reload_ai_model(str(real_copy))
         assert res is True
-        assert orchestrator.yolo_detector.model_path == os.path.abspath(str(fake_model))
-        orchestrator.yolo_detector._load_model_if_available.assert_called_once()
-        orchestrator.overlay.add_log.assert_called_once()
+        assert orchestrator.yolo_detector.model_path == os.path.abspath(str(real_copy))
+        assert orchestrator.yolo_detector.load_calls == 1
+        # The worker's own detector must be reloaded too, with the same path.
+        assert orchestrator.worker.yolo_detector.model_path == os.path.abspath(str(real_copy))
+        assert orchestrator.worker.yolo_detector.load_calls == 1
+        assert len(orchestrator.overlay.logs) == 1
 
 
 def test_shell_page_created_signal_dynamic_hooking():
-    """Verify shell.page_created signal dynamically invokes _on_shell_page_created."""
+    """Verify _hook_shell_page_creation itself wires dynamic page creation.
+
+    F-1336: the old test connected ``shell.page_created`` to the handler by
+    hand and then emitted it, so it tested its own wiring, not the hook.
+    _hook_shell_page_creation does NOT connect page_created at all — it wraps
+    shell._mount and shell.open_tool. This test therefore exercises only the
+    hook: after hooking, mounting / opening a page through the shell must
+    invoke _on_shell_page_created with no manual signal connection.
+    """
     orchestrator = FakeOrchestrator()
     shell = MockShell()
     orchestrator.shell = shell
 
-    # Hook shell page creation
+    # Hook shell page creation — no manual .connect() anywhere in this test.
     orchestrator._hook_shell_page_creation(shell)
-    shell.page_created.connect(orchestrator._on_shell_page_created)
+    assert getattr(shell._mount, "_gatherion_hooked", False) is True
+    assert getattr(shell.open_tool, "_gatherion_hooked", False) is True
 
-    # Emit dynamic creation of calibration and stats
+    # Path 1: _mount creates the calibration page -> handler runs.
     calib = MockCalibrationWidget()
-    shell.page_created.emit("calibration", calib)
+    shell._mount("calibration", calib)
     assert orchestrator.calibration_win is calib
 
+    # Path 2: open_tool materializes a page already registered in shell.pages.
     stats_widget = QWidget()
-    shell.page_created.emit("stats", stats_widget)
+    shell.pages["stats"] = stats_widget
+    shell.open_tool("stats")
     assert orchestrator.analytics_win is stats_widget
+
+    # The hook must be idempotent: hooking twice must not double-wrap/fire twice.
+    orchestrator._hook_shell_page_creation(shell)
+    calib2 = MockCalibrationWidget()
+    shell._mount("calibration", calib2)
+    assert orchestrator.calibration_win is calib2

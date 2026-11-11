@@ -49,6 +49,31 @@ if _app is None:
     _app = QApplication(sys.argv)
 
 
+def _isolate_disk_panic_history(testcase: unittest.TestCase) -> None:
+    """Neutralise the on-disk panic strip for HUD layout tests.
+
+    OverlayHUD.__init__ calls refresh_panic_from_disk(), which reads the
+    latest record under logs/alarms/ and shows the panic strip — growing
+    the card by ~5px (295 > 290/275). That directory is written by the
+    test suite itself, so whether the strip appears depends on test
+    ordering/history, not on the layout under test. Patching the reader
+    to return [] keeps the production behaviour (showing the strip)
+    intact while the geometry assertions measure the bare layout.
+    Test-side isolation only — no production code is touched.
+    """
+    from unittest import mock
+
+    from core.opsec_crypto import PanicAlertSystem
+
+    patcher = mock.patch.object(
+        PanicAlertSystem,
+        "load_panic_history_from_disk",
+        lambda *args, **kwargs: [],
+    )
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+
+
 class TestLiveDataBinding(unittest.TestCase):
     """
     Requirement R1 Verification:
@@ -60,6 +85,30 @@ class TestLiveDataBinding(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication(sys.argv)
+        # One shell for the whole class: construction mounts all 10 pages and
+        # reloads the 7.7 MB Altgard map (~20-35 s on this VM), so a fresh
+        # shell per test costs ~90 s for three tests that only read the home
+        # page. Tests run in ALPHABETICAL order under unittest/pytest (not
+        # definition order), so test_app_shell_apply_snapshot_live_binding
+        # runs BEFORE test_app_shell_clean_default_idle_indicators and
+        # mutates the shared home page (active chip "35", visible) — the
+        # idle test therefore resets the page to idle itself via
+        # apply_snapshot({}) before asserting. The shell is closed in
+        # tearDownClass, never in per-test tearDown.
+        from ui.app_shell import GatherionShell
+
+        cls.shell = GatherionShell()
+        cls.app.processEvents()
+        cls.home_page = cls.shell.pages.get("home")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            cls.shell.close()
+            cls.shell.deleteLater()
+        except Exception:
+            pass
+        cls.app.processEvents()
 
     def setUp(self) -> None:
         self.widgets_to_cleanup: List[QWidget] = []
@@ -73,6 +122,29 @@ class TestLiveDataBinding(unittest.TestCase):
                 pass
         self.widgets_to_cleanup.clear()
         self.app.processEvents()
+
+    def _stat_chips(self, home_page: QWidget) -> Dict[str, Any]:
+        """Stat chips of a home page, asserting the full key set is present.
+
+        The three shell tests used to repeat this getattr-fallback lookup
+        plus the exact-keys assertion; a missing chip must FAIL, not silently
+        skip the checks below (previously `if "active" in stat_chips:` let a
+        refactor pass vacuously).
+        """
+        chips = getattr(home_page, "_stats", getattr(home_page, "_stat_chips", {}))
+        self.assertIsInstance(chips, dict)
+        self.assertEqual(
+            set(chips.keys()),
+            {"gathered", "active", "failures", "yz"},
+            "HomePage stat chips are missing keys — the idle/snapshot checks below must not be skipped",
+        )
+        return chips
+
+    def _chip_value_label(self, chip: Any) -> QLabel:
+        """Value label of a stat/session chip, asserting it exists."""
+        lbl = getattr(chip, "value", getattr(chip, "_value_label", None))
+        self.assertIsNotNone(lbl, "Stat chip has no value label")
+        return lbl
 
     def _collect_widget_texts(self, root: QWidget) -> List[str]:
         """Recursively collects visible text from all QLabel, QPushButton, etc."""
@@ -118,6 +190,46 @@ class TestLiveDataBinding(unittest.TestCase):
         self.assertIsInstance(cap["fps"], (int, float))
         self.assertIsInstance(cap["latency_ms"], (int, float))
 
+        # S-7204: fallback + cache behaviour (previously only key/type checks,
+        # so a broken fallback or cache would still pass).
+        # 1) Cache: a second snapshot inside the TTL is equal but a deep copy
+        # (F-0396) — callers must never mutate the cache or observe later
+        # refreshes through an old handle.
+        SystemMonitor.reset_cache()
+        snap1 = SystemMonitor.get_snapshot()
+        snap2 = SystemMonitor.get_snapshot()
+        self.assertEqual(snap1, snap2, "Consecutive snapshots within the cache TTL must be equal")
+        self.assertIsNot(snap1, snap2, "get_snapshot must return a deep copy, not the cached dict itself")
+        self.assertIsNot(snap1["gpu"], snap2["gpu"], "get_snapshot must deep-copy nested sections")
+        # 2) GPU fallback: with NVML unavailable the snapshot must report the
+        # clean idle fallback (available False, zeroed values), never invented
+        # hardware numbers. Forced via monkeypatch so the check holds on a
+        # GPU machine too, not only on this GPU-less host.
+        import core.system_monitor as system_monitor
+
+        original_init_nvml = system_monitor._init_nvml_if_needed
+        try:
+            system_monitor._init_nvml_if_needed = lambda: False
+            SystemMonitor.reset_cache()
+            fb = SystemMonitor.get_snapshot()
+            self.assertFalse(
+                fb["gpu"]["available"],
+                "GPU fallback must report available=False when NVML is absent",
+            )
+            self.assertEqual(fb["gpu"]["pct"], 0, "GPU fallback pct must be 0")
+            self.assertEqual(fb["gpu"]["temp"], 0, "GPU fallback temp must be 0")
+            self.assertEqual(fb["gpu"]["mem_used_gb"], 0.0, "GPU fallback mem_used_gb must be 0.0")
+            self.assertEqual(fb["gpu"]["mem_total_gb"], 0.0, "GPU fallback mem_total_gb must be 0.0")
+            # 3) Capture fallback with no capture instance: nothing measured.
+            self.assertEqual(fb["capture"]["fps"], 0.0, "Capture fallback fps must be 0.0")
+            self.assertFalse(
+                fb["capture"]["latency_measured"],
+                "No capture instance means no measured latency",
+            )
+        finally:
+            system_monitor._init_nvml_if_needed = original_init_nvml
+            SystemMonitor.reset_cache()
+
     def test_app_shell_no_mock_prototype_strings_in_active_views(self) -> None:
         """
         Verifies GatherionShell and HomePage contain NO prototype mock strings:
@@ -127,10 +239,7 @@ class TestLiveDataBinding(unittest.TestCase):
         - No fake detections ('Saf Aether Kristali', 'Odyle Parçası', 'Aria Cevheri', 'Saldırgan: Lepharist Gözcü')
         - No fake footer stats ('Bugün: 3 oturum · en iyi toplama 68/saat · ortalama güven %90.2')
         """
-        from ui.app_shell import GatherionShell
-
-        shell = GatherionShell()
-        self.widgets_to_cleanup.append(shell)
+        shell = self.shell
         self.app.processEvents()
 
         # Check topbar performance label
@@ -169,69 +278,91 @@ class TestLiveDataBinding(unittest.TestCase):
         """
         Verifies that unstarted/idle state displays clean default idle indicators:
         - Topbar: clean idle or live hardware metrics
-        - Active nodes default: '0' (not '195')
+        - Active nodes default: hidden with an empty value (not '195' and not
+          a made-up '0' — F-0553: idle means no measurement, so the chip is
+          hidden via hide_stat() instead of showing a fabricated default)
         - Session chip default: '0:00' with subtext 'beklemede' or 'duraklatıldı' (not '3:44')
         - Route summary: contains '0 node' or '—' or 'Bölge Seçilmedi' / 'Rota Yok'
         - Route progress: '%0 — 0 aktif node' (not '%18 — 195 aktif node')
         """
-        from ui.app_shell import GatherionShell
-
-        shell = GatherionShell()
-        self.widgets_to_cleanup.append(shell)
+        shell = self.shell
         self.app.processEvents()
 
-        home_page = shell.pages.get("home")
+        home_page = self.home_page
         self.assertIsNotNone(home_page)
 
-        # Active nodes counter
-        stat_chips = getattr(home_page, "_stats", getattr(home_page, "_stat_chips", {}))
-        if "active" in stat_chips:
-            chip = stat_chips["active"]
-            val_lbl = getattr(chip, "value", getattr(chip, "_value_label", None))
-            if val_lbl is not None:
-                active_val = val_lbl.text().strip()
-                self.assertNotEqual(
-                    active_val,
-                    "195",
-                    f"Active node chip defaulted to mock value '195' instead of '0'",
-                )
+        # Sıra kirliliği izolasyonu: unittest/pytest metotları alfabetik
+        # çalıştırır, bu yüzden test_app_shell_apply_snapshot_live_binding
+        # bu testten ÖNCE koşup paylaşılan home sayfasını mutasyona uğratır
+        # (active chip "35" + görünür). Idle iddiası bozulmamış idle
+        # durumunu ölçer; o yüzden önce üretimin kendi idle yolundan
+        # (apply_snapshot({}) → tüm chipler hide_stat, session "0:00",
+        # route özeti "Bölge Seçilmedi · 0 node") sıfırla. Üretim
+        # davranışına dokunulmaz — yalnızca test izolasyonu.
+        home_page.apply_snapshot({})
+        self.app.processEvents()
 
-        # Session chip
-        if hasattr(home_page, "session_chip"):
-            chip = home_page.session_chip
-            val_lbl = getattr(chip, "value", getattr(chip, "_value_label", None))
-            if val_lbl is not None:
-                sess_val = val_lbl.text().strip()
-                self.assertNotEqual(
-                    sess_val,
-                    "3:44",
-                    f"Session chip defaulted to mock value '3:44' instead of '0:00'",
-                )
-                self.assertIn(sess_val, ("0:00", "00:00", "—"))
+        # Stat chips must exist — a missing chip must FAIL, not silently skip
+        stat_chips = self._stat_chips(home_page)
+        active_chip = stat_chips["active"]
+        active_lbl = self._chip_value_label(active_chip)
+        active_val = active_lbl.text().strip()
+        self.assertNotEqual(
+            active_val,
+            "195",
+            "Active node chip defaulted to mock value '195' instead of being hidden",
+        )
+        # S-7201 / F-0553: idle means NO measurement — HomePage.apply_snapshot
+        # hides the chip (hide_stat: value "" + setVisible(False)) instead of
+        # showing a made-up "0". Expect the hidden empty state, not "0".
+        self.assertEqual(
+            active_val,
+            "",
+            "Active node chip must show no value while idle (F-0553: no made-up '0')",
+        )
+        self.assertTrue(
+            active_chip.isHidden(),
+            "Active node chip must be hidden while idle (F-0553)",
+        )
 
-        # Route summary label
-        if hasattr(home_page, "route_summary_label"):
-            route_text = home_page.route_summary_label.text()
-            self.assertNotIn("195 node", route_text)
+        # Session chip must exist and show the idle value.
+        self.assertTrue(hasattr(home_page, "session_chip"), "HomePage has no session_chip")
+        chip = home_page.session_chip
+        val_lbl = self._chip_value_label(chip)
+        sess_val = val_lbl.text().strip()
+        self.assertNotEqual(
+            sess_val,
+            "3:44",
+            "Session chip defaulted to mock value '3:44' instead of '0:00'",
+        )
+        self.assertIn(sess_val, ("0:00", "00:00", "—"))
 
-        # Route progress label
-        if hasattr(home_page, "route_progress_label"):
-            prog_text = home_page.route_progress_label.text()
-            self.assertNotIn("%18", prog_text)
-            self.assertNotIn("195", prog_text)
+        # Route summary label must exist and carry no mock node count.
+        self.assertTrue(hasattr(home_page, "route_summary_label"), "HomePage has no route_summary_label")
+        route_text = home_page.route_summary_label.text()
+        self.assertNotIn("195 node", route_text)
+
+        # Route progress label must exist and carry no mock progress.
+        self.assertTrue(hasattr(home_page, "route_progress_label"), "HomePage has no route_progress_label")
+        prog_text = home_page.route_progress_label.text()
+        self.assertNotIn("%18", prog_text)
+        self.assertNotIn("195", prog_text)
 
     def test_app_shell_apply_snapshot_live_binding(self) -> None:
         """
-        Verifies that calling apply_snapshot with live data updates the UI elements accordingly
-        without adding mock offsets (e.g. no +224 offset).
-        """
-        from ui.app_shell import GatherionShell
+        Verifies that calling apply_snapshot with live data updates the UI elements
+        with the snapshot values verbatim — no mock offset is added to any numeric
+        field (e.g. active=35 must render as "35 node", not 35+224=259).
 
-        shell = GatherionShell()
-        self.widgets_to_cleanup.append(shell)
+        NOTE: "session_time_str" is NOT a production input — ui/app_shell.py
+        HomePage.apply_snapshot never reads it (it derives the session chip from
+        session_duration_sec / elapsed time while running, else "0:00"), so the
+        snapshot below must not pass it: a dead key can never prove live binding.
+        """
+        shell = self.shell
         self.app.processEvents()
 
-        home_page = shell.pages.get("home")
+        home_page = self.home_page
         self.assertIsNotNone(home_page)
 
         snapshot = {
@@ -247,27 +378,39 @@ class TestLiveDataBinding(unittest.TestCase):
             "capture": {"fps": 55.4, "latency_ms": 18.0},
             "state": "RUNNING",
             "mode": "explorer",
-            "session_time_str": "05:12",
         }
 
         home_page.apply_snapshot(snapshot)
         self.app.processEvents()
 
-        # Check route summary label
-        if hasattr(home_page, "route_summary_label"):
-            route_summary = home_page.route_summary_label.text()
-            self.assertIn("Morheim", route_summary)
-            self.assertIn("Ice Fortress Path", route_summary)
-            self.assertIn("35", route_summary)
+        # Route summary label must exist and carry the exact values, verbatim.
+        self.assertTrue(hasattr(home_page, "route_summary_label"), "HomePage has no route_summary_label")
+        route_summary = home_page.route_summary_label.text()
+        self.assertIn("Morheim", route_summary)
+        self.assertIn("Ice Fortress Path", route_summary)
+        # Exact "35 node" (not a bare "35" substring, which "359" would also satisfy).
+        self.assertIn("35 node", route_summary)
+        # No mock offset: none of the snapshot numbers may appear shifted by +224.
+        for shifted in ("259", "242", "226", "229"):
+            self.assertNotIn(shifted, route_summary, f"Route summary shows a +224-shifted value {shifted}")
 
-        # Check stat chips
-        chips = getattr(home_page, "_stats", getattr(home_page, "_stat_chips", {}))
+        # Stat chips must exist and show the snapshot values exactly.
+        chips = self._stat_chips(home_page)
         for key, expected_val in [("gathered", "18"), ("active", "35"), ("failures", "2"), ("yz", "5")]:
-            if key in chips:
-                chip = chips[key]
-                val_lbl = getattr(chip, "value", getattr(chip, "_value_label", None))
-                if val_lbl is not None:
-                    self.assertEqual(val_lbl.text().strip(), expected_val)
+            chip = chips[key]
+            val_lbl = self._chip_value_label(chip)
+            self.assertEqual(val_lbl.text().strip(), expected_val)
+            self.assertNotEqual(
+                val_lbl.text().strip(),
+                str(int(expected_val) + 224),
+                f"Stat chip {key!r} shows a +224-shifted value",
+            )
+
+        # Session chip: idle (not running) so it must read "0:00" — the snapshot
+        # carries no session_duration_sec and no dead "session_time_str" key.
+        self.assertTrue(hasattr(home_page, "session_chip"), "HomePage has no session_chip")
+        sess_lbl = self._chip_value_label(home_page.session_chip)
+        self.assertEqual(sess_lbl.text().strip(), "0:00")
 
     def test_settings_window_clean_defaults_and_no_mock_strings(self) -> None:
         """
@@ -283,34 +426,35 @@ class TestLiveDataBinding(unittest.TestCase):
         self.widgets_to_cleanup.append(settings)
         self.app.processEvents()
 
-        # Check status label
-        if hasattr(settings, "status_lbl"):
-            status_text = settings.status_lbl.text()
-            self.assertNotIn(
-                "YZ taraması yanlış düğüm bulamadı",
-                status_text,
-                "Settings status label still displays hardcoded scan report",
-            )
-            self.assertTrue(
-                "hazır" in status_text.lower() or "beklemede" in status_text.lower() or "yüklendi" in status_text.lower(),
-                f"Settings status label does not indicate clean ready/idle state: {status_text}",
-            )
+        # Check status label (S-4301: assert existence first — a bare
+        # hasattr guard would pass vacuously if the label were removed).
+        self.assertTrue(hasattr(settings, "status_lbl"), "SettingsWindow has no status_lbl")
+        status_text = settings.status_lbl.text()
+        self.assertNotIn(
+            "YZ taraması yanlış düğüm bulamadı",
+            status_text,
+            "Settings status label still displays hardcoded scan report",
+        )
+        self.assertTrue(
+            "hazır" in status_text.lower() or "beklemede" in status_text.lower() or "yüklendi" in status_text.lower(),
+            f"Settings status label does not indicate clean ready/idle state: {status_text}",
+        )
 
-        # Check version label
-        if hasattr(settings, "version_lbl"):
-            version_text = settings.version_lbl.text()
-            self.assertNotIn("v1.6.15", version_text, "Settings version label is outdated (v1.6.15)")
-            self.assertIn("v2.0", version_text)
+        # Check version label (S-4301: same — must fail, not skip, if removed).
+        self.assertTrue(hasattr(settings, "version_lbl"), "SettingsWindow has no version_lbl")
+        version_text = settings.version_lbl.text()
+        self.assertNotIn("v1.6.15", version_text, "Settings version label is outdated (v1.6.15)")
+        self.assertIn("v2.0", version_text)
 
-        # Check header metric chips
+        # Check header metric chips (S-4301: same — must fail, not skip, if removed).
         for chip_attr in ("chip_fps", "chip_gpu", "chip_cpu", "chip_lat"):
-            if hasattr(settings, chip_attr):
-                chip = getattr(settings, chip_attr)
-                txt = chip.text()
-                self.assertNotIn("61", txt, f"{chip_attr} contains hardcoded 61")
-                self.assertNotIn("32%", txt, f"{chip_attr} contains hardcoded 32%")
-                self.assertNotIn("14%", txt, f"{chip_attr} contains hardcoded 14%")
-                self.assertNotIn("16ms", txt, f"{chip_attr} contains hardcoded 16ms")
+            self.assertTrue(hasattr(settings, chip_attr), f"SettingsWindow has no {chip_attr}")
+            chip = getattr(settings, chip_attr)
+            txt = chip.text()
+            self.assertNotIn("61", txt, f"{chip_attr} contains hardcoded 61")
+            self.assertNotIn("32%", txt, f"{chip_attr} contains hardcoded 32%")
+            self.assertNotIn("14%", txt, f"{chip_attr} contains hardcoded 14%")
+            self.assertNotIn("16ms", txt, f"{chip_attr} contains hardcoded 16ms")
 
     def test_analytics_dialog_clean_fallbacks_and_no_mock_multipliers(self) -> None:
         """
@@ -328,20 +472,101 @@ class TestLiveDataBinding(unittest.TestCase):
         analytics.refresh_metrics()
         self.app.processEvents()
 
+        # 1) avg_match_pct default fallback must be exactly 0.0 (not fake 89.5).
+        # A bare assertNotEqual(..., 89.5) would also pass for 89.6 or any other
+        # wrong value, so assert the exact default the empty telemetry yields.
         last_metrics = getattr(analytics, "_last_metrics", {})
         avg_match = last_metrics.get("avg_match_pct", 0.0)
-        self.assertNotEqual(
+        self.assertEqual(
             avg_match,
-            89.5,
-            f"AnalyticsDialog _last_metrics still falls back to fake 89.5 match confidence!",
+            0.0,
+            f"AnalyticsDialog _last_metrics avg_match_pct must fall back to exactly 0.0, got {avg_match!r}",
         )
+
+        # 2) Table pricing must NOT hardcode cnt * 9900. The KİNAH column
+        # (index 6) prices via the real broker lookup. F-1481: the old test
+        # seeded unknown "Test Ore" and expected a fabricated 10000 default
+        # ("30.00K"), but production (F-0547, analytics_dialog.py) shows
+        # "fiyat yok" for unknown materials and never invents a price — and
+        # format_kinah_tr(30000) is "30K", not "30.00K". So seed a KNOWN
+        # broker-priced material instead: "Iron Ore" = 6400 Kinah/unit
+        # (DEFAULT_BROKER_PRICES + config/broker_prices.json, probe-verified),
+        # so 3 adet must render as format_kinah_tr(3 * 6400) = "19.2K" —
+        # never a 9900 multiple (3 * 9900 = 29.700 / "29.70K").
+        analytics._populate_table(
+            [
+                {
+                    "resource_type": "Iron Ore",
+                    "region": "Morheim",
+                    "route": "Ice Fortress Path",
+                    "count": 3,
+                    "share_pct": 100.0,
+                    "avg_walk_sec": 1.5,
+                    "avg_match_pct": 0.0,
+                }
+            ]
+        )
+        self.app.processEvents()
+        self.assertEqual(analytics.table.rowCount(), 1, "Analytics table must hold the seeded row")
+        count_cell = analytics.table.item(0, 3)
+        self.assertIsNotNone(count_cell)
+        self.assertEqual(count_cell.text().strip(), "3")
+        kinah_cell = analytics.table.item(0, 6)
+        self.assertIsNotNone(kinah_cell, "Analytics table has no KİNAH cell")
+        kinah_text = kinah_cell.text().strip()
+        self.assertNotIn("9900", kinah_text, f"KİNAH column hardcodes a 9900 price: {kinah_text!r}")
+        self.assertNotIn("29.700", kinah_text, f"KİNAH column shows cnt*9900 (3*9900): {kinah_text!r}")
+        self.assertNotIn("29.70K", kinah_text, f"KİNAH column shows cnt*9900 (3*9900): {kinah_text!r}")
+        self.assertNotIn("fiyat yok", kinah_text, f"KİNAH column did not resolve the known Iron Ore price: {kinah_text!r}")
+        self.assertEqual(kinah_text, "19.2K", f"KİNAH column must show the real broker price (3 x 6400), got {kinah_text!r}")
+
+        # 2b) F-0547 companion: an UNKNOWN material must show "fiyat yok",
+        # never a fabricated default price (the old "30.00K" expectation).
+        analytics._populate_table(
+            [
+                {
+                    "resource_type": "Test Ore",
+                    "region": "Morheim",
+                    "route": "Ice Fortress Path",
+                    "count": 3,
+                    "share_pct": 100.0,
+                    "avg_walk_sec": 1.5,
+                    "avg_match_pct": 0.0,
+                }
+            ]
+        )
+        self.app.processEvents()
+        self.assertEqual(analytics.table.rowCount(), 1, "Analytics table must hold the seeded row")
+        unknown_kinah_cell = analytics.table.item(0, 6)
+        self.assertIsNotNone(unknown_kinah_cell, "Analytics table has no KİNAH cell")
+        self.assertEqual(
+            unknown_kinah_cell.text().strip(),
+            "fiyat yok",
+            f"Unknown material must show 'fiyat yok', got {unknown_kinah_cell.text().strip()!r}",
+        )
+
+        # 3) Insights region must NOT hardcode 'Altgard' when there is no data:
+        # with empty rows the insight cards fall back to "—" / "Henüz veri yok".
+        analytics._update_insights([], 0.0)
+        self.app.processEvents()
+        insight_texts = []
+        for card_attr in ("ins_rota", "ins_kinah", "ins_dikkat"):
+            self.assertTrue(hasattr(analytics, card_attr), f"AnalyticsDialog has no {card_attr}")
+            card = getattr(analytics, card_attr)
+            insight_texts.append(card.val_lbl.text())
+            insight_texts.append(card.sub_lbl.text())
+        for text in insight_texts:
+            self.assertNotIn("Altgard", text, f"Insights card hardcodes 'Altgard' with no data: {text!r}")
+        self.assertEqual(analytics.ins_rota.val_lbl.text(), "—")
+        self.assertEqual(analytics.ins_kinah.val_lbl.text(), "—")
+        self.assertEqual(analytics.ins_rota.sub_lbl.text(), "Henüz veri yok")
 
 
 class TestOverlayHUDLayout(unittest.TestCase):
     """
     Requirement R2 Verification:
     Asserts floating HUD overlay layout geometry:
-    - Default size (540, 290) and minimum size (500, 275) without bottom vertical cutoff.
+    - Default size (760, 290) and minimum size (720, 275) without bottom vertical cutoff.
     - Zero text clipping on all 8 action buttons via QFontMetrics.
     - Stats container row 1 has at least 26px height (no number truncation).
     - Log labels have independent vertical clearance (no overlapping text).
@@ -352,6 +577,7 @@ class TestOverlayHUDLayout(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication(sys.argv)
 
     def setUp(self) -> None:
+        _isolate_disk_panic_history(self)
         # Import either from ui.overlay_window or ui.overlay_hud
         try:
             from ui.overlay_window import OverlayHUD
@@ -380,30 +606,53 @@ class TestOverlayHUDLayout(unittest.TestCase):
         self.assertIsNotNone(cls_ref)
 
     def test_hud_dimensions_default_and_minimum(self) -> None:
-        """Verifies HUD supports default (540, 290) and minimum (500, 275) dimensions."""
-        # Minimum size check
-        min_size = self.hud.minimumSize()
-        self.assertLessEqual(min_size.width(), 500, f"HUD minimumWidth {min_size.width()} > 500")
-        self.assertLessEqual(min_size.height(), 275, f"HUD minimumHeight {min_size.height()} > 275")
+        """Verifies HUD supports default (760, 290) and minimum (720, 275) dimensions.
 
-        # Resize to default
-        self.hud.resize(540, 290)
+        [O4] Minimum width is 720, not 500: the 8 single-row action buttons
+        need 687px for long Turkish labels (D71 clipping test); at 500px all
+        8 clipped. Default (760, 290) keeps the +40/+15 delta over minimum.
+        """
+        # Minimum size check — S-7207: exact equality, not one-sided bounds.
+        # A MINIMUM_SIZE regression to (500, 200), or a default-size shrink,
+        # would still pass assertLessEqual/assertGreaterEqual, so pin both ends.
+        min_size = self.hud.minimumSize()
+        self.assertEqual(
+            min_size.width(),
+            720,
+            f"HUD minimumWidth must be exactly 720 (8 buttons need 687px), got {min_size.width()}",
+        )
+        self.assertEqual(
+            min_size.height(),
+            275,
+            f"HUD minimumHeight must be exactly 275, got {min_size.height()}",
+        )
+
+        # Resize to default — the default size itself is pinned too.
+        self.hud.resize(760, 290)
         self.app.processEvents()
-        self.assertEqual(self.hud.width(), 540)
-        self.assertGreaterEqual(self.hud.height(), 275)
+        self.assertEqual(self.hud.width(), 760)
+        self.assertEqual(self.hud.height(), 290)
 
     def test_hud_no_bottom_vertical_cutoff_at_default_and_minimum(self) -> None:
         """
         Asserts that card layout minimum size fits within window height across default
         and minimum dimensions, ensuring zero bottom vertical cutoff.
         """
-        test_sizes = [(540, 290), (500, 275)]
+        # [S-4304] Sizes must be >= MINIMUM_SIZE (720, 275): Qt clamps a shown
+        # window to its minimum, so (540, 290)/(500, 275) silently tested 720px
+        # geometry. Default (760, 290) / minimum (720, 275) are exercised for real.
+        test_sizes = [(760, 290), (720, 275)]
         for w, h in test_sizes:
             with self.subTest(size=(w, h)):
                 self.hud.resize(w, h)
                 if hasattr(self.hud, "card"):
                     self.hud.card.resize(w, h)
                 self.app.processEvents()
+                self.assertEqual(
+                    self.hud.width(),
+                    w,
+                    f"HUD width {self.hud.width()} != requested {w} (clamped to minimum?)",
+                )
 
                 card = getattr(self.hud, "card", self.hud)
                 card_layout = card.layout()
@@ -416,21 +665,23 @@ class TestOverlayHUDLayout(unittest.TestCase):
                     f"Card layout minimum height {min_h}px overflows window height {h}px at size ({w}, {h})",
                 )
 
-                # Verify footer layout or version label does not overflow bottom
-                if hasattr(self.hud, "version_label"):
-                    geo = self.hud.version_label.geometry()
-                    self.assertLessEqual(
-                        geo.bottom(),
-                        h,
-                        f"Version label bottom {geo.bottom()} exceeds HUD height {h}",
-                    )
+                # Verify footer layout or version label does not overflow bottom.
+                # (S-7202: assert existence first — a bare hasattr guard would
+                # pass vacuously if the label were removed.)
+                self.assertTrue(hasattr(self.hud, "version_label"), "OverlayHUD has no version_label")
+                geo = self.hud.version_label.geometry()
+                self.assertLessEqual(
+                    geo.bottom(),
+                    h,
+                    f"Version label bottom {geo.bottom()} exceeds HUD height {h}",
+                )
 
     def test_all_8_action_buttons_no_text_clipping(self) -> None:
         """
         Asserts all 8 action buttons (Başlat, Menü, Nokta, Durdur, Devam, Savaş, Toplam, Kapat):
         - Have non-empty text.
         - Zero text clipping: QFontMetrics horizontal advance + horizontal clearance <= allocated button width.
-        - Verified across default (540, 290) and minimum (500, 275) window sizes.
+        - Verified across default (760, 290) and minimum (720, 275) window sizes.
         """
         button_attrs = [
             ("btn_run", "Başlat"),
@@ -443,12 +694,19 @@ class TestOverlayHUDLayout(unittest.TestCase):
             ("btn_quit", "Kapat"),
         ]
 
-        test_sizes = [(540, 290), (500, 275)]
+        # [S-4304] See test_hud_no_bottom_vertical_cutoff_at_default_and_minimum:
+        # sizes must be >= MINIMUM_SIZE (720, 275), else Qt clamps the shown HUD.
+        test_sizes = [(760, 290), (720, 275)]
         for w, h in test_sizes:
             self.hud.resize(w, h)
             if hasattr(self.hud, "card"):
                 self.hud.card.resize(w, h)
             self.app.processEvents()
+            self.assertEqual(
+                self.hud.width(),
+                w,
+                f"HUD width {self.hud.width()} != requested {w} (clamped to minimum?)",
+            )
 
             for btn_attr, expected_text in button_attrs:
                 with self.subTest(size=(w, h), button=btn_attr):
@@ -491,56 +749,80 @@ class TestOverlayHUDLayout(unittest.TestCase):
         Asserts that the stats container row 1 (numerical values) has at least 26px height
         to guarantee 19px-22px bold glyphs are not truncated vertically.
         """
-        test_sizes = [(540, 290), (500, 275)]
+        # [S-4304] Sizes must be >= MINIMUM_SIZE (720, 275); see cutoff test.
+        test_sizes = [(760, 290), (720, 275)]
         for w, h in test_sizes:
             with self.subTest(size=(w, h)):
                 self.hud.resize(w, h)
                 if hasattr(self.hud, "card"):
                     self.hud.card.resize(w, h)
                 self.app.processEvents()
+                self.assertEqual(
+                    self.hud.width(),
+                    w,
+                    f"HUD width {self.hud.width()} != requested {w} (clamped to minimum?)",
+                )
 
                 # Check stat value labels
                 for stat_attr in ("gathered_label", "ready_label", "failed_label"):
-                    if hasattr(self.hud, stat_attr):
-                        lbl: QLabel = getattr(self.hud, stat_attr)
-                        lbl_h = lbl.height()
-                        self.assertGreaterEqual(
-                            lbl_h,
-                            24,
-                            f"Stat label {stat_attr} height {lbl_h}px is less than 24px minimum at size ({w}, {h})",
-                        )
+                    # [S-4302] No silent skip: every stat label is required.
+                    # If one is removed the test must fail, not pass vacuously.
+                    self.assertTrue(
+                        hasattr(self.hud, stat_attr),
+                        f"OverlayHUD missing required stat label '{stat_attr}'",
+                    )
+                    lbl: QLabel = getattr(self.hud, stat_attr)
+                    lbl_h = lbl.height()
+                    self.assertGreaterEqual(
+                        lbl_h,
+                        26,
+                        f"Stat label {stat_attr} height {lbl_h}px is less than 26px minimum at size ({w}, {h})",
+                    )
 
     def test_logs_container_no_overlapping_labels(self) -> None:
         """
         Asserts that the 3 log labels have independent vertical clearance and do not
         overlap each other vertically.
         """
-        test_sizes = [(540, 290), (500, 275)]
+        # [S-4304] Sizes must be >= MINIMUM_SIZE (720, 275); see cutoff test.
+        test_sizes = [(760, 290), (720, 275)]
         for w, h in test_sizes:
             with self.subTest(size=(w, h)):
                 self.hud.resize(w, h)
                 if hasattr(self.hud, "card"):
                     self.hud.card.resize(w, h)
                 self.app.processEvents()
+                self.assertEqual(
+                    self.hud.width(),
+                    w,
+                    f"HUD width {self.hud.width()} != requested {w} (clamped to minimum?)",
+                )
 
                 log_labels = getattr(self.hud, "log_labels", [])
-                if len(log_labels) >= 3:
-                    geo0 = log_labels[0].geometry()
-                    geo1 = log_labels[1].geometry()
-                    geo2 = log_labels[2].geometry()
+                # [S-4303] No silent skip: exactly 3 log labels are required.
+                # If a refactor drops one, the overlap assertions must fail,
+                # not disappear.
+                self.assertEqual(
+                    len(log_labels),
+                    3,
+                    f"OverlayHUD must expose exactly 3 log labels, got {len(log_labels)}",
+                )
+                geo0 = log_labels[0].geometry()
+                geo1 = log_labels[1].geometry()
+                geo2 = log_labels[2].geometry()
 
-                    # Assert label 0 is strictly above label 1
-                    self.assertLessEqual(
-                        geo0.y() + geo0.height(),
-                        geo1.y() + 1,
-                        f"Log label 0 overlaps log label 1: y0={geo0.y()} h0={geo0.height()} vs y1={geo1.y()}",
-                    )
-                    # Assert label 1 is strictly above label 2
-                    self.assertLessEqual(
-                        geo1.y() + geo1.height(),
-                        geo2.y() + 1,
-                        f"Log label 1 overlaps log label 2: y1={geo1.y()} h1={geo1.height()} vs y2={geo2.y()}",
-                    )
+                # Assert label 0 is strictly above label 1
+                self.assertLessEqual(
+                    geo0.y() + geo0.height(),
+                    geo1.y() + 1,
+                    f"Log label 0 overlaps log label 1: y0={geo0.y()} h0={geo0.height()} vs y1={geo1.y()}",
+                )
+                # Assert label 1 is strictly above label 2
+                self.assertLessEqual(
+                    geo1.y() + geo1.height(),
+                    geo2.y() + 1,
+                    f"Log label 1 overlaps log label 2: y1={geo1.y()} h1={geo1.height()} vs y2={geo2.y()}",
+                )
 
 
 class TestYOLOPreviewAnnotations(unittest.TestCase):
@@ -657,6 +939,35 @@ class TestYOLOPreviewAnnotations(unittest.TestCase):
         self.assertFalse(ann.isNull())
         self.assertEqual(ann.size(), QSize(400, 300))
 
+        # S-7205: prove labels are actually NOT drawn — render the same frame
+        # with labels on and require the two images to differ (the label pill
+        # + text above the box), while the no-label image must still differ
+        # from the source (the bounding box itself is drawn).
+        ann_labels = render_annotated_pixmap(src, annotations, show_labels=True)
+        self.assertFalse(ann_labels.isNull())
+        src_img = src.toImage()
+        no_label_img = ann.toImage()
+        label_img = ann_labels.toImage()
+        diff_no_label_vs_src = 0
+        diff_labels_vs_no_label = 0
+        for x in range(400):
+            for y in range(300):
+                if no_label_img.pixelColor(x, y) != src_img.pixelColor(x, y):
+                    diff_no_label_vs_src += 1
+                if label_img.pixelColor(x, y) != no_label_img.pixelColor(x, y):
+                    diff_labels_vs_no_label += 1
+        self.assertGreater(
+            diff_no_label_vs_src,
+            0,
+            "show_labels=False must still draw the bounding box (facade detected!)",
+        )
+        self.assertGreater(
+            diff_labels_vs_no_label,
+            0,
+            "show_labels=True must draw label pills that show_labels=False omits — "
+            "otherwise the flag is ignored",
+        )
+
     def test_yolo_preview_dialog_initialization_and_canvas(self) -> None:
         """
         Verifies YOLOPreviewDialog initializes properly with a test image and annotations,
@@ -686,12 +997,14 @@ class TestYOLOPreviewAnnotations(unittest.TestCase):
         self.assertEqual(len(dialog.canvas._annotations), 2)
         self.assertTrue(dialog.canvas._show_annotations)
 
-        # Test toggle annotations
-        if hasattr(dialog, "chk_annotations"):
-            dialog.chk_annotations.setChecked(False)
-            self.assertFalse(dialog.canvas._show_annotations)
-            dialog.chk_annotations.setChecked(True)
-            self.assertTrue(dialog.canvas._show_annotations)
+        # Test toggle annotations — S-7203: assert existence first; a bare
+        # hasattr guard would pass with zero assertions if the checkbox were
+        # removed (same silent-pass pattern fixed by S-4301/S-4302 elsewhere).
+        self.assertTrue(hasattr(dialog, "chk_annotations"), "YOLOPreviewDialog has no chk_annotations")
+        dialog.chk_annotations.setChecked(False)
+        self.assertFalse(dialog.canvas._show_annotations)
+        dialog.chk_annotations.setChecked(True)
+        self.assertTrue(dialog.canvas._show_annotations)
 
     def test_yolo_preview_edge_cases(self) -> None:
         """
@@ -730,9 +1043,13 @@ class TestYOLOPreviewAnnotations(unittest.TestCase):
 
     def test_yolo_factory_dialog_lightbox_integration(self) -> None:
         """
-        Verifies YOLOFactoryDialog imports and routes review preview popup to YOLOPreviewDialog
-        or preserves annotations for lightbox display.
+        Verifies YOLOFactoryDialog routes the review preview to YOLOPreviewDialog
+        and preserves annotations for lightbox display (S-7206: previously only
+        hasattr presence was asserted — the routing itself was never exercised).
         """
+        from unittest.mock import patch
+
+        import ui.yolo_panel as yolo_panel
         from ui.yolo_factory_dialog import YOLOFactoryDialog
 
         factory = YOLOFactoryDialog()
@@ -743,6 +1060,83 @@ class TestYOLOPreviewAnnotations(unittest.TestCase):
         self.assertTrue(hasattr(factory, "review_preview"))
         # Assert lightbox open method exists
         self.assertTrue(hasattr(factory, "_open_review_lightbox"))
+
+        # _open_review_lightbox opens a modal YOLOPreviewDialog (dlg.exec()),
+        # so patch the dialog class: the mock records the routing arguments
+        # and exec() returns at once instead of blocking the test.
+        # 1) No pixmap yet: lightbox must log and return WITHOUT opening a dialog.
+        with patch.object(yolo_panel, "YOLOPreviewDialog") as mock_dialog:
+            factory._open_review_lightbox()
+            mock_dialog.assert_not_called()
+        self.assertFalse(
+            factory._lightbox_open,
+            "_lightbox_open must stay False when there is no pixmap to enlarge",
+        )
+
+        # 2) With a review pixmap plus one weak and one trusted box, the dialog
+        # must open with BOTH annotations preserved, the stem in the title
+        # and the detection count in the meta string.
+        pix = QPixmap(640, 480)
+        pix.fill(QColor("#1a1a24"))
+        factory._review_lightbox_pixmap = pix
+        factory._review_items = [
+            {
+                "stem": "kare_01",
+                "conf": 0.91,
+                "weak": [
+                    {
+                        "class_name": "ore_orichalcum",
+                        "confidence": 0.88,
+                        "cx": 0.4,
+                        "cy": 0.4,
+                        "w": 0.1,
+                        "h": 0.1,
+                    }
+                ],
+                "trusted": [
+                    {
+                        "class_name": "herb_aria",
+                        "confidence": 0.94,
+                        "cx": 0.5,
+                        "cy": 0.5,
+                        "w": 0.18,
+                        "h": 0.18,
+                    }
+                ],
+            }
+        ]
+        factory._review_index = 0
+        with patch.object(yolo_panel, "YOLOPreviewDialog") as mock_dialog:
+            factory._open_review_lightbox()
+            self.assertEqual(
+                mock_dialog.call_count,
+                1,
+                "Lightbox must open exactly one YOLOPreviewDialog",
+            )
+            kwargs = mock_dialog.call_args.kwargs
+            self.assertIs(
+                kwargs.get("source_pixmap"),
+                pix,
+                "Lightbox must pass the review pixmap to the dialog",
+            )
+            routed = kwargs.get("annotations", [])
+            self.assertEqual(
+                len(routed),
+                2,
+                f"Lightbox must preserve both weak + trusted annotations, got {routed!r}",
+            )
+            self.assertEqual(
+                {a.get("class_name") for a in routed},
+                {"ore_orichalcum", "herb_aria"},
+                "Lightbox must preserve weak and trusted boxes, not drop one side",
+            )
+            self.assertIn("kare_01", kwargs.get("title", ""), "Lightbox title must carry the frame stem")
+            self.assertIn("2 tespit", kwargs.get("meta", ""), "Lightbox meta must carry the detection count")
+        # The finally block in _open_review_lightbox must reset the flag.
+        self.assertFalse(
+            factory._lightbox_open,
+            "_lightbox_open must be reset after the dialog closes",
+        )
 
 
 if __name__ == "__main__":

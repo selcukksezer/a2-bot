@@ -24,9 +24,11 @@ from core.hardware_input_port import SerialHidAdapter
 from tools.hid_com_util import (
     env_export_line,
     format_port_table,
+    hid_candidates,
     list_com_ports,
     pick_best_port,
     port_devices,
+    tap_keys,
     wait_for_new_com,
     write_settings_serial_port,
 )
@@ -43,16 +45,38 @@ def _resolve_port(args: argparse.Namespace) -> str:
             print("ERROR: no new COM within timeout", file=sys.stderr)
             return ""
         print("New COM:", ", ".join(fresh))
-        port = pick_best_port(prefer_new=fresh) or fresh[0]
+        # S-4901 (same pattern as F-1227 in set_hid_com.py): `pick_best_port(...)
+        # or fresh[0]` used the first fresh COM without checking whether it is
+        # a HID candidate. When pick_best_port returns '' (ambiguous / no
+        # candidate), fail loudly instead of smoking the wrong port.
+        picked = pick_best_port(prefer_new=fresh)
+        if not picked:
+            cands = hid_candidates()
+            print(
+                "ERROR: new COM(s) could not be resolved to a single HID "
+                f"candidate: {', '.join(fresh)}; candidates: "
+                + (", ".join(c.device for c in cands) or "(none)"),
+                file=sys.stderr,
+            )
+            print(format_port_table(), file=sys.stderr)
+            return ""
+        port = picked
     if not port and args.auto:
         port = pick_best_port()
     if not port:
         # Fall back to settings.json via env-less resolve
         try:
-            from core.hardware_input_port import resolve_serial_hid_port
+            from core.hardware_input_port import (
+                is_tcp_hid_endpoint,
+                resolve_serial_hid_port,
+            )
 
             cand = str(resolve_serial_hid_port() or "").strip()
-            if cand and not cand.lower().startswith("tcp"):
+            # resolve_serial_hid_port may return a network endpoint
+            # (tcp://, udp://, or bare host:port) from GATHERION_HID_TCP /
+            # input.hid_tcp — that is NOT a COM port and must never be
+            # handed to SerialHidAdapter as port_name.
+            if cand and not is_tcp_hid_endpoint(cand):
                 port = cand
         except Exception:
             pass
@@ -161,14 +185,23 @@ def main() -> int:
         return 0 if ok_ping else 1
 
     keys = [k.strip().lower() for k in str(args.keys).split(",") if k.strip()]
-    hold = max(20, int(args.hold_ms)) / 1000.0
-    for key in keys:
+
+    def _report(key: str, down_ok: bool, up_ok: bool) -> None:
         print(f"  KEYDOWN/UP {key}")
-        hid.key_down(key)
-        time.sleep(hold)
-        hid.key_up(key)
-        time.sleep(0.15)
+        if not down_ok or not up_ok:
+            print(
+                f"  FAIL key {key}: key_down={down_ok} key_up={up_ok}",
+                file=sys.stderr,
+            )
+
+    failed_keys = tap_keys(hid, keys, hold_ms=int(args.hold_ms), gap_sec=0.15, on_key=_report)
     hid.close()
+    if failed_keys:
+        print(
+            f"FAIL: key send failed for {failed_keys} on {port}",
+            file=sys.stderr,
+        )
+        return 1
     print("Done. Focus Notepad/AION2 — keys must come from the USB HID device.")
     print("Skills are NOT proven until MP/CD drops with this COM path live.")
     print("Combat path: SerialHID connected → Tab/1/2/3 hardware-only (no soft SendInput).")

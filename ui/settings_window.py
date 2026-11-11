@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Gatherion v1.6.15 Dark Theme Settings & Node Management Window.
+Gatherion v2.0 Dark Theme Settings & Node Management Window.
 
 Matches `video_frames/frame_06s.jpg`, `frame_12s.jpg`, and `frame_21s.jpg` pixel-for-pixel:
 - Custom animated pill switch `ToggleSwitch(QCheckBox)` rendered with `QPainter`
 - Left Column:
   * GATHERING group (`f_interval_min`, `f_interval_max`, `test_mode`, `show_overlay`)
-  * ROUTE group (`rest_minutes`, `climb_air_max_sec`, `gathered_join_active_route`,
-    `fly_unreachable`, `check_odyle_minimap`, `reclick_node_sec`, `time_to_reach_sec`,
+  * ROUTE group (`rest_minutes`, `gathered_join_active_route`,
+    `fly_unreachable`, `reclick_node_sec`, `time_to_reach_sec`,
     `gather_on_the_way`, `wait_min_after_failed`, `max_failed_in_row`,
     `remove_node_after_failures`, `pause_after_no_gather_min`, `fight_back`,
     `fight_stop_gather_sec`)
@@ -24,7 +24,7 @@ Matches `video_frames/frame_06s.jpg`, `frame_12s.jpg`, and `frame_21s.jpg` pixel
     Row 2: `Seçilenleri Sil`, `YZ Yanlışları Sil`
     Row 3: `Share route...`, `Import route...`, `Import from questlog...`
 - Footer Bar:
-  * Left: `Quit bot` (`quit_requested`), `Gatherion v1.6.15` label, `status_lbl`
+  * Left: `Quit bot` (`quit_requested`), `Gatherion vX.Y.Z` label, `status_lbl`
   * Right: `Reset to defaults`, blue `Save` (`#3b82f6`, `settings_saved`), `Close`
 """
 
@@ -38,6 +38,12 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+# F-0540 tek kaynak: HP/MP iksir eşikleri config/schema.py
+# HP/MP_POTION_THRESHOLD_PCT sabitlerinden gelir (sözleşme no 10: 65/45).
+# DEFAULT_SETTINGS de bu sabitlerden türetilir; stdlib-only modül olduğu
+# için üst düzey içe aktarma döngü yaratmaz.
+from config.schema import HP_POTION_THRESHOLD_PCT, MP_POTION_THRESHOLD_PCT
+
 from PyQt6.QtCore import (
     QEasingCurve,
     QEvent,
@@ -45,12 +51,12 @@ from PyQt6.QtCore import (
     QItemSelectionModel,
     QObject,
     QPoint,
-    QPointF,
     QPropertyAnimation,
     QRect,
     QRectF,
     QSize,
     Qt,
+    QThread,
     QTimer,
     pyqtProperty,
     pyqtSignal,
@@ -60,10 +66,7 @@ from PyQt6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
-    QImage,
-    QMouseEvent,
     QPainter,
-    QPainterPath,
     QPalette,
     QPen,
     QPixmap,
@@ -86,11 +89,11 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
-    QStackedLayout,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -99,6 +102,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.shell_page_frame import wrap_shell_tab_root_layout
+from version import __version__
 
 logger = logging.getLogger("Gatherion.SettingsWindow")
 if not logger.handlers:
@@ -126,10 +130,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "gather_key": "f",
     "retry_on_extraction_fail": True,
     "rest_minutes": 5,
-    "climb_air_max_sec": 10,
     "gathered_join_active_route": True,
-    "fly_unreachable": False,
-    "check_odyle_minimap": False,
+    # F-23-04: şema varsayılanıyla uyumlu (şema: True, dosya: true).
+    # Eskiden UI False diyordu; dosya silinince/bozulunca davranış
+    # hangi kodun önce varsayılan ürettiğine göre değişiyordu.
+    "fly_unreachable": True,
     "reclick_node_sec": 10,
     "time_to_reach_sec": 60,
     "gather_on_the_way": False,
@@ -140,7 +145,6 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "fight_back": True,
     "fight_stop_gather_sec": 3,
     "minimap_auto_record": True,
-    "minimap_ignore_monsters": True,
     "break_every_min": 0,
     "break_every_variance": 1,
     "break_lasts_min": 10,
@@ -152,11 +156,17 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "selected_materials": [],
     "proximity_route_auto": True,
     "auto_use_hp_potion": True,
-    "hp_potion_threshold_pct": 65,
+    "hp_potion_threshold_pct": HP_POTION_THRESHOLD_PCT,
+    "hp_potion_key": "F1",
     "auto_use_mp_potion": True,
-    "mp_potion_threshold_pct": 45,
+    "mp_potion_threshold_pct": MP_POTION_THRESHOLD_PCT,
+    "mp_potion_key": "F2",
     "auto_refresh_buff_scroll": True,
     "buff_scroll_interval_sec": 300,
+    "buff_scroll_key": "F7",
+    # F-23-06: molaları açıp kapatan ana şalter (BreakSettings.enabled).
+    # Eskiden DEFAULT_SETTINGS'te yoktu, UI'da widget'ı yoktu.
+    "breaks_enabled": True,
 }
 
 # Mapping between canonical keys and legacy nested (section, key) pairs
@@ -173,10 +183,8 @@ LEGACY_KEY_MAP: Dict[str, Tuple[str, str]] = {
     "selected_materials": ("gathering", "selected_materials"),
     "proximity_route_auto": ("gathering", "proximity_route_auto"),
     "rest_minutes": ("route", "rest_after_visit_min"),
-    "climb_air_max_sec": ("route", "climb_air_max_sec"),
     "gathered_join_active_route": ("route", "gathered_nodes_join_route"),
     "fly_unreachable": ("route", "fly_unreachable"),
-    "check_odyle_minimap": ("route", "check_odyle_minimap"),
     "reclick_node_sec": ("route", "reclick_interval_sec"),
     "time_to_reach_sec": ("route", "time_to_reach_node_sec"),
     "gather_on_the_way": ("route", "exploration_gather"),
@@ -188,15 +196,22 @@ LEGACY_KEY_MAP: Dict[str, Tuple[str, str]] = {
     "fight_stop_gather_sec": ("route", "fight_stop_gather_sec"),
     "auto_use_hp_potion": ("route", "auto_use_hp_potion"),
     "hp_potion_threshold_pct": ("route", "hp_potion_threshold_pct"),
+    # F-23-03: tuş anahtarları şemaya eklendi (RouteSettings); artık
+    # bölüm-dışı düz öznitelik olarak değil, gerçek alan olarak yazılır.
+    "hp_potion_key": ("route", "hp_potion_key"),
     "auto_use_mp_potion": ("route", "auto_use_mp_potion"),
     "mp_potion_threshold_pct": ("route", "mp_potion_threshold_pct"),
+    "mp_potion_key": ("route", "mp_potion_key"),
     "auto_refresh_buff_scroll": ("route", "auto_refresh_buff_scroll"),
     "buff_scroll_interval_sec": ("route", "buff_scroll_interval_sec"),
+    "buff_scroll_key": ("route", "buff_scroll_key"),
     "minimap_auto_record": ("route", "minimap_auto_record"),
-    "minimap_ignore_monsters": ("route", "minimap_ignore_monsters"),
     "auto_record_3d_crests": ("route", "auto_record_3d_crests"),
     "last_tab": ("display", "last_tab"),
     "break_every_min": ("breaks", "interval_min"),
+    # F-23-06: düz anahtar "breaks_enabled" -> BreakSettings.enabled alanı.
+    # _cfg_set bölüm yazımında gerçek alan adını (leg_key) kullanır.
+    "breaks_enabled": ("breaks", "enabled"),
     "break_every_variance": ("breaks", "interval_jitter_min"),
     "break_lasts_min": ("breaks", "duration_min"),
     "break_lasts_variance": ("breaks", "duration_jitter_min"),
@@ -274,7 +289,7 @@ class ToggleSwitch(QCheckBox):
         label = self.text()
         if not label:
             return self.SWITCH_HEIGHT + 4
-        fm = QFontMetrics(QFont("Segoe UI", 9))
+        fm = QFontMetrics(QFont("Segoe UI", 10))
         text_w = max(48, int(width) - self.SWITCH_WIDTH - self.TEXT_SPACING - 8)
         bounds = fm.boundingRect(0, 0, text_w, 800, int(Qt.TextFlag.TextWordWrap), label)
         return max(self.SWITCH_HEIGHT + 4, bounds.height() + 4)
@@ -283,7 +298,7 @@ class ToggleSwitch(QCheckBox):
         label = self.text()
         if not label:
             return QSize(self.SWITCH_WIDTH + 4, self.SWITCH_HEIGHT + 4)
-        fm = QFontMetrics(QFont("Segoe UI", 9))
+        fm = QFontMetrics(QFont("Segoe UI", 10))
         text_w = fm.horizontalAdvance(label)
         pref_w = min(self.SWITCH_WIDTH + self.TEXT_SPACING + text_w + 12, 520)
         return QSize(pref_w, self.heightForWidth(pref_w))
@@ -352,7 +367,7 @@ class ToggleSwitch(QCheckBox):
         # Optional inline text label
         label = self.text()
         if label:
-            font = QFont("Segoe UI", 9)
+            font = QFont("Segoe UI", 10)
             painter.setFont(font)
             text_color = QColor("#ffffff") if self._hovered else QColor("#d7dfe7")
             painter.setPen(QPen(text_color))
@@ -372,16 +387,49 @@ class ToggleSwitch(QCheckBox):
 
 
 class _HotkeyCaptureEdit(QLineEdit):
-    """Interactive hotkey capture input matching ayarlar.html `#hkStrip`."""
+    """Interactive hotkey capture input matching ayarlar.html `#hkStrip`.
+
+    Prototype behaviour: focus shows "tuş bekliyor…", the next key
+    combination is captured, Escape restores the previous chord, and a
+    bare F8/F9/F10 is never accepted (those keys go to the game/Windows
+    without modifiers, so the chord would never reach the bot).
+    """
 
     def __init__(self, default_chord: str = "", parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._prev_text = str(default_chord or "")
+        self._capturing = False
+        self.setMinimumHeight(30)
+        self.setStyleSheet("QLineEdit { padding: 4px 8px; font-size: 12px; }")
         if default_chord:
             self.setText(default_chord)
             self.setPlaceholderText(default_chord)
 
+    def focusInEvent(self, event: Any) -> None:  # noqa: N802
+        self._prev_text = self.text()
+        self._capturing = True
+        self.setPlaceholderText("tuş bekliyor…")
+        self.setProperty("capturing", True)
+        self.setStyleSheet("border: 1px solid #e9a820; background-color: #2a2416;")
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event: Any) -> None:  # noqa: N802
+        self._capturing = False
+        self.setProperty("capturing", False)
+        self.setStyleSheet("")
+        if not self.text().strip():
+            # Nothing captured: restore the chord that was there before.
+            self.setText(self._prev_text)
+        super().focusOutEvent(event)
+
     def keyPressEvent(self, event: Any) -> None:  # noqa: N802
         key = event.key()
+        if key == Qt.Key.Key_Escape:
+            # Cancel the capture, restore the previous chord.
+            self.setText(self._prev_text)
+            event.accept()
+            self.clearFocus()
+            return
         if key in (
             Qt.Key.Key_Control,
             Qt.Key.Key_Shift,
@@ -394,6 +442,18 @@ class _HotkeyCaptureEdit(QLineEdit):
             super().keyPressEvent(event)
             return
         mods = event.modifiers()
+        has_mod = bool(
+            mods
+            & (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.AltModifier
+                | Qt.KeyboardModifier.ShiftModifier
+                | Qt.KeyboardModifier.MetaModifier
+            )
+        )
+        if Qt.Key.Key_F8 <= key <= Qt.Key.Key_F10 and not has_mod:
+            # Bare F8/F9/F10 go to the game/Windows; ignore and keep waiting.
+            return
         parts: List[str] = []
         if mods & Qt.KeyboardModifier.ControlModifier:
             parts.append("ctrl")
@@ -405,6 +465,7 @@ class _HotkeyCaptureEdit(QLineEdit):
             parts.append(f"f{key - Qt.Key.Key_F1 + 1}")
             self.setText("+".join(parts))
             event.accept()
+            self.clearFocus()
             return
         if mods & (
             Qt.KeyboardModifier.ControlModifier
@@ -416,6 +477,7 @@ class _HotkeyCaptureEdit(QLineEdit):
                 parts.append(txt)
                 self.setText("+".join(parts))
                 event.accept()
+                self.clearFocus()
                 return
         super().keyPressEvent(event)
 
@@ -442,10 +504,21 @@ class _RestBadgeWidget(QWidget):
         self._text = str(text)
         self._is_ready = bool(is_ready)
         self._ignored = bool(ignored)
-        self.setFixedHeight(26)
-        self.setMinimumWidth(88 if self._ignored else 58)
+        self.setFixedHeight(28)
+        self.setMinimumWidth(96 if self._ignored else 64)
+
+    @property
+    def is_ignored(self) -> bool:
+        """P2-7: bu rozet `Yoksayılan` (not_gatherable) düğüme aittir."""
+        return bool(self._ignored)
 
     def set_status(self, text: str, is_ready: bool) -> None:
+        # P2-7 (K-06): yoksayılan rozet canlı güncellemede ezilmez —
+        # `_update_live_node_statuses` dinlenme süresinden "Hazır"/
+        # "4dk 12sn" hesaplayıp bu rozete yazıyordu; yoksayılan düğüm
+        # için o hesap geçersizdir, rozet "Yoksayılan" kalır.
+        if self._ignored:
+            return
         if self._text != text or self._is_ready != is_ready:
             self._text = str(text)
             self._is_ready = bool(is_ready)
@@ -455,13 +528,13 @@ class _RestBadgeWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        font = QFont("Segoe UI", 8)
+        font = QFont("Segoe UI", 9)
         font.setWeight(QFont.Weight.Bold)
         painter.setFont(font)
         fm = QFontMetrics(font)
 
-        pill_w = max(44, fm.horizontalAdvance(self._text) + 16)
-        pill_h = 18
+        pill_w = max(48, fm.horizontalAdvance(self._text) + 18)
+        pill_h = 20
         pill_x = 4
         pill_y = (self.height() - pill_h) // 2
         pill_rect = QRectF(float(pill_x), float(pill_y), float(pill_w), float(pill_h))
@@ -538,6 +611,8 @@ class _AddNodesToRouteDialog(QDialog):
         )
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
         info = QLabel(
             f"'{region_name}' bölgesinden '{route_name}' rotasına eklenecek noktaları seçin:"
         )
@@ -545,6 +620,7 @@ class _AddNodesToRouteDialog(QDialog):
         layout.addWidget(info)
 
         self.list_widget = QListWidget(self)
+        self.list_widget.setMinimumHeight(180)
         self.list_widget.setSelectionMode(
             QAbstractItemView.SelectionMode.MultiSelection
         )
@@ -557,17 +633,20 @@ class _AddNodesToRouteDialog(QDialog):
 
         btn_row = QHBoxLayout()
         self.btn_create_new = QPushButton("Yeni Nokta Oluştur", self)
+        self.btn_create_new.setMinimumHeight(32)
         self._create_new_requested = False
         self.btn_create_new.clicked.connect(self._on_create_new)
         btn_row.addWidget(self.btn_create_new)
         btn_row.addStretch()
 
         btn_add = QPushButton("Seçilenleri Ekle", self)
+        btn_add.setMinimumHeight(32)
         btn_add.setStyleSheet(
             "background-color: #3b82f6; color: #ffffff; border: none; font-weight: bold;"
         )
         btn_add.clicked.connect(self.accept)
         btn_cancel = QPushButton("İptal", self)
+        btn_cancel.setMinimumHeight(32)
         btn_cancel.clicked.connect(self.reject)
         btn_row.addWidget(btn_add)
         btn_row.addWidget(btn_cancel)
@@ -640,7 +719,8 @@ class _BuiltinQuestlogImportDialog(QDialog):
         self.route_manager = route_manager
         self.imported_summary: str = ""
         self.setWindowTitle("Görev Günlüğünden (Questlog) İçe Aktar")
-        self.setFixedSize(410, 415)
+        self.setMinimumSize(420, 430)
+        self.resize(420, 430)
         self.setStyleSheet(
             """
             QDialog {
@@ -687,7 +767,7 @@ class _BuiltinQuestlogImportDialog(QDialog):
         # Zone row
         row_zone = QHBoxLayout()
         lbl_z = QLabel("Bölge:")
-        lbl_z.setFixedWidth(72)
+        lbl_z.setFixedWidth(84)
         row_zone.addWidget(lbl_z)
         self.cb_zone = QComboBox(self)
         for z in self.ZONE_DATA.keys():
@@ -699,14 +779,14 @@ class _BuiltinQuestlogImportDialog(QDialog):
         # Resources row
         row_res = QHBoxLayout()
         lbl_r = QLabel("Kaynaklar:")
-        lbl_r.setFixedWidth(72)
+        lbl_r.setFixedWidth(84)
         lbl_r.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         row_res.addWidget(lbl_r)
         self.list_resources = QListWidget(self)
         self.list_resources.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        self.list_resources.setFixedHeight(105)
+        self.list_resources.setFixedHeight(120)
         self.list_resources.itemSelectionChanged.connect(self._update_selected_label)
         row_res.addWidget(self.list_resources, stretch=1)
         root.addLayout(row_res)
@@ -714,14 +794,14 @@ class _BuiltinQuestlogImportDialog(QDialog):
         # Sub-zones row
         row_sub = QHBoxLayout()
         lbl_s = QLabel("Alt Bölgeler:")
-        lbl_s.setFixedWidth(72)
+        lbl_s.setFixedWidth(84)
         lbl_s.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         row_sub.addWidget(lbl_s)
         self.list_subzones = QListWidget(self)
         self.list_subzones.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        self.list_subzones.setFixedHeight(105)
+        self.list_subzones.setFixedHeight(120)
         self.list_subzones.itemSelectionChanged.connect(self._update_selected_label)
         row_sub.addWidget(self.list_subzones, stretch=1)
         root.addLayout(row_sub)
@@ -740,11 +820,13 @@ class _BuiltinQuestlogImportDialog(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self.btn_import = QPushButton("İçe Aktar", self)
+        self.btn_import.setMinimumHeight(32)
         self.btn_import.setStyleSheet(
             "background-color: #0284c7; color: #ffffff; border: none; font-weight: bold;"
         )
         self.btn_import.clicked.connect(self._on_import_clicked)
         self.btn_cancel = QPushButton("İptal", self)
+        self.btn_cancel.setMinimumHeight(32)
         self.btn_cancel.clicked.connect(self.reject)
         btn_row.addWidget(self.btn_import)
         btn_row.addWidget(self.btn_cancel)
@@ -795,17 +877,25 @@ class _BuiltinQuestlogImportDialog(QDialog):
             if isinstance(rdata, tuple) and len(rdata) >= 1:
                 res_name = str(rdata[0])
 
+        # Fallback import (F-0601): the old code invented 12 nodes on a
+        # circle and reported success even when every add failed. Only nodes
+        # the route manager actually accepts are counted, and a failure or
+        # an empty result is reported as a failure — never as "aktarıldı".
         count_to_import = 12
+        imported = 0
+        import_error: Optional[Exception] = None
         try:
-            if self.route_manager is not None:
-                if hasattr(self.route_manager, "create_region"):
-                    self.route_manager.create_region(zone_name)
-                if hasattr(self.route_manager, "create_route"):
-                    self.route_manager.create_route(zone_name, route_name)
-                for idx in range(count_to_import):
-                    angle = (2.0 * math.pi * idx) / float(count_to_import)
-                    mx = int(900 + 220 * math.cos(angle))
-                    my = int(460 + 160 * math.sin(angle))
+            if self.route_manager is None or not hasattr(self.route_manager, "add_node"):
+                raise RuntimeError("Rota yöneticisi yok ya da add_node desteklemiyor.")
+            if hasattr(self.route_manager, "create_region"):
+                self.route_manager.create_region(zone_name)
+            if hasattr(self.route_manager, "create_route"):
+                self.route_manager.create_route(zone_name, route_name)
+            for idx in range(count_to_import):
+                angle = (2.0 * math.pi * idx) / float(count_to_import)
+                mx = int(900 + 220 * math.cos(angle))
+                my = int(460 + 160 * math.sin(angle))
+                try:
                     self.route_manager.add_node(
                         region=zone_name,
                         route=route_name,
@@ -813,13 +903,30 @@ class _BuiltinQuestlogImportDialog(QDialog):
                         map_y=my,
                         resource_type=res_name,
                     )
-                self.route_manager.active_region = zone_name
-                self.route_manager.active_route = route_name
+                    imported += 1
+                except Exception as exc_add:
+                    logger.error("Fallback questlog add_node failed: %s", exc_add)
+                    import_error = exc_add
+            self.route_manager.active_region = zone_name
+            self.route_manager.active_route = route_name
         except Exception as exc:
             logger.error("Fallback questlog import error: %s", exc)
+            import_error = exc
 
+        if imported == 0:
+            self.imported_summary = (
+                f"Questlog içe aktarma başarısız: hiçbir nokta eklenemedi"
+                + (f" ({import_error})" if import_error is not None else "")
+            )
+            QMessageBox.warning(self, "İçe Aktarma Başarısız", self.imported_summary)
+            return
         self.imported_summary = (
-            f"{count_to_import} nokta {zone_name} · {route_name} rotasına aktarıldı"
+            f"{imported} nokta {zone_name} · {route_name} rotasına aktarıldı"
+            + (
+                f" ({count_to_import - imported} nokta eklenemedi)"
+                if imported < count_to_import
+                else ""
+            )
         )
         self.accept()
 
@@ -893,9 +1000,142 @@ class _RowSelectFilter(QObject):
         return -1
 
 
+# P2-2: çalışan YZ tarama thread'leri pencere yok edilse bile hayatta kalır —
+# QThread ebeveynsiz kurulur, bitince finished zinciri siler. Pencere
+# kapanırken closeEvent işbirlikçi stop + sınırlı wait uygular.
+_ACTIVE_WRONG_SCAN_THREADS: set = set()
+
+
+class _WrongScanWorker(QObject):
+    """One wrong-node scan off the GUI thread (P2-2).
+
+    Only pure work runs here: model load, patch reads, single-pass
+    classification — the confidence histogram is built from the same
+    pass (``confidences_out``), never a second inference run. No QWidget
+    access and no route-manager mutation: backup, delete and list refresh
+    happen in the GUI-thread slot that receives ``finished``.
+    """
+
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)  # {"wrong": [...], "meta": str}
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        nodes: Sequence[Any],
+        patch_paths: Sequence[Optional[str]],
+        tier: str,
+        region: str,
+    ) -> None:
+        super().__init__()
+        self._nodes = list(nodes)
+        # Position-aligned with _nodes: disk path per node, or None when
+        # the patch must fall back to load_node_patch().
+        self._patch_paths = list(patch_paths)
+        self._tier = str(tier)
+        self._region = str(region)
+        self._stop_requested = False
+
+    def stop(self) -> None:
+        """Cooperative stop: checked between phases only.
+
+        ``classify_wrong_nodes`` cannot be aborted mid-loop (its progress
+        callback is best-effort by design), so a stop requested during
+        classification takes effect after that pass returns.
+        """
+        self._stop_requested = True
+
+    def run(self) -> None:
+        try:
+            from core.wrong_node_scan import (
+                _node_id,
+                classify_wrong_nodes,
+                format_scan_meta_tr,
+                load_gatherion_detector,
+                load_node_patch,
+                load_patch_file,
+                scan_confidence_summary,
+            )
+
+            if self._stop_requested:
+                self.failed.emit("YZ taraması durduruldu.")
+                return
+            try:
+                detector = load_gatherion_detector()
+            except Exception as exc:
+                logger.error("Gatherion modeli yüklenemedi: %s", exc)
+                self.failed.emit(f"Gatherion modeli yüklenemedi. Dosya yazılmadı: {exc}")
+                return
+            if self._stop_requested:
+                self.failed.emit("YZ taraması durduruldu.")
+                return
+            images: Dict[int, Any] = {}
+            for index, node in enumerate(self._nodes):
+                node_id = _node_id(node, index)
+                image = None
+                path = (
+                    self._patch_paths[index]
+                    if index < len(self._patch_paths)
+                    else None
+                )
+                if path:
+                    try:
+                        image = load_patch_file(path)
+                    except Exception as exc:
+                        logger.debug("Patch dosyası okunamadı #%s: %s", node_id, exc)
+                        image = None
+                if image is None:
+                    image = load_node_patch(node, region=self._region)
+                images[node_id] = image
+
+            def _progress(done: int, total: int) -> None:
+                if done % 8 != 0 and done != total:
+                    return
+                self.progress.emit(done, total)
+
+            confs: List[float] = []
+            wrong = classify_wrong_nodes(
+                self._nodes,
+                images,
+                detector,
+                on_progress=_progress,
+                tier=self._tier,
+                confidences_out=confs,
+            )
+            # P2-2: summary from the confidences of THIS pass — the
+            # detector is not run a second time over the same thumbnails.
+            summary = scan_confidence_summary(
+                self._nodes, images, detector, confs=confs
+            )
+            meta = format_scan_meta_tr(detector, summary, tier=self._tier)
+            if self._stop_requested:
+                self.failed.emit("YZ taraması durduruldu.")
+                return
+            self.finished.emit({"wrong": wrong, "meta": meta})
+        except Exception as exc:
+            logger.error("Wrong-node scan failed: %s", exc)
+            self.failed.emit(f"YZ taraması yazılmadı: {exc}")
+
+
+def _resolve_analytics_telemetry(host: Any) -> Optional[Any]:
+    """Ayarlar penceresinden istatistik açılırken canlı telemetri motorunu bulur.
+
+    Önce `host._live_telemetry` (main.py / shell verir), sonra shell'in
+    `_telemetry`'si. Bulunamazsa None döner — diyalog kendi boş motorunu
+    kurar (v20-istatistik R3 düzeltmesi öncesi davranış).
+    """
+    tel = getattr(host, "_live_telemetry", None)
+    if tel is not None:
+        return tel
+    shell = getattr(host, "_shell", None)
+    if shell is not None:
+        return getattr(shell, "_telemetry", None)
+    return None
+
+
 class SettingsWindow(QDialog):
     """
-    Gatherion v1.6.15 two-column dark settings and node management window (Türkçe UI).
+    Gatherion v2.0 two-column dark settings and node management window (Türkçe UI).
     """
 
     quit_requested = pyqtSignal()
@@ -909,8 +1149,25 @@ class SettingsWindow(QDialog):
         route_manager: Optional[Any] = None,
         parent: Optional[QWidget] = None,
         settings: Optional[Any] = None,
+        mobile_server: Optional[Any] = None,
+        mobile_token_auth: Optional[Any] = None,
+        telemetry: Optional[Any] = None,
     ) -> None:
         super().__init__(parent)
+        # S-4301: the live settings window had no token-rotation path —
+        # the R43 fix lived only in the dead SettingsDialog class, so
+        # the old mobile token stayed valid. Both are optional (the
+        # window also works standalone); when present,
+        # rotate_mobile_token() propagates the new token to the live
+        # server instead of only writing it to disk. Callers that own
+        # a MobileRemoteServer / MobileTokenAuthenticator (e.g. main.py,
+        # ui/app_shell.py) should pass them here.
+        self.mobile_server = mobile_server
+        # v20-istatistik (R3): canlı telemetri motoru (main.py / shell verir).
+        # Yoksa istatistik diyaloğu kendi boş motorunu kurar ve tüm
+        # oturum/bugün metrikleri kalıcı 0 görünür.
+        self._live_telemetry = telemetry
+        self.mobile_token_auth = mobile_token_auth
         raw_cfg = settings if settings is not None else config_manager
         self.config_manager = raw_cfg if raw_cfg is not None else self._create_default_config_manager()
         self.route_manager = route_manager or self._create_default_route_manager()
@@ -922,6 +1179,17 @@ class SettingsWindow(QDialog):
             else getattr(self.config_manager, "settings", self.config_manager)
         )
         self._last_saved_values: Dict[str, Any] = {}
+        # YZ taraması özeti (alt bilgi satırı): son taramanın gerçek sonucu.
+        self._last_scan_removed: int = 0
+        self._last_scan_backup: str = ""
+        self._last_scan_meta: str = ""
+        # P2-2: arka plan YZ taraması — thread/worker referansları ve
+        # taramanın başladığı bölge/rota (sonuç slotu bunlara yazar).
+        self._wrong_scan_thread: Optional[Any] = None
+        self._wrong_scan_worker: Optional[Any] = None
+        self._wrong_scan_context: Tuple[str, str, int] = ("", "", 0)
+        # Ayar yüklenirken sinyal veren kontroller kirli sayılmaz.
+        self._loading_settings: bool = True
 
         # Kara Liste (Blacklist) Yöneticisi
         try:
@@ -938,17 +1206,28 @@ class SettingsWindow(QDialog):
         self._calibration_dlg: Optional[QDialog] = None
         self._guide_dlg: Optional[QDialog] = None
 
-        self.setWindowTitle("Gatherion v1.6.15 — Ayarlar ve Rota Yönetimi")
+        self.setWindowTitle(f"Gatherion v{__version__} — Ayarlar ve Rota Yönetimi")
         self.setMinimumSize(1040, 720)
         self.resize(1100, 760)
         self._apply_dark_stylesheet()
         self._init_ui()
-        self._load_from_settings()
+        try:
+            self._load_from_settings()
+        finally:
+            self._loading_settings = False
         self.refresh_regions_and_routes(
             prefer_region=str(self._cfg_get("active_region", "") or "") or None,
             prefer_route=str(self._cfg_get("active_route", "") or "") or None,
         )
         self.load_blacklist_table()
+        self._update_infoline()
+        try:
+            self.append_log(
+                f"Ayarlar yüklendi: {self._current_region() or '-'} · "
+                f"{self._current_route() or '-'}"
+            )
+        except Exception:
+            pass
 
         # Live 1-second timer to update node LAST and REST badges dynamically
         self._refresh_timer = QTimer(self)
@@ -990,15 +1269,18 @@ class SettingsWindow(QDialog):
     def _candidate_settings_objects(self, explicit_target: Optional[Any] = None) -> List[Any]:
         """Returns ordered list of active settings/config objects to inspect or mutate."""
         objs: List[Any] = []
+        # Order matters: the config manager is the source of truth and is
+        # read first (F-0688). ``self.settings`` may be a stale snapshot
+        # taken at construction time, so it is only a late fallback.
         for item in (
             explicit_target,
             getattr(explicit_target, "settings", None) if explicit_target is not None else None,
-            getattr(self, "settings", None),
-            getattr(getattr(self, "settings", None), "settings", None),
             self.config_manager,
             getattr(self.config_manager, "settings", None),
             getattr(self.config_manager, "config", None),
             getattr(self.config_manager, "data", None),
+            getattr(self, "settings", None),
+            getattr(getattr(self, "settings", None), "settings", None),
         ):
             if item is not None and not any(item is existing for existing in objs):
                 objs.append(item)
@@ -1079,6 +1361,10 @@ class SettingsWindow(QDialog):
                     return top_val
 
                 # 3. Manager .get(...) method fallback
+                # SettingsManager/ConfigManager use get(section, key, default);
+                # calling get(key, default) would silently treat the key as a
+                # section and never return the value (F-0684). A flat lookup
+                # therefore uses section "" (top-level attribute).
                 if hasattr(obj, "get") and callable(obj.get):
                     try:
                         if sec:
@@ -1087,7 +1373,11 @@ class SettingsWindow(QDialog):
                                 val = obj.get(sec, leg_key, None)
                             if val is not None and not isinstance(val, dict):
                                 return val
-                        val = obj.get(key, default)
+                        try:
+                            val = obj.get("", key, default)
+                        except TypeError:
+                            # Plain dict-style get(key, default) managers.
+                            val = obj.get(key, default)
                         if val is not None and not isinstance(val, dict):
                             return val
                     except TypeError:
@@ -1125,15 +1415,31 @@ class SettingsWindow(QDialog):
                             if leg_key:
                                 sec_obj[leg_key] = value
                         else:
-                            try:
-                                setattr(sec_obj, key, value)
-                            except Exception as exc_sec:
-                                logger.debug("Could not setattr %s.%s: %s", sec, key, exc_sec)
-                            if leg_key and leg_key != key and hasattr(sec_obj, leg_key):
+                            sec_fields = getattr(sec_obj, "__dataclass_fields__", None)
+                            if (
+                                isinstance(sec_fields, dict)
+                                and leg_key
+                                and leg_key != key
+                                and leg_key in sec_fields
+                                and key not in sec_fields
+                            ):
+                                # F-23-12: düz anahtar ("breaks_enabled")
+                                # bölüm alanının adı değil — gölge öznitelik
+                                # yazma, gerçek alanı ("enabled") yaz.
                                 try:
                                     setattr(sec_obj, leg_key, value)
                                 except Exception as exc_leg:
                                     logger.debug("Could not setattr %s.%s: %s", sec, leg_key, exc_leg)
+                            else:
+                                try:
+                                    setattr(sec_obj, key, value)
+                                except Exception as exc_sec:
+                                    logger.debug("Could not setattr %s.%s: %s", sec, key, exc_sec)
+                                if leg_key and leg_key != key and hasattr(sec_obj, leg_key):
+                                    try:
+                                        setattr(sec_obj, leg_key, value)
+                                    except Exception as exc_leg:
+                                        logger.debug("Could not setattr %s.%s: %s", sec, leg_key, exc_leg)
 
                 # Keep harvests_per_node synchronized across gathering and route
                 if key == "harvests_per_node":
@@ -1145,20 +1451,62 @@ class SettingsWindow(QDialog):
                             except Exception as exc_m:
                                 logger.debug("Mirror harvests_per_node error: %s", exc_m)
 
+                # P1-13: pause_on_alt_tab iki dalda da var (route +
+                # gathering) ama üretim okuyucuları route'u önce okur
+                # (main._resolve_pause_on_alt_tab, BotWorker._get_cfg);
+                # UI yalnızca gathering yazar. Ayna yazılmazsa UI anahtarı
+                # etkisiz kalır (route varsayılan True gathering'i gölgeler).
+                # harvests_per_node ile aynı desen.
+                if key == "pause_on_alt_tab":
+                    if isinstance(obj, dict):
+                        route_sec = obj.get("route")
+                        if not isinstance(route_sec, dict):
+                            route_sec = {}
+                            obj["route"] = route_sec
+                        route_sec["pause_on_alt_tab"] = value
+                    else:
+                        route_obj = getattr(obj, "route", None)
+                        if route_obj is not None and not isinstance(route_obj, dict):
+                            try:
+                                setattr(route_obj, "pause_on_alt_tab", bool(value))
+                            except Exception as exc_m:
+                                logger.debug("Mirror pause_on_alt_tab error: %s", exc_m)
+
                 # Also set attribute on top-level settings object using safe setattr
-                if not hasattr(obj, "save") or hasattr(obj, "__dataclass_fields__"):
+                # F-23-12: yalnızca gerçek üst düzey alan yazılır — bölüm
+                # anahtarları (örn. hp_potion_threshold_pct) dataclass üzerine
+                # gölge öznitelik olarak yazılmaz; asdict() onları diske
+                # yazmıyordu (sahte kalıcılık) ve _cfg_get önceliğini
+                # kırılgan kılıyordu. Kaydedilmemiş değer yok: bölüm değeri
+                # yukarıda zaten yazıldı. Dataclass olmayan düz nesnelerde
+                # eski davranış korunur.
+                _top_fields = getattr(obj, "__dataclass_fields__", None)
+                if isinstance(_top_fields, dict):
+                    _write_top = key in _top_fields
+                else:
+                    _write_top = not hasattr(obj, "save")
+                if _write_top:
                     try:
                         setattr(obj, key, value)
                     except Exception as exc_top:
                         logger.debug("Top-level setattr skipped for %s: %s", key, exc_top)
 
-                # Call manager .set(...) if present
-                if hasattr(obj, "set") and callable(obj.set):
+                # Call manager .set(...) if present. While a batch save is
+                # running (_cfg_batching), skip it: SettingsManager.set() writes
+                # the whole file on every call (~38 writes per Save, F-0596).
+                # The batched values are already applied to the underlying
+                # settings objects above and _cfg_save() persists once.
+                if (
+                    hasattr(obj, "set")
+                    and callable(obj.set)
+                    and not getattr(self, "_cfg_batching", False)
+                ):
                     try:
                         if sec:
                             obj.set(sec, key, value)
                         else:
-                            obj.set(key, value)
+                            # set(section, key, value); "" = top-level (F-0684).
+                            obj.set("", key, value)
                     except TypeError:
                         try:
                             obj.set(key, value)
@@ -1167,7 +1515,13 @@ class SettingsWindow(QDialog):
             except Exception as exc:
                 logger.warning("Failed to set config key '%s': %s", key, exc)
 
-    def _cfg_save(self) -> None:
+    def _cfg_save(self) -> bool:
+        """Persist the config manager to disk once.
+
+        Returns True only when a save was attempted and reported success.
+        A failure is reported to the caller (F-0539) instead of being
+        swallowed here while the UI claims the settings were saved.
+        """
         for obj in self._candidate_settings_objects():
             try:
                 if hasattr(obj, "validate") and callable(obj.validate):
@@ -1177,14 +1531,18 @@ class SettingsWindow(QDialog):
 
         cm = self.config_manager
         if cm is None:
-            return
+            return False
         try:
             if hasattr(cm, "save") and callable(cm.save):
-                cm.save()
-            elif hasattr(cm, "save_config") and callable(cm.save_config):
-                cm.save_config()
+                saved = cm.save()
+                return bool(saved) if saved is not None else True
+            if hasattr(cm, "save_config") and callable(cm.save_config):
+                saved = cm.save_config()
+                return bool(saved) if saved is not None else True
+            return False
         except Exception as exc:
             logger.error("Failed to save configuration to disk: %s", exc)
+            return False
 
     # ------------------------------------------------------------------
     # Styling & Layout Initialization
@@ -1217,7 +1575,7 @@ class SettingsWindow(QDialog):
                 margin-top: 8px;
                 padding: 12px 12px 10px 12px;
                 font-weight: 700;
-                font-size: 11px;
+                font-size: 12px;
                 color: #9bb8dc;
             }
             QGroupBox::title {
@@ -1227,6 +1585,7 @@ class SettingsWindow(QDialog):
                 background-color: #12181f;
                 color: #9bb8dc;
                 font-weight: 700;
+                font-size: 12px;
                 padding: 1px 6px;
                 border-radius: 3px;
                 letter-spacing: 0.6px;
@@ -1245,8 +1604,8 @@ class SettingsWindow(QDialog):
                 border: 1px solid #2c3846;
                 border-radius: 5px;
                 color: #e8edf2;
-                padding: 3px 7px;
-                min-height: 22px;
+                padding: 4px 8px;
+                min-height: 24px;
                 font-size: 12px;
                 font-family: Consolas, "Cascadia Mono", monospace;
                 selection-background-color: #2f7fe0;
@@ -1287,8 +1646,8 @@ class SettingsWindow(QDialog):
                 color: #e8edf2;
                 border: 1px solid #2c3846;
                 border-radius: 5px;
-                padding: 5px 10px;
-                min-height: 20px;
+                padding: 6px 12px;
+                min-height: 24px;
                 font-size: 12px;
                 font-weight: 500;
             }
@@ -1349,14 +1708,14 @@ class SettingsWindow(QDialog):
                 color: #8b98a6;
                 border: none;
                 border-bottom: 1px solid #232d39;
-                padding: 6px 8px;
-                font-size: 10px;
+                padding: 7px 8px;
+                font-size: 11px;
                 font-weight: 700;
                 letter-spacing: 0.7px;
             }
             QScrollBar:vertical {
                 background: #0d1218;
-                width: 8px;
+                width: 10px;
                 margin: 0px;
             }
             QScrollBar::handle:vertical {
@@ -1376,7 +1735,7 @@ class SettingsWindow(QDialog):
 
     def _init_ui(self) -> None:
         root_layout = wrap_shell_tab_root_layout(self, "settings")
-        root_layout.setSpacing(8)
+        root_layout.setSpacing(10)
 
         # Prototype Header (.header) matching ayarlar.html
         header_frame = QFrame(self)
@@ -1412,28 +1771,28 @@ class SettingsWindow(QDialog):
         self.chip_fps = QLabel('FPS <b style="color:#e8edf2;font-family:Consolas;">0</b>', header_frame)
         self.chip_fps.setTextFormat(Qt.TextFormat.RichText)
         self.chip_fps.setStyleSheet(
-            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 3px 8px; font-size: 11px; color: #8b98a6;"
+            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 4px 10px; font-size: 11px; color: #8b98a6;"
         )
         perf_row.addWidget(self.chip_fps)
 
         self.chip_gpu = QLabel('GPU <b style="color:#e8edf2;font-family:Consolas;">0%</b>', header_frame)
         self.chip_gpu.setTextFormat(Qt.TextFormat.RichText)
         self.chip_gpu.setStyleSheet(
-            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 3px 8px; font-size: 11px; color: #8b98a6;"
+            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 4px 10px; font-size: 11px; color: #8b98a6;"
         )
         perf_row.addWidget(self.chip_gpu)
 
         self.chip_cpu = QLabel('CPU <b style="color:#e8edf2;font-family:Consolas;">0%</b>', header_frame)
         self.chip_cpu.setTextFormat(Qt.TextFormat.RichText)
         self.chip_cpu.setStyleSheet(
-            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 3px 8px; font-size: 11px; color: #8b98a6;"
+            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 4px 10px; font-size: 11px; color: #8b98a6;"
         )
         perf_row.addWidget(self.chip_cpu)
 
         self.chip_lat = QLabel('LAT <b style="color:#e8edf2;font-family:Consolas;">0.0ms</b>', header_frame)
         self.chip_lat.setTextFormat(Qt.TextFormat.RichText)
         self.chip_lat.setStyleSheet(
-            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 3px 8px; font-size: 11px; color: #8b98a6;"
+            "background-color: #12181f; border: 1px solid #232d39; border-radius: 5px; padding: 4px 10px; font-size: 11px; color: #8b98a6;"
         )
         perf_row.addWidget(self.chip_lat)
         header_lay.addLayout(perf_row)
@@ -1453,7 +1812,7 @@ class SettingsWindow(QDialog):
         left_host = QWidget()
         left_host.setObjectName("SettingsLeftHost")
         left_host.setStyleSheet("background-color: #0a0e13;")
-        left_host.setMinimumWidth(340)
+        left_host.setMinimumWidth(360)
         left_col = QVBoxLayout(left_host)
         left_col.setContentsMargins(0, 0, 4, 0)
         left_col.setSpacing(8)
@@ -1467,6 +1826,7 @@ class SettingsWindow(QDialog):
         sub_pair_row.addWidget(self._build_cartography_group(), stretch=13)
         sub_pair_row.addWidget(self._build_breaks_group(), stretch=10)
         left_col.addLayout(sub_pair_row)
+        left_col.addWidget(self._build_consumables_group())
         left_col.addStretch(1)
 
         self._columns_scroll = QScrollArea(columns_host)
@@ -1488,7 +1848,7 @@ class SettingsWindow(QDialog):
         right_host = QWidget(columns_host)
         right_host.setObjectName("SettingsRightHost")
         right_host.setStyleSheet("background-color: #0a0e13;")
-        right_host.setMinimumWidth(320)
+        right_host.setMinimumWidth(340)
         right_col = QVBoxLayout(right_host)
         right_col.setContentsMargins(0, 0, 0, 0)
         right_col.setSpacing(8)
@@ -1534,6 +1894,15 @@ class SettingsWindow(QDialog):
         info_lay.addWidget(self.status_lbl)
         footer_bar_lay.addWidget(info_frame)
 
+        # Alt bilgi satırı (prototip `.infoline`): YZ taraması özeti —
+        # son taramanın gerçek sonucu, yoksa hazır durumu + eşik profili.
+        self.infoline_lbl = QLabel(
+            "YZ modeli hazır. Henüz tarama yapılmadı.", self.footer_bar
+        )
+        self.infoline_lbl.setWordWrap(True)
+        self.infoline_lbl.setStyleSheet("color: #8b98a6; font-size: 11px; border: none;")
+        footer_bar_lay.addWidget(self.infoline_lbl)
+
         divider = QFrame(self.footer_bar)
         divider.setFrameShape(QFrame.Shape.HLine)
         divider.setFixedHeight(1)
@@ -1552,7 +1921,7 @@ class SettingsWindow(QDialog):
         self.btn_quit.clicked.connect(self._on_quit_clicked)
         footer_layout.addWidget(self.btn_quit)
 
-        self.version_lbl = QLabel("Gatherion v2.0", self)
+        self.version_lbl = QLabel(f"Gatherion v{__version__}", self)
         self.version_lbl.setStyleSheet("color: #67737f; font-size: 11px;")
         footer_layout.addWidget(self.version_lbl)
 
@@ -1590,6 +1959,17 @@ class SettingsWindow(QDialog):
         )
         self.btn_mobile_connect.clicked.connect(self._on_open_mobile_connect)
 
+        # S-4301: live token rotation in the window the user actually
+        # sees (the R43 fix previously existed only in the dead
+        # SettingsDialog class). Rotates the shared 256-bit mobile
+        # token and pushes it to the live server; the old token stops
+        # being accepted.
+        self.btn_rotate_token = QPushButton("🔑 Mobil Token Döndür", self)
+        self.btn_rotate_token.setToolTip(
+            "Yeni 256-bit mobil token üretir ve canlı mobil sunucuya uygular (eski token geçersiz olur)"
+        )
+        self.btn_rotate_token.clicked.connect(self.rotate_mobile_token)
+
         self.btn_analytics = QPushButton("İstatistikler", self)
         self.btn_analytics.setToolTip("Canlı telemetri ve toplama istatistiklerini açar")
         self.btn_analytics.clicked.connect(self._on_open_analytics)
@@ -1618,6 +1998,7 @@ class SettingsWindow(QDialog):
             self.btn_radar,
             self.btn_yolo_factory,
             self.btn_mobile_connect,
+            self.btn_rotate_token,
             self.btn_analytics,
             self.btn_calibration,
             self.btn_guide,
@@ -1626,9 +2007,26 @@ class SettingsWindow(QDialog):
             self.btn_close,
         )
         for index, button in enumerate(tool_buttons):
+            button.setMinimumHeight(34)
             tool_grid.addWidget(button, index // 3, index % 3)
         footer_bar_lay.addLayout(tool_grid)
+
+        # Alt log şeridi (prototip `.log`): son 60 satır, salt okunur.
+        self.log_text = QPlainTextEdit(self.footer_bar)
+        self.log_text.setObjectName("SettingsLogStrip")
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(60)
+        self.log_text.setFixedHeight(44)
+        self.log_text.setFont(QFont("Consolas", 10))
+        self.log_text.setStyleSheet(
+            "background-color: #05070a; color: #9fb0a3; border: none;"
+            " border-top: 1px solid #232d39; padding: 4px 8px;"
+        )
+        footer_bar_lay.addWidget(self.log_text)
+
         root_layout.addWidget(self.footer_bar)
+        self._wire_dirty_tracking()
+        self._update_infoline()
 
     # ------------------------------------------------------------------
     # Left Column Builders (matching ayarlar.html `.grid2` + `.trow`)
@@ -1656,7 +2054,7 @@ class SettingsWindow(QDialog):
         self.f_interval_min.setRange(0.1, 60.0)
         self.f_interval_min.setSingleStep(0.1)
         self.f_interval_min.setDecimals(1)
-        self.f_interval_min.setFixedWidth(56)
+        self.f_interval_min.setFixedWidth(64)
         self.spin_f_min = self.f_interval_min
         cell_min.addWidget(self.f_interval_min)
         h_min = QLabel("sn")
@@ -1672,7 +2070,7 @@ class SettingsWindow(QDialog):
         self.f_interval_max.setRange(0.1, 60.0)
         self.f_interval_max.setSingleStep(0.1)
         self.f_interval_max.setDecimals(1)
-        self.f_interval_max.setFixedWidth(56)
+        self.f_interval_max.setFixedWidth(64)
         self.spin_f_max = self.f_interval_max
         cell_max.addWidget(self.f_interval_max)
         h_max = QLabel("sn")
@@ -1689,7 +2087,7 @@ class SettingsWindow(QDialog):
         self.harvests_per_node = QSpinBox(self)
         self.harvests_per_node.setRange(1, 10)
         self.harvests_per_node.setValue(3)
-        self.harvests_per_node.setFixedWidth(56)
+        self.harvests_per_node.setFixedWidth(64)
         self.harvests_per_node.setToolTip(
             "Harvests per node (3x per material) — Her materyal noktasından kaç kez toplanacağı (1-10)"
         )
@@ -2000,19 +2398,11 @@ class SettingsWindow(QDialog):
         row_rest.addWidget(QLabel("Dinlenme süresi (dk):"), stretch=1)
         self.rest_minutes = QSpinBox(self)
         self.rest_minutes.setRange(0, 240)
-        self.rest_minutes.setFixedWidth(56)
+        self.rest_minutes.setFixedWidth(64)
         self.spin_rest = self.rest_minutes
         row_rest.addWidget(self.rest_minutes)
         g_top.addLayout(row_rest, 0, 0)
 
-        row_climb = QHBoxLayout()
-        row_climb.setSpacing(6)
-        row_climb.addWidget(QLabel("Havada maks. yükselme (sn):"), stretch=1)
-        self.climb_air_max_sec = QSpinBox(self)
-        self.climb_air_max_sec.setRange(0, 120)
-        self.climb_air_max_sec.setFixedWidth(56)
-        row_climb.addWidget(self.climb_air_max_sec)
-        g_top.addLayout(row_climb, 0, 1)
         lay.addLayout(g_top)
 
         self.gathered_join_active_route = ToggleSwitch(
@@ -2024,11 +2414,6 @@ class SettingsWindow(QDialog):
             "Yürüyerek ulaşılamayan noktalara uçarak git", self
         )
         lay.addWidget(self.fly_unreachable)
-
-        self.check_odyle_minimap = ToggleSwitch(
-            "Havadayken Minimap üzerinde Odyle kontrol et", self
-        )
-        lay.addWidget(self.check_odyle_minimap)
 
         # Row: .grid2 (Yolda noktaya tekrar tıklama süresi | Noktaya ulaşma süresi)
         g_mid = QGridLayout()
@@ -2042,7 +2427,7 @@ class SettingsWindow(QDialog):
         row_reclick.addWidget(QLabel("Yolda noktaya tekrar tıklama süresi:"), stretch=1)
         self.reclick_node_sec = QSpinBox(self)
         self.reclick_node_sec.setRange(0, 300)
-        self.reclick_node_sec.setFixedWidth(48)
+        self.reclick_node_sec.setFixedWidth(56)
         row_reclick.addWidget(self.reclick_node_sec)
         h_rec = QLabel("sn (0: kapalı)")
         h_rec.setProperty("hintLabel", True)
@@ -2054,7 +2439,7 @@ class SettingsWindow(QDialog):
         row_reach.addWidget(QLabel("Noktaya ulaşma süresi:"), stretch=1)
         self.time_to_reach_sec = QSpinBox(self)
         self.time_to_reach_sec.setRange(5, 600)
-        self.time_to_reach_sec.setFixedWidth(48)
+        self.time_to_reach_sec.setFixedWidth(56)
         self.spin_reach = self.time_to_reach_sec
         row_reach.addWidget(self.time_to_reach_sec)
         h_rch = QLabel("sn (sonra tekrar tıkla ve atla)")
@@ -2081,7 +2466,7 @@ class SettingsWindow(QDialog):
         row_wait_fail.addWidget(QLabel("Bekle:"), stretch=1)
         self.wait_min_after_failed = QSpinBox(self)
         self.wait_min_after_failed.setRange(0, 240)
-        self.wait_min_after_failed.setFixedWidth(48)
+        self.wait_min_after_failed.setFixedWidth(56)
         row_wait_fail.addWidget(self.wait_min_after_failed)
         h_wf = QLabel("dk, arka arkaya")
         h_wf.setProperty("hintLabel", True)
@@ -2093,7 +2478,7 @@ class SettingsWindow(QDialog):
         row_wait_count.addWidget(QLabel("Başarısız noktada:"), stretch=1)
         self.max_failed_in_row = QSpinBox(self)
         self.max_failed_in_row.setRange(0, 100)
-        self.max_failed_in_row.setFixedWidth(48)
+        self.max_failed_in_row.setFixedWidth(56)
         row_wait_count.addWidget(self.max_failed_in_row)
         h_wc = QLabel("(0: kapalı)")
         h_wc.setProperty("hintLabel", True)
@@ -2105,7 +2490,7 @@ class SettingsWindow(QDialog):
         row_rem_fail.addWidget(QLabel("Noktayı sil:"), stretch=1)
         self.remove_node_after_failures = QSpinBox(self)
         self.remove_node_after_failures.setRange(0, 100)
-        self.remove_node_after_failures.setFixedWidth(44)
+        self.remove_node_after_failures.setFixedWidth(52)
         row_rem_fail.addWidget(self.remove_node_after_failures)
         h_rf = QLabel("ardışık başarısızlıktan sonra (0: kapalı)")
         h_rf.setProperty("hintLabel", True)
@@ -2117,7 +2502,7 @@ class SettingsWindow(QDialog):
         row_pause.addWidget(QLabel("Duraklat:"), stretch=1)
         self.pause_after_no_gather_min = QSpinBox(self)
         self.pause_after_no_gather_min.setRange(0, 480)
-        self.pause_after_no_gather_min.setFixedWidth(48)
+        self.pause_after_no_gather_min.setFixedWidth(56)
         row_pause.addWidget(self.pause_after_no_gather_min)
         h_ps = QLabel("dk toplama yapılmazsa (0: kapalı)")
         h_ps.setProperty("hintLabel", True)
@@ -2141,7 +2526,7 @@ class SettingsWindow(QDialog):
         row_fight.addWidget(QLabel("Çatışma sonrası bekle:"), stretch=1)
         self.fight_stop_gather_sec = QSpinBox(self)
         self.fight_stop_gather_sec.setRange(0, 120)
-        self.fight_stop_gather_sec.setFixedWidth(48)
+        self.fight_stop_gather_sec.setFixedWidth(56)
         row_fight.addWidget(self.fight_stop_gather_sec)
         h_ft = QLabel("sn")
         h_ft.setProperty("hintLabel", True)
@@ -2174,17 +2559,8 @@ class SettingsWindow(QDialog):
         self.world_3d_auto_record.setToolTip(
             "3B ekranda görünen Aria, Mela, Odyle ve cevher parıltılarını otomatik haritalandırır"
         )
-        self.minimap_cluster_stack_bonus = self.world_3d_auto_record
         lay.addWidget(self.world_3d_auto_record)
 
-        self.minimap_ignore_monsters = ToggleSwitch(
-            "Minimap’teki canavar noktalarını (+) yoksay", self, checked=True
-        )
-        self.minimap_ignore_monsters.setToolTip(
-            "Ignore Monster white dots on Minimap"
-        )
-        self.chk_minimap_ignore_monsters = self.minimap_ignore_monsters
-        lay.addWidget(self.minimap_ignore_monsters)
         lay.addStretch(1)
 
         return grp
@@ -2197,9 +2573,15 @@ class SettingsWindow(QDialog):
         grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         lay.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
 
+        self.breaks_enabled = QCheckBox("Molalar etkin", self)
+        self.breaks_enabled.setToolTip(
+            "Kapalıyken mola zamanlayıcısı çalışmaz (break_every_min değeri ne olursa olsun)."
+        )
+        lay.addWidget(self.breaks_enabled)
+
         self.break_every_min = QSpinBox(self)
         self.break_every_min.setRange(0, 720)
-        self.break_every_min.setFixedWidth(56)
+        self.break_every_min.setFixedWidth(64)
         row_every = QHBoxLayout()
         row_every.setSpacing(6)
         row_every.addWidget(QLabel("Mola sıklığı (dk, 0: kapalı):"), stretch=1)
@@ -2208,7 +2590,7 @@ class SettingsWindow(QDialog):
 
         self.break_every_variance = QSpinBox(self)
         self.break_every_variance.setRange(0, 120)
-        self.break_every_variance.setFixedWidth(56)
+        self.break_every_variance.setFixedWidth(64)
         row_every_var = QHBoxLayout()
         row_every_var.setSpacing(6)
         row_every_var.addWidget(QLabel("Mola sıklığı sapması (dk):"), stretch=1)
@@ -2217,7 +2599,7 @@ class SettingsWindow(QDialog):
 
         self.break_lasts_min = QSpinBox(self)
         self.break_lasts_min.setRange(1, 240)
-        self.break_lasts_min.setFixedWidth(56)
+        self.break_lasts_min.setFixedWidth(64)
         row_lasts = QHBoxLayout()
         row_lasts.setSpacing(6)
         row_lasts.addWidget(QLabel("Mola süresi (dk):"), stretch=1)
@@ -2226,7 +2608,7 @@ class SettingsWindow(QDialog):
 
         self.break_lasts_variance = QSpinBox(self)
         self.break_lasts_variance.setRange(0, 60)
-        self.break_lasts_variance.setFixedWidth(56)
+        self.break_lasts_variance.setFixedWidth(64)
         row_lasts_var = QHBoxLayout()
         row_lasts_var.setSpacing(6)
         row_lasts_var.addWidget(QLabel("Mola süresi sapması (dk):"), stretch=1)
@@ -2241,10 +2623,91 @@ class SettingsWindow(QDialog):
         lbl.setStyleSheet("color: #8b98a6; font-size: 11px;")
         lay.addWidget(lbl)
         edit = _HotkeyCaptureEdit(default, self)
-        edit.setFixedWidth(120)
+        edit.setFixedWidth(132)
         edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(edit)
         return edit
+
+    def _build_consumables_group(self) -> QGroupBox:
+        """F-23-01/F-23-02: HP/MP iksir + buff parşömen ayarları.
+
+        Eskiden bu değerlerin UI'da hiç widget'ı yoktu — yalnızca
+        get/set_consumable_settings() API'sinden değiştirilebiliyor,
+        tuşlar diske hiç yazılmıyordu (F-23-03). Artık kullanıcı eşik ve
+        tuşları buradan değiştirir; değerler şema alanlarına yazılır ve
+        get_settings_dict() üzerinden kaydedilir. Üretim tarafında bu
+        eşikleri okuyan yolun bağlanması C grubunun işidir (state_machine /
+        mana_phase_combat) — UI burada yalnızca görünür + kalıcı yapar.
+        """
+        grp = QGroupBox("TÜKETİM (HP/MP İKSİR + BUFF)", self)
+        lay = QVBoxLayout(grp)
+        lay.setSpacing(6)
+        lay.setContentsMargins(10, 12, 10, 10)
+        grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        lay.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
+
+        self.chk_auto_use_hp_potion = QCheckBox("HP iksiri otomatik", self)
+        lay.addWidget(self.chk_auto_use_hp_potion)
+        self.spin_hp_potion_threshold = QSpinBox(self)
+        self.spin_hp_potion_threshold.setRange(1, 100)
+        self.spin_hp_potion_threshold.setSuffix(" %")
+        self.spin_hp_potion_threshold.setFixedWidth(72)
+        row_hp = QHBoxLayout()
+        row_hp.setSpacing(6)
+        row_hp.addWidget(QLabel("HP eşiği:"), stretch=1)
+        row_hp.addWidget(self.spin_hp_potion_threshold)
+        lay.addLayout(row_hp)
+        self.edit_hp_potion_key = QLineEdit(self)
+        self.edit_hp_potion_key.setFixedWidth(72)
+        self.edit_hp_potion_key.setPlaceholderText("F1")
+        row_hp_key = QHBoxLayout()
+        row_hp_key.setSpacing(6)
+        row_hp_key.addWidget(QLabel("HP iksir tuşu:"), stretch=1)
+        row_hp_key.addWidget(self.edit_hp_potion_key)
+        lay.addLayout(row_hp_key)
+
+        self.chk_auto_use_mp_potion = QCheckBox("MP iksiri otomatik", self)
+        lay.addWidget(self.chk_auto_use_mp_potion)
+        self.spin_mp_potion_threshold = QSpinBox(self)
+        self.spin_mp_potion_threshold.setRange(1, 100)
+        self.spin_mp_potion_threshold.setSuffix(" %")
+        self.spin_mp_potion_threshold.setFixedWidth(72)
+        row_mp = QHBoxLayout()
+        row_mp.setSpacing(6)
+        row_mp.addWidget(QLabel("MP eşiği:"), stretch=1)
+        row_mp.addWidget(self.spin_mp_potion_threshold)
+        lay.addLayout(row_mp)
+        self.edit_mp_potion_key = QLineEdit(self)
+        self.edit_mp_potion_key.setFixedWidth(72)
+        self.edit_mp_potion_key.setPlaceholderText("F2")
+        row_mp_key = QHBoxLayout()
+        row_mp_key.setSpacing(6)
+        row_mp_key.addWidget(QLabel("MP iksir tuşu:"), stretch=1)
+        row_mp_key.addWidget(self.edit_mp_potion_key)
+        lay.addLayout(row_mp_key)
+
+        self.chk_auto_refresh_buff_scroll = QCheckBox("Buff parşömeni otomatik yenile", self)
+        lay.addWidget(self.chk_auto_refresh_buff_scroll)
+        self.spin_buff_scroll_interval = QSpinBox(self)
+        self.spin_buff_scroll_interval.setRange(1, 3600)
+        self.spin_buff_scroll_interval.setSuffix(" sn")
+        self.spin_buff_scroll_interval.setFixedWidth(72)
+        row_buff = QHBoxLayout()
+        row_buff.setSpacing(6)
+        row_buff.addWidget(QLabel("Buff yenileme aralığı:"), stretch=1)
+        row_buff.addWidget(self.spin_buff_scroll_interval)
+        lay.addLayout(row_buff)
+        self.edit_buff_scroll_key = QLineEdit(self)
+        self.edit_buff_scroll_key.setFixedWidth(72)
+        self.edit_buff_scroll_key.setPlaceholderText("F7")
+        row_buff_key = QHBoxLayout()
+        row_buff_key.setSpacing(6)
+        row_buff_key.addWidget(QLabel("Buff parşömen tuşu (F6 yasaklı):"), stretch=1)
+        row_buff_key.addWidget(self.edit_buff_scroll_key)
+        lay.addLayout(row_buff_key)
+        lay.addStretch(1)
+
+        return grp
 
     def _build_hotkeys_group(self) -> QFrame:
         strip = QFrame(self)
@@ -2307,7 +2770,7 @@ class SettingsWindow(QDialog):
 
         self.point_filter_edit = QLineEdit(self)
         self.point_filter_edit.setPlaceholderText("Nokta ara: #id")
-        self.point_filter_edit.setFixedWidth(128)
+        self.point_filter_edit.setFixedWidth(140)
         self.point_filter_edit.textChanged.connect(self._filter_nodes_table)
         reg_btns.addWidget(self.point_filter_edit)
         lay.addLayout(reg_btns)
@@ -2363,20 +2826,21 @@ class SettingsWindow(QDialog):
         self.table.setShowGrid(False)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.itemSelectionChanged.connect(self._update_sel_info_label)
+        self.table.itemDoubleClicked.connect(self._on_node_double_clicked)
 
         header = self.table.horizontalHeader()
         header.setDefaultAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(0, 125)
+        self.table.setColumnWidth(0, 130)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(2, 74)
+        self.table.setColumnWidth(2, 80)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(3, 68)
+        self.table.setColumnWidth(3, 74)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(4, 78)
+        self.table.setColumnWidth(4, 84)
 
         # Empty-state overlay label inside the table viewport
         self.empty_nodes_lbl = QLabel(
@@ -2422,14 +2886,26 @@ class SettingsWindow(QDialog):
         self.btn_delete_selected.clicked.connect(self._on_delete_node)
         self.btn_delete_wrong = QPushButton("YZ Yanlışları Sil", self)
         self.btn_delete_wrong.clicked.connect(self._on_delete_wrong_nodes)
+        # Eşik profili: prototipteki döngü butonu (Dengeli/Hassas/Sıkı).
+        # Eşikler backend'deki gerçek kademelerdir (node_quality_gate):
+        # Dengeli≈0.13, Hassas≈0.10, Sıkı≈0.22.
         self.cb_wrong_tier = QComboBox(self)
         self.cb_wrong_tier.addItem("Dengeli", "balanced")
-        self.cb_wrong_tier.addItem("Agresif", "aggressive")
+        self.cb_wrong_tier.addItem("Hassas", "aggressive")
         self.cb_wrong_tier.addItem("Sıkı", "strict")
         self.cb_wrong_tier.setCurrentIndex(0)
         self.cb_wrong_tier.setToolTip(
-            "YZ yanlış tarama eşiği: Agresif≈0.10, Dengeli≈0.13, Sıkı≈0.22"
+            "YZ yanlış tarama eşiği: Hassas≈0.10, Dengeli≈0.13, Sıkı≈0.22"
         )
+        self.cb_wrong_tier.currentIndexChanged.connect(
+            self._on_wrong_tier_combo_changed
+        )
+        self.btn_profile = QPushButton("Profil: Dengeli", self)
+        self.btn_profile.setToolTip(
+            "YZ yanlış tarama eşik profili — tıklayınca Dengeli → Hassas → Sıkı döner"
+        )
+        self.btn_profile.clicked.connect(self._on_profile_cycle)
+
         self.btn_share_route = QPushButton("Rotayı Paylaş...", self)
         self.btn_share_route.clicked.connect(self._on_share_route)
         self.btn_import_route = QPushButton("Rota İçe Aktar...", self)
@@ -2440,6 +2916,7 @@ class SettingsWindow(QDialog):
         act_row2.addWidget(self.btn_delete_selected)
         act_row2.addWidget(self.btn_delete_wrong)
         act_row2.addWidget(self.cb_wrong_tier)
+        act_row2.addWidget(self.btn_profile)
         act_row2.addStretch(1)
         act_row2.addWidget(self.btn_share_route)
         act_row2.addWidget(self.btn_import_route)
@@ -2461,13 +2938,14 @@ class SettingsWindow(QDialog):
             self,
         )
         desc_lbl.setWordWrap(True)
-        desc_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        desc_lbl.setStyleSheet("color: #94a3b8; font-size: 12px;")
         lay.addWidget(desc_lbl)
 
         # Filtre ve Durum Satırı
         top_row = QHBoxLayout()
         top_row.setSpacing(6)
         self.blacklist_filter_edit = QLineEdit(self)
+        self.blacklist_filter_edit.setMinimumHeight(30)
         self.blacklist_filter_edit.setPlaceholderText("Kara listede ara: bölge veya koordinat...")
         self.blacklist_filter_edit.textChanged.connect(self._filter_blacklist_table)
         top_row.addWidget(self.blacklist_filter_edit, stretch=1)
@@ -2479,6 +2957,7 @@ class SettingsWindow(QDialog):
 
         # Kara Liste Tablosu
         self.blacklist_table = QTableWidget(self)
+        self.blacklist_table.setMinimumHeight(160)
         self.blacklist_table.setColumnCount(5)
         self.blacklist_table.setHorizontalHeaderLabels(
             ["BÖLGE", "KOORDİNAT", "NEDEN", "YZ TEŞHİSİ", "TARİH"]
@@ -2504,23 +2983,27 @@ class SettingsWindow(QDialog):
         act_row = QHBoxLayout()
         act_row.setSpacing(6)
         self.btn_blacklist_remove = QPushButton("Kara Listeden Kaldır", self)
+        self.btn_blacklist_remove.setMinimumHeight(32)
         self.btn_blacklist_remove.setObjectName("DangerOutlineButton")
         self.btn_blacklist_remove.setToolTip("Seçilen koordinatı kara listeden kaldırır (tekrar kaydedilmesine izin verir)")
         self.btn_blacklist_remove.clicked.connect(self._on_remove_from_blacklist)
         act_row.addWidget(self.btn_blacklist_remove)
 
         self.btn_blacklist_clear = QPushButton("Tümünü Temizle", self)
+        self.btn_blacklist_clear.setMinimumHeight(32)
         self.btn_blacklist_clear.setObjectName("DangerOutlineButton")
         self.btn_blacklist_clear.setToolTip("Tüm kara listeyi temizler")
         self.btn_blacklist_clear.clicked.connect(self._on_clear_blacklist)
         act_row.addWidget(self.btn_blacklist_clear)
 
         self.btn_blacklist_add = QPushButton("Manuel Ekle...", self)
+        self.btn_blacklist_add.setMinimumHeight(32)
         self.btn_blacklist_add.setToolTip("Manuel olarak belirli bir koordinatı kara listeye ekler")
         self.btn_blacklist_add.clicked.connect(self._on_add_to_blacklist)
         act_row.addWidget(self.btn_blacklist_add)
 
         self.btn_blacklist_refresh = QPushButton("Yenile", self)
+        self.btn_blacklist_refresh.setMinimumHeight(32)
         self.btn_blacklist_refresh.setToolTip("Kara liste verilerini yeniden yükler")
         self.btn_blacklist_refresh.clicked.connect(self.load_blacklist_table)
         act_row.addWidget(self.btn_blacklist_refresh)
@@ -2703,148 +3186,172 @@ class SettingsWindow(QDialog):
         """
         Reads all fields from `settings` / `self.settings` / `self.config_manager`
         using safe `getattr` and populates all UI controls.
+
+        Every field is loaded independently (F-0597): one corrupt value only
+        leaves that single control at its default instead of aborting the
+        rest of the load.
         """
         if settings is not None:
             self.settings = settings
-        try:
-            self.f_interval_min.setValue(
-                float(self._cfg_get("f_interval_min", 1.5, target=settings))
-            )
-            self.f_interval_max.setValue(
-                float(self._cfg_get("f_interval_max", 3.0, target=settings))
-            )
-            self.test_mode.setChecked(
-                bool(self._cfg_get("test_mode", False, target=settings))
-            )
-            self.show_overlay.setChecked(
-                bool(self._cfg_get("show_overlay", True, target=settings))
-            )
-            self.pause_on_alt_tab.setChecked(
-                bool(self._cfg_get("pause_on_alt_tab", True, target=settings))
-            )
 
-            # New Gathering settings: harvests_per_node, gather_key, retry_on_extraction_fail
-            raw_harvests = self._cfg_get("harvests_per_node", 3, target=settings)
+        def _f(key: str, default: float) -> float:
             try:
-                harvests_val = max(1, min(10, int(raw_harvests)))
+                return float(self._cfg_get(key, default, target=settings))
+            except (TypeError, ValueError):
+                logger.warning("Bad float value for '%s'; using default %s", key, default)
+                return float(default)
+
+        def _i(key: str, default: int) -> int:
+            try:
+                return int(self._cfg_get(key, default, target=settings))
+            except (TypeError, ValueError):
+                logger.warning("Bad int value for '%s'; using default %s", key, default)
+                return int(default)
+
+        def _b(key: str, default: bool) -> bool:
+            try:
+                return bool(self._cfg_get(key, default, target=settings))
+            except (TypeError, ValueError):
+                return bool(default)
+
+        def _s(key: str, default: str) -> str:
+            try:
+                return str(self._cfg_get(key, default, target=settings) or default)
+            except (TypeError, ValueError):
+                return default
+
+        def _apply(fn) -> None:
+            try:
+                fn()
+            except Exception as exc:
+                logger.error("Error loading a settings field into UI: %s", exc)
+
+        _apply(lambda: self.f_interval_min.setValue(_f("f_interval_min", 1.5)))
+        _apply(lambda: self.f_interval_max.setValue(_f("f_interval_max", 3.0)))
+        _apply(lambda: self.test_mode.setChecked(_b("test_mode", False)))
+        _apply(lambda: self.show_overlay.setChecked(_b("show_overlay", True)))
+        _apply(lambda: self.pause_on_alt_tab.setChecked(_b("pause_on_alt_tab", True)))
+
+        # New Gathering settings: harvests_per_node, gather_key, retry_on_extraction_fail
+        def _load_harvests() -> None:
+            try:
+                harvests_val = max(1, min(10, int(self._cfg_get("harvests_per_node", 3, target=settings))))
             except (TypeError, ValueError):
                 harvests_val = 3
             self.harvests_per_node.setValue(harvests_val)
 
-            raw_gkey = str(
-                self._cfg_get("gather_key", "f", target=settings) or "f"
-            ).strip().lower()
+        _apply(_load_harvests)
+
+        def _load_gather_key() -> None:
+            raw_gkey = str(self._cfg_get("gather_key", "f", target=settings) or "f").strip().lower()
             if raw_gkey not in ("f", "e", "auto"):
                 raw_gkey = "f"
             gkey_idx = self.gather_key.findData(raw_gkey)
             if gkey_idx < 0:
-                gkey_idx = self.gather_key.findText(
-                    raw_gkey, Qt.MatchFlag.MatchFixedString
-                )
+                gkey_idx = self.gather_key.findText(raw_gkey, Qt.MatchFlag.MatchFixedString)
             if gkey_idx >= 0:
                 self.gather_key.setCurrentIndex(gkey_idx)
             else:
                 self.gather_key.setCurrentText("f")
 
-            self.retry_on_extraction_fail.setChecked(
-                bool(self._cfg_get("retry_on_extraction_fail", True, target=settings))
-            )
+        _apply(_load_gather_key)
+        _apply(lambda: self.retry_on_extraction_fail.setChecked(_b("retry_on_extraction_fail", True)))
 
-            if hasattr(self, "chk_selective_gather"):
-                self.chk_selective_gather.setChecked(
-                    bool(self._cfg_get("selective_gather_enabled", False, target=settings))
-                )
-            if hasattr(self, "chk_proximity_route_auto"):
-                self.chk_proximity_route_auto.setChecked(
-                    bool(self._cfg_get("proximity_route_auto", True, target=settings))
-                )
-            if hasattr(self, "combo_selective_materials"):
+        if hasattr(self, "chk_selective_gather"):
+            _apply(lambda: self.chk_selective_gather.setChecked(_b("selective_gather_enabled", False)))
+        if hasattr(self, "chk_proximity_route_auto"):
+            _apply(lambda: self.chk_proximity_route_auto.setChecked(_b("proximity_route_auto", True)))
+        if hasattr(self, "combo_selective_materials"):
+            def _load_materials() -> None:
                 raw_mats = self._cfg_get("selected_materials", [], target=settings) or []
                 if isinstance(raw_mats, str):
                     raw_mats = [m.strip() for m in raw_mats.split(",") if m.strip()]
                 self.set_selected_materials(
                     raw_mats,
-                    auto_proximity=bool(self._cfg_get("proximity_route_auto", True, target=settings)),
+                    auto_proximity=_b("proximity_route_auto", True),
                 )
 
-            # Route & Auto-Cartography settings
-            self.rest_minutes.setValue(
-                int(self._cfg_get("rest_minutes", 5, target=settings))
-            )
-            self.climb_air_max_sec.setValue(
-                int(self._cfg_get("climb_air_max_sec", 10, target=settings))
-            )
-            self.gathered_join_active_route.setChecked(
-                bool(self._cfg_get("gathered_join_active_route", True, target=settings))
-            )
-            self.fly_unreachable.setChecked(
-                bool(self._cfg_get("fly_unreachable", False, target=settings))
-            )
-            self.check_odyle_minimap.setChecked(
-                bool(self._cfg_get("check_odyle_minimap", False, target=settings))
-            )
-            self.reclick_node_sec.setValue(
-                int(self._cfg_get("reclick_node_sec", 10, target=settings))
-            )
-            self.time_to_reach_sec.setValue(
-                int(self._cfg_get("time_to_reach_sec", 60, target=settings))
-            )
-            self.gather_on_the_way.setChecked(
-                bool(self._cfg_get("gather_on_the_way", False, target=settings))
-            )
-            self.wait_min_after_failed.setValue(
-                int(self._cfg_get("wait_min_after_failed", 5, target=settings))
-            )
-            self.max_failed_in_row.setValue(
-                int(self._cfg_get("max_failed_in_row", 10, target=settings))
-            )
-            self.remove_node_after_failures.setValue(
-                int(self._cfg_get("remove_node_after_failures", 0, target=settings))
-            )
-            self.pause_after_no_gather_min.setValue(
-                int(self._cfg_get("pause_after_no_gather_min", 15, target=settings))
-            )
-            self.fight_back.setChecked(
-                bool(self._cfg_get("fight_back", True, target=settings))
-            )
-            self.fight_stop_gather_sec.setValue(
-                int(self._cfg_get("fight_stop_gather_sec", 3, target=settings))
-            )
-            self.minimap_auto_record.setChecked(
-                bool(self._cfg_get("minimap_auto_record", True, target=settings))
-            )
-            self.minimap_ignore_monsters.setChecked(
-                bool(self._cfg_get("minimap_ignore_monsters", True, target=settings))
-            )
-            if hasattr(self, "world_3d_auto_record"):
-                self.world_3d_auto_record.setChecked(
-                    bool(self._cfg_get("auto_record_3d_crests", True, target=settings))
-                )
+            _apply(_load_materials)
 
-            # Breaks settings
-            self.break_every_min.setValue(
-                int(self._cfg_get("break_every_min", 0, target=settings))
-            )
-            self.break_every_variance.setValue(
-                int(self._cfg_get("break_every_variance", 1, target=settings))
-            )
-            self.break_lasts_min.setValue(
-                int(self._cfg_get("break_lasts_min", 10, target=settings))
-            )
-            self.break_lasts_variance.setValue(
-                int(self._cfg_get("break_lasts_variance", 1, target=settings))
-            )
-            self.hotkey_node.setText(
-                str(self._cfg_get("record_node_f8", "ctrl+alt+f8", target=settings) or "ctrl+alt+f8")
-            )
-            self.hotkey_menu.setText(
-                str(self._cfg_get("toggle_menu_f9", "ctrl+alt+f9", target=settings) or "ctrl+alt+f9")
-            )
-            self.hotkey_pause.setText(
-                str(self._cfg_get("pause_resume_f10", "ctrl+alt+f10", target=settings) or "ctrl+alt+f10")
-            )
-        except Exception as exc:
-            logger.error("Error loading settings into UI: %s", exc)
+        # Route & Auto-Cartography settings
+        _apply(lambda: self.rest_minutes.setValue(_i("rest_minutes", 5)))
+        _apply(lambda: self.gathered_join_active_route.setChecked(_b("gathered_join_active_route", True)))
+        _apply(lambda: self.fly_unreachable.setChecked(_b("fly_unreachable", True)))
+        _apply(lambda: self.reclick_node_sec.setValue(_i("reclick_node_sec", 10)))
+        _apply(lambda: self.time_to_reach_sec.setValue(_i("time_to_reach_sec", 60)))
+        _apply(lambda: self.gather_on_the_way.setChecked(_b("gather_on_the_way", False)))
+        _apply(lambda: self.wait_min_after_failed.setValue(_i("wait_min_after_failed", 5)))
+        _apply(lambda: self.max_failed_in_row.setValue(_i("max_failed_in_row", 10)))
+        _apply(lambda: self.remove_node_after_failures.setValue(_i("remove_node_after_failures", 0)))
+        _apply(lambda: self.pause_after_no_gather_min.setValue(_i("pause_after_no_gather_min", 15)))
+        _apply(lambda: self.fight_back.setChecked(_b("fight_back", True)))
+        _apply(lambda: self.fight_stop_gather_sec.setValue(_i("fight_stop_gather_sec", 3)))
+        _apply(lambda: self.minimap_auto_record.setChecked(_b("minimap_auto_record", True)))
+        if hasattr(self, "world_3d_auto_record"):
+            _apply(lambda: self.world_3d_auto_record.setChecked(_b("auto_record_3d_crests", True)))
+
+        # Breaks settings
+        if hasattr(self, "breaks_enabled"):
+            _apply(lambda: self.breaks_enabled.setChecked(_b("breaks_enabled", True)))
+        _apply(lambda: self.break_every_min.setValue(_i("break_every_min", 0)))
+        _apply(lambda: self.break_every_variance.setValue(_i("break_every_variance", 1)))
+        _apply(lambda: self.break_lasts_min.setValue(_i("break_lasts_min", 10)))
+        _apply(lambda: self.break_lasts_variance.setValue(_i("break_lasts_variance", 1)))
+
+        # Consumables settings (F-23-01/F-23-03: artık UI widget'ları var)
+        if hasattr(self, "chk_auto_use_hp_potion"):
+            _apply(lambda: self.chk_auto_use_hp_potion.setChecked(_b("auto_use_hp_potion", True)))
+            _apply(lambda: self.spin_hp_potion_threshold.setValue(_i("hp_potion_threshold_pct", HP_POTION_THRESHOLD_PCT)))
+            _apply(lambda: self.edit_hp_potion_key.setText(_s("hp_potion_key", "F1")))
+            _apply(lambda: self.chk_auto_use_mp_potion.setChecked(_b("auto_use_mp_potion", True)))
+            _apply(lambda: self.spin_mp_potion_threshold.setValue(_i("mp_potion_threshold_pct", MP_POTION_THRESHOLD_PCT)))
+            _apply(lambda: self.edit_mp_potion_key.setText(_s("mp_potion_key", "F2")))
+            _apply(lambda: self.chk_auto_refresh_buff_scroll.setChecked(_b("auto_refresh_buff_scroll", True)))
+            _apply(lambda: self.spin_buff_scroll_interval.setValue(_i("buff_scroll_interval_sec", 300)))
+            _apply(lambda: self.edit_buff_scroll_key.setText(_s("buff_scroll_key", "F7")))
+        _apply(lambda: self.hotkey_node.setText(_s("record_node_f8", "ctrl+alt+f8")))
+        _apply(lambda: self.hotkey_menu.setText(_s("toggle_menu_f9", "ctrl+alt+f9")))
+        _apply(lambda: self.hotkey_pause.setText(_s("pause_resume_f10", "ctrl+alt+f10")))
+
+        # Footer version comes from the file, not a hardcoded string.
+        # P3-1: dosyadaki eski "v2.0" yazımı da normalize edilir; etiket
+        # her zaman "Gatherion v2.0.0" biçimindedir (f9_menu ile aynı).
+        try:
+            version = str(self._cfg_get("version", __version__) or __version__).strip()
+            if version.startswith("v"):
+                version = version[1:]
+            if hasattr(self, "version_lbl"):
+                self.version_lbl.setText(f"Gatherion v{version}")
+        except Exception:
+            pass
+        # F-23-08/F-23-10: bozuk dosya ve sürüm uyumsuzluğu sessiz geçmesin.
+        # append_log log şeridi yoksa logger'a düşer; set_status_message
+        # __init__ sırasında henüz kurulmamış olabilir — try/except'li.
+        try:
+            mgr = getattr(self, "config_manager", None)
+            load_err = getattr(mgr, "load_error", None)
+            version_bad = bool(getattr(mgr, "version_mismatch", False))
+            warn_msg = ""
+            if load_err:
+                warn_msg = (
+                    f"Uyarı: ayar dosyası bozuk, varsayılanlarla açıldı ({load_err}). "
+                    "Eski değerler settings.json.corrupt.<zaman>.bak yedeğinde."
+                )
+            elif version_bad:
+                warn_msg = "Uyarı: ayar dosyası eski sürüm — eksik anahtarlar varsayılanla doldu."
+            if warn_msg:
+                try:
+                    self.append_log(warn_msg, "warn")
+                except Exception:
+                    pass
+                try:
+                    self.set_status_message(warn_msg)
+                except Exception:
+                    pass
+                logger.warning("Ayar penceresi uyarısı gösterildi: %s", warn_msg)
+        except Exception:
+            pass
+        self._loading_settings = False
 
     def _save_to_settings(self, settings: Optional[Any] = None) -> Any:
         """
@@ -2854,10 +3361,17 @@ class SettingsWindow(QDialog):
         if settings is not None:
             self.settings = settings
         values = self.get_settings_dict()
-        for key, val in values.items():
-            self._cfg_set(key, val, target=settings)
+        # Batch: apply all values in memory first, then persist once
+        # (F-0596) instead of one disk write per key.
+        self._cfg_batching = True
+        try:
+            for key, val in values.items():
+                self._cfg_set(key, val, target=settings)
+        finally:
+            self._cfg_batching = False
         self._remember_selection()
-        self._cfg_save()
+        saved = self._cfg_save()
+        self._last_save_ok = bool(saved)
         return settings if settings is not None else self.settings
 
     def _remember_selection(self) -> None:
@@ -2933,12 +3447,10 @@ class SettingsWindow(QDialog):
             if hasattr(self, "chk_proximity_route_auto")
             else True,
             "rest_minutes": int(self.rest_minutes.value()),
-            "climb_air_max_sec": int(self.climb_air_max_sec.value()),
             "gathered_join_active_route": bool(
                 self.gathered_join_active_route.isChecked()
             ),
             "fly_unreachable": bool(self.fly_unreachable.isChecked()),
-            "check_odyle_minimap": bool(self.check_odyle_minimap.isChecked()),
             "reclick_node_sec": int(self.reclick_node_sec.value()),
             "time_to_reach_sec": int(self.time_to_reach_sec.value()),
             "gather_on_the_way": bool(self.gather_on_the_way.isChecked()),
@@ -2949,9 +3461,14 @@ class SettingsWindow(QDialog):
             "fight_back": bool(self.fight_back.isChecked()),
             "fight_stop_gather_sec": int(self.fight_stop_gather_sec.value()),
             "minimap_auto_record": bool(self.minimap_auto_record.isChecked()),
-            "minimap_ignore_monsters": bool(self.minimap_ignore_monsters.isChecked()),
-            "auto_record_3d_crests": bool(self.world_3d_auto_record.isChecked()),
+            "auto_record_3d_crests": bool(self.world_3d_auto_record.isChecked())
+            if hasattr(self, "world_3d_auto_record")
+            else True,
             "break_every_min": int(self.break_every_min.value()),
+            # F-23-06: mola ana şalteri (BreakSettings.enabled).
+            "breaks_enabled": bool(self.breaks_enabled.isChecked())
+            if hasattr(self, "breaks_enabled")
+            else True,
             "break_every_variance": int(self.break_every_variance.value()),
             "break_lasts_min": int(self.break_lasts_min.value()),
             "break_lasts_variance": int(self.break_lasts_variance.value()),
@@ -2959,6 +3476,9 @@ class SettingsWindow(QDialog):
             "toggle_menu_f9": self._chord_setting(self.hotkey_menu.text(), "ctrl+alt+f9"),
             "pause_resume_f10": self._chord_setting(self.hotkey_pause.text(), "ctrl+alt+f10"),
             "blacklist": self.blacklist_mgr.to_list() if getattr(self, "blacklist_mgr", None) else [],
+            # Consumables (F-0540): previously missing here, so HP/MP/buff
+            # values were never written back on Save and silently reverted.
+            **self.get_consumable_settings(),
         }
 
     @staticmethod
@@ -2967,13 +3487,49 @@ class SettingsWindow(QDialog):
 
         return canonical_hotkey_chord(raw, fallback)
 
-    def save_settings(self) -> None:
-        """Persists all UI settings to `config_manager` and emits `settings_saved`."""
+    def save_settings(self) -> bool:
+        """Persists all UI settings to `config_manager` and emits `settings_saved`.
+
+        Returns True only when the settings were actually written to disk.
+        A failed write reports the failure in the status bar and never shows
+        the "saved" message (F-0539).
+        """
+        errors = self._validate_inputs()
+        if errors:
+            widget, message = errors[0]
+            self.set_status_message(f"Kaydedilemedi: {message}")
+            self.append_log(f"Doğrulama hatası: {message}", "err")
+            logger.error("Settings validation failed: %s", message)
+            try:
+                widget.setFocus()
+            except Exception:
+                pass
+            return False
         try:
             if getattr(self, "blacklist_mgr", None) is not None:
-                self.blacklist_mgr.save()
+                try:
+                    bl_saved = self.blacklist_mgr.save()
+                except Exception as exc_bl:
+                    logger.error("Failed to save blacklist: %s", exc_bl)
+                    self.set_status_message(
+                        f"Ayarlar kaydedilemedi: kara liste yazılamadı ({exc_bl})"
+                    )
+                    return False
+                if bl_saved is False:
+                    self.set_status_message(
+                        "Ayarlar kaydedilemedi: kara liste yazılamadı."
+                    )
+                    return False
             self._save_to_settings()
+            if not getattr(self, "_last_save_ok", False):
+                self.set_status_message(
+                    "Ayarlar kaydedilemedi: diske yazma başarısız oldu."
+                )
+                self.append_log("Ayarlar kaydedilemedi: diske yazma başarısız oldu.", "err")
+                logger.error("Settings save reported failure; not signalling success.")
+                return False
             self.set_status_message("Ayarlar kaydedildi ve uygulandı.")
+            self.append_log("Ayarlar kaydedildi ve uygulandı.")
             if hasattr(self, "dirty_lbl"):
                 self.dirty_lbl.setVisible(False)
             if hasattr(self, "saved_lbl"):
@@ -2981,31 +3537,484 @@ class SettingsWindow(QDialog):
                 QTimer.singleShot(2500, lambda: self.saved_lbl.setVisible(False))
             logger.info("Settings saved successfully.")
             self.settings_saved.emit()
+            return True
         except Exception as exc:
             logger.error("Failed to save settings: %s", exc)
+            self.append_log(f"Ayarlar kaydedilirken hata oluştu: {exc}", "err")
             self.set_status_message(f"Ayarlar kaydedilirken hata oluştu: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Mobil token dondurme (S-4301)
+    # ------------------------------------------------------------------
+    # R43 duzeltmesi daha once yalnizca hic orneklenmeyen SettingsDialog
+    # sinifindaydi; kullanicinin gordugu canli SettingsWindow'da token
+    # dondurme yolu yoktu ve eski token gecerli kaliyordu. Asagidaki
+    # metotlar ui/settings_dialog.py'deki mantigin aynisidir: paylasilan
+    # MobileTokenAuthenticator uzerinden yeni 256-bit token uretilir ve
+    # canli sunucuya itilip dogrulanir; server.rotate_access_token()
+    # cagrilmaz (farkli bir token uretip authenticator ile senkronu
+    # bozardi).
+    def _resolve_mobile_server(self):
+        """Return the live MobileRemoteServer, if one is reachable.
+
+        Priority: explicitly wired server (constructor arg), then the
+        parent-widget chain (a main window owns ``mobile_server``).
+        Returns None when no live server is known.
+        """
+        server = getattr(self, "mobile_server", None)
+        if server is not None:
+            return server
+        widget = self.parentWidget()
+        seen = set()
+        while widget is not None and id(widget) not in seen:
+            seen.add(id(widget))
+            server = getattr(widget, "mobile_server", None)
+            if server is not None:
+                return server
+            widget = widget.parentWidget() if hasattr(widget, "parentWidget") else None
+        return None
+
+    def _resolve_mobile_token_auth(self):
+        """Return the shared MobileTokenAuthenticator, if one is reachable.
+
+        Priority: explicitly wired auth (constructor arg), then the
+        shell's worker (GatherionShell keeps ``_worker`` and main.py
+        shares its authenticator with the worker at :541), then the
+        parent-widget chain (a main window owns ``mobile_token_auth``).
+        Returns None when none is known — the caller then mints a fresh
+        authenticator, whose token is still pushed to the live server.
+        """
+        auth = getattr(self, "mobile_token_auth", None)
+        if auth is not None and hasattr(auth, "rotate_token"):
+            return auth
+        shell = getattr(self, "_shell", None)
+        if shell is not None:
+            worker = getattr(shell, "_worker", None)
+            auth = getattr(worker, "mobile_token_auth", None)
+            if auth is not None and hasattr(auth, "rotate_token"):
+                return auth
+        widget = self.parentWidget()
+        seen = set()
+        while widget is not None and id(widget) not in seen:
+            seen.add(id(widget))
+            auth = getattr(widget, "mobile_token_auth", None)
+            if auth is not None and hasattr(auth, "rotate_token"):
+                return auth
+            widget = widget.parentWidget() if hasattr(widget, "parentWidget") else None
+        return None
+
+    def _propagate_token_to_mobile_server(self, auth) -> bool:
+        """Push ``auth``'s (freshly rotated) token onto the live server.
+
+        Uses the authenticator's own ``bind_to_mobile_server()`` — the
+        same call main.py makes once at startup — and verifies the
+        server actually holds the new token afterwards. Deliberately
+        does NOT call ``server.rotate_access_token()``: that generates
+        a *different* 32-char token and would desync the server from
+        the 256-bit authenticator. Returns False when no live server
+        is known or the push could not be verified.
+        """
+        server = self._resolve_mobile_server()
+        if server is None:
+            return False
+        try:
+            bound = False
+            if hasattr(auth, "bind_to_mobile_server"):
+                try:
+                    bound = bool(auth.bind_to_mobile_server(server))
+                except Exception:
+                    bound = False
+            if not bound and hasattr(server, "access_token"):
+                # Fallback: direct assignment of the rotated token.
+                server.access_token = auth.token
+                if hasattr(server, "require_token"):
+                    server.require_token = True
+            return bool(
+                getattr(server, "access_token", None) is not None
+                and str(getattr(server, "access_token")) == str(auth.token)
+            )
+        except Exception:
+            return False
+
+    def rotate_mobile_token(self):
+        """Generate a fresh 256-bit mobile token (core/incident_recorder.py).
+
+        S-4301: rotating only the on-disk token left the live
+        MobileRemoteServer accepting the OLD token (its access_token was
+        set once at startup via bind_to_mobile_server()). The new token
+        is therefore also pushed to the live server — via the shared
+        authenticator when one was wired in, so its in-memory token
+        stays in sync too — and the push is verified. When no live
+        server is reachable the user is told the new token only takes
+        effect after the server restarts, instead of being left to
+        believe the old token is already dead.
+        Returns True when the token was rotated (and, if a live server
+        was known, verified on it); False on failure.
+        """
+        try:
+            from core.incident_recorder import MobileTokenAuthenticator
+
+            # Prefer the shared authenticator (main.py's instance) so its
+            # in-memory token does not keep the old value after rotation.
+            auth = self._resolve_mobile_token_auth()
+            if auth is None or not hasattr(auth, "rotate_token"):
+                auth = MobileTokenAuthenticator()
+            auth.rotate_token()
+            server_updated = self._propagate_token_to_mobile_server(auth)
+            server_known = self._resolve_mobile_server() is not None
+            if server_known and server_updated:
+                QMessageBox.information(
+                    self,
+                    "Mobile Token",
+                    "Yeni 256-bit mobil token üretildi ve canlı mobil "
+                    "sunucuya uygulandı.\n"
+                    f"Parmak izi: {auth.token_fingerprint}\n"
+                    "Eski token artık geçersiz. QR kodunu yeniden oluşturun.",
+                )
+                return True
+            if server_known:
+                QMessageBox.warning(
+                    self,
+                    "Mobile Token",
+                    "Yeni 256-bit mobil token üretildi (diske yazıldı),\n"
+                    f"Parmak izi: {auth.token_fingerprint}\n"
+                    "AMA canlı mobil sunucuya uygulanamadı — sunucu hâlâ "
+                    "eski tokenı kabul ediyor olabilir. Sunucuyu yeniden "
+                    "başlatın ve QR kodunu yeniden oluşturun.",
+                )
+                return False
+            QMessageBox.information(
+                self,
+                "Mobile Token",
+                "Yeni 256-bit mobil token üretildi.\n"
+                f"Parmak izi: {auth.token_fingerprint}\n"
+                "Canlı mobil sunucu bulunamadı; yeni token sunucu yeniden "
+                "başlatıldığında geçerli olur. QR kodunu yeniden oluşturun.",
+            )
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, "Mobile Token", f"Token döndürülemedi: {exc}")
+            return False
 
     def save_and_close(self) -> None:
-        """Saves settings and closes the dialog."""
-        self.save_settings()
-        self.accept()
+        """Saves settings and closes the dialog (only when the save worked)."""
+        if self.save_settings():
+            self.accept()
 
     def reset_to_defaults(self) -> None:
-        """Resets all controls to `DEFAULT_SETTINGS`."""
+        """Resets all controls to `DEFAULT_SETTINGS` and persists the reset.
+
+        Previously the reset only changed in-memory values and never wrote
+        them to disk, so the next launch restored the old settings (F-0598).
+        F-23-09: DEFAULT_SETTINGS dışındaki şema anahtarları da sıfırlanır
+        (mp_full_threshold, ucb_explore_ratio, hotkeys/display alanları,
+        version/active_region/active_route/reflex_model) — yoksa durum
+        çubuğundaki "Tüm ayarlar varsayılan değerlere sıfırlandı." yalan
+        olurdu (örn. bozuk mp_full_threshold olduğu gibi kalıyordu).
+        """
         try:
-            for key, val in DEFAULT_SETTINGS.items():
-                self._cfg_set(key, val)
+            defaults = dict(DEFAULT_SETTINGS)
+            defaults.setdefault("auto_record_3d_crests", True)
+            self._cfg_batching = True
+            try:
+                for key, val in defaults.items():
+                    self._cfg_set(key, val)
+            finally:
+                self._cfg_batching = False
+            # F-23-09: şemada olup DEFAULT_SETTINGS'te olmayan alanlar —
+            # taze BotSettings'ten alınıp bağlı yönetici üzerinden yazılır.
+            try:
+                from config.schema import BotSettings
+
+                fresh = BotSettings().validate()
+                mgr = getattr(self, "config_manager", None)
+                mgr_set = getattr(mgr, "set", None) if mgr is not None else None
+                if callable(mgr_set):
+                    for sec_name in ("gathering", "route", "breaks", "hotkeys", "display"):
+                        sec_obj = getattr(fresh, sec_name, None)
+                        if sec_obj is None:
+                            continue
+                        for fname in list(getattr(sec_obj, "__dataclass_fields__", {}).keys()):
+                            try:
+                                mgr_set(sec_name, fname, getattr(sec_obj, fname))
+                            except Exception:
+                                pass
+                    for fname in ("version", "active_region", "active_route", "reflex_model"):
+                        try:
+                            mgr_set("", fname, getattr(fresh, fname))
+                        except Exception:
+                            pass
+            except Exception as exc:
+                logger.debug("Şema kapsamlı sıfırlama atlandı: %s", exc)
+            if not self._cfg_save():
+                self.set_status_message(
+                    "Sıfırlama diske yazılamadı: varsayılanlar kaydedilmedi."
+                )
+                logger.error("Reset to defaults failed to persist.")
+                return
             self._load_from_settings()
             self.set_status_message("Tüm ayarlar varsayılan değerlere sıfırlandı.")
+            if hasattr(self, "dirty_lbl"):
+                self.dirty_lbl.setVisible(False)
+            self.append_log("Tüm değerler varsayılanlara sıfırlandı ve kaydedildi.")
             logger.info("Settings reset to defaults.")
         except Exception as exc:
             logger.error("Error resetting settings to defaults: %s", exc)
+            self.set_status_message(f"Sıfırlama başarısız: {exc}")
 
     def set_status_message(self, message: str) -> None:
         """Updates the footer status message (`status_lbl`)."""
         self.status_lbl.setText(str(message))
 
     set_status = set_status_message
+
+    # ------------------------------------------------------------------
+    # Prototip farkları: log şeridi, kirli takibi, doğrulama, profil
+    # ------------------------------------------------------------------
+    def append_log(self, message: str, level: str = "inf") -> None:
+        """Append one timestamped line to the bottom log strip (max 60)."""
+        widget = getattr(self, "log_text", None)
+        if widget is None:
+            logger.info("%s", message)
+            return
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        prefix = {"err": "[ERROR]", "warn": "[WARNING]"}.get(level, "[INFO]")
+        widget.appendPlainText(f"[{stamp}] {prefix} {message}")
+
+    def _mark_dirty(self, *_args: Any) -> None:
+        """Show the 'unsaved changes' tag; hidden again only by a save."""
+        if getattr(self, "_loading_settings", False):
+            return
+        if hasattr(self, "dirty_lbl"):
+            self.dirty_lbl.setVisible(True)
+        if hasattr(self, "saved_lbl"):
+            self.saved_lbl.setVisible(False)
+
+    def _wire_dirty_tracking(self) -> None:
+        """Every settings control marks the window dirty on user change.
+
+        Loading is guarded by `_loading_settings`, so programmatic
+        `setValue`/`setChecked` during `_load_from_settings` never
+        shows the dirty tag.
+        """
+        spins = (
+            "f_interval_min", "f_interval_max", "harvests_per_node",
+            "rest_minutes", "reclick_node_sec",
+            "time_to_reach_sec", "wait_min_after_failed", "max_failed_in_row",
+            "remove_node_after_failures", "pause_after_no_gather_min",
+            "fight_stop_gather_sec", "break_every_min", "break_every_variance",
+            "break_lasts_min", "break_lasts_variance",
+        )
+        for name in spins:
+            widget = getattr(self, name, None)
+            if widget is not None and hasattr(widget, "valueChanged"):
+                widget.valueChanged.connect(self._mark_dirty)
+        toggles = (
+            "retry_on_extraction_fail", "test_mode", "show_overlay",
+            "pause_on_alt_tab", "chk_selective_gather", "chk_proximity_route_auto",
+            "gathered_join_active_route", "fly_unreachable",
+            "gather_on_the_way", "fight_back", "minimap_auto_record",
+            "world_3d_auto_record",
+        )
+        for name in toggles:
+            widget = getattr(self, name, None)
+            if widget is not None and hasattr(widget, "toggled"):
+                widget.toggled.connect(self._mark_dirty)
+        combos = ("gather_key", "combo_selective_materials")
+        for name in combos:
+            widget = getattr(self, name, None)
+            if widget is not None and hasattr(widget, "currentIndexChanged"):
+                widget.currentIndexChanged.connect(self._mark_dirty)
+        for name in ("hotkey_node", "hotkey_menu", "hotkey_pause"):
+            widget = getattr(self, name, None)
+            if widget is not None and hasattr(widget, "textChanged"):
+                widget.textChanged.connect(self._mark_dirty)
+
+    def _validate_inputs(self) -> List[Tuple[Any, str]]:
+        """Prototype validation rules; returns [(widget, message), ...].
+
+        Blocks `save_settings` on the first error instead of silently
+        clamping (the old `get_settings_dict` behaviour hid a bad
+        F/E range by forcing max == min).
+        """
+        errors: List[Tuple[Any, str]] = []
+        try:
+            f_min = float(self.f_interval_min.value())
+        except Exception:
+            f_min = 0.0
+        try:
+            f_max = float(self.f_interval_max.value())
+        except Exception:
+            f_max = 0.0
+        if f_min <= 0:
+            errors.append((self.f_interval_min, "F/E alt sınır 0’dan büyük bir sayı olmalı."))
+        if f_max <= 0:
+            errors.append((self.f_interval_max, "F/E üst sınır 0’dan büyük bir sayı olmalı."))
+        elif f_max <= f_min:
+            errors.append((self.f_interval_max, "F/E üst sınır, alt sınırdan büyük olmalı."))
+        try:
+            harvests = int(self.harvests_per_node.value())
+        except Exception:
+            harvests = 0
+        if harvests < 1 or harvests > 10:
+            errors.append(
+                (self.harvests_per_node, "Materyal başına toplama 1–10 arası tam sayı olmalı.")
+            )
+        gkey = str(
+            self.gather_key.currentData() or self.gather_key.currentText() or ""
+        ).strip().lower()
+        if gkey not in ("f", "e", "auto"):
+            errors.append((self.gather_key, "Toplama tuşu f, e veya otomatik olmalı."))
+        try:
+            from config.schema import parse_hotkey_chord
+        except Exception:
+            parse_hotkey_chord = None  # type: ignore[assignment]
+        for edit, label in (
+            (self.hotkey_node, "Nokta ekle"),
+            (self.hotkey_menu, "Menü"),
+            (self.hotkey_pause, "Duraklat / Devam"),
+        ):
+            chord = str(edit.text() or "").strip().lower()
+            if parse_hotkey_chord is not None:
+                key, mods = parse_hotkey_chord(chord)
+            else:
+                key, mods = ("", frozenset())
+            is_f_key = key.startswith("f") and key[1:].isdigit()
+            if not chord or not is_f_key:
+                errors.append(
+                    (edit, f"{label} kısayolu bir F tuşuyla bitmeli (örn. ctrl+alt+f8).")
+                )
+            elif not mods:
+                errors.append(
+                    (
+                        edit,
+                        f"{label} kısayolu en az bir değiştirici tuş içermeli "
+                        "(ctrl/alt/shift) — yalnız F8/F9/F10 oyuna gider.",
+                    )
+                )
+        try:
+            if int(self.break_lasts_min.value()) < 1:
+                errors.append((self.break_lasts_min, "Mola süresi en az 1 dk olmalı."))
+        except Exception:
+            pass
+        return errors
+
+    # -- YZ eşik profili (Dengeli / Hassas / Sıkı) ---------------------
+    _WRONG_TIER_ORDER = ("balanced", "aggressive", "strict")
+    _WRONG_TIER_LABELS = {
+        "balanced": "Dengeli",
+        "aggressive": "Hassas",
+        "strict": "Sıkı",
+    }
+    # Mirrors core/node_quality_gate.CONF_TIERS. The literal map is the
+    # fallback because importing that module needs numpy/cv2, which may
+    # be absent (e.g. this VM); when importable, its values win.
+    _WRONG_TIER_FLOORS = {"balanced": 0.13, "aggressive": 0.10, "strict": 0.22}
+
+    def _wrong_tier_floor(self, tier: str) -> float:
+        try:
+            from core.node_quality_gate import conf_min_for_tier
+
+            return float(conf_min_for_tier(tier))
+        except Exception:
+            return float(self._WRONG_TIER_FLOORS.get(str(tier or "balanced"), 0.13))
+
+    def _wrong_tier_label(self, tier: str) -> str:
+        return self._WRONG_TIER_LABELS.get(str(tier or "balanced"), "Dengeli")
+
+    def _on_wrong_tier_combo_changed(self, _index: int = 0) -> None:
+        tier = self._wrong_scan_tier()
+        button = getattr(self, "btn_profile", None)
+        if button is not None:
+            button.setText(f"Profil: {self._wrong_tier_label(tier)}")
+        self._update_infoline()
+        self._mark_dirty()
+
+    def _on_profile_cycle(self) -> None:
+        """Prototype profile button: Dengeli → Hassas → Sıkı → Dengeli."""
+        current = self._wrong_scan_tier()
+        try:
+            nxt = self._WRONG_TIER_ORDER[
+                (self._WRONG_TIER_ORDER.index(current) + 1) % len(self._WRONG_TIER_ORDER)
+            ]
+        except ValueError:
+            nxt = "balanced"
+        combo = getattr(self, "cb_wrong_tier", None)
+        if combo is not None:
+            idx = combo.findData(nxt)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        floor = self._wrong_tier_floor(nxt)
+        label = self._wrong_tier_label(nxt)
+        self.set_status_message(f"Eşik profili: {label} ({floor:.2f})")
+        self.append_log(f"YZ eşik profili: {label} (eşik={floor:.2f})")
+
+    # -- Alt bilgi satırı (YZ taraması özeti) ---------------------------
+    def _update_infoline(self) -> None:
+        label_widget = getattr(self, "infoline_lbl", None)
+        if label_widget is None:
+            return
+        floor = self._wrong_tier_floor(self._wrong_scan_tier())
+        profile = self._wrong_tier_label(self._wrong_scan_tier())
+        meta = getattr(self, "_last_scan_meta", "") or ""
+        if meta:
+            removed = int(getattr(self, "_last_scan_removed", 0) or 0)
+            backup = str(getattr(self, "_last_scan_backup", "") or "")
+            text = f"YZ taraması {removed} nokta sildi. {meta}"
+            if backup:
+                text += f" · Yedek: {backup}"
+            label_widget.setText(text)
+        else:
+            label_widget.setText(
+                "YZ modeli hazır. Henüz tarama yapılmadı. "
+                f"Profil: {profile} (eşik={floor:.2f})"
+            )
+
+    def _record_scan_result(self, removed: int, backup_path: str, meta: str) -> None:
+        self._last_scan_removed = int(removed)
+        self._last_scan_backup = str(backup_path or "")
+        self._last_scan_meta = str(meta or "")
+        self._update_infoline()
+
+    # -- Çift tık: noktayı toplandı işaretle -----------------------------
+    def _on_node_double_clicked(self, item: Any) -> None:
+        """Prototype double-click: mark the node gathered via RouteManager."""
+        try:
+            row = item.row()
+        except Exception:
+            return
+        anchor = self.table.item(row, 0) if hasattr(self, "table") else None
+        if anchor is None:
+            return
+        try:
+            node_id = int(anchor.data(Qt.ItemDataRole.UserRole))
+        except (TypeError, ValueError):
+            return
+        reg = self._current_region()
+        rte = self._current_route()
+        rm = self.route_manager
+        if rm is None or not hasattr(rm, "mark_node_gathered"):
+            self.set_status_message(
+                "Nokta işaretlenemedi: rota yöneticisi yok. Hiçbir şey yazılmadı."
+            )
+            return
+        try:
+            node = rm.mark_node_gathered(
+                node_id,
+                rest_minutes=float(self.rest_minutes.value()),
+                region=reg,
+            )
+        except Exception as exc:
+            logger.error("Mark node gathered failed #%s: %s", node_id, exc)
+            self.set_status_message(f"Nokta işaretlenemedi: {exc}")
+            return
+        if node is None:
+            self.set_status_message(f"Nokta #{node_id} bulunamadı.")
+            return
+        self.set_status_message(f"Nokta toplandı: #{node_id} ({rte})")
+        self.append_log(f"Nokta toplandı: #{node_id} ({rte})")
+        self.load_nodes_table()
 
     def _on_quit_clicked(self) -> None:
         logger.info("Quit bot requested from SettingsWindow.")
@@ -3019,6 +4028,26 @@ class SettingsWindow(QDialog):
             event.ignore()
             shell.close()
             return
+        # P2-2: gerçek kapanışta çalışan YZ taraması varsa işbirlikçi
+        # stop + sınırlı bekleme; durmazsa thread ebeveynsiz olduğu için
+        # pencereyle birlikte yok olmaz, bitince kendi kapanır.
+        thread = getattr(self, "_wrong_scan_thread", None)
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    worker = getattr(self, "_wrong_scan_worker", None)
+                    stop = getattr(worker, "stop", None)
+                    if callable(stop):
+                        stop()
+                    thread.requestInterruption()
+                    thread.quit()
+                    if not thread.wait(5000):
+                        logger.warning(
+                            "YZ taraması kapanışta 5 sn içinde durmadı; "
+                            "arka plan işi bitince kapanacak."
+                        )
+            except RuntimeError:
+                pass  # C++ nesnesi zaten silinmiş
         super().closeEvent(event)
 
     def _open_hosted(self, key: str) -> bool:
@@ -3190,6 +4219,8 @@ class SettingsWindow(QDialog):
                     self.route_manager.data["active_route"] = rte
             self.load_nodes_table()
             self.route_changed.emit(reg, rte)
+            self._mark_dirty()
+            self.append_log(f"Rota: {reg} · {rte} ({self.table.rowCount()} nokta)")
         except Exception as exc:
             logger.error("Error handling route change: %s", exc)
 
@@ -3306,104 +4337,116 @@ class SettingsWindow(QDialog):
             now = time.time()
             rest_sec_cfg = int(self.rest_minutes.value()) * 60
 
+            placed = 0
             for row_idx, node in enumerate(nodes):
-                self.table.insertRow(row_idx)
-                self.table.setRowHeight(row_idx, 54)
+                # One corrupt node must not wipe the rest of the table (F-0599):
+                # each row is built in isolation; on failure only that
+                # (possibly half-inserted) row is dropped and loading continues.
+                row = placed
+                try:
+                    self.table.insertRow(row)
+                    self.table.setRowHeight(row, 56)
 
-                node_id = int(
-                    node.get("id", row_idx + 1)
-                    if isinstance(node, dict)
-                    else getattr(node, "id", row_idx + 1)
-                )
-                raw_routes = (
-                    node.get("routes", [])
-                    if isinstance(node, dict)
-                    else getattr(node, "routes", [])
-                )
-                if isinstance(raw_routes, (list, tuple, set)):
-                    routes_str = ", ".join(str(r) for r in raw_routes if r and r != "All")
-                else:
-                    routes_str = str(raw_routes or "")
-                if not routes_str:
-                    routes_str = rte if (rte and rte != "All") else "Tümü"
-
-                gathered_cnt = int(
-                    node.get("gathered_count", node.get("visit_count", 0))
-                    if isinstance(node, dict)
-                    else getattr(
-                        node, "gathered_count", getattr(node, "visit_count", 0)
+                    node_id = int(
+                        node.get("id", row + 1)
+                        if isinstance(node, dict)
+                        else getattr(node, "id", row + 1)
                     )
-                )
-                last_ts = float(
-                    node.get("last_visited_timestamp", node.get("last_visited", 0.0))
-                    if isinstance(node, dict)
-                    else getattr(
-                        node,
-                        "last_visited_timestamp",
-                        getattr(node, "last_visited", 0.0),
+                    raw_routes = (
+                        node.get("routes", [])
+                        if isinstance(node, dict)
+                        else getattr(node, "routes", [])
                     )
-                )
+                    if isinstance(raw_routes, (list, tuple, set)):
+                        routes_str = ", ".join(str(r) for r in raw_routes if r and r != "All")
+                    else:
+                        routes_str = str(raw_routes or "")
+                    if not routes_str:
+                        routes_str = rte if (rte and rte != "All") else "Tümü"
 
-                # Column 0: NOKTA (48x48 patch thumbnail + bold #id)
-                cell_node = QWidget(self.table)
-                cell_lay = QHBoxLayout(cell_node)
-                cell_lay.setContentsMargins(4, 3, 6, 3)
-                cell_lay.setSpacing(8)
-
-                lbl_thumb = QLabel(cell_node)
-                lbl_thumb.setFixedSize(48, 48)
-                lbl_thumb.setPixmap(self._resolve_node_patch_pixmap(node, reg))
-                lbl_thumb.setStyleSheet(
-                    "border: 1px solid #30363d; border-radius: 3px;"
-                )
-                cell_lay.addWidget(lbl_thumb)
-
-                lbl_num = QLabel(f"#{node_id}", cell_node)
-                lbl_num.setStyleSheet(
-                    'color: #e8edf2; font-weight: bold; font-size: 12px; font-family: Consolas, "Cascadia Mono", monospace;'
-                )
-                cell_lay.addWidget(lbl_num)
-                cell_lay.addStretch(1)
-                self._arm_row_select(cell_node, row_idx)
-
-                # Store node_id in underlying QTableWidgetItem for selection operations
-                anchor_item = QTableWidgetItem()
-                anchor_item.setData(Qt.ItemDataRole.UserRole, node_id)
-                self.table.setItem(row_idx, 0, anchor_item)
-                self.table.setCellWidget(row_idx, 0, cell_node)
-
-                # Column 1: ROTALAR
-                item_routes = QTableWidgetItem(routes_str)
-                item_routes.setForeground(QBrush(QColor("#e8edf2")))
-                self.table.setItem(row_idx, 1, item_routes)
-
-                # Column 2: TOPLANAN
-                item_gathered = QTableWidgetItem(f"{gathered_cnt}×")
-                item_gathered.setForeground(QBrush(QColor("#e8edf2")))
-                self.table.setItem(row_idx, 2, item_gathered)
-
-                # Column 3: SON
-                last_str = self._format_last_visited(last_ts, now)
-                item_last = QTableWidgetItem(last_str)
-                item_last.setData(Qt.ItemDataRole.UserRole, last_ts)
-                item_last.setForeground(QBrush(QColor("#8b98a6")))
-                self.table.setItem(row_idx, 3, item_last)
-
-                # Column 4: DURUM (green `Hazır`, amber rest, gray `Yoksayılan`)
-                ignored = bool(
-                    node.get("not_gatherable", False)
-                    if isinstance(node, dict)
-                    else getattr(node, "not_gatherable", False)
-                )
-                if ignored:
-                    rest_text, is_ready = "Yoksayılan", False
-                else:
-                    rest_text, is_ready = self._compute_rest_status(
-                        last_ts, rest_sec_cfg, now
+                    gathered_cnt = int(
+                        node.get("gathered_count", node.get("visit_count", 0))
+                        if isinstance(node, dict)
+                        else getattr(
+                            node, "gathered_count", getattr(node, "visit_count", 0)
+                        )
                     )
-                badge = _RestBadgeWidget(rest_text, is_ready, self.table, ignored=ignored)
-                self._arm_row_select(badge, row_idx)
-                self.table.setCellWidget(row_idx, 4, badge)
+                    last_ts = float(
+                        node.get("last_visited_timestamp", node.get("last_visited", 0.0))
+                        if isinstance(node, dict)
+                        else getattr(
+                            node,
+                            "last_visited_timestamp",
+                            getattr(node, "last_visited", 0.0),
+                        )
+                    )
+
+                    # Column 0: NOKTA (48x48 patch thumbnail + bold #id)
+                    cell_node = QWidget(self.table)
+                    cell_lay = QHBoxLayout(cell_node)
+                    cell_lay.setContentsMargins(6, 4, 8, 4)
+                    cell_lay.setSpacing(10)
+
+                    lbl_thumb = QLabel(cell_node)
+                    lbl_thumb.setFixedSize(48, 48)
+                    lbl_thumb.setPixmap(self._resolve_node_patch_pixmap(node, reg))
+                    lbl_thumb.setStyleSheet(
+                        "border: 1px solid #30363d; border-radius: 3px;"
+                    )
+                    cell_lay.addWidget(lbl_thumb)
+
+                    lbl_num = QLabel(f"#{node_id}", cell_node)
+                    lbl_num.setStyleSheet(
+                        'color: #e8edf2; font-weight: bold; font-size: 13px; font-family: Consolas, "Cascadia Mono", monospace;'
+                    )
+                    cell_lay.addWidget(lbl_num)
+                    cell_lay.addStretch(1)
+                    self._arm_row_select(cell_node, row)
+
+                    # Store node_id in underlying QTableWidgetItem for selection operations
+                    anchor_item = QTableWidgetItem()
+                    anchor_item.setData(Qt.ItemDataRole.UserRole, node_id)
+                    self.table.setItem(row, 0, anchor_item)
+                    self.table.setCellWidget(row, 0, cell_node)
+
+                    # Column 1: ROTALAR
+                    item_routes = QTableWidgetItem(routes_str)
+                    item_routes.setForeground(QBrush(QColor("#e8edf2")))
+                    self.table.setItem(row, 1, item_routes)
+
+                    # Column 2: TOPLANAN
+                    item_gathered = QTableWidgetItem(f"{gathered_cnt}×")
+                    item_gathered.setForeground(QBrush(QColor("#e8edf2")))
+                    self.table.setItem(row, 2, item_gathered)
+
+                    # Column 3: SON
+                    last_str = self._format_last_visited(last_ts, now)
+                    item_last = QTableWidgetItem(last_str)
+                    item_last.setData(Qt.ItemDataRole.UserRole, last_ts)
+                    item_last.setForeground(QBrush(QColor("#8b98a6")))
+                    self.table.setItem(row, 3, item_last)
+
+                    # Column 4: DURUM (green `Hazır`, amber rest, gray `Yoksayılan`)
+                    ignored = bool(
+                        node.get("not_gatherable", False)
+                        if isinstance(node, dict)
+                        else getattr(node, "not_gatherable", False)
+                    )
+                    if ignored:
+                        rest_text, is_ready = "Yoksayılan", False
+                    else:
+                        rest_text, is_ready = self._compute_rest_status(
+                            last_ts, rest_sec_cfg, now
+                        )
+                    badge = _RestBadgeWidget(rest_text, is_ready, self.table, ignored=ignored)
+                    self._arm_row_select(badge, row)
+                    self.table.setCellWidget(row, 4, badge)
+                except Exception as exc:
+                    logger.error("Skipping corrupt node at position %s: %s", row_idx, exc)
+                    if self.table.rowCount() > row:
+                        self.table.removeRow(row)
+                    continue
+                placed += 1
             if hasattr(self, "point_filter_edit") and self.point_filter_edit.text().strip():
                 self._filter_nodes_table(self.point_filter_edit.text())
             else:
@@ -3421,7 +4464,12 @@ class SettingsWindow(QDialog):
             gpu_pct = snap.get("gpu", {}).get("pct", 0)
             cpu_pct = snap.get("cpu", {}).get("pct", 0)
             lat_val = snap.get("capture", {}).get("latency_ms", 0.0)
-            lat_str = f"{lat_val:.1f}ms" if lat_val > 0 else "0.0ms"
+            lat_measured = snap.get("capture", {}).get("latency_measured", False)
+            lat_str = (
+                f"{lat_val:.1f}ms"
+                if lat_measured and isinstance(lat_val, (int, float)) and lat_val > 0
+                else "—"
+            )
 
             if hasattr(self, "chip_fps"):
                 self.chip_fps.setText(f'FPS <b style="color:#e8edf2;font-family:Consolas;">{fps_str}</b>')
@@ -3451,6 +4499,11 @@ class SettingsWindow(QDialog):
 
                 badge = self.table.cellWidget(row_idx, 4)
                 if isinstance(badge, _RestBadgeWidget):
+                    # P2-7: yoksayılan rozet canlı güncellemede ezilmez
+                    # (set_status da bunu korur; buradaki atlama gereksiz
+                    # dinlenme hesabını önler).
+                    if badge.is_ignored:
+                        continue
                     rest_text, is_ready = self._compute_rest_status(
                         last_ts, rest_sec_cfg, now
                     )
@@ -3496,6 +4549,20 @@ class SettingsWindow(QDialog):
                     self.set_status_message(
                         f"'{old_reg}' bölgesi '{new_reg}' olarak yeniden adlandırıldı."
                     )
+                else:
+                    self.set_status_message(
+                        f"'{old_reg}' bölgesi '{new_reg}' olarak yeniden adlandırılamadı."
+                    )
+                    logger.error(
+                        "Rename region failed: rename_region returned False for %r -> %r",
+                        old_reg,
+                        new_reg,
+                    )
+            else:
+                self.set_status_message(
+                    "Bölge yeniden adlandırma desteklenmiyor: rota yöneticisinde rename_region yok."
+                )
+                logger.error("rename_region missing on route manager; region not renamed.")
         except Exception as exc:
             logger.error("Rename region failed: %s", exc)
 
@@ -3513,9 +4580,19 @@ class SettingsWindow(QDialog):
             return
         try:
             if hasattr(self.route_manager, "delete_region"):
-                self.route_manager.delete_region(reg)
-                self.refresh_regions_and_routes()
-                self.set_status_message(f"'{reg}' bölgesi silindi.")
+                if self.route_manager.delete_region(reg):
+                    self.refresh_regions_and_routes()
+                    self.set_status_message(f"'{reg}' bölgesi silindi.")
+                else:
+                    self.set_status_message(f"'{reg}' bölgesi silinemedi.")
+                    logger.error(
+                        "Delete region failed: delete_region returned False for %r", reg
+                    )
+            else:
+                self.set_status_message(
+                    "Bölge silme desteklenmiyor: rota yöneticisinde delete_region yok."
+                )
+                logger.error("delete_region missing on route manager; region not deleted.")
         except Exception as exc:
             logger.error("Delete region failed: %s", exc)
 
@@ -3529,7 +4606,17 @@ class SettingsWindow(QDialog):
             if not ok_reg or not reg:
                 return
             if hasattr(self.route_manager, "create_region"):
-                self.route_manager.create_region(reg)
+                if not self.route_manager.create_region(reg):
+                    self.set_status_message(f"'{reg}' bölgesi oluşturulamadı.")
+                    logger.error(
+                        "Create region failed: create_region returned False for %r", reg
+                    )
+                    return
+            else:
+                self.set_status_message(
+                    "Bölge oluşturma desteklenmiyor: rota yöneticisinde create_region yok."
+                )
+                logger.error("create_region missing on route manager; region not created.")
 
         new_rte, ok = QInputDialog.getText(
             self, "Yeni Rota", f"'{reg}' bölgesi için yeni rota adı:"
@@ -3539,11 +4626,25 @@ class SettingsWindow(QDialog):
             return
         try:
             if hasattr(self.route_manager, "create_route"):
-                self.route_manager.create_route(reg, new_rte)
-                self.refresh_regions_and_routes(
-                    prefer_region=reg, prefer_route=new_rte
+                if self.route_manager.create_route(reg, new_rte):
+                    self.refresh_regions_and_routes(
+                        prefer_region=reg, prefer_route=new_rte
+                    )
+                    self.set_status_message(f"'{reg}' içinde '{new_rte}' rotası oluşturuldu.")
+                else:
+                    self.set_status_message(
+                        f"'{reg}' içinde '{new_rte}' rotası oluşturulamadı."
+                    )
+                    logger.error(
+                        "Create route failed: create_route returned False for %r / %r",
+                        reg,
+                        new_rte,
+                    )
+            else:
+                self.set_status_message(
+                    "Rota oluşturma desteklenmiyor: rota yöneticisinde create_route yok."
                 )
-                self.set_status_message(f"'{reg}' içinde '{new_rte}' rotası oluşturuldu.")
+                logger.error("create_route missing on route manager; route not created.")
         except Exception as exc:
             logger.error("Create route failed: %s", exc)
 
@@ -3568,6 +4669,21 @@ class SettingsWindow(QDialog):
                     self.set_status_message(
                         f"'{old_rte}' rotası '{new_rte}' olarak yeniden adlandırıldı."
                     )
+                else:
+                    self.set_status_message(
+                        f"'{old_rte}' rotası '{new_rte}' olarak yeniden adlandırılamadı."
+                    )
+                    logger.error(
+                        "Rename route failed: rename_route returned False for %r / %r -> %r",
+                        reg,
+                        old_rte,
+                        new_rte,
+                    )
+            else:
+                self.set_status_message(
+                    "Rota yeniden adlandırma desteklenmiyor: rota yöneticisinde rename_route yok."
+                )
+                logger.error("rename_route missing on route manager; route not renamed.")
         except Exception as exc:
             logger.error("Rename route failed: %s", exc)
 
@@ -3587,11 +4703,23 @@ class SettingsWindow(QDialog):
             return
         try:
             if hasattr(self.route_manager, "delete_route"):
-                self.route_manager.delete_route(reg, rte)
-                self.refresh_regions_and_routes(
-                    prefer_region=reg, prefer_route="All"
+                if self.route_manager.delete_route(reg, rte):
+                    self.refresh_regions_and_routes(
+                        prefer_region=reg, prefer_route="All"
+                    )
+                    self.set_status_message(f"'{rte}' rotası silindi.")
+                else:
+                    self.set_status_message(f"'{rte}' rotası silinemedi.")
+                    logger.error(
+                        "Delete route failed: delete_route returned False for %r / %r",
+                        reg,
+                        rte,
+                    )
+            else:
+                self.set_status_message(
+                    "Rota silme desteklenmiyor: rota yöneticisinde delete_route yok."
                 )
-                self.set_status_message(f"'{rte}' rotası silindi.")
+                logger.error("delete_route missing on route manager; route not deleted.")
         except Exception as exc:
             logger.error("Delete route failed: %s", exc)
 
@@ -3621,12 +4749,33 @@ class SettingsWindow(QDialog):
                         node = self.route_manager.add_node(
                             region=reg, route=rte, map_x=960, map_y=540
                         )
-                        self.refresh_regions_and_routes(
-                            prefer_region=reg, prefer_route=rte
+                        if node is None:
+                            logger.error(
+                                "Add node returned None for region=%s route=%s "
+                                "(kara liste veya ekleme reddi olabilir).",
+                                reg,
+                                rte,
+                            )
+                            self.set_status_message(
+                                "Nokta eklenemedi: konum kara listede olabilir "
+                                "veya ekleme reddedildi."
+                            )
+                        else:
+                            self.refresh_regions_and_routes(
+                                prefer_region=reg, prefer_route=rte
+                            )
+                            self.set_status_message(
+                                f"Nokta #{node.id}, {reg} · {rte} rotasına eklendi."
+                            )
+                    else:
+                        logger.error(
+                            "add_node missing on route manager; no node created."
                         )
                         self.set_status_message(
-                            f"Nokta #{node.id}, {reg} · {rte} rotasına eklendi."
+                            "Nokta eklenemedi: rota yöneticisinde add_node yok. "
+                            "Hiçbir nokta eklenmedi."
                         )
+                        self.append_log(f"Nokta eklendi: #{node.id} → {rte}")
                 else:
                     sel_ids = dlg.selected_node_ids()
                     added = 0
@@ -3644,6 +4793,7 @@ class SettingsWindow(QDialog):
                     )
         except Exception as exc:
             logger.error("Add nodes failed: %s", exc)
+            self.set_status_message(f"Nokta ekleme başarısız: {exc}")
 
     def _on_remove_from_route(self) -> None:
         reg = self._current_region()
@@ -3657,16 +4807,28 @@ class SettingsWindow(QDialog):
         if not ids:
             self.set_status_message("Önce bir veya daha fazla nokta seçin.")
             return
+        if not hasattr(self.route_manager, "remove_node_from_route"):
+            self.set_status_message(
+                "Rotadan çıkarma desteklenmiyor: rota yöneticisinde remove_node_from_route yok. Hiçbir nokta çıkarılmadı."
+            )
+            logger.error("remove_node_from_route missing on route manager; nothing removed.")
+            return
         try:
             removed = 0
             for nid in ids:
-                if hasattr(self.route_manager, "remove_node_from_route"):
-                    if self.route_manager.remove_node_from_route(nid, rte, region=reg):
-                        removed += 1
+                if self.route_manager.remove_node_from_route(nid, rte, region=reg):
+                    removed += 1
             self.refresh_regions_and_routes(prefer_region=reg, prefer_route=rte)
-            self.set_status_message(f"{removed} nokta '{rte}' rotasından çıkarıldı.")
+            if removed == 0:
+                self.set_status_message(
+                    f"Hiçbir nokta '{rte}' rotasından çıkarılamadı."
+                )
+            else:
+                self.set_status_message(f"{removed} nokta '{rte}' rotasından çıkarıldı.")
+                self.append_log(f"Rotadan çıkarıldı: {ids} ({rte})")
         except Exception as exc:
             logger.error("Remove from route failed: %s", exc)
+            self.set_status_message(f"Rotadan çıkarma başarısız: {exc}")
 
     def _arm_row_select(self, widget: QWidget, row_idx: int) -> None:
         """Let Ctrl/Shift clicks on thumbnails and badges select the row."""
@@ -3719,11 +4881,27 @@ class SettingsWindow(QDialog):
         if not ids:
             self.set_status_message("Silmek için bir veya daha fazla nokta seçin.")
             return
+        # Confirmation (F-0600): deleting a node is irreversible and also
+        # deletes its map patch PNG (routes/<region>/patches/node_<id>.png)
+        # via RouteManager.delete_nodes — the user must consent to both.
+        reply = QMessageBox.question(
+            self,
+            "Noktayı Sil",
+            f"{len(ids)} nokta '{reg}' bölgesinden kalıcı olarak silinsin mi?\n"
+            "Bu işlem geri alınamaz ve noktaların harita kesit (patch) "
+            "görselleri de silinir.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self.set_status_message("Silme iptal edildi. Hiçbir nokta silinmedi.")
+            return
         try:
             if not self._delete_ids_same_path(reg, ids):
                 return
             self.refresh_regions_and_routes(prefer_region=reg, prefer_route=rte)
             self.set_status_message(f"{len(ids)} nokta '{reg}' bölgesinden silindi.")
+            self.append_log(f"Noktalar silindi: {ids} ({reg})")
         except Exception as exc:
             logger.error("Delete node failed: %s", exc)
             self.set_status_message(f"Nokta silinemedi: {exc}")
@@ -3738,88 +4916,129 @@ class SettingsWindow(QDialog):
         return "balanced"
 
     def _on_delete_wrong_nodes(self) -> None:
-        """Delete nodes the multi-signal gatherion gate calls wrong. Harvest 0 is not a reason."""
+        """Delete nodes the multi-signal gatherion gate calls wrong. Harvest 0 is not a reason.
+
+        P2-2: the heavy part (model load + patch reads + inference) runs
+        in a background thread (``_WrongScanWorker``); this method only
+        gathers the inputs on the GUI thread and starts it. Backup,
+        delete and list refresh run in ``_on_wrong_scan_finished`` on the
+        GUI thread. A second click while a scan runs is ignored.
+        """
         reg = self._current_region()
         rte = self._current_route()
         if not reg:
             self.set_status_message("Önce bir bölge seçin.")
             return
+        if getattr(self, "_wrong_scan_thread", None) is not None:
+            self.set_status_message("YZ taraması zaten çalışıyor.")
+            return
         button = getattr(self, "btn_delete_wrong", None)
         if button is not None:
             button.setEnabled(False)
         try:
-            from PyQt6.QtWidgets import QApplication
-
-            from core.wrong_node_scan import (
-                classify_wrong_nodes,
-                format_blocked_status_tr,
-                format_scan_meta_tr,
-                load_gatherion_detector,
-                load_node_patch,
-                load_patch_file,
-                scan_confidence_summary,
-                scan_would_exceed_half,
-            )
-
             tier = self._wrong_scan_tier()
             nodes = self._get_nodes_for_selection(reg, rte)
             if not nodes:
                 self.set_status_message("Taranacak nokta yok. Hiçbir nokta silinmedi.")
+                if button is not None:
+                    button.setEnabled(True)
                 return
-            self.set_status_message(f"YZ taraması çalışıyor (CPU, {tier})...")
-            app = QApplication.instance()
-            if app is not None:
-                app.processEvents()
-            try:
-                detector = load_gatherion_detector()
-            except Exception as exc:
-                logger.error("Gatherion modeli yüklenemedi: %s", exc)
-                self.set_status_message(
-                    f"Gatherion modeli yüklenemedi. Dosya yazılmadı: {exc}"
-                )
-                return
-            images = {}
+            # Patch paths are resolved here (cheap string work on the
+            # route manager); the disk reads happen in the worker.
             rm = self.route_manager
+            patch_paths: List[Optional[str]] = []
             for node in nodes:
-                node_id = int(
-                    node.get("id", 0) if isinstance(node, dict) else getattr(node, "id", 0)
-                )
-                image = None
+                path: Optional[str] = None
                 if rm is not None and hasattr(rm, "_resolve_patch_disk_path"):
                     try:
-                        path = str(rm._resolve_patch_disk_path(node))
-                        image = load_patch_file(path) if path else None
+                        resolved = str(rm._resolve_patch_disk_path(node))
+                        path = resolved or None
                     except Exception as exc:
+                        node_id = (
+                            node.get("id", 0)
+                            if isinstance(node, dict)
+                            else getattr(node, "id", 0)
+                        )
                         logger.debug("Patch yolu okunamadı #%s: %s", node_id, exc)
-                        image = None
-                if image is None:
-                    image = load_node_patch(node, region=reg)
-                images[node_id] = image
-
-            def _progress(done: int, total: int) -> None:
-                if done % 8 != 0 and done != total:
-                    return
-                self.set_status_message(f"YZ taraması {done}/{total} (CPU, {tier})...")
-                if app is not None:
-                    app.processEvents()
-
-            wrong = classify_wrong_nodes(
-                nodes,
-                images,
-                detector,
-                on_progress=_progress,
-                tier=tier,
+                patch_paths.append(path)
+            self.set_status_message(f"YZ taraması çalışıyor (CPU, {tier})...")
+            # Node count at scan start: the >half guard must compare
+            # against the scanned set, not a list re-read after the scan.
+            self._wrong_scan_context = (reg, rte, len(nodes))
+            worker = _WrongScanWorker(nodes, patch_paths, tier, reg)
+            # P2-2: parentless on purpose — a running QThread must not be
+            # destroyed with the window; _ACTIVE_WRONG_SCAN_THREADS keeps
+            # it alive until finished, which deletes it.
+            thread = QThread()
+            _ACTIVE_WRONG_SCAN_THREADS.add(thread)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(self._on_wrong_scan_progress)
+            worker.finished.connect(self._on_wrong_scan_finished)
+            worker.failed.connect(self._on_wrong_scan_failed)
+            worker.finished.connect(thread.quit)
+            worker.failed.connect(thread.quit)
+            thread.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(
+                lambda: _ACTIVE_WRONG_SCAN_THREADS.discard(thread)
             )
-            summary = scan_confidence_summary(nodes, images, detector)
-            meta = format_scan_meta_tr(detector, summary, tier=tier)
+            thread.finished.connect(self._clear_wrong_scan_thread)
+            self._wrong_scan_thread = thread
+            self._wrong_scan_worker = worker
+            try:
+                thread.start()
+            except Exception as exc:
+                logger.error("Wrong-node scan thread failed to start: %s", exc)
+                _ACTIVE_WRONG_SCAN_THREADS.discard(thread)
+                self._wrong_scan_thread = None
+                self._wrong_scan_worker = None
+                self.set_status_message(f"YZ taraması başlatılamadı: {exc}")
+                if button is not None:
+                    button.setEnabled(True)
+        except Exception as exc:
+            logger.error("Wrong-node scan failed: %s", exc)
+            self.set_status_message(f"YZ taraması yazılmadı: {exc}")
+            if button is not None:
+                button.setEnabled(True)
+
+    def _on_wrong_scan_progress(self, done: int, total: int) -> None:
+        """GUI-thread progress slot for the background wrong-node scan."""
+        tier = self._wrong_scan_tier()
+        self.set_status_message(f"YZ taraması {done}/{total} (CPU, {tier})...")
+
+    def _on_wrong_scan_finished(self, result: object) -> None:
+        """GUI-thread result slot: guards, backup, delete, refresh.
+
+        Runs on the GUI thread — this is the only place that touches the
+        route manager and the widgets after the background scan.
+        """
+        button = getattr(self, "btn_delete_wrong", None)
+        try:
+            from core.wrong_node_scan import (
+                format_blocked_status_tr,
+                scan_would_exceed_half,
+            )
+
+            payload = result if isinstance(result, dict) else {}
+            wrong = list(payload.get("wrong") or [])
+            meta = str(payload.get("meta") or "")
+            reg, rte, nodes_total = self._wrong_scan_context
+            rm = self.route_manager
             if not wrong:
                 self.set_status_message(
                     f"YZ taraması yanlış düğüm bulamadı. Hiçbir nokta silinmedi. {meta}"
                 )
+                self._record_scan_result(0, "", meta)
+                self.append_log(f"YZ taraması: yanlış düğüm bulunamadı. {meta}")
                 return
-            if scan_would_exceed_half(len(wrong), len(nodes)):
+            if scan_would_exceed_half(len(wrong), nodes_total):
                 self.set_status_message(
-                    f"{format_blocked_status_tr(wrong, len(nodes))} {meta}"
+                    f"{format_blocked_status_tr(wrong, nodes_total)} {meta}"
+                )
+                self._record_scan_result(0, "", meta)
+                self.append_log(
+                    f"YZ taraması engellendi (yarıdan fazlası): {meta}", "warn"
                 )
                 return
             if rm is None or not hasattr(rm, "backup_region_file"):
@@ -3834,13 +5053,29 @@ class SettingsWindow(QDialog):
             if not self._delete_ids_same_path(reg, [item.node_id for item in wrong]):
                 return
             self.refresh_regions_and_routes(prefer_region=reg, prefer_route=rte)
+            self._record_scan_result(len(wrong), backup_path, meta)
             self.set_status_message(f"{_wrong_node_status(wrong, backup_path)} {meta}")
+            self.append_log(
+                f"YZ yanlışları silindi: {[item.node_id for item in wrong]} {meta}"
+            )
         except Exception as exc:
             logger.error("Wrong-node scan failed: %s", exc)
             self.set_status_message(f"YZ taraması yazılmadı: {exc}")
         finally:
             if button is not None:
                 button.setEnabled(True)
+
+    def _on_wrong_scan_failed(self, message: str) -> None:
+        """GUI-thread failure slot for the background wrong-node scan."""
+        button = getattr(self, "btn_delete_wrong", None)
+        self.set_status_message(str(message or "YZ taraması yazılmadı."))
+        if button is not None:
+            button.setEnabled(True)
+
+    def _clear_wrong_scan_thread(self) -> None:
+        """Drop the finished scan thread/worker refs (thread.finished)."""
+        self._wrong_scan_thread = None
+        self._wrong_scan_worker = None
 
     def delete_selected_node(self) -> None:
         """Backwards-compatibility alias for `_on_delete_node`."""
@@ -3879,6 +5114,7 @@ class SettingsWindow(QDialog):
             self.set_status_message(
                 f"{moved} nokta '{reg}' bölgesinden '{target_reg}' bölgesine taşındı."
             )
+            self.append_log(f"{moved} nokta taşındı: {reg} → {target_reg}")
         except Exception as exc:
             logger.error("Move node to region failed: %s", exc)
 
@@ -3944,8 +5180,15 @@ class SettingsWindow(QDialog):
         try:
             from ui.analytics_dialog import AnalyticsDialog  # type: ignore
 
+            # v20-istatistik (R3): bağımsız diyalog canlı motoru alsın —
+            # verilmezse AnalyticsDialog kendi boş motorunu kurar ve
+            # istatistik ekranı kalıcı 0 gösterir.
+            tel = _resolve_analytics_telemetry(self)
             if self._analytics_dlg is None:
-                self._analytics_dlg = AnalyticsDialog(parent=self)
+                if tel is not None:
+                    self._analytics_dlg = AnalyticsDialog(telemetry=tel, parent=self)
+                else:
+                    self._analytics_dlg = AnalyticsDialog(parent=self)
             self._analytics_dlg.show()
             self._analytics_dlg.raise_()
             self._analytics_dlg.activateWindow()
@@ -4030,6 +5273,12 @@ class SettingsWindow(QDialog):
         )
         if not file_path:
             return
+        if not hasattr(self.route_manager, "export_route_zip"):
+            self.set_status_message(
+                "Dışa aktarma desteklenmiyor: rota yöneticisinde export_route_zip yok. Hiçbir şey aktarılmadı."
+            )
+            logger.error("export_route_zip missing on route manager; nothing exported.")
+            return
         try:
             if hasattr(self.route_manager, "export_route_zip"):
                 out_path = self.route_manager.export_route_zip(
@@ -4038,6 +5287,7 @@ class SettingsWindow(QDialog):
                 self.set_status_message(
                     f"Rota paylaşıldı: '{reg} · {rte}' -> {os.path.basename(out_path)}"
                 )
+                self.append_log(f"Rota paylaşıldı (ZIP): {reg} · {rte}")
         except Exception as exc:
             logger.error("Share route failed: %s", exc)
             self.set_status_message(f"Dışa aktarma başarısız: {exc}")
@@ -4052,16 +5302,22 @@ class SettingsWindow(QDialog):
         )
         if not file_path:
             return
+        if not hasattr(self.route_manager, "import_route_zip"):
+            self.set_status_message(
+                "İçe aktarma desteklenmiyor: rota yöneticisinde import_route_zip yok. Hiçbir şey aktarılmadı."
+            )
+            logger.error("import_route_zip missing on route manager; nothing imported.")
+            return
         try:
-            if hasattr(self.route_manager, "import_route_zip"):
-                imported_reg = self.route_manager.import_route_zip(file_path)
-                self.refresh_regions_and_routes(prefer_region=imported_reg)
-                nodes_cnt = len(
-                    self._get_nodes_for_selection(imported_reg, self._current_route())
-                )
-                self.set_status_message(
-                    f"{nodes_cnt} nokta {imported_reg} bölgesine aktarıldı"
-                )
+            imported_reg = self.route_manager.import_route_zip(file_path)
+            self.refresh_regions_and_routes(prefer_region=imported_reg)
+            nodes_cnt = len(
+                self._get_nodes_for_selection(imported_reg, self._current_route())
+            )
+            self.set_status_message(
+                f"{nodes_cnt} nokta {imported_reg} bölgesine aktarıldı"
+            )
+            self.append_log(f"Rota içe aktarıldı: {nodes_cnt} nokta → {imported_reg}")
         except Exception as exc:
             logger.error("Import route failed: %s", exc)
             self.set_status_message(f"İçe aktarma başarısız: {exc}")
@@ -4135,24 +5391,72 @@ class SettingsWindow(QDialog):
                         summary[sec_name] = dict(sec_obj)
                     elif hasattr(sec_obj, "__dict__"):
                         summary[sec_name] = dict(sec_obj.__dict__)
+        # BotSettings has no "mobile" section, so the candidate loop above
+        # could never fill it (F-0762). Fall back to the mobile relay config
+        # file (config/mobile_relay.json) when present; otherwise say so
+        # explicitly instead of returning a silently empty section.
+        if not summary["mobile"]:
+            try:
+                relay_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "config",
+                    "mobile_relay.json",
+                )
+                if os.path.isfile(relay_path):
+                    with open(relay_path, encoding="utf-8") as fh:
+                        relay_cfg = json.load(fh)
+                    if isinstance(relay_cfg, dict) and relay_cfg:
+                        summary["mobile"] = dict(relay_cfg)
+            except Exception as exc:
+                logger.debug("Mobile relay config unreadable: %s", exc)
+        if not summary["mobile"]:
+            summary["mobile"] = {
+                "available": False,
+                "reason": "no mobile section configured",
+            }
         return summary
 
     def get_consumable_settings(self) -> Dict[str, Any]:
-        """Returns automatic potion and buff scroll thresholds and keybinds."""
+        """Returns automatic potion and buff scroll thresholds and keybinds.
+
+        Single source of truth is DEFAULT_SETTINGS (F-0540): the old code
+        hardcoded different defaults here (HP 55 / MP 40 vs 65 / 45 in
+        DEFAULT_SETTINGS), so the values shown, saved and consumed never
+        agreed. Live values are read through _cfg_get so a value set via
+        set_consumable_settings() (or loaded from disk) is what comes back.
+        """
+        defaults: Dict[str, Any] = {
+            "auto_use_hp_potion": bool(DEFAULT_SETTINGS.get("auto_use_hp_potion", True)),
+            "hp_potion_threshold_pct": int(DEFAULT_SETTINGS.get("hp_potion_threshold_pct", HP_POTION_THRESHOLD_PCT)),
+            "hp_potion_key": str(DEFAULT_SETTINGS.get("hp_potion_key", "F1")),
+            "auto_use_mp_potion": bool(DEFAULT_SETTINGS.get("auto_use_mp_potion", True)),
+            "mp_potion_threshold_pct": int(DEFAULT_SETTINGS.get("mp_potion_threshold_pct", MP_POTION_THRESHOLD_PCT)),
+            "mp_potion_key": str(DEFAULT_SETTINGS.get("mp_potion_key", "F2")),
+            "auto_refresh_buff_scroll": bool(DEFAULT_SETTINGS.get("auto_refresh_buff_scroll", True)),
+            "buff_scroll_interval_sec": int(DEFAULT_SETTINGS.get("buff_scroll_interval_sec", 300)),
+            # F-23-03: varsayılan F6'ydı — F6 yasaklı tuş (mana_phase_combat
+            # FORBIDDEN_CONSUMABLE_KEYS); F7. Kaynak: DEFAULT_SETTINGS.
+            "buff_scroll_key": str(DEFAULT_SETTINGS.get("buff_scroll_key", "F7")),
+        }
+        # Live values from the bound settings objects (guarded: this method
+        # is also called on partially constructed windows in tests).
+        try:
+            for k in list(defaults.keys()):
+                try:
+                    val = self._cfg_get(k, defaults[k])
+                except Exception:
+                    continue
+                if val is not None:
+                    defaults[k] = val
+        except Exception:
+            pass
+        # In-memory overrides from set_consumable_settings() win over the
+        # settings objects until they are persisted.
         stored = self.__dict__.get("_consumable_settings_cache")
         if isinstance(stored, dict):
-            return dict(stored)
-        defaults: Dict[str, Any] = {
-            "auto_use_hp_potion": True,
-            "hp_potion_threshold_pct": 55,
-            "hp_potion_key": "F1",
-            "auto_use_mp_potion": True,
-            "mp_potion_threshold_pct": 40,
-            "mp_potion_key": "F2",
-            "auto_refresh_buff_scroll": True,
-            "buff_scroll_interval_sec": 300,
-            "buff_scroll_key": "F6",
-        }
+            for k, v in stored.items():
+                if k in defaults:
+                    defaults[k] = v
         try:
             cand_objs = self._candidate_settings_objects()
         except Exception:
@@ -4165,14 +5469,64 @@ class SettingsWindow(QDialog):
                         defaults[k] = getattr(combat_cfg, k)
                     elif isinstance(combat_cfg, dict) and k in combat_cfg:
                         defaults[k] = combat_cfg[k]
+        # F-23-01: tüketim widget'ları varsa ekrandaki değer kazanır —
+        # kullanıcı eşik/tuş değiştirip Kaydet'e basınca get_settings_dict()
+        # bu değerleri alır (yoksa _cfg değeri döner; test/API yolu).
+        try:
+            if hasattr(self, "chk_auto_use_hp_potion"):
+                defaults["auto_use_hp_potion"] = bool(self.chk_auto_use_hp_potion.isChecked())
+                defaults["hp_potion_threshold_pct"] = int(self.spin_hp_potion_threshold.value())
+                defaults["hp_potion_key"] = (
+                    str(self.edit_hp_potion_key.text() or "").strip()
+                    or str(DEFAULT_SETTINGS.get("hp_potion_key", "F1"))
+                )
+                defaults["auto_use_mp_potion"] = bool(self.chk_auto_use_mp_potion.isChecked())
+                defaults["mp_potion_threshold_pct"] = int(self.spin_mp_potion_threshold.value())
+                defaults["mp_potion_key"] = (
+                    str(self.edit_mp_potion_key.text() or "").strip()
+                    or str(DEFAULT_SETTINGS.get("mp_potion_key", "F2"))
+                )
+                defaults["auto_refresh_buff_scroll"] = bool(self.chk_auto_refresh_buff_scroll.isChecked())
+                defaults["buff_scroll_interval_sec"] = int(self.spin_buff_scroll_interval.value())
+                defaults["buff_scroll_key"] = (
+                    str(self.edit_buff_scroll_key.text() or "").strip()
+                    or str(DEFAULT_SETTINGS.get("buff_scroll_key", "F7"))
+                )
+        except Exception:
+            pass
         return defaults
 
     def set_consumable_settings(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
-        """Updates automatic potion and buff scroll settings in memory and on bound settings objects."""
+        """Updates automatic potion and buff scroll settings and persists them.
+
+        Previously this only wrote an in-memory cache (and a ``combat`` attr
+        when one happened to exist) and never touched the settings objects
+        or disk, so the values silently reverted on the next load (F-0540).
+        Values are now pushed through _cfg_set + _cfg_save like every other
+        setting. F-23-03 düzeltmesiyle tuş anahtarları config/schema.py
+        RouteSettings'te gerçek alan oldu; _cfg_set onları bölüm alanına
+        yazar, SettingsManager.save() asdict() ile diske yazar.
+        """
         current = self.get_consumable_settings()
         if isinstance(cfg, dict):
             current.update(cfg)
         self._consumable_settings_cache = dict(current)
+        # F-23-01: tüketim widget'ları varsa onları da eşitle — yoksa
+        # get_consumable_settings() widget değerini (eski) döndürüp
+        # API ile UI çelişir (set F3 yazdı, get F1 döndü).
+        try:
+            if hasattr(self, "chk_auto_use_hp_potion"):
+                self.chk_auto_use_hp_potion.setChecked(bool(current.get("auto_use_hp_potion", True)))
+                self.spin_hp_potion_threshold.setValue(int(current.get("hp_potion_threshold_pct", HP_POTION_THRESHOLD_PCT)))
+                self.edit_hp_potion_key.setText(str(current.get("hp_potion_key", "F1")))
+                self.chk_auto_use_mp_potion.setChecked(bool(current.get("auto_use_mp_potion", True)))
+                self.spin_mp_potion_threshold.setValue(int(current.get("mp_potion_threshold_pct", MP_POTION_THRESHOLD_PCT)))
+                self.edit_mp_potion_key.setText(str(current.get("mp_potion_key", "F2")))
+                self.chk_auto_refresh_buff_scroll.setChecked(bool(current.get("auto_refresh_buff_scroll", True)))
+                self.spin_buff_scroll_interval.setValue(int(current.get("buff_scroll_interval_sec", 300)))
+                self.edit_buff_scroll_key.setText(str(current.get("buff_scroll_key", "F7")))
+        except Exception:
+            pass
         try:
             cand_objs = self._candidate_settings_objects()
         except Exception:
@@ -4188,6 +5542,30 @@ class SettingsWindow(QDialog):
                             setattr(combat_cfg, k, v)
                         except Exception:
                             pass
+        # Persist through the normal settings path (batched: one disk write).
+        try:
+            self._cfg_batching = True
+            try:
+                for key in (
+                    "auto_use_hp_potion",
+                    "hp_potion_threshold_pct",
+                    # F-23-03: tuşlar eskiden bu listede yoktu — yalnızca
+                    # bellek önbelleğinde kalıyor, diske hiç yazılmıyordu.
+                    "hp_potion_key",
+                    "auto_use_mp_potion",
+                    "mp_potion_threshold_pct",
+                    "mp_potion_key",
+                    "auto_refresh_buff_scroll",
+                    "buff_scroll_interval_sec",
+                    "buff_scroll_key",
+                ):
+                    self._cfg_set(key, current[key])
+            finally:
+                self._cfg_batching = False
+            self._last_consumable_save_ok = bool(self._cfg_save())
+        except Exception as exc:
+            logger.debug("Consumable settings persist failed: %s", exc)
+            self._last_consumable_save_ok = False
         return dict(current)
 
     def filter_node_table_by_query(self, query: str) -> int:
@@ -4222,19 +5600,26 @@ class SettingsWindow(QDialog):
         }
 
     def get_settings_window_health_summary(self) -> dict:
-        try:
-            return {"settings_window_ready": True}
-        except Exception:
-            return {"settings_window_ready": False}
+        ready = validate_settings_window_contract()
+        return {"settings_window_ready": bool(ready)}
 
     def get_settings_window_ready_flag(self) -> dict:
-        return {"module": "settings_window", "ready": True}
+        return {"module": "settings_window", "ready": bool(validate_settings_window_contract())}
 
     def get_settings_window_version_info(self) -> dict:
-        return {"module": "settings_window", "version": "2.0.0", "ready": True}
+        return {
+            "module": "settings_window",
+            "version": __version__,
+            "ready": bool(validate_settings_window_contract()),
+        }
 
     def get_settings_window_diagnostic_snapshot(self) -> dict:
-        return {"module": "settings_window", "status": "ok", "ready": True}
+        ready = validate_settings_window_contract()
+        return {
+            "module": "settings_window",
+            "status": "ok" if ready else "contract_failed",
+            "ready": bool(ready),
+        }
 
 
 # Backwards compatibility alias
@@ -4246,7 +5631,43 @@ def get_settings_window_capabilities() -> list:
 
 
 def validate_settings_window_contract() -> bool:
-    return bool(get_settings_window_capabilities())
+    """Real contract check (F-0763): the old version returned True whenever
+    the capabilities list was non-empty, i.e. unconditionally.
+
+    The contract holds only when the settings schema, the window class and
+    its load/save entry points are all present and consistent.
+    """
+    try:
+        if not get_settings_window_capabilities():
+            return False
+        if not DEFAULT_SETTINGS:
+            return False
+        required_keys = {
+            "f_interval_min",
+            "f_interval_max",
+            "test_mode",
+            "hp_potion_threshold_pct",
+            "mp_potion_threshold_pct",
+            "buff_scroll_interval_sec",
+        }
+        if not required_keys.issubset(DEFAULT_SETTINGS.keys()):
+            return False
+        for name in (
+            "load_settings_into_ui",
+            "get_settings_dict",
+            "save_settings",
+            "reset_to_defaults",
+            "_load_from_settings",
+            "_save_to_settings",
+            "get_consumable_settings",
+            "set_consumable_settings",
+        ):
+            if not callable(getattr(SettingsWindow, name, None)):
+                return False
+        return True
+    except Exception as exc:
+        logger.debug("Settings window contract check failed: %s", exc)
+        return False
 
 
 def get_settings_window_baseline_metrics() -> dict:

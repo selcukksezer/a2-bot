@@ -3,7 +3,11 @@ import csv
 import json
 import logging
 import os
-from datetime import datetime
+import re
+import time
+import weakref
+from collections import deque
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
@@ -27,7 +31,10 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -40,9 +47,10 @@ from PyQt6.QtWidgets import (
 )
 
 from core.telemetry import TelemetryEngine
-from core.economy_broker import SessionProfitSimulator, TradeBrokerPriceScanner, format_kinah_tr
+from core.economy_broker import SessionProfitSimulator, format_kinah_tr
 from core.lifetime_stats import get_lifetime_stats
 from ui.shell_page_frame import wrap_shell_tab_root_layout
+from version import __version__
 
 logger = logging.getLogger("AnalyticsDialog")
 if not logger.handlers:
@@ -51,6 +59,38 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+
+
+class _QtLogHandler(logging.Handler):
+    """Bot logger'larından gelen gerçek kayıtları dialog'a taşır.
+
+    Kayıtlar başka thread'lerden gelebilir; handler yalnızca dialog'un
+    pyqtSignal'ını tetikler (queued bağlantı GUI thread'inde çalışır).
+    Dialog silinmişse weakref boş döner ve kayıt sessizce atılır.
+    """
+
+    def __init__(self, dialog_ref: Any) -> None:
+        super().__init__(level=logging.INFO)
+        self._dialog_ref = dialog_ref
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: N802
+        try:
+            dlg = self._dialog_ref()
+            if dlg is None:
+                return
+            dlg.log_record_received.emit(record.levelname, record.getMessage())
+        except Exception:
+            pass
+
+
+# Canlı Günlük'e bağlanan logger adları: botun gerçek kayıt kaynakları.
+_LIVE_LOG_SOURCES = ("Gatherion", "AnalyticsDialog", "TelemetryEngine", "EconomyBroker")
+
+# logs/bot.log satır biçimi: [21:15:58] [Gatherion.StateMachine] [INFO] mesaj
+_LOG_LINE_RE = re.compile(
+    r"^\[(?P<time>\d{2}:\d{2}:\d{2})\] \[(?P<name>[^\]]+)\] "
+    r"\[(?P<level>INFO|WARNING|ERROR|DEBUG|CRITICAL)\] (?P<msg>.*)$"
+)
 
 
 class KPICard(QFrame):
@@ -69,7 +109,7 @@ class KPICard(QFrame):
         super().__init__(parent)
         self.accent_color = accent_color
         self.setObjectName("KPICard")
-        self.setMinimumHeight(74 if compact else 88)
+        self.setMinimumHeight(80 if compact else 96)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setStyleSheet(
             f"""
@@ -88,7 +128,7 @@ class KPICard(QFrame):
 
         self.title_lbl = QLabel(title.upper(), self)
         self.title_lbl.setStyleSheet(
-            "color: #6b7280; font-size: 10px; font-weight: 800; letter-spacing: 0.7px; border: none; background: transparent;"
+            "color: #9aa3af; font-size: 11px; font-weight: 800; letter-spacing: 0.7px; border: none; background: transparent;"
         )
 
         val_size = 20 if compact else 24
@@ -99,7 +139,7 @@ class KPICard(QFrame):
 
         self.sub_lbl = QLabel(subtext, self)
         self.sub_lbl.setStyleSheet(
-            "color: #9aa3af; font-size: 11px; font-weight: 500; border: none; background: transparent;"
+            "color: #9aa3af; font-size: 12px; font-weight: 500; border: none; background: transparent;"
         )
 
         layout.addWidget(self.title_lbl)
@@ -165,13 +205,14 @@ class _InsightCard(QFrame):
 
         self.tag_lbl = QLabel(tag_text.upper(), self)
         self.tag_lbl.setStyleSheet(
-            f"color: {tag_color}; font-size: 9px; font-weight: 800; letter-spacing: 0.9px; border: none; background: transparent;"
+            f"color: {tag_color}; font-size: 10px; font-weight: 800; letter-spacing: 0.9px; border: none; background: transparent;"
         )
         row.addWidget(self.tag_lbl)
 
         self.val_lbl = QLabel(initial_val, self)
+        self.val_lbl.setWordWrap(True)
         self.val_lbl.setStyleSheet(
-            "color: #eef1f5; font-size: 12px; font-weight: 700; border: none; background: transparent;"
+            "color: #eef1f5; font-size: 13px; font-weight: 700; border: none; background: transparent;"
         )
         row.addWidget(self.val_lbl)
 
@@ -179,7 +220,7 @@ class _InsightCard(QFrame):
 
         self.sub_lbl = QLabel(initial_sub, self)
         self.sub_lbl.setStyleSheet(
-            'color: #9aa3af; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; border: none; background: transparent;'
+            'color: #9aa3af; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; border: none; background: transparent;'
         )
         row.addWidget(self.sub_lbl)
 
@@ -195,14 +236,14 @@ class _ShareBarCellWidget(QWidget):
         super().__init__(parent)
         self._pct = max(0.0, min(100.0, float(pct)))
         row = QHBoxLayout(self)
-        row.setContentsMargins(6, 2, 6, 2)
+        row.setContentsMargins(8, 4, 8, 4)
         row.setSpacing(6)
 
         bar = QProgressBar(self)
         bar.setRange(0, 100)
         bar.setValue(int(round(self._pct)))
         bar.setTextVisible(False)
-        bar.setFixedSize(56, 5)
+        bar.setFixedSize(64, 6)
         bar.setStyleSheet(
             """
             QProgressBar {
@@ -220,7 +261,7 @@ class _ShareBarCellWidget(QWidget):
 
         lbl = QLabel(f"%{self._pct:.1f}", self)
         lbl.setStyleSheet(
-            'color: #eef1f5; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; background: transparent; border: none;'
+            'color: #eef1f5; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; background: transparent; border: none;'
         )
         row.addWidget(lbl)
         row.addStretch(1)
@@ -338,10 +379,10 @@ class LiveThroughputChart(QWidget):
             painter.setBrush(QBrush(QColor("#11151c")))
             painter.drawRoundedRect(bg_rect, 8.0, 8.0)
 
-            margin_left = 40.0
-            margin_right = 48.0
+            margin_left = 46.0
+            margin_right = 52.0
             margin_top = 12.0
-            margin_bottom = 26.0
+            margin_bottom = 28.0
 
             plot_w = max(40.0, rect.width() - margin_left - margin_right)
             plot_h = max(40.0, rect.height() - margin_top - margin_bottom)
@@ -350,7 +391,7 @@ class LiveThroughputChart(QWidget):
 
             grid_pen = QPen(QColor(255, 255, 255, 16), 1.0, Qt.PenStyle.DashLine)
             grid_pen.setDashPattern([3.0, 3.0])
-            label_font = QFont("Consolas", 8)
+            label_font = QFont("Consolas", 9)
             painter.setFont(label_font)
 
             valid_buckets = [b for b in (self.buckets or []) if isinstance(b, dict)]
@@ -386,7 +427,7 @@ class LiveThroughputChart(QWidget):
 
             if not valid_buckets:
                 painter.setPen(QColor("#6b7280"))
-                painter.drawText(plot_rect, int(Qt.AlignmentFlag.AlignCenter), "Telemetri verileri bekleniyor...")
+                painter.drawText(plot_rect, int(Qt.AlignmentFlag.AlignCenter), "Bu aralıkta gösterilecek kayıt yok — henüz kayıt yok")
                 return
 
             n = max(1, len(valid_buckets))
@@ -460,6 +501,9 @@ class AnalyticsDialog(QDialog):
     Canlı Performans & İstatistik Paneli.
     """
 
+    # Canlı Günlük: bot logger'larından gelen gerçek kayıtlar (thread-safe).
+    log_record_received = pyqtSignal(str, str)
+
     def __init__(
         self,
         telemetry: Optional[TelemetryEngine] = None,
@@ -487,11 +531,16 @@ class AnalyticsDialog(QDialog):
         self._active_range = "today"
         self._selected_slice: Optional[int] = None
         self._selected_group_key: Optional[str] = None
+        self._selected_event: Optional[Tuple[str, Dict[str, Any]]] = None
         self._sort_col = "count"
         self._sort_dir = -1
         self._last_rows: List[Dict[str, Any]] = []
         self._last_metrics: Dict[str, Any] = {}
         self._updating_filters = False
+        # Canlı Günlük durumu: (saat, seviye, mesaj) kayıtları, en fazla 300.
+        self._log_records: deque = deque(maxlen=300)
+        self._log_filter = "all"
+        self._log_handler: Optional[_QtLogHandler] = None
 
         self.setWindowTitle("Telemetri ve Performans Analizi")
         self.resize(1120, 820)
@@ -520,10 +569,10 @@ class AnalyticsDialog(QDialog):
                 color: #eef1f5;
                 border: 1px solid #1e2530;
                 border-radius: 6px;
-                padding: 3px 8px;
-                font-size: 11px;
+                padding: 4px 8px;
+                font-size: 12px;
                 font-weight: 600;
-                min-height: 22px;
+                min-height: 26px;
             }
             QComboBox:hover, QSpinBox:hover {
                 border-color: #2c3545;
@@ -546,8 +595,8 @@ class AnalyticsDialog(QDialog):
                 background: transparent;
                 color: #9aa3af;
                 border: none;
-                padding: 5px 11px;
-                font-size: 11px;
+                padding: 6px 12px;
+                font-size: 12px;
                 font-weight: 700;
                 border-radius: 5px;
             }
@@ -563,8 +612,8 @@ class AnalyticsDialog(QDialog):
                 color: #eef1f5;
                 border: 1px solid #1e2530;
                 border-radius: 7px;
-                padding: 6px 12px;
-                font-size: 11px;
+                padding: 7px 13px;
+                font-size: 12px;
                 font-weight: 700;
             }
             QPushButton:hover {
@@ -577,18 +626,18 @@ class AnalyticsDialog(QDialog):
                 color: #eef1f5;
                 gridline-color: transparent;
                 border: none;
-                font-size: 12px;
+                font-size: 13px;
                 selection-background-color: rgba(245, 181, 10, 0.14);
                 selection-color: #eef1f5;
             }
             QHeaderView::section {
                 background-color: #0d1015;
                 color: #9aa3af;
-                padding: 7px 10px;
+                padding: 8px 10px;
                 border: none;
                 border-bottom: 1px solid #1e2530;
                 font-weight: 800;
-                font-size: 10px;
+                font-size: 11px;
                 letter-spacing: 0.6px;
             }
             QHeaderView::section:hover {
@@ -598,6 +647,7 @@ class AnalyticsDialog(QDialog):
         )
 
         self._build_ui()
+        self._setup_live_log()
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(1000)
@@ -630,15 +680,15 @@ class AnalyticsDialog(QDialog):
         left_titles.setSpacing(1)
         kicker = QLabel("ÖLÇÜM", content)
         kicker.setStyleSheet(
-            "color: #6b7280; font-size: 10px; font-weight: 800; letter-spacing: 2.0px;"
+            "color: #9aa3af; font-size: 11px; font-weight: 800; letter-spacing: 2.0px;"
         )
         title = QLabel("İstatistik", content)
-        title.setStyleSheet("color: #eef1f5; font-size: 21px; font-weight: 800;")
+        title.setStyleSheet("color: #eef1f5; font-size: 22px; font-weight: 800;")
         sub = QLabel(
             "Kayıtlı toplama olayları üzerinden hesaplanır — filtreler tüm panelleri günceller.",
             content,
         )
-        sub.setStyleSheet("color: #9aa3af; font-size: 12px;")
+        sub.setStyleSheet("color: #9aa3af; font-size: 13px;")
         left_titles.addWidget(kicker)
         left_titles.addWidget(title)
         left_titles.addWidget(sub)
@@ -653,14 +703,14 @@ class AnalyticsDialog(QDialog):
         self.session_info_lbl = QLabel("Oturum: 00:00:00 | Savaşlar: 0 | Hatalar: 0", content)
         self.session_info_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.session_info_lbl.setStyleSheet(
-            'font-size: 11px; font-weight: 600; color: #f5b50a; font-family: Consolas, "Cascadia Mono", monospace;'
+            'font-size: 12px; font-weight: 600; color: #f5b50a; font-family: Consolas, "Cascadia Mono", monospace;'
         )
         right_head.addWidget(self.session_info_lbl)
 
         self.lifetime_info_lbl = QLabel("Kalıcı: Materyal 0 · Altın 0 · Canavar 0", content)
         self.lifetime_info_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.lifetime_info_lbl.setStyleSheet(
-            'font-size: 11px; font-weight: 600; color: #56c8f5; font-family: Consolas, "Cascadia Mono", monospace;'
+            'font-size: 12px; font-weight: 600; color: #56c8f5; font-family: Consolas, "Cascadia Mono", monospace;'
         )
         right_head.addWidget(self.lifetime_info_lbl)
 
@@ -670,13 +720,13 @@ class AnalyticsDialog(QDialog):
         acts_row.addStretch(1)
 
         hiz_lbl = QLabel("HIZ", content)
-        hiz_lbl.setStyleSheet("color: #6b7280; font-size: 10px; font-weight: 700; letter-spacing: 0.6px;")
+        hiz_lbl.setStyleSheet("color: #9aa3af; font-size: 11px; font-weight: 700; letter-spacing: 0.6px;")
         acts_row.addWidget(hiz_lbl)
 
         self.speed_combo = QComboBox(content)
-        self.speed_combo.addItem("Yavaş", 2400)
-        self.speed_combo.addItem("Normal", 1000)
-        self.speed_combo.addItem("Hızlı", 550)
+        self.speed_combo.addItem("Yavaş", 2600)
+        self.speed_combo.addItem("Normal", 1500)
+        self.speed_combo.addItem("Hızlı", 700)
         self.speed_combo.setCurrentIndex(1)
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         acts_row.addWidget(self.speed_combo)
@@ -699,7 +749,7 @@ class AnalyticsDialog(QDialog):
         toolbar = QFrame(content)
         toolbar.setObjectName("StatsToolbar")
         tb_lay = QHBoxLayout(toolbar)
-        tb_lay.setContentsMargins(12, 7, 12, 7)
+        tb_lay.setContentsMargins(14, 9, 14, 9)
         tb_lay.setSpacing(10)
 
         seg_frame = QFrame(toolbar)
@@ -730,7 +780,7 @@ class AnalyticsDialog(QDialog):
         tb_lay.addWidget(seg_frame)
 
         lbl_b = QLabel("BÖLGE", toolbar)
-        lbl_b.setStyleSheet("color: #6b7280; font-size: 10px; font-weight: 700; letter-spacing: 0.6px;")
+        lbl_b.setStyleSheet("color: #9aa3af; font-size: 11px; font-weight: 700; letter-spacing: 0.6px;")
         tb_lay.addWidget(lbl_b)
         self.region_filter = QComboBox(toolbar)
         self.region_filter.addItem("Tümü", "ALL")
@@ -738,7 +788,7 @@ class AnalyticsDialog(QDialog):
         tb_lay.addWidget(self.region_filter)
 
         lbl_r = QLabel("ROTA", toolbar)
-        lbl_r.setStyleSheet("color: #6b7280; font-size: 10px; font-weight: 700; letter-spacing: 0.6px;")
+        lbl_r.setStyleSheet("color: #9aa3af; font-size: 11px; font-weight: 700; letter-spacing: 0.6px;")
         tb_lay.addWidget(lbl_r)
         self.route_filter = QComboBox(toolbar)
         self.route_filter.addItem("Tümü", "ALL")
@@ -746,12 +796,12 @@ class AnalyticsDialog(QDialog):
         tb_lay.addWidget(self.route_filter)
 
         lbl_t = QLabel("HEDEF /SA", toolbar)
-        lbl_t.setStyleSheet("color: #6b7280; font-size: 10px; font-weight: 700; letter-spacing: 0.6px;")
+        lbl_t.setStyleSheet("color: #9aa3af; font-size: 11px; font-weight: 700; letter-spacing: 0.6px;")
         tb_lay.addWidget(lbl_t)
         self.target_rate_spin = QSpinBox(toolbar)
         self.target_rate_spin.setRange(5, 500)
         self.target_rate_spin.setValue(40)
-        self.target_rate_spin.setFixedWidth(56)
+        self.target_rate_spin.setFixedWidth(64)
         self.target_rate_spin.valueChanged.connect(lambda _v: self.refresh_metrics())
         tb_lay.addWidget(self.target_rate_spin)
 
@@ -759,7 +809,7 @@ class AnalyticsDialog(QDialog):
         self.slice_chip_btn.setVisible(False)
         self.slice_chip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.slice_chip_btn.setStyleSheet(
-            "background: rgba(245, 181, 10, 0.14); border: 1px solid rgba(245, 181, 10, 0.45); color: #f5b50a; padding: 3px 9px; border-radius: 99px; font-size: 11px; font-weight: 700;"
+            "background: rgba(245, 181, 10, 0.14); border: 1px solid rgba(245, 181, 10, 0.45); color: #f5b50a; padding: 4px 10px; border-radius: 99px; font-size: 12px; font-weight: 700;"
         )
         self.slice_chip_btn.clicked.connect(lambda: self._on_chart_slice_clicked(-1))
         tb_lay.addWidget(self.slice_chip_btn)
@@ -769,7 +819,7 @@ class AnalyticsDialog(QDialog):
         self.rec_count_lbl = QLabel('<b style="color:#eef1f5;">0</b> kayıt · BUGÜN', toolbar)
         self.rec_count_lbl.setTextFormat(Qt.TextFormat.RichText)
         self.rec_count_lbl.setStyleSheet(
-            'color: #6b7280; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px;'
+            'color: #6b7280; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;'
         )
         tb_lay.addWidget(self.rec_count_lbl)
         page_lay.addWidget(toolbar)
@@ -777,7 +827,7 @@ class AnalyticsDialog(QDialog):
         # 3. KALICI İSTATİSTİKLER (ömür boyu)
         lifetime_title = QLabel("KALICI İSTATİSTİKLER (ÖMÜR BOYU)", content)
         lifetime_title.setStyleSheet(
-            "font-size: 10px; font-weight: 800; color: #9aa3af; letter-spacing: 1.0px;"
+            "font-size: 11px; font-weight: 800; color: #9aa3af; letter-spacing: 1.0px;"
         )
         page_lay.addWidget(lifetime_title)
 
@@ -794,7 +844,7 @@ class AnalyticsDialog(QDialog):
         # 4. SEÇİLİ ARALIK İSTATİSTİKLERİ
         self.range_sec_title = QLabel("BUGÜN İSTATİSTİKLERİ (SEÇİLİ ARALIK)", content)
         self.range_sec_title.setStyleSheet(
-            "font-size: 10px; font-weight: 800; color: #9aa3af; letter-spacing: 1.0px;"
+            "font-size: 11px; font-weight: 800; color: #9aa3af; letter-spacing: 1.0px;"
         )
         page_lay.addWidget(self.range_sec_title)
 
@@ -853,8 +903,10 @@ class AnalyticsDialog(QDialog):
             chart_card,
         )
         self.chart_title_lbl.setStyleSheet(
-            "color: #eef1f5; font-size: 11px; font-weight: 800; letter-spacing: 0.4px;"
+            "color: #eef1f5; font-size: 12px; font-weight: 800; letter-spacing: 0.4px;"
         )
+        # Long range names (e.g. SON 7 GÜN) must wrap, never clip, at 12px.
+        self.chart_title_lbl.setWordWrap(True)
         chart_head.addWidget(self.chart_title_lbl)
         chart_head.addStretch(1)
 
@@ -864,7 +916,7 @@ class AnalyticsDialog(QDialog):
             chart_card,
         )
         leg_lbl.setTextFormat(Qt.TextFormat.RichText)
-        leg_lbl.setStyleSheet("color: #9aa3af; font-size: 11px;")
+        leg_lbl.setStyleSheet("color: #9aa3af; font-size: 12px;")
         chart_head.addWidget(leg_lbl)
         chart_lay.addLayout(chart_head)
 
@@ -876,19 +928,19 @@ class AnalyticsDialog(QDialog):
         # Right Detail Inspector Card (302px wide)
         self.detail_card = QFrame(content)
         self.detail_card.setObjectName("StatsDetailCard")
-        self.detail_card.setFixedWidth(302)
+        self.detail_card.setFixedWidth(320)
         det_lay = QVBoxLayout(self.detail_card)
-        det_lay.setContentsMargins(14, 12, 14, 12)
+        det_lay.setContentsMargins(16, 14, 16, 14)
         det_lay.setSpacing(8)
 
         self.detail_kicker_lbl = QLabel("ARALIK ÖZETİ", self.detail_card)
         self.detail_kicker_lbl.setStyleSheet(
-            "color: #6b7280; font-size: 10px; font-weight: 800; letter-spacing: 1.0px;"
+            "color: #9aa3af; font-size: 11px; font-weight: 800; letter-spacing: 1.0px;"
         )
         self.detail_title_lbl = QLabel("Bugün Özeti", self.detail_card)
-        self.detail_title_lbl.setStyleSheet("color: #eef1f5; font-size: 14px; font-weight: 800;")
+        self.detail_title_lbl.setStyleSheet("color: #eef1f5; font-size: 15px; font-weight: 800;")
         self.detail_sub_lbl = QLabel("0 kayıt · tüm bölgeler · tüm rotalar", self.detail_card)
-        self.detail_sub_lbl.setStyleSheet("color: #9aa3af; font-size: 11px;")
+        self.detail_sub_lbl.setStyleSheet("color: #9aa3af; font-size: 12px;")
         det_lay.addWidget(self.detail_kicker_lbl)
         det_lay.addWidget(self.detail_title_lbl)
         det_lay.addWidget(self.detail_sub_lbl)
@@ -905,10 +957,10 @@ class AnalyticsDialog(QDialog):
             r_lay = QHBoxLayout()
             r_lay.setContentsMargins(0, 2, 0, 2)
             kl = QLabel(k_txt, self.detail_card)
-            kl.setStyleSheet("color: #9aa3af; font-size: 11px;")
+            kl.setStyleSheet("color: #9aa3af; font-size: 12px;")
             vl = QLabel("0", self.detail_card)
             vl.setStyleSheet(
-                'color: #eef1f5; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; font-weight: 700;'
+                'color: #eef1f5; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; font-weight: 700;'
             )
             r_lay.addWidget(kl)
             r_lay.addStretch(1)
@@ -916,7 +968,32 @@ class AnalyticsDialog(QDialog):
             self.detail_kv_labels.append((kl, vl))
             det_lay.addLayout(r_lay)
 
+        self.detail_events_title = QLabel("SON OLAYLAR", self.detail_card)
+        self.detail_events_title.setStyleSheet(
+            "color: #6b7280; font-size: 10px; font-weight: 800; letter-spacing: 1.0px; margin-top: 6px;"
+        )
+        det_lay.addWidget(self.detail_events_title)
+
+        self.detail_events_list = QListWidget(self.detail_card)
+        self.detail_events_list.setMaximumHeight(118)
+        self.detail_events_list.setStyleSheet(
+            "QListWidget { background-color: #0d1015; border: 1px solid #1e2530; border-radius: 6px; "
+            "color: #eef1f5; font-size: 11px; outline: none; }"
+            "QListWidget::item { padding: 4px 6px; border-bottom: 1px solid #1e2530; }"
+            "QListWidget::item:selected { background-color: rgba(245, 181, 10, 0.14); color: #eef1f5; }"
+            "QListWidget::item:disabled { color: #6b7280; }"
+        )
+        self.detail_events_list.itemClicked.connect(self._on_event_selected)
+        det_lay.addWidget(self.detail_events_list)
+
         det_lay.addStretch(1)
+
+        self.btn_group_csv = QPushButton("Grubu CSV İndir", self.detail_card)
+        self.btn_group_csv.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_group_csv.setVisible(False)
+        self.btn_group_csv.setToolTip("Seçili kaynak grubunun olaylarını CSV olarak kaydeder")
+        self.btn_group_csv.clicked.connect(self.on_export_group_csv)
+        det_lay.addWidget(self.btn_group_csv)
 
         self.btn_clear_selection = QPushButton("Seçimi Temizle", self.detail_card)
         self.btn_clear_selection.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -931,12 +1008,12 @@ class AnalyticsDialog(QDialog):
         table_head_row = QHBoxLayout()
         table_title = QLabel("BÖLGE/NOKTA VERİMLİLİĞİ VE KAYNAK DAĞILIMI", content)
         table_title.setStyleSheet(
-            "font-size: 10px; font-weight: 800; color: #9aa3af; letter-spacing: 1.0px;"
+            "font-size: 11px; font-weight: 800; color: #9aa3af; letter-spacing: 1.0px;"
         )
         table_head_row.addWidget(table_title)
         table_head_row.addStretch(1)
         table_hint = QLabel("Başlığa tıklayarak sıralayın · satıra tıklayınca detay açılır", content)
-        table_hint.setStyleSheet("color: #6b7280; font-size: 11px;")
+        table_hint.setStyleSheet("color: #6b7280; font-size: 12px;")
         table_head_row.addWidget(table_hint)
         page_lay.addLayout(table_head_row)
 
@@ -960,7 +1037,7 @@ class AnalyticsDialog(QDialog):
                 "SON",
             ]
         )
-        self.table.setMinimumHeight(165)
+        self.table.setMinimumHeight(180)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -984,10 +1061,67 @@ class AnalyticsDialog(QDialog):
         tc_lay.addWidget(self.table)
         page_lay.addWidget(table_card, stretch=1)
 
+        # 8. CANLI GÜNLÜK (.logcard) — bot logger'larından gerçek kayıtlar.
+        log_card = QFrame(content)
+        log_card.setObjectName("StatsLogCard")
+        log_card.setStyleSheet(
+            "QFrame#StatsLogCard { background-color: #05070a; border: 1px solid #1e2530; border-radius: 9px; }"
+        )
+        log_lay = QVBoxLayout(log_card)
+        log_lay.setContentsMargins(0, 0, 0, 0)
+        log_lay.setSpacing(0)
+
+        log_head = QHBoxLayout()
+        log_head.setContentsMargins(12, 6, 12, 6)
+        log_head.setSpacing(8)
+        log_title = QLabel("CANLI GÜNLÜK", log_card)
+        log_title.setStyleSheet("color: #eef1f5; font-size: 11px; font-weight: 800; letter-spacing: 0.6px;")
+        log_head.addWidget(log_title)
+        log_head.addStretch(1)
+
+        self._log_filter_group = QButtonGroup(log_card)
+        self._log_filter_group.setExclusive(True)
+        self._log_filter_buttons: Dict[str, QPushButton] = {}
+        for f_key, f_label in (("all", "Tümü"), ("INFO", "INFO"), ("WARNING", "WARNING")):
+            fb = QPushButton(f_label, log_card)
+            fb.setCheckable(True)
+            fb.setChecked(f_key == "all")
+            fb.setCursor(Qt.CursorShape.PointingHandCursor)
+            fb.setStyleSheet(
+                "QPushButton { background: transparent; border: 1px solid #1e2530; color: #9aa3af; "
+                "border-radius: 99px; padding: 3px 10px; font-size: 11px; font-weight: 700; }"
+                "QPushButton:checked { background: #ffffff; border-color: #ffffff; color: #000000; }"
+            )
+            fb.clicked.connect(lambda _c=False, fk=f_key: self._on_log_filter_selected(fk))
+            self._log_filter_group.addButton(fb)
+            self._log_filter_buttons[f_key] = fb
+            log_head.addWidget(fb)
+
+        self.btn_clear_log = QPushButton("Temizle", log_card)
+        self.btn_clear_log.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_log.setStyleSheet(
+            "QPushButton { background: transparent; border: 1px solid #1e2530; color: #fca5a5; "
+            "border-radius: 99px; padding: 3px 10px; font-size: 11px; font-weight: 700; }"
+        )
+        self.btn_clear_log.clicked.connect(self._on_clear_log)
+        log_head.addWidget(self.btn_clear_log)
+        log_lay.addLayout(log_head)
+
+        self.log_view = QPlainTextEdit(log_card)
+        self.log_view.setReadOnly(True)
+        self.log_view.setFixedHeight(72)
+        self.log_view.setMaximumBlockCount(300)
+        self.log_view.setStyleSheet(
+            "QPlainTextEdit { background-color: #05070a; color: #c3ccd9; border: none; "
+            'font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; }'
+        )
+        log_lay.addWidget(self.log_view)
+        page_lay.addWidget(log_card)
+
         scroll.setWidget(content)
         root_layout.addWidget(scroll, stretch=1)
 
-        # 8. BOTTOM ACTIONS (.actions)
+        # 9. BOTTOM ACTIONS (.actions)
         btn_layout = QHBoxLayout()
         btn_layout.setContentsMargins(6, 0, 6, 0)
         btn_layout.setSpacing(8)
@@ -995,7 +1129,7 @@ class AnalyticsDialog(QDialog):
         self.btn_export_csv = QPushButton("CSV Dışa Aktar", self)
         self.btn_export_csv.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_export_csv.setStyleSheet(
-            "QPushButton { background-color: #1d7fd1; border-color: #3694e3; color: #ffffff; padding: 8px 14px; } "
+            "QPushButton { background-color: #1d7fd1; border-color: #3694e3; color: #ffffff; padding: 10px 16px; } "
             "QPushButton:hover { background-color: #2589de; }"
         )
         self.btn_export_csv.clicked.connect(self.on_export_csv)
@@ -1003,7 +1137,7 @@ class AnalyticsDialog(QDialog):
         self.btn_save_json = QPushButton("JSON Rapor Kaydet", self)
         self.btn_save_json.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_save_json.setStyleSheet(
-            "QPushButton { background-color: #1f9d63; border-color: #2cb676; color: #ffffff; padding: 8px 14px; } "
+            "QPushButton { background-color: #1f9d63; border-color: #2cb676; color: #ffffff; padding: 10px 16px; } "
             "QPushButton:hover { background-color: #24ad6e; }"
         )
         self.btn_save_json.clicked.connect(self.on_save_json)
@@ -1011,7 +1145,7 @@ class AnalyticsDialog(QDialog):
         self.btn_reset = QPushButton("Oturumu Sıfırla", self)
         self.btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_reset.setStyleSheet(
-            "QPushButton { background-color: #d97a06; border-color: #f08c0e; color: #ffffff; padding: 8px 14px; } "
+            "QPushButton { background-color: #d97a06; border-color: #f08c0e; color: #ffffff; padding: 10px 16px; } "
             "QPushButton:hover { background-color: #e58309; }"
         )
         self.btn_reset.clicked.connect(self.on_reset_stats)
@@ -1019,7 +1153,7 @@ class AnalyticsDialog(QDialog):
         self.btn_reset_lifetime = QPushButton("Tüm Veriyi Sıfırla", self)
         self.btn_reset_lifetime.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_reset_lifetime.setStyleSheet(
-            "QPushButton { background-color: #d81b4c; border-color: #ec3564; color: #ffffff; padding: 8px 14px; } "
+            "QPushButton { background-color: #d81b4c; border-color: #ec3564; color: #ffffff; padding: 10px 16px; } "
             "QPushButton:hover { background-color: #e42254; }"
         )
         self.btn_reset_lifetime.setToolTip("Ömür boyu istatistikleri siler — yalnızca açık onayla")
@@ -1028,7 +1162,7 @@ class AnalyticsDialog(QDialog):
         self.btn_close = QPushButton("Kapat", self)
         self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_close.setStyleSheet(
-            "QPushButton { background-color: #141923; border-color: #1e2530; color: #eef1f5; padding: 8px 16px; } "
+            "QPushButton { background-color: #141923; border-color: #1e2530; color: #eef1f5; padding: 10px 18px; } "
             "QPushButton:hover { background-color: #1b2230; }"
         )
         self.btn_close.clicked.connect(self.close)
@@ -1055,9 +1189,109 @@ class AnalyticsDialog(QDialog):
             self.btn_live.setText("Canlı Akışı Duraklat")
             self.refresh_metrics()
 
+    # -- Canlı Günlük ---------------------------------------------------
+    def _setup_live_log(self) -> None:
+        """Bot logger'larına handler bağlar + güncel oturum log dosyası kuyruğunu yükler.
+
+        Gösterilen her satır ya botun gerçek log kaydıdır ya da dialog'un
+        kendi eylem kaydıdır (açılış, filtre, dışa aktarma...). Sahte
+        hazır satır yoktur.
+        """
+        try:
+            self.log_record_received.connect(self._on_log_record)
+            self._log_handler = _QtLogHandler(weakref.ref(self))
+            for name in _LIVE_LOG_SOURCES:
+                lg = logging.getLogger(name)
+                if lg.level == logging.NOTSET:
+                    lg.setLevel(logging.INFO)
+                if self._log_handler not in lg.handlers:
+                    lg.addHandler(self._log_handler)
+        except Exception as exc:
+            logger.debug(f"Canlı günlük handler bağlanamadı: {exc}")
+        self._tail_bot_log()
+        self._append_log_record("INFO", "İstatistik sayfası açıldı — kayıtlı olaylar yüklendi")
+
+    def _tail_bot_log(self, max_lines: int = 40) -> None:
+        """Güncel oturum log dosyasının son satırlarını Canlı Günlük'e yükler (dosya yoksa atlanır)."""
+        try:
+            from core.session_log import resolve_current_log_path
+
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            resolved = resolve_current_log_path(os.path.join(repo_root, "logs"))
+            if resolved is None:
+                return
+            path = os.fspath(resolved)
+            if not os.path.isfile(path):
+                return
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-max(1, int(max_lines)):]
+            for raw in lines:
+                line = raw.rstrip("\n")
+                if not line.strip():
+                    continue
+                m = _LOG_LINE_RE.match(line)
+                if m:
+                    self._append_log_record(
+                        m.group("level"), m.group("msg"), time_str=m.group("time")
+                    )
+                else:
+                    self._append_log_record("INFO", line)
+        except Exception as exc:
+            # D-3 (dilim-29): eskiden yalnızca logger.debug — kullanıcı
+            # Canlı Günlük'ü boş görüyor, nedenini bulamıyordu (debug
+            # görünmüyor). Artık warning + panelde görünür kayıt.
+            logger.warning(f"günlük kuyruğu okunamadı ({os.path.basename(path)}): {exc}")
+            try:
+                self._append_log_record(
+                    "WARNING",
+                    f"günlük dosyası okunamadı ({exc}) — Canlı Günlük yalnızca canlı kayıtları gösterecek.",
+                )
+            except Exception:
+                pass
+
+    def _log_visible(self, level: str) -> bool:
+        if self._log_filter == "all":
+            return True
+        if self._log_filter == "INFO":
+            return level == "INFO"
+        # WARNING filtresi: WARNING ve üzeri (ERROR/CRITICAL) gösterilir.
+        return level in ("WARNING", "ERROR", "CRITICAL")
+
+    def _append_log_record(self, level: str, msg: str, time_str: Optional[str] = None) -> None:
+        lvl = str(level or "INFO").upper()
+        ts = time_str or datetime.now().strftime("%H:%M:%S")
+        self._log_records.append((ts, lvl, str(msg)))
+        if self._log_visible(lvl):
+            try:
+                self.log_view.appendPlainText(f"[{ts}] [{lvl}] {msg}")
+            except Exception:
+                pass
+
+    def _on_log_record(self, level: str, msg: str) -> None:
+        self._append_log_record(level, msg)
+
+    def _on_log_filter_selected(self, filter_key: str) -> None:
+        self._log_filter = str(filter_key)
+        try:
+            self.log_view.clear()
+            for ts, lvl, msg in self._log_records:
+                if self._log_visible(lvl):
+                    self.log_view.appendPlainText(f"[{ts}] [{lvl}] {msg}")
+        except Exception as exc:
+            logger.debug(f"log filtre yenileme hatası: {exc}")
+
+    def _on_clear_log(self) -> None:
+        self._log_records.clear()
+        try:
+            self.log_view.clear()
+        except Exception:
+            pass
+        self._append_log_record("INFO", "Günlük temizlendi.")
+
     def _on_range_selected(self, range_key: str) -> None:
         self._active_range = str(range_key)
         self._selected_slice = None
+        self._selected_event = None
         self.chart_widget.set_selected_slice(None)
         self.slice_chip_btn.setVisible(False)
         self.refresh_metrics()
@@ -1065,6 +1299,7 @@ class AnalyticsDialog(QDialog):
     def _on_filter_changed(self, _index: int = 0) -> None:
         if self._updating_filters:
             return
+        self._selected_event = None
         self.refresh_metrics()
 
     def _on_chart_slice_clicked(self, idx: int) -> None:
@@ -1076,9 +1311,17 @@ class AnalyticsDialog(QDialog):
             self._selected_slice = idx
             self.chart_widget.set_selected_slice(idx)
             buckets = self.chart_widget.buckets
-            lbl = str(buckets[idx].get("label", f"#{idx + 1}")) if 0 <= idx < len(buckets) else f"#{idx + 1}"
+            lbl = f"#{idx + 1}"
+            if 0 <= idx < len(buckets) and isinstance(buckets[idx], dict):
+                try:
+                    b_from = datetime.fromtimestamp(float(buckets[idx].get("start_ts", 0) or 0)).strftime("%H:%M")
+                    b_to = datetime.fromtimestamp(float(buckets[idx].get("end_ts", 0) or 0)).strftime("%H:%M")
+                    lbl = f"{b_from}–{b_to}"
+                except (TypeError, ValueError, OSError):
+                    lbl = str(buckets[idx].get("label", f"#{idx + 1}"))
             self.slice_chip_btn.setText(f"Dilim: {lbl} ×")
             self.slice_chip_btn.setVisible(True)
+        self._selected_event = None
         self.refresh_metrics()
 
     def _on_header_clicked(self, col_index: int) -> None:
@@ -1089,7 +1332,7 @@ class AnalyticsDialog(QDialog):
             3: "count",
             4: "share_pct",
             5: "avg_walk_sec",
-            6: "kinah",
+            6: "kinah_value",
             7: "avg_conf",
         }
         key = col_map.get(col_index, "count")
@@ -1104,18 +1347,453 @@ class AnalyticsDialog(QDialog):
         selected = self.table.selectionModel().selectedRows()
         if not selected:
             self._selected_group_key = None
+            self._selected_event = None
             self._update_detail_inspector()
             return
         row_idx = selected[0].row()
         it = self.table.item(row_idx, 0)
         if it is not None:
             self._selected_group_key = str(it.data(Qt.ItemDataRole.UserRole) or "")
+        self._selected_event = None
         self._update_detail_inspector()
 
     def _clear_group_selection(self) -> None:
         self._selected_group_key = None
+        self._selected_event = None
         self.table.clearSelection()
         self._update_detail_inspector()
+
+    # -- Detay paneli: son olaylar -------------------------------------
+    def _recent_events(self, limit: int = 6) -> List[Tuple[str, Dict[str, Any]]]:
+        """Seçili aralık + dilim + bölge/rota + grup filtrelerine uyan son olaylar.
+
+        Kalıcı ("all") aralıkta olay kaydı tutulmaz — boş liste döner.
+        Olay başına kinah telemetride tutulmaz; kinah yalnızca broker
+        fiyatından tahmin edilir (detay panelinde "tahmini" diye yazılır).
+        """
+        try:
+            tel = getattr(self, "telemetry", None)
+            if tel is None:
+                return []
+            start, now, mode = self._range_window()
+            if mode == "all":
+                return []
+            metrics = self._last_metrics if isinstance(self._last_metrics, dict) else {}
+            slice_start = float(metrics.get("slice_start_ts", start) or start)
+            slice_end = float(metrics.get("slice_end_ts", now) or now)
+            reg_sel = str(self.region_filter.currentData() or "ALL")
+            rte_sel = str(self.route_filter.currentData() or "ALL")
+            group_key = str(self._selected_group_key or "")
+
+            def _in_window(ev: Any) -> bool:
+                if not isinstance(ev, dict):
+                    return False
+                try:
+                    ts = float(ev.get("timestamp", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    return False
+                return slice_start <= ts <= slice_end
+
+            def _group_match(ev: Dict[str, Any]) -> bool:
+                if not group_key:
+                    return True
+                key = (
+                    f"{ev.get('resource_type', '')}|{ev.get('region', '')}|"
+                    f"{ev.get('route', '')}"
+                )
+                return key == group_key
+
+            found: List[Tuple[float, str, Dict[str, Any]]] = []
+            for ev in list(getattr(tel, "gather_events", None) or []):
+                if not isinstance(ev, dict) or not _in_window(ev):
+                    continue
+                if reg_sel != "ALL" and str(ev.get("region", "")) != reg_sel:
+                    continue
+                if rte_sel != "ALL" and str(ev.get("route", "")) != rte_sel:
+                    continue
+                if not _group_match(ev):
+                    continue
+                found.append((float(ev.get("timestamp", 0.0) or 0.0), "gather", ev))
+            # Başarısızlık ve savaş olayları bölge/rota taşımaz: yalnızca
+            # filtreler "Tümü" iken ve grup seçili değilken listelenir.
+            if reg_sel == "ALL" and rte_sel == "ALL" and not group_key:
+                for ev in list(getattr(tel, "failure_events", None) or []):
+                    if isinstance(ev, dict) and _in_window(ev):
+                        found.append((float(ev.get("timestamp", 0.0) or 0.0), "fail", ev))
+                for ev in list(getattr(tel, "combat_events", None) or []):
+                    if isinstance(ev, dict) and _in_window(ev):
+                        found.append((float(ev.get("timestamp", 0.0) or 0.0), "combat", ev))
+            found.sort(key=lambda t: t[0], reverse=True)
+            return [(kind, ev) for _ts, kind, ev in found[: max(0, int(limit))]]
+        except Exception as exc:
+            logger.debug(f"_recent_events hatası: {exc}")
+            return []
+
+    def _event_kinah_text(self, ev: Dict[str, Any]) -> str:
+        """Olayın tahmini kinah değeri — broker fiyatı bilinmiyorsa 'fiyat yok'."""
+        try:
+            price = self._known_unit_price(str(ev.get("resource_type", "")))
+            if price is None:
+                return "fiyat yok"
+            items = int(ev.get("items_gathered", 1) or 1)
+            return f"{format_kinah_tr(price * items)} (tahmini)"
+        except (TypeError, ValueError):
+            return "fiyat yok"
+
+    def _on_event_selected(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(data, tuple) and len(data) == 2 and isinstance(data[1], dict):
+            self._selected_event = (str(data[0]), dict(data[1]))
+        else:
+            self._selected_event = None
+        self._update_detail_inspector()
+
+    def _known_unit_price(self, res_name: str) -> Optional[int]:
+        """F-0547: unit Kinah price only when the broker actually knows it.
+        TradeBrokerPriceScanner.get_price() returns None for unknown materials
+        when no explicit default is given (P0-7), so 'known' is checked
+        against the price table (exact / case-insensitive match only —
+        substring matching was removed: e.g. 'Odyle' must not price
+        'Pure Odyle'). Returns None when the price is unknown — callers
+        must not invent one.
+        """
+        name = str(res_name or "").strip()
+        if not name:
+            return None
+        econ = getattr(self, "economy_calculator", None)
+        scanner = getattr(econ, "price_scanner", econ) if econ is not None else None
+        prices = getattr(scanner, "prices", None) if scanner is not None else None
+        if isinstance(prices, dict):
+            # S110 (v19/P3-8): fiyat tablosundaki sayısal olmayan
+            # değer (`"1.5k"`, `"abc"`) `int()`'te patlıyor, try
+            # yalnızca `_row_kinah`'ın çarpım satırını sarıyordu —
+            # fiyat okuma try DIŞINDAYDI, yenileme çöküyordu.
+            # Bilinmeyen/bozuk fiyat = fiyat bilinmiyor (None).
+            if name in prices:
+                try:
+                    return int(prices[name])
+                except (TypeError, ValueError):
+                    return None
+            low = name.lower()
+            for k, v in prices.items():
+                if str(k).lower() == low:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        return None
+            return None
+        get_price = getattr(scanner, "get_price", None) if scanner is not None else None
+        if callable(get_price):
+            try:
+                val = int(get_price(name, 0) or 0)
+            except Exception:
+                return None
+            return val if val > 0 else None
+        return None
+
+    def _row_kinah(self, row: Dict[str, Any]) -> Optional[int]:
+        """Known-price Kinah value of a breakdown row, or None."""
+        if not isinstance(row, dict):
+            return None
+        price = self._known_unit_price(str(row.get("resource_type", "")))
+        if price is None:
+            return None
+        try:
+            return int(row.get("count", 0) or 0) * int(price)
+        except (TypeError, ValueError):
+            return None
+
+    def _range_window(self) -> Tuple[float, float, str]:
+        """F-0522: (start_ts, now, mode) for the active range filter."""
+        now = time.time()
+        key = str(getattr(self, "_active_range", "today") or "today")
+        if key == "session":
+            tel = getattr(self, "telemetry", None)
+            start = float(getattr(tel, "session_start_ts", now) or now)
+            return start, now, "session"
+        if key == "7d":
+            return now - 7 * 86400.0, now, "7d"
+        if key == "all":
+            return 0.0, now, "all"
+        midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.timestamp(), now, "today"
+
+    @staticmethod
+    def _build_buckets(
+        events: List[Dict[str, Any]],
+        failures: List[Dict[str, Any]],
+        combats: List[Dict[str, Any]],
+        start: float,
+        now: float,
+    ) -> List[Dict[str, Any]]:
+        buckets: List[Dict[str, Any]] = []
+        span = max(5.0, (max(now, start) - start) / 12.0)
+        for i in range(12):
+            b_start = start + i * span
+            b_end = b_start + span
+            buckets.append(
+                {
+                    "index": i,
+                    "label": datetime.fromtimestamp(b_end).strftime("%H:%M:%S"),
+                    "start_ts": b_start,
+                    "end_ts": b_end,
+                    "count": 0,
+                    "failures": 0,
+                    "combats": 0,
+                    "rate_per_hour": 0.0,
+                }
+            )
+        for ev in events:
+            ts = float(ev.get("timestamp", 0.0) or 0.0)
+            idx = int((ts - start) / span) if span > 0 else -1
+            if 0 <= idx < 12:
+                buckets[idx]["count"] += 1
+        for ev in failures:
+            ts = float(ev.get("timestamp", 0.0) or 0.0)
+            idx = int((ts - start) / span) if span > 0 else -1
+            if 0 <= idx < 12:
+                buckets[idx]["failures"] += 1
+        for ev in combats:
+            ts = float(ev.get("timestamp", 0.0) or 0.0)
+            idx = int((ts - start) / span) if span > 0 else -1
+            if 0 <= idx < 12:
+                buckets[idx]["combats"] += 1
+        for b in buckets:
+            b["rate_per_hour"] = round((b["count"] / span) * 3600.0, 2)
+        return buckets
+
+    @staticmethod
+    def _merged_events(live: Any, history: Any, kind: str) -> List[Dict[str, Any]]:
+        """Canlı + geçmiş oturum olaylarını birleştir (tekilleştir; canlı kazanır).
+
+        Geçmiş olaylar `TelemetryEngine.load_history_events` ile ayrı
+        listelerde tutulur; aynı olay birden çok snapshot'ta geçebilir.
+        Anahtar: (zaman, düğüm, tür/sonuç) — canlı listedeki kopya
+        geçmiştekiyle aynıysa bir kez sayılır.
+        """
+        merged: Dict[Any, Dict[str, Any]] = {}
+
+        def _key(ev: Dict[str, Any]) -> Any:
+            try:
+                ts = round(float(ev.get("timestamp", 0.0) or 0.0), 3)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if kind == "gather":
+                return ("g", ts, ev.get("node_id"), str(ev.get("resource_type", "")))
+            if kind == "failure":
+                return ("f", ts, ev.get("node_id"), str(ev.get("reason", "")))
+            return ("c", ts, str(ev.get("outcome", "")), ev.get("duration_sec"))
+
+        for ev in history or []:
+            if isinstance(ev, dict):
+                merged[_key(ev)] = ev
+        for ev in live or []:
+            if isinstance(ev, dict):
+                merged[_key(ev)] = ev
+        def _ts(ev: Dict[str, Any]) -> float:
+            try:
+                return float(ev.get("timestamp", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        return sorted(merged.values(), key=_ts)
+
+    def _metrics_for_range(self, base: Dict[str, Any]) -> Dict[str, Any]:
+        """F-0522/F-0617: recompute the displayed metrics for the active
+        range (and the selected chart slice, if any) from raw telemetry
+        events instead of always showing whole-session numbers."""
+        base = dict(base) if isinstance(base, dict) else {}
+        tel = getattr(self, "telemetry", None)
+        start, now, mode = self._range_window()
+        buckets = list(base.get("hourly_buckets") or [])
+        slice_start, slice_end = start, now
+        if self._selected_slice is not None and buckets:
+            idx = int(self._selected_slice)
+            if 0 <= idx < len(buckets) and isinstance(buckets[idx], dict):
+                slice_start = float(buckets[idx].get("start_ts", start) or start)
+                slice_end = float(buckets[idx].get("end_ts", now) or now)
+
+        if mode == "all":
+            try:
+                snap = get_lifetime_stats().snapshot()
+            except Exception:
+                snap = {}
+            mats = snap.get("materials_by_key") or {}
+            if not isinstance(mats, dict):
+                mats = {}
+            gathered = int(snap.get("materials_total", 0) or 0)
+            gold = int(snap.get("gold_earned", 0) or 0)
+            kills = int(snap.get("monsters_killed", 0) or 0)
+            rows: List[Dict[str, Any]] = []
+            for res, qty in sorted(mats.items(), key=lambda kv: -int(kv[1] or 0)):
+                try:
+                    q = int(qty or 0)
+                except (TypeError, ValueError):
+                    continue
+                if q <= 0:
+                    continue
+                # P1-6 (K-06): türsüz kalıcı kayıt "Orichalcum Ore"
+                # sayılmaz — boş tür ayrı "Unknown" kovasına girer.
+                res_name = (str(res).strip() or "Unknown")
+                rows.append(
+                    {
+                        "resource_type": res_name,
+                        "region": "Kalıcı",
+                        "route": "Kalıcı",
+                        "count": q,
+                        "share_pct": round((q / max(1, gathered)) * 100.0, 1),
+                        "avg_walk_sec": 0.0,
+                        "avg_match_pct": 0.0,
+                    }
+                )
+            out = dict(base)
+            out.update(
+                {
+                    "range_mode": "all",
+                    "session_duration_sec": float(base.get("session_duration_sec") or 0.0),
+                    "gathered_total": gathered,
+                    "failed_total": 0,
+                    "combat_count": int(base.get("combat_count") or 0),
+                    "gathers_per_hour": 0.0,
+                    "avg_walk_sec": 0.0,
+                    "avg_match_pct": 0.0,
+                    # Lifetime history has no attempt log: success is unknown, not 100%.
+                    "success_rate_pct": None,
+                    "kills_in_range": kills,
+                    "kills_label": "Öldürülen canavar (kalıcı)",
+                    "by_resource": dict(mats),
+                    "by_route": {},
+                    "by_region": {},
+                    "failure_reasons": {},
+                    "detailed_breakdown": rows,
+                    "lifetime_gold": gold,
+                    "lifetime_kills": kills,
+                }
+            )
+            return out
+
+        def _in_window(ev: Any) -> bool:
+            if not isinstance(ev, dict):
+                return False
+            try:
+                ts = float(ev.get("timestamp", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return False
+            return slice_start <= ts <= slice_end
+
+        events = [e for e in self._merged_events(getattr(tel, "gather_events", None), getattr(tel, "history_gather_events", None), "gather") if _in_window(e)]
+        failures = [e for e in self._merged_events(getattr(tel, "failure_events", None), getattr(tel, "history_failure_events", None), "failure") if _in_window(e)]
+        combats = [e for e in self._merged_events(getattr(tel, "combat_events", None), getattr(tel, "history_combat_events", None), "combat") if _in_window(e)]
+        gathered = len(events)
+        failed = len(failures)
+        # P1-6 (K-06): oturum aralığı + dilim seçili değilken toplamlar
+        # kaplı olay listesinden değil telemetrinin kümülatif
+        # sayaçlarından okunur (5000 gather sonrası liste başından
+        # atar; toplam takılmaz). Kırılım satırları/paylar ise tutulan
+        # pencereye göre hesaplanmaya devam eder (aşağıda window_total).
+        slice_selected = self._selected_slice is not None and bool(buckets)
+        window_total = max(1, len(events))
+        if mode == "session" and not slice_selected:
+            gathered = int(base.get("gathered_total") or gathered)
+            failed = int(base.get("failed_total") or failed)
+            combats_n = int(base.get("combat_count") or len(combats))
+        else:
+            combats_n = len(combats)
+        total_attempts = gathered + failed
+        # v20-istatistik (R1): aralık içi öldürme — yalnızca temizlenen
+        # savaşlar sayılır (ölüm/kaçış değil); kalıcı sayaç buraya girmez.
+        kills_in_range = sum(
+            1
+            for c in combats
+            if str(c.get("outcome", "") or "").upper()
+            in ("CLEARED", "WIN", "VICTORY", "KILLED", "SUCCESS")
+        )
+        elapsed_h = max(1.0 / 3600.0, (slice_end - slice_start) / 3600.0)
+        # P1-6: ortalamalar tutulan pencere olaylarına bölünür
+        # (toplamlar kümülatif olabilir; payda pencere sayısıdır).
+        if events:
+            avg_walk = round(sum(float(e.get("walk_duration_sec", 0.0) or 0.0) for e in events) / len(events), 2)
+            avg_match = round(sum(int(e.get("match_pct", 0) or 0) for e in events) / len(events), 1)
+        else:
+            avg_walk, avg_match = 0.0, 0.0
+        by_resource: Dict[str, int] = {}
+        by_route: Dict[str, int] = {}
+        by_region: Dict[str, int] = {}
+        failure_reasons: Dict[str, int] = {}
+        groups: Dict[str, Dict[str, Any]] = {}
+        for e in events:
+            # P1-6 (K-06): türsüz olay "Orichalcum Ore" sayılmaz —
+            # türü yoksa/boşsa ayrı "Unknown" kovasına girer.
+            res = (str(e.get("resource_type") or "Unknown").strip() or "Unknown")
+            reg = str(e.get("region", "Unknown"))
+            rte = str(e.get("route", "Default Route"))
+            by_resource[res] = by_resource.get(res, 0) + 1
+            by_route[rte] = by_route.get(rte, 0) + 1
+            by_region[reg] = by_region.get(reg, 0) + 1
+            key = f"{res}||{reg}||{rte}"
+            g = groups.setdefault(
+                key,
+                {"resource_type": res, "region": reg, "route": rte, "count": 0,
+                 "total_walk_sec": 0.0, "total_match_pct": 0},
+            )
+            g["count"] += 1
+            try:
+                g["total_walk_sec"] += float(e.get("walk_duration_sec", 0.0) or 0.0)
+                g["total_match_pct"] += int(e.get("match_pct", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        for f in failures:
+            reason = str(f.get("reason", "timeout") or "timeout")
+            failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+        rows = []
+        for g in groups.values():
+            cnt = max(1, int(g["count"]))
+            rows.append(
+                {
+                    "resource_type": g["resource_type"],
+                    "region": g["region"],
+                    "route": g["route"],
+                    "count": int(g["count"]),
+                    # P1-6: pay, satırların hesaplandığı tutulan
+                    # pencereye bölünür (kümülatif toplama değil).
+                    "share_pct": round((int(g["count"]) / window_total) * 100.0, 1),
+                    "avg_walk_sec": round(float(g["total_walk_sec"]) / cnt, 2),
+                    "avg_match_pct": round(float(g["total_match_pct"]) / cnt, 1),
+                }
+            )
+        rows.sort(key=lambda r: r["count"], reverse=True)
+        out = dict(base)
+        out.update(
+            {
+                "range_mode": mode,
+                "range_start_ts": start,
+                "range_end_ts": now,
+                "slice_start_ts": slice_start,
+                "slice_end_ts": slice_end,
+                "gathered_total": gathered,
+                "failed_total": failed,
+                "combat_count": combats_n,
+                "kills_in_range": kills_in_range,
+                "kills_label": "Öldürülen canavar",
+                "combat_duration_sec": round(
+                    sum(float(c.get("duration_sec", 0.0) or 0.0) for c in combats), 2
+                ),
+                "gathers_per_hour": round((gathered / elapsed_h), 2),
+                "avg_walk_sec": avg_walk,
+                "avg_match_pct": avg_match,
+                # F-0708: no attempts yet -> unknown (None), never 100% or 0%.
+                "success_rate_pct": (
+                    round((gathered / total_attempts) * 100.0, 2) if total_attempts > 0 else None
+                ),
+                "by_resource": by_resource,
+                "by_route": by_route,
+                "by_region": by_region,
+                "failure_reasons": failure_reasons,
+                "detailed_breakdown": rows,
+                "hourly_buckets": self._build_buckets(events, failures, combats, start, now),
+            }
+        )
+        return out
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -1141,7 +1819,14 @@ class AnalyticsDialog(QDialog):
                 f"Kalıcı: Materyal {mats_total} · Altın {format_kinah_tr(gold)} · Canavar {kills}"
             )
         except Exception as exc:
-            logger.debug("lifetime cards refresh skipped: %s", exc)
+            logger.warning("lifetime cards refresh failed: %s", exc)
+            try:
+                self.card_lt_materials.update_card("—", "yüklenemedi")
+                self.card_lt_gold.update_card("—", "yüklenemedi")
+                self.card_lt_kills.update_card("—", "yüklenemedi")
+                self.lifetime_info_lbl.setText("Kalıcı: yüklenemedi")
+            except Exception:
+                pass
 
     def _sync_filter_combos(self, rows: List[Dict[str, Any]]) -> None:
         self._updating_filters = True
@@ -1172,19 +1857,27 @@ class AnalyticsDialog(QDialog):
         try:
             self._refresh_lifetime_cards()
 
-            metrics = self.telemetry.get_live_metrics()
+            raw_metrics = self.telemetry.get_live_metrics()
+            base_metrics = raw_metrics if isinstance(raw_metrics, dict) else {}
+            metrics = self._metrics_for_range(base_metrics)
             self._last_metrics = metrics
-            duration_sec = float(metrics.get("session_duration_sec", 0.0))
+            range_mode = str(metrics.get("range_mode") or self._active_range)
+            # Session label always shows the live session length, even when
+            # the range filter shows today / 7 days / lifetime numbers.
+            duration_sec = float(base_metrics.get("session_duration_sec") or 0.0)
             duration_str = self._format_duration(duration_sec)
-            combats = int(metrics.get("combat_count", 0))
-            failures = int(metrics.get("failed_total", 0))
-            gathered = int(metrics.get("gathered_total", 0))
-            rate_hr = float(metrics.get("gathers_per_hour", 0.0))
-            success_pct = float(metrics.get("success_rate_pct", 100.0))
-            avg_walk = float(metrics.get("avg_walk_sec", 0.0))
-            avg_match = float(metrics.get("avg_match_pct", 0.0))
+            combats = int(metrics.get("combat_count") or 0)
+            failures = int(metrics.get("failed_total") or 0)
+            gathered = int(metrics.get("gathered_total") or 0)
+            rate_hr = float(metrics.get("gathers_per_hour") or 0.0)
+            success_raw = metrics.get("success_rate_pct")
+            success_pct = float(success_raw) if success_raw is not None else None
+            avg_walk = float(metrics.get("avg_walk_sec") or 0.0)
+            avg_match = float(metrics.get("avg_match_pct") or 0.0)
 
-            all_rows = list(metrics.get("detailed_breakdown", []) or [])
+            all_rows = [
+                r for r in (metrics.get("detailed_breakdown", []) or []) if isinstance(r, dict)
+            ]
             self._sync_filter_combos(all_rows)
 
             reg_sel = str(self.region_filter.currentData() or "ALL")
@@ -1197,31 +1890,76 @@ class AnalyticsDialog(QDialog):
             ]
             self._last_rows = rows
 
-            if self.economy_calculator is not None and hasattr(self.economy_calculator, "record_gather"):
+            # F-0619/F-0620: sync the economy simulator under its lock, summing
+            # counts across groups (max() undercounted multi-group resources).
+            # Counts are per-node events; multiply by items_per_gather so the
+            # simulator counts actual items, matching telemetry (F-1753).
+            # Lifetime rows already count items, so no multiplier there.
+            if self.economy_calculator is not None and hasattr(self.economy_calculator, "gathered_counts"):
                 try:
+                    totals: Dict[str, int] = {}
                     for row in all_rows:
-                        res_type = str(row.get("resource_type", ""))
-                        cnt = int(row.get("count", 0))
-                        if res_type and cnt > 0 and hasattr(self.economy_calculator, "gathered_counts"):
-                            self.economy_calculator.gathered_counts[res_type] = max(
-                                self.economy_calculator.gathered_counts.get(res_type, 0),
-                                cnt,
-                            )
+                        res_type = str(row.get("resource_type", "")).strip()
+                        cnt = int(row.get("count", 0) or 0)
+                        if res_type and cnt > 0:
+                            totals[res_type] = totals.get(res_type, 0) + cnt
+                    per_event = 1 if range_mode == "all" else int(
+                        getattr(self.telemetry, "items_per_gather", 3) or 3
+                    )
+
+                    def _apply_sync() -> None:
+                        gc = self.economy_calculator.gathered_counts
+                        gc.clear()
+                        for res_type, cnt in totals.items():
+                            gc[res_type] = cnt * per_event
+
+                    sync_lock = getattr(self.economy_calculator, "_lock", None)
+                    if sync_lock is not None:
+                        with sync_lock:
+                            _apply_sync()
+                    else:
+                        _apply_sync()
                 except Exception as e:
                     logger.debug(f"Ekonomi senkronizasyon uyarısı: {e}")
 
-            econ_summary = {}
-            if self.economy_calculator is not None and hasattr(self.economy_calculator, "get_session_economy_summary"):
-                try:
-                    effective_hrs = max(1.0 / 3600.0, duration_sec / 3600.0)
-                    econ_summary = self.economy_calculator.get_session_economy_summary(elapsed_hours=effective_hrs)
-                except Exception as e:
-                    logger.error(f"Ekonomi özeti alınırken hata: {e}")
+            if range_mode == "all":
+                net_kinah = int(metrics.get("lifetime_gold", 0) or 0)
+                fmt_net = format_kinah_tr(net_kinah)
+                kinah_hr = 0
+                fmt_hr = "—"
+            else:
+                econ_summary = {}
+                if self.economy_calculator is not None and hasattr(self.economy_calculator, "get_session_economy_summary"):
+                    try:
+                        # P1-6 (K-06): oran, toplamın ait olduğu süreye
+                        # bölünür — tüm aralık süresine değil. Dilim
+                        # seçiliyse dilim süresi; yoksa ekonomi özeti
+                        # oturum kapsamlı olduğu için oturum süresi.
+                        # Eskiden "bugün/7 gün" aralığında saatlik oran,
+                        # gece yarısından beri geçen tüm süreye bölünüp
+                        # olduğundan küçük çıkıyordu.
+                        slice_start = float(metrics.get("slice_start_ts") or 0.0)
+                        slice_end = float(metrics.get("slice_end_ts") or 0.0)
+                        if (
+                            self._selected_slice is not None
+                            and slice_start > 0.0
+                            and slice_end > slice_start
+                        ):
+                            elapsed = max(1.0, slice_end - slice_start)
+                        elif duration_sec > 0:
+                            elapsed = max(1.0, duration_sec)
+                        else:
+                            range_start = float(metrics.get("range_start_ts") or 0.0)
+                            elapsed = max(1.0, time.time() - range_start) if range_start else max(1.0, duration_sec)
+                        effective_hrs = max(1.0 / 3600.0, elapsed / 3600.0)
+                        econ_summary = self.economy_calculator.get_session_economy_summary(elapsed_hours=effective_hrs)
+                    except Exception as e:
+                        logger.error(f"Ekonomi özeti alınırken hata: {e}")
 
-            net_kinah = int(econ_summary.get("net_kinah_earned", 0))
-            fmt_net = str(econ_summary.get("formatted_net_kinah", format_kinah_tr(net_kinah)))
-            kinah_hr = int(econ_summary.get("kinah_per_hour", 0))
-            fmt_hr = str(econ_summary.get("formatted_kinah_per_hour", format_kinah_tr(kinah_hr)))
+                net_kinah = int(econ_summary.get("net_kinah_earned", 0) or 0)
+                fmt_net = str(econ_summary.get("formatted_net_kinah", format_kinah_tr(net_kinah)))
+                kinah_hr = int(econ_summary.get("kinah_per_hour", 0) or 0)
+                fmt_hr = str(econ_summary.get("formatted_kinah_per_hour", format_kinah_tr(kinah_hr)))
 
             self.session_info_lbl.setText(
                 f"Oturum: {duration_str} | Savaşlar: {combats} | Hatalar: {failures}"
@@ -1249,20 +1987,33 @@ class AnalyticsDialog(QDialog):
                 f"Hedef {target_rate}/sa · %{target_pct} · aktif saat başına",
                 progress_pct=target_pct,
             )
-            self.card_success.update_card(f"%{success_pct:.1f}", f"{failures} başarısız deneme")
+            # F-0708: no attempts yet -> show "—", never a fabricated 100%.
+            if success_pct is None:
+                self.card_success.update_card("%—", "henüz deneme yok")
+            else:
+                self.card_success.update_card(f"%{success_pct:.1f}", f"{failures} başarısız deneme")
             self.card_walk.update_card(f"{avg_walk:.2f}sn", f"Temizlenen savaş: {combats}")
 
             self.card_kinah_total.update_card(f"{fmt_net}", "Seçili aralıkta kazanılan")
             self.card_kinah_rate.update_card(f"{fmt_hr}/sa", "Aktif saat başına kinah")
 
             buckets = metrics.get("hourly_buckets", [])
-            self.chart_widget.set_buckets(buckets)
+            if gathered + failures == 0:
+                # Kayıt yoksa grafik sahte sıfır çubukları değil boş durumu çizer.
+                self.chart_widget.set_buckets([])
+            else:
+                self.chart_widget.set_buckets(buckets)
 
             self._update_insights(rows, avg_match)
             self._populate_table(rows)
             self._update_detail_inspector()
         except Exception as exc:
             logger.error(f"refresh_metrics sırasında hata: {exc}", exc_info=True)
+            # F-0709: never leave the UI silently showing stale data.
+            try:
+                self.session_info_lbl.setText("⚠ Yenileme hatası — bayat veri gösteriliyor")
+            except Exception:
+                pass
 
     def _update_insights(self, rows: List[Dict[str, Any]], avg_match: float) -> None:
         if not rows:
@@ -1270,25 +2021,130 @@ class AnalyticsDialog(QDialog):
             self.ins_kinah.update_insight("—", "Henüz veri yok")
             self.ins_dikkat.update_insight("—", "Sorun tespit edilmedi")
             return
-        by_count = sorted(rows, key=lambda r: int(r.get("count", 0)), reverse=True)
-        best_r = by_count[0]
-        self.ins_rota.update_insight(
-            f"{best_r.get('region', '—')} · {best_r.get('route', 'Varsayılan')}",
-            f"{int(best_r.get('count', 0))} adet · ort. {float(best_r.get('avg_walk_sec', 0.0)):.2f}sn",
-        )
-        self.ins_kinah.update_insight(
-            str(best_r.get("resource_type", "Materyal")),
-            f"{int(best_r.get('count', 0))} adet · %{float(best_r.get('share_pct', 0.0)):.1f} pay",
-        )
-        slowest = sorted(rows, key=lambda r: float(r.get("avg_walk_sec", 0.0)), reverse=True)[0]
-        self.ins_dikkat.update_insight(
-            f"{slowest.get('resource_type', '—')} ({slowest.get('route', '—')})",
-            f"yürüme {float(slowest.get('avg_walk_sec', 0.0)):.2f}sn · güven %{avg_match:.0f}",
-        )
+        # EN VERİMLİ ROTA (prototip): rota başına ortalama kinah; bilinen
+        # broker fiyatı yoksa adede göre en çok toplayan rota gösterilir.
+        route_stats: Dict[str, List[int]] = {}
+        for r in rows:
+            kv = self._row_kinah(r)
+            if kv is None:
+                continue
+            rte = str(r.get("route", "—") or "—")
+            acc = route_stats.setdefault(rte, [0, 0])
+            acc[0] += int(kv)
+            acc[1] += int(r.get("count", 0) or 0)
+        if route_stats:
+            best_route, (tot_k, tot_c) = max(
+                route_stats.items(), key=lambda kv: kv[1][0] / max(1, kv[1][1])
+            )
+            self.ins_rota.update_insight(
+                str(best_route),
+                f"toplama başına ort. {tot_k // max(1, tot_c)} kinah · {tot_c} toplama",
+            )
+        else:
+            by_count = sorted(rows, key=lambda r: int(r.get("count", 0) or 0), reverse=True)
+            best_r = by_count[0]
+            self.ins_rota.update_insight(
+                f"{best_r.get('region', '—')} · {best_r.get('route', 'Varsayılan')}",
+                f"{int(best_r.get('count', 0) or 0)} adet · fiyat bilgisi yok, adede göre",
+            )
+        # F-0546: 'most Kinah' is ranked by known-price Kinah value, not by
+        # item count; with no known price for any row, say so.
+        priced = [(self._row_kinah(r), r) for r in rows]
+        priced = [(v, r) for v, r in priced if v is not None and v > 0]
+        if priced:
+            best_kinah, best_kinah_row = max(priced, key=lambda kv: kv[0])
+            self.ins_kinah.update_insight(
+                str(best_kinah_row.get("resource_type", "Materyal")),
+                f"{format_kinah_tr(best_kinah)} Kinah · {int(best_kinah_row.get('count', 0) or 0)} adet",
+            )
+        else:
+            self.ins_kinah.update_insight("—", "Fiyat bilgisi yok")
+        # DİKKAT (prototip): en yavaş grup ve en düşük güvenli grup.
+        # Az kayıtlı gruplar (3'ten az) gürültü olmasın diye önce onlara bakılır.
+        cands = [r for r in rows if int(r.get("count", 0) or 0) >= 3] or list(rows)
+        slowest = max(cands, key=lambda r: float(r.get("avg_walk_sec", 0.0) or 0.0))
+        lowest = min(cands, key=lambda r: float(r.get("avg_match_pct", 0.0) or 0.0))
+        slow_walk = float(slowest.get("avg_walk_sec", 0.0) or 0.0)
+        low_conf = float(lowest.get("avg_match_pct", 0.0) or 0.0)
+        if slowest is lowest:
+            self.ins_dikkat.update_insight(
+                f"{slowest.get('resource_type', '—')} ({slowest.get('route', '—')})",
+                f"yürüme {slow_walk:.2f}sn · güven %{low_conf:.0f} — en yavaş ve en düşük",
+            )
+        else:
+            self.ins_dikkat.update_insight(
+                f"{slowest.get('resource_type', '—')} ({slowest.get('route', '—')})",
+                f"yürüme {slow_walk:.2f}sn en yavaş · "
+                f"{lowest.get('resource_type', '—')} güven %{low_conf:.0f} en düşük",
+            )
+
+    def _lifetime_kills(self) -> Optional[int]:
+        try:
+            return int(get_lifetime_stats().snapshot().get("monsters_killed", 0) or 0)
+        except Exception:
+            return None
 
     def _update_detail_inspector(self) -> None:
         metrics = self._last_metrics
         rows = self._last_rows
+        kills = self._lifetime_kills()
+        kills_txt = f"{kills}" if kills is not None else "—"
+
+        # -- Tek olay seçimi (prototip: "Olay Kaydı" detayı) -------------
+        if getattr(self, "_selected_event", None):
+            kind, ev = self._selected_event
+            try:
+                ts = float(ev.get("timestamp", 0.0) or 0.0)
+                ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "—"
+            except (TypeError, ValueError, OSError):
+                ts_str = "—"
+            if kind == "gather":
+                self.detail_kicker_lbl.setText("SEÇİLİ OLAY")
+                self.detail_title_lbl.setText(str(ev.get("resource_type", "Toplama")))
+                self.detail_sub_lbl.setText(
+                    f"{ts_str} · {ev.get('region', '—')} · {ev.get('route', '—')}"
+                )
+                pairs = [
+                    ("Kaynak", str(ev.get("resource_type", "—"))),
+                    ("Rota", str(ev.get("route", "—"))),
+                    ("Sonuç", "Toplandı"),
+                    ("Eşleşme güveni", f"%{int(ev.get('match_pct', 0) or 0)}"),
+                    ("Yürüme süresi", f"{float(ev.get('walk_duration_sec', 0.0) or 0.0):.2f} sn"),
+                    ("Kazanılan kinah", self._event_kinah_text(ev)),
+                ]
+            elif kind == "fail":
+                self.detail_kicker_lbl.setText("SEÇİLİ OLAY")
+                self.detail_title_lbl.setText("Başarısız Deneme")
+                self.detail_sub_lbl.setText(f"{ts_str} · Node #{ev.get('node_id', '—')}")
+                pairs = [
+                    ("Tür", "Başarısız deneme"),
+                    ("Node", f"#{ev.get('node_id', '—')}"),
+                    ("Sebep", str(ev.get("reason", "timeout"))),
+                    ("Zaman", ts_str),
+                    ("Öldürülen canavar (kalıcı)", kills_txt),
+                    ("Not", "Başarısız deneme kaynak taşımaz"),
+                ]
+            else:  # combat
+                self.detail_kicker_lbl.setText("SEÇİLİ OLAY")
+                self.detail_title_lbl.setText("Savaş Olayı")
+                self.detail_sub_lbl.setText(f"{ts_str} · Sonuç: {ev.get('outcome', '—')}")
+                pairs = [
+                    ("Tür", "Savaş"),
+                    ("Sonuç", str(ev.get("outcome", "—"))),
+                    ("Süre", f"{float(ev.get('duration_sec', 0.0) or 0.0):.2f} sn"),
+                    ("Zaman", ts_str),
+                    ("Öldürülen canavar (kalıcı)", kills_txt),
+                    ("Not", "Savaş olayı rota/kaynak taşımaz"),
+                ]
+            for (kl, vl), (k_txt, v_txt) in zip(self.detail_kv_labels, pairs):
+                kl.setText(k_txt)
+                vl.setText(v_txt)
+            self.btn_group_csv.setVisible(False)
+            self.btn_clear_selection.setText("← Özete Dön")
+            self.btn_clear_selection.setVisible(True)
+            self._populate_detail_events()
+            return
+
         if self._selected_group_key:
             matched = None
             for r in rows:
@@ -1309,14 +2165,19 @@ class AnalyticsDialog(QDialog):
                     ("Rota", str(matched.get("route", "—"))),
                     ("Ort. yürüme süresi", f"{walk:.2f} sn"),
                     ("Ort. eşleşme güveni", f"%{float(metrics.get('avg_match_pct', 0.0) or 0.0):.1f}"),
-                    ("Durum", "Aktif"),
+                    # F-0710: no hard-coded "Durum: Aktif"; show lifetime kills.
+                    ("Öldürülen canavar (kalıcı)", kills_txt),
                 ]
                 for (kl, vl), (k_txt, v_txt) in zip(self.detail_kv_labels, pairs):
                     kl.setText(k_txt)
                     vl.setText(v_txt)
+                self.btn_group_csv.setVisible(True)
+                self.btn_clear_selection.setText("Seçimi Temizle")
                 self.btn_clear_selection.setVisible(True)
+                self._populate_detail_events()
                 return
 
+        self.btn_group_csv.setVisible(False)
         self.btn_clear_selection.setVisible(False)
         range_titles = {
             "session": "Oturum Özeti",
@@ -1332,22 +2193,91 @@ class AnalyticsDialog(QDialog):
         res_Count = len({str(r.get("resource_type", "")) for r in rows})
         rte_Count = len({str(r.get("route", "")) for r in rows})
         self.detail_sub_lbl.setText(f"{gathered + failures} kayıt · seçili filtre")
+        # v20-istatistik (R1): özet satırı artık aralığın kill'ini gösterir.
+        # Eskiden her aralıkta kalıcı kill (89) basılıyordu — "Bugün Özeti"
+        # kalıcı sayıyı bugünün sayısı gibi gösteriyordu. Kalıcı kill
+        # yalnızca "Kalıcı" aralığında, "(kalıcı)" etiketiyle görünür.
+        kills_range = metrics.get("kills_in_range")
+        kills_range_txt = f"{int(kills_range)}" if kills_range is not None else "—"
+        kills_range_label = str(metrics.get("kills_label") or "Öldürülen canavar")
         pairs = [
             ("Toplam deneme", f"{gathered + failures} ({gathered} başarılı)"),
             ("Farklı kaynak türü", f"{res_Count}"),
             ("Farklı rota", f"{rte_Count}"),
             ("Savaş / temizlenen", f"{combats}"),
-            ("Başarılı toplama", f"{gathered}"),
+            # F-0710: the 5th label is "Öldürülen canavar" — show kills, not
+            # a second copy of the gather count.
+            (kills_range_label, kills_range_txt),
             ("Başarısız deneme", f"{failures}"),
         ]
         for (kl, vl), (k_txt, v_txt) in zip(self.detail_kv_labels, pairs):
             kl.setText(k_txt)
             vl.setText(v_txt)
+        self._populate_detail_events()
+
+    def _populate_detail_events(self) -> None:
+        """Detay panelindeki SON OLAYLAR listesini doldurur (en fazla 6).
+
+        Kalıcı aralıkta olay kaydı tutulmadığı için liste boş gösterilir.
+        """
+        try:
+            lst = self.detail_events_list
+            lst.blockSignals(True)
+            lst.clear()
+            mode = "all" if str(getattr(self, "_active_range", "today")) == "all" else ""
+            events = [] if mode == "all" else self._recent_events(6)
+            if not events:
+                empty = QListWidgetItem(
+                    "henüz kayıt yok" if mode != "all"
+                    else "Kalıcı aralıkta olay kaydı tutulmaz"
+                )
+                empty.setFlags(Qt.ItemFlag.NoItemFlags)
+                lst.addItem(empty)
+            else:
+                for kind, ev in events:
+                    try:
+                        ts = float(ev.get("timestamp", 0.0) or 0.0)
+                        ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "--:--:--"
+                    except (TypeError, ValueError, OSError):
+                        ts_str = "--:--:--"
+                    if kind == "gather":
+                        text = (
+                            f"{ts_str} · {ev.get('resource_type', '—')} · "
+                            f"{ev.get('route', '—')} — Toplandı"
+                        )
+                    elif kind == "fail":
+                        text = f"{ts_str} · Başarısız — {ev.get('reason', 'timeout')}"
+                    else:
+                        text = (
+                            f"{ts_str} · Savaş {ev.get('outcome', '—')} — "
+                            f"{float(ev.get('duration_sec', 0.0) or 0.0):.1f} sn"
+                        )
+                    item = QListWidgetItem(text)
+                    item.setData(Qt.ItemDataRole.UserRole, (kind, dict(ev)))
+                    lst.addItem(item)
+            lst.blockSignals(False)
+        except Exception as exc:
+            logger.debug(f"_populate_detail_events hatası: {exc}")
 
     def _populate_table(self, rows: List[Dict[str, Any]]) -> None:
         try:
+            # F-0618: enrich rows with the values the KİNAH / ORT. GÜVEN
+            # columns sort by — the raw rows carry neither key, so sorting
+            # those columns was a no-op (every key defaulted to 0).
+            enriched: List[Dict[str, Any]] = []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                item = dict(r)
+                kinah_val = self._row_kinah(item)
+                item["kinah_value"] = int(kinah_val) if kinah_val is not None else 0
+                try:
+                    item["avg_conf"] = float(item.get("avg_match_pct", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    item["avg_conf"] = 0.0
+                enriched.append(item)
             sorted_rows = sorted(
-                rows,
+                enriched,
                 key=lambda r: (
                     str(r.get(self._sort_col, ""))
                     if self._sort_col in ("resource_type", "region", "route")
@@ -1356,11 +2286,24 @@ class AnalyticsDialog(QDialog):
                 reverse=(self._sort_dir < 0),
             )
             self.table.blockSignals(True)
+            self.table.clearSpans()
             self.table.setRowCount(len(sorted_rows))
+            if not sorted_rows:
+                # Boş durum (prototip): sahte satır yok, tek bilgilendirme satırı.
+                self.table.setRowCount(1)
+                empty_it = QTableWidgetItem(
+                    "henüz kayıt yok — aralığı genişletin veya bölge/rota filtresini sıfırlayın"
+                )
+                empty_it.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                empty_it.setForeground(QBrush(QColor("#6b7280")))
+                self.table.setItem(0, 0, empty_it)
+                self.table.setSpan(0, 0, 1, 9)
+                self.table.blockSignals(False)
+                return
             avg_match = float(self._last_metrics.get("avg_match_pct", 0.0) or 0.0)
 
             for r_idx, row_data in enumerate(sorted_rows):
-                self.table.setRowHeight(r_idx, 32)
+                self.table.setRowHeight(r_idx, 36)
                 res_name = str(row_data.get("resource_type", "Bilinmiyor"))
                 reg_name = str(row_data.get("region", "Bilinmiyor"))
                 rte_name = str(row_data.get("route", "Varsayılan"))
@@ -1368,17 +2311,14 @@ class AnalyticsDialog(QDialog):
                 share_pct = float(row_data.get("share_pct", 0.0))
                 walk_sec = float(row_data.get("avg_walk_sec", 0.0))
 
-                # Real broker economy price lookup
-                unit_price = 0
-                if hasattr(self, "economy_calculator") and self.economy_calculator is not None:
-                    if hasattr(self.economy_calculator, "get_price"):
-                        unit_price = int(self.economy_calculator.get_price(res_name) or 0)
-                    elif hasattr(self.economy_calculator, "price_scanner") and hasattr(self.economy_calculator.price_scanner, "get_price"):
-                        unit_price = int(self.economy_calculator.price_scanner.get_price(res_name) or 0)
-                if unit_price > 0:
+                # F-0547: only a known broker price yields a Kinah figure;
+                # an unknown material shows "fiyat yok", never a fabricated
+                # 10.000 Kinah/unit default.
+                unit_price = self._known_unit_price(res_name)
+                if unit_price is not None and unit_price > 0:
                     est_kinah = format_kinah_tr(cnt * unit_price)
                 elif cnt > 0:
-                    est_kinah = f"{cnt} adet"
+                    est_kinah = "fiyat yok"
                 else:
                     est_kinah = "0 Kinah"
 
@@ -1415,9 +2355,8 @@ class AnalyticsDialog(QDialog):
                 it_cnt.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
                 self.table.setItem(r_idx, 3, it_cnt)
 
-                it_share = QTableWidgetItem(f"%{share_pct:.1f}")
-                it_share.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
-                self.table.setItem(r_idx, 4, it_share)
+                # F-0711: the PAY % cell is a widget only — a setItem() text
+                # item underneath it was invisible (widget covers the cell).
                 self.table.setCellWidget(r_idx, 4, _ShareBarCellWidget(share_pct, self.table))
 
                 it_walk = QTableWidgetItem(f"{walk_sec:.2f}sn")
@@ -1487,6 +2426,65 @@ class AnalyticsDialog(QDialog):
         except Exception as exc:
             logger.error(f"on_save_json hatası: {exc}", exc_info=True)
 
+    def on_export_group_csv(self) -> None:
+        """Seçili kaynak grubunun olaylarını CSV olarak kaydeder (prototip: 'Grubu CSV İndir')."""
+        try:
+            if not self._selected_group_key:
+                return
+            parts = str(self._selected_group_key).split("|")
+            if len(parts) != 3:
+                return
+            res_name, reg_name, rte_name = parts
+            events = [kind_ev for kind_ev in self._recent_events(100000) if kind_ev[0] == "gather"]
+            # _recent_events grup filtresi zaten uygular; yine de doğrula.
+            events = [
+                ev for _k, ev in events
+                if str(ev.get("resource_type", "")) == res_name
+                and str(ev.get("region", "")) == reg_name
+                and str(ev.get("route", "")) == rte_name
+            ]
+            safe = "".join(c if c.isalnum() or c in ("-", "_") else "-" for c in res_name).strip("-") or "grup"
+            default_path = os.path.abspath(os.path.join("logs", f"gatherion-{safe}.csv"))
+            os.makedirs(os.path.dirname(default_path), exist_ok=True)
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Grubu CSV İndir", default_path, "CSV Dosyaları (*.csv);;Tüm Dosyalar (*)"
+            )
+            if not file_path:
+                return
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f, delimiter=";")
+                w.writerow(["Kaynak", "Bolge", "Rota", "Adet", "Ort. Guven", "Ort. Yurume (sn)", "Tahmini Kinah"])
+                total_kinah = 0
+                for ev in events:
+                    price = self._known_unit_price(res_name)
+                    items = int(ev.get("items_gathered", 1) or 1)
+                    kinah = (price * items) if price is not None else 0
+                    total_kinah += kinah
+                    w.writerow([
+                        res_name, reg_name, rte_name, items,
+                        int(ev.get("match_pct", 0) or 0),
+                        f"{float(ev.get('walk_duration_sec', 0.0) or 0.0):.2f}",
+                        kinah if price is not None else "fiyat yok",
+                    ])
+                w.writerow([])
+                w.writerow(["Saat", "Sonuc", "Guven", "Yurume (sn)", "Kinah", "Canavar"])
+                for ev in events:
+                    price = self._known_unit_price(res_name)
+                    items = int(ev.get("items_gathered", 1) or 1)
+                    kinah = (price * items) if price is not None else 0
+                    ts = ev.get("iso_time") or datetime.fromtimestamp(
+                        float(ev.get("timestamp", 0.0) or 0.0)
+                    ).isoformat(timespec="seconds")
+                    w.writerow([ts, "ok", int(ev.get("match_pct", 0) or 0),
+                                f"{float(ev.get('walk_duration_sec', 0.0) or 0.0):.2f}",
+                                kinah if price is not None else "fiyat yok", "—"])
+            self._append_log_record(
+                "INFO", f"Grup CSV indirildi — {res_name} ({len(events)} olay, tahmini {format_kinah_tr(total_kinah)})"
+            )
+            QMessageBox.information(self, "Grubu CSV İndir", f"Grup CSV kaydedildi:\n{file_path}")
+        except Exception as exc:
+            logger.error(f"on_export_group_csv hatası: {exc}", exc_info=True)
+
     def on_reset_stats(self) -> None:
         """Yalnızca oturum istatistiklerini sıfırlar; kalıcı lifetime dokunulmaz."""
         try:
@@ -1521,7 +2519,7 @@ class AnalyticsDialog(QDialog):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-            get_lifetime_stats().reset()
+            get_lifetime_stats().reset(confirm=True)
             self.refresh_metrics()
             QMessageBox.information(self, "Kalıcı İstatistikler", "Kalıcı istatistikler sıfırlandı.")
             logger.info("Kullanıcı onayıyla lifetime istatistikleri sıfırlandı.")
@@ -1534,10 +2532,26 @@ class AnalyticsDialog(QDialog):
                 self._refresh_timer.stop()
         except Exception as exc:
             logger.error(f"closeEvent hatası: {exc}")
+        try:
+            if self._log_handler is not None:
+                for name in _LIVE_LOG_SOURCES:
+                    try:
+                        lg = logging.getLogger(name)
+                        if self._log_handler in lg.handlers:
+                            lg.removeHandler(self._log_handler)
+                    except Exception:
+                        pass
+                self._log_handler = None
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def get_combat_and_consumable_analytics(self) -> Dict[str, Any]:
-        """Returns session combat, potion usage, buff scroll refresh, and selective gather metrics."""
+        """Returns session combat, potion usage, buff scroll refresh, and selective gather metrics.
+        F-0548: keys the telemetry does not track are None (unknown), never
+        a fabricated 0 — and selective_gather_hits is never silently equated
+        with gathered_total. success_rate_pct is None when unknown.
+        """
         metrics = dict(self.__dict__.get("_last_metrics") or {})
         telemetry = self.__dict__.get("telemetry")
         if not metrics and telemetry is not None and hasattr(telemetry, "get_live_metrics"):
@@ -1545,15 +2559,32 @@ class AnalyticsDialog(QDialog):
                 metrics = dict(telemetry.get_live_metrics() or {})
             except Exception:
                 metrics = {}
+
+        def _opt_int(key: str) -> Optional[int]:
+            if key not in metrics or metrics.get(key) is None:
+                return None
+            try:
+                return int(metrics.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        def _opt_float(key: str) -> Optional[float]:
+            if key not in metrics or metrics.get(key) is None:
+                return None
+            try:
+                return float(metrics.get(key))
+            except (TypeError, ValueError):
+                return None
+
         return {
             "combat_count": int(metrics.get("combat_count", 0) or 0),
             "gathered_total": int(metrics.get("gathered_total", 0) or 0),
             "failed_total": int(metrics.get("failed_total", 0) or 0),
-            "hp_potions_used": int(metrics.get("hp_potions_used", 0) or 0),
-            "mp_potions_used": int(metrics.get("mp_potions_used", 0) or 0),
-            "buff_scrolls_used": int(metrics.get("buff_scrolls_used", 0) or 0),
-            "selective_gather_hits": int(metrics.get("selective_gather_hits", metrics.get("gathered_total", 0)) or 0),
-            "success_rate_pct": float(metrics.get("success_rate_pct", 100.0) or 100.0),
+            "hp_potions_used": _opt_int("hp_potions_used"),
+            "mp_potions_used": _opt_int("mp_potions_used"),
+            "buff_scrolls_used": _opt_int("buff_scrolls_used"),
+            "selective_gather_hits": _opt_int("selective_gather_hits"),
+            "success_rate_pct": _opt_float("success_rate_pct"),
         }
 
     def export_analytics_snapshot_dict(self) -> Dict[str, Any]:
@@ -1568,23 +2599,48 @@ class AnalyticsDialog(QDialog):
             "combat_and_consumables": self.get_combat_and_consumable_analytics(),
             "lifetime": snap_lt,
             "rows_count": len(self.__dict__.get("_last_rows") or []),
-            "ready": True,
+            "ready": bool(self.__dict__.get("_last_metrics") or snap_lt),
         }
 
     def get_analytics_dialog_health_summary(self) -> dict:
+        """F-0621: real check — the attached telemetry must return a live
+        metrics dict with the core keys. No telemetry / broken metrics ->
+        ready False with the reason, never a constant True."""
         try:
-            return {"analytics_dialog_ready": True}
-        except Exception:
-            return {"analytics_dialog_ready": False}
+            tel = self.__dict__.get("telemetry")
+            if tel is None or not hasattr(tel, "get_live_metrics"):
+                return {"analytics_dialog_ready": False, "error": "telemetry yok"}
+            metrics = tel.get_live_metrics()
+            ok = (
+                isinstance(metrics, dict)
+                and "gathered_total" in metrics
+                and "success_rate_pct" in metrics
+            )
+            return {
+                "analytics_dialog_ready": bool(ok),
+                "telemetry_live_metrics_ok": bool(ok),
+                "gathered_total": metrics.get("gathered_total") if isinstance(metrics, dict) else None,
+            }
+        except Exception as exc:
+            return {"analytics_dialog_ready": False, "error": str(exc)}
 
     def get_analytics_dialog_ready_flag(self) -> dict:
-        return {"module": "analytics_dialog", "ready": True}
+        ready = bool(self.get_analytics_dialog_health_summary().get("analytics_dialog_ready"))
+        return {"module": "analytics_dialog", "ready": ready}
 
     def get_analytics_dialog_version_info(self) -> dict:
-        return {"module": "analytics_dialog", "version": "2.0.0", "ready": True}
+        ready = bool(self.get_analytics_dialog_health_summary().get("analytics_dialog_ready"))
+        return {"module": "analytics_dialog", "version": __version__, "ready": ready}
 
     def get_analytics_dialog_diagnostic_snapshot(self) -> dict:
-        return {"module": "analytics_dialog", "status": "ok", "ready": True}
+        health = self.get_analytics_dialog_health_summary()
+        ready = bool(health.get("analytics_dialog_ready"))
+        return {
+            "module": "analytics_dialog",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+            "health": health,
+        }
 
 
 def get_analytics_dialog_capabilities() -> list:
@@ -1592,7 +2648,18 @@ def get_analytics_dialog_capabilities() -> list:
 
 
 def validate_analytics_dialog_contract() -> bool:
-    return bool(get_analytics_dialog_capabilities())
+    """F-0621: real check — a fresh TelemetryEngine must produce a live
+    metrics dict with the core keys."""
+    try:
+        engine = TelemetryEngine()
+        metrics = engine.get_live_metrics()
+        return (
+            isinstance(metrics, dict)
+            and "gathered_total" in metrics
+            and "success_rate_pct" in metrics
+        )
+    except Exception:
+        return False
 
 
 def get_analytics_dialog_baseline_metrics() -> dict:

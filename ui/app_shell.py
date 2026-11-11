@@ -58,8 +58,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from core.session_log import resolve_current_log_path
 from ui.shell_page_frame import wrap_shell_tab_root_layout
 from ui.shell_theme import SHELL_COLORS
+
+from version import __version__
 
 logger = logging.getLogger("Gatherion.AppShell")
 
@@ -137,6 +140,35 @@ _HOME_STATS = (
 
 _DEFAULT_HOTKEY_LINE = "Kısayollar: Ctrl+Alt+F8 nokta · Ctrl+Alt+F9 menü · Ctrl+Alt+F10 duraklat / devam"
 
+# Prototip ızgara sırası (gatherion-anasayfa-prototipi.html): 21 buton, 7x3.
+# "pause_resume_f10" = Başlat (akor), "pause_only" = Duraklat (akor),
+# "map"/"yolo" = sayfa kısayolları, diğerleri F9 eylem kimlikleri.
+# "toggle_menu_f9" (Menü) prototipte yok — ızgaraya girmez, Ctrl+Alt+F9
+# akoru ve tepsi üzerinden açılmaya devam eder.
+_PROTOTYPE_GRID_ORDER = (
+    "pause_resume_f10",
+    "resume",
+    "pause_only",
+    "route",
+    "combat",
+    "explorer",
+    "auto_record",
+    "manual_record",
+    "minimap_auto_record",
+    "active_route",
+    "radar",
+    "map",
+    "yolo",
+    "analytics",
+    "calibrate",
+    "yolo_factory",
+    "settings",
+    "open_log",
+    "guide",
+    "copy_support",
+    "exit",
+)
+
 # Short home captions. The long F9 sentence stays on the tooltip.
 _HOME_ACTION_LABELS = {
     "resume": "Devam Et",
@@ -171,8 +203,19 @@ def _short_home_action(action_id: str, long_label: str) -> str:
 
 
 def _resolve_log_path(log_path: str) -> str:
+    # v20/session-logs: guncel oturum dosyasi cozulur
+    # (logs/session_YYYY-MM-DD_HHMMSS.log); oturum dosyasi yoksa eski
+    # tek dosya (bot.log) yedegi. D-2 (dilim-29) oncelik aynen korunur:
+    # once F:\a2, sonra F:\Gatherion, sonra yerel logs/. NOT: PC'de eski
+    # bir F:\a2 dizini kalmissa guncel bot baska dizinde calisiyor olsa
+    # bile eski log okunur — F:\a2'nin hala canli bot dizini oldugu
+    # PC'de dogrulanmali (ACIK SORU).
     if log_path:
         return log_path
+    for _log_dir in (r"F:\a2\logs", r"F:\Gatherion\logs", os.path.join("logs")):
+        _current = resolve_current_log_path(_log_dir)
+        if _current is not None:
+            return os.fspath(_current)
     if os.path.isdir(r"F:\a2"):
         return r"F:\a2\logs\bot.log"
     if os.path.isdir("F:\\"):
@@ -208,8 +251,35 @@ def _home_state_word(raw: Any) -> str:
     return "Çalışıyor"
 
 
+# P2-7 (K-06): WARN filtresi TEK TANIM — canlı günlük şeridi
+# (_LogSource._filtered_text) ile günlük sayfası
+# (_LogPage._filter_log_content) aynı kümeyi gösterir. Eskiden şerit
+# WARN'de WARNING/WARN/ERROR/ÖNİZLEME/DURUM geçirirken sayfa yalnızca
+# WARN/WARNING/UYARI geçiriyordu; aynı düğme iki yüzeyde farklı satır
+# gösteriyordu. Kanonik küme sayfanınkidir (r37 F-0627 testi kilitler:
+# WARN yalnızca [WARN] satırını geçirir, [ERROR] geçemez).
+_WARN_KEYWORDS = ("WARN", "WARNING", "UYARI")
+
+
+def _log_line_matches_warn(line: str) -> bool:
+    """WARN filtresi yüklemi — iki günlük yüzeyinde de aynı."""
+    upper = str(line or "").upper()
+    return any(keyword in upper for keyword in _WARN_KEYWORDS)
+
+
+# PREVIEW (canlı şeritteki "Önizleme" hapı) WARN'den ayrı bir moddur;
+# tarihsel kümesi aynen korunur (uyarı/hata + önizleme/durum satırları).
+_PREVIEW_KEYWORDS = ("WARNING", "WARN", "ERROR", "ÖNIZLEME", "ÖNİZLEME", "DURUM")
+
+
+def _log_line_matches_preview(line: str) -> bool:
+    """PREVIEW filtresi yüklemi — WARN ile birleştirilmez (P2-7)."""
+    upper = str(line or "").upper()
+    return any(keyword in upper for keyword in _PREVIEW_KEYWORDS)
+
+
 class _LogSource:
-    """One tail of logs/bot.log, painted into every attached view."""
+    """One tail of the current session log, painted into every attached view."""
 
     def __init__(self, log_path: str) -> None:
         self.log_path = log_path
@@ -252,7 +322,7 @@ class _LogSource:
                 if self._stamp == ("missing",) and self._text:
                     return None
                 self._stamp = ("missing",)
-                return "Günlük dosyası henüz yok."
+                return ""  # F-0716: no placeholder text as a fake log line
             stat = os.stat(self.log_path)
             stamp = (stat.st_mtime_ns, stat.st_size)
             if stamp == self._stamp and self._text:
@@ -261,7 +331,7 @@ class _LogSource:
                 text = handle.read()
             self._stamp = stamp
             tail = text[-120000:] if len(text) > 120000 else text
-            return tail or "Günlük dosyası boş."
+            return tail  # F-0716: empty log renders empty, not a fake line
         except Exception as exc:
             self._stamp = None
             return f"Günlük okunamadı: {exc}"
@@ -271,11 +341,25 @@ class _LogSource:
             return raw
         lines = raw.splitlines()
         if self._filter_mode == "INFO":
-            kept = [ln for ln in lines if "INFO" in ln or ("WARNING" not in ln and "ERROR" not in ln)]
-            return "\n".join(kept) if kept else raw
-        if self._filter_mode in ("WARN", "PREVIEW"):
-            kept = [ln for ln in lines if any(k in ln for k in ("WARNING", "WARN", "ERROR", "Önizleme", "Durum"))]
-            return "\n".join(kept[-25:]) if kept else "\n".join(lines[-8:])
+            # F-0627: INFO filtresi yalnizca INFO etiketli satirlari gosterir
+            # (_LogPage._filter_log_content ile ayni mantik). Eski mantik
+            # ("INFO" yoksa WARN/ERROR/CRITICAL de yoksa gec) seviye etiketi
+            # tasimayan her satiri (DEBUG dahil) INFO'dan geciriyordu.
+            kept = [ln for ln in lines if "INFO" in ln.upper()]
+            return "\n".join(kept) if kept else ""
+        if self._filter_mode == "WARN":
+            # P2-7: WARN yüklemi _LogPage ile aynı tek tanım
+            # (_log_line_matches_warn). Son 25 satır kesiti yalnızca
+            # bu şeridin görüntü sınırıdır, filtre tanımı değil.
+            kept = [ln for ln in lines if _log_line_matches_warn(ln)]
+            return "\n".join(kept[-25:]) if kept else ""
+        if self._filter_mode == "PREVIEW":
+            # S-3702: buyuk/kucuk harfe duyarsiz eslesme (.upper()).
+            # Not: "önizleme".upper() -> "ÖNIZLEME" (i -> I) oldugundan hem
+            # ASCII-I hem de İ'li bicim aranir; zaten büyük harfli "ÖNİZLEME"
+            # satirlari da yakalanir.
+            kept = [ln for ln in lines if _log_line_matches_preview(ln)]
+            return "\n".join(kept[-25:]) if kept else ""
         if self._filter_mode == "ERROR":
             kept = [ln for ln in lines if any(k in ln.upper() for k in ("ERROR", "CRITICAL", "EXCEPTION", "TRACEBACK", "HATA"))]
             return "\n".join(kept) if kept else ""
@@ -300,7 +384,7 @@ class _LogSource:
 
 
 class _LogPage(QWidget):
-    """Shows logs/bot.log inside the main window. No extra log window."""
+    """Shows the current session log inside the main window. No extra log window."""
 
     LEVEL_FILTERS = ("ALL", "INFO", "WARN", "ERROR")
 
@@ -329,6 +413,7 @@ class _LogPage(QWidget):
         self.search_edit.setObjectName("LogPageSearchEdit")
         self.search_edit.setPlaceholderText("🔍 Günlükte ara (Hata, Savaş, Hasat, Rota)...")
         self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setMinimumHeight(32)
         self.search_edit.setStyleSheet(
             """
             QLineEdit {
@@ -356,7 +441,7 @@ class _LogPage(QWidget):
             btn.setCheckable(True)
             btn.setChecked(lvl == "ALL")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFixedHeight(28)
+            btn.setFixedHeight(32)
             btn.clicked.connect(lambda _checked=False, mode=lvl: self.set_level_filter(mode))
             self.level_filter_group.addButton(btn)
             self.level_filter_buttons[lvl] = btn
@@ -366,14 +451,14 @@ class _LogPage(QWidget):
         self.level_combo.setObjectName("LogLevelCombo")
         self.level_combo.addItems(list(self.LEVEL_FILTERS))
         self.level_combo.setCurrentText("ALL")
-        self.level_combo.setFixedHeight(28)
+        self.level_combo.setFixedHeight(32)
         self.level_combo.currentTextChanged.connect(self.set_level_filter)
         toolbar_row.addWidget(self.level_combo)
 
         self.btn_export_log = QPushButton("Günlüğü Dışa Aktar / Kopyala", self)
         self.btn_export_log.setObjectName("LogExportCopyBtn")
         self.btn_export_log.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_export_log.setFixedHeight(28)
+        self.btn_export_log.setFixedHeight(32)
         self.btn_export_log.setStyleSheet(
             """
             QPushButton {
@@ -382,7 +467,7 @@ class _LogPage(QWidget):
                 border: 1px solid rgba(86, 200, 245, 0.40);
                 border-radius: 6px;
                 padding: 4px 10px;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 600;
             }
             QPushButton:hover {
@@ -417,14 +502,24 @@ class _LogPage(QWidget):
         refresh_row = QHBoxLayout()
         self.filter_status_label = QLabel("Seviye: ALL · Tüm satırlar gösteriliyor", self)
         self.filter_status_label.setObjectName("LogFilterStatusLabel")
-        self.filter_status_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        self.filter_status_label.setStyleSheet("color: #8b94a3; font-size: 12px;")
         refresh_row.addWidget(self.filter_status_label)
         refresh_row.addStretch(1)
         refresh = QPushButton("Yenile", self)
         refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh.setMinimumHeight(32)
         refresh.clicked.connect(self.reload)
         refresh_row.addWidget(refresh)
+        # v20/session-logs: logun sonunu gorememe sikayeti (Selcuk) —
+        # sayfa acilinca son satir gorunsun; butonla her an sona gidilsin.
+        go_end = QPushButton("Sona Git", self)
+        go_end.setObjectName("LogGoToEndBtn")
+        go_end.setCursor(Qt.CursorShape.PointingHandCursor)
+        go_end.setMinimumHeight(32)
+        go_end.clicked.connect(self._go_to_end)
+        refresh_row.addWidget(go_end)
         layout.addLayout(refresh_row)
+        self._went_to_end_once = False
         self.reload()
 
     def set_level_filter(self, level: str) -> None:
@@ -455,15 +550,17 @@ class _LogPage(QWidget):
         lines = text.splitlines()
         lvl = self._level_filter
         if lvl == "INFO":
+            # F-0627: INFO filtresi yalnizca INFO etiketli satirlari gosterir.
+            # Eski mantik ("INFO" yoksa WARN/ERROR/CRITICAL de yoksa gec) seviye
+            # etiketi tasimayan her satiri (DEBUG dahil) INFO'dan geciriyordu.
             lines = [
                 ln for ln in lines
-                if "INFO" in ln.upper() or ("WARN" not in ln.upper() and "ERROR" not in ln.upper() and "CRITICAL" not in ln.upper())
+                if "INFO" in ln.upper()
             ]
         elif lvl == "WARN":
-            lines = [
-                ln for ln in lines
-                if any(k in ln.upper() for k in ("WARN", "WARNING", "UYARI"))
-            ]
+            # P2-7: WARN yüklemi _LogSource ile aynı tek tanım
+            # (_log_line_matches_warn) — r37 F-0627 bu davranışı kilitler.
+            lines = [ln for ln in lines if _log_line_matches_warn(ln)]
         elif lvl == "ERROR":
             lines = [
                 ln for ln in lines
@@ -498,39 +595,69 @@ class _LogPage(QWidget):
         else:
             recs = self.__dict__.get("_records") or []
             filtered = "\n".join(str(r[1]) if isinstance(r, (tuple, list)) and len(r) > 1 else str(r) for r in recs)
+        # F-0630: only write a file when the caller asked for one (target_path);
+        # the button path (no target) copies to the clipboard only.
+        clipboard_ok = False
         try:
             app = QApplication.instance()
             if app is not None:
                 clipboard = QApplication.clipboard()
                 if clipboard is not None:
                     clipboard.setText(filtered)
+                    clipboard_ok = True
         except Exception:
             logger.debug("Panoya kopyalama atlandı", exc_info=True)
-
+        file_ok = False
+        file_err: Optional[str] = None
         export_file = target_path
-        if not export_file and src is not None and getattr(src, "log_path", None):
-            base_dir = os.path.dirname(src.log_path) or "."
-            export_file = os.path.join(base_dir, "bot_filtered_export.log")
         if export_file:
             try:
                 os.makedirs(os.path.dirname(os.path.abspath(export_file)), exist_ok=True)
                 with open(export_file, "w", encoding="utf-8") as fh:
                     fh.write(filtered)
-            except Exception:
+                file_ok = True
+            except Exception as exc:
+                file_err = str(exc)
                 logger.debug("Filtrelenmiş günlük dosyaya yazılamadı", exc_info=True)
 
         lbl = self.__dict__.get("filter_status_label")
         if lbl is not None:
             line_cnt = len(filtered.splitlines()) if filtered else 0
             lvl = self.__dict__.get("_level_filter", "ALL")
-            lbl.setText(
-                f"Günlük dışa aktarıldı / panoya kopyalandı ({line_cnt} satır · Seviye: {lvl})"
-            )
+            if file_ok:
+                lbl.setText(
+                    f"Günlük dışa aktarıldı ({line_cnt} satır · Seviye: {lvl})"
+                )
+            elif clipboard_ok:
+                lbl.setText(
+                    f"Günlük panoya kopyalandı ({line_cnt} satır · Seviye: {lvl})"
+                )
+            else:
+                lbl.setText(
+                    f"Günlük dışa aktarılamadı ({line_cnt} satır · Seviye: {lvl})"
+                    + (f" — dosya hatası: {file_err}" if file_err else "")
+                )
         return filtered
+
+    def _go_to_end(self) -> None:
+        """Kaydiriciyi logun sonuna gotur (v20/session-logs)."""
+        try:
+            bar = self.view.verticalScrollBar()
+            cursor = self.view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.view.setTextCursor(cursor)
+            bar.setValue(bar.maximum())
+        except Exception:
+            logger.debug("Günlük sonuna kaydırılamadı", exc_info=True)
 
     def reload(self) -> None:
         self.source.reload()
         self.source._paint(self.view, follow=False)
+        # v20/session-logs: sayfa acilinca logun sonu gorunsun; kullanici
+        # yukari kaydirdiktan sonra zorla sona cekilmez (yalnizca ilk kez).
+        if not getattr(self, "_went_to_end_once", False):
+            self._went_to_end_once = True
+            self._go_to_end()
 
 
 class _StatChip(QFrame):
@@ -548,8 +675,8 @@ class _StatChip(QFrame):
         self.setObjectName("HomeStat")
         self._default_value = default_value
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 11, 16, 11)
-        layout.setSpacing(4)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(6)
 
         self.caption = QLabel(caption.upper(), self)
         self.caption.setObjectName("HomeStatCaption")
@@ -581,8 +708,10 @@ class _StatChip(QFrame):
         self.sub.setText(text)
 
     def hide_stat(self) -> None:
-        self.value.setText(self._default_value)
-        self.setVisible(True)
+        # F-0553: hide the chip entirely; showing the default ("0") would
+        # present a made-up value as a real measurement.
+        self.value.setText("")
+        self.setVisible(False)
 
 
 class _HomeTogglePill(QFrame):
@@ -594,7 +723,7 @@ class _HomeTogglePill(QFrame):
         super().__init__(parent)
         self._checked = bool(checked)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(32)
+        self.setFixedHeight(36)
         self.setStyleSheet(
             """
             QFrame {
@@ -609,19 +738,19 @@ class _HomeTogglePill(QFrame):
                 background: transparent;
                 border: none;
                 color: #9aa3af;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 600;
             }
             """
         )
         row = QHBoxLayout(self)
-        row.setContentsMargins(10, 4, 10, 4)
-        row.setSpacing(6)
+        row.setContentsMargins(12, 6, 12, 6)
+        row.setSpacing(8)
         self.label = QLabel(label_text, self)
         row.addWidget(self.label)
         row.addStretch(1)
         self._indicator = QWidget(self)
-        self._indicator.setFixedSize(28, 16)
+        self._indicator.setFixedSize(32, 18)
         row.addWidget(self._indicator)
 
     def isChecked(self) -> bool:  # noqa: N802
@@ -654,7 +783,7 @@ class _HomeTogglePill(QFrame):
             painter.setPen(QPen(QColor(255, 255, 255, 22), 1.0))
         painter.drawRoundedRect(r, 8.0, 8.0)
 
-        knob_d = 10.0
+        knob_d = 12.0
         knob_y = r.y() + (r.height() - knob_d) / 2.0
         knob_x = (r.right() - knob_d - 3.0) if self._checked else (r.x() + 3.0)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -668,7 +797,7 @@ class _HomeMinimapCanvas(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setMinimumHeight(200)
+        self.setMinimumHeight(220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._nodes: List[Dict[str, Any]] = []
         self._active_node_id: Optional[int] = None
@@ -727,7 +856,7 @@ class _HomeMinimapCanvas(QWidget):
         painter.fillRect(rect, rad)
 
         # 40px cyan grid lines
-        grid_pen = QPen(QColor(86, 200, 245, 18), 1.0)
+        grid_pen = QPen(QColor(86, 200, 245, 26), 1.0)
         painter.setPen(grid_pen)
         gx = 40.0
         while gx < w:
@@ -803,8 +932,20 @@ class _HomeMinimapCanvas(QWidget):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawPath(route_path)
 
+            # F-0631: "completed" is a position in the route sequence, not a
+            # comparison between the sequence index and the node id.
+            active_pos: Optional[int] = None
+            if self._active_node_id is not None:
+                for _pos, _nd in enumerate(valid_nodes):
+                    try:
+                        if int(_nd.get("id", _pos + 1) or (_pos + 1)) == int(self._active_node_id):
+                            active_pos = _pos
+                            break
+                    except (ValueError, TypeError):
+                        continue
+
             # Waypoint circles
-            wp_font = QFont("Consolas", 8, QFont.Weight.Bold)
+            wp_font = QFont("Consolas", 9, QFont.Weight.Bold)
             painter.setFont(wp_font)
             active_pt: Optional[QPointF] = None
 
@@ -816,7 +957,7 @@ class _HomeMinimapCanvas(QWidget):
                     stroke_c = QColor("#f5b50a")
                     fill_c = QColor("#11151c")
                     txt_c = QColor("#f5b50a")
-                elif self._is_running and idx < (self._active_node_id or 0):
+                elif self._is_running and active_pos is not None and idx < active_pos:
                     stroke_c = QColor("#34d399")
                     fill_c = QColor("#11151c")
                     txt_c = QColor("#34d399")
@@ -827,9 +968,9 @@ class _HomeMinimapCanvas(QWidget):
 
                 painter.setPen(QPen(stroke_c, 2.0))
                 painter.setBrush(fill_c)
-                painter.drawEllipse(pt, 7.5, 7.5)
+                painter.drawEllipse(pt, 8.5, 8.5)
                 painter.setPen(txt_c)
-                painter.drawText(QRectF(pt.x() - 8.0, pt.y() - 8.0, 16.0, 16.0), Qt.AlignmentFlag.AlignCenter, str(idx + 1))
+                painter.drawText(QRectF(pt.x() - 9.0, pt.y() - 9.0, 18.0, 18.0), Qt.AlignmentFlag.AlignCenter, str(idx + 1))
 
             # Player marker (only rendered when running and target point is known)
             if self._is_running:
@@ -841,7 +982,7 @@ class _HomeMinimapCanvas(QWidget):
                     painter.setPen(Qt.PenStyle.NoPen)
                     painter.setBrush(QColor("#f5b50a"))
                     painter.drawEllipse(pl_pt, 4.5, 4.5)
-                    sen_font = QFont("Consolas", 8, QFont.Weight.Bold)
+                    sen_font = QFont("Consolas", 9, QFont.Weight.Bold)
                     painter.setFont(sen_font)
                     painter.setPen(QColor("#f5b50a"))
                     painter.drawText(
@@ -852,13 +993,13 @@ class _HomeMinimapCanvas(QWidget):
 
         # Top-right live/idle badge
         badge_w = 72.0 if self._live_tag == "BEKLEMEDE" else 50.0
-        badge_rect = QRectF(w - badge_w - 8.0, 8.0, badge_w, 20.0)
+        badge_rect = QRectF(w - badge_w - 8.0, 8.0, badge_w, 22.0)
         painter.setPen(QPen(QColor(255, 255, 255, 22), 1.0))
         painter.setBrush(QColor(10, 12, 16, 215))
         painter.drawRoundedRect(badge_rect, 5.0, 5.0)
         badge_color = QColor("#34d399") if self._live_tag == "CANLI" else QColor("#f5b50a")
         painter.setPen(badge_color)
-        b_font = QFont("Consolas", 8, QFont.Weight.Bold)
+        b_font = QFont("Consolas", 9, QFont.Weight.Bold)
         painter.setFont(b_font)
         painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self._live_tag)
 
@@ -932,6 +1073,7 @@ class _HomePage(QWidget):
         on_open: Callable[[str], None],
         on_action: Callable[[str], None],
         on_chord: Callable[[str], None],
+        on_toggle: Optional[Callable[[str, bool], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -939,6 +1081,7 @@ class _HomePage(QWidget):
         self._on_open = on_open
         self._on_action = on_action
         self._on_chord = on_chord
+        self._on_toggle = on_toggle
         self._action_buttons: Dict[str, QPushButton] = {}
         self._chord_buttons: Dict[str, QPushButton] = {}
         self._shortcut_buttons: Dict[str, QPushButton] = {}
@@ -960,8 +1103,8 @@ class _HomePage(QWidget):
         content = QWidget(scroll)
         content.setObjectName("HomeScrollContent")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(18, 14, 18, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 16, 20, 14)
+        layout.setSpacing(14)
 
         # 1. STATUS BAR (.status)
         status_card = QFrame(content)
@@ -971,7 +1114,7 @@ class _HomePage(QWidget):
         status_row.setSpacing(14)
 
         self.status_dot = QFrame(status_card)
-        self.status_dot.setFixedSize(9, 9)
+        self.status_dot.setFixedSize(11, 11)
         self._apply_dot_style(running=False)
         status_row.addWidget(self.status_dot)
 
@@ -1046,7 +1189,7 @@ class _HomePage(QWidget):
         cmds_wrap = QWidget(content)
         cmds_lay = QVBoxLayout(cmds_wrap)
         cmds_lay.setContentsMargins(0, 0, 0, 0)
-        cmds_lay.setSpacing(5)
+        cmds_lay.setSpacing(8)
 
         for key, caption in (
             ("radar", "Radar"),
@@ -1059,15 +1202,15 @@ class _HomePage(QWidget):
             button.setObjectName(f"HomeOpen_{key}")
             button.setProperty("homeAction", True)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setFixedHeight(32)
+            button.setFixedHeight(36)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             button.clicked.connect(lambda _checked=False, page=key: on_open(page))
             self._shortcut_buttons[key] = button
 
         self._action_grid = QGridLayout()
         self._action_grid.setContentsMargins(0, 0, 0, 0)
-        self._action_grid.setHorizontalSpacing(6)
-        self._action_grid.setVerticalSpacing(6)
+        self._action_grid.setHorizontalSpacing(8)
+        self._action_grid.setVerticalSpacing(8)
         for column in range(7):
             self._action_grid.setColumnStretch(column, 1)
         cmds_lay.addLayout(self._action_grid)
@@ -1101,11 +1244,11 @@ class _HomePage(QWidget):
     def _apply_dot_style(self, running: bool) -> None:
         if running:
             self.status_dot.setStyleSheet(
-                "background-color: #34d399; border-radius: 4px; border: 1px solid #6ee7b7;"
+                "background-color: #34d399; border-radius: 5px; border: 1px solid #6ee7b7;"
             )
         else:
             self.status_dot.setStyleSheet(
-                "background-color: #f5b50a; border-radius: 4px; border: 1px solid #fcd34d;"
+                "background-color: #f5b50a; border-radius: 5px; border: 1px solid #fcd34d;"
             )
 
     def _build_minimap_card(self, parent: QWidget) -> QFrame:
@@ -1132,10 +1275,10 @@ class _HomePage(QWidget):
         self.minimap_steps_container = QWidget(card)
         self.minimap_steps_layout = QVBoxLayout(self.minimap_steps_container)
         self.minimap_steps_layout.setContentsMargins(0, 0, 0, 0)
-        self.minimap_steps_layout.setSpacing(4)
+        self.minimap_steps_layout.setSpacing(6)
 
         self.minimap_empty_lbl = QLabel("Rotada kayıtlı nokta yok. (F8 ile nokta kaydedin)", self.minimap_steps_container)
-        self.minimap_empty_lbl.setStyleSheet("color: #6b7280; font-size: 11px; padding: 10px 0;")
+        self.minimap_empty_lbl.setStyleSheet("color: #8b94a3; font-size: 12px; padding: 10px 0;")
         self.minimap_empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.minimap_steps_layout.addWidget(self.minimap_empty_lbl)
         lay.addWidget(self.minimap_steps_container)
@@ -1144,7 +1287,7 @@ class _HomePage(QWidget):
         self.minimap_pbar.setRange(0, 100)
         self.minimap_pbar.setValue(0)
         self.minimap_pbar.setTextVisible(False)
-        self.minimap_pbar.setFixedHeight(5)
+        self.minimap_pbar.setFixedHeight(6)
         self.minimap_pbar.setStyleSheet(
             """
             QProgressBar {
@@ -1163,12 +1306,12 @@ class _HomePage(QWidget):
         foot = QHBoxLayout()
         foot.setContentsMargins(0, 0, 0, 0)
         fl = QLabel("Rota ilerlemesi", card)
-        fl.setStyleSheet("color: #6b7280; font-size: 11px;")
+        fl.setStyleSheet("color: #8b94a3; font-size: 12px;")
         foot.addWidget(fl)
         foot.addStretch(1)
         self.route_progress_label = QLabel("%0 — 0 aktif node", card)
         self.route_progress_label.setStyleSheet(
-            'color: #9aa3af; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px;'
+            'color: #9aa3af; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;'
         )
         foot.addWidget(self.route_progress_label)
         lay.addLayout(foot)
@@ -1210,7 +1353,7 @@ class _HomePage(QWidget):
         self.gpu_bar.setRange(0, 100)
         self.gpu_bar.setValue(0)
         self.gpu_bar.setTextVisible(False)
-        self.gpu_bar.setFixedHeight(5)
+        self.gpu_bar.setFixedHeight(6)
         self.gpu_bar.setStyleSheet(
             """
             QProgressBar { background-color: #1a202b; border: none; border-radius: 2px; }
@@ -1227,7 +1370,7 @@ class _HomePage(QWidget):
         top_cpu = QHBoxLayout()
         self.cpu_title_lbl = QLabel("CPU · Çoklu Çekirdek", card)
         self.cpu_title_lbl.setStyleSheet("color: #9aa3af; font-size: 12px;")
-        self.cpu_val_lbl = QLabel("0% · 2.4 GHz", card)
+        self.cpu_val_lbl = QLabel("0% · — GHz", card)
         self.cpu_val_lbl.setStyleSheet('color: #eef1f5; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;')
         top_cpu.addWidget(self.cpu_title_lbl)
         top_cpu.addStretch(1)
@@ -1238,7 +1381,7 @@ class _HomePage(QWidget):
         self.cpu_bar.setRange(0, 100)
         self.cpu_bar.setValue(0)
         self.cpu_bar.setTextVisible(False)
-        self.cpu_bar.setFixedHeight(5)
+        self.cpu_bar.setFixedHeight(6)
         self.cpu_bar.setStyleSheet(
             """
             QProgressBar { background-color: #1a202b; border: none; border-radius: 2px; }
@@ -1255,7 +1398,7 @@ class _HomePage(QWidget):
         top_mss = QHBoxLayout()
         self.mss_title_lbl = QLabel("Ekran Yakalama (MSS)", card)
         self.mss_title_lbl.setStyleSheet("color: #9aa3af; font-size: 12px;")
-        self.mss_val_lbl = QLabel("0 FPS · 0.0 ms", card)
+        self.mss_val_lbl = QLabel("0 FPS · — ms", card)
         self.mss_val_lbl.setStyleSheet('color: #eef1f5; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;')
         top_mss.addWidget(self.mss_title_lbl)
         top_mss.addStretch(1)
@@ -1266,7 +1409,7 @@ class _HomePage(QWidget):
         self.mss_bar.setRange(0, 100)
         self.mss_bar.setValue(0)
         self.mss_bar.setTextVisible(False)
-        self.mss_bar.setFixedHeight(5)
+        self.mss_bar.setFixedHeight(6)
         self.mss_bar.setStyleSheet(
             """
             QProgressBar { background-color: #1a202b; border: none; border-radius: 2px; }
@@ -1287,19 +1430,31 @@ class _HomePage(QWidget):
         self.sys_kv_line.setTextFormat(Qt.TextFormat.RichText)
         self.sys_kv_line.setWordWrap(True)
         self.sys_kv_line.setStyleSheet(
-            "color: #6b7280; font-size: 11px; border-top: 1px solid #1e2530; padding-top: 8px;"
+            "color: #8b94a3; font-size: 12px; border-top: 1px solid #1e2530; padding-top: 8px;"
         )
         lay.addWidget(self.sys_kv_line)
 
         tog_row = QHBoxLayout()
-        tog_row.setContentsMargins(0, 2, 0, 0)
-        tog_row.setSpacing(6)
+        tog_row.setContentsMargins(0, 4, 0, 0)
+        tog_row.setSpacing(8)
+        # Gerçek anahtarlar: shell on_toggle ile ayarlara / çalışma durumuna
+        # yazar. on_toggle yoksa (doğrudan _HomePage kullanımı) eski F9
+        # eylem davranışı korunur — sahte geri bildirim verilmez.
+        def _emit_toggle(key: str, val: bool) -> None:
+            if callable(self._on_toggle):
+                self._on_toggle(key, val)
+            elif key == "auto_record":
+                self._on_action("auto_record")
+            elif key == "avoid_combat":
+                self._on_action("combat")
+            elif key == "mobile_panel":
+                self._on_open("mobile")
         self.tog_auto_rec = _HomeTogglePill("Oto-Kayıt", checked=False, parent=card)
-        self.tog_auto_rec.toggled.connect(lambda _v: self._on_action("auto_record"))
+        self.tog_auto_rec.toggled.connect(lambda v: _emit_toggle("auto_record", v))
         self.tog_avoid_combat = _HomeTogglePill("Savaşta Kaçın", checked=False, parent=card)
-        self.tog_avoid_combat.toggled.connect(lambda _v: self._on_action("combat"))
+        self.tog_avoid_combat.toggled.connect(lambda v: _emit_toggle("avoid_combat", v))
         self.tog_mobile_panel = _HomeTogglePill("Mobil Panel", checked=False, parent=card)
-        self.tog_mobile_panel.toggled.connect(lambda _v: self._on_open("mobile"))
+        self.tog_mobile_panel.toggled.connect(lambda v: _emit_toggle("mobile_panel", v))
         tog_row.addWidget(self.tog_auto_rec, stretch=1)
         tog_row.addWidget(self.tog_avoid_combat, stretch=1)
         tog_row.addWidget(self.tog_mobile_panel, stretch=1)
@@ -1327,11 +1482,11 @@ class _HomePage(QWidget):
         self.detections_container = QWidget(card)
         self.detections_layout = QVBoxLayout(self.detections_container)
         self.detections_layout.setContentsMargins(0, 0, 0, 0)
-        self.detections_layout.setSpacing(6)
+        self.detections_layout.setSpacing(8)
         lay.addWidget(self.detections_container)
 
         self.detections_empty_lbl = QLabel("Henüz tespit yok · YOLO hazır", self.detections_container)
-        self.detections_empty_lbl.setStyleSheet("color: #6b7280; font-size: 11px; padding: 12px 0;")
+        self.detections_empty_lbl.setStyleSheet("color: #8b94a3; font-size: 12px; padding: 12px 0;")
         self.detections_empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.detections_layout.addWidget(self.detections_empty_lbl)
 
@@ -1342,7 +1497,7 @@ class _HomePage(QWidget):
             card,
         )
         self.detections_foot_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self.detections_foot_lbl.setStyleSheet("color: #6b7280; font-size: 11px; padding-top: 2px;")
+        self.detections_foot_lbl.setStyleSheet("color: #8b94a3; font-size: 12px; padding-top: 2px;")
         lay.addWidget(self.detections_foot_lbl)
         lay.addStretch(1)
         return card
@@ -1366,7 +1521,7 @@ class _HomePage(QWidget):
 
         if not node_list:
             lbl = QLabel("Rotada kayıtlı nokta yok. (F8 ile nokta kaydedin)", self.minimap_steps_container)
-            lbl.setStyleSheet("color: #6b7280; font-size: 11px; padding: 8px 0;")
+            lbl.setStyleSheet("color: #8b94a3; font-size: 12px; padding: 8px 0;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.minimap_steps_layout.addWidget(lbl)
             if hasattr(self, "minimap_pbar"):
@@ -1416,23 +1571,23 @@ class _HomePage(QWidget):
                     "QFrame { background-color: #0d1015; border: 1px solid #1e2530; border-radius: 7px; }"
                 )
             sr = QHBoxLayout(step_frame)
-            sr.setContentsMargins(10, 5, 10, 5)
-            sr.setSpacing(10)
+            sr.setContentsMargins(12, 7, 12, 7)
+            sr.setSpacing(12)
 
             badge = QLabel(str(idx + 1), step_frame)
-            badge.setFixedSize(20, 20)
+            badge.setFixedSize(22, 22)
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
             if state == "done":
                 badge.setStyleSheet(
-                    'background: rgba(52, 211, 153, 0.15); color: #34d399; border-radius: 5px; font-family: Consolas, monospace; font-size: 11px; font-weight: 700; border: none;'
+                    'background: rgba(52, 211, 153, 0.15); color: #34d399; border-radius: 5px; font-family: Consolas, monospace; font-size: 12px; font-weight: 700; border: none;'
                 )
             elif state == "active":
                 badge.setStyleSheet(
-                    'background: rgba(245, 181, 10, 0.20); color: #f5b50a; border-radius: 5px; font-family: Consolas, monospace; font-size: 11px; font-weight: 700; border: none;'
+                    'background: rgba(245, 181, 10, 0.20); color: #f5b50a; border-radius: 5px; font-family: Consolas, monospace; font-size: 12px; font-weight: 700; border: none;'
                 )
             else:
                 badge.setStyleSheet(
-                    'background: rgba(255, 255, 255, 0.06); color: #9aa3af; border-radius: 5px; font-family: Consolas, monospace; font-size: 11px; font-weight: 700; border: none;'
+                    'background: rgba(255, 255, 255, 0.06); color: #9aa3af; border-radius: 5px; font-family: Consolas, monospace; font-size: 12px; font-weight: 700; border: none;'
                 )
             sr.addWidget(badge)
 
@@ -1442,7 +1597,7 @@ class _HomePage(QWidget):
 
             meta_lbl = QLabel(meta_txt, step_frame)
             meta_lbl.setStyleSheet(
-                'color: #6b7280; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; border: none; background: transparent;'
+                'color: #8b94a3; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; border: none; background: transparent;'
             )
             sr.addWidget(meta_lbl)
             self.minimap_steps_layout.addWidget(step_frame)
@@ -1487,14 +1642,14 @@ class _HomePage(QWidget):
         if hasattr(self, "cpu_title_lbl"):
             self.cpu_title_lbl.setText(str(cpu.get("name") or "CPU · Çoklu Çekirdek"))
         if hasattr(self, "cpu_val_lbl"):
-            self.cpu_val_lbl.setText(str(cpu.get("label_str") or "0% · 2.4 GHz"))
+            self.cpu_val_lbl.setText(str(cpu.get("label_str") or "0% · — GHz"))
         if hasattr(self, "cpu_bar"):
             self.cpu_bar.setValue(_safe_pct(cpu))
 
         if hasattr(self, "mss_title_lbl"):
             self.mss_title_lbl.setText("Ekran Yakalama (MSS)")
         if hasattr(self, "mss_val_lbl"):
-            self.mss_val_lbl.setText(str(cap.get("label_str") or "0 FPS · 0.0 ms"))
+            self.mss_val_lbl.setText(str(cap.get("label_str") or "0 FPS · — ms"))
         if hasattr(self, "mss_bar"):
             self.mss_bar.setValue(_safe_pct(cap))
 
@@ -1529,7 +1684,7 @@ class _HomePage(QWidget):
         items = [d for d in (detections or []) if isinstance(d, dict)]
         if not items:
             lbl = QLabel("Henüz tespit yok · YOLO hazır", self.detections_container)
-            lbl.setStyleSheet("color: #6b7280; font-size: 11px; padding: 12px 0;")
+            lbl.setStyleSheet("color: #8b94a3; font-size: 12px; padding: 12px 0;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.detections_layout.addWidget(lbl)
         else:
@@ -1539,8 +1694,8 @@ class _HomePage(QWidget):
                     "QFrame { background-color: #0d1015; border: 1px solid #1e2530; border-radius: 7px; }"
                 )
                 dr = QHBoxLayout(d_frame)
-                dr.setContentsMargins(10, 5, 10, 5)
-                dr.setSpacing(8)
+                dr.setContentsMargins(12, 7, 12, 7)
+                dr.setSpacing(10)
 
                 name_txt = str(d.get("name") or d.get("category_tr") or "Hedef")
                 dist_txt = str(d.get("dist") or d.get("location_str") or "Görüş alanı")
@@ -1563,11 +1718,11 @@ class _HomePage(QWidget):
                 dr.addWidget(n_lbl, stretch=1)
 
                 m_lbl = QLabel(dist_txt, d_frame)
-                m_lbl.setStyleSheet('color: #6b7280; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; border: none; background: transparent;')
+                m_lbl.setStyleSheet('color: #8b94a3; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; border: none; background: transparent;')
                 dr.addWidget(m_lbl)
 
                 c_lbl = QLabel(conf_txt, d_frame)
-                c_lbl.setStyleSheet(f'color: {conf_color}; font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; font-weight: 700; border: none; background: transparent;')
+                c_lbl.setStyleSheet(f'color: {conf_color}; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; font-weight: 700; border: none; background: transparent;')
                 dr.addWidget(c_lbl)
 
                 self.detections_layout.addWidget(d_frame)
@@ -1618,15 +1773,23 @@ class _HomePage(QWidget):
                 node_button.setToolTip(f"{node} mevcut konumu kaydeder. {current}".strip())
 
     def set_running(self, running: Optional[bool]) -> None:
-        """Ctrl+Alt+F10 label: Başlat while paused, Durdur while running."""
+        """Ctrl+Alt+F10 label: Başlat while paused, Duraklat while running."""
         is_run = bool(running)
+        if is_run and not self._running:
+            # F-0713: session clock starts when the run starts, not when
+            # the home page was constructed.
+            self._started_ts = time.monotonic()
         self._running = is_run
         self._apply_dot_style(is_run)
         button = self._chord_buttons.get("pause_resume_f10")
         if button is not None:
-            text = "Durdur" if is_run else "Başlat"
+            text = "Duraklat" if is_run else "Başlat"
             if button.text() != text:
                 button.setText(text)
+        pause_button = self._chord_buttons.get("pause_only")
+        if pause_button is not None:
+            # Duraklat yalnızca çalışırken anlamlı; duraklıyken basılamaz.
+            pause_button.setEnabled(is_run)
         if hasattr(self, "btn_status_run"):
             top_text = "Duraklat" if is_run else "Başlat"
             if self.btn_status_run.text() != top_text:
@@ -1645,6 +1808,12 @@ class _HomePage(QWidget):
                 "go",
             ),
             (
+                "pause_only",
+                "Duraklat",
+                "Yalnızca çalışırken duraklatır; duraklıyken hiçbir şey yapmaz.",
+                "",
+            ),
+            (
                 "toggle_menu_f9",
                 "Menü",
                 "Ctrl+Alt+F9 menüyü açar. Yürüyüşü duraklatmaz.",
@@ -1660,24 +1829,53 @@ class _HomePage(QWidget):
                 button.setProperty("homeActionVariant", variant)
             button.setToolTip(tip)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setFixedHeight(32)
+            button.setFixedHeight(36)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             button.clicked.connect(lambda _checked=False, chord=key: self._on_chord(chord))
             self._chord_buttons[key] = button
+        # Duraklat yalnızca çalışırken basılabilir; başlangıçta kapalı.
+        self._chord_buttons["pause_only"].setEnabled(False)
         self._place_buttons([])
 
-    def _place_buttons(self, action_buttons: list) -> None:
-        ordered: List[QPushButton] = [
-            self._chord_buttons["pause_resume_f10"],
-            self._chord_buttons["toggle_menu_f9"],
-        ]
-        ordered.extend(action_buttons)
-        existing_labels = {b.text().strip().lower() for b in ordered}
+    def _place_buttons(self, _action_buttons: list) -> None:
+        """Prototip sırasına göre dizer: 21 buton, 7x3 ızgara.
+
+        Akor butonları + F9 eylem butonları + sayfa kısayolları tek havuzda
+        toplanır; prototip sırası önce uygulanır, havuzda kalıp sıraya
+        girmeyen buton (ileride eklenen F9 satırı gibi) sona eklenir.
+        "toggle_menu_f9" (Menü) prototipte yoktur — ızgaraya girmez, F9
+        menüsü Ctrl+Alt+F9 akoruyla açılmaya devam eder.
+        """
+        pool: Dict[str, QPushButton] = {}
+        for key, btn in self._chord_buttons.items():
+            if key == "toggle_menu_f9":
+                continue
+            pool[key] = btn
+        for aid, btn in self._action_buttons.items():
+            pool[aid] = btn
+        pool_labels = {b.text().strip().lower() for b in pool.values()}
         for key, btn in self._shortcut_buttons.items():
-            if btn.text().strip().lower() not in existing_labels:
-                ordered.append(btn)
-            else:
+            if key in pool or btn.text().strip().lower() in pool_labels:
+                # Aynı işi F9 eylem butonu yapıyor ("Kalibrasyon" kısayolu /
+                # "calibrate" eylemi gibi); kısayol gizlenir.
                 btn.setVisible(False)
+            else:
+                pool[key] = btn
+        ordered: List[QPushButton] = []
+        seen: set = set()
+        for key in _PROTOTYPE_GRID_ORDER:
+            btn = pool.get(key)
+            if btn is None or id(btn) in seen:
+                continue
+            seen.add(id(btn))
+            ordered.append(btn)
+        for btn in pool.values():
+            if id(btn) not in seen:
+                seen.add(id(btn))
+                ordered.append(btn)
+        menu_btn = self._chord_buttons.get("toggle_menu_f9")
+        if menu_btn is not None:
+            menu_btn.setVisible(False)
         for index, button in enumerate(ordered):
             button.setVisible(True)
             self._action_grid.addWidget(button, index // 7, index % 7)
@@ -1716,7 +1914,10 @@ class _HomePage(QWidget):
             widget = item.widget()
             if widget is None:
                 continue
-            if widget.property("homeChord") or widget in self._shortcut_buttons.values():
+            # F-0622: only the real chord/shortcut buttons survive a rebuild.
+            # The old manual_record action button also carries a "homeChord"
+            # property, so it must not be kept as a parented ghost.
+            if widget in self._chord_buttons.values() or widget in self._shortcut_buttons.values():
                 widget.setParent(self)
                 continue
             widget.setParent(None)
@@ -1735,7 +1936,7 @@ class _HomePage(QWidget):
                 button.setProperty("homeActionVariant", "danger")
             button.setToolTip(long_label)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setFixedHeight(32)
+            button.setFixedHeight(36)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             button.clicked.connect(lambda _checked=False, aid=action_id: self._on_action(aid))
             created.append(button)
@@ -1757,10 +1958,12 @@ class _HomePage(QWidget):
         reg = str(snapshot.get("region") or "").strip()
         rte = str(snapshot.get("route") or "").strip()
         act = str(snapshot.get("active") or "0").strip()
+        route_no = str(snapshot.get("route_no") or "").strip()
 
         if reg and rte:
+            route_part = f" — Rota #{route_no}" if route_no else ""
             self.route_summary_label.setText(
-                f'<b style="color:#eef1f5;">{reg}</b> · {rte} · {act} node'
+                f'<b style="color:#eef1f5;">{reg}</b> · {rte}{route_part} · {act} node'
             )
             if hasattr(self, "minimap_meta_label"):
                 self.minimap_meta_label.setText(f"{reg} · {rte}")
@@ -1806,7 +2009,35 @@ class _HomePage(QWidget):
             label.setVisible(False)
             return
         label.setText(text)
-        label.setVisible(False)
+        label.setVisible(True)  # F-0714: a present value must be shown
+
+
+class _LazyPagePlaceholder(QWidget):
+    """Lightweight stand-in for a shell page that has not been built yet.
+
+    Startup mounts one of these per lazy page instead of running the real
+    factory (CalibrationWizard alone costs ~2.3 s, YOLOFactoryDialog ~1.15 s
+    on this VM). The placeholder owns no signals, no timers and no heavy
+    imports; it is only a stack slot that keeps the page's index stable
+    until _ensure_page swaps the real widget in at the same index.
+
+    Placeholders are deliberately NOT registered in GatherionShell.pages:
+    get_page_if_created()/page() must report "no real page yet" (None) for
+    them, and main.py's boot-time iteration over shell.pages must never see
+    them (it would otherwise store a bare QWidget as e.g. map_viewer_win).
+    They live only in the QStackedWidget plus _page_index/_index_key and
+    the shell's _lazy_placeholders dict.
+    """
+
+    def __init__(self, nav_key: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._lazy_nav_key = str(nav_key)
+        self.setObjectName("ShellLazyPlaceholder")
+
+
+def _is_lazy_placeholder(widget: Any) -> bool:
+    """True only for a _LazyPagePlaceholder stand-in, never for a real page."""
+    return isinstance(widget, _LazyPagePlaceholder)
 
 
 class GatherionShell(QMainWindow):
@@ -1848,15 +2079,27 @@ class GatherionShell(QMainWindow):
         tunnel_mgr: Any = None,
         factory: Any = None,
         log_path: str = "",
-        window_title: str = "Gatherion-Local v2.0 (Türkçe)",
+        window_title: str = f"Gatherion-Local v{__version__} (Türkçe)",
         worker: Any = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._closing = False
+        # W5: close() on a shell that was never shown must not
+        # persist session state. A never-shown shell has no user session;
+        # persisting its programmatically driven region/route (e.g. a test
+        # shell whose sync tests left Verteron/IronLoop active) writes
+        # test state into the repo's config/settings.json and pollutes
+        # every later SettingsWindow in the same run.
+        self._ever_shown = False
         self.settings_mgr = settings_mgr
         self.route_mgr = route_mgr
         self._telemetry = telemetry
+        # P1-6 (K-06): "en iyi toplama" rekoru — anlık hız değil,
+        # uygulama ömrü boyunca görülen en yüksek saatlik hız.
+        # Oturumun ilk 60 saniyesindeki gürültülü hız (1 toplama /
+        # 10 sn = 360/sa) rekor sayılmaz.
+        self._best_gathers_per_hour: float = 0.0
         self._worker = worker
         self._explorer = explorer
         self._auto_cartographer = (
@@ -1866,7 +2109,16 @@ class GatherionShell(QMainWindow):
             or explorer
         )
         self.f9_menu = f9_menu
+        self._mobile_server = mobile_server
+        self._tunnel_mgr = tunnel_mgr
         self._chord_handlers: Dict[str, Callable[[], None]] = {}
+        self._factories: Dict[str, Callable[[], QWidget]] = {}
+        # Lazy pages: factory + placeholder slot per nav key. The factory is
+        # only invoked by _ensure_page on first open; see _mount_lazy.
+        self._lazy_factories: Dict[str, Callable[[], QWidget]] = {}
+        self._lazy_placeholders: Dict[str, QWidget] = {}
+        self._bound_workers: List[Any] = []
+        self._bound_cartographers: List[Any] = []
         self.pages: Dict[str, QWidget] = {}
         self._page_index: Dict[str, int] = {}
         self._index_key: Dict[int, str] = {}
@@ -1942,7 +2194,7 @@ class GatherionShell(QMainWindow):
         log_card = self._build_log_card(right_column)
         log_wrap = QWidget(right_column)
         log_wrap_lay = QVBoxLayout(log_wrap)
-        log_wrap_lay.setContentsMargins(18, 0, 18, 12)
+        log_wrap_lay.setContentsMargins(18, 0, 18, 14)
         log_wrap_lay.setSpacing(0)
         log_wrap_lay.addWidget(log_card)
         right_lay.addWidget(log_wrap)
@@ -1984,16 +2236,16 @@ class GatherionShell(QMainWindow):
     def _build_topbar(self) -> QFrame:
         bar = QFrame(self)
         bar.setObjectName("ShellTopBar")
-        bar.setFixedHeight(34)
+        bar.setFixedHeight(38)
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(16, 0, 16, 0)
-        lay.setSpacing(10)
+        lay.setSpacing(12)
 
         brand = QLabel("GATHERION", bar)
         brand.setObjectName("TopBrand")
         lay.addWidget(brand)
 
-        self.top_page_meta = QLabel("Anasayfa · Gatherion-Local v2.0", bar)
+        self.top_page_meta = QLabel(f"Anasayfa · Gatherion-Local v{__version__}", bar)
         self.top_page_meta.setObjectName("TopPageMeta")
         lay.addWidget(self.top_page_meta)
 
@@ -2001,14 +2253,14 @@ class GatherionShell(QMainWindow):
 
         lbl_region = QLabel("Bölge:", bar)
         lbl_region.setObjectName("ShellTopRegionLabel")
-        lbl_region.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
+        lbl_region.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 600;")
         lay.addWidget(lbl_region)
 
         from ui.shell_theme import apply_combobox_dark_style
 
         self.region_combo = QComboBox(bar)
         self.region_combo.setObjectName("ShellRegionCombo")
-        self.region_combo.setMinimumWidth(110)
+        self.region_combo.setMinimumWidth(130)
         apply_combobox_dark_style(self.region_combo)
         self.combo_region = self.region_combo
         self.region_combo.currentIndexChanged.connect(self._on_region_combo_changed)
@@ -2016,12 +2268,12 @@ class GatherionShell(QMainWindow):
 
         lbl_route = QLabel("Rota:", bar)
         lbl_route.setObjectName("ShellTopRouteLabel")
-        lbl_route.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
+        lbl_route.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 600;")
         lay.addWidget(lbl_route)
 
         self.route_combo = QComboBox(bar)
         self.route_combo.setObjectName("ShellRouteCombo")
-        self.route_combo.setMinimumWidth(100)
+        self.route_combo.setMinimumWidth(120)
         apply_combobox_dark_style(self.route_combo)
         self.combo_route = self.route_combo
         self.route_combo.currentIndexChanged.connect(self._on_route_combo_changed)
@@ -2035,7 +2287,7 @@ class GatherionShell(QMainWindow):
         self.top_perf_label = QLabel(bar)
         self.top_perf_label.setTextFormat(Qt.TextFormat.RichText)
         self.top_perf_label.setStyleSheet(
-            'font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; color: #9aa3af;'
+            'font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; color: #9aa3af;'
         )
         self._update_topbar_perf(running=False)
         lay.addWidget(self.top_perf_label)
@@ -2076,10 +2328,10 @@ class GatherionShell(QMainWindow):
     def _build_rail(self) -> QFrame:
         rail = QFrame(self)
         rail.setObjectName("ShellNavRail")
-        rail.setFixedWidth(150)
+        rail.setFixedWidth(164)
         layout = QVBoxLayout(rail)
         layout.setContentsMargins(10, 12, 10, 12)
-        layout.setSpacing(2)
+        layout.setSpacing(4)
 
         brand = QLabel("GATHERION", rail)
         brand.setObjectName("RailBrand")
@@ -2097,6 +2349,7 @@ class GatherionShell(QMainWindow):
             button.setCheckable(True)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.setMinimumHeight(34)
             button.clicked.connect(lambda _checked=False, page=key: self.open_tool(page))
             self._nav_group.addButton(button)
             self._nav_buttons[key] = button
@@ -2108,19 +2361,20 @@ class GatherionShell(QMainWindow):
         foot.setStyleSheet("QFrame { border-top: 1px solid #1e2530; background: transparent; }")
         foot_lay = QHBoxLayout(foot)
         foot_lay.setContentsMargins(0, 10, 0, 0)
-        foot_lay.setSpacing(6)
+        foot_lay.setSpacing(8)
 
         settings_btn = QPushButton("Ayarlar", foot)
         settings_btn.setObjectName("Rail_settings")
         settings_btn.setProperty("shellNav", True)
         settings_btn.setCheckable(True)
         settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings_btn.setMinimumHeight(34)
         settings_btn.clicked.connect(lambda _checked=False: self.open_tool("settings"))
         self._nav_group.addButton(settings_btn)
         self._nav_buttons["settings"] = settings_btn
         foot_lay.addWidget(settings_btn, stretch=1)
 
-        ver_lbl = QLabel("v1.6.15", foot)
+        ver_lbl = QLabel(f"v{__version__}", foot)  # F-0715: pencere başlığı/topbar sürümü gösterir (P3-1: tek kaynak)
         ver_lbl.setObjectName("RailVersion")
         foot_lay.addWidget(ver_lbl)
         layout.addWidget(foot)
@@ -2135,10 +2389,10 @@ class GatherionShell(QMainWindow):
 
         head = QFrame(card)
         head.setObjectName("ShellLogHead")
-        head.setFixedHeight(28)
+        head.setFixedHeight(32)
         head_lay = QHBoxLayout(head)
         head_lay.setContentsMargins(12, 0, 12, 0)
-        head_lay.setSpacing(6)
+        head_lay.setSpacing(8)
 
         title = QLabel("CANLI GÜNLÜK", head)
         title.setObjectName("ShellLogTitle")
@@ -2157,6 +2411,7 @@ class GatherionShell(QMainWindow):
             pill.setCheckable(True)
             pill.setChecked(checked)
             pill.setCursor(Qt.CursorShape.PointingHandCursor)
+            pill.setMinimumHeight(24)
             pill.clicked.connect(lambda _c=False, m=mode_id: self._log_source.set_filter_mode(m))
             self._log_filter_group.addButton(pill)
             head_lay.addWidget(pill)
@@ -2164,6 +2419,7 @@ class GatherionShell(QMainWindow):
         clear_btn = QPushButton("Temizle", head)
         clear_btn.setObjectName("ShellLogClearBtn")
         clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setMinimumHeight(28)
         clear_btn.clicked.connect(self._log_source.clear_views)
         head_lay.addWidget(clear_btn)
         card_lay.addWidget(head)
@@ -2171,7 +2427,7 @@ class GatherionShell(QMainWindow):
         self.log_view = QPlainTextEdit(card)
         self.log_view.setObjectName("ShellLogDock")
         self.log_view.setReadOnly(True)
-        self.log_view.setFixedHeight(68)
+        self.log_view.setFixedHeight(80)
         self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.log_view.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         log_font = QFont("Consolas")
@@ -2209,9 +2465,17 @@ class GatherionShell(QMainWindow):
         return widget
 
     def get_page_if_created(self, key: str) -> Optional[QWidget]:
-        """Returns the page widget if already instantiated and mounted, else None."""
+        """Returns the page widget if already instantiated and mounted, else None.
+
+        A lazy placeholder counts as "not created": callers (map/radar sync,
+        _on_* handlers) already tolerate None, so they must never receive
+        the bare placeholder widget.
+        """
         resolved = self.ALIASES.get(str(key), str(key))
-        return self.pages.get(resolved)
+        widget = self.pages.get(resolved)
+        if widget is not None and _is_lazy_placeholder(widget):
+            return None
+        return widget
 
 
     def set_tab_title(self, key: str, title: str) -> None:
@@ -2250,13 +2514,29 @@ class GatherionShell(QMainWindow):
             else:
                 self.toggle_f9()
             return
+        if key == "pause_only":
+            # "Duraklat" butonu: yalnızca çalışırken duraklatır. Duraklıyken
+            # basmak hiçbir şey yapmaz (sahte geri bildirim yok).
+            if self._worker_is_running():
+                pause_handler = self._chord_handlers.get("pause_resume_f10")
+                if callable(pause_handler):
+                    pause_handler()
+                else:
+                    logger.warning("F10 kısayolu kayıtlı değil: duraklat/devam işleyicisi yok")
+                self._publish_home()
+            return
         if key == "pause_resume_f10":
             if callable(handler):
                 handler()
+            else:
+                logger.warning("F10 kısayolu kayıtlı değil: duraklat/devam işleyicisi yok")
             self._publish_home()
             return
-        if key == "record_node_f8" and callable(handler):
-            handler()
+        if key == "record_node_f8":
+            if callable(handler):
+                handler()
+            else:
+                logger.warning("F8 kısayolu kayıtlı değil: nokta kayıt işleyicisi yok")
 
     def _worker_is_running(self) -> bool:
         worker = self._worker
@@ -2273,7 +2553,7 @@ class GatherionShell(QMainWindow):
         label = QLabel(f"{title} açılamadı:\n{exc}")
         label.setWordWrap(True)
         label.setObjectName("ShellPageError")
-        label.setStyleSheet("color: #fca5a5; padding: 16px;")
+        label.setStyleSheet("color: #fca5a5; padding: 20px;")
         label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         return label
 
@@ -2285,6 +2565,78 @@ class GatherionShell(QMainWindow):
             widget = self._error_page(title, exc)
         return self._mount(key, widget)
 
+    def _mount_lazy(self, key: str, title: str, factory: Callable[[], QWidget]) -> QWidget:
+        """Mounts a lightweight placeholder; the real page is built on first open.
+
+        The factory is NOT called here — it is only stored in
+        _lazy_factories (and _factories, for the pre-existing _ensure_page
+        fallback) until _ensure_page runs it. The placeholder reserves the
+        page's stack index so rail order and _page_index stay stable, but
+        it is not registered in self.pages and page_created is NOT emitted
+        for it: no signal wiring (shell-side or main.py-side) may ever run
+        against a bare placeholder. ``title`` is kept for call-site
+        compatibility; it is only used if the factory later fails.
+        """
+        resolved = self.ALIASES.get(str(key), str(key))
+        self._lazy_factories[resolved] = factory
+        self.__dict__.setdefault("_factories", {})[resolved] = factory
+        placeholder = _LazyPagePlaceholder(resolved, parent=self.stack)
+        self._embed(placeholder)
+        index = self.stack.addWidget(placeholder)
+        self._page_index[resolved] = index
+        self._index_key[index] = resolved
+        self._lazy_placeholders[resolved] = placeholder
+        return placeholder
+
+    def _mount_replacing(
+        self,
+        key: str,
+        index: Optional[int],
+        title: str,
+        factory: Callable[[], QWidget],
+        placeholder: QWidget,
+    ) -> QWidget:
+        """Builds the real page and swaps it in where the placeholder sat.
+
+        Same _safe_mount failure behaviour (constructor error -> error page
+        instead of aborting the shell), but the widget is inserted at the
+        placeholder's original stack index so _page_index/_index_key and
+        rail order are preserved. page_created fires exactly once, for the
+        real widget — that is what wires map/radar/settings signals
+        (_on_page_created) and main.py's _on_shell_page_created.
+        """
+        try:
+            widget = factory()
+        except Exception as exc:
+            logger.error("Sayfa oluşturulamadı (%s): %s", key, exc, exc_info=True)
+            widget = self._error_page(title, exc)
+        self._embed(widget)
+        try:
+            self.stack.removeWidget(placeholder)
+        except Exception:
+            logger.debug("Lazy placeholder kaldırılamadı (%s)", key, exc_info=True)
+        try:
+            placeholder.deleteLater()
+        except Exception:
+            pass
+        if index is None:
+            index = self.stack.addWidget(widget)
+        else:
+            # removeWidget shifted later widgets down by one; inserting at
+            # the placeholder's old index restores the original order.
+            index = self.stack.insertWidget(int(index), widget)
+        self.pages[key] = widget
+        self._page_index[key] = index
+        self._index_key[index] = key
+        self._lazy_placeholders.pop(key, None)
+        self._lazy_factories.pop(key, None)
+        self.__dict__.get("_factories", {}).pop(key, None)
+        try:
+            self.page_created.emit(str(key), widget)
+        except Exception:
+            logger.debug("page_created emit hatası", exc_info=True)
+        return widget
+
     def _build_pages(
         self,
         settings_mgr: Any,
@@ -2295,25 +2647,48 @@ class GatherionShell(QMainWindow):
         tunnel_mgr: Any,
         factory: Any,
     ) -> None:
-        self._mount(
+        # F-0625: home is mounted under the same _safe_mount protection as
+        # the other pages; a constructor failure shows an error page instead
+        # of aborting the whole shell build.
+        # Startup-lazy: ONLY home stays eager — _publish_home (1 s timer)
+        # reads self.pages["home"] and bails out unless it is a real
+        # _HomePage, so a lazy home would leave the landing page blank.
+        # Every other page below stays _mount_lazy (placeholder until first open).
+        self._safe_mount(
             "home",
-            _HomePage(
+            "Anasayfa",
+            lambda: _HomePage(
                 on_open=self.open_tool,
                 on_action=self._run_f9_action,
                 on_chord=self._run_chord,
+                on_toggle=self._on_home_toggle,
             ),
         )
 
         from ui.settings_window import SettingsWindow
 
         def _settings() -> QWidget:
-            window = SettingsWindow(settings_mgr, route_mgr, parent=self.stack)
+            # S-4301: live server + shared token authenticator are wired
+            # in (server via this closure, auth via the shell's worker —
+            # main.py shares its authenticator with the worker at :541)
+            # so token rotation in the live SettingsWindow reaches the
+            # server instead of only the dead SettingsDialog class.
+            window = SettingsWindow(
+                settings_mgr,
+                route_mgr,
+                parent=self.stack,
+                mobile_server=mobile_server,
+                mobile_token_auth=getattr(
+                    getattr(self, "_worker", None), "mobile_token_auth", None
+                ),
+                telemetry=telemetry,
+            )
             window._shell = self  # type: ignore[attr-defined]
             window.tab_opener = self.open_tool  # type: ignore[attr-defined]
             window.setWindowTitle(self.windowTitle())
             return window
 
-        self._safe_mount("settings", "Ayarlar", _settings)
+        self._mount_lazy("settings", "Ayarlar", _settings)
 
         def _radar() -> QWidget:
             from ui.cartography_radar import CartographyRadarDialog
@@ -2324,7 +2699,7 @@ class GatherionShell(QMainWindow):
                 parent=self.stack,
             )
 
-        self._safe_mount("radar", "Radar", _radar)
+        self._mount_lazy("radar", "Radar", _radar)
 
         def _yolo() -> QWidget:
             from ui.yolo_pipeline_web import create_yolo_factory_page
@@ -2333,7 +2708,7 @@ class GatherionShell(QMainWindow):
                 factory_controller=factory, parent=self.stack
             )
 
-        self._safe_mount("yolo", "YOLO", _yolo)
+        self._mount_lazy("yolo", "YOLO", _yolo)
 
         def _mobile() -> QWidget:
             from ui.mobile_connect_dialog import MobileConnectDialog
@@ -2344,33 +2719,33 @@ class GatherionShell(QMainWindow):
                 parent=self.stack,
             )
 
-        self._safe_mount("mobile", "Mobil", _mobile)
+        self._mount_lazy("mobile", "Mobil", _mobile)
 
         def _stats() -> QWidget:
             from ui.analytics_dialog import AnalyticsDialog
 
             return AnalyticsDialog(telemetry=telemetry, parent=self.stack)
 
-        self._safe_mount("stats", "İstatistik", _stats)
+        self._mount_lazy("stats", "İstatistik", _stats)
 
         def _calibration() -> QWidget:
             from ui.calibration_wizard import CalibrationWizard
 
             return CalibrationWizard(parent=self.stack)
 
-        self._safe_mount("calibration", "Kalibrasyon", _calibration)
+        self._mount_lazy("calibration", "Kalibrasyon", _calibration)
 
         def _guide() -> QWidget:
             from ui.guide_dialog import GuideDialog
 
             return GuideDialog(parent=self.stack)
 
-        self._safe_mount("guide", "Kılavuz", _guide)
+        self._mount_lazy("guide", "Kılavuz", _guide)
 
         def _logs() -> QWidget:
             return _LogPage(self._log_source, parent=self.stack)
 
-        self._safe_mount("logs", "Log", _logs)
+        self._mount_lazy("logs", "Log", _logs)
         self._mount_f9(route_mgr)
 
         def _map() -> QWidget:
@@ -2378,7 +2753,7 @@ class GatherionShell(QMainWindow):
 
             return MapViewerWindow(route_manager=route_mgr, parent=self.stack)
 
-        self._safe_mount("map", "Harita", _map)
+        self._mount_lazy("map", "Harita", _map)
         self._sync_home_actions()
 
     def _f9_action_pairs(self) -> list:
@@ -2395,17 +2770,100 @@ class GatherionShell(QMainWindow):
             pairs.append((str(action_id), tip or label))
         return pairs
 
-    def _run_f9_action(self, action_id: str) -> None:
-        """Same slot the F9 row uses. Konum Ekle uses the F8 chord when that handler is set."""
-        if action_id == "manual_record":
+    def _run_f9_action(self, action_id: str, *, via_menu: bool = False) -> None:
+        """Same slot the F9 row uses. Konum Ekle uses the F8 chord when that handler is set.
+
+        via_menu=True skips the F8 shortcut: the F9 menu row itself runs, so
+        "manual_record" switches the worker to manual mode instead of
+        recording a node (used by the Oto-Kayıt pill when it is switched off).
+        """
+        if action_id == "manual_record" and not via_menu:
             handler = self._chord_handlers.get("record_node_f8")
             if callable(handler):
                 handler()
                 return
         menu = self.f9_menu
-        if menu is None or not hasattr(menu, "_on_row_clicked"):
+        if menu is None:
+            logger.warning("F9 eylemi çalıştırılamadı (%s): F9 menüsü kurulu değil", action_id)
+            return
+        if not hasattr(menu, "_on_row_clicked"):
+            logger.warning("F9 eylemi çalıştırılamadı (%s): menüde _on_row_clicked yok", action_id)
             return
         menu._on_row_clicked(str(action_id))
+
+    def _on_home_toggle(self, key: str, checked: bool) -> None:
+        """Anasayfa sistem kartındaki gerçek anahtarlar.
+
+        Oto-Kayıt: worker modunu değiştirir (açık = auto_record, kapalı =
+        manual_record; kapalı konum F8 ile nokta kaydetmez).
+        Savaşta Kaçın: settings.route.fight_back ayarını tersine çevirip
+        config/settings.json dosyasına yazar.
+        Mobil Panel: mobil uzaktan kontrol sunucusunu başlatır/durdurur.
+        Karşılığı yoksa (ayar yöneticisi / sunucu yok) hiçbir şey yapılmaz
+        ve sahte geri bildirim verilmez; durum 1 sn'lik yayında doğrulanır.
+        """
+        key = str(key or "").strip()
+        try:
+            if key == "auto_record":
+                if checked:
+                    self._run_f9_action("auto_record")
+                else:
+                    self._run_f9_action("manual_record", via_menu=True)
+            elif key == "avoid_combat":
+                mgr = getattr(self, "settings_mgr", None)
+                cfg = getattr(mgr, "settings", None) if mgr is not None else None
+                route_cfg = getattr(cfg, "route", None) if cfg is not None else None
+                if route_cfg is not None and hasattr(route_cfg, "fight_back"):
+                    route_cfg.fight_back = not bool(checked)
+                    try:
+                        mgr.save(cfg)
+                    except Exception:
+                        logger.debug("Savaşta Kaçın ayarı kaydedilemedi", exc_info=True)
+                else:
+                    logger.warning("Savaşta Kaçın değiştirilemedi: ayar yöneticisi yok")
+            elif key == "mobile_panel":
+                server = getattr(self, "_mobile_server", None)
+                if server is None:
+                    logger.warning("Mobil Panel değiştirilemedi: mobil sunucu yok")
+                elif checked:
+                    try:
+                        server.start()
+                    except Exception as exc:
+                        logger.error("Mobil sunucu başlatılamadı: %s", exc, exc_info=True)
+                else:
+                    try:
+                        server.stop()
+                    except Exception as exc:
+                        logger.error("Mobil sunucu durdurulamadı: %s", exc, exc_info=True)
+            else:
+                logger.warning("Bilinmeyen anasayfa anahtarı: %s", key)
+        finally:
+            try:
+                self._publish_home()
+            except Exception:
+                logger.debug("Anahtar sonrası anasayfa yayını atlandı", exc_info=True)
+
+    def _is_avoid_combat_active(self) -> bool:
+        """Savaşta Kaçın hapı: settings.route.fight_back kapalıyken açıktır."""
+        try:
+            mgr = getattr(self, "settings_mgr", None)
+            cfg = getattr(mgr, "settings", None) if mgr is not None else None
+            route_cfg = getattr(cfg, "route", None) if cfg is not None else None
+            if route_cfg is not None and hasattr(route_cfg, "fight_back"):
+                return not bool(route_cfg.fight_back)
+        except Exception:
+            logger.debug("Savaşta Kaçın durumu okunamadı", exc_info=True)
+        return False
+
+    def _is_mobile_panel_active(self) -> bool:
+        """Mobil Panel hapı: mobil sunucu çalışıyorken açıktır."""
+        try:
+            server = getattr(self, "_mobile_server", None)
+            if server is not None and hasattr(server, "is_running"):
+                return bool(server.is_running)
+        except Exception:
+            logger.debug("Mobil Panel durumu okunamadı", exc_info=True)
+        return False
 
     def _sync_home_actions(self) -> None:
         home = self.pages.get("home")
@@ -2415,9 +2873,17 @@ class GatherionShell(QMainWindow):
     def _mount_f9(self, route_mgr: Any) -> None:
         menu = self.f9_menu
         if menu is None:
-            from ui.f9_menu import F9Menu
+            # F-0625: an F9Menu construction failure must not abort the shell;
+            # the shell stays usable and F9 actions report the missing menu.
+            try:
+                from ui.f9_menu import F9Menu
 
-            menu = F9Menu(route_manager=route_mgr)
+                menu = F9Menu(route_manager=route_mgr)
+            except Exception as exc:
+                logger.error("F9 menüsü oluşturulamadı: %s", exc, exc_info=True)
+                self.f9_menu = None
+                self._f9_overlay.hide()
+                return
             self.f9_menu = menu
         self._embed(menu)
         if hasattr(menu, "attach_embedded"):
@@ -2431,7 +2897,11 @@ class GatherionShell(QMainWindow):
 
     def page(self, key: str) -> Optional[QWidget]:
         resolved = self.ALIASES.get(str(key), str(key))
-        return self.pages.get(resolved)
+        widget = self.pages.get(resolved)
+        if widget is not None and _is_lazy_placeholder(widget):
+            # Same rule as get_page_if_created: a placeholder is no page yet.
+            return None
+        return widget
 
     def current_key(self) -> str:
         return self._index_key.get(self.stack.currentIndex(), "home")
@@ -2498,6 +2968,11 @@ class GatherionShell(QMainWindow):
             return True
         if self.is_f9_open():
             self._close_f9()
+        # Lazy pages: build the real widget before resolving its stack index.
+        # _ensure_page is a no-op for already-built pages and returns None
+        # for unknown keys, so the "Bilinmeyen sayfa" warning below still
+        # only fires for keys with no factory at all.
+        self._ensure_page(resolved)
         index = self._page_index.get(resolved)
         if index is None:
             logger.warning("Bilinmeyen sayfa: %s", key)
@@ -2509,7 +2984,7 @@ class GatherionShell(QMainWindow):
             button.setChecked(True)
             button.blockSignals(False)
             if hasattr(self, "top_page_meta"):
-                self.top_page_meta.setText(f"{button.text()} · Gatherion-Local v2.0")
+                self.top_page_meta.setText(f"{button.text()} · Gatherion-Local v{__version__}")
         self._after_page(resolved)
         return True
 
@@ -2553,14 +3028,34 @@ class GatherionShell(QMainWindow):
         self._sync_region_route_to_page("map")
 
     def _ensure_page(self, key: str) -> Optional[QWidget]:
-        """Returns the page if already mounted, or lazily constructs it if a factory exists."""
+        """Returns the page if already mounted, or lazily constructs it if a factory exists.
+
+        A mounted lazy placeholder is replaced in place (same stack index)
+        by the real widget via _mount_replacing; page_created fires exactly
+        once, for the real widget. An already-built page is returned as-is
+        with no re-emit. Unknown keys (no factory) return None.
+        """
         resolved = self.ALIASES.get(str(key), str(key))
-        if resolved in self.pages:
-            return self.pages[resolved]
-        factory = getattr(self, f"_factory_{resolved}", None)
-        if callable(factory):
-            return self._safe_mount(resolved, resolved.title(), factory)
-        return None
+        existing = self.pages.get(resolved)
+        if existing is not None and not _is_lazy_placeholder(existing):
+            return existing
+        factory = (
+            self.__dict__.get("_lazy_factories", {}).get(resolved)
+            or self.__dict__.get("_factories", {}).get(resolved)
+            or getattr(self, f"_factory_{resolved}", None)
+        )
+        if not callable(factory):
+            return None
+        placeholder = self._lazy_placeholders.get(resolved)
+        if placeholder is None and existing is not None:
+            # Defensive: placeholder tracked in pages instead of its own dict.
+            placeholder = existing
+        if placeholder is not None:
+            index = self._page_index.get(resolved)
+            return self._mount_replacing(
+                resolved, index, resolved.title(), factory, placeholder
+            )
+        return self._safe_mount(resolved, resolved.title(), factory)
 
     # ------------------------------------------------------------------
     # Bölge / Rota Eşzamanlama (Region & Route Synchronization)
@@ -2711,7 +3206,9 @@ class GatherionShell(QMainWindow):
         canon = self._resolve_canonical_region(str(selected))
         self._syncing_combos = True
         try:
-            self._populate_route_combo(canon, active_route="All")
+            # F-0626: keep the current route when the new region still has
+            # it; _populate_route_combo falls back to "All" only if it does not.
+            self._populate_route_combo(canon, active_route=self.get_active_route())
         finally:
             self._syncing_combos = False
         self._propagate_region_selection(canon)
@@ -2722,6 +3219,29 @@ class GatherionShell(QMainWindow):
         selected = self.route_combo.itemData(index) or self.route_combo.itemText(index)
         self._propagate_route_selection(str(selected).strip())
 
+    @staticmethod
+    def _find_combo_index(combo: Any, target: str) -> int:
+        """Combo'da hedefi bul: önce tam eşleşme, sonra önek.
+
+        S054 (v19/P3-8): eski kod ilk önek eşleşmesini alıyordu —
+        öneki paylaşan iki öğe ("Altgard" / "Altgard Depths") varsa
+        listedeki ilk yanlış seçilebilirdi. Önek yalnızca TEK aday
+        varsa kabul edilir; birden çok adayda -1 döner (çağıran yeni
+        öğe ekler), tahmin yapılmaz.
+        """
+        target_l = str(target).lower()
+        prefix_hits: List[int] = []
+        for i in range(combo.count()):
+            val = combo.itemData(i) or combo.itemText(i)
+            text = str(combo.itemText(i)).lower()
+            if str(val).lower() == target_l or text == target_l:
+                return i
+            if text.startswith(target_l):
+                prefix_hits.append(i)
+        if len(prefix_hits) == 1:
+            return prefix_hits[0]
+        return -1
+
     def set_active_region(self, region_name: str, update_combo: bool = True) -> None:
         canon_reg = self._resolve_canonical_region(region_name)
         if update_combo and self.region_combo is not None:
@@ -2729,12 +3249,7 @@ class GatherionShell(QMainWindow):
             self._syncing_combos = True
             try:
                 self.region_combo.blockSignals(True)
-                idx = -1
-                for i in range(self.region_combo.count()):
-                    val = self.region_combo.itemData(i) or self.region_combo.itemText(i)
-                    if str(val).lower() == canon_reg.lower() or str(self.region_combo.itemText(i)).lower().startswith(canon_reg.lower()):
-                        idx = i
-                        break
+                idx = self._find_combo_index(self.region_combo, canon_reg)
                 if idx >= 0:
                     self.region_combo.setCurrentIndex(idx)
                 else:
@@ -2753,12 +3268,7 @@ class GatherionShell(QMainWindow):
             self._syncing_combos = True
             try:
                 self.route_combo.blockSignals(True)
-                idx = -1
-                for i in range(self.route_combo.count()):
-                    val = self.route_combo.itemData(i) or self.route_combo.itemText(i)
-                    if str(val).lower() == clean_route.lower() or str(self.route_combo.itemText(i)).lower().startswith(clean_route.lower()):
-                        idx = i
-                        break
+                idx = self._find_combo_index(self.route_combo, clean_route)
                 if idx >= 0:
                     self.route_combo.setCurrentIndex(idx)
                 else:
@@ -2818,7 +3328,12 @@ class GatherionShell(QMainWindow):
                         if str(val).lower() == canon_reg.lower() or str(combo.itemText(i)).lower().startswith(canon_reg.lower()):
                             idx = i
                             break
-                    if idx >= 0 and combo.currentIndex() != idx:
+                    if idx < 0:
+                        # F-0718: region missing from the settings combo is
+                        # added instead of silently skipping the sync.
+                        combo.addItem(canon_reg, canon_reg)
+                        idx = combo.count() - 1
+                    if combo.currentIndex() != idx:
                         combo.blockSignals(True)
                         combo.setCurrentIndex(idx)
                         combo.blockSignals(False)
@@ -2885,7 +3400,12 @@ class GatherionShell(QMainWindow):
                         if str(val).lower() == clean_route.lower() or str(combo.itemText(i)).lower().startswith(clean_route.lower()):
                             idx = i
                             break
-                    if idx >= 0 and combo.currentIndex() != idx:
+                    if idx < 0:
+                        # F-0718: route missing from the settings combo is
+                        # added instead of silently skipping the sync.
+                        combo.addItem(clean_route, clean_route)
+                        idx = combo.count() - 1
+                    if combo.currentIndex() != idx:
                         combo.blockSignals(True)
                         combo.setCurrentIndex(idx)
                         combo.blockSignals(False)
@@ -2973,6 +3493,16 @@ class GatherionShell(QMainWindow):
     def _bind_worker_signals(self, worker: Any) -> None:
         if worker is None:
             return
+        # F-0628: binding the same worker twice doubles every live signal.
+        # S053 (v19/P3-8): eski koruma `id()` kümesiydi — GC edilen
+        # worker'ın id'si yeni worker'a yeniden verilebiliyor, yeni
+        # worker'ın sinyalleri sessizce bağlanmıyordu. Kimlik listesi
+        # (güçlü referans) tutulur: bağlı nesne yaşarken id'si yeniden
+        # kullanılamaz, kontrol `is` ile kesindir.
+        bound = self.__dict__.setdefault("_bound_workers", [])
+        if any(w is worker for w in bound):
+            return
+        bound.append(worker)
         if hasattr(worker, "node_recorded"):
             try:
                 worker.node_recorded.connect(self._on_worker_node_recorded)
@@ -2997,18 +3527,51 @@ class GatherionShell(QMainWindow):
     def _bind_cartographer_signals(self, cartographer: Any) -> None:
         if cartographer is None:
             return
-        if hasattr(cartographer, "node_discovered"):
+        # F-0628: binding the same cartographer twice doubles every signal.
+        # S053 (v19/P3-8): `id()` kümesi yerine kimlik listesi — gerekçe
+        # _bind_worker_signals'dakiyle aynı (id yeniden kullanımı).
+        bound = self.__dict__.setdefault("_bound_cartographers", [])
+        if any(c is cartographer for c in bound):
+            return
+        bound.append(cartographer)
+        # F-0549: the real AutoCartographer exposes no Qt signals — it has a
+        # callback API (add_node_discovered_callback / add_radar_event_callback).
+        # Support both: Qt-signal cartographers (radar dialog) and callback ones.
+        node_sig = getattr(cartographer, "node_discovered", None)
+        if node_sig is not None and hasattr(node_sig, "connect"):
             try:
-                cartographer.node_discovered.connect(self._on_radar_node_discovered)
+                node_sig.connect(self._on_radar_node_discovered)
             except Exception:
                 pass
-        if hasattr(cartographer, "route_updated"):
+        elif hasattr(cartographer, "add_node_discovered_callback"):
             try:
-                cartographer.route_updated.connect(
+                cartographer.add_node_discovered_callback(self._on_radar_node_discovered)
+            except Exception:
+                pass
+        route_sig = getattr(cartographer, "route_updated", None)
+        if route_sig is not None and hasattr(route_sig, "connect"):
+            try:
+                route_sig.connect(
                     lambda: self._on_radar_sequence_updated(
                         self.get_active_region(), self.get_active_route()
                     )
                 )
+            except Exception:
+                pass
+        elif hasattr(cartographer, "add_radar_event_callback"):
+            def _on_radar_event(event: str, _payload: Any) -> None:
+                # H-sweep (dilim 13 Y6): cartographer 'route_updated'
+                # HİÇ göndermez — yalnızca 'node_discovered' /
+                # 'node_updated' gönderir (auto_cartographer.py
+                # _emit_radar_event). Eski filtre hiçbir zaman
+                # tutmazdı; radar sıra yenilemesi ölüydü.
+                if str(event) in ("node_discovered", "node_updated"):
+                    self._on_radar_sequence_updated(
+                        self.get_active_region(), self.get_active_route()
+                    )
+
+            try:
+                cartographer.add_radar_event_callback(_on_radar_event)
             except Exception:
                 pass
 
@@ -3035,6 +3598,16 @@ class GatherionShell(QMainWindow):
         if self._auto_cartographer is not None and hasattr(widget, "set_auto_cartographer"):
             try:
                 widget.set_auto_cartographer(self._auto_cartographer)
+            except Exception:
+                pass
+        # v20/map-nodes: harita penceresi keşif anında yenilensin diye
+        # ExplorerMode'a dinleyici olarak kaydedilir — yoksa yeni düğüm
+        # yalnızca 1 sn'lik poll sayacı değişirse (veya sekme değişirse)
+        # görünür; register_map_viewer üretimde hiç çağrılmıyordu.
+        _explorer = getattr(self, "_explorer", None)
+        if _explorer is not None and hasattr(_explorer, "register_map_viewer"):
+            try:
+                _explorer.register_map_viewer(widget)
             except Exception:
                 pass
         self._sync_region_route_to_page("map")
@@ -3234,37 +3807,54 @@ class GatherionShell(QMainWindow):
                     map_win.set_player_position(float(px), float(py))
                 except Exception:
                     pass
-        overlay = getattr(self, "overlay", None)
+        # F-0719: overlays wired via set_overlay(), or carried by the worker.
+        overlay = getattr(self, "overlay", None) or getattr(getattr(self, "_worker", None), "overlay", None)
         if overlay is not None and hasattr(overlay, "update_state"):
             try:
                 overlay.update_state(hud_data)
             except Exception:
                 pass
-        overlay_hud = getattr(self, "overlay_hud", None)
+        overlay_hud = getattr(self, "overlay_hud", None) or getattr(
+            getattr(self, "_worker", None), "overlay_hud", None
+        )
         if overlay_hud is not None and hasattr(overlay_hud, "update_state"):
             try:
                 overlay_hud.update_state(hud_data)
             except Exception:
                 pass
 
-    def _on_worker_state_changed(self, old_state: str, new_state: str) -> None:
+    def _on_worker_state_changed(self, _old_state: str, new_state: str) -> None:
         self._publish_home()
 
     def _on_worker_status_updated(self, status: str) -> None:
         self._publish_home()
 
     def _publish_home(self) -> None:
+        # F-0550: each section is guarded on its own — one bad value used to
+        # kill the whole 1-second home refresh silently.
         running = self._worker_is_running()
-        self._update_topbar_perf(running=running)
+        try:
+            self._update_topbar_perf(running=running)
+        except Exception:
+            logger.debug("Topbar performans güncellenemedi", exc_info=True)
         home = self.pages.get("home")
         if not isinstance(home, _HomePage):
             return
+
+        # 0. Actions + running state + snapshot
         try:
             home.sync_actions(self._f9_action_pairs())
             home.set_running(running)
             home.apply_snapshot(self._home_snapshot())
+        except Exception:
+            logger.debug("Anasayfa eylem/özet güncellenemedi", exc_info=True)
 
-            # 1. Update live system card metrics
+        sess_duration_sec = 0.0
+        avg_match_conf = 0.0
+        m: Dict[str, Any] = {}
+
+        # 1. Update live system card metrics
+        try:
             from core.system_monitor import SystemMonitor
             cap = getattr(self, "capture", None)
             if cap is None and self._worker is not None:
@@ -3282,9 +3872,6 @@ class GatherionShell(QMainWindow):
 
             watchdog_txt = "Normal" if running else "Beklemede"
             rate_txt = "~0/sa"
-            sess_duration_sec = 0.0
-            avg_match_conf = 0.0
-            m: Dict[str, Any] = {}
             if self._telemetry is not None and hasattr(self._telemetry, "get_live_metrics"):
                 try:
                     m = self._telemetry.get_live_metrics()
@@ -3292,6 +3879,12 @@ class GatherionShell(QMainWindow):
                     rate_txt = f"~{gph:.0f}/sa" if gph > 0 else "~0/sa"
                     sess_duration_sec = float(m.get("session_duration_sec", 0.0))
                     avg_match_conf = float(m.get("avg_match_pct", 0.0))
+                    # P1-6 (K-06): best_rate anlık hız değil rekor tutar.
+                    if sess_duration_sec >= 60.0 and gph > 0:
+                        self._best_gathers_per_hour = max(
+                            float(getattr(self, "_best_gathers_per_hour", 0.0) or 0.0),
+                            gph,
+                        )
                 except Exception:
                     pass
 
@@ -3304,8 +3897,11 @@ class GatherionShell(QMainWindow):
                 "rate": rate_txt,
             }
             home.update_system_metrics(sys_snap, meta_dict)
+        except Exception:
+            logger.debug("Anasayfa sistem metrikleri güncellenemedi", exc_info=True)
 
-            # 2. Update route steps & minimap canvas
+        # 2. Update route steps & minimap canvas
+        try:
             active_reg = self.get_active_region() or ""
             active_rte = self.get_active_route() or ""
             nodes: List[Any] = []
@@ -3323,33 +3919,66 @@ class GatherionShell(QMainWindow):
                 curr_node_idx = int(getattr(self._worker, "current_node_index", 0) or 0)
 
             home.update_route_steps(active_reg, active_rte, nodes, active_idx=curr_node_idx)
+        except Exception:
+            logger.debug("Anasayfa rota adımları güncellenemedi", exc_info=True)
 
-            # 3. Update detection log card
+        # 3. Update detection log card
+        try:
             detections: List[Dict[str, Any]] = []
             if self._worker is not None and hasattr(self._worker, "last_detections"):
                 detections = getattr(self._worker, "last_detections", []) or []
 
             foot_stats = {
                 "sessions": 1 if running or sess_duration_sec > 0 else 0,
-                "best_rate": int(float(m.get("gathers_per_hour", 0.0))) if m else 0,
+                # P1-6 (K-06): rekor (max), anlık hız değil.
+                "best_rate": int(float(getattr(self, "_best_gathers_per_hour", 0.0) or 0.0)),
                 "avg_confidence": avg_match_conf,
             }
             home.update_detections(detections, foot_stats)
-
-            # 4. Sync toggle pills
-            if hasattr(home, "tog_auto_rec"):
-                auto_rec = False
-                if hasattr(self, "_settings") and hasattr(self._settings, "route"):
-                    auto_rec = bool(getattr(self._settings.route, "auto_record", False))
-                home.tog_auto_rec.setChecked(auto_rec)
         except Exception:
-            logger.debug("Anasayfa durumu okunamadı", exc_info=True)
+            logger.debug("Anasayfa tespit kartı güncellenemedi", exc_info=True)
+
+        # 4. Sync toggle pills
+        try:
+            if hasattr(home, "tog_auto_rec"):
+                home.tog_auto_rec.setChecked(self._is_auto_record_active())
+            if hasattr(home, "tog_avoid_combat"):
+                home.tog_avoid_combat.setChecked(self._is_avoid_combat_active())
+            if hasattr(home, "tog_mobile_panel"):
+                home.tog_mobile_panel.setChecked(self._is_mobile_panel_active())
+        except Exception:
+            logger.debug("Anasayfa hapları güncellenemedi", exc_info=True)
+
+    def _is_auto_record_active(self) -> bool:
+        """F-0551: the Oto-Kayıt pill reflects the live bot mode, not a
+        self._settings attribute that never exists on the shell (the old code
+        read it every second and therefore forced the pill off forever)."""
+        try:
+            worker = getattr(self, "_worker", None)
+            mode = None
+            if worker is not None:
+                mode = getattr(worker, "mode", None) or getattr(worker, "active_mode", None)
+            if mode is not None:
+                return str(mode).strip().lower() == "auto_record"
+        except Exception:
+            logger.debug("Çalışan modu okunamadı", exc_info=True)
+        menu = getattr(self, "f9_menu", None)
+        menu_mode = getattr(menu, "_active_mode", None) if menu is not None else None
+        if menu_mode is not None:
+            return str(menu_mode).strip().lower() == "auto_record"
+        settings_mgr = getattr(self, "settings_mgr", None)
+        cfg = getattr(settings_mgr, "settings", None) if settings_mgr is not None else None
+        route_cfg = getattr(cfg, "route", None) if cfg is not None else None
+        if route_cfg is not None:
+            return bool(getattr(route_cfg, "auto_record", False))
+        return False
 
     def _home_snapshot(self) -> Dict[str, Optional[str]]:
         snapshot: Dict[str, Optional[str]] = {
             "state": None,
             "region": None,
             "route": None,
+            "route_no": None,
             "gathered": None,
             "active": None,
             "failures": None,
@@ -3371,6 +4000,14 @@ class GatherionShell(QMainWindow):
             snapshot["region"] = active_reg
         if active_rte:
             snapshot["route"] = active_rte
+        if active_reg and active_rte and self.route_mgr is not None:
+            # Prototip "Rota #3": aktif rotanın bölgedeki sıra numarası.
+            try:
+                routes = self.route_mgr.get_routes(active_reg)
+                if isinstance(routes, list) and active_rte in routes:
+                    snapshot["route_no"] = str(routes.index(active_rte) + 1)
+            except Exception:
+                logger.debug("Rota sıra numarası okunamadı", exc_info=True)
 
         route_mgr = self.route_mgr
         if route_mgr is not None:
@@ -3393,15 +4030,32 @@ class GatherionShell(QMainWindow):
             try:
                 metrics = telemetry.get_live_metrics()
                 if isinstance(metrics, dict):
-                    if "failed_total" in metrics:
-                        snapshot["failures"] = str(int(metrics["failed_total"]))
+                    # P1-6 / P2-7 (K-06): "failures" tek anlam taşır — son 1
+                    # saatteki hata sayısı (rozet alt yazısı "son 1
+                    # saatte" ile aynı). Eskiden telemetri varsa oturum
+                    # toplamı, yoksa ardışık hata serisi
+                    # (`failed_in_row`) yazılıyordu; iki farklı nicelik
+                    # aynı anahtardaydı. Telemetri yoksa değer bilinmez
+                    # (None) kalır, uydurma sayı yazılmaz.
+                    if hasattr(telemetry, "count_recent_failures"):
+                        snapshot["failures"] = str(int(telemetry.count_recent_failures(3600.0)))
+                    elif hasattr(telemetry, "failure_events"):
+                        try:
+                            import time as _time
+
+                            cutoff = _time.time() - 3600.0
+                            snapshot["failures"] = str(
+                                sum(
+                                    1
+                                    for ev in list(telemetry.failure_events or [])
+                                    if isinstance(ev, dict)
+                                    and float(ev.get("timestamp", 0.0) or 0.0) >= cutoff
+                                )
+                            )
+                        except Exception:
+                            logger.debug("Son 1 saat hata sayısı okunamadı", exc_info=True)
                     if "session_duration_sec" in metrics:
                         snapshot["session_duration_sec"] = str(float(metrics["session_duration_sec"]))
-            except Exception:
-                logger.debug("Hata sayısı okunamadı", exc_info=True)
-        elif worker is not None and hasattr(worker, "failed_in_row"):
-            try:
-                snapshot["failures"] = str(int(worker.failed_in_row))
             except Exception:
                 logger.debug("Hata sayısı okunamadı", exc_info=True)
 
@@ -3414,6 +4068,14 @@ class GatherionShell(QMainWindow):
         return snapshot
 
     def persist_settings(self) -> None:
+        # Never-shown shell: no user session existed, so there is no
+        # session state to persist. Skipping here keeps programmatic /
+        # test-driven region/route state (e.g. Verteron/IronLoop left by
+        # sync tests) out of the repo's config/settings.json. A shell the
+        # user actually saw (showEvent ran) persists exactly as before.
+        if not getattr(self, "_ever_shown", False):
+            logger.debug("Ayarlar kaydedilmedi: shell hiç gösterilmedi")
+            return
         page = self.pages.get("settings")
         if page is None or not hasattr(page, "save_settings"):
             return
@@ -3424,6 +4086,7 @@ class GatherionShell(QMainWindow):
 
     def showEvent(self, event: Any) -> None:  # noqa: N802
         self._closing = False
+        self._ever_shown = True
         super().showEvent(event)
         QTimer.singleShot(0, self._stick_log)
 
@@ -3434,17 +4097,27 @@ class GatherionShell(QMainWindow):
         bar = view.verticalScrollBar()
         bar.setValue(bar.maximum())
 
+    def set_overlay(self, overlay: Any = None, overlay_hud: Any = None) -> None:
+        """Wires the in-game overlay HUD so worker HUD updates reach it.
+
+        F-0719: _on_worker_hud_update read self.overlay / self.overlay_hud,
+        but nothing ever set those attributes, so the branches were dead.
+        """
+        if overlay is not None:
+            self.overlay = overlay
+        if overlay_hud is not None:
+            self.overlay_hud = overlay_hud
+
     def set_shutdown(self, handler: Callable[[], None]) -> None:
         """Shell Kapat and the window close end the process. They do not only hide it."""
         self._shutdown = handler
         self._rewire_shell_kapat()
 
     def _rewire_shell_kapat(self) -> None:
+        # F-0629: the Settings page's own Kapat button is NOT a shell-quit
+        # button — it closes the settings page. Rewiring it to quit the app
+        # (and disconnecting its own handler) was wrong, so it is left alone.
         targets: list = []
-        settings = self.pages.get("settings")
-        settings_close = getattr(settings, "btn_close", None)
-        if settings_close is not None:
-            targets.append(settings_close)
         home = self.pages.get("home")
         if home is not None:
             for button in home.findChildren(QPushButton):
@@ -3462,7 +4135,9 @@ class GatherionShell(QMainWindow):
                 continue
             seen.add(id(button))
             try:
-                button.clicked.disconnect()
+                # Only cut a previous _on_kapat connection (repeat calls must
+                # not duplicate it); leave every other slot on the button alone.
+                button.clicked.disconnect(self._on_kapat)
             except Exception:
                 logger.debug("Kapat bağlantısı zaten boş", exc_info=True)
             button.clicked.connect(self._on_kapat)
@@ -3473,11 +4148,20 @@ class GatherionShell(QMainWindow):
             return
         handler = getattr(self, "_shutdown", None)
         if not callable(handler):
+            self.persist_settings()
             self.close()
             return
         self._shutdown_started = True
         self._closing = True
-        handler()
+        try:
+            self.persist_settings()
+            handler()
+        except Exception as exc:
+            # F-0720: a failed handler must not leave the button permanently
+            # dead — clear the flag so a second click can retry the shutdown.
+            self._shutdown_started = False
+            self._closing = False
+            logger.error("Kapatma işleyicisi başarısız oldu: %s", exc, exc_info=True)
 
     def switch_to_tab(self, tab_key: str) -> bool:
         """Programmatically switches to one of the 10 shell tabs and returns True on success."""
@@ -3486,14 +4170,18 @@ class GatherionShell(QMainWindow):
         pages = self.__dict__.get("pages") or {}
         if key not in pages and key not in valid_keys:
             return False
+        if pages.get(key) is None:
+            # F-0721: a known-but-unmounted tab was not switched to.
+            return False
+        if "stack" in self.__dict__:
+            # F-0721: report the real outcome of the switch, not a blind True.
+            try:
+                if not self._select(key):
+                    return False
+            except Exception as exc:
+                logger.debug("Sekme değiştirilemedi (%s): %s", key, exc)
+                return False
         self._active_tab_key = key
-        try:
-            if "stack" in self.__dict__ and hasattr(self, "_select_tab"):
-                self._select_tab(key)
-            elif "stack" in self.__dict__ and hasattr(self, "open_tool"):
-                self.open_tool(key)
-        except Exception:
-            pass
         return True
 
     def get_all_tabs_health_snapshot(self) -> Dict[str, Any]:
@@ -3503,32 +4191,66 @@ class GatherionShell(QMainWindow):
         tabs_status: Dict[str, Dict[str, Any]] = {}
         for k in tab_keys:
             w = pages.get(k)
+            # F-0552: a mounted error page (or a missing page) is not ready.
+            obj_name = None
+            try:
+                obj_name = w.objectName() if w is not None and hasattr(w, "objectName") else None
+            except Exception:
+                obj_name = None
+            ready = w is not None and obj_name != "ShellPageError"
             tabs_status[k] = {
                 "tab_key": k,
                 "mounted": w is not None,
-                "ready": True,
+                "ready": ready,
                 "class_name": type(w).__name__ if w is not None else "Unmounted",
             }
+        active = getattr(self, "_active_tab_key", "home")
+        try:
+            active = self.current_key()
+        except Exception:
+            pass
         return {
             "total_tabs": len(tab_keys),
-            "all_ready": True,
+            "all_ready": all(t["ready"] for t in tabs_status.values()),
             "tabs": tabs_status,
-            "active_tab": getattr(self, "_active_tab_key", "home"),
+            "active_tab": active,
         }
 
     def closeEvent(self, event: Any) -> None:  # noqa: N802
-        self._closing = True
-        event.accept()
+        # S055 (v19/P3-8): eskiden event.accept() en baştaydı — kapatma
+        # işleyicisi başarısız olsa da pencere kapanıyor, _on_kapat'ın
+        # F-0720 yeniden-deneme kuralı (bayrak temizlenir, ikinci tıklama
+        # dener) bu yolda işlemiyordu. Kabul yalnızca işleyici
+        # başarılıysa verilir; başarısızlıkta event.ignore() ile pencere
+        # açık kalır, kullanıcı Kapat ile yeniden deneyebilir.
         if getattr(self, "_shutdown_started", False):
+            event.accept()
             super().closeEvent(event)
             return
         handler = getattr(self, "_shutdown", None)
         if not callable(handler):
+            self._closing = True
             self.persist_settings()
+            event.accept()
             super().closeEvent(event)
             return
+        # F-0722: the shutdown-handler path must save settings too, not only
+        # the no-handler path above.
+        self._closing = True
+        self.persist_settings()
         self._shutdown_started = True
-        handler()
+        try:
+            handler()
+        except Exception as exc:
+            # F-0720: same retry rule as _on_kapat — do not strand the shell
+            # in a half-shut-down state with the flag stuck on.
+            self._shutdown_started = False
+            self._closing = False
+            logger.error("Kapatma işleyicisi başarısız oldu: %s", exc, exc_info=True)
+            event.ignore()
+            return
+        event.accept()
+        super().closeEvent(event)
 
 
 AppShell = GatherionShell

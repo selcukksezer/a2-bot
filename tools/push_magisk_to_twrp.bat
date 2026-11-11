@@ -41,6 +41,10 @@ if errorlevel 1 (
 )
 "%ADB%" shell "mkdir -p /sdcard/Download" >nul 2>&1
 "%ADB%" push "%ZIP%" /sdcard/Download/Magisk-v31.1.zip
+if errorlevel 1 (
+  echo FAIL: adb push /sdcard/Download/ failed
+  exit /b 3
+)
 "%ADB%" shell "ls -la /sdcard/Magisk-v31.1.zip /sdcard/Download/Magisk-v31.1.zip"
 echo.
 echo === TWRP Install ===
@@ -48,3 +52,4 @@ echo Select Storage -^> Internal Storage -^> OK
 echo Find Magisk-v31.1.zip -^> Install -^> swipe to flash -^> Reboot System
 echo Zip on phone: /sdcard/Magisk-v31.1.zip  and  /sdcard/Download/Magisk-v31.1.zip
 endlocal
+exit /b 0

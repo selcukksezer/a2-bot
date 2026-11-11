@@ -10,9 +10,11 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
+import core.omni_game_learner as _ogl
 from core.omni_game_learner import OmniGameLearner, layout_boxes_for_learn_category
 
 
@@ -40,6 +42,23 @@ class TestEventDrivenCombatLearning(unittest.TestCase):
     def setUp(self):
         self.learner = OmniGameLearner(bot_worker=None, save_screenshots=False)
         self.learner.reset_combat_learning_metrics()
+        # DEV-D088: on_encounter_end() -> save_learned_weights() with no
+        # path writes the REAL repo config/learned_skill_weights.json
+        # (updated_at + tuned weights) — every run dirtied a tracked file.
+        # Redirect default-path saves of THIS learner to a tmp dir; the
+        # real method still runs, explicit-path saves (see
+        # test_save_and_load_learned_weights_persistence) pass through.
+        self._weights_tmpdir = tempfile.TemporaryDirectory()
+        real_save = self.learner.save_learned_weights
+        tmp_path = Path(self._weights_tmpdir.name) / "learned_skill_weights.json"
+
+        def _save_redirect(path=None, _real=real_save, _tmp=tmp_path):
+            return _real(path=_tmp if path is None else path)
+
+        self.learner.save_learned_weights = _save_redirect
+
+    def tearDown(self):
+        self._weights_tmpdir.cleanup()
 
     def test_skill_key_normalization(self):
         self.assertEqual(self.learner._normalize_skill_key("q"), "Q")
@@ -175,56 +194,89 @@ class TestEventDrivenCombatLearning(unittest.TestCase):
         self.assertEqual(combo[0], "2")
 
     def test_elimination_of_fake_synthetic_boxes(self):
+        # F-1290: _save_learning_sample must NEVER write into the real repo
+        # dataset. All learner output dirs are redirected to a tmp tree, and
+        # the test asserts on the exact files it created (no stale-file pass).
+        from core.omni_game_learner import LEARNING_DIR
+        from dataset_factory import label_trust as _lt
+
+        real_before = set((LEARNING_DIR / "monsters").glob("learn_monsters_*.json"))
+        stale_manifest = Path("models") / "stale_manifest.json"
+        stale_before = stale_manifest.read_bytes() if stale_manifest.is_file() else None
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
+            tmp_dataset = tmp_path / "dataset"
+            tmp_learning = tmp_dataset / "game_learning"
+            (tmp_learning / "monsters").mkdir(parents=True)
+            (tmp_dataset / "images" / "train").mkdir(parents=True)
+            (tmp_dataset / "labels" / "train").mkdir(parents=True)
             frame = np.full((120, 160, 3), 100, dtype=np.uint8)
 
-            # 1. When boxes is None, it must NOT fabricate synthetic (0.5, 0.5, 0.2, 0.2)
-            self.learner._save_learning_sample(
-                frame=frame,
-                category="monsters",
-                annotations_meta={"test": True},
-                boxes=None,
-            )
+            with (
+                patch.object(_ogl, "LEARNING_DIR", tmp_learning),
+                patch.object(_ogl, "DATASET_DIR", tmp_dataset),
+                patch.object(_ogl, "TRAIN_IMAGES_DIR", tmp_dataset / "images" / "train"),
+                patch.object(_ogl, "TRAIN_LABELS_DIR", tmp_dataset / "labels" / "train"),
+                # DEV-D088: commit_split_labels() -> mark_model_stale()
+                # defaults models_dir to CWD-relative Path("models"), so a
+                # tmp-redirected save still rewrote the REAL repo
+                # models/stale_manifest.json. Record the calls instead: the
+                # invalidation must still happen, but only against tmp.
+                patch.object(_lt, "mark_model_stale") as mock_stale,
+            ):
+                # 1. When boxes is None, it must NOT fabricate synthetic (0.5, 0.5, 0.2, 0.2)
+                # — and no empty record is written at all (B-04/B-10):
+                # no file, no counters, False returned.
+                saved_none = self.learner._save_learning_sample(
+                    frame=frame,
+                    category="monsters",
+                    annotations_meta={"test": True},
+                    boxes=None,
+                )
+                self.assertIs(saved_none, False)
 
-            # Check json files created in game_learning
-            gl_dir = tmp_path / "dataset" / "game_learning" / "monsters"
-            # Instead check learner's directory
-            from core.omni_game_learner import LEARNING_DIR
-            jsons = list((LEARNING_DIR / "monsters").glob("learn_monsters_*.json"))
-            self.assertTrue(len(jsons) > 0)
-            latest_json = sorted(jsons, key=lambda p: p.stat().st_mtime)[-1]
-            data = json.loads(latest_json.read_text(encoding="utf-8"))
+                # Exactly zero sample files: nothing fabricated, nothing written.
+                jsons = list((tmp_learning / "monsters").glob("learn_monsters_*.json"))
+                self.assertEqual(len(jsons), 0)
 
-            # When boxes=None was passed, boxes list must be empty, no fake synthetic coords!
-            self.assertEqual(data["boxes"], [])
-            self.assertIsNone(data["box_norm"])
-            self.assertIsNone(data["class_id"])
+                # 2. When genuine boxes are passed, omni_synthetic must be False
+                real_boxes = [
+                    {
+                        "class_id": 10,
+                        "box": (0.45, 0.55, 0.12, 0.22),
+                        "confidence": 0.88,
+                        "source": "visual_monster_detector",
+                        "trusted": True,
+                        "weak": False,
+                    }
+                ]
+                self.learner._save_learning_sample(
+                    frame=frame,
+                    category="monsters",
+                    annotations_meta={"test": True},
+                    boxes=real_boxes,
+                )
+                jsons2 = list((tmp_learning / "monsters").glob("learn_monsters_*.json"))
+                self.assertEqual(len(jsons2), 1)
+                new_json = [p for p in jsons2 if p not in jsons]
+                self.assertEqual(len(new_json), 1)
+                data2 = json.loads(new_json[0].read_text(encoding="utf-8"))
+                self.assertEqual(len(data2["boxes"]), 1)
+                self.assertEqual(data2["boxes"][0]["class_id"], 10)
 
-            # 2. When genuine boxes are passed, omni_synthetic must be False
-            real_boxes = [
-                {
-                    "class_id": 10,
-                    "box": (0.45, 0.55, 0.12, 0.22),
-                    "confidence": 0.88,
-                    "source": "visual_monster_detector",
-                    "trusted": True,
-                    "weak": False,
-                }
-            ]
-            self.learner._save_learning_sample(
-                frame=frame,
-                category="monsters",
-                annotations_meta={"test": True},
-                boxes=real_boxes,
-            )
-            latest_json2 = sorted(
-                (LEARNING_DIR / "monsters").glob("learn_monsters_*.json"),
-                key=lambda p: p.stat().st_mtime,
-            )[-1]
-            data2 = json.loads(latest_json2.read_text(encoding="utf-8"))
-            self.assertEqual(len(data2["boxes"]), 1)
-            self.assertEqual(data2["boxes"][0]["class_id"], 10)
+        # Real repo dataset untouched by either call.
+        real_after = set((LEARNING_DIR / "monsters").glob("learn_monsters_*.json"))
+        self.assertEqual(real_after, real_before)
+
+        # DEV-D088: the real stale manifest must be byte-identical too, and
+        # the (single) successful save must still have requested model
+        # invalidation — against the tmp dataset, never the repo. The
+        # rejected empty save (boxes=None) invalidates nothing.
+        stale_after = stale_manifest.read_bytes() if stale_manifest.is_file() else None
+        self.assertEqual(stale_after, stale_before)
+        self.assertEqual(mock_stale.call_count, 1)
+        for call in mock_stale.call_args_list:
+            self.assertEqual(call.kwargs.get("dataset_dir"), tmp_dataset)
 
     def test_save_and_load_learned_weights_persistence(self):
         with tempfile.TemporaryDirectory() as tmpdir:

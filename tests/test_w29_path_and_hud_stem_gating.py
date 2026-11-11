@@ -54,6 +54,14 @@ def _build_synthetic_aria_grass_and_hud_frame(height: int = 1080, width: int = 1
     return frame
 
 
+def _frame_hsv_gray():
+    """Fresh synthetic frame plus its HSV/gray conversions (the scanners' inputs)."""
+    frame = _build_synthetic_aria_grass_and_hud_frame()
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return frame, hsv, gray
+
+
 def test_w29_01_stem_gating_locks_reject_boot_aria_stems():
     """
     Test 1: Verify `is_path_learning_stem` and `is_skill_learning_stem` strictly return False
@@ -74,15 +82,44 @@ def test_w29_01_stem_gating_locks_reject_boot_aria_stems():
     assert is_skill_learning_stem("learn_skills_001_hud") is True
 
 
+def test_w29_01b_stem_gating_predicate_branches_and_near_misses():
+    """
+    Test 1b (D89 coverage): every OR-branch of both stem predicates, plus
+    near-misses that must stay locked. test_w29_01 only exercised the
+    `learn_paths_` / `learn_skills` branches; the other branches
+    (`learn_obstacles`, `_path_ground`, `path_` / `learn_vitality`,
+    `skill_`, `_vitality`) and the strip/lower normalisation had no test.
+    """
+    # is_path_learning_stem — all four branches
+    assert is_path_learning_stem("learn_obstacles_001_wall") is True
+    assert is_path_learning_stem("arena_path_ground_tile") is True
+    assert is_path_learning_stem("path_corridor_001") is True
+    assert is_path_learning_stem("  LEARN_PATHS_001_grass  ") is True  # strip + lower
+    # Near-misses: must stay False (locked)
+    assert is_path_learning_stem("learn_paths") is False  # missing trailing "_" of "learn_paths_"
+    assert is_path_learning_stem("relearn_paths_001") is False
+    assert is_path_learning_stem("xpath_ground_001") is False  # no "_" before "path_ground"
+    assert is_path_learning_stem("boot_001_aria_path") is False
+
+    # is_skill_learning_stem — all four branches
+    assert is_skill_learning_stem("learn_vitality_001_hp") is True
+    assert is_skill_learning_stem("skill_bar_001") is True
+    assert is_skill_learning_stem("hud_vitality_bar") is True
+    assert is_skill_learning_stem("  Learn_Skills_001_HUD ") is True  # strip + lower
+    # Near-misses: must stay False (locked)
+    assert is_skill_learning_stem("skills_001") is False  # no "learn_skills", no "skill_" prefix
+    assert is_skill_learning_stem("learn_skill_001") is False  # singular: not "learn_skills"
+    assert is_skill_learning_stem("my_skills_001") is False
+    assert is_skill_learning_stem("boot_001_aria_skill") is False
+
+
 def test_w29_02_scan_path_and_obstacles_blocks_grass_path_ground_on_boot_aria():
     """
     Test 2: Verify `_scan_path_and_obstacles` does NOT emit `15: path_ground` (or `14: obstacle`)
     over smooth grass on `boot_*_aria_*` frames, even when the grass texture satisfies ground criteria.
     """
     labeler = YOLOAutoLabeler()
-    frame = _build_synthetic_aria_grass_and_hud_frame()
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frame, hsv, gray = _frame_hsv_gray()
 
     # Confirm the synthetic grass DOES trigger 15: path_ground when unlocked via learn_paths_*
     unlocked_anns = labeler._scan_path_and_obstacles(
@@ -113,9 +150,7 @@ def test_w29_03_scan_hud_and_skills_blocks_fake_skill_ui_prompt_on_boot_aria():
     and never emits fake `13: skill_ui_prompt` over the HUD even on `learn_skills_*` stems.
     """
     labeler = YOLOAutoLabeler()
-    frame = _build_synthetic_aria_grass_and_hud_frame()
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frame, hsv, gray = _frame_hsv_gray()
 
     # Normal gather frame (`boot_*_aria_*`) must be completely blocked by is_skill_learning_stem
     for stem in ("boot_478467_000_aria_3d_crest_far", "boot_555_003_aria_gather"):
@@ -160,6 +195,20 @@ def test_w29_04_auto_label_frame_end_to_end_boot_aria_no_path_ground_or_skill_ui
     assert 13 not in emitted_class_ids, f"13: skill_ui_prompt must not be emitted on boot_*_aria_*: {annotations}"
     assert 14 not in emitted_class_ids, f"14: obstacle must not be emitted on boot_*_aria_*: {annotations}"
 
+    # Pozitif kontrol: aynı kare learn_paths_* kaynağıyla etiketlenince 15
+    # ÜRETİLMELİ — yoksa yukarıdaki yokluk assert'leri boş (vacuous) olur,
+    # çünkü boru hattı 15'i hiçbir koşulda üretemiyor olabilirdi.
+    unlocked = labeler.auto_label_frame(
+        frame=frame,
+        known_material_name="Aria",
+        fast_mode=True,
+        source_path="dataset/images/learn_paths_001_grass.jpg",
+    )
+    unlocked_class_ids = {int(a["class_id"]) for a in unlocked}
+    assert 15 in unlocked_class_ids, (
+        f"Positive control failed: 15: path_ground must be emitted on learn_paths_*: {unlocked}"
+    )
+
 
 def test_w29_05_auto_label_frame_preserves_aria_and_filters_minimap_hud_poison_on_boot_aria():
     """
@@ -168,7 +217,7 @@ def test_w29_05_auto_label_frame_preserves_aria_and_filters_minimap_hud_poison_o
     or `15: path_ground` injected into the HUD minimap region.
     """
     labeler = YOLOAutoLabeler(exemplar_memory=False)
-    frame = _build_synthetic_aria_grass_and_hud_frame()
+    frame, _, _ = _frame_hsv_gray()
 
     # Draw a vibrant purple Aria crystal cluster around (960, 420)
     cv2.circle(frame, (960, 420), 28, (215, 70, 235), -1)

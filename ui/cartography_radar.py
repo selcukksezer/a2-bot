@@ -14,12 +14,25 @@ import math
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
 
+from core.corridor_navigator import WORLD_MAP_METERS_PER_PX, jump_length_threshold
 from core.minimap_scanner import MinimapScanner
+
+# P1-1: minimap class ids / names come from the single taxonomy source
+# (dataset_factory.class_taxonomy, authority dataset/data.yaml) — the
+# radar used to hardcode 9/11 and the non-canonical name
+# "minimap_monster_negative" in a field called taxonomy_class_name.
+from dataset_factory.class_taxonomy import canonical_name_to_id as _taxonomy_name_to_id
+
+_TAXONOMY_IDS = _taxonomy_name_to_id()
+MINIMAP_SPROUT_CLASS_ID: int = _TAXONOMY_IDS["minimap_sprout"]
+MINIMAP_MONSTER_DOT_CLASS_ID: int = _TAXONOMY_IDS["minimap_monster_dot"]
+MINIMAP_SPROUT_CLASS_NAME: str = "minimap_sprout"
+MINIMAP_MONSTER_DOT_CLASS_NAME: str = "minimap_monster_dot"
 
 from ui.shell_page_frame import wrap_shell_tab_root_layout
 
@@ -68,6 +81,7 @@ from ui.map_viewer import (
     sort_nodes_by_proximity,
     normalize_material_token,
 )
+from version import __version__
 
 logger = logging.getLogger("Gatherion.CartographyRadar")
 
@@ -83,7 +97,51 @@ _MAGNIFIER_Y_FRAC = 0.36
 _CLOCK_X_FRAC = 0.62
 _CLOCK_Y_FRAC = 0.74
 _GATHER_PLAYER_CLEARANCE = 0.075
+# 3B projeksiyon zemin mesafesi kalibrasyonu (RadarCanvas.project_3d_yolo_boxes).
+# Değerler Aion 2 70° HFOV kamera geometrisinden ampirik çıkarıldı; sihirli
+# sabit olarak gömülmesin diye burada adlandırıldı (kalibre edilmediler,
+# yalnızca tek yerden okunur hale getirildiler).
+_PROJ_NEAR_DIST_M = 1.5  # En yakın zemin mesafesi (m)
+_PROJ_FAR_DIST_M = 55.0  # En uzak zemin mesafesi (m)
+_PROJ_FEET_BASE_M = 5.5  # Ayak çizgisindeki zemin mesafesi (m)
+_PROJ_FEET_FALLOFF = 0.78  # Ayaktan uzağa gidildikçe mesafe düşüş katsayısı
+_PROJ_BEYOND_FEET_BASE_M = 6.0  # Ayak çizgisi üstü taban mesafe (m)
+_PROJ_BEYOND_FEET_SPAN_M = 39.0  # Ayak çizgisi üstü mesafe aralığı (m)
+_PROJ_BEYOND_FEET_EXP = 1.35  # Ayak çizgisi üstü mesafe eğrisi üssü
+_PROJ_APPARENT_REF_H_PX = 160.0  # Görünen yükseklikten mesafe için referans boy (px)
+_PROJ_APPARENT_MIN_H_PX = 8.0  # Görünen yükseklik alt sınırı (px)
+_PROJ_APPARENT_SCALE = 4.5  # Görünen yükseklikten mesafe ölçeği
 _PANEL_SCANNER: Optional[MinimapScanner] = None
+
+
+def _detection_confidence(det: Any, default: float = 0.0) -> float:
+    """
+    Tespit güvenini None/bozuk değere karşı güvenli okur.
+
+    `det.get("confidence", 0.0)` anahtar mevcut ama değeri None ise
+    `float(None)` ile çöker; eksik/None/bozuk değerde `default` döner.
+
+    P1-4 (K-07): eksik güven artık 0.90 diye uydurulmuyor — bilinmiyorsa
+    0.0 (minimap yolundaki `mat.get("confidence", 0.0)` ile tutarlı).
+    """
+    raw: Any = None
+    if isinstance(det, dict):
+        for key in ("confidence", "conf", "score"):
+            if det.get(key) is not None:
+                raw = det.get(key)
+                break
+    else:
+        for key in ("confidence", "conf", "score"):
+            value = getattr(det, key, None)
+            if value is not None:
+                raw = value
+                break
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _panel_minimap_scanner() -> MinimapScanner:
@@ -335,8 +393,8 @@ def classify_minimap_crop_bgr(
                 "confidence": float(node.get("confidence", 0.0) or 0.0),
                 "source_type": "minimap_auto",
                 "kind": "sprout_material",
-                "class_id": 9,
-                "class_name": "minimap_sprout",
+                "class_id": MINIMAP_SPROUT_CLASS_ID,
+                "class_name": MINIMAP_SPROUT_CLASS_NAME,
                 "is_gatherable": True,
                 "hud_chrome": False,
             }
@@ -357,8 +415,8 @@ def classify_minimap_crop_bgr(
                 "norm_y": round(py / float(height), 4),
                 "label": "•✕",
                 "kind": "monster_dot",
-                "class_id": 11,
-                "class_name": "minimap_monster_dot",
+                "class_id": MINIMAP_MONSTER_DOT_CLASS_ID,
+                "class_name": MINIMAP_MONSTER_DOT_CLASS_NAME,
                 "is_hostile": False,
                 "is_gatherable": False,
                 "hud_chrome": False,
@@ -380,8 +438,12 @@ def classify_minimap_crop_bgr(
                 "norm_y": round(py / float(height), 4),
                 "label": "🔴",
                 "kind": "hostile_dot",
-                "class_id": 11,
-                "class_name": "minimap_monster_negative",
+                # P1-1: the taxonomy name is "minimap_monster_dot" —
+                # "minimap_monster_negative" is not a canonical name
+                # (it used to leak into taxonomy_class_name downstream);
+                # hostility is carried by kind/is_hostile, not the name.
+                "class_id": MINIMAP_MONSTER_DOT_CLASS_ID,
+                "class_name": MINIMAP_MONSTER_DOT_CLASS_NAME,
                 "is_hostile": True,
                 "is_gatherable": False,
                 "hud_chrome": False,
@@ -421,6 +483,43 @@ DEFAULT_MAP_REF: Tuple[float, float] = (1280.0, 720.0)
 # AION 2 Altgard dünya haritası (Aion2Data, istemci 2026-10-28). 2258×2400.
 HD_ZONE_MAP_REL = os.path.join("assets", "maps", "altgard.png")
 
+# Bölgeye duyarlı HD harita görselleri (Görev 4).
+# Source: https://aion2data.com/game/maps/verteron.webp
+# AION 2 Verteron dünya haritası (Aion2Data). 2303×2400.
+# KURAL: Altgard görseli yalnızca bölge Altgard (veya bilinmiyor) ise adaydır;
+# başka bölge için asla Altgard haritası gösterilmez.
+HD_ZONE_MAPS: Dict[str, str] = {
+    "altgard": os.path.join("assets", "maps", "altgard.png"),
+    "verteron": os.path.join("assets", "maps", "verteron.png"),
+}
+
+# frame_18s.jpg Altgard dünya haritası kırpmasıdır; yalnızca Altgard
+# bölgesinde yedek olabilir. Başka bölgede yedek olamaz.
+FRAME18_REGION_KEYS: Tuple[str, ...] = ("", "altgard")
+
+
+def region_map_candidates(region_name: Optional[str]) -> List[str]:
+    """Bölge için HD harita görseli adayları (mutlak yol, sırayla).
+
+    Altgard görseli yalnızca bölge Altgard (veya boş/bilinmiyor) ise adaydır;
+    başka bölge için kendi görseli yoksa BOŞ liste döner — çağrıcı mozaik
+    yedeğe düşer, yanlış bölge haritası göstermez (Görev 4).
+    """
+    key = str(region_name or "").strip().lower()
+    if key == "":
+        # Bölge bilinmiyorsa eski varsayılan: Altgard.
+        key = "altgard"
+    rel = HD_ZONE_MAPS.get(key)
+    if rel is None:
+        return []
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return [os.path.join(root, rel)]
+
+
+def is_altgard_map_region(region_name: Optional[str]) -> bool:
+    """frame_18s.jpg (Altgard kırpması) bu bölge için yedek olabilir mi?"""
+    return str(region_name or "").strip().lower() in FRAME18_REGION_KEYS
+
 # frame_18s.jpg arazi kırpması (kare içinde sol-üst 280,80) ORB ile bu PNG'ye
 # oturtuldu. Ölçek/öteleme yalnızca çizimde. region_data.json yazılmaz.
 # Safe Haven, Dredgion Crash Site ve Silent Hill etiketleri aynı kuzeybatı
@@ -439,8 +538,19 @@ HD_FIT_OFFSET: Tuple[float, float] = (
 )
 
 
-def hd_zone_map_path() -> str:
+def hd_zone_map_path(region: Optional[str] = None) -> str:
+    """Bölgeye duyarlı HD harita yolu.
+
+    region verilmezse geriye dönük uyumluluk için Altgard yolu döner.
+    Bölgenin kendi görseli yoksa (örn. Heiron) yine Altgard yolu döner;
+    dosya varlığı çağrıcıda region_map_candidates ile denetlenmelidir —
+    bu fonksiyon tek başına "harita var" anlamına gelmez.
+    """
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if region:
+        candidates = region_map_candidates(region)
+        if candidates:
+            return candidates[0]
     return os.path.join(root, HD_ZONE_MAP_REL)
 
 
@@ -542,13 +652,25 @@ def _segment_lengths(coords: List[Tuple[float, float]], closed: bool) -> List[fl
     return lengths
 
 
-def jump_length_threshold(lengths: List[float]) -> float:
-    """Yerel adımın çok üstündeki bağı zikzak sıçrama sayar."""
-    if not lengths:
-        return 280.0
-    core = sorted(lengths)[: max(1, int(math.ceil(len(lengths) * 0.8)))]
-    typical = core[len(core) // 2]
-    return max(typical * 6.0, 280.0)
+# jump_length_threshold: tek tanım core/corridor_navigator.py'de (P1-12 / v18).
+# Zikzak-sıçrama eşiği — yerel adımın çok üstündeki bağı sıçrama sayar.
+# (Eski yerel tanım buradan kaldırıldı; bu modüldeki iki kullanım yeri
+# — calculate_route_metrics ve _jump_mask — artık aynı tanımı okur.)
+
+
+def _distance_matrix(coords: List[Tuple[float, float]]) -> np.ndarray:
+    """Koordinatlar arası simetrik Öklid mesafe matrisi (n x n, float64).
+
+    Rota iyileştirme (en yakın komşu, 2-opt, or-opt) eskiden her aday çifti
+    için ayrı `math.hypot` çağrısı yapıyordu: n=120 düğümde tek bir
+    `optimize_smooth_loop` ~92 bin hypot çağrısı demekti. Matris bir kez
+    kurulur, sonrası O(1) tablo okumasıdır; değerler `math.hypot` ile
+    aynı float64 Öklid mesafesidir (numpy `hypot`), yani tur maliyeti ve
+    iyileştirme kararları değişmez.
+    """
+    pts = np.asarray(coords, dtype=np.float64).reshape(-1, 2)
+    diff = pts[:, None, :] - pts[None, :, :]
+    return np.hypot(diff[..., 0], diff[..., 1])
 
 
 if not logger.handlers:
@@ -599,7 +721,7 @@ class SequentialRoutePlanner:
 
     CANONICAL_REGION_ALIASES: Dict[str, str] = CANONICAL_REGION_ALIASES
 
-    def __init__(self, meters_per_pixel: float = 0.28) -> None:
+    def __init__(self, meters_per_pixel: float = WORLD_MAP_METERS_PER_PX) -> None:
         self.meters_per_pixel: float = float(meters_per_pixel)
         self._map_ref: Tuple[float, float] = DEFAULT_MAP_REF
         self._hd_fit: bool = False
@@ -679,6 +801,7 @@ class SequentialRoutePlanner:
 
         # Harici planlayıcı varsa (core.sequential_router.SequentialRoutePlanner) kullan ve 2-opt ile doğrula
         working: List[Any] = list(nodes)
+        external_order_used = False
         if self._external_planner is not None:
             try:
                 if hasattr(self._external_planner, "build_sequential_order"):
@@ -689,6 +812,7 @@ class SequentialRoutePlanner:
                     )
                     if isinstance(res, list) and len(res) == len(working):
                         working = list(res)
+                        external_order_used = True
                 else:
                     for method_name in (
                         "optimize_smooth_loop",
@@ -702,6 +826,7 @@ class SequentialRoutePlanner:
                             res = fn(working)
                             if isinstance(res, list) and len(res) == len(working):
                                 working = list(res)
+                                external_order_used = True
                                 break
             except Exception as exc:
                 logger.debug("External planner method call fallback: %s", exc)
@@ -720,40 +845,50 @@ class SequentialRoutePlanner:
         )
 
         best_order = list(angular_order)
-        best_cost = self._tour_cost_indices(best_order, coords)
+        # Mesafe matrisi bir kez kurulur ve aşağıdaki tüm adımlar (tur maliyeti,
+        # multi-start NN, 2-opt, or-opt) aynı tabloyu kullanır; eskiden her
+        # `_tour_cost_indices` çağrısı matrisi sıfırdan kuruyordu.
+        dist = _distance_matrix(coords)
+        best_cost = self._tour_cost_indices(best_order, coords, dist)
 
-        # Multi-start nearest neighbor denemeleri
+        # Harici planlayıcının sırası çöpe atılmaz: aday tur olarak maliyetine
+        # bakılır, dahili adaylardan kısaysa o tur kazanır.
+        if external_order_used:
+            ext_order = list(range(n_count))
+            ext_cost = self._tour_cost_indices(ext_order, coords, dist)
+            if ext_cost < best_cost:
+                best_cost = ext_cost
+                best_order = ext_order
+
+        # Multi-start nearest neighbor denemeleri (mesafe matrisi + argmin:
+        # eskiden her adımda kalan düğümler üzerinde math.hypot'lu `min`
+        # çalışıyordu — O(n) hypot çağrısı/adım, başlangıç başına O(n^2)).
         step = max(1, n_count // 8)
         start_indices = list(range(0, n_count, step))
         if 0 not in start_indices:
             start_indices.insert(0, 0)
 
         for start_idx in start_indices:
-            unvisited = set(range(n_count))
-            unvisited.remove(start_idx)
+            remaining = np.ones(n_count, dtype=bool)
+            remaining[start_idx] = False
             tour = [start_idx]
             curr = start_idx
-            while unvisited:
-                nxt = min(
-                    unvisited,
-                    key=lambda idx: math.hypot(
-                        coords[idx][0] - coords[curr][0],
-                        coords[idx][1] - coords[curr][1],
-                    ),
-                )
+            while remaining.any():
+                row = np.where(remaining, dist[curr], np.inf)
+                nxt = int(np.argmin(row))
                 tour.append(nxt)
-                unvisited.remove(nxt)
+                remaining[nxt] = False
                 curr = nxt
-            cost = self._tour_cost_indices(tour, coords)
+            cost = self._tour_cost_indices(tour, coords, dist)
             if cost < best_cost:
                 best_cost = cost
                 best_order = tour
 
         # 2-Opt Kesişim ve Zikzak Giderme (Uncrossing all intersecting edges)
-        best_order = self._two_opt_indices(best_order, coords)
+        best_order = self._two_opt_indices(best_order, coords, dist)
 
         # Or-Opt (Tekli düğüm kaydırma ile keskin geri dönüşleri / ping-pong'ları temizle)
-        best_order = self._or_opt_indices(best_order, coords)
+        best_order = self._or_opt_indices(best_order, coords, dist)
 
         # Yürüyüş izi varsa döngünün başlangıç noktasını ve dönüş yönünü yürüyüş yönüyle hizala
         if walk_trajectory and len(walk_trajectory) >= 2:
@@ -855,12 +990,27 @@ class SequentialRoutePlanner:
                 key=lambda i: math.hypot(self._node_xy(nodes[i])[0] - cx, self._node_xy(nodes[i])[1] - cy)
             )
 
+        # İleri pencere (forward_window): mevcut düğümde zaten duruluyorsa
+        # (hedefe varılmışsa) pencere içindeki ilk henüz varılmamış düğüme
+        # ilerle; yoksa sıradaki düğüm hedef olur. Pencere 1 ise hep sıradaki.
+        window = max(1, int(forward_window)) if forward_window is not None else 1
+        cx, cy = self._node_xy(current_node)
+        for step in range(1, window + 1):
+            cand_idx = curr_idx + step
+            if loop:
+                cand_idx %= n
+            elif cand_idx >= n:
+                break
+            ccx, ccy = self._node_xy(nodes[cand_idx])
+            if math.hypot(ccx - cx, ccy - cy) > 2.0:
+                return nodes[cand_idx]
+
         next_idx = (curr_idx + 1) % n if loop else min(curr_idx + 1, n - 1)
         return nodes[next_idx]
 
     def cyclical_next(self, current_node: Any, nodes: List[Any]) -> Optional[Any]:
         """Döngüsel rotada ardışık bir sonraki düğümü ((i + 1) % len) döndürür."""
-        return self.get_next_in_sequence(current_node, nodes, loop=True)
+        return self.get_next_in_sequence(current_node, nodes, forward_window=1, loop=True)
 
     def insert_node_in_sequence(self, new_node: Any, nodes: List[Any]) -> List[Any]:
         """
@@ -1043,6 +1193,8 @@ class SequentialRoutePlanner:
         """
         scale = float(meters_per_pixel if meters_per_pixel is not None else self.meters_per_pixel)
         count = len(nodes or [])
+        # Kapalı döngü en az 3 düğüm ister; 0/1/2 düğümde kapanacak döngü yoktur.
+        is_closed_loop = count >= 3
         if count == 0:
             return {
                 "discovered_nodes": 0,
@@ -1059,7 +1211,7 @@ class SequentialRoutePlanner:
                 "min_step_m": 0.0,
                 "min_step_px": 0.0,
                 "ping_pong_jumps": 0,
-                "closed_loop": True,
+                "closed_loop": is_closed_loop,
             }
         if count == 1:
             return {
@@ -1077,13 +1229,18 @@ class SequentialRoutePlanner:
                 "min_step_m": 0.0,
                 "min_step_px": 0.0,
                 "ping_pong_jumps": 0,
-                "closed_loop": True,
+                "closed_loop": is_closed_loop,
             }
 
         coords = [self._node_xy(n) for n in nodes]
+        # Kapalı döngü en az 3 düğüm ister (yukarıdaki is_closed_loop):
+        # 2 düğümde kapanış kenarı (B -> A) yoktur, tek gidiş kenarı (A -> B)
+        # sayılır. Eski kod range(count) ile B -> A kenarını da toplayıp
+        # 2 düğümlü toplam mesafeyi iki kat çıkarıyordu (P1-12 / v18).
+        num_segments = count if count >= 3 else max(count - 1, 0)
         total_px = 0.0
         seg_lengths: List[float] = []
-        for i in range(count):
+        for i in range(num_segments):
             x0, y0 = coords[i]
             x1, y1 = coords[(i + 1) % count]
             seg = math.hypot(x1 - x0, y1 - y0)
@@ -1091,7 +1248,7 @@ class SequentialRoutePlanner:
             total_px += seg
 
         total_meters = round(total_px * scale, 1)
-        avg_step_px = round(total_px / float(count), 1) if count > 0 else 0.0
+        avg_step_px = round(total_px / float(num_segments), 1) if num_segments > 0 else 0.0
         avg_step_m = round(avg_step_px * scale, 1)
         max_jump_px = round(max(seg_lengths), 1) if seg_lengths else 0.0
         max_jump_m = round(max_jump_px * scale, 1)
@@ -1114,7 +1271,7 @@ class SequentialRoutePlanner:
                 "min_step_m": min_step_m,
                 "min_step_px": min_step_px,
                 "ping_pong_jumps": 0,
-                "closed_loop": True,
+                "closed_loop": is_closed_loop,
             }
 
         # Zikzak sıçrama = harita çerçevesine oturtulmuş koordinatta
@@ -1138,8 +1295,6 @@ class SequentialRoutePlanner:
 
         raw_score = 100.0 - (ping_pong_jumps * 15.0) - min(18.0, sharp_turn_penalty * 0.35)
         smoothness = round(max(5.0, min(100.0, raw_score)), 1)
-        if ping_pong_jumps == 0 and smoothness < 92.0:
-            smoothness = round(min(99.5, 92.0 + (smoothness * 0.07)), 1)
 
         return {
             "discovered_nodes": count,
@@ -1156,7 +1311,7 @@ class SequentialRoutePlanner:
             "min_step_m": min_step_m,
             "min_step_px": min_step_px,
             "ping_pong_jumps": int(ping_pong_jumps),
-            "closed_loop": True,
+            "closed_loop": is_closed_loop,
         }
 
     def evaluate_sequence_quality(
@@ -1173,25 +1328,36 @@ class SequentialRoutePlanner:
     # Dahili Geometri ve 2-Opt Yardımcıları
     # ------------------------------------------------------------------
     @staticmethod
-    def _tour_cost_indices(order: List[int], coords: List[Tuple[float, float]]) -> float:
-        total = 0.0
+    def _tour_cost_indices(
+        order: List[int],
+        coords: List[Tuple[float, float]],
+        dist: Optional[np.ndarray] = None,
+    ) -> float:
+        """Kapalı turun toplam uzunluğu. `dist` verilirse önceden kurulmuş
+        mesafe matrisi kullanılır (çağrı başına O(n²) matris kurulumu yok);
+        verilmezse matris burada kurulur (eski davranış)."""
         n = len(order)
-        for i in range(n):
-            a = coords[order[i]]
-            b = coords[order[(i + 1) % n]]
-            total += math.hypot(b[0] - a[0], b[1] - a[1])
-        return total
+        if n <= 1:
+            return 0.0
+        if dist is None:
+            dist = _distance_matrix(coords)
+        idx = np.asarray(order, dtype=np.intp)
+        nxt = np.roll(idx, -1)
+        return float(np.sum(dist[idx, nxt]))
 
     @classmethod
     def _two_opt_indices(
         cls,
         order: List[int],
         coords: List[Tuple[float, float]],
+        dist: Optional[np.ndarray] = None,
         max_passes: int = 40,
     ) -> List[int]:
         n = len(order)
         if n <= 3:
             return list(order)
+        if dist is None:
+            dist = _distance_matrix(coords)
 
         best = list(order)
         improved = True
@@ -1203,10 +1369,10 @@ class SequentialRoutePlanner:
                 for j in range(i + 2, n):
                     if i == 0 and j == n - 1:
                         continue
-                    a, b = coords[best[i]], coords[best[i + 1]]
-                    c, d = coords[best[j]], coords[best[(j + 1) % n]]
-                    old_len = math.hypot(b[0] - a[0], b[1] - a[1]) + math.hypot(d[0] - c[0], d[1] - c[1])
-                    new_len = math.hypot(c[0] - a[0], c[1] - a[1]) + math.hypot(d[0] - b[0], d[1] - b[1])
+                    bi, bi1 = best[i], best[i + 1]
+                    bj, bj1 = best[j], best[(j + 1) % n]
+                    old_len = dist[bi, bi1] + dist[bj, bj1]
+                    new_len = dist[bi, bj] + dist[bj1, bi1]
                     if new_len + 1e-6 < old_len:
                         best[i + 1 : j + 1] = reversed(best[i + 1 : j + 1])
                         improved = True
@@ -1244,12 +1410,15 @@ class SequentialRoutePlanner:
         cls,
         order: List[int],
         coords: List[Tuple[float, float]],
+        dist: Optional[np.ndarray] = None,
         max_passes: int = 15,
     ) -> List[int]:
         """Tekil düğümleri daha uygun komşu kenarlara taşıyarak keskin zikzakları giderir."""
         n = len(order)
         if n <= 4:
             return list(order)
+        if dist is None:
+            dist = _distance_matrix(coords)
 
         best = list(order)
         improved = True
@@ -1264,11 +1433,7 @@ class SequentialRoutePlanner:
                 v = best[i]
                 w = best[next_i]
 
-                rem_gain = (
-                    math.hypot(coords[v][0] - coords[u][0], coords[v][1] - coords[u][1])
-                    + math.hypot(coords[w][0] - coords[v][0], coords[w][1] - coords[v][1])
-                    - math.hypot(coords[w][0] - coords[u][0], coords[w][1] - coords[u][1])
-                )
+                rem_gain = dist[v, u] + dist[w, v] - dist[w, u]
                 if rem_gain <= 1e-4:
                     continue
 
@@ -1280,11 +1445,7 @@ class SequentialRoutePlanner:
                     next_j = (j + 1) % n
                     p = best[j]
                     q = best[next_j]
-                    ins_cost = (
-                        math.hypot(coords[v][0] - coords[p][0], coords[v][1] - coords[p][1])
-                        + math.hypot(coords[q][0] - coords[v][0], coords[q][1] - coords[v][1])
-                        - math.hypot(coords[q][0] - coords[p][0], coords[q][1] - coords[p][1])
-                    )
+                    ins_cost = dist[v, p] + dist[q, v] - dist[q, p]
                     delta = rem_gain - ins_cost
                     if delta > best_delta + 1e-4:
                         best_delta = delta
@@ -1339,7 +1500,7 @@ class MinimapLiveCropPreviewWidget(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(230, 195)
+        self.setMinimumSize(240, 205)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         self._minimap_pixmap: Optional[QPixmap] = None
@@ -1432,6 +1593,32 @@ class MinimapLiveCropPreviewWidget(QWidget):
                 logger.debug("Canlı minimap kırpımı ayrıştırılamadı: %s", exc)
         self.set_minimap_detections(mats, mobs)
 
+    def update_minimap_crop(self, minimap_crop: Any) -> None:
+        """
+        Canlı minimap kırpımını (BGR ndarray) önizlemeye işler.
+
+        Canvas (`SequentialMapCanvas.update_live_frame`) ve diyalog
+        (`CartographyRadarDialog.update_live_frame`) bu metodu çağırır;
+        daha önce metot yoktu, çağrı AttributeError ile sessizce yutuluyordu.
+        """
+        if minimap_crop is None:
+            return
+        try:
+            if isinstance(minimap_crop, QPixmap):
+                self.set_minimap_pixmap(minimap_crop)
+                return
+            arr = np.asarray(minimap_crop)
+            if arr.size == 0 or arr.ndim != 3 or arr.shape[2] < 3:
+                return
+            rgb = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            qimg = QImage(
+                rgb.data, w, h, int(rgb.strides[0]), QImage.Format.Format_RGB888
+            )
+            self.set_minimap_pixmap(QPixmap.fromImage(qimg.copy()))
+        except Exception as exc:
+            logger.debug("update_minimap_crop hatası: %s", exc)
+
     def set_minimap_detections(
         self,
         gatherable_materials: List[Dict[str, Any]],
@@ -1492,8 +1679,8 @@ class MinimapLiveCropPreviewWidget(QWidget):
         painter.drawRoundedRect(target_rect, 8.0, 8.0)
 
         inner_margin = 6.0
-        header_h = 20.0
-        footer_h = 22.0
+        header_h = 22.0
+        footer_h = 24.0
         crop_rect = QRectF(
             target_rect.left() + inner_margin,
             target_rect.top() + header_h + 4.0,
@@ -1502,7 +1689,7 @@ class MinimapLiveCropPreviewWidget(QWidget):
         )
 
         # Üst Başlık: Sağ Üst Minimap Canlı Kırpma & Filtre
-        hdr_font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        hdr_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
         painter.setFont(hdr_font)
         painter.setPen(QColor("#67e8f9"))
         painter.drawText(
@@ -1519,7 +1706,7 @@ class MinimapLiveCropPreviewWidget(QWidget):
             painter.fillRect(crop_rect, QColor("#09131c"))
 
         # 1. Yoksayılan Canavar Beyaz Noktaları (• shown as dim gray/red crossed-out dots •✕)
-        mob_font = QFont("Segoe UI", 7, QFont.Weight.Bold)
+        mob_font = QFont("Segoe UI", 8, QFont.Weight.Bold)
         painter.setFont(mob_font)
         for mob in self._rejected_monsters:
             nx = float(mob.get("norm_x", 0.5))
@@ -1541,7 +1728,7 @@ class MinimapLiveCropPreviewWidget(QWidget):
             painter.drawLine(QPointF(mx - cs, my + cs), QPointF(mx + cs, my - cs))
 
         # 2. Toplanabilir Materyal İkonları (Parlak Zümrüt/Camgöbeği + 3x / 6x / 9x Rozeti)
-        badge_font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        badge_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
         painter.setFont(badge_font)
         for mat in self._gatherable_materials:
             nx = float(mat.get("norm_x", 0.5))
@@ -1576,7 +1763,7 @@ class MinimapLiveCropPreviewWidget(QWidget):
 
             # 3x / 6x / 9x yığın hasat rozeti
             stack_txt = str(mat.get("stack_badge") or f"{int(mat.get('stack_count', 3) or 3)}x")
-            pill_rect = QRectF(mx + 7.5, my - 7.5, 22.0, 14.0)
+            pill_rect = QRectF(mx + 7.5, my - 8.0, 24.0, 16.0)
             painter.setPen(QPen(QColor("#34d399"), 1.2))
             painter.setBrush(QBrush(QColor(6, 48, 40, 235)))
             painter.drawRoundedRect(pill_rect, 3.5, 3.5)
@@ -1585,7 +1772,7 @@ class MinimapLiveCropPreviewWidget(QWidget):
             painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, stack_txt)
 
         # Alt Bilgi Satırı
-        footer_font = QFont("Segoe UI", 7, QFont.Weight.DemiBold)
+        footer_font = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
         painter.setFont(footer_font)
         painter.setPen(QColor("#a7f3d0"))
         footer_str = (
@@ -1644,7 +1831,6 @@ class SequentialMapCanvas(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self._base_pixmap: Optional[QPixmap] = None
-        self._coord_offset: Tuple[int, int] = (0, 0)
         self._map_ref: Tuple[float, float] = DEFAULT_MAP_REF
         self._hd_fit_active: bool = False
         self._ordered_nodes: List[Dict[str, Any]] = []
@@ -1757,12 +1943,10 @@ class SequentialMapCanvas(QWidget):
     def set_map_pixmap(
         self,
         pixmap: QPixmap,
-        coord_offset: Tuple[int, int] = (0, 0),
         map_ref_size: Optional[Tuple[float, float]] = None,
     ) -> None:
         """Arka plan bölge haritasını ayarlar ve görünüme sığdırır."""
         self._base_pixmap = pixmap
-        self._coord_offset = coord_offset
         if map_ref_size is not None:
             self._map_ref = (max(1.0, float(map_ref_size[0])), max(1.0, float(map_ref_size[1])))
         self._initial_fit_done = False
@@ -1920,17 +2104,17 @@ class SequentialMapCanvas(QWidget):
         self.update()
 
     def _resolved_xy(self, node: Any) -> Tuple[float, float]:
+        # HD modunda tek dönüşüm: resolve_node_xy(apply_hd=True) zaten HD
+        # ölçeğindeki düğümü olduğu gibi bırakır, 1280×720 düğümü HD'ye oturtur.
+        # Önceki kod apply_hd=False ile çözüp üstüne apply_hd_fit uyguluyordu;
+        # zaten HD ölçeğindeki düğüm ikinci kez ölçekleniyordu (çift dönüşüm).
         if self._hd_fit_active:
-            x, y = resolve_node_xy(node, DEFAULT_MAP_REF[0], DEFAULT_MAP_REF[1])
-            return apply_hd_fit(x, y)
+            return resolve_node_xy(node, DEFAULT_MAP_REF[0], DEFAULT_MAP_REF[1], apply_hd=True)
         return resolve_node_xy(node, self._map_ref[0], self._map_ref[1])
 
     def _raw_to_map_coords(self, raw_x: float, raw_y: float) -> QPointF:
-        """Tam harita pikseli. Kırpma genişliğine kıvırmaz (eski 614×450 köşe yığını)."""
-        if self._base_pixmap is None or self._base_pixmap.isNull():
-            return QPointF(raw_x, raw_y)
-        ox, oy = self._coord_offset
-        return QPointF(float(raw_x) - float(ox), float(raw_y) - float(oy))
+        """Tam harita pikseli (ofset yok; eski 614×450 kırpma ofseti kaldırıldı)."""
+        return QPointF(float(raw_x), float(raw_y))
 
     def _map_to_widget(self, map_pt: QPointF) -> QPointF:
         return QPointF(
@@ -2370,7 +2554,7 @@ class SequentialMapCanvas(QWidget):
             # Keşif etiketi ("+ DISCOVERED")
             if progress < 0.85:
                 lbl_alpha = int((1.0 - progress / 0.85) * 255)
-                font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+                font = QFont("Segoe UI", 9, QFont.Weight.Bold)
                 painter.setFont(font)
                 painter.setPen(QColor(74, 222, 128, lbl_alpha))
                 painter.drawText(
@@ -2426,8 +2610,8 @@ class SequentialMapCanvas(QWidget):
         Etiketler üst üste biniyorsa sadece daire kalır. Hover, seçili, uç ve
         sıçrama uçları her zaman yazılır.
         """
-        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
-        badge_font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+        badge_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
         jump_nodes = jump_nodes or set()
         placed_labels: List[QRectF] = []
 
@@ -2534,7 +2718,7 @@ class SequentialMapCanvas(QWidget):
             seq_w = float(painter.fontMetrics().horizontalAdvance(seq_label))
             painter.setFont(badge_font)
             bw = max(20.0, float(painter.fontMetrics().horizontalAdvance(badge_str)) + 9.0)
-            label_rect = QRectF(tx - 2.0, ty - 12.0, seq_w + 8.0 + bw, 16.0)
+            label_rect = QRectF(tx - 2.0, ty - 13.0, seq_w + 8.0 + bw, 18.0)
             force_label = (
                 idx == self._hovered_seq_idx
                 or idx == self._selected_seq_idx
@@ -2579,7 +2763,7 @@ class SequentialMapCanvas(QWidget):
             self._draw_outlined_text(painter, tx, ty, seq_label, font, text_color=label_col)
             painter.setFont(badge_font)
             bw = max(20.0, float(painter.fontMetrics().horizontalAdvance(badge_str)) + 9.0)
-            bh = 14.5
+            bh = 16.0
             pill_rect = QRectF(tx + seq_w + 5.0, w_pt.y() - bh * 0.5 + 0.5, bw, bh)
             painter.save()
             border_col = QColor("#facc15" if (is_filter and is_matching) else ("#22d3ee" if is_minimap_auto else "#34d399"))
@@ -2622,12 +2806,12 @@ class SequentialMapCanvas(QWidget):
     def _draw_canvas_legend(self, painter: QPainter) -> None:
         """Sol alt köşede Türkçe görsel katmanların açıklamasını gösterir."""
         legend_w = min(float(self.width() - 24), 980.0)
-        legend_rect = QRectF(12.0, float(self.height() - 40), legend_w, 28.0)
+        legend_rect = QRectF(12.0, float(self.height() - 42), legend_w, 30.0)
         painter.setPen(QPen(QColor(45, 55, 72, 190), 1.0))
         painter.setBrush(QBrush(QColor(15, 23, 42, 215)))
         painter.drawRoundedRect(legend_rect, 6.0, 6.0)
 
-        font = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
+        font = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
         painter.setFont(font)
         painter.setPen(QColor("#e2e8f0"))
         legend_text = (
@@ -2698,7 +2882,7 @@ class RadarCanvas(SequentialMapCanvas):
 
         # Radar Geometri ve Projeksiyon Parametreleri
         self._heading_deg: float = 0.0
-        self._meters_per_pixel: float = 0.28
+        self._meters_per_pixel: float = WORLD_MAP_METERS_PER_PX
         self._sweep_inner_m: float = 10.0
         self._sweep_mid_m: float = 25.0
         self._sweep_outer_m: float = 45.0
@@ -2706,8 +2890,13 @@ class RadarCanvas(SequentialMapCanvas):
         self._feet_y_ratio: float = 0.58
         self._horizon_y_ratio: float = 0.28
         self._offline_sim_active: bool = True
-        self._current_subregion: str = "Altgard"
-        self._current_canonical_region: str = "Altgard"
+        # S016 (v19/P3-8): varsayılan "Altgard" idi — canlı tespit
+        # gelmeden HUD "(Altgard · Altgard)" gösteriyordu; oysa
+        # route_manager.py:198 ve bu dosyadaki canlı tespit yolu
+        # "bilinmiyor asla varsayılan bölgeye düşülmez" der. İlk
+        # tespit gelene kadar "Bilinmiyor" gösterilir.
+        self._current_subregion: str = "Bilinmiyor"
+        self._current_canonical_region: str = "Bilinmiyor"
 
     def get_current_subregion(self) -> str:
         return str(self._current_subregion)
@@ -2716,7 +2905,13 @@ class RadarCanvas(SequentialMapCanvas):
         return str(self._current_canonical_region)
 
     def set_current_subregion(self, subregion: str, canonical_region: Optional[str] = None) -> None:
-        self._current_subregion = str(subregion or "Altgard")
+        # S016 (v19/P3-8): boş girdi eskiden "Altgard" varsayıyordu.
+        if not str(subregion or "").strip():
+            self._current_subregion = "Bilinmiyor"
+            self._current_canonical_region = "Bilinmiyor"
+            self.update()
+            return
+        self._current_subregion = str(subregion)
         self._current_canonical_region = str(canonical_region or resolve_canonical_region(subregion))
         self.update()
 
@@ -2764,7 +2959,9 @@ class RadarCanvas(SequentialMapCanvas):
             return self._filter_show_projections
         if key in ("sweep", "supurme", "radar_sweep"):
             return self._filter_show_sweep
-        return True
+        # Bilinmeyen filtre adı 'açık' sayılmaz; yanlış pozitif filtre durumunu gizlerdi.
+        logger.debug("get_filter: bilinmeyen filtre adı '%s'", filter_name)
+        return False
 
     def get_filters(self) -> Dict[str, bool]:
         return {
@@ -2855,12 +3052,13 @@ class RadarCanvas(SequentialMapCanvas):
                     bh = float(det.get("height", 32.0))
                     return cx, gy, bw, bh
                 elif "x" in det and "y" in det:
+                    # x/y her zaman (merkez_x, zemin_y) demektir; w/h yalnızca
+                    # boyuttur. "w" varken x'i sol-üst saymak, w yokken merkez
+                    # saymakla çelişiyordu.
                     x = float(det["x"])
                     y = float(det["y"])
                     bw = float(det.get("w", det.get("width", 32.0)))
                     bh = float(det.get("h", det.get("height", 32.0)))
-                    if "w" in det:
-                        return x + bw * 0.5, y + bh, bw, bh
                     return x, y, bw, bh
             elif hasattr(det, "x1") and hasattr(det, "y1"):
                 x1, y1 = float(det.x1), float(det.y1)
@@ -2947,13 +3145,14 @@ class RadarCanvas(SequentialMapCanvas):
                 bh *= float(fh)
 
             raw_label = ""
-            conf = 0.90
+            # P1-4 (K-07): güveni olmayan kutu 0.90 sayılmaz — bilinmiyorsa 0.0.
+            conf = 0.0
             if isinstance(raw_det, dict):
                 raw_label = str(raw_det.get("class_name") or raw_det.get("name") or raw_det.get("label") or raw_det.get("cls") or "resource")
-                conf = float(raw_det.get("confidence", raw_det.get("conf", raw_det.get("score", 0.90))))
+                conf = _detection_confidence(raw_det, 0.0)
             elif hasattr(raw_det, "class_name"):
                 raw_label = str(raw_det.class_name)
-                conf = float(getattr(raw_det, "confidence", 0.90))
+                conf = _detection_confidence(raw_det, 0.0)
 
             if conf > 1.0:
                 conf /= 100.0
@@ -2969,20 +3168,20 @@ class RadarCanvas(SequentialMapCanvas):
             # 2. Dikey Perspektif Zemin Mesafesi (Ground Distance in Meters)
             if sy >= feet_y:
                 foot_norm = max(0.0, min(1.0, (sy - feet_y) / max(1.0, float(fh) - feet_y)))
-                ground_dist = max(1.5, 5.5 * (1.0 - foot_norm * 0.78))
+                ground_dist = max(_PROJ_NEAR_DIST_M, _PROJ_FEET_BASE_M * (1.0 - foot_norm * _PROJ_FEET_FALLOFF))
                 if bh > 4.0:
-                    apparent_dist = (160.0 / max(8.0, float(bh))) * 4.5
+                    apparent_dist = (_PROJ_APPARENT_REF_H_PX / max(_PROJ_APPARENT_MIN_H_PX, float(bh))) * _PROJ_APPARENT_SCALE
                     dist_m = min(ground_dist, apparent_dist) if apparent_dist < ground_dist else (0.85 * ground_dist + 0.15 * min(10.0, apparent_dist))
                 else:
                     dist_m = ground_dist
             else:
                 ground_norm = max(0.01, min(1.0, (feet_y - sy) / max(1.0, feet_y - horizon_y)))
-                dist_m = 6.0 + 39.0 * (ground_norm ** 1.35)
+                dist_m = _PROJ_BEYOND_FEET_BASE_M + _PROJ_BEYOND_FEET_SPAN_M * (ground_norm ** _PROJ_BEYOND_FEET_EXP)
                 if bh > 4.0:
-                    apparent_dist = (160.0 / max(8.0, float(bh))) * 4.5
+                    apparent_dist = (_PROJ_APPARENT_REF_H_PX / max(_PROJ_APPARENT_MIN_H_PX, float(bh))) * _PROJ_APPARENT_SCALE
                     dist_m = 0.65 * dist_m + 0.35 * min(55.0, max(2.0, apparent_dist))
 
-            dist_m = float(np.clip(dist_m, 1.5, 55.0))
+            dist_m = float(np.clip(dist_m, _PROJ_NEAR_DIST_M, _PROJ_FAR_DIST_M))
 
             category, color_hex, shape = self._classify_detection_label(raw_label)
 
@@ -3066,7 +3265,11 @@ class RadarCanvas(SequentialMapCanvas):
                 rel_dy = (ny - 0.545) * 115.0
 
             dist_px = math.hypot(float(rel_dx), float(rel_dy))
-            conf = float(det.get("confidence", 0.95))
+            # P1-4 (K-07): eksik güven 0.95 sayılmaz — bilinmiyorsa 0.0.
+            # Böylece güveni bilinmeyen tespit, oyuncu kleransı içinde
+            # (conf < 0.72) elenir; `classify_minimap_crop_bgr` zaten aynı
+            # kuralı 0.0 varsayımıyla uygular.
+            conf = _detection_confidence(det, 0.0)
 
             # 0.075 oyuncu kleransı: Oyuncuya çok yakın sahte canavar/filiz filtreleme (güven >= 0.72 olan filiz korunur)
             if dist_px <= gather_clearance_px and conf < 0.72:
@@ -3085,20 +3288,22 @@ class RadarCanvas(SequentialMapCanvas):
                 category = "enemy"
                 color_hex = "#ef4444"
                 shape = "cross"
-                class_id = 11
-                class_name = "minimap_monster_negative"
+                class_id = MINIMAP_MONSTER_DOT_CLASS_ID
+                # P1-1: canonical taxonomy name — "minimap_monster_negative"
+                # is not a class name; hostility lives in is_hostile/kind.
+                class_name = MINIMAP_MONSTER_DOT_CLASS_NAME
             elif "monster" in kind.lower() or not is_gatherable:
                 category = "enemy"
                 color_hex = "#f87171"
                 shape = "cross"
-                class_id = 11
-                class_name = "minimap_monster_dot"
+                class_id = MINIMAP_MONSTER_DOT_CLASS_ID
+                class_name = MINIMAP_MONSTER_DOT_CLASS_NAME
             else:
                 category = "sprout"
                 color_hex = "#22d3ee"
                 shape = "double_circle"
-                class_id = 9
-                class_name = "minimap_sprout"
+                class_id = MINIMAP_SPROUT_CLASS_ID
+                class_name = MINIMAP_SPROUT_CLASS_NAME
 
             item = {
                 "source": "minimap",
@@ -3165,7 +3370,33 @@ class RadarCanvas(SequentialMapCanvas):
                     sub_info = scanner.identify_subregion(minimap_crop, self._player_pos)
                     if sub_info and sub_info.get("subregion"):
                         self._current_subregion = str(sub_info["subregion"])
-                        self._current_canonical_region = str(sub_info.get("canonical_region", "Altgard"))
+                        # H-sweep (dilim 13): kanonik bölge bilinmiyorsa
+                        # (None) son bilinen bölge korunur — "Altgard"
+                        # varsayılmaz, str(None) = "None" yazılmaz.
+                        # (identify_subregion bilinmeyende canonical None
+                        # döner; anahtar yoksa da .get() None verir.)
+                        _canon = sub_info.get("canonical_region")
+                        if _canon:
+                            self._current_canonical_region = str(_canon)
+                        # Görev 4: canlı bölge tespitini RouteManager'a ilet.
+                        # Yalnızca mekansal bbox tespiti güvenilirdir; başlık
+                        # şablonları yalnızca Altgard adlarını içerir, o yüzden
+                        # başlık sonucu korumayı beslemez (yalnız görüntü).
+                        try:
+                            routes = getattr(self, "routes", None)
+                            note = getattr(routes, "note_detected_region", None)
+                            if (
+                                callable(note)
+                                and str(sub_info.get("source", "")) == "spatial_bbox"
+                                and float(sub_info.get("confidence", 0.0) or 0.0) >= 0.45
+                            ):
+                                note(
+                                    sub_info.get("canonical_region"),
+                                    confidence=float(sub_info.get("confidence", 0.0) or 0.0),
+                                    source="spatial_bbox",
+                                )
+                        except Exception as _det_exc:
+                            logger.debug("Bölge tespiti RouteManager'a iletilemedi: %s", _det_exc)
 
                     mats, mobs = classify_minimap_crop_bgr(minimap_crop)
                     combined_dets = list(mats) + list(mobs)
@@ -3313,13 +3544,19 @@ class RadarCanvas(SequentialMapCanvas):
         for gy in range(oy, h, step):
             painter.drawLine(0, gy, w, gy)
 
-        font = QFont("Segoe UI", 8)
+        font = QFont("Segoe UI", 9)
         painter.setFont(font)
-        painter.setPen(QColor(100, 116, 139, 140))
+        # Not: HUD kutusu (12,12,340,46) tuvalin sol üstünü kaplar; ızgara başlığı
+        # HUD'un altına (y=64) taşındı — aksi halde HUD dikdörtgeninin altında
+        # kalıp hiç görünmüyordu (paintEvent'de HUD ızgaradan sonra çizilir).
+        painter.setPen(QColor(100, 116, 139, 175))
         painter.drawText(
-            QRectF(14.0, 14.0, 320.0, 20.0),
+            QRectF(14.0, 64.0, 320.0, 22.0),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            "● RADAR KOORDİNAT REFERANS IZGARASI (Ölçek: 0.28m/px)",
+            # v19 P1-7/P1-12: ölçek etiketi artık sabit yazı değil — o an
+            # kullanılan _meters_per_pixel değerini gösterir (kalibrasyon
+            # sonrası da doğru kalır).
+            "● RADAR KOORDİNAT REFERANS IZGARASI (Ölçek: %.2fm/px)" % float(self._meters_per_pixel),
         )
 
     def _draw_concentric_radar_rings_and_sweep(self, painter: QPainter, center: QPointF) -> None:
@@ -3345,7 +3582,7 @@ class RadarCanvas(SequentialMapCanvas):
         painter.drawEllipse(center, r_inner, r_inner)
 
         # Mesafe etiketleri (10m, 25m, 45m)
-        dist_font = QFont("Segoe UI", 7, QFont.Weight.Bold)
+        dist_font = QFont("Segoe UI", 8, QFont.Weight.Bold)
         painter.setFont(dist_font)
         painter.setPen(QColor("#6ee7b7"))
         painter.drawText(QPointF(center.x() + 4.0, center.y() - r_inner + 9.0), "10m")
@@ -3430,8 +3667,9 @@ class RadarCanvas(SequentialMapCanvas):
         if nearest is None:
             return
 
-        nx = float(nearest.get("map_x", nearest.get("x", 0.0)))
-        ny = float(nearest.get("map_y", nearest.get("y", 0.0)))
+        # En yakın düğüm de diğer düğümler gibi HD/norm çözümlemesinden
+        # geçirilir; ham map_x/map_y HD modunda yanlış noktaya vektör çizer.
+        nx, ny = self._resolved_xy(nearest)
         t_wpt = self._map_to_widget(self._raw_to_map_coords(nx, ny))
 
         dx = t_wpt.x() - p_wpt.x()
@@ -3472,11 +3710,11 @@ class RadarCanvas(SequentialMapCanvas):
         mid_y = (p_wpt.y() + t_wpt.y()) * 0.5
         target_name = str(nearest.get("resource_type") or nearest.get("name") or "Hedef")
         badge_text = f"🧭 {dist_m:.1f}m ➔ {target_name} [#1]"
-        badge_font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        badge_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
         painter.setFont(badge_font)
         fm = painter.fontMetrics()
         bw = max(40.0, float(fm.horizontalAdvance(badge_text)) + 12.0)
-        bh = 17.0
+        bh = 19.0
         badge_rect = QRectF(mid_x - bw * 0.5, mid_y - bh * 0.5 - 12.0, bw, bh)
 
         painter.setPen(QPen(QColor("#facc15"), 1.2))
@@ -3499,7 +3737,10 @@ class RadarCanvas(SequentialMapCanvas):
 
     def _draw_3d_projected_markers(self, painter: QPainter, player_center: QPointF) -> None:
         """3B Kamera YZ tespitlerini radar üzerine renk kodlu semboller ve mesafe etiketleriyle çizer."""
-        font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        # Not: det["map_x"/"map_y"] projeksiyon çıktısıdır; oyuncu konumu / baz
+        # pixmap üzerinden zaten tuval harita çerçevesindedir. _resolved_xy
+        # ile yeniden çözmek HD modunda çift dönüşüm yapar, uygulanmaz.
+        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
         for det in self._live_3d_projections:
             cat = str(det.get("category", "default"))
             if cat == "enemy" and not self._filter_show_enemies:
@@ -3575,7 +3816,10 @@ class RadarCanvas(SequentialMapCanvas):
 
     def _draw_minimap_projected_markers(self, painter: QPainter) -> None:
         """Minimap'ten tespit edilen filizleri çift halka ve rozetlerle çizer."""
-        font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        # Not: mat["map_x"/"map_y"] project_minimap_detections çıktısıdır ve
+        # zaten tuval harita çerçevesindedir; _resolved_xy ile yeniden çözmek
+        # HD modunda çift dönüşüm yapar, uygulanmaz.
+        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
         for mat in self._live_minimap_detections:
             cat = str(mat.get("category", "sprout"))
             if cat == "enemy" and not self._filter_show_enemies:
@@ -3605,7 +3849,7 @@ class RadarCanvas(SequentialMapCanvas):
                 painter.setBrush(QBrush(QColor("#10b981")))
                 painter.drawEllipse(wpt, 5.0, 5.0)
 
-                pill_rect = QRectF(wpt.x() + 11.0, wpt.y() - 7.0, 24.0, 14.0)
+                pill_rect = QRectF(wpt.x() + 11.0, wpt.y() - 8.0, 26.0, 16.0)
                 painter.setPen(QPen(QColor("#22d3ee"), 1.2))
                 painter.setBrush(QBrush(QColor(6, 46, 42, 220)))
                 painter.drawRoundedRect(pill_rect, 3.5, 3.5)
@@ -3616,15 +3860,15 @@ class RadarCanvas(SequentialMapCanvas):
     def _draw_radar_hud_overlay(self, painter: QPainter) -> None:
         """Sağ üstte/sol üstte canlı durum, yakınlaştırma ve aktif filtre durumunu gösteren taktiksel gösterge."""
         hud_w = 340.0
-        hud_h = 42.0
+        hud_h = 46.0
         hud_rect = QRectF(12.0, 12.0, hud_w, hud_h)
 
         painter.setPen(QPen(QColor(51, 65, 85, 200), 1.0))
         painter.setBrush(QBrush(QColor(15, 23, 42, 225)))
         painter.drawRoundedRect(hud_rect, 6.0, 6.0)
 
-        font_b = QFont("Segoe UI", 8, QFont.Weight.Bold)
-        font_s = QFont("Segoe UI", 8)
+        font_b = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        font_s = QFont("Segoe UI", 9)
         painter.setFont(font_b)
 
         zone_info = f"({self._current_canonical_region} · {self._current_subregion})"
@@ -3635,7 +3879,7 @@ class RadarCanvas(SequentialMapCanvas):
             painter.setPen(QColor("#f59e0b"))
             status_text = f"● REFERANS SİMÜLASYONU {zone_info}"
 
-        painter.drawText(QRectF(20.0, 16.0, 315.0, 16.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, status_text)
+        painter.drawText(QRectF(20.0, 16.0, 315.0, 18.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, status_text)
 
         painter.setFont(font_s)
         painter.setPen(QColor("#94a3b8"))
@@ -3647,7 +3891,7 @@ class RadarCanvas(SequentialMapCanvas):
             f"{'Rota ' if self._filter_show_path else ''}"
             f"{'3B YZ' if self._filter_show_projections else ''}"
         )
-        painter.drawText(QRectF(20.0, 32.0, 300.0, 16.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, filter_str)
+        painter.drawText(QRectF(20.0, 34.0, 300.0, 18.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, filter_str)
 
 
 class CartographyRadarDialog(QDialog):
@@ -3695,13 +3939,16 @@ class CartographyRadarDialog(QDialog):
         self.routes = route_manager or kwargs.get("routes")
         self.cartography_engine = cartography_engine or kwargs.get("auto_cartographer")
         self.planner = sequential_planner if sequential_planner is not None else SequentialRoutePlanner(
-            meters_per_pixel=float(getattr(self.routes, "meters_per_pixel", 0.28) or 0.28)
+            meters_per_pixel=float(getattr(self.routes, "meters_per_pixel", WORLD_MAP_METERS_PER_PX) or WORLD_MAP_METERS_PER_PX)
         )
 
         self._region_name: str = region_name or self._resolve_active_region()
         self._route_name: str = route_name or self._resolve_active_route()
         self._explicit_map_path: Optional[str] = map_image_path
         self._loaded_map_path: str = ""
+        # Görev 4: bölgeye ait HD harita görseli yoksa bölge adı burada tutulur
+        # ("bu bölge için harita yok" durumu; Altgard görseli kullanılmaz).
+        self._map_missing_for_region: str = ""
         self._hd_map_active: bool = False
         self._auto_cartography_enabled: bool = True
         initial_nodes = kwargs.get("ordered_nodes") or kwargs.get("nodes")
@@ -3726,7 +3973,8 @@ class CartographyRadarDialog(QDialog):
                         return str(reg)
         except Exception as exc:
             logger.debug("Could not resolve active_region: %s", exc)
-        return "Verteron"
+        # Varsayılan bölge Altgard'dır; harita Altgard karesidir (Verteron değil).
+        return "Altgard"
 
     def _resolve_active_route(self) -> str:
         try:
@@ -3765,11 +4013,11 @@ class CartographyRadarDialog(QDialog):
                 background-color: #1c2533;
                 border: 1px solid #2d3b4e;
                 border-radius: 6px;
-                padding: 4px 8px;
+                padding: 6px 10px;
             }
             QLabel#StatTitle {
                 color: #94a3b8;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 600;
             }
             QLabel#StatValue {
@@ -3827,14 +4075,14 @@ class CartographyRadarDialog(QDialog):
         )
 
         root_layout = wrap_shell_tab_root_layout(self, "radar")
-        root_layout.setSpacing(8)
+        root_layout.setSpacing(10)
 
         # 1. ÜST KONTROL ÇUBUĞU. Sayaçlar sağ sütunda; haritanın üstüne binmez.
         self.top_bar = QFrame(self)
         self.top_bar.setObjectName("TopStatsBar")
         top_layout = QHBoxLayout(self.top_bar)
-        top_layout.setContentsMargins(12, 8, 12, 8)
-        top_layout.setSpacing(10)
+        top_layout.setContentsMargins(14, 10, 14, 10)
+        top_layout.setSpacing(12)
 
         self.lbl_status_prefix = QLabel(
             "Canlı Oto-Haritalama ve Minimap Radarı:", self.top_bar
@@ -3857,7 +4105,7 @@ class CartographyRadarDialog(QDialog):
         top_layout.addWidget(self.btn_stop_discovery)
 
         # Filtre ve Yakınlaştırma (Zoom/Pan) Kontrolleri (Worker MR4)
-        top_layout.addSpacing(8)
+        top_layout.addSpacing(12)
         sep_filters = QFrame(self.top_bar)
         sep_filters.setFrameShape(QFrame.Shape.VLine)
         sep_filters.setStyleSheet("color: #334155;")
@@ -3926,7 +4174,7 @@ class CartographyRadarDialog(QDialog):
         top_layout.addWidget(sep_select)
 
         self.lbl_material_filter = QLabel("🎯 Seç-Topla Filtresi:", self.top_bar)
-        self.lbl_material_filter.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 11px;")
+        self.lbl_material_filter.setStyleSheet("color: #38bdf8; font-weight: bold; font-size: 12px;")
         top_layout.addWidget(self.lbl_material_filter)
 
         self.combo_material_filter = QComboBox(self.top_bar)
@@ -3938,10 +4186,10 @@ class CartographyRadarDialog(QDialog):
                 color: #ffffff;
                 border: 1px solid #0284c7;
                 border-radius: 4px;
-                padding: 3px 8px;
-                font-size: 11px;
+                padding: 5px 10px;
+                font-size: 12px;
                 font-weight: bold;
-                min-width: 140px;
+                min-width: 160px;
             }
             QComboBox::drop-down { border: 0px; }
             QComboBox QAbstractItemView {
@@ -3982,8 +4230,8 @@ class CartographyRadarDialog(QDialog):
                 color: #ffffff;
                 border: 1px solid #38bdf8;
                 border-radius: 4px;
-                padding: 4px 10px;
-                font-size: 11px;
+                padding: 6px 12px;
+                font-size: 12px;
                 font-weight: bold;
             }
             QPushButton:hover {
@@ -3999,7 +4247,7 @@ class CartographyRadarDialog(QDialog):
         # 2. ORTA BÖLÜM: RADAR TUVALİ + SAĞ ÜST MİNİMAP CANLI KIRPMA & FİLTRE PANELİ
         middle_layout = QHBoxLayout()
         middle_layout.setContentsMargins(0, 0, 0, 0)
-        middle_layout.setSpacing(8)
+        middle_layout.setSpacing(10)
 
         self.canvas = RadarCanvas(self)
         self.canvas.setMinimumSize(240, 200)
@@ -4010,10 +4258,10 @@ class CartographyRadarDialog(QDialog):
         # Sağ sütun: kontroller haritanın üstüne binmez.
         self.minimap_side_panel = QFrame(self)
         self.minimap_side_panel.setObjectName("MinimapSidePanel")
-        self.minimap_side_panel.setFixedWidth(268)
+        self.minimap_side_panel.setFixedWidth(284)
         side_layout = QVBoxLayout(self.minimap_side_panel)
-        side_layout.setContentsMargins(10, 10, 10, 10)
-        side_layout.setSpacing(8)
+        side_layout.setContentsMargins(12, 12, 12, 12)
+        side_layout.setSpacing(10)
 
         self.lbl_hybrid_scanner_title = QLabel(
             "3B Dünya + Sağ Üst Minimap Hibrit Tarayıcı", self.minimap_side_panel
@@ -4031,7 +4279,7 @@ class CartographyRadarDialog(QDialog):
             self.minimap_side_panel,
         )
         self.lbl_minimap_sub.setWordWrap(True)
-        self.lbl_minimap_sub.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.lbl_minimap_sub.setStyleSheet("color: #94a3b8; font-size: 12px;")
         side_layout.addWidget(self.lbl_minimap_sub)
 
         self.minimap_preview_widget = MinimapLiveCropPreviewWidget(self.minimap_side_panel)
@@ -4041,7 +4289,7 @@ class CartographyRadarDialog(QDialog):
         self.lbl_minimap_filter_stats = QLabel(self.minimap_side_panel)
         self.lbl_minimap_filter_stats.setWordWrap(True)
         self.lbl_minimap_filter_stats.setStyleSheet(
-            "color: #a7f3d0; font-size: 11px; font-weight: 600;"
+            "color: #a7f3d0; font-size: 12px; font-weight: 600;"
         )
         side_layout.addWidget(self.lbl_minimap_filter_stats)
 
@@ -4083,14 +4331,15 @@ class CartographyRadarDialog(QDialog):
         self.bottom_bar = QFrame(self)
         self.bottom_bar.setObjectName("BottomControlBar")
         bottom_layout = QHBoxLayout(self.bottom_bar)
-        bottom_layout.setContentsMargins(12, 8, 12, 8)
-        bottom_layout.setSpacing(8)
+        bottom_layout.setContentsMargins(14, 10, 14, 10)
+        bottom_layout.setSpacing(10)
 
         self.btn_sort_smooth = QPushButton(
             "Sıralı Rotayı Optimize Et", self.bottom_bar
         )
         self.btn_sort_smooth.setObjectName("PrimarySortBtn")
         self.btn_sort_smooth.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sort_smooth.setMinimumHeight(32)
         self.btn_sort_smooth.clicked.connect(self.sort_smooth_sequential_loop)
         bottom_layout.addWidget(self.btn_sort_smooth)
 
@@ -4098,6 +4347,7 @@ class CartographyRadarDialog(QDialog):
             "Gezdiğim Sırayla Diz", self.bottom_bar
         )
         self.btn_sort_walk.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sort_walk.setMinimumHeight(32)
         self.btn_sort_walk.clicked.connect(self.sort_by_walk_path)
         bottom_layout.addWidget(self.btn_sort_walk)
 
@@ -4105,6 +4355,7 @@ class CartographyRadarDialog(QDialog):
             "Koridor Şerit Sırası", self.bottom_bar
         )
         self.btn_sort_corridor.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sort_corridor.setMinimumHeight(32)
         self.btn_sort_corridor.clicked.connect(self.sort_corridor_sweep)
         bottom_layout.addWidget(self.btn_sort_corridor)
 
@@ -4112,6 +4363,7 @@ class CartographyRadarDialog(QDialog):
             "Sırayı Ters Çevir", self.bottom_bar
         )
         self.btn_reverse_order.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reverse_order.setMinimumHeight(32)
         self.btn_reverse_order.clicked.connect(self.reverse_node_order)
         bottom_layout.addWidget(self.btn_reverse_order)
 
@@ -4120,6 +4372,7 @@ class CartographyRadarDialog(QDialog):
         self.btn_save_route = QPushButton("Sıralı Rotayı Kaydet", self.bottom_bar)
         self.btn_save_route.setObjectName("SaveRouteBtn")
         self.btn_save_route.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_save_route.setMinimumHeight(32)
         self.btn_save_route.clicked.connect(self.save_sequential_route)
         bottom_layout.addWidget(self.btn_save_route)
 
@@ -4138,8 +4391,8 @@ class CartographyRadarDialog(QDialog):
         card = QFrame(parent_widget or self.top_bar)
         card.setObjectName("StatCard")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(8, 3, 8, 3)
-        card_layout.setSpacing(1)
+        card_layout.setContentsMargins(10, 5, 10, 5)
+        card_layout.setSpacing(3)
 
         lbl_title = QLabel(title, card)
         lbl_title.setObjectName("StatTitle")
@@ -4287,6 +4540,34 @@ class CartographyRadarDialog(QDialog):
                     existing["harvest_count"] = int(existing.get("harvest_count", 0) or 0)
                     existing["stack_badge"] = f"{stack_cnt}x"
                     existing["harvest_badge"] = f"{existing['harvest_count']}/{stack_cnt}"
+                    # Yığın güncellemesi kalıcı depoya da yazılır; önceden
+                    # yalnızca bellek içi _ordered_nodes güncelleniyordu.
+                    if self.routes is not None and hasattr(self.routes, "data") and isinstance(self.routes.data, dict):
+                        reg_data = self.routes.data.setdefault("regions", {}).setdefault(
+                            self._region_name, {"nodes": [], "routes": {self._route_name: []}}
+                        )
+                        nodes_list = reg_data.setdefault("nodes", [])
+                        stored = None
+                        existing_id = existing.get("id")
+                        for cand in nodes_list:
+                            if not isinstance(cand, dict):
+                                continue
+                            if existing_id is not None and cand.get("id") == existing_id:
+                                stored = cand
+                                break
+                            if math.hypot(
+                                float(cand.get("map_x", 0)) - target_x,
+                                float(cand.get("map_y", 0)) - target_y,
+                            ) <= 14.0:
+                                stored = cand
+                                break
+                        if stored is not None:
+                            stored["source_type"] = "minimap_auto"
+                            stored["minimap_auto"] = True
+                            stored["stack_count"] = stack_cnt
+                            stored["max_harvests"] = stack_cnt
+                            stored["stack_badge"] = f"{stack_cnt}x"
+                            stored["harvest_badge"] = existing["harvest_badge"]
                     self.canvas.trigger_discovery_pulse(
                         target_x,
                         target_y,
@@ -4345,11 +4626,74 @@ class CartographyRadarDialog(QDialog):
             self.canvas.set_sequential_nodes(self._ordered_nodes)
             self._refresh_metrics_bar()
             self._refresh_minimap_filter_stats()
+            # K-19: düğümler yukarıda yalnızca bellek içi sözlüklere
+            # (self._ordered_nodes / routes.data) yazıldı; "kaydedildi"
+            # raporu gerçek disk yazımına bağlanır. Kayıt sonucu ne olursa
+            # olsun dönüş değeri (kaydedilen düğüm listesi) değişmez.
+            persist_ok: Optional[bool] = None
+            persist_error: Optional[str] = None
+            if recorded_nodes and self.routes is not None:
+                try:
+                    if hasattr(self.routes, "save_region"):
+                        persist_ok = self.routes.save_region(self._region_name) is not False
+                    elif hasattr(self.routes, "save_data"):
+                        persist_ok = self.routes.save_data() is not False
+                except Exception as exc:
+                    persist_ok = False
+                    persist_error = str(exc)
+                if persist_ok:
+                    # Doğrulama: save_region True dönse bile, yukarıdaki
+                    # yazımlar legacy `data` dalına gittiği için
+                    # save_region içindeki senkron koşulu tutmazsa
+                    # düğümler diske ulaşmamış olabilir. Kayıtta id'leri
+                    # arayarak "kaydedildi" raporunu gerçekten doğrula.
+                    try:
+                        wanted_ids = {
+                            int(n.get("id", 0))
+                            for n in recorded_nodes
+                            if isinstance(n, dict) and n.get("id") is not None
+                        }
+                        stored_ids = set()
+                        regions_map = getattr(self.routes, "_regions", None)
+                        if isinstance(regions_map, dict):
+                            for key in (self._region_name, resolve_canonical_region(self._region_name)):
+                                info = regions_map.get(key)
+                                if isinstance(info, dict):
+                                    for n in info.get("nodes", []):
+                                        nid = getattr(n, "id", None)
+                                        if nid is None and isinstance(n, dict):
+                                            nid = n.get("id")
+                                        if nid is not None:
+                                            stored_ids.add(int(nid))
+                        if wanted_ids and not wanted_ids <= stored_ids:
+                            persist_ok = False
+                            persist_error = (
+                                "kayda yazılmayan düğümler: "
+                                f"{sorted(wanted_ids - stored_ids)}"
+                            )
+                    except Exception as exc:
+                        logger.warning("Minimap kayıt doğrulaması yapılamadı: %s", exc)
             self.minimap_materials_recorded.emit(list(recorded_nodes))
-            logger.info(
-                "Minimap'ten %d toplanabilir materyal rotaya kaydedildi (canavarlar yoksayıldı).",
-                len(recorded_nodes),
-            )
+            if not recorded_nodes:
+                logger.info("Minimap'ten kaydedilecek materyal bulunamadı.")
+            elif persist_ok is True:
+                logger.info(
+                    "Minimap'ten %d toplanabilir materyal rotaya kaydedildi (canavarlar yoksayıldı).",
+                    len(recorded_nodes),
+                )
+            elif persist_ok is False:
+                logger.error(
+                    "Minimap'ten %d toplanabilir materyal belleğe alındı ancak kalıcı depoya yazılamadı (%s/%s)%s; yeniden yüklemede kaybolur.",
+                    len(recorded_nodes),
+                    self._region_name,
+                    self._route_name,
+                    f": {persist_error}" if persist_error else "",
+                )
+            else:
+                logger.warning(
+                    "Minimap'ten %d toplanabilir materyal belleğe alındı; kalıcı depoya yazılmadı (RouteManager bağlı değil).",
+                    len(recorded_nodes),
+                )
             return recorded_nodes
         except Exception as exc:
             logger.error("record_minimap_now hatası: %s", exc)
@@ -4395,9 +4739,21 @@ class CartographyRadarDialog(QDialog):
             candidates.append((self._explicit_map_path, is_f18))
 
         region_key = (self._region_name or "").strip().lower()
-        hd_path = hd_zone_map_path()
-        if region_key in ("", "altgard") and os.path.isfile(hd_path):
-            candidates.append((hd_path, False))
+        # Görev 4 — bölgeye duyarlı harita seçimi: Altgard görseli yalnızca
+        # bölge Altgard (veya bilinmiyor) ise adaydır. Başka bölgede kendi
+        # görseli yoksa Altgard haritası kullanılmaz; mozaik yedeğe düşülür.
+        self._map_missing_for_region = ""
+        for hd_candidate in region_map_candidates(self._region_name):
+            if os.path.isfile(hd_candidate):
+                candidates.append((hd_candidate, False))
+        if region_key not in ("", "altgard") and not candidates:
+            self._map_missing_for_region = str(self._region_name or region_key)
+            logger.warning(
+                "'%s' bölgesi için HD harita görseli yok (assets/maps/%s.png); "
+                "Altgard haritası kullanılmıyor, mozaik yedeğe düşülüyor.",
+                self._region_name,
+                region_key,
+            )
 
         safe_reg = "".join(
             c if c.isalnum() or c in ("_", "-") else "_"
@@ -4420,10 +4776,14 @@ class CartographyRadarDialog(QDialog):
                 "video_frames",
                 "frame_18s.jpg",
             )
-        if os.path.exists(frame18_path):
+        # frame_18s.jpg Altgard dünya haritası kırpmasıdır; başka bölgede yedek olamaz.
+        if os.path.exists(frame18_path) and is_altgard_map_region(self._region_name):
             candidates.append((frame18_path, True))
 
-        hd_abs = os.path.abspath(hd_path) if hd_path else ""
+        # HD fit yalnızca Altgard haritasına özeldir (2258×2400 affine);
+        # başka bölge haritası (örn. Verteron 2303×2400) bu fiti almaz,
+        # orantılı ölçekle çizilir (Verteron fiti henüz kalibre değil).
+        hd_abs = os.path.abspath(hd_zone_map_path())
         for path, should_crop_f18 in candidates:
             try:
                 img = QImage(path)
@@ -4505,10 +4865,17 @@ class CartographyRadarDialog(QDialog):
             if hasattr(self.routes, "data") and isinstance(self.routes.data, dict):
                 regions = self.routes.data.get("regions", {})
                 reg_data = regions.get(self._region_name)
-                if reg_data is None and regions:
-                    first_reg = next(iter(regions.keys()))
-                    self._region_name = first_reg
-                    reg_data = regions.get(first_reg, {})
+                if reg_data is None:
+                    # İstenen bölge yoksa sessizce ilk bölgeye geçilmez;
+                    # mevcut düğümler korunur, durum loglanır.
+                    if regions:
+                        logger.warning(
+                            "İstenen bölge '%s' bulunamadı; ilk bölgeye geçilmiyor "
+                            "(mevcut bölgeler: %s).",
+                            self._region_name,
+                            sorted(str(k) for k in regions.keys()),
+                        )
+                    reg_data = {}
                 if isinstance(reg_data, dict):
                     for n in reg_data.get("nodes", []):
                         if isinstance(n, dict):
@@ -4534,84 +4901,84 @@ class CartographyRadarDialog(QDialog):
         self, nodes: List[Dict[str, Any]], pixmap: QPixmap
     ) -> List[Tuple[float, float]]:
         """
-        Eğer dışarıdan bir yürüyüş izi verilmemişse mevcut düğümler boyunca
-        doğal bir oyuncu yürüyüş izi (walk_trajectory) üretir.
-        """
-        if not nodes:
-            pw = float(pixmap.width() if not pixmap.isNull() else 800)
-            ph = float(pixmap.height() if not pixmap.isNull() else 500)
-            return [
-                (pw * 0.18, ph * 0.25),
-                (pw * 0.35, ph * 0.28),
-                (pw * 0.55, ph * 0.42),
-                (pw * 0.72, ph * 0.62),
-            ]
+        F-0643: Sentetik yürüyüş izi ÜRETİLMEZ.
 
-        pts: List[Tuple[float, float]] = []
-        for idx, n in enumerate(nodes):
-            nx = float(n.get("map_x", n.get("x", 0.0)))
-            ny = float(n.get("map_y", n.get("y", 0.0)))
-            pts.append((nx, ny))
-            if idx + 1 < len(nodes):
-                nx2 = float(nodes[idx + 1].get("map_x", nodes[idx + 1].get("x", 0.0)))
-                ny2 = float(nodes[idx + 1].get("map_y", nodes[idx + 1].get("y", 0.0)))
-                mid_x = (nx + nx2) * 0.5 + 8.0 * math.sin(idx + 1.0)
-                mid_y = (ny + ny2) * 0.5 + 8.0 * math.cos(idx + 1.0)
-                pts.append((mid_x, mid_y))
-        return pts
+        Eski davranış düğüm koordinatları arasına sin/cos salınımlı ara
+        noktalar ekleyip bunu oyuncunun gezdiği iz gibi gösteriyordu; o iz
+        gerçek bir yürüyüş kaydı değildir. Yürüyüş izi yalnızca kaydedilmiş
+        oyuncu hareketidir (`set_walk_trajectory` / `append_walk_point`
+        yoluyla gelen gerçek iz). Kayıtlı iz yoksa boş liste döner; düğüm
+        koordinatlarından iz uydurulmaz. (P3-4: "geriye dönük uyumluluk
+        için korunur (çağıran kod kırılmasın)" gerekçesi bayattı — R45
+        çağrıyı reload_map_and_nodes'tan kaldırdığından beri üretimde
+        çağıran kalmadı; yöntem fail-closed bekçi olarak durur: gelecekte
+        biri iz isterse uydurma yerine [] alır. Tek çağıran
+        tests/test_r45_cartography_synthetic_trajectory.py regresyon
+        testidir.) Her zaman [] döner.
+        """
+        return []
 
     def reload_map_and_nodes(self) -> None:
         """Haritayı, sıralı düğümleri, yürüyüş izini ve üst istatistik çubuğunu yeniler."""
         try:
             self._region_name = self._region_name or self._resolve_active_region()
             self._route_name = self._route_name or self._resolve_active_route()
-            self.setWindowTitle(
+            title = (
                 f"Canlı Oto-Haritalama ve Minimap Radarı · {self._region_name} ({self._route_name})"
             )
+            # Görev 4: bölge uyumsuzluğu varsa başlıkta görünür uyarı.
+            try:
+                getter = getattr(self.routes, "get_region_mismatch", None)
+                mismatch = getter() if callable(getter) else None
+            except Exception:
+                mismatch = None
+            if isinstance(mismatch, dict):
+                title += (
+                    f" · ⚠ BÖLGE UYUMSUZLUĞU: {mismatch.get('detected_region')} ≠ "
+                    f"{mismatch.get('active_region')} — rota durduruldu"
+                )
+            self.setWindowTitle(title)
 
             nodes = self._extract_nodes_from_manager()
-            pixmap, offset, map_ref = self._load_region_map_pixmap(nodes)
+            pixmap, _offset, map_ref = self._load_region_map_pixmap(nodes)
             self.planner.set_hd_fit(self._hd_map_active)
             self.planner.set_map_reference(map_ref[0], map_ref[1])
             self.canvas.set_map_reference(map_ref[0], map_ref[1])
             self.canvas.set_hd_fit(self._hd_map_active)
 
-            # Eğer düğümler 0,0 koordinatlıysa veya harita sınırları içindeyse normalize et
+            # Konumu bilinmeyen (0,0) düğüme daire üzerinde uydurma koordinat
+            # verilmez; kayıtlı koordinat aynen bırakılır, eksik konum loglanır.
             pw = max(200, pixmap.width())
             ph = max(200, pixmap.height())
-            for idx, n in enumerate(nodes):
-                mx = float(n.get("map_x", n.get("x", 0.0)))
-                my = float(n.get("map_y", n.get("y", 0.0)))
+            unknown_count = 0
+            for n in nodes:
+                try:
+                    mx = float(n.get("map_x", n.get("x", 0.0)) or 0.0)
+                    my = float(n.get("map_y", n.get("y", 0.0)) or 0.0)
+                except (TypeError, ValueError):
+                    mx, my = 0.0, 0.0
                 if mx <= 0.0 and my <= 0.0:
-                    angle = (2.0 * math.pi * idx) / max(1, len(nodes))
-                    n["map_x"] = int(pw * 0.5 + math.cos(angle) * (pw * 0.30))
-                    n["map_y"] = int(ph * 0.5 + math.sin(angle) * (ph * 0.28))
-
-            if offset != (0, 0) and nodes:
-                max_x = max(self.planner._node_xy(n)[0] for n in nodes)
-                max_y = max(self.planner._node_xy(n)[1] for n in nodes)
-                if max_x <= pw and max_y <= ph:
-                    offset = (0, 0)
-
-            self._ordered_nodes = list(nodes)
-            if not self._walk_trajectory and self._ordered_nodes:
-                resolved_for_walk: List[Dict[str, Any]] = []
-                for n in self._ordered_nodes:
-                    rx, ry = self.planner._node_xy(n)
-                    copy_n = dict(n)
-                    copy_n["map_x"] = rx
-                    copy_n["map_y"] = ry
-                    resolved_for_walk.append(copy_n)
-                self._walk_trajectory = self._generate_default_walk_trajectory(
-                    resolved_for_walk, pixmap
+                    unknown_count += 1
+            if unknown_count:
+                logger.warning(
+                    "Konumu bilinmeyen %d düğüm var (%s); koordinat uydurulmadan bırakıldı.",
+                    unknown_count,
+                    self._region_name,
                 )
 
-            self.canvas.set_map_pixmap(pixmap, coord_offset=offset, map_ref_size=map_ref)
+            self._ordered_nodes = list(nodes)
+            # F-0643: Kayıtlı yürüyüş izi yoksa düğümlerden sentetik iz
+            # üretilmez ve oyuncu konumu izden/düğümden uydurulmaz.
+            # Yürüyüş izi yalnızca kaydedilmiş gerçek oyuncu hareketidir
+            # (set_walk_trajectory / append_walk_point); oyuncu konumu ise
+            # yalnızca canlı kareden (update_live_frame) veya app_shell
+            # üzerinden gelen gerçek konumdan alınır. Burada iz yoksa iz
+            # boş kalır, oyuncu konumu da önceki gerçek değerinde (veya
+            # bilinmiyorsa None) kalır; sabit 45° bakış açısıyla son
+            # düğüme konum atanmaz.
+            self.canvas.set_map_pixmap(pixmap, map_ref_size=map_ref)
             self.canvas.set_sequential_nodes(self._ordered_nodes)
             self.canvas.set_walk_trajectory(self._walk_trajectory)
-            if self._walk_trajectory:
-                lx, ly = self._walk_trajectory[-1]
-                self.canvas.set_player_position(lx, ly, angle_deg=45.0)
 
             self._refresh_metrics_bar()
             self._refresh_minimap_filter_stats()
@@ -4898,6 +5265,16 @@ class CartographyRadarDialog(QDialog):
             for seq_idx, node_dict in enumerate(self._ordered_nodes, start=1):
                 node_dict["seq_index"] = seq_idx
 
+            persist_ok = True
+            if self.routes is None:
+                # K-19: kalıcı depo bağlı değilken "kaydedildi" dönmek yalan
+                # olur — sıralama yalnızca bellekte (_ordered_nodes) durur.
+                logger.error(
+                    "Sıralı rota kalıcı depoya yazılamadı (%s/%s): RouteManager bağlı değil; sıralama yalnızca bellekte.",
+                    self._region_name,
+                    self._route_name,
+                )
+                return False
             if self.routes is not None:
                 try:
                     # Yeni RouteManager (_regions sözlüğü ve NodeData listesi) uyumluluğu
@@ -4905,6 +5282,10 @@ class CartographyRadarDialog(QDialog):
                         self.routes._regions, dict
                     ):
                         reg_info = self.routes._regions.get(self._region_name)
+                        if reg_info is None:
+                            reg_info = self.routes._regions.get(
+                                resolve_canonical_region(self._region_name)
+                            )
                         if isinstance(reg_info, dict) and "nodes" in reg_info:
                             existing_nodes = reg_info["nodes"]
                             id_to_obj = {int(getattr(n, "id", 0)): n for n in existing_nodes}
@@ -4919,22 +5300,47 @@ class CartographyRadarDialog(QDialog):
                                     reordered_objs.append(rem_obj)
                             reg_info["nodes"] = reordered_objs
                             if hasattr(self.routes, "save_region"):
-                                self.routes.save_region(self._region_name)
+                                if self.routes.save_region(self._region_name) is False:
+                                    persist_ok = False
                             elif hasattr(self.routes, "save_data"):
-                                self.routes.save_data()
+                                if self.routes.save_data() is False:
+                                    persist_ok = False
+                        else:
+                            logger.warning(
+                                "Sıralı rota yazılamadı: '%s' bölgesi RouteManager'da yok.",
+                                self._region_name,
+                            )
+                            persist_ok = False
                     elif hasattr(self.routes, "data") and isinstance(self.routes.data, dict):
-                        reg_data = self.routes.data.get("regions", {}).get(
-                            self._region_name, {}
-                        )
+                        # Canlı sözlüğe yazılır; .get(..., {}) ile alınan kopuk
+                        # sözlüğe yazmak kalıcı depoya ulaşmazdı.
+                        regions = self.routes.data.setdefault("regions", {})
+                        if not isinstance(regions, dict):
+                            regions = {}
+                            self.routes.data["regions"] = regions
+                        reg_data = regions.get(self._region_name)
+                        if reg_data is None:
+                            reg_data = {}
+                            regions[self._region_name] = reg_data
                         if isinstance(reg_data, dict):
                             reg_data["nodes"] = list(self._ordered_nodes)
                         if hasattr(self.routes, "save_data"):
-                            self.routes.save_data()
+                            if self.routes.save_data() is False:
+                                persist_ok = False
                 except Exception as inner_exc:
                     logger.warning(
                         "RouteManager üzerine sıralı rota yazılırken kısmi uyarı: %s",
                         inner_exc,
                     )
+                    persist_ok = False
+
+            if not persist_ok:
+                logger.error(
+                    "Sıralı rota kalıcı depoya yazılamadı (%s/%s); başarı sayılmadı.",
+                    self._region_name,
+                    self._route_name,
+                )
+                return False
 
             self.sequence_updated.emit(str(self._region_name), str(self._route_name))
             logger.info(
@@ -5029,11 +5435,89 @@ class CartographyRadarDialog(QDialog):
             self.canvas.set_sequential_nodes(self._ordered_nodes)
             self._refresh_metrics_bar()
 
-    def _remove_node_at_index(self, idx: int) -> None:
-        if 0 <= idx < len(self._ordered_nodes):
+    def _remove_node_at_index(self, idx: int) -> bool:
+        """Sağ tık "Rotadan Çıkar": düğümü tek bir kalıcı daldan siler.
+
+        K-19: eskiden yalnızca ``_ordered_nodes`` listesinden atılıyor, ne
+        ``_regions`` ne ``data`` dalına ne de diske dokunuluyordu; düğüm
+        yeniden yüklemede diriliyordu. Artık kalıcı depo tek kaynaktır:
+        isimli rotada ``remove_node_from_route``, varsayılan ("All")
+        rotada ``delete_node`` (varsayılan rotadaki düğüm bölgedeki
+        düğümün kendisidir) çağrılır; yazım başarısızsa düğüm ekranda
+        kalır ve ``False`` döner. Kalıcı depo bağlı değilse silme
+        yalnızca bellekte olur ve bu açıkça loglanır.
+        """
+        if not 0 <= idx < len(self._ordered_nodes):
+            return False
+        node_obj = self._ordered_nodes[idx]
+        try:
+            node_id = int(node_obj.get("id", -1))
+        except (TypeError, ValueError):
+            node_id = -1
+        if node_id < 0:
+            return False
+
+        route_name = str(getattr(self, "_route_name", "") or "")
+        region_name = str(getattr(self, "_region_name", "") or "")
+
+        if self.routes is None:
             self._ordered_nodes.pop(idx)
             self.canvas.set_sequential_nodes(self._ordered_nodes)
             self._refresh_metrics_bar()
+            logger.warning(
+                "Düğüm #%d rotadan çıkarıldı ancak kalıcı depoya yazılmadı "
+                "(RouteManager bağlı değil); yeniden yüklemede geri gelir.",
+                node_id,
+            )
+            return True
+
+        persisted = False
+        try:
+            # "All", RouteManager'daki DEFAULT_ROUTE'un karşılığıdır;
+            # bu dosyada core.route_manager import edilmez, literal
+            # bilerek aynen tutulur.
+            if route_name and route_name != "All" and hasattr(self.routes, "remove_node_from_route"):
+                persisted = self.routes.remove_node_from_route(
+                    node_id, route_name, region=region_name
+                )
+            elif hasattr(self.routes, "delete_node"):
+                persisted = self.routes.delete_node(node_id, region=region_name)
+            else:
+                logger.error(
+                    "Düğüm #%d rotadan çıkarılamadı: RouteManager'da silme yolu yok.",
+                    node_id,
+                )
+                return False
+        except Exception as exc:
+            logger.error("Düğüm #%d rotadan çıkarılırken hata: %s", node_id, exc)
+            return False
+
+        if not persisted:
+            # Kalıcı depoda düğüm hiç yoksa (yalnızca UI belleğindeyse)
+            # ekrandan atmak dürüsttür; aksi hâlde dirilme yerine
+            # ekranda tutup hatayı logla.
+            node_in_store = False
+            try:
+                if hasattr(self.routes, "get_node"):
+                    node_in_store = self.routes.get_node(node_id, region=region_name) is not None
+            except Exception:
+                node_in_store = True
+            if node_in_store:
+                logger.error(
+                    "Düğüm #%d rotadan çıkarılamadı (kalıcı kayıt başarısız); ekranda bırakıldı.",
+                    node_id,
+                )
+                return False
+            logger.warning(
+                "Düğüm #%d kalıcı depoda bulunamadı; yalnızca ekrandan çıkarıldı.",
+                node_id,
+            )
+
+        self._ordered_nodes.pop(idx)
+        self.canvas.set_sequential_nodes(self._ordered_nodes)
+        self._refresh_metrics_bar()
+        logger.info("Düğüm #%d rotadan çıkarıldı (%s/%s).", node_id, region_name, route_name)
+        return True
 
     def normalize_node_patch_preview(self, patch_img: Any) -> Any:
         """Normalizes a node patch via SobelClahePatchNormalizer for diagnostic preview."""
@@ -5138,8 +5622,28 @@ class CartographyRadarDialog(QDialog):
             "total_nodes": total,
             "minimap_auto_nodes": minimap_auto_count,
             "material_filter": mat_filter,
-            "radar_ready": True,
+            "radar_ready": canvas is not None,
         }
+
+    def _cartography_radar_health(self) -> Tuple[bool, Dict[str, Any]]:
+        """Gerçek hazırlık durumu: canvas + harita + planlayıcı mevcut mu?"""
+        canvas = self.__dict__.get("canvas")
+        canvas_ready = canvas is not None
+        map_loaded = False
+        if canvas is not None:
+            pix = getattr(canvas, "_base_pixmap", None)
+            map_loaded = pix is not None and not pix.isNull()
+        planner_ready = getattr(self, "planner", None) is not None
+        nodes = len(getattr(self, "_ordered_nodes", None) or [])
+        ready = bool(canvas_ready and map_loaded and planner_ready)
+        details: Dict[str, Any] = {
+            "canvas_ready": canvas_ready,
+            "map_loaded": map_loaded,
+            "planner_ready": planner_ready,
+            "nodes": nodes,
+            "region": str(getattr(self, "_region_name", "")),
+        }
+        return ready, details
 
     def optimize_visible_radar_route(self, player_xy: Optional[Tuple[float, float]] = None) -> List[Dict[str, Any]]:
         """Re-orders visible radar route nodes by nearest-neighbor + 2-opt proximity."""
@@ -5167,7 +5671,7 @@ class CartographyRadarDialog(QDialog):
                 ),
             )
             nxt = remaining.pop(best_idx)
-            nxt["seq_index"] = len(ordered)
+            nxt["seq_index"] = len(ordered) + 1
             ordered.append(nxt)
             cx = float(nxt.get("map_x", nxt.get("x", cx)))
             cy = float(nxt.get("map_y", nxt.get("y", cy)))
@@ -5179,19 +5683,25 @@ class CartographyRadarDialog(QDialog):
         return ordered
 
     def get_cartography_radar_health_summary(self) -> dict:
-        try:
-            return {"cartography_radar_ready": True}
-        except Exception:
-            return {"cartography_radar_ready": False}
+        ready, details = self._cartography_radar_health()
+        return {"cartography_radar_ready": ready, **details}
 
     def get_cartography_radar_ready_flag(self) -> dict:
-        return {"module": "cartography_radar", "ready": True}
+        ready, _details = self._cartography_radar_health()
+        return {"module": "cartography_radar", "ready": ready}
 
     def get_cartography_radar_version_info(self) -> dict:
-        return {"module": "cartography_radar", "version": "2.0.0", "ready": True}
+        ready, _details = self._cartography_radar_health()
+        return {"module": "cartography_radar", "version": __version__, "ready": ready}
 
     def get_cartography_radar_diagnostic_snapshot(self) -> dict:
-        return {"module": "cartography_radar", "status": "ok", "ready": True}
+        ready, details = self._cartography_radar_health()
+        return {
+            "module": "cartography_radar",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+            **details,
+        }
 
 
 def get_cartography_radar_capabilities() -> list:

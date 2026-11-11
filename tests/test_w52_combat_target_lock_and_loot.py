@@ -30,10 +30,17 @@ from dataset_factory.exemplar_memory import ExemplarMemory
 
 
 class _DummyInputDriver:
-    """Lightweight deterministic input spy for recording key and mouse dispatches."""
+    """Lightweight deterministic input spy for recording key and mouse dispatches.
+
+    NOTE (D89/F-2068): test_mode stays False so the code under test runs its
+    production timing paths. With test_mode=True, CombatRecovery shortens the
+    fast-TAB interval to 0.05s and skips the hardware input path, so the test
+    would exercise test-only timing instead of production timing. Sleeps are
+    stubbed by the tests themselves where speed is needed.
+    """
 
     def __init__(self) -> None:
-        self.test_mode: bool = True
+        self.test_mode: bool = False
         self.events: List[Tuple[str, str]] = []
         self.keys_pressed: List[str] = []
 
@@ -94,6 +101,9 @@ def test_1_combat_system_monster_death_triggers_immediate_loot_f_and_tab(monkeyp
     """
     Test 1: Verify CombatSystem.fight_back_step locks onto an active monster, and as soon as
     the monster dies, immediately dispatches 'f' (loot) followed by 'tab' (next target) without delay.
+
+    §7-A no 27 (loot tek F): ölüm dalında tek F+Tab v17 davranışıdır;
+    P1-11/testupd-A çevirmesi geri alındı (F13).
     """
     monkeypatch.setattr("time.sleep", lambda _s: None)
     driver = _DummyInputDriver()
@@ -101,7 +111,11 @@ def test_1_combat_system_monster_death_triggers_immediate_loot_f_and_tab(monkeyp
 
     alive_frame = _make_combat_frame(has_enemy_bar=True)
     dead_frame = _make_combat_frame(has_enemy_bar=False)
-    in_range_bbox = (580, 260, 120, 160)  # norm_h = 160/720 = 0.222 >= melee_min_norm_h (0.11)
+    # Tek formül (P1-12): dist = 0.96 / norm_h; melee IN_RANGE için
+    # dist <= 3.8 m -> norm_h >= 0.253 -> 720p'de bh >= 182. bh=200
+    # (norm_h 0.278 -> 3.5 m) menzildedir; v17'deki bh=160 (4.3 m) P1-12
+    # sonrası TOO_FAR'dır — bbox v17'den farklı, davranış beklentisi v17'dir.
+    in_range_bbox = (580, 260, 120, 200)
 
     # Step 1: Engage live monster -> locks target and attacks
     engaged = combat_sys.fight_back_step(input_ctrl=driver, frame=alive_frame, target_bbox=in_range_bbox, target_hp_pct=80.0)
@@ -109,6 +123,16 @@ def test_1_combat_system_monster_death_triggers_immediate_loot_f_and_tab(monkeyp
     assert combat_sys.in_combat is True
     assert combat_sys.was_fighting is True
     assert combat_sys.no_target_streak == 0
+
+    # The attack action itself must be asserted, not just the lock state
+    # (D89/F-2053): exactly one skill-rotation key is dispatched on engage.
+    # Which key is drawn is random by design (random.choice over the 8-key
+    # rotation pool), so the assertion pins the pool membership and the count,
+    # not a specific key.
+    assert len(driver.keys_pressed) == 1
+    assert driver.keys_pressed[0] in {"t", "1", "2", "3", "4", "q", "e", "r"}
+    assert combat_sys.total_attacks == 1
+    assert sum(combat_sys.skill_rotation_counts.values()) == 1
 
     driver.keys_pressed.clear()
     driver.events.clear()
@@ -133,10 +157,33 @@ def test_1_combat_system_monster_death_triggers_immediate_loot_f_and_tab(monkeyp
 
 def test_2_combat_recovery_execute_combat_loop_loot_f_and_fast_tab_to_next_monster(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Test 2: Verify CombatRecovery.execute_combat_loop immediately loots ('f') and presses 'tab'
-    when a monster dies, seamlessly chains into the newly targeted monster, and returns 'CLEARED'.
+    Test 2: Verify CombatRecovery.execute_combat_loop loots ('f') and presses 'tab'
+    when a monster dies, seamlessly chains into the newly targeted monster, and returns
+    'CLEARED_UNVERIFIED' when the loot is not verified.
+
+    P1-11: "CLEARED" + "loot collected" bildirimi YALNIZCA doğrulanmış
+    loot'ta verilir. Bu testte okuyucu enjekte edilmediğinden doğrulama
+    "no_reader" ile döner — öldürme kanıtlıdır ama loot kanıtsızdır, sonuç
+    "CLEARED_UNVERIFIED" olur (core/combat_recovery.py:1905-1929).
+
+    no27 (F-0419) — doğrulanmış loot akışı: döngü sonrası kör final F
+    KALDIRILDI. Eski beklenti (12 tuş / 3×F: 2 öldürme F'si + final F),
+    no27'nin yasakladığı kör ikinci F'yi kilitliyordu: döngü yalnızca
+    clear dalındaki F'ten sonra break eder, yani final F her zaman
+    ikinci (kör) F olurdu ve loot'u bozardı. Yeni beklenti 11 tuş /
+    2×F'dir (öldürme başına TEK F + TAB); okuyucu enjekte edilmediğinden
+    doğrulama "no_reader" ile anında döner, kare tüketilmez.
+
+    Determinism (D89/F-2063, F-2068): the periodic TAB cadence in the loop is
+    gated on the wall clock (time.monotonic), so with a free-running clock the
+    number of extra TABs varies run to run (3..7 observed). The test therefore
+    freezes the clock (monotonic -> 0.0) alongside the stubbed sleep: the only
+    TABs left are the forced ones (initial lock + one per kill), and the full
+    key sequence is exactly reproducible. The driver runs with test_mode=False
+    (production timing paths).
     """
     monkeypatch.setattr("time.sleep", lambda _s: None)
+    monkeypatch.setattr("time.monotonic", lambda: 0.0)
     driver = _DummyInputDriver()
     recovery = CombatRecovery(input_ctrl=driver)
 
@@ -174,24 +221,174 @@ def test_2_combat_recovery_execute_combat_loop_loot_f_and_fast_tab_to_next_monst
         stop_gather_sec=0.0,
     )
 
+    assert result == "CLEARED_UNVERIFIED"
+    assert "FIGHTING" in statuses
+    assert statuses[-1] == "CLEARED_UNVERIFIED"
+    assert recovery.in_combat is False
+
+    # Exact key sequence (D89/F-2063): no loose >= counts. With the frozen clock
+    # the sequence is fully determined by the scripted frames:
+    #   initial forced TAB, rotation t/2/3, kill #1 -> F + TAB, rotation r/q/e,
+    #   kill #2 -> F + TAB. NO post-loop final F (no27/F-0419: a blind second
+    #   F after a kill F corrupts the loot; the old 12-key / 3xF expectation
+    #   locked in that forbidden blind F).
+    assert driver.keys_pressed == [
+        "tab", "t", "2", "3", "f", "tab", "r", "q", "e", "f", "tab",
+    ]
+    assert driver.keys_pressed.count("f") == 2  # one verified-attempt F per kill, no final F
+    assert driver.keys_pressed.count("tab") == 3  # initial lock + 2 post-kill
+    # No cast-bar reader is injected in this test, so verification degrades
+    # to "no_reader" (single F, no blind retry) for each loot cycle.
+    assert recovery.loot_verification_outcomes == ["no_reader", "no_reader"]
+    assert recovery.last_loot_outcome == "no_reader"
+
+    # Verify that after each loot 'f', the very next key action is 'tab'
+    # (new target acquisition) — never a second 'f' (no27: a blind second F
+    # while looting corrupts the loot).
+    for idx, key in enumerate(driver.keys_pressed[:-1]):
+        if key == "f":
+            assert driver.keys_pressed[idx + 1] == "tab"
+
+
+class _FakeCastBarReader:
+    """no27: verify_gather_cast_bar vekilini senaryoya göre oynatan sahte okuyucu.
+
+    script: her çağrıda döndürülecek (is_present, progress_pct) listesi;
+    liste tükenince son değer tekrarlanır. Gerçek GameHUDReader yerine
+    geçer; loot başlangıç/bitiş sinyallerini sahte vision ile verir.
+    """
+
+    def __init__(self, script: List[Tuple[bool, float]]) -> None:
+        self.script = list(script)
+        self.calls = 0
+
+    def verify_gather_cast_bar(self, frame: Any) -> Tuple[bool, float]:
+        idx = min(self.calls, len(self.script) - 1)
+        self.calls += 1
+        return self.script[idx]
+
+
+def test_6_no27_loot_not_started_presses_single_f_without_blind_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Test 6 (no27-a): F basıldı ama loot BAŞLAMADI (kanal barı 1,5 sn / 15
+    yoklamada hiç görülmedi) -> kör ikinci F basılmaz, TAB'a geçilir.
+
+    Sahte okuyucu hep (False, 0.0) döner. Donmuş saatte (monotonic -> 0.0)
+    yoklama sayısı belirleyicidir: başlangıç fazı 15 yoklamada biter.
+    """
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    monkeypatch.setattr("time.monotonic", lambda: 0.0)
+    driver = _DummyInputDriver()
+    reader = _FakeCastBarReader([(False, 0.0)] * 40)
+    recovery = CombatRecovery(input_ctrl=driver, cast_bar_reader=reader)
+
+    alive_frame = _make_combat_frame(has_enemy_bar=True)
+    dead_frame = _make_combat_frame(has_enemy_bar=False)
+
+    # Kare senaryosu:
+    #   [0] alive (kilit), [1..3] dead (grace + clear 1 + clear 2 -> F),
+    #   [4..18] dead x15 (başlangıç yoklaması: 15 karede bar yok),
+    #   [19] dead (TAB sonrası kontrol: hedef yok -> döngü biter)
+    frames = [alive_frame] + [dead_frame] * 19
+    frame_iter = iter(frames)
+
+    def _capture_next() -> np.ndarray:
+        return next(frame_iter, dead_frame)
+
+    statuses: List[str] = []
+    result = recovery.execute_combat_loop(
+        input_ctrl=driver,
+        capture=_capture_next,
+        status_callback=lambda state, *_args: statuses.append(state),
+        max_fight_sec=2.0,
+        stop_gather_sec=0.0,
+    )
+
+    assert result == "CLEARED_UNVERIFIED"
+    assert "FIGHTING" in statuses
+    assert statuses[-1] == "CLEARED_UNVERIFIED"
+    assert recovery.in_combat is False
+
+    assert driver.keys_pressed == ["tab", "t", "2", "3", "f", "tab"]
+    assert driver.keys_pressed.count("f") == 1  # tek F; kör tekrar yok
+    assert reader.calls == 15  # başlangıç fazı: 15 yoklama, bar hiç görülmedi
+    assert recovery.loot_verification_outcomes == ["not_started"]
+    assert recovery.last_loot_outcome == "not_started"
+
+
+def test_7_no27_loot_not_finished_next_f_waits_for_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Test 7 (no27-b): loot BAŞLADI (bar %30 görüldü) ama BİTMEDİ (3 sn /
+    30 yoklamada ne %90+ oldu ne kayboldu) -> bitiş doğrulanmadan bir
+    sonraki F basılmaz; TAB'dan sonra yeni canavarın öldürülmesiyle gelen
+    İKİNCİ loot döngüsünde bar %95 görülürse o F doğrulanır.
+
+    Sahte okuyucu: ilk 31 çağrı (True, 30.0) [F #1: 1 başlangıç + 30
+    bitiş yoklaması], sonrası (True, 95.0) [F #2: ilk yoklamada doğrulandı].
+    """
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    monkeypatch.setattr("time.monotonic", lambda: 0.0)
+    driver = _DummyInputDriver()
+    reader = _FakeCastBarReader([(True, 30.0)] * 31 + [(True, 95.0)] * 10)
+    recovery = CombatRecovery(input_ctrl=driver, cast_bar_reader=reader)
+
+    alive_frame = _make_combat_frame(has_enemy_bar=True)
+    dead_frame = _make_combat_frame(has_enemy_bar=False)
+
+    # Kare senaryosu (donmuş saatte yoklama sayısı belirleyicidir):
+    #   [0] alive (kilit), [1..3] dead (grace + clear 1 + clear 2 -> F #1),
+    #   [4..34] dead x31 (F #1 yoklaması: 1 başlangıç + 30 bitiş, bar hep %30),
+    #   [35] alive (TAB sonrası: canavar #2 hedeflendi),
+    #   [36] alive (döngü: canavar #2 kilitli),
+    #   [37..39] dead (grace + clear 1 + clear 2 -> F #2),
+    #   [40] dead (F #2 yoklaması: bar %95 -> verified),
+    #   [41] dead (TAB sonrası kontrol: hedef yok -> döngü biter)
+    frames = (
+        [alive_frame]
+        + [dead_frame] * 3
+        + [dead_frame] * 31
+        + [alive_frame, alive_frame]
+        + [dead_frame] * 3
+        + [dead_frame, dead_frame]
+    )
+    frame_iter = iter(frames)
+
+    def _capture_next() -> np.ndarray:
+        return next(frame_iter, dead_frame)
+
+    statuses: List[str] = []
+    result = recovery.execute_combat_loop(
+        input_ctrl=driver,
+        capture=_capture_next,
+        status_callback=lambda state, *_args: statuses.append(state),
+        max_fight_sec=2.0,
+        stop_gather_sec=0.0,
+    )
+
     assert result == "CLEARED"
     assert "FIGHTING" in statuses
     assert statuses[-1] == "CLEARED"
     assert recovery.in_combat is False
 
-    # Verify 'f' (loot) was pressed at least twice (for Monster 1 and Monster 2) and 'tab' was cycled
-    assert driver.keys_pressed.count("f") >= 2
-    assert driver.keys_pressed.count("tab") >= 3
-
-    # Verify that after the first 'f' (loot), the very next key action is 'tab' (new target acquisition)
-    first_f_idx = driver.keys_pressed.index("f")
-    assert driver.keys_pressed[first_f_idx + 1] == "tab"
+    assert driver.keys_pressed == [
+        "tab", "t", "2", "3", "f", "tab", "r", "q", "e", "f", "tab",
+    ]
+    assert driver.keys_pressed.count("f") == 2  # öldürme başına TEK F
+    # F #1'den hemen sonra TAB gelir — bitmemiş loot'a kör ikinci F yok;
+    # ikinci F ancak yeni canavar öldükten sonra (yeni loot döngüsü) basılır.
+    assert driver.keys_pressed[5] == "tab"
+    assert reader.calls == 32  # 31 (F #1) + 1 (F #2, ilk yoklamada %95)
+    assert recovery.loot_verification_outcomes == ["not_finished", "verified"]
+    assert recovery.last_loot_outcome == "verified"
 
 
 def test_3_target_lock_flicker_grace_prevents_false_loot_before_actual_death() -> None:
     """
     Test 3: Verify CombatRecovery 1-frame targeting flicker grace sustains target lock during
     transient UI flicker without false target loss, and confirms loss on the subsequent frame.
+    Entry needs 2 consecutive bar frames first (2-frame entry confirmation):
+    a single-frame bar must not enter combat. Each tick passes a fresh frame
+    copy, as production grabs a new frame per tick.
     """
     driver = _DummyInputDriver()
     recovery = CombatRecovery(input_ctrl=driver)
@@ -199,23 +396,34 @@ def test_3_target_lock_flicker_grace_prevents_false_loot_before_actual_death() -
 
     alive_frame = _make_combat_frame(has_enemy_bar=True)
     flicker_frame = _make_combat_frame(has_enemy_bar=False)
+    # 2. ve 4. kareler gerçekten farklı içerikli olmalı — alive_frame.copy()
+    # içerik parmak iziyle "aynı kare" sayılır ve doğrulama ilerlemez.
+    # (0, 0) pikseli parmak izi örneklemesindedir, hiçbir tespit ROI'sinde değildir.
+    alive_frame_2 = alive_frame.copy()
+    alive_frame_2[0, 0] = (1, 0, 0)
+    alive_frame_4 = alive_frame.copy()
+    alive_frame_4[0, 0] = (2, 0, 0)
 
-    # Frame 1: Hostile target bar visible -> lock acquired, grace inactive
-    assert recovery.detect_enemy_target_bar(alive_frame, use_flicker_grace=True) is True
+    # Frame 1: Hostile target bar visible once -> not yet a confirmed lock
+    assert recovery.detect_enemy_target_bar(alive_frame.copy(), use_flicker_grace=True) is False
     assert recovery.is_targeting_flicker_grace() is False
 
-    # Frame 2: 1-frame UI flicker (bar missing for 1 tick) -> lock sustained via grace
-    assert recovery.detect_enemy_target_bar(flicker_frame, use_flicker_grace=True) is True
-    assert recovery.is_targeting_flicker_grace() is True
-
-    # Frame 3: Bar reappears -> grace resets cleanly without interrupting combat
-    assert recovery.detect_enemy_target_bar(alive_frame, use_flicker_grace=True) is True
+    # Frame 2: Bar on the 2nd consecutive frame -> lock acquired, grace inactive
+    assert recovery.detect_enemy_target_bar(alive_frame_2, use_flicker_grace=True) is True
     assert recovery.is_targeting_flicker_grace() is False
 
-    # Frame 4 & 5: Monster actually dies (2 consecutive frames without bar) -> grace expires on 2nd frame
-    assert recovery.detect_enemy_target_bar(flicker_frame, use_flicker_grace=True) is True
+    # Frame 3: 1-frame UI flicker (bar missing for 1 tick) -> lock sustained via grace
+    assert recovery.detect_enemy_target_bar(flicker_frame.copy(), use_flicker_grace=True) is True
     assert recovery.is_targeting_flicker_grace() is True
-    assert recovery.detect_enemy_target_bar(flicker_frame, use_flicker_grace=True) is False
+
+    # Frame 4: Bar reappears -> grace resets cleanly without interrupting combat
+    assert recovery.detect_enemy_target_bar(alive_frame_4, use_flicker_grace=True) is True
+    assert recovery.is_targeting_flicker_grace() is False
+
+    # Frame 5 & 6: Monster actually dies (2 consecutive frames without bar) -> grace expires on 2nd frame
+    assert recovery.detect_enemy_target_bar(flicker_frame.copy(), use_flicker_grace=True) is True
+    assert recovery.is_targeting_flicker_grace() is True
+    assert recovery.detect_enemy_target_bar(flicker_frame.copy(), use_flicker_grace=True) is False
     assert recovery.is_targeting_flicker_grace() is False
 
     # Immediate fast_tab_cycle dispatches 'tab' and increments tab_cycle_count
@@ -247,18 +455,29 @@ def test_4_exemplar_memory_validates_monster_and_rejects_negative_or_resource_ta
 
     combat = ManaPhaseCombat(exemplar_memory=mem)
 
-    # 1. Learned 3D monster crop -> Validated with high confidence (>= 0.85)
-    valid_mob, conf_mob = combat.is_valid_monster_target(frame=None, target_crop=monster_crop)
+    # Held-out variants (D89/F-2060): same visual class rendered at a different
+    # size, NEVER added to memory. Validating with the exact stored crops is a
+    # self-match (similarity 1.0 by construction) and proves nothing about
+    # recognition of a newly seen monster / resource / false target.
+    monster_held_out = _make_distinct_crop(hue=15, sat=210, val=190, stripe_bgr=(20, 40, 240), size=(56, 56))
+    herb_held_out = _make_distinct_crop(hue=95, sat=220, val=200, stripe_bgr=(240, 190, 20), size=(56, 56))
+    neg_rock_held_out = _make_distinct_crop(hue=0, sat=10, val=90, stripe_bgr=(60, 60, 60), size=(56, 56))
+    assert not np.array_equal(monster_held_out, monster_crop)
+    assert not np.array_equal(herb_held_out, herb_crop)
+    assert not np.array_equal(neg_rock_held_out, neg_rock_crop)
+
+    # 1. Held-out 3D monster crop -> Validated with high confidence (>= 0.85)
+    valid_mob, conf_mob = combat.is_valid_monster_target(frame=None, target_crop=monster_held_out)
     assert valid_mob is True
     assert conf_mob >= 0.85
 
-    # 2. Learned negative exemplar (rock / friendly NPC) -> Rejected
-    valid_neg, conf_neg = combat.is_valid_monster_target(frame=None, target_crop=neg_rock_crop)
+    # 2. Held-out negative exemplar (rock / friendly NPC) -> Rejected
+    valid_neg, conf_neg = combat.is_valid_monster_target(frame=None, target_crop=neg_rock_held_out)
     assert valid_neg is False
     assert conf_neg <= 0.25
 
-    # 3. Learned gatherable resource (class_id=0 herb_aria) -> Rejected as non-monster
-    valid_herb, conf_herb = combat.is_valid_monster_target(frame=None, target_crop=herb_crop)
+    # 3. Held-out gatherable resource (class_id=0 herb_aria) -> Rejected as non-monster
+    valid_herb, conf_herb = combat.is_valid_monster_target(frame=None, target_crop=herb_held_out)
     assert valid_herb is False
     assert conf_herb <= 0.25
 

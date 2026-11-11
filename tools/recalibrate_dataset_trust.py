@@ -11,13 +11,20 @@ gösteriyor ama çoğu yanlış güven sınırı yanlış yüzde 85 üzeri"
 Strict Recalibration & Purge Rules:
 1. Protected Verification Immunity:
    Boxes with `hand_label = True`, `human_approved = True`, `approved = True`,
-   or `confirmed = True` remain `trusted = True, weak = False, confidence >= 0.90`.
+   or `confirmed = True` remain `trusted = True, weak = False`. The recorded
+   confidence is preserved as-is and never inflated to 0.90 (F-1212: a
+   protected box with confidence 0.70 stays 0.70; one with no recorded
+   confidence stays 0.0 — trust comes from the protection flag, not from
+   an invented confidence value).
 2. Context-Based STEM Gating (Zero Out-of-Context Clutter):
    - On non-`learn_paths_*` frames: strictly purge `15: path_ground` and `14: obstacle`.
    - On non-`learn_skills_*` / non-`learn_vitality_*` frames: strictly purge
-     `13: skill_ui_prompt`, `16: player_hp_bar`, `17: player_mp_bar`, `19: skill_bar`.
+     `13: skill_ui_prompt`, `19: skill_bar`, `20: skill_slot_ready`,
+     `21: skill_slot_cooldown` and the HUD vitals `16: player_hp_bar`,
+     `17: player_mp_bar`, `18: target_hp_bar`.
    - On non-essence frames (gathering/combat): strictly purge `22..134: essence_*`
-     (including `98: essence_yggdrasil_log`).
+     (including `98: essence_yggdrasil_log`); class ids above 134 do not exist
+     in any taxonomy and are purged as unknown.
 3. Heuristic Source Demotion & Confidence Capping:
    - Boxes from `UNVERIFIED_HEURISTIC_SOURCES` (such as `chromatic_salient_3d_resource`,
      `visual_ground_path_segmenter`, `hud_skill_slot`, etc.) are capped at `<= 0.68`
@@ -27,13 +34,14 @@ Strict Recalibration & Purge Rules:
    - When a known material stem (e.g. `boot_*_aria_*`) contains conflicting resource
      boxes (e.g. `ore_orichalcum` or `herb_targena`), confidence is capped at `<= 0.45`
      and marked `weak = True, trusted = False`.
-5. Non-explicit Legacy Boxes from TXT:
-   - Boxes originating from legacy `.txt` without explicit confidence get `0.58`
-     confidence and `weak = True, trusted = False`.
-6. Verified Template Seed & High Confidence Proof:
+5. Verified Template Seed & High Confidence Proof (checked BEFORE legacy demotion,
+   so a genuine seed box without an explicit confidence is never demoted to 0.58):
    - Genuine template seeds (F/E prompt, 3D crest, minimap sprout, monster scanner)
      with confidence >= emin_threshold (0.85) remain `trusted = True, weak = False`.
    - Sub-threshold template boxes (< 0.85) are kept as `weak = True, trusted = False`.
+6. Non-explicit Legacy Boxes from TXT:
+   - Boxes originating from legacy `.txt` without explicit confidence get `0.58`
+     confidence and `weak = True, trusted = False`.
 7. Atomic Synchronization & Manifest Rebuild:
    - Cleanly rewrites both `dataset/review/{train,val}/*.json` and `dataset/labels/{train,val}/*.txt`.
    - Rebuilds `dataset/manifest_stats.json` via `DatasetCurator.rebuild_manifest_stats()`.
@@ -55,7 +63,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -65,16 +73,14 @@ from dataset_factory.label_trust import (
     MINIMAP_HUD_XYXY,
     TRAIN_CONF_FLOOR,
     _is_hand_or_gather_seed,
-    _rewrite_label_txt,
-    _yolo_line,
     annotation_confidence,
     box_center_in_minimap_hud,
-    filter_hud_false_positives,
     is_path_learning_stem,
     mark_model_stale,
     slot_iou,
-    train_txt_boxes,
+    write_review_pair,
 )
+from dataset_factory.stem_material_validator import is_stem_material_conflict
 
 logger = logging.getLogger("recalibrate_dataset_trust")
 
@@ -104,20 +110,19 @@ HEURISTIC_TOKENS: Tuple[str, ...] = (
     "omni_",
 )
 
-# Known material tokens in filename stems -> target material class_id
-KNOWN_MATERIAL_STEM_MAP: Dict[str, int] = {
-    "aria": 0,       # herb_aria
-    "mela": 1,       # herb_mela
-    "targena": 2,    # herb_targena
-    "orichalcum": 3, # ore_orichalcum
-    "ori": 3,
-    "crystal": 4,    # gem_crystal
-    "tree": 5,       # wood_tree
-}
-
 WORLD_RESOURCE_CLASSES: frozenset = frozenset({0, 1, 2, 3, 4, 5})
 PATH_OBSTACLE_CLASSES: frozenset = frozenset({14, 15})
-HUD_SKILL_CLASSES: frozenset = frozenset({13, 16, 17, 19})
+# Kanonik küme (dataset_factory/class_taxonomy.py::HUD_SKILL_CLASSES):
+# 13 skill_ui_prompt, 19 skill_bar, 20 skill_slot_ready, 21 skill_slot_cooldown.
+# 16/17/18 can barları kanonikte HUD_SKILL değil HUD_VITALS'tır; ancak kök
+# kontrolü (skill/vitality öğrenme karesi) aynı olduğu için kök kapısı
+# iki kümeye de uygulanır — 16/17 daha önce de bu kapıdaydı, davranış korunur.
+HUD_SKILL_CLASSES: frozenset = frozenset({13, 19, 20, 21})
+HUD_VITALS_CLASSES: frozenset = frozenset({16, 17, 18})
+HUD_GATED_CLASSES: frozenset = frozenset({13, 16, 17, 18, 19, 20, 21})
+# Essence sınıfları dokümana göre 22..134 aralığındadır.
+ESSENCE_CLASS_MIN: int = 22
+ESSENCE_CLASS_MAX: int = 134
 
 
 def is_skill_learning_stem(stem: str) -> bool:
@@ -148,24 +153,24 @@ def is_essence_learning_stem(stem: str) -> bool:
     )
 
 
-def get_stem_expected_material(stem: str) -> Optional[int]:
-    """Extract expected resource class_id from stem if it specifies a known material."""
-    s = str(stem or "").lower()
-    for token, cid in KNOWN_MATERIAL_STEM_MAP.items():
-        # Match as whole word or surrounded by delimiters
-        if f"_{token}_" in s or s.startswith(f"{token}_") or s.endswith(f"_{token}") or f"_{token}." in s:
-            return cid
-    return None
-
-
 def is_conflicting_material(stem: str, class_id: int) -> bool:
-    """True if stem specifies a material but box is an incompatible world resource."""
-    expected = get_stem_expected_material(stem)
-    if expected is None:
+    """True if stem specifies a material but box is an incompatible world resource.
+
+    F-2001: tespit artık dataset_factory.stem_material_validator
+    (StemMaterialValidator) tarafından yapılır — burada duran
+    stem->class_id tablosu (KNOWN_MATERIAL_STEM_MAP /
+    get_stem_expected_material) onun dar bir kopyasıydı (yalnızca
+    aria/mela/targena/orichalcum/crystal/tree biliyordu; edana/lumina/
+    obsidian/blood/wood eşanlamlılarını ve geçersiz essence durumunu
+    kaçırıyordu) ve kaldırıldı. Kanonik class_id ile çağrılır, böylece
+    karar taksonomi destekli validator'dan gelir, yerel kopyadan değil.
+    Demotion'ın kendisi (confidence <= 0.45, trusted=False, weak=True,
+    demoted_reason="stem_material_conflict") Rule 4'te aynen korunur.
+    """
+    try:
+        return bool(is_stem_material_conflict(stem, class_id=int(class_id)))
+    except (TypeError, ValueError):
         return False
-    if class_id in WORLD_RESOURCE_CLASSES and class_id != expected:
-        return True
-    return False
 
 
 def is_unverified_heuristic_source(source: str) -> bool:
@@ -183,18 +188,52 @@ def is_genuine_verified_seed(box: Dict[str, Any]) -> bool:
     if _is_hand_or_gather_seed(box):
         return True
     src = str(box.get("source", "")).strip().lower()
-    verified_sources = (
-        "vision_3d_crest",
-        "material_scanner_f_gather_prompt",
-        "material_scanner_floating_icon",
-        "material_scanner_minimap_sprout",
-        "hostile_red_hp_bar_monster",
-        "3d_monster_scanner",
-        "target_hp_bar_scanner",
-        "3d_mesh_below_crest",
-        "3d_mesh_under_floating_icon",
+    return any(v in src for v in _VERIFIED_SEED_SOURCES)
+
+
+# Verified template-seed sources (module level: is_genuine_verified_seed used
+# to rebuild this tuple on every box — it is constant, so build it once).
+_VERIFIED_SEED_SOURCES: Tuple[str, ...] = (
+    "vision_3d_crest",
+    "material_scanner_f_gather_prompt",
+    "material_scanner_floating_icon",
+    "material_scanner_minimap_sprout",
+    "hostile_red_hp_bar_monster",
+    "3d_monster_scanner",
+    "target_hp_bar_scanner",
+    "3d_mesh_below_crest",
+    "3d_mesh_under_floating_icon",
+)
+
+
+class _StemContext(NamedTuple):
+    """Per-stem predicates for calibrate_single_box, computed once per file.
+
+    Every field depends only on the frame stem, never on the box — so
+    recalibrate_entire_dataset_trust computes it once per review file and
+    reuses it for all boxes instead of re-running the string scans per box.
+
+    NOTE: there is deliberately NO expected-material field here. F-2001
+    (G2-10) removed the local stem->class_id table and moved material
+    conflict detection to the canonical StemMaterialValidator
+    (is_conflicting_material); Rule 4 calls that directly. D69's hoist
+    added an expected_material field calling the deleted
+    get_stem_expected_material, which raised NameError for every
+    non-protected box (all 9 recalibrate tests failed in v2).
+    """
+
+    is_path: bool
+    is_skill: bool
+    is_essence: bool
+
+
+def stem_context(stem: str) -> _StemContext:
+    """Compute the per-stem calibration context for one frame stem."""
+    return _StemContext(
+        is_path=is_path_learning_stem(stem),
+        is_skill=is_skill_learning_stem(stem),
+        is_essence=is_essence_learning_stem(stem),
     )
-    return any(v in src for v in verified_sources)
 
 
 def calibrate_single_box(
@@ -202,6 +241,7 @@ def calibrate_single_box(
     stem: str = "",
     emin_threshold: float = 0.85,
     purge_synthetic: bool = True,
+    stem_ctx: Optional[_StemContext] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     """Calibrate a single bounding box according to strict trust and purge rules.
 
@@ -209,6 +249,11 @@ def calibrate_single_box(
         (calibrated_box, action_str)
         If action_str starts with "purged_", calibrated_box will be None.
         Otherwise action_str is one of "preserved_trusted", "demoted_to_weak", "kept_weak".
+
+    ``stem_ctx`` is an optional precomputed :func:`stem_context` for ``stem``.
+    When omitted it is computed from ``stem`` (identical result); callers
+    calibrating many boxes of one frame should pass it to avoid re-running
+    the per-stem string scans for every box.
     """
     if not isinstance(raw_box, dict) or "cx" not in raw_box or "cy" not in raw_box:
         return None, "purged_invalid_format"
@@ -222,9 +267,30 @@ def calibrate_single_box(
     except (TypeError, ValueError):
         return None, "purged_invalid_geometry"
 
-    # Geometric sanity check
-    if w <= 0.0 or h <= 0.0 or not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0):
+    # Geometric sanity check: centre must be inside the frame AND the whole box
+    # must fit inside it (a centred box whose edges spill outside the frame is
+    # not a valid annotation).
+    eps = 1e-6
+    x0, x1 = cx - w / 2.0, cx + w / 2.0
+    y0, y1 = cy - h / 2.0, cy + h / 2.0
+    if (
+        w <= 0.0
+        or h <= 0.0
+        or not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0)
+        or x0 < -eps
+        or x1 > 1.0 + eps
+        or y0 < -eps
+        or y1 > 1.0 + eps
+    ):
         return None, "purged_out_of_bounds"
+
+    # Class ids below 0 (e.g. the -1 default for a missing class_id) and
+    # above the documented essence range (22..134) do not exist in any
+    # taxonomy; they are invalid data, not a class to calibrate. The lower
+    # bound matters: without it cid=-1 passes geometry, matches no rule
+    # branch, and can reach Rule 8 as preserved_trusted (S-4801).
+    if cid < 0 or cid > ESSENCE_CLASS_MAX:
+        return None, "purged_unknown_class"
 
     box = dict(raw_box)
     box["class_id"] = cid
@@ -248,7 +314,11 @@ def calibrate_single_box(
     if is_protected:
         box["trusted"] = True
         box["weak"] = False
-        box["confidence"] = max(0.90, round(float(conf), 4) if conf > 0 else 0.90)
+        # F-1212: preserve the recorded confidence as-is — never inflate it
+        # to 0.90. A protected box with confidence 0.70 stays 0.70, and one
+        # with no recorded confidence stays 0.0 (annotation_confidence
+        # returns 0.0 when no confidence/score key is present).
+        box["confidence"] = round(float(conf), 4)
         return box, "preserved_trusted"
 
     # Rule 2: Illegal Minimap HUD False Positives
@@ -257,24 +327,34 @@ def calibrate_single_box(
         if cid not in {7, 8, 9, 11}:
             return None, "purged_illegal_minimap_hud_box"
 
-    # Rule 3: Context-Based Stem Gating (Purge out-of-context clutter)
+    # Rule 3: Context-Based Stem Gating (Purge out-of-context clutter).
+    # The gates depend only on the stem; use the precomputed context.
+    ctx = stem_ctx if stem_ctx is not None else stem_context(stem)
     if purge_synthetic:
         # Ground Path (15) and Obstacle (14) ONLY on path learning frames
         if cid in PATH_OBSTACLE_CLASSES:
-            if not is_path_learning_stem(stem):
+            if not ctx.is_path:
                 return None, "purged_out_of_context_path_obstacle"
 
-        # HUD Skills (13) & Bars (16, 17, 19) ONLY on skill/vitality learning frames
-        if cid in HUD_SKILL_CLASSES:
-            if not is_skill_learning_stem(stem):
+        # HUD Skills (13, 19, 20, 21) & vitals (16, 17, 18) ONLY on
+        # skill/vitality learning frames
+        if cid in HUD_GATED_CLASSES:
+            if not ctx.is_skill:
                 return None, "purged_out_of_context_hud_skill"
 
         # Essence classes (22..134) ONLY on dedicated essence frames
-        if cid >= 22:
-            if not is_essence_learning_stem(stem):
+        if ESSENCE_CLASS_MIN <= cid <= ESSENCE_CLASS_MAX:
+            if not ctx.is_essence:
                 return None, "purged_out_of_context_essence_on_gather_frame"
 
-    # Rule 4: Material Conflict Detection on Known Stems
+    # Rule 4: Material Conflict Detection on Known Stems (F-2001: the
+    # decision comes from the canonical StemMaterialValidator via
+    # is_conflicting_material — the same call this rule used before D69.
+    # D69 replaced it with a ctx.expected_material comparison against the
+    # local table G2-10 had deleted, so every non-protected box raised
+    # NameError in stem_context. The validator memoizes stem extraction
+    # (stem_material_validator._cached_stem_materials), so the per-box
+    # call stays cheap; the is_path/is_skill/is_essence hoist is kept.)
     if is_conflicting_material(stem, cid):
         box["confidence"] = min(round(float(conf), 4), 0.45)
         box["trusted"] = False
@@ -282,23 +362,9 @@ def calibrate_single_box(
         box["demoted_reason"] = "stem_material_conflict"
         return box, "demoted_to_weak" if was_trusted else "kept_weak"
 
-    # Rule 5: Non-explicit Legacy Boxes from TXT (Task 1: Ensure non-explicit legacy boxes from .txt get 0.58 confidence and weak = True)
-    if box.get("legacy_auto") is True or not box.get("has_explicit_conf", True) or conf <= 1e-6 or "legacy" in src:
-        box["confidence"] = 0.58
-        box["trusted"] = False
-        box["weak"] = True
-        box["demoted_reason"] = "legacy_txt_unverified"
-        return box, "demoted_to_weak" if was_trusted else "kept_weak"
-
-    # Rule 6: Unverified Heuristic Source Demotion
-    if is_unverified_heuristic_source(src):
-        box["confidence"] = min(round(float(conf), 4), 0.68)
-        box["trusted"] = False
-        box["weak"] = True
-        box["demoted_reason"] = "unverified_heuristic_source"
-        return box, "demoted_to_weak" if was_trusted else "kept_weak"
-
-    # Rule 7: Genuine Template Seed & High Confidence Proof
+    # Rule 5: Genuine Template Seed & High Confidence Proof — checked BEFORE
+    # the legacy demotion below, so a genuine seed box that happens to carry no
+    # explicit confidence is never wrongly demoted to 0.58.
     if is_genuine_verified_seed(box):
         if conf >= float(emin_threshold):
             box["trusted"] = True
@@ -310,6 +376,22 @@ def calibrate_single_box(
             box["weak"] = True
             box["demoted_reason"] = "seed_below_emin_threshold"
             return box, "demoted_to_weak" if was_trusted else "kept_weak"
+
+    # Rule 6: Non-explicit Legacy Boxes from TXT (Task 1: Ensure non-explicit legacy boxes from .txt get 0.58 confidence and weak = True)
+    if box.get("legacy_auto") is True or not box.get("has_explicit_conf", True) or conf <= 1e-6 or "legacy" in src:
+        box["confidence"] = 0.58
+        box["trusted"] = False
+        box["weak"] = True
+        box["demoted_reason"] = "legacy_txt_unverified"
+        return box, "demoted_to_weak" if was_trusted else "kept_weak"
+
+    # Rule 7: Unverified Heuristic Source Demotion
+    if is_unverified_heuristic_source(src):
+        box["confidence"] = min(round(float(conf), 4), 0.68)
+        box["trusted"] = False
+        box["weak"] = True
+        box["demoted_reason"] = "unverified_heuristic_source"
+        return box, "demoted_to_weak" if was_trusted else "kept_weak"
 
     # Rule 8: General Confidence Gate for Other Sources
     if conf >= float(emin_threshold):
@@ -329,25 +411,50 @@ def _dedupe_and_nms(
     boxes: Sequence[Dict[str, Any]],
     iou_thresh: float = 0.65,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Perform Non-Maximum Suppression (NMS) deduplication across boxes."""
+    """Perform Non-Maximum Suppression (NMS) deduplication across boxes.
+
+    Suppression only ever happens between boxes of the SAME class, so the
+    boxes are grouped by class first and NMS runs per class: a frame with
+    N boxes over C classes drops from O(N^2) kept-list scans to
+    O(sum over classes of n_c^2). The result is identical to the old flat
+    scan — within a class the rank order is unchanged, and a box is only
+    ever suppressed by a higher-ranked box of its own class — and the
+    returned list keeps the global rank order.
+    """
     def _rank(b: Dict[str, Any]) -> Tuple[float, float]:
         is_t = 1.0 if (b.get("trusted") is True or b.get("hand_label") is True) else 0.0
         return (is_t, annotation_confidence(b))
 
-    sorted_boxes = sorted(boxes, key=_rank, reverse=True)
-    kept: List[Dict[str, Any]] = []
+    # Global rank order (stable: ties keep input order), tagged with the
+    # rank position so the merged result restores that exact order.
+    ranked = sorted(enumerate(boxes), key=lambda p: _rank(p[1]), reverse=True)
+    by_class: Dict[Any, List[Tuple[int, Dict[str, Any]]]] = {}
+    for rank_pos, (_in_pos, b) in enumerate(ranked):
+        # A non-numeric class_id used to raise inside the flat scan and
+        # kill the whole run; group it under its own key instead (it can
+        # only ever be suppressed by a box with the same malformed id).
+        try:
+            key: Any = int(b.get("class_id", -1))
+        except (TypeError, ValueError):
+            key = ("malformed", str(b.get("class_id")))
+        by_class.setdefault(key, []).append((rank_pos, b))
+
+    kept_pos: List[Tuple[int, Dict[str, Any]]] = []
     dropped = 0
-    for b in sorted_boxes:
-        suppress = False
-        for k in kept:
-            if int(b.get("class_id", -1)) == int(k.get("class_id", -1)):
+    for members in by_class.values():
+        kept_cls: List[Dict[str, Any]] = []
+        for pos, b in members:
+            suppress = False
+            for k in kept_cls:
                 if slot_iou(b, k) > iou_thresh:
                     suppress = True
                     dropped += 1
                     break
-        if not suppress:
-            kept.append(b)
-    return kept, dropped
+            if not suppress:
+                kept_cls.append(b)
+                kept_pos.append((pos, b))
+    kept_pos.sort(key=lambda p: p[0])
+    return [b for _, b in kept_pos], dropped
 
 
 def recalibrate_entire_dataset_trust(
@@ -382,9 +489,13 @@ def recalibrate_entire_dataset_trust(
 
     demoted_boxes = 0
     purged_false_boxes = 0
+    # NMS drops are de-duplication, not false-box purges: counted separately
+    # and never added to purged_false_boxes.
+    nms_duplicates_dropped = 0
     preserved_verified_boxes = 0
     files_rewritten = 0
     labels_rewritten = 0
+    errors: List[str] = []
 
     purged_breakdown: Dict[str, int] = {}
 
@@ -427,34 +538,60 @@ def recalibrate_entire_dataset_trust(
         trusted_in = [b for b in (payload.get("trusted") or []) if isinstance(b, dict)]
         weak_in = [b for b in (payload.get("weak") or []) if isinstance(b, dict)]
 
-        # If review file has no boxes or was salvaged, load legacy boxes from txt
+        # If review file has no boxes or was salvaged, load legacy boxes from txt.
+        # A single malformed line must not discard the rest of the file: parse
+        # line by line and skip only the broken lines.
         if not trusted_in and not weak_in and txt_path.is_file():
             try:
                 txt_content = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
-                if txt_content:
-                    for line in txt_content.splitlines():
-                        parts = line.split()
-                        if len(parts) >= 5:
-                            cid = int(float(parts[0]))
-                            cx = float(parts[1])
-                            cy = float(parts[2])
-                            w = float(parts[3])
-                            h = float(parts[4])
-                            weak_in.append({
-                                "class_id": cid,
-                                "cx": cx,
-                                "cy": cy,
-                                "w": w,
-                                "h": h,
-                                "confidence": 0.58,
-                                "trusted": False,
-                                "weak": True,
-                                "legacy_auto": True,
-                                "has_explicit_conf": False,
-                                "source": "legacy_txt",
-                            })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to read label txt %s: %s", txt_path, e)
+                txt_content = ""
+            if txt_content:
+                for line_no, line in enumerate(txt_content.splitlines(), start=1):
+                    parts = line.split()
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        cid = int(float(parts[0]))
+                        cx = float(parts[1])
+                        cy = float(parts[2])
+                        w = float(parts[3])
+                        h = float(parts[4])
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Skipping malformed label line %d in %s: %r",
+                            line_no,
+                            txt_path,
+                            line.strip(),
+                        )
+                        continue
+                    # S-4801: a negative (or out-of-range) class_id in a TXT
+                    # line is invalid data, not a class — skip it here so it
+                    # never enters the candidate list (calibrate_single_box
+                    # also purges it as purged_unknown_class as a second
+                    # line of defence).
+                    if cid < 0 or cid > ESSENCE_CLASS_MAX:
+                        logger.warning(
+                            "Skipping label line %d in %s: invalid class_id %d",
+                            line_no,
+                            txt_path,
+                            cid,
+                        )
+                        continue
+                    weak_in.append({
+                        "class_id": cid,
+                        "cx": cx,
+                        "cy": cy,
+                        "w": w,
+                        "h": h,
+                        "confidence": 0.58,
+                        "trusted": False,
+                        "weak": True,
+                        "legacy_auto": True,
+                        "has_explicit_conf": False,
+                        "source": "legacy_txt",
+                    })
 
         # Record BEFORE metrics
         trusted_before_count = len(trusted_in)
@@ -466,9 +603,12 @@ def recalibrate_entire_dataset_trust(
         if weak_before_count > 0:
             previous_weak_images += 1
 
-        # Process all boxes through strict calibration and purge rules
+        # Process all boxes through strict calibration and purge rules.
+        # The per-stem context depends only on the stem: compute it once
+        # per file and reuse it for every box of this frame.
         candidate_boxes: List[Dict[str, Any]] = []
         all_boxes_in = list(trusted_in) + list(weak_in)
+        ctx = stem_context(stem)
 
         for b in all_boxes_in:
             calibrated, action = calibrate_single_box(
@@ -476,6 +616,7 @@ def recalibrate_entire_dataset_trust(
                 stem=stem,
                 emin_threshold=emin_th,
                 purge_synthetic=purge_synthetic,
+                stem_ctx=ctx,
             )
 
             if calibrated is None:
@@ -488,13 +629,10 @@ def recalibrate_entire_dataset_trust(
                 elif action == "demoted_to_weak":
                     demoted_boxes += 1
 
-        # NMS Deduplication
+        # NMS Deduplication (de-duplication only — not a false-box purge)
         deduped_boxes, nms_dropped = _dedupe_and_nms(candidate_boxes, iou_thresh=0.65)
         if nms_dropped > 0:
-            purged_false_boxes += nms_dropped
-            purged_breakdown["purged_nms_duplicate"] = (
-                purged_breakdown.get("purged_nms_duplicate", 0) + nms_dropped
-            )
+            nms_duplicates_dropped += nms_dropped
 
         # Final segregation into trusted (Emin) and weak (Şüpheli)
         final_trusted = [b for b in deduped_boxes if b.get("trusted") is True]
@@ -520,30 +658,26 @@ def recalibrate_entire_dataset_trust(
             payload["recalibrated"] = True
             payload["recalibrated_at"] = datetime.now(timezone.utc).isoformat()
 
+            # P3-26: JSON+TXT go through the single writer — one emit
+            # rule, atomic writes, .bak before overwrite. allow_empty=True:
+            # recalibration deliberately purges false boxes; a stale TXT
+            # line would otherwise be resurrected as a trusted hand label
+            # by _reconcile_txt_hand_labels (K-01/K-02).
             try:
-                json_path.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
+                pair = write_review_pair(
+                    review_path=json_path,
+                    label_path=txt_path,
+                    review_payload=payload,
+                    stem=stem,
+                    floor=TRAIN_CONF_FLOOR,
+                    allow_empty=True,
                 )
                 files_rewritten += 1
+                if pair["txt_written"]:
+                    labels_rewritten += 1
             except Exception as e:
-                logger.error("Failed to write JSON %s: %s", json_path, e)
-
-            # Rewrite corresponding label .txt cleanly
-            emit = train_txt_boxes(
-                final_trusted,
-                final_weak,
-                stem=stem,
-                floor=TRAIN_CONF_FLOOR,
-            )
-            txt_path.parent.mkdir(parents=True, exist_ok=True)
-            lines = [_yolo_line(box) for box in emit if "cx" in box]
-            txt_content = ("\n".join(lines) + "\n") if lines else ""
-            try:
-                txt_path.write_text(txt_content, encoding="utf-8")
-                labels_rewritten += 1
-            except Exception as e:
-                logger.error("Failed to write label txt %s: %s", txt_path, e)
+                errors.append(f"write review pair {json_path}: {e}")
+                logger.error("Failed to write review pair %s: %s", json_path, e)
 
     # Rebuild manifest_stats.json at completion
     manifest_stats: Dict[str, Any] = {}
@@ -552,20 +686,29 @@ def recalibrate_entire_dataset_trust(
             from dataset_factory.dataset_curator import DatasetCurator
             curator = DatasetCurator(dataset_dir=root)
             manifest_stats = curator.rebuild_manifest_stats()
-            mark_model_stale(
-                reason=(
-                    f"Dataset güven skorları yeniden kalibre edildi "
-                    f"({purged_false_boxes} kutu temizlendi, {demoted_boxes} kutu şüpheliye taşındı)"
-                ),
-                dataset_dir=root,
-            )
         except Exception as e:
+            errors.append(f"rebuild manifest_stats.json: {e}")
             logger.error("Failed to rebuild manifest_stats.json: %s", e)
+        else:
+            try:
+                mark_model_stale(
+                    reason=(
+                        f"Dataset güven skorları yeniden kalibre edildi "
+                        f"({purged_false_boxes} kutu temizlendi, {demoted_boxes} kutu şüpheliye taşındı)"
+                    ),
+                    dataset_dir=root,
+                )
+            except Exception as e:
+                errors.append(f"mark_model_stale: {e}")
+                logger.error("Failed to mark model stale: %s", e)
 
     duration = round(time.time() - start_time, 2)
 
     report: Dict[str, Any] = {
-        "ok": True,
+        # "ok" is False whenever anything failed (write error, manifest
+        # rebuild failure, ...). It is never unconditionally True.
+        "ok": len(errors) == 0,
+        "errors": errors,
         "dry_run": bool(dry_run),
         "dataset_dir": str(root),
         "emin_threshold": emin_th,
@@ -582,6 +725,7 @@ def recalibrate_entire_dataset_trust(
             "new_weak_boxes": new_weak_boxes,
             "demoted_boxes": demoted_boxes,
             "purged_false_boxes": purged_false_boxes,
+            "nms_duplicates_dropped": nms_duplicates_dropped,
             "preserved_verified_boxes": preserved_verified_boxes,
         },
         "purged_breakdown": purged_breakdown,
@@ -677,6 +821,11 @@ def main() -> int:
     print("-" * 72)
     print(f"Files Rewritten (Review JSONs):   {report['files_rewritten']}")
     print(f"Labels Rewritten (YOLO TXTs):     {report['labels_rewritten']}")
+    if not report["ok"]:
+        print("-" * 72)
+        print("HATALAR:")
+        for err in report["errors"]:
+            print(f"  - {err}")
     print("=" * 72)
 
     if args.export_report:
@@ -687,7 +836,9 @@ def main() -> int:
         )
         print(f"Report exported to: {args.export_report}")
 
-    return 0
+    # Exit non-zero when anything failed — the run must not report success
+    # while files or the manifest could not be written.
+    return 0 if report["ok"] else 1
 
 
 if __name__ == "__main__":

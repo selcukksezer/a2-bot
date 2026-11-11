@@ -7,6 +7,12 @@ set "PYTHONPATH=%PROJECT_DIR%"
 set "PYTHONUTF8=1"
 set "GATHERION_HOME=F:\a2"
 if not exist "%GATHERION_HOME%\main.py" set "GATHERION_HOME=F:\Gatherion"
+if not exist "%GATHERION_HOME%" mkdir "%GATHERION_HOME%" >nul 2>&1
+if not exist "%GATHERION_HOME%" (
+    echo [UYARI] "%GATHERION_HOME%" olusturulamadi; GATHERION_HOME proje dizinine aliniyor.
+    set "GATHERION_HOME=%~dp0"
+)
+set "GATHERION_LOG=%GATHERION_HOME%\logs\gatherion.log"
 set "TEMP=%GATHERION_HOME%\temp"
 set "TMP=%GATHERION_HOME%\temp"
 set "YOLO_CONFIG_DIR=%GATHERION_HOME%\appdata"
@@ -49,11 +55,33 @@ cd /d "%~dp0"
 echo [TAMAM] Calisma Dizini : %CD%
 echo [BILGI] Python Yorumlayicisi : "%PYTHON_EXE%"
 
-"%PYTHON_EXE%" -c "import PyQt6, cv2, mss, numpy, pydirectinput, keyboard, PIL" >nul 2>&1
-if %errorLevel% == 0 goto :RUN_BOT
+echo [STARTUP] on-kontrol basladi %TIME%
+rem Hizli on-kontrol: importlib.util.find_spec modul kodunu CALISTIRMAZ, DLL yuklemez;
+rem yalnizca modulun bulunup bulunmadigina bakar (tam import yerine).
+rem Eksik modul varsa pip paket adi "%TEMP%\missing_pkgs.txt" dosyasina yazilir.
+"%PYTHON_EXE%" -c "import importlib.util,sys; mods={'PyQt6':'PyQt6','cv2':'opencv-python','mss':'mss','numpy':'numpy','pydirectinput':'pydirectinput','keyboard':'keyboard','yaml':'pyyaml','onnxruntime':'onnxruntime-gpu','psutil':'psutil','serial':'pyserial'}; missing=[pkg for mod,pkg in mods.items() if importlib.util.find_spec(mod) is None]; print(' '.join(missing)); sys.exit(1 if missing else 0)" > "%TEMP%\missing_pkgs.txt" 2>nul
+if %errorLevel% == 0 goto :PRECHECK_DONE
+set "MISSING_PKGS="
+set /p MISSING_PKGS=<"%TEMP%\missing_pkgs.txt"
+if "%MISSING_PKGS%" == "" (
+    echo [HATA] On-kontrol calistirilamadi; eksik paket listesi alinamadi.
+    >>"%GATHERION_LOG%" echo [%DATE% %TIME%] [HATA] On-kontrol calistirilamadi; bot baslatilmadi.
+    pause
+    exit /b 1
+)
+echo [BILGI] Eksik Python paketleri tespit edildi: %MISSING_PKGS%
+echo [BILGI] Yalnizca eksik paketler kuruluyor (requirements.txt tam kurulum yapilmiyor)...
+"%PYTHON_EXE%" -m pip install %MISSING_PKGS%
+if errorlevel 1 (
+    echo [HATA] Eksik paket kurulumu basarisiz oldu; bot baslatilmiyor.
+    >>"%GATHERION_LOG%" echo [%DATE% %TIME%] [HATA] Eksik paket kurulumu basarisiz oldu; bot baslatilmadi.
+    pause
+    exit /b 1
+)
 
-echo [BILGI] Eksik Python paketleri tespit edildi, requirements.txt yukleniyor...
-"%PYTHON_EXE%" -m pip install -r "%~dp0requirements.txt"
+:PRECHECK_DONE
+del "%TEMP%\missing_pkgs.txt" >nul 2>&1
+echo [STARTUP] on-kontrol bitti %TIME%
 
 :RUN_BOT
 echo [BILGI] Gatherion v2.0 konsol modunda baslatiliyor...
@@ -63,6 +91,7 @@ echo         - Oyun icinde [F8] tusuna basarak kaynak noktasini kaydedebilirsini
 echo ============================================================================
 echo.
 
+echo [STARTUP] main.py baslatiliyor %TIME%
 "%PYTHON_EXE%" "%~dp0main.py" %*
 set "APP_EXIT_CODE=%errorLevel%"
 
@@ -70,7 +99,7 @@ if "%APP_EXIT_CODE%" == "0" goto :END_SCRIPT
 color 0C
 echo.
 echo [HATA] Uygulama beklenmeyen bir hata kodu ile kapandi (Kod: %APP_EXIT_CODE%).
-echo        Detaylar icin logs\bot.log dosyasini inceleyebilirsiniz.
+echo        Detaylar icin %GATHERION_HOME%\logs\bot.log dosyasini inceleyebilirsiniz.
 pause
 
 :END_SCRIPT

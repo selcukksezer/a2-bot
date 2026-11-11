@@ -14,7 +14,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
     QAction,
     QBrush,
@@ -45,8 +45,167 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.shell_theme import SHELL_COLORS
+from version import __version__
+
+# P2-2: günlük kuyruk sınırları — görüntüleyici / destek kopyası eskiden
+# bütün logs/bot.log dosyasını (sınırsız) UI thread'inde okuyordu.
+_LOG_TAIL_MAX_BYTES = 256 * 1024
+_LOG_TAIL_MAX_LINES = 2000
+_LOG_SUPPORT_TAIL_LINES = 50
+
+
+def _read_log_tail_lines(
+    log_path: str,
+    max_bytes: int = _LOG_TAIL_MAX_BYTES,
+    max_lines: int = _LOG_TAIL_MAX_LINES,
+) -> Tuple[List[str], bool]:
+    """Read the tail of a log file, bounded by bytes and lines.
+
+    Returns ``(lines, truncated)``. Only the last ``max_bytes`` are read
+    (seek from the end); a partial first line is dropped. The caller —
+    never the GUI thread — decides how many lines it needs.
+    """
+    try:
+        size = os.path.getsize(log_path)
+    except OSError:
+        return [], False
+    truncated = size > max_bytes
+    with open(log_path, "rb") as f:
+        if truncated:
+            f.seek(size - max_bytes)
+            chunk = f.read()
+            nl = chunk.find(b"\n")
+            chunk = chunk[nl + 1 :] if nl != -1 else chunk
+        else:
+            chunk = f.read()
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        truncated = True
+    return lines, truncated
+
+
+class _LogOpenWorker(QThread):
+    """Runs the external log opener off the GUI thread (P2-2).
+
+    ``open`` / ``xdg-open`` can block up to the 15 s timeout; ``done``
+    reports whether the external viewer actually opened the file.
+    """
+
+    done = pyqtSignal(bool)
+
+    def __init__(self, log_path: str, parent: Optional[Any] = None) -> None:
+        super().__init__(parent)
+        self._log_path = str(log_path)
+
+    def run(self) -> None:
+        opened = False
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(self._log_path)
+                opened = True
+            elif sys.platform == "darwin":
+                # F-0654: check the exit code; a spawned Popen is not proof
+                # the log actually opened.
+                proc = subprocess.run(["open", self._log_path], timeout=15)
+                opened = proc.returncode == 0
+            else:
+                proc = subprocess.run(["xdg-open", self._log_path], timeout=15)
+                opened = proc.returncode == 0
+        except Exception as exc:
+            logger.warning("Harici günlük açma başarısız: %s", exc)
+        self.done.emit(bool(opened))
+
+
+class _LogTailWorker(QThread):
+    """Reads a bounded log tail off the GUI thread (P2-2)."""
+
+    loaded = pyqtSignal(object)  # {"lines": [...], "truncated": bool}
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self, log_path: str, max_lines: int, parent: Optional[Any] = None
+    ) -> None:
+        super().__init__(parent)
+        self._log_path = str(log_path)
+        self._max_lines = max(1, int(max_lines))
+
+    def run(self) -> None:
+        try:
+            lines, truncated = _read_log_tail_lines(
+                self._log_path, max_lines=self._max_lines
+            )
+            self.loaded.emit({"lines": lines, "truncated": truncated})
+        except Exception as exc:
+            logger.error("Günlük kuyruğu okunamadı: %s", exc)
+            self.failed.emit(str(exc))
+
+# P3-6: CWD-bağımlı yollar proje köküne göre çözülür (core/project_root.py).
+from core.project_root import PROJECT_ROOT, project_path
 
 logger = logging.getLogger("Gatherion.F9Menu")
+
+# F-0736: constructor defaults used to be hardcoded (minimap_auto_record=True,
+# auto_consumables=True) and never read from settings. None means "read the
+# repo config/settings.json (gathering/route sections), fall back to True".
+
+def _settings_flag(key: str, default: bool) -> bool:
+    try:
+        settings_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config",
+            "settings.json",
+        )
+        with open(settings_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        section, _, name = key.partition(".")
+        val = data.get(section, {}).get(name) if isinstance(data, dict) else None
+        return default if val is None else bool(val)
+    except Exception:
+        return default
+
+
+def _resolve_bool_arg(value: Optional[bool], settings_key: str, default: bool) -> bool:
+    if value is not None:
+        return bool(value)
+    return _settings_flag(settings_key, default)
+
+
+def _persist_settings_flag(key: str, value: bool) -> bool:
+    """F-0573: tek bir bayrağı config/settings.json'a kalıcı yazar.
+
+    `_settings_flag` ile aynı dosyayı/anahtarı kullanır (örn.
+    "gathering.auto_consumables") — constructor bu anahtarı okur,
+    `config/schema.py` SettingsManager da aynı dosyayı kaynak alır
+    (R01'deki `auto_consumables` alanı buradan beslenir). Diğer
+    anahtarlara dokunulmaz; yazma başarısız olursa False döner.
+    """
+    try:
+        settings_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "config",
+            "settings.json",
+        )
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        section, _, name = key.partition(".")
+        section_data = data.get(section)
+        if not isinstance(section_data, dict):
+            section_data = {}
+            data[section] = section_data
+        section_data[name] = bool(value)
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            f.write("\n")
+        return True
+    except Exception as exc:
+        logger.debug("settings.json kalıcı yazma uyarısı (%s): %s", key, exc)
+        return False
 
 # Opaque panel fill — light row/header text (#e5e7eb / #f8fafc) needs a real dark surface.
 # WA_TranslucentBackground alone often leaves a white QScrollArea / desktop behind the text.
@@ -85,8 +244,8 @@ class _MenuRowWidget(QWidget):
 
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(30)
-        self.setMinimumWidth(180)
+        self.setFixedHeight(32)
+        self.setMinimumWidth(200)
 
     def set_text(self, text: str) -> None:
         safe_text = str(text or "").strip()
@@ -113,17 +272,18 @@ class _MenuRowWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            # F-0568: press only records the timestamp. Emitting here AND on
+            # release fired the action twice on a long press (>= 0.35 s).
             self._last_press_ts = time.monotonic()
-            self.clicked.emit(self.action_id)
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            last_p = getattr(self, "_last_press_ts", 0.0)
-            if (time.monotonic() - last_p) >= 0.35:
-                self.clicked.emit(self.action_id)
+            # Single emission point: every press+release pair fires exactly once,
+            # short click or long press alike.
+            self.clicked.emit(self.action_id)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -157,7 +317,7 @@ class _MenuRowWidget(QWidget):
 
         text_x = left_x + 18
 
-        font = QFont("Segoe UI", 9)
+        font = QFont("Segoe UI", 10)
         font.setWeight(QFont.Weight.DemiBold)
         painter.setFont(font)
         painter.setPen(QPen(_ROW_TEXT_HOVER if self.is_hovered else _ROW_TEXT))
@@ -172,7 +332,7 @@ class _MenuRowWidget(QWidget):
 
         if self.has_submenu:
             chev_rect = QRect(rect.width() - 16, 0, 12, rect.height())
-            chev_font = QFont("Segoe UI", 10)
+            chev_font = QFont("Segoe UI", 11)
             chev_font.setWeight(QFont.Weight.Bold)
             painter.setFont(chev_font)
             painter.setPen(QPen(_ROW_MUTED))
@@ -210,6 +370,8 @@ class F9Menu(QWidget):
     route_changed = pyqtSignal(str, str)  # (region, route) Canlı UI ve rota senkronizasyonu sinyali
     gathering_state_changed = pyqtSignal(dict)  # Canlı toplama/hasat durumu verisi
     harvest_stage_changed = pyqtSignal(int, int)  # (current_stage, max_stages)
+    # A grubu devri: panik kilit durumu (PanicAlertSystem.get_panic_status biçimi).
+    panic_status_changed = pyqtSignal(dict)
     routes_reloaded = pyqtSignal(dict)  # Yeniden taranan {region: [routes]}
     minimap_auto_record_toggled = pyqtSignal(bool)  # Sağ Üst Minimap Oto-Kayıt sinyali
     panel_open_changed = pyqtSignal(bool)
@@ -241,12 +403,19 @@ class F9Menu(QWidget):
         self,
         route_manager: Optional[Any] = None,
         active_mode: str = "manual_record",
-        minimap_auto_record: bool = True,
+        minimap_auto_record: Optional[bool] = None,
         harvests_per_node: int = 3,
         parent: Optional[QWidget] = None,
-        auto_consumables: bool = True,
+        auto_consumables: Optional[bool] = None,
     ) -> None:
         super().__init__(parent)
+        # F-0736: explicit args win; otherwise read config/settings.json.
+        minimap_auto_record = _resolve_bool_arg(
+            minimap_auto_record, "route.minimap_auto_record", True
+        )
+        auto_consumables = _resolve_bool_arg(
+            auto_consumables, "gathering.auto_consumables", True
+        )
         self.route_manager = route_manager
         self.shell: Optional[Any] = None
         self.overlay: Optional[Any] = None
@@ -273,8 +442,16 @@ class F9Menu(QWidget):
         self._route_submenu: Optional[QMenu] = None
         self._guide_dialog: Optional[QDialog] = None
         self._log_dialog: Optional[QDialog] = None
+        # P2-2: çalışan günlük işi (harici açıcı / kuyruk okuma) — aynı
+        # anda tek iş; bitince finished zinciri referansı temizler.
+        self._log_job_thread: Optional[Any] = None
         self._last_popup_ts: float = 0.0
         self._panel_open: bool = False
+        # F-0732: previously only created on first use via getattr(); define here.
+        self._in_dismiss: bool = False
+        self._embedded: bool = False
+        self._disk_routes_cache: Dict[str, List[str]] = {}
+        self._disk_routes_cache_ts: float = 0.0
         self._paused: bool = True
         self._collapsible: List[QWidget] = []
         self._menu_chord_label = "Ctrl+Alt+F9"
@@ -340,7 +517,82 @@ class F9Menu(QWidget):
                 sanitized[reg_name] = clean_routes if clean_routes else ["All"]
         return sanitized
 
-    def _sync_from_route_manager(self) -> None:
+    @staticmethod
+    def _parse_regions_map(raw_map: Any) -> Dict[str, List[str]]:
+        """F-0655: parse a regions map whose values may be a routes list/tuple/
+        set/dict, a dict with a "routes" key, or a single route string. The old
+        code only handled dict values, silently dropping list-valued regions
+        even though the comment claimed list/dict/tuple were handled."""
+        parsed: Dict[str, List[str]] = {}
+        if not isinstance(raw_map, dict):
+            return parsed
+        for reg_name, reg_val in raw_map.items():
+            if reg_name is None:
+                continue
+            name = str(reg_name).strip()
+            if not name:
+                continue
+            if isinstance(reg_val, dict) and "routes" in reg_val:
+                routes = F9Menu._sanitize_regions_routes({name: reg_val["routes"]}).get(name)
+            else:
+                routes = F9Menu._sanitize_regions_routes({name: reg_val}).get(name)
+            parsed[name] = routes if routes else ["All"]
+        return parsed
+
+    def _scan_disk_routes(self, force: bool = False) -> Dict[str, List[str]]:
+        """F-0738: scan <repo>/routes (or the manager's base_dir) for
+        region_data.json. Result is cached for 60 s so every sync does not
+        re-scan the disk; reload_routes() forces a fresh scan. P3-6: relative
+        bases resolve against the project root, never the CWD. The old code
+        scanned on every sync and resolved a relative base against the CWD
+        plus a hardcoded F:\\a2\\routes path."""
+        now = time.monotonic()
+        if not force and self._disk_routes_cache and (now - self._disk_routes_cache_ts) < 60.0:
+            return {k: list(v) for k, v in self._disk_routes_cache.items()}
+        found: Dict[str, List[str]] = {}
+        base_dir = "routes"
+        if self.route_manager is not None and hasattr(self.route_manager, "base_dir"):
+            base_dir = str(self.route_manager.base_dir)
+        if not os.path.isabs(base_dir):
+            candidate = str(PROJECT_ROOT / base_dir)
+            if os.path.isdir(candidate):
+                base_dir = candidate
+            elif os.path.isdir(r"F:\a2\routes"):
+                base_dir = r"F:\a2\routes"
+            else:
+                # Kök altında yok: CWD'ye düşme; kök-altı aday olduğu gibi
+                # kalsın, aşağıdaki isdir kontrolü boş sonuç döndürür.
+                base_dir = candidate
+        if os.path.isdir(base_dir):
+            try:
+                for entry in sorted(os.listdir(base_dir)):
+                    entry_path = os.path.join(base_dir, entry)
+                    json_path = os.path.join(entry_path, "region_data.json")
+                    if os.path.isdir(entry_path) and os.path.isfile(json_path):
+                        with open(json_path, "r", encoding="utf-8") as jf:
+                            reg_data = json.load(jf)
+                        reg_name = str(reg_data.get("region", entry)).strip()
+                        r_list = ["All"]
+                        raw_rtes = reg_data.get("routes", [])
+                        if isinstance(raw_rtes, list):
+                            for r in raw_rtes:
+                                rs = str(r).strip()
+                                if rs and rs not in r_list:
+                                    r_list.append(rs)
+                        for n in reg_data.get("nodes", []):
+                            if isinstance(n, dict):
+                                for r in n.get("routes", []):
+                                    rs = str(r).strip()
+                                    if rs and rs not in r_list:
+                                        r_list.append(rs)
+                        found[reg_name] = r_list
+            except Exception as exc:
+                logger.debug("Disk rotaları taranırken hata: %s", exc)
+        self._disk_routes_cache = {k: list(v) for k, v in found.items()}
+        self._disk_routes_cache_ts = now
+        return {k: list(v) for k, v in found.items()}
+
+    def _sync_from_route_manager(self, force_disk_rescan: bool = False) -> None:
         """RouteManager mevcutsa bölgeleri, rotaları ve aktif seçimi senkronize eder."""
         try:
             if self.route_manager is not None:
@@ -370,19 +622,12 @@ class F9Menu(QWidget):
                         logger.debug("get_regions üzerinden okuma hatası: %s", sub_exc)
 
                 # 2. _regions dict (handles routes as list, dict, or tuple)
+                # F-0655: list-valued regions were silently dropped here.
                 if not self._regions_routes and hasattr(self.route_manager, "_regions"):
                     raw_regs = getattr(self.route_manager, "_regions", {})
-                    if isinstance(raw_regs, dict) and raw_regs:
-                        parsed = {}
-                        for reg_name, reg_val in raw_regs.items():
-                            if isinstance(reg_val, dict):
-                                r_val = reg_val.get("routes", [])
-                                if isinstance(r_val, dict):
-                                    parsed[str(reg_name)] = list(r_val.keys()) if r_val else ["All"]
-                                elif isinstance(r_val, (list, tuple, set)):
-                                    parsed[str(reg_name)] = [str(r) for r in r_val if r] if r_val else ["All"]
-                        if parsed:
-                            self._regions_routes = parsed
+                    parsed = self._parse_regions_map(raw_regs)
+                    if parsed:
+                        self._regions_routes = parsed
 
                 # 3. data dict fallback
                 if hasattr(self.route_manager, "data") and isinstance(self.route_manager.data, dict):
@@ -390,64 +635,26 @@ class F9Menu(QWidget):
                     self._active_region = data.get("active_region") or self._active_region
                     self._active_route = data.get("active_route") or self._active_route
                     if not self._regions_routes:
-                        regions_dict = data.get("regions", {})
-                        parsed = {}
-                        for reg_name, reg_val in regions_dict.items():
-                            if isinstance(reg_val, dict):
-                                routes_map = reg_val.get("routes", {})
-                                if isinstance(routes_map, dict):
-                                    parsed[str(reg_name)] = list(routes_map.keys()) if routes_map else ["All"]
-                                elif isinstance(routes_map, (list, tuple, set)):
-                                    parsed[str(reg_name)] = [str(r) for r in routes_map if r] if routes_map else ["All"]
+                        parsed = self._parse_regions_map(data.get("regions", {}))
                         if parsed:
                             self._regions_routes = parsed
         except Exception as exc:
             logger.warning("RouteManager üzerinden rotalar senkronize edilemedi: %s", exc)
 
         # 4. Scan disk base_dir / routes/ directory for region_data.json
-        base_dir = "routes"
-        if self.route_manager is not None and hasattr(self.route_manager, "base_dir"):
-            base_dir = str(self.route_manager.base_dir)
-        if not os.path.isabs(base_dir):
-            if os.path.isdir(r"F:\a2\routes"):
-                base_dir = r"F:\a2\routes"
-            elif os.path.isdir("routes"):
-                base_dir = os.path.abspath("routes")
-
-        if os.path.isdir(base_dir):
-            try:
-                for entry in sorted(os.listdir(base_dir)):
-                    entry_path = os.path.join(base_dir, entry)
-                    json_path = os.path.join(entry_path, "region_data.json")
-                    if os.path.isdir(entry_path) and os.path.isfile(json_path):
-                        with open(json_path, "r", encoding="utf-8") as jf:
-                            reg_data = json.load(jf)
-                        reg_name = str(reg_data.get("region", entry)).strip()
-                        r_list = ["All"]
-                        raw_rtes = reg_data.get("routes", [])
-                        if isinstance(raw_rtes, list):
-                            for r in raw_rtes:
-                                rs = str(r).strip()
-                                if rs and rs not in r_list:
-                                    r_list.append(rs)
-                        for n in reg_data.get("nodes", []):
-                            if isinstance(n, dict):
-                                for r in n.get("routes", []):
-                                    rs = str(r).strip()
-                                    if rs and rs not in r_list:
-                                        r_list.append(rs)
-                        if reg_name not in self._regions_routes:
-                            self._regions_routes[reg_name] = r_list
-                        else:
-                            for r in r_list:
-                                if r not in self._regions_routes[reg_name]:
-                                    self._regions_routes[reg_name].append(r)
-            except Exception as exc:
-                logger.debug("Disk rotaları taranırken hata: %s", exc)
+        # F-0738: cached scan (see _scan_disk_routes); reload forces rescan.
+        for reg_name, r_list in self._scan_disk_routes(force=force_disk_rescan).items():
+            if reg_name not in self._regions_routes:
+                self._regions_routes[reg_name] = list(r_list)
+            else:
+                for r in r_list:
+                    if r not in self._regions_routes[reg_name]:
+                        self._regions_routes[reg_name].append(r)
 
         # 5. Legacy routes.json fallback
         if not self._regions_routes:
-            routes_path = os.path.join(os.getcwd(), "routes", "routes.json")
+            # P3-6: kök-bağımlı (eski: os.getcwd() + "routes/routes.json").
+            routes_path = str(project_path("routes", "routes.json"))
             if os.path.exists(routes_path):
                 try:
                     with open(routes_path, "r", encoding="utf-8") as f:
@@ -462,14 +669,9 @@ class F9Menu(QWidget):
                     logger.debug("F9Menu içinde routes.json okunamadı: %s", exc)
 
         # 6. Default canonical regions and subregions fallback
+        # F-0737: _default_regions_routes() was dead code; use it here.
         if not self._regions_routes:
-            self._regions_routes = {
-                "Altgard": ["All", "Dredgion Crash Site", "Safe Haven", "Quai Campsite", "Calderon Canyon", "Silent Hill"],
-                "Verteron": ["All", "Tolbas Forest", "Cantas Coast", "Pilgrim's Ridge", "Verteron Citadel"],
-                "Eltnen": ["All", "Manduri Forest", "Golden Bough Garrison", "Eiron Desert"],
-                "Morheim": ["All", "Ice Claw Village", "Patamor Ridge", "Mist Mane Village"],
-                "DefaultRegion": ["All"],
-            }
+            self._regions_routes = self._default_regions_routes()
 
     def _init_ui(self) -> None:
         # Qt.WindowType.Tool + WindowStaysOnTopHint kullanıyoruz:
@@ -499,8 +701,8 @@ class F9Menu(QWidget):
         self._apply_panel_stylesheet(embedded=False)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 6, 2, 6)
-        layout.setSpacing(1)
+        layout.setContentsMargins(4, 8, 4, 8)
+        layout.setSpacing(2)
 
         # -----------------------------------------------------------------
         # 0. ÜST BAŞLIK & 3X TOPLAMA MODU ROZETİ (HEADER / SUBTITLE)
@@ -508,7 +710,7 @@ class F9Menu(QWidget):
         self.header_frame = QFrame(self)
         self.header_frame.setStyleSheet("QFrame { background: transparent; border: none; }")
         header_vbox = QVBoxLayout(self.header_frame)
-        header_vbox.setContentsMargins(14, 4, 14, 4)
+        header_vbox.setContentsMargins(14, 6, 14, 6)
         header_vbox.setSpacing(3)
 
         top_bar = QHBoxLayout()
@@ -523,7 +725,7 @@ class F9Menu(QWidget):
             QLabel {{
                 color: {SHELL_COLORS["text"]};
                 font-family: 'Segoe UI', sans-serif;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 700;
             }}
             """
@@ -542,15 +744,15 @@ class F9Menu(QWidget):
                 border: 1px solid rgba(34, 197, 94, 0.45);
                 border-radius: 4px;
                 font-family: 'Segoe UI', sans-serif;
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 700;
-                padding: 2px 6px;
+                padding: 3px 7px;
             }
             """
         )
 
         self._toggle_btn = QPushButton("✕", self.header_frame)
-        self._toggle_btn.setFixedSize(22, 22)
+        self._toggle_btn.setFixedSize(24, 24)
         self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._toggle_btn.setToolTip("Menüyü kapat")
         self._toggle_btn.setStyleSheet(
@@ -585,7 +787,7 @@ class F9Menu(QWidget):
             QLabel {{
                 color: {SHELL_COLORS["muted"]};
                 font-family: 'Segoe UI', sans-serif;
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 500;
             }}
             """
@@ -682,8 +884,8 @@ class F9Menu(QWidget):
             """
         )
         sg_layout = QVBoxLayout(self.selective_gather_frame)
-        sg_layout.setContentsMargins(6, 4, 6, 4)
-        sg_layout.setSpacing(4)
+        sg_layout.setContentsMargins(8, 6, 8, 6)
+        sg_layout.setSpacing(6)
 
         # Header row: Label + Checkbox
         hdr_row = QHBoxLayout()
@@ -696,7 +898,7 @@ class F9Menu(QWidget):
             QLabel {{
                 color: {SHELL_COLORS['text']};
                 font-family: 'Segoe UI', sans-serif;
-                font-size: 10px;
+                font-size: 11px;
                 font-weight: 700;
             }}
             """
@@ -710,12 +912,12 @@ class F9Menu(QWidget):
             QCheckBox {
                 color: #38bdf8;
                 font-family: 'Segoe UI', sans-serif;
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 600;
             }
             QCheckBox::indicator {
-                width: 13px;
-                height: 13px;
+                width: 15px;
+                height: 15px;
                 border-radius: 3px;
                 border: 1px solid #475569;
                 background-color: #0f172a;
@@ -744,11 +946,11 @@ class F9Menu(QWidget):
                 color: #ffffff;
                 border: 1px solid #334155;
                 border-radius: 4px;
-                padding: 3px 6px;
+                padding: 4px 8px;
                 font-family: 'Segoe UI', sans-serif;
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 500;
-                min-height: 20px;
+                min-height: 24px;
             }
             QComboBox:hover {
                 border-color: #38bdf8;
@@ -760,7 +962,7 @@ class F9Menu(QWidget):
                 selection-color: #ffffff;
                 border: 1px solid #334155;
                 outline: none;
-                font-size: 9px;
+                font-size: 10px;
             }
             """
         )
@@ -787,9 +989,9 @@ class F9Menu(QWidget):
                 border: 1px solid #3b82f6;
                 border-radius: 4px;
                 font-family: 'Segoe UI', sans-serif;
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 700;
-                padding: 4px 6px;
+                padding: 6px 8px;
             }
             QPushButton:hover {
                 background-color: #2563eb;
@@ -800,6 +1002,7 @@ class F9Menu(QWidget):
             }
             """
         )
+        self.btn_proximity_route.setMinimumHeight(30)
         self.btn_proximity_route.clicked.connect(self._on_proximity_route_button_clicked)
         sg_layout.addWidget(self.btn_proximity_route)
 
@@ -817,13 +1020,13 @@ class F9Menu(QWidget):
             QCheckBox {
                 color: #a7f3d0;
                 font-family: 'Segoe UI', sans-serif;
-                font-size: 9px;
+                font-size: 10px;
                 font-weight: 600;
                 padding-top: 2px;
             }
             QCheckBox::indicator {
-                width: 13px;
-                height: 13px;
+                width: 15px;
+                height: 15px;
                 border-radius: 3px;
                 border: 1px solid #475569;
                 background-color: #0f172a;
@@ -866,6 +1069,19 @@ class F9Menu(QWidget):
                     worker.set_auto_consumables_enabled(new_state)
             except Exception as exc:
                 logger.debug("Worker auto consumables senkronizasyon uyarısı: %s", exc)
+
+        # F-0573: kalıcılık — kutu eskiden yalnızca (varsa) worker
+        # özniteliğini yazıyordu; BotWorker'da bu öznitelik hiç
+        # tanımlı değil, o yüzden yazma boşa gidiyordu. Artık durum
+        # config/settings.json'daki gathering.auto_consumables ayarına
+        # da yazılır: constructor aynı anahtarı okur (F-0736),
+        # config/schema.py'deki auto_consumables alanı (R01) bu
+        # dosyadan beslenir, iksir mantığı da (R26) o bayrağı okur.
+        try:
+            if not _persist_settings_flag("gathering.auto_consumables", new_state):
+                logger.warning("auto_consumables ayarı settings.json'a yazılamadı")
+        except Exception as exc:
+            logger.warning("auto_consumables kalıcılık hatası: %s", exc)
 
         overlay = self.__dict__.get("overlay")
         if overlay is not None and hasattr(overlay, "add_log"):
@@ -918,7 +1134,8 @@ class F9Menu(QWidget):
         try:
             p_open = self.is_panel_open()
         except Exception:
-            p_open = True
+            # F-0656: on error the state is unknown; never claim the panel is open.
+            p_open = False
         return {
             "active_mode": str(self.__dict__.get("_active_mode") or "manual_record"),
             "mode_label": mode_cap,
@@ -1009,23 +1226,20 @@ class F9Menu(QWidget):
         self.combo_selective_materials.blockSignals(False)
 
     def _on_selective_material_changed(self, index: int) -> None:
+        # F-0646: merely browsing the material list must NOT auto-enable
+        # selective gather. Only the checkbox / proximity button / explicit
+        # set_selected_materials() change the enabled flag. The selection is
+        # remembered; the live signal only goes out while gathering is enabled.
         raw_materials = self.combo_selective_materials.itemData(index) if index >= 0 else []
         materials = [str(m).strip() for m in (raw_materials or []) if m is not None and str(m).strip()]
         self._selected_materials = list(materials)
-        if materials:
-            self._selective_gather_enabled = True
-            if hasattr(self, "chk_selective_gather"):
-                self.chk_selective_gather.blockSignals(True)
-                self.chk_selective_gather.setChecked(True)
-                self.chk_selective_gather.blockSignals(False)
-        else:
-            self._selective_gather_enabled = False
-            if hasattr(self, "chk_selective_gather"):
-                self.chk_selective_gather.blockSignals(True)
-                self.chk_selective_gather.setChecked(False)
-                self.chk_selective_gather.blockSignals(False)
+        if hasattr(self, "chk_selective_gather"):
+            self.chk_selective_gather.blockSignals(True)
+            self.chk_selective_gather.setChecked(self._selective_gather_enabled)
+            self.chk_selective_gather.blockSignals(False)
 
-        self.selective_gather_changed.emit(self._selected_materials, self._proximity_route_auto)
+        if self._selective_gather_enabled:
+            self.selective_gather_changed.emit(self._selected_materials, self._proximity_route_auto)
         logger.info(
             "F9Menu Seç-Topla materyal seçildi: %s (Aktif: %s)",
             self._selected_materials,
@@ -1058,7 +1272,9 @@ class F9Menu(QWidget):
             self.chk_selective_gather.setChecked(True)
             self.chk_selective_gather.blockSignals(False)
         self.selective_gather_changed.emit(self._selected_materials, True)
-        self.action_triggered.emit("build_proximity_route")
+        # F-0731: the old action_triggered.emit("build_proximity_route") had no
+        # counterpart in main.py; selective_gather_changed above is the channel
+        # main.py handles (build_proximity_material_route).
         logger.info(
             "F9Menu 'Yakınlığa Göre Rota Çiz & Topla' tıklandı. Materyaller: %s",
             self._selected_materials,
@@ -1108,6 +1324,9 @@ class F9Menu(QWidget):
             self.chk_selective_gather.blockSignals(True)
             self.chk_selective_gather.setChecked(bool(mats))
             self.chk_selective_gather.blockSignals(False)
+
+        # F-0647: programmatic sync was silent; emit so worker/shell stay in sync.
+        self.selective_gather_changed.emit(list(mats), bool(auto_proximity))
 
     def get_selected_materials(self) -> List[str]:
         return list(self._selected_materials)
@@ -1261,15 +1480,161 @@ class F9Menu(QWidget):
             self.worker = worker
             if hasattr(worker, "hud_update") and hasattr(worker.hud_update, "connect"):
                 try:
+                    # Disconnect a previous binding first: bind_targets() called
+                    # twice used to connect set_gathering_state twice.
+                    try:
+                        worker.hud_update.disconnect(self.set_gathering_state)
+                    except Exception:
+                        pass
                     worker.hud_update.connect(self.set_gathering_state)
                 except Exception as exc:
                     logger.debug("worker.hud_update f9_menu bağlantı uyarısı: %s", exc)
+            # F-0573 (menu side): push the current consumables + minimap state
+            # to the worker at bind time, so the toggle is not a placebo once
+            # bind_targets() is actually called. (The production call itself
+            # lives in main.py, and BotWorker acting on the flag is core-side:
+            # R26 reads config/schema.py auto_consumables in state_machine.)
+            try:
+                if hasattr(worker, "set_auto_consumables_enabled"):
+                    worker.set_auto_consumables_enabled(self._auto_consumables_enabled)
+                elif hasattr(worker, "auto_consumables_enabled"):
+                    worker.auto_consumables_enabled = self._auto_consumables_enabled
+                if hasattr(worker, "set_minimap_auto_record"):
+                    worker.set_minimap_auto_record(self._minimap_auto_record_enabled)
+            except Exception as exc:
+                logger.debug("Worker durum senkronizasyon uyarısı: %s", exc)
+            # A grubu devri: canlı panik kilidini overlay'e bağla —
+            # worker.panic_system main.py'de kurulur (PanicAlertSystem).
+            # Overlay kilidi 5 sn'de bir yoklar; kilit yoksa disk yedeği
+            # (logs/alarms/) kullanılır. Bağlantı kurulamazsa sessizce
+            # geçilir — panik şeridi yalnızca görünmez kalır.
+            try:
+                panic_lock = getattr(worker, "panic_system", None)
+                overlay_obj = self.__dict__.get("overlay")
+                if panic_lock is not None and overlay_obj is not None:
+                    set_lock = getattr(overlay_obj, "set_panic_lock", None)
+                    if callable(set_lock):
+                        set_lock(panic_lock)
+                    refresh_disk = getattr(overlay_obj, "refresh_panic_from_disk", None)
+                    if callable(refresh_disk):
+                        refresh_disk()
+            except Exception as exc:
+                logger.debug("Panik kilit bağlantısı kurulamadı: %s", exc)
+
+        # F-0650: yetim sinyalleri bağlı hedeflerdeki gerçek tüketicilere
+        # bağla (aşağıdaki _connect_orphan_signals). main.py bu metodu
+        # iki kez çağırır (önce overlay+worker, sonra shell) — her
+        # çağrıda yalnızca o anda bağlı olan hedefler bağlanır.
+        self._connect_orphan_signals()
 
         if route_manager is not None:
             self.route_manager = route_manager
             self._sync_from_route_manager()
 
         self._refresh_labels()
+
+    def _connect_orphan_signals(self) -> None:
+        """F-0650: üretimde hiçbir .connect() almayan F9Menu sinyallerini
+        bağlı hedeflerdeki gerçek tüketici slotlarına bağlar.
+
+        - harvest_stage_changed -> overlay.update_harvest_stage
+          (set_gathering_state yalnızca sinyal yayıyordu; overlay
+          rozeti bu yolla güncellenir)
+        - gathering_state_changed -> overlay.update_state
+        - panic_status_changed -> overlay.update_panic_status (A grubu
+          devri: HUD/mobil panik tüketicisi; payload'da "panic_status"
+          yoksa sinyal hiç yayılmaz, overlay kendi kilit yoklamasını
+          ve disk yedeğini kullanır)
+        - mode_selected -> overlay.set_mode (bilinmeyen mod id'si —
+          örn. mod olmayan eylem — set_mode içinde yoksayılır)
+        - routes_reloaded -> _on_routes_reloaded (shell rota kombosunu
+          aktif bölge için tazeler)
+        - consumables_toggled -> worker.set_auto_consumables_enabled
+          (2. tur: sinyalin üretimde hiçbir abonesi yoktu;
+          BotWorker.set_auto_consumables_enabled core/state_machine.py'de
+          F-0573 ile mevcut. Toggle anında worker'a canlı push yapar;
+          bind anındaki tek seferlik push (bind_targets) + doğrudan
+          yazma (set_auto_consumables_enabled) aynen durur — aynı
+          bool'un idempotent yazımıdır.)
+        Her bağlantı disconnect-first yapılır: bind_targets() iki kez
+        çağrıldığında slot iki kez çalışmaz.
+        """
+        overlay = self.__dict__.get("overlay")
+        if overlay is not None:
+            for signal, slot, name in (
+                (
+                    self.harvest_stage_changed,
+                    getattr(overlay, "update_harvest_stage", None),
+                    "update_harvest_stage",
+                ),
+                (
+                    self.gathering_state_changed,
+                    getattr(overlay, "update_state", None),
+                    "update_state",
+                ),
+                (
+                    self.panic_status_changed,
+                    getattr(overlay, "update_panic_status", None),
+                    "update_panic_status",
+                ),
+                (
+                    self.mode_selected,
+                    getattr(overlay, "set_mode", None),
+                    "set_mode",
+                ),
+            ):
+                if not callable(slot):
+                    continue
+                try:
+                    try:
+                        signal.disconnect(slot)
+                    except Exception:
+                        pass
+                    signal.connect(slot)
+                except Exception as exc:
+                    logger.debug("F9Menu sinyal bağlantı uyarısı (%s): %s", name, exc)
+        shell = self.__dict__.get("shell")
+        if shell is not None:
+            try:
+                try:
+                    self.routes_reloaded.disconnect(self._on_routes_reloaded)
+                except Exception:
+                    pass
+                self.routes_reloaded.connect(self._on_routes_reloaded)
+            except Exception as exc:
+                logger.debug("F9Menu routes_reloaded bağlantı uyarısı: %s", exc)
+        worker = self.__dict__.get("worker")
+        if worker is not None:
+            slot = getattr(worker, "set_auto_consumables_enabled", None)
+            if callable(slot):
+                try:
+                    try:
+                        self.consumables_toggled.disconnect(slot)
+                    except Exception:
+                        pass
+                    self.consumables_toggled.connect(slot)
+                except Exception as exc:
+                    logger.debug("F9Menu consumables_toggled bağlantı uyarısı: %s", exc)
+
+    def _on_routes_reloaded(self, routes: dict) -> None:
+        """F-0650: routes_reloaded tüketicisi.
+
+        Yeniden taranan rotalar shell'in rota kombo kutusunda eski
+        kalmasın diye aktif bölge/rota için komboyu tazeler. Kombo
+        route_manager'dan okur; F9Menu reload_routes() zaten
+        route_manager'ı/diski yeniden taramıştı.
+        """
+        if not isinstance(routes, dict):
+            return
+        shell = getattr(self, "shell", None)
+        if shell is None:
+            return
+        try:
+            populate = getattr(shell, "_populate_route_combo", None)
+            if callable(populate):
+                populate(str(self._active_region or ""), str(self._active_route or ""))
+        except Exception as exc:
+            logger.debug("routes_reloaded shell senkronizasyon uyarısı: %s", exc)
 
     def bind_live_sources(
         self,
@@ -1346,13 +1711,24 @@ class F9Menu(QWidget):
                 if hasattr(self.route_manager, "load_region"):
                     try:
                         self.route_manager.load_region(self._active_region)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # S-1702: sessiz pass yok — bölge yüklenemezse rota
+                        # değişimi başarılı görünmemeli, uyarı loglanmalı.
+                        logger.warning(
+                            "Aktif rota bölgesi yüklenirken hata (%s): %s",
+                            self._active_region,
+                            exc,
+                        )
                 if hasattr(self.route_manager, "save_data"):
                     try:
                         self.route_manager.save_data()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # S-1702: sessiz pass yok — kalıcı yazma başarısız
+                        # olsa bile rota değişimi başarılı görünmemeli.
+                        logger.warning(
+                            "Aktif rota kalıcı kaydı (save_data) başarısız: %s",
+                            exc,
+                        )
         except Exception as exc:
             logger.warning("Aktif rota RouteManager içine kaydedilirken hata: %s", exc)
         self.populate_region_materials(self._active_region)
@@ -1432,29 +1808,44 @@ class F9Menu(QWidget):
     @pyqtSlot()
     def reload_routes(self) -> None:
         """Forces re-reading regions and routes from RouteManager and disk."""
-        self._sync_from_route_manager()
+        self._sync_from_route_manager(force_disk_rescan=True)
         self._refresh_labels()
         self.routes_reloaded.emit(dict(self._regions_routes))
+
+    @staticmethod
+    def _safe_int(value: Any, fallback: Optional[int] = None) -> Optional[int]:
+        """F-0648: coerce one field without raising; bad input keeps the old value."""
+        if value is None or isinstance(value, bool):
+            return fallback
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(str(value).strip()))
+            except (TypeError, ValueError):
+                return fallback
 
     @pyqtSlot(dict)
     def set_gathering_state(self, data: dict) -> None:
         """
         Consumes snapshot data (from worker.hud_update or orchestrator) and synchronizes
         harvest stage, gathering progress, active mode, and pause state.
+        F-0648: each field is parsed independently — one bad field (e.g. a
+        non-numeric gathered_count) no longer swallows the whole update.
         """
         if not isinstance(data, dict):
             return
 
-        try:
-            # 1. Harvest Stage
-            stage = data.get("harvest_stage", data.get("current_harvest_stage"))
-            max_s = data.get("max_harvest_stages", data.get("harvests_per_node"))
-            if stage is not None:
-                self._current_harvest_stage = max(0, int(stage))
-            if max_s is not None:
-                self._harvests_per_node = max(1, int(max_s))
+        # 1. Harvest Stage
+        stage = self._safe_int(data.get("harvest_stage", data.get("current_harvest_stage")))
+        max_s = self._safe_int(data.get("max_harvest_stages", data.get("harvests_per_node")))
+        if stage is not None:
+            self._current_harvest_stage = max(0, stage)
+        if max_s is not None:
+            self._harvests_per_node = max(1, max_s)
 
-            # 2. Gathering Flag & Resource
+        # 2. Gathering Flag & Resource
+        try:
             state_val = str(data.get("current_state", data.get("state", ""))).upper()
             self._is_gathering = (state_val in ("GATHERING", "TOPLANIYOR") or (self._current_harvest_stage > 0))
             res_type = data.get("resource_type", data.get("resource_name", data.get("current_node_resource")))
@@ -1462,39 +1853,64 @@ class F9Menu(QWidget):
                 self._current_resource = str(res_type)
             elif not self._is_gathering:
                 self._current_resource = ""
+        except Exception as exc:
+            logger.debug("set_gathering_state durum alanı hatası: %s", exc)
 
-            # 3. Counters
-            if "gathered_count" in data:
-                self._gathered_count = int(data["gathered_count"])
-            if "active_node_id" in data:
-                self._active_node_id = int(data["active_node_id"])
+        # 3. Counters (bad values keep the previous count, logged, not fatal)
+        count = self._safe_int(data.get("gathered_count"))
+        if count is not None:
+            self._gathered_count = count
+        elif "gathered_count" in data:
+            logger.debug("set_gathering_state: gathered_count geçersiz: %r", data.get("gathered_count"))
+        node_id = self._safe_int(data.get("active_node_id"))
+        if node_id is not None:
+            self._active_node_id = node_id
+        elif "active_node_id" in data:
+            logger.debug("set_gathering_state: active_node_id geçersiz: %r", data.get("active_node_id"))
 
-            # 4. Mode
+        # 4. Mode
+        try:
             mode_val = data.get("mode", data.get("current_mode"))
             if mode_val:
                 self._active_mode = self._normalize_mode(str(mode_val))
-
-            # 5. Paused
-            paused_val = data.get("paused", data.get("is_paused"))
-            if paused_val is not None:
-                self._paused = bool(paused_val)
-
-            # 6. Region / Route
-            reg_val = data.get("region", data.get("active_region"))
-            if reg_val:
-                self._active_region = str(reg_val)
-            rte_val = data.get("route", data.get("active_route"))
-            if rte_val:
-                self._active_route = str(rte_val)
-
-            self._refresh_labels()
-
-            # Emit state changed signals
-            self.gathering_state_changed.emit(data)
-            if stage is not None:
-                self.harvest_stage_changed.emit(self._current_harvest_stage, self._harvests_per_node)
         except Exception as exc:
-            logger.debug("set_gathering_state hatası: %s", exc)
+            logger.debug("set_gathering_state mod alanı hatası: %s", exc)
+
+        # 5. Paused
+        paused_val = data.get("paused", data.get("is_paused"))
+        if paused_val is not None:
+            self._paused = bool(paused_val)
+
+        # 6. Region / Route
+        reg_val = data.get("region", data.get("active_region"))
+        if reg_val:
+            self._active_region = str(reg_val)
+        rte_val = data.get("route", data.get("active_route"))
+        if rte_val:
+            self._active_route = str(rte_val)
+
+        try:
+            self._refresh_labels()
+        except Exception as exc:
+            logger.debug("set_gathering_state etiket yenileme hatası: %s", exc)
+
+        # Emit state changed signals
+        try:
+            self.gathering_state_changed.emit(data)
+        except Exception as exc:
+            logger.debug("set_gathering_state sinyal hatası: %s", exc)
+        if stage is not None:
+            try:
+                self.harvest_stage_changed.emit(self._current_harvest_stage, self._harvests_per_node)
+            except Exception as exc:
+                logger.debug("set_gathering_state harvest sinyal hatası: %s", exc)
+        # A grubu devri: payload'da panik durumu varsa overlay'e ilet.
+        panic_val = data.get("panic_status")
+        if isinstance(panic_val, dict):
+            try:
+                self.panic_status_changed.emit(dict(panic_val))
+            except Exception as exc:
+                logger.debug("set_gathering_state panik sinyal hatası: %s", exc)
 
     @pyqtSlot(int, int)
     @pyqtSlot(int)
@@ -1592,8 +2008,9 @@ class F9Menu(QWidget):
             self._apply_collapsed_chrome()
 
     def update_routes(self, regions_routes: Dict[str, List[str]]) -> None:
+        # F-0737: route maps go through _sanitize_regions_routes().
         if regions_routes:
-            self._regions_routes = regions_routes
+            self._regions_routes = self._sanitize_regions_routes(regions_routes)
         self._refresh_labels()
 
     def _refresh_labels(self) -> None:
@@ -1610,9 +2027,9 @@ class F9Menu(QWidget):
                         border: 1px solid rgba(34, 197, 94, 0.75);
                         border-radius: 4px;
                         font-family: 'Segoe UI', sans-serif;
-                        font-size: 9px;
+                        font-size: 10px;
                         font-weight: 700;
-                        padding: 2px 6px;
+                        padding: 3px 7px;
                     }
                     """
                 )
@@ -1626,9 +2043,9 @@ class F9Menu(QWidget):
                         border: 1px solid rgba(34, 197, 94, 0.45);
                         border-radius: 4px;
                         font-family: 'Segoe UI', sans-serif;
-                        font-size: 9px;
+                        font-size: 10px;
                         font-weight: 700;
-                        padding: 2px 6px;
+                        padding: 3px 7px;
                     }
                     """
                 )
@@ -1695,7 +2112,7 @@ class F9Menu(QWidget):
                 background-color: {bg};
                 color: {text};
                 border: 1px solid {line};
-                border-radius: 6px;
+                border-radius: 8px;
             }}
             """
         )
@@ -1714,7 +2131,7 @@ class F9Menu(QWidget):
         rect = self.rect().adjusted(0, 0, -1, -1)
         painter.setPen(QPen(_PANEL_BORDER, 1.0))
         painter.setBrush(QBrush(_PANEL_BG))
-        painter.drawRoundedRect(rect, 6.0, 6.0)
+        painter.drawRoundedRect(rect, 8.0, 8.0)
         painter.end()
         super().paintEvent(event)
 
@@ -1726,7 +2143,10 @@ class F9Menu(QWidget):
         self._apply_panel_stylesheet(embedded=True)
         self.setMinimumSize(480, 360)
         self.setMaximumSize(16777215, 16777215)
-        self._panel_open = False
+        # F-0649: _apply_open_chrome() below shows the full panel, so the
+        # hosted panel is open; leaving _panel_open=False made is_panel_open()
+        # lie (and set_hosted_open(False) is the way to close it).
+        self._panel_open = True
         self._apply_open_chrome()
 
     def set_hosted_open(self, is_open: bool) -> None:
@@ -1797,7 +2217,7 @@ class F9Menu(QWidget):
         for widget in self._collapsible:
             widget.setVisible(True)
         if hasattr(self, "_toggle_btn"):
-            self._toggle_btn.setFixedSize(22, 22)
+            self._toggle_btn.setFixedSize(24, 24)
             self._toggle_btn.setText("✕")
             self._toggle_btn.setToolTip("Menüyü kapat")
         self.adjustSize()
@@ -1810,15 +2230,15 @@ class F9Menu(QWidget):
             self._toggle_btn.setText(label)
             self._toggle_btn.setToolTip(f"Menüyü aç ({label})")
             self._toggle_btn.setVisible(True)
-            self._toggle_btn.setFixedHeight(22)
+            self._toggle_btn.setFixedHeight(24)
             text_w = self._toggle_btn.fontMetrics().horizontalAdvance(label) + 16
             self._toggle_btn.setFixedWidth(max(22, text_w))
         self.setMinimumSize(0, 0)
         self.setMaximumSize(16777215, 16777215)
         self.adjustSize()
         rail_w = self._toggle_btn.width() + 18 if hasattr(self, "_toggle_btn") else 40
-        self.setFixedWidth(max(40, rail_w))
-        self.setFixedHeight(max(40, self._toggle_btn.height() + 16))
+        self.setFixedWidth(max(44, rail_w))
+        self.setFixedHeight(max(44, self._toggle_btn.height() + 18))
 
     def _place_on_left(self) -> None:
         if getattr(self, "_embedded", False):
@@ -1911,22 +2331,25 @@ class F9Menu(QWidget):
                     color: #e5e7eb;
                     border: 1px solid #2d323b;
                     border-radius: 6px;
-                    padding: 4px;
+                    padding: 6px;
                     font-family: 'Segoe UI', sans-serif;
-                    font-size: 12px;
+                    font-size: 13px;
                 }
                 QMenu::item {
-                    padding: 6px 24px 6px 12px;
+                    padding: 8px 26px 8px 14px;
                     border-radius: 4px;
                 }
                 QMenu::item:selected {
                     background-color: #2563eb;
                     color: #ffffff;
                 }
+                QMenu::item:disabled {
+                    color: #9ca3af;
+                }
                 QMenu::separator {
                     height: 1px;
                     background: #2d323b;
-                    margin: 4px 6px;
+                    margin: 5px 8px;
                 }
                 """
             )
@@ -2013,14 +2436,15 @@ class F9Menu(QWidget):
 
     def _select_route(self, region: str, route: str) -> None:
         try:
+            # F-0651: set_active_route() already propagates to shell/overlay/
+            # worker once; the extra _propagate_route_to_targets() call and the
+            # duplicate route_changed emit ran the sort + snapshot a 2nd/3rd time.
             self.set_active_route(region, route)
             if self._route_submenu is not None:
                 self._route_submenu.hide()
             logger.info("F9Menu üzerinden rota seçildi: %s · %s", region, route)
             self.route_selected.emit(region, route)
-            self.route_changed.emit(region, route)
             self.action_triggered.emit(f"route_selected:{region}:{route}")
-            self._propagate_route_to_targets(region, route)
         except Exception as exc:
             logger.error("Rota seçimi hatası (%s, %s): %s", region, route, exc)
 
@@ -2034,6 +2458,12 @@ class F9Menu(QWidget):
         self._trigger_action(action_id)
 
     def _trigger_action(self, action_id: str) -> None:
+        # F-0734: only known actions are dispatched / logged as triggered.
+        # Unknown strings used to be emitted and logged as if they had run.
+        known_actions = set(self.SHORT_LABELS) | {"route_selected"}
+        if action_id not in known_actions:
+            logger.warning("F9Menu bilinmeyen eylem yoksayıldı: %r", action_id)
+            return
         try:
             if self._route_submenu is not None and self._route_submenu.isVisible():
                 self._route_submenu.hide()
@@ -2042,7 +2472,9 @@ class F9Menu(QWidget):
                 new_state = self.toggle_minimap_auto_record()
                 state_str = "on" if new_state else "off"
                 logger.info("Sağ Üst Minimap Oto-Kayıt değiştirildi: %s", state_str)
-                self.action_triggered.emit(f"minimap_auto_record:{state_str}")
+                # F-0570: main.py only matches the bare "minimap_auto_record"
+                # branch; "minimap_auto_record:on/off" matched no branch.
+                self.action_triggered.emit("minimap_auto_record")
                 worker = getattr(self, "worker", None)
                 if worker is not None:
                     try:
@@ -2079,26 +2511,43 @@ class F9Menu(QWidget):
                         shell._publish_home()
                     except Exception:
                         pass
-                self.set_active_mode(action_id)
+                # F-0733: the second set_active_mode(action_id) call below was
+                # a duplicate; one call is enough.
 
             # Günlük açma, Kullanım Kılavuzu ve Destek Tanılama için yerleşik işleyiciler
-            opener = getattr(self, "tool_opener", None)
-            if action_id == "open_log":
-                if callable(opener):
-                    opener("logs")
+            # F-0571: these are handled here (or by the shell's tool_opener) AND
+            # main.py also handles them via action_triggered, so they ran twice.
+            # Handle once, locally, and do NOT emit action_triggered for them.
+            if action_id in ("open_log", "guide", "copy_support"):
+                opener = getattr(self, "tool_opener", None)
+                if action_id == "open_log":
+                    if callable(opener):
+                        opener("logs")
+                    else:
+                        self._handle_open_log()
+                elif action_id == "guide":
+                    if callable(opener):
+                        opener("guide")
+                    else:
+                        self._handle_open_guide()
                 else:
-                    self._handle_open_log()
-            elif action_id == "guide":
-                if callable(opener):
-                    opener("guide")
-                else:
-                    self._handle_open_guide()
-            elif action_id == "copy_support":
-                self._handle_copy_for_support()
+                    self._handle_copy_for_support()
+                logger.info("F9Menu eylemi tetiklendi: %s", action_id)
+                return
 
             logger.info("F9Menu eylemi tetiklendi: %s", action_id)
             self.action_triggered.emit(action_id)
-            self.mode_selected.emit(action_id)
+            # S-1701: mode_selected yalnızca gerçek mod eylemlerinde yayılır.
+            # radar/analytics/calibrate/yolo_factory/settings/exit/resume gibi
+            # mod olmayan eylemler bu sinyali almaz.
+            if action_id in (
+                "combat",
+                "auto_record",
+                "manual_record",
+                "route",
+                "explorer",
+            ):
+                self.mode_selected.emit(action_id)
         except Exception as exc:
             logger.error("F9Menu eylemi tetiklenirken hata ('%s'): %s", action_id, exc)
 
@@ -2119,7 +2568,8 @@ class F9Menu(QWidget):
         S -> Ayarlar (settings)
         L -> Günlük Kaydını Aç (open_log)
         I -> Kullanım Kılavuzu (guide)
-        C -> Destek İçin Tanılama Kopyala (copy_support)
+        C -> Savaş (combat)
+        P / H -> Destek İçin Tanılama Kopyala (copy_support)
         X -> Çıkış (exit)
         Esc -> Menüyü kapat
         """
@@ -2172,54 +2622,109 @@ class F9Menu(QWidget):
     # -------------------------------------------------------------------------
     # Yerleşik Yardımcı İşleyiciler (Log, Kılavuz, Destek Panosu)
     # -------------------------------------------------------------------------
-    def _ensure_log_file(self) -> str:
+    @staticmethod
+    def _resolve_log_path() -> str:
+        """F-0653: the log path must be main.py's LOG_FILE, not a second path
+        guessed from the CWD. Importing main here would be circular, so it is
+        imported lazily; the fallback mirrors main._resolve_log_dir() but is
+        anchored at the repo root instead of os.getcwd()."""
+        try:
+            from main import LOG_FILE as _main_log_file
+
+            return str(_main_log_file)
+        except Exception:
+            pass
         if os.path.isdir(r"F:\a2"):
             log_dir = r"F:\a2\logs"
         elif os.path.isdir("F:\\"):
             log_dir = r"F:\Gatherion\logs"
         else:
-            log_dir = os.path.join(os.getcwd(), "logs")
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            log_dir = os.path.join(repo_root, "logs")
         os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, "bot.log")
+        return os.path.join(log_dir, "bot.log")
+
+    def _ensure_log_file(self) -> str:
+        log_path = self._resolve_log_path()
         if not os.path.exists(log_path):
             try:
-                with open(log_path, "w", encoding="utf-8") as f:
-                    f.write(
-                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Gatherion v1.6.15 günlük dosyası başlatıldı.\n"
-                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Aktif mod: {self._active_mode}\n"
-                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Aktif rota: {self._active_region} · {self._active_route}\n"
-                    )
+                # F-0653: only touch an empty file. The old code fabricated
+                # timestamped "log started" lines for a log that never existed.
+                with open(log_path, "a", encoding="utf-8"):
+                    pass
             except Exception as exc:
                 logger.warning("Varsayılan logs/bot.log oluşturulamadı: %s", exc)
         return log_path
 
-    def _handle_open_log(self) -> None:
-        """logs/bot.log dosyasını sistem düzenleyicisinde veya yerleşik görüntüleyicide açar."""
-        log_path = self._ensure_log_file()
-        opened_externally = False
+    def _start_log_job(self, worker: QThread) -> bool:
+        """Start one log background job; False if one is already running."""
+        if getattr(self, "_log_job_thread", None) is not None:
+            logger.debug("Günlük işi zaten çalışıyor; yeni istek yoksayıldı.")
+            return False
+        worker.finished.connect(self._clear_log_job)
+        worker.finished.connect(worker.deleteLater)
+        self._log_job_thread = worker
         try:
-            if sys.platform.startswith("win"):
-                os.startfile(log_path)
-                opened_externally = True
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", log_path])
-                opened_externally = True
-            else:
-                subprocess.Popen(["xdg-open", log_path])
-                opened_externally = True
+            worker.start()
         except Exception as exc:
-            logger.warning("Harici günlük açma başarısız (%s), yerleşik görüntüleyici açılıyor.", exc)
+            logger.error("Günlük işi başlatılamadı: %s", exc)
+            self._log_job_thread = None
+            return False
+        return True
 
-        if not opened_externally:
-            self._show_builtin_log_viewer(log_path)
+    def _clear_log_job(self) -> None:
+        """Drop the finished log job ref (worker.finished)."""
+        self._log_job_thread = None
+
+    def _handle_open_log(self) -> None:
+        """logs/bot.log dosyasını sistem düzenleyicisinde veya yerleşik görüntüleyicide açar.
+
+        P2-2: harici açıcı (15 sn'ye kadar bekleyebilen subprocess)
+        arka plan thread'inde çalışır; açılmazsa yerleşik görüntüleyici
+        açılır (o da sınırlı kuyruk okur).
+        """
+        log_path = self._ensure_log_file()
+        worker = _LogOpenWorker(log_path, self)
+        worker.done.connect(self._on_log_open_done)
+        self._start_log_job(worker)
+
+    def _on_log_open_done(self, opened: bool) -> None:
+        """GUI-thread slot: fall back to the builtin viewer if needed."""
+        if opened:
+            return
+        logger.warning(
+            "Harici günlük açma başarısız, yerleşik görüntüleyici açılıyor."
+        )
+        self._show_builtin_log_viewer(self._ensure_log_file())
 
     def _show_builtin_log_viewer(self, log_path: str) -> None:
-        try:
-            content = ""
-            if os.path.exists(log_path):
-                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
+        """P2-2: günlük içeriği arka planda, sınırlı kuyruk olarak okunur;
+        dialog GUI thread'indeki slotta kurulur."""
+        worker = _LogTailWorker(log_path, _LOG_TAIL_MAX_LINES, self)
+        worker.loaded.connect(
+            lambda payload: self._on_log_tail_loaded(payload, log_path)
+        )
+        worker.failed.connect(
+            lambda msg: self._on_log_tail_failed(msg, log_path)
+        )
+        self._start_log_job(worker)
 
+    def _on_log_tail_loaded(self, payload: object, log_path: str) -> None:
+        """GUI-thread slot: build the log viewer dialog from the tail."""
+        try:
+            data = payload if isinstance(payload, dict) else {}
+            lines = list(data.get("lines") or [])
+            truncated = bool(data.get("truncated"))
+            if lines:
+                content = "\n".join(lines)
+                if truncated:
+                    content = (
+                        "(Günlük çok büyük — yalnızca son kayıtlar "
+                        f"gösteriliyor, en fazla {_LOG_TAIL_MAX_LINES} satır.)\n"
+                        + content
+                    )
+            else:
+                content = ""
             dlg = QDialog()
             dlg.setWindowTitle(f"Gatherion Günlük Görüntüleyici — {log_path}")
             dlg.resize(700, 460)
@@ -2239,10 +2744,16 @@ class F9Menu(QWidget):
                     border: none;
                     border-radius: 4px;
                     padding: 6px 14px;
+                    min-height: 32px;
+                }
+                QPushButton:hover {
+                    background-color: #1d4ed8;
                 }
                 """
             )
             lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(12, 12, 12, 12)
+            lay.setSpacing(10)
             txt = QTextEdit(dlg)
             txt.setReadOnly(True)
             txt.setPlainText(content or "Günlük dosyası boş.")
@@ -2255,11 +2766,19 @@ class F9Menu(QWidget):
         except Exception as exc:
             logger.error("Yerleşik günlük görüntüleyici açılamadı: %s", exc)
 
+    def _on_log_tail_failed(self, message: str, log_path: str) -> None:
+        """GUI-thread slot: show the viewer with the read error instead."""
+        logger.error("Günlük kuyruğu okunamadı: %s", message)
+        self._on_log_tail_loaded(
+            {"lines": [f"(Günlük okunamadı: {message})"], "truncated": False},
+            log_path,
+        )
+
     def _handle_open_guide(self) -> None:
         """Etkileşimli Türkçe 'Kullanım Kılavuzu & Sorun Giderme' penceresini açar."""
         try:
             dlg = QDialog()
-            dlg.setWindowTitle("Gatherion v1.6.15 — Kullanım Kılavuzu & Sorun Giderme")
+            dlg.setWindowTitle(f"Gatherion v{__version__} — Kullanım Kılavuzu & Sorun Giderme")
             dlg.resize(580, 420)
             dlg.setStyleSheet(
                 """
@@ -2283,6 +2802,7 @@ class F9Menu(QWidget):
                     border-radius: 4px;
                     padding: 6px 16px;
                     font-weight: bold;
+                    min-height: 32px;
                 }
                 QPushButton:hover {
                     background-color: #0284c7;
@@ -2290,10 +2810,12 @@ class F9Menu(QWidget):
                 """
             )
             lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(12, 12, 12, 12)
+            lay.setSpacing(10)
             guide_text = QTextEdit(dlg)
             guide_text.setReadOnly(True)
             guide_text.setHtml(
-                "<h3>Gatherion v1.6.15 — Hızlı Kurulum & Kullanım Kılavuzu</h3>"
+                f"<h3>Gatherion v{__version__} — Hızlı Kurulum & Kullanım Kılavuzu</h3>"
                 "<ol>"
                 "<li><b>Ctrl+Alt+F9 Hızlı Kontrol Menüsü & Ayarlar (S):</b> F tuşu aralığını, dinlenme süresini ve aktif Bölge/Rota seçimini yapılandırın.</li>"
                 "<li><b>3x Toplama Modu (Harvests/Node: 3x):</b> Her kaynak noktası ardışık 3 aşamada (1/3 -> 2/3 -> 3/3) tamamen toplanır.</li>"
@@ -2313,17 +2835,30 @@ class F9Menu(QWidget):
             logger.error("Kullanım kılavuzu penceresi gösterilemedi: %s", exc)
 
     def _handle_copy_for_support(self) -> None:
-        """Tanılama durumunu ve logs/bot.log son satırlarını sistem panosuna kopyalar."""
+        """Tanılama durumunu ve logs/bot.log son satırlarını sistem panosuna kopyalar.
+
+        P2-2: son satırlar arka planda, sınırlı kuyruk olarak okunur;
+        rapor ve pano yazımı GUI thread'indeki slotta yapılır (pano
+        yalnızca ana thread'den yazılabilir).
+        """
+        log_path = self._ensure_log_file()
+        worker = _LogTailWorker(log_path, _LOG_SUPPORT_TAIL_LINES, self)
+        worker.loaded.connect(self._on_support_tail_loaded)
+        worker.failed.connect(
+            lambda msg: logger.error(
+                "Destek tanılama günlüğü okunamadı: %s", msg
+            )
+        )
+        self._start_log_job(worker)
+
+    def _on_support_tail_loaded(self, payload: object) -> None:
+        """GUI-thread slot: build the support report and copy it."""
         try:
-            log_path = self._ensure_log_file()
-            tail_lines: List[str] = []
-            if os.path.exists(log_path):
-                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                    all_lines = f.readlines()
-                    tail_lines = [ln.rstrip("\r\n") for ln in all_lines[-50:]]
+            data = payload if isinstance(payload, dict) else {}
+            tail_lines = [ln.rstrip("\r\n") for ln in (data.get("lines") or [])]
 
             report = (
-                "=== Gatherion v1.6.15 Destek Tanılama Raporu ===\n"
+                f"=== Gatherion v{__version__} Destek Tanılama Raporu ===\n"
                 f"Zaman Damgası: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"Platform: {platform.platform()} | Python {platform.python_version()}\n"
                 f"Aktif Mod: {self._active_mode}\n"
@@ -2342,19 +2877,72 @@ class F9Menu(QWidget):
             logger.error("Destek bilgisi panoya kopyalanamadı: %s", exc)
 
     def get_f9_menu_health_summary(self) -> dict:
+        # F-0572: the old version returned {"f9_menu_ready": True} without
+        # checking anything. Now the flag reflects real internal state.
         try:
-            return {"f9_menu_ready": True}
-        except Exception:
-            return {"f9_menu_ready": False}
+            checks = {
+                "regions_loaded": bool(self._regions_routes),
+                "active_region_known": self._active_region in self._regions_routes
+                if self._regions_routes
+                else False,
+                "rows_built": bool(getattr(self, "_rows", {})),
+                "mode_valid": self._active_mode in self.MODE_LABELS or self._active_mode == "manual_record",
+                "harvests_sane": 1 <= int(self._harvests_per_node) <= 10,
+            }
+            ready = all(checks.values())
+            return {"f9_menu_ready": ready, "checks": checks}
+        except Exception as exc:
+            return {"f9_menu_ready": False, "error": str(exc)}
 
     def get_f9_menu_ready_flag(self) -> dict:
-        return {"module": "f9_menu", "ready": True}
+        # F-0572: readiness is derived from the class contract (signals and
+        # binding API actually present), not a hardcoded True.
+        try:
+            required_signals = (
+                "action_triggered",
+                "mode_selected",
+                "route_selected",
+                "consumables_toggled",
+                "selective_gather_changed",
+            )
+            required_methods = (
+                "bind_targets",
+                "set_gathering_state",
+                "set_active_route",
+                "get_f9_quick_control_summary",
+            )
+            ok = all(hasattr(F9Menu, name) for name in required_signals + required_methods)
+            return {"module": "f9_menu", "ready": bool(ok)}
+        except Exception:
+            return {"module": "f9_menu", "ready": False}
 
     def get_f9_menu_version_info(self) -> dict:
-        return {"module": "f9_menu", "version": "2.0.0", "ready": True}
+        # S-3901: eskiden sabit {"ready": True} dönüyor, hiçbir şeyi
+        # kontrol etmiyordu. Hazırlık artık gerçek sınıf-sözleşme
+        # kontrolünden (get_f9_menu_ready_flag: gerekli sinyaller +
+        # bağlama API'si F9Menu'de gerçekten var mı) türetiliyor.
+        flag = self.get_f9_menu_ready_flag()
+        return {"module": "f9_menu", "version": __version__, "ready": bool(flag.get("ready", False))}
 
     def get_f9_menu_diagnostic_snapshot(self) -> dict:
-        return {"module": "f9_menu", "status": "ok", "ready": True}
+        # S-3901: eskiden sabit {"status": "ok", "ready": True} dönüyordu.
+        # Durum artık gerçek sağlık özetini (F-0572 kontrolleri: bölge
+        # yüklü, aktif bölge biliniyor, satırlar kurulu, mod geçerli,
+        # hasat sayısı makul) yansıtıyor; kontrol geçemezse "degraded".
+        health = self.get_f9_menu_health_summary()
+        ready = bool(health.get("f9_menu_ready", False))
+        snapshot: dict = {
+            "module": "f9_menu",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+        }
+        checks = health.get("checks")
+        if isinstance(checks, dict):
+            snapshot["checks"] = checks
+        error = health.get("error")
+        if error:
+            snapshot["error"] = error
+        return snapshot
 
     def get_f9_menu_capabilities(self) -> list:
         return ["f9_menu", "quick_actions", "diagnostic_snapshot"]
@@ -2365,7 +2953,43 @@ def get_f9_menu_capabilities() -> list:
 
 
 def validate_f9_menu_contract() -> bool:
-    return bool(get_f9_menu_capabilities())
+    # S-3901: eskiden bool(get_f9_menu_capabilities()) idi — sabit,
+    # boş olmayan bir liste, yani asla başarısız olamazdı; üstüne kurulu
+    # baseline/readiness/audit/telemetry/integrity/compliance/probe
+    # zinciri de hep True/ok dönüyordu. Sözleşme artık gerçek F9Menu
+    # sınıfına karşı kontrol ediliyor: duyurulan her capability gerçek
+    # bir metoda karşılık gelmeli ve gerekli sinyaller + bağlama API'si
+    # (get_f9_menu_ready_flag'in instance üzerinde kontrol ettiği
+    # kümenin aynısı) sınıfta gerçekten bulunmalı.
+    try:
+        capabilities = get_f9_menu_capabilities()
+        if not capabilities:
+            return False
+        capability_targets = {
+            "f9_menu": "get_f9_menu_health_summary",
+            "quick_actions": "get_f9_quick_control_summary",
+            "diagnostic_snapshot": "get_f9_menu_diagnostic_snapshot",
+        }
+        if any(cap not in capability_targets for cap in capabilities):
+            return False
+        if not all(hasattr(F9Menu, target) for target in capability_targets.values()):
+            return False
+        required_signals = (
+            "action_triggered",
+            "mode_selected",
+            "route_selected",
+            "consumables_toggled",
+            "selective_gather_changed",
+        )
+        required_methods = (
+            "bind_targets",
+            "set_gathering_state",
+            "set_active_route",
+            "get_f9_quick_control_summary",
+        )
+        return all(hasattr(F9Menu, name) for name in required_signals + required_methods)
+    except Exception:
+        return False
 
 
 def get_f9_menu_baseline_metrics() -> dict:

@@ -1,96 +1,99 @@
 # -*- coding: utf-8 -*-
 """
-PyQt6 F9 Context Menu (Gatherion Style Radial/Popup Menu)
-Triggered anywhere on screen via F9:
-- Resume (R)
-- Auto record (A)
-- Manual record (N)
-- Route mode (M)
-- Active route (T)
-- Settings (S)
-- Exit (X)
+PyQt6 F9 Context Menu — compatibility shim.
+
+The live F9 menu is :class:`ui.f9_menu.F9Menu` (a QWidget with short Turkish
+rows, including the ``active_route`` ("Rota") row, ``mode_selected`` /
+``action_triggered`` signals and real key handling in ``keyPressEvent``).
+An earlier QMenu copy of the menu used to live in this module: it promised
+an "Active route (T)" row its actions never had, and its "(R)/(A)/(N)/(M)/
+(S)/(X)" labels were decoration with no shortcuts wired. That dead copy is
+removed; this module re-exports the live class so ``ui.menu.F9Menu`` keeps
+working, and the health helpers below probe the live class instead of
+blindly reporting ``ready: True``.
 """
 
-from PyQt6.QtWidgets import QMenu, QWidget
-from PyQt6.QtGui import QAction, QCursor, QFont, QIcon
-from PyQt6.QtCore import Qt, pyqtSignal
+from ui.f9_menu import F9Menu
+from version import __version__
 
-class F9Menu(QMenu):
-    mode_selected = pyqtSignal(str) # 'route', 'auto_record', 'manual_record', 'resume', 'settings', 'exit'
+__all__ = [
+    "F9Menu",
+    "get_menu_capabilities",
+    "get_ui_menu_capabilities",
+    "validate_ui_menu_contract",
+    "get_ui_menu_baseline_metrics",
+    "get_ui_menu_readiness_status",
+    "validate_menu_contract",
+    "get_menu_readiness_status",
+    "get_menu_audit_record",
+    "get_menu_operational_digest",
+    "get_menu_telemetry_payload",
+    "get_menu_integrity_seal",
+    "get_menu_compliance_certificate",
+    "get_menu_readiness_probe",
+    "get_menu_audit_summary",
+    "get_menu_health_summary",
+    "get_menu_status_summary",
+    "get_menu_ready_flag",
+    "get_menu_version_info",
+    "get_menu_diagnostic_snapshot",
+]
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setStyleSheet("""
-            QMenu {
-                background-color: #1a1e24;
-                color: #e2e8f0;
-                border: 1px solid #334155;
-                border-radius: 8px;
-                padding: 6px;
-                font-size: 13px;
-                font-family: 'Segoe UI', Tahoma, sans-serif;
-            }
-            QMenu::item {
-                padding: 8px 24px 8px 12px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #2563eb;
-                color: #ffffff;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #334155;
-                margin: 4px 8px;
-            }
-        """)
 
-        # Items matching Gatherion exactly
-        self.act_resume = QAction("Resume: route mode\t(R)", self)
-        self.act_auto = QAction("Auto record: you walk, bot presses F\t(A)", self)
-        self.act_manual = QAction("Manual record: you walk, F8 saves node\t(N)", self)
-        self.act_route = QAction("Route mode: bot walks and presses F\t(M)", self)
-        self.act_settings = QAction("Settings...\t(S)", self)
-        self.act_exit = QAction("Exit\t(X)", self)
+def _live_menu_probe() -> dict:
+    """Check the live F9Menu class for real instead of claiming readiness."""
+    try:
+        labels = dict(getattr(F9Menu, "SHORT_LABELS", {}) or {})
+        probe = {
+            "live_class": "ui.f9_menu.F9Menu",
+            "available": F9Menu is not None,
+            "has_active_route_row": "active_route" in labels,
+            "has_mode_selected_signal": hasattr(F9Menu, "mode_selected"),
+            "row_count": len(labels),
+        }
+        probe["ready"] = bool(
+            probe["available"]
+            and probe["has_active_route_row"]
+            and probe["has_mode_selected_signal"]
+        )
+        return probe
+    except Exception as exc:  # pragma: no cover - defensive
+        return {
+            "live_class": "ui.f9_menu.F9Menu",
+            "available": False,
+            "has_active_route_row": False,
+            "has_mode_selected_signal": False,
+            "row_count": 0,
+            "ready": False,
+            "error": str(exc),
+        }
 
-        self.addAction(self.act_resume)
-        self.addSeparator()
-        self.addAction(self.act_auto)
-        self.addAction(self.act_manual)
-        self.addAction(self.act_route)
-        self.addSeparator()
-        self.addAction(self.act_settings)
-        self.addAction(self.act_exit)
 
-        # Connections
-        self.act_resume.triggered.connect(lambda: self.mode_selected.emit("resume"))
-        self.act_auto.triggered.connect(lambda: self.mode_selected.emit("auto_record"))
-        self.act_manual.triggered.connect(lambda: self.mode_selected.emit("manual_record"))
-        self.act_route.triggered.connect(lambda: self.mode_selected.emit("route"))
-        self.act_settings.triggered.connect(lambda: self.mode_selected.emit("settings"))
-        self.act_exit.triggered.connect(lambda: self.mode_selected.emit("exit"))
+def get_menu_health_summary() -> dict:
+    probe = _live_menu_probe()
+    return {"module": "menu", "ready": probe["ready"], "live": probe}
 
-    def popup_at_cursor(self):
-        cursor_pos = QCursor.pos()
-        self.popup(cursor_pos)
 
-    def get_menu_health_summary(self) -> dict:
-        return {"module": "menu", "ready": True}
+def get_menu_status_summary() -> dict:
+    return {"menu_ready": _live_menu_probe()["ready"]}
 
-    def get_menu_status_summary(self) -> dict:
-        try:
-            return {"menu_ready": True}
-        except Exception:
-            return {"menu_ready": False}
 
-    def get_menu_ready_flag(self) -> dict:
-        return {"module": "menu", "ready": True}
+def get_menu_ready_flag() -> dict:
+    return {"module": "menu", "ready": _live_menu_probe()["ready"]}
 
-    def get_menu_version_info(self) -> dict:
-        return {"module": "menu", "version": "2.0.0", "ready": True}
 
-    def get_menu_diagnostic_snapshot(self) -> dict:
-        return {"module": "menu", "status": "ok", "ready": True}
+def get_menu_version_info() -> dict:
+    return {"module": "menu", "version": __version__, "ready": _live_menu_probe()["ready"]}
+
+
+def get_menu_diagnostic_snapshot() -> dict:
+    probe = _live_menu_probe()
+    return {
+        "module": "menu",
+        "status": "ok" if probe["ready"] else "degraded",
+        "ready": probe["ready"],
+        "live": probe,
+    }
 
 
 def get_menu_capabilities() -> list:
@@ -102,11 +105,11 @@ def get_ui_menu_capabilities() -> list:
 
 
 def validate_ui_menu_contract() -> bool:
-    return bool(get_ui_menu_capabilities())
+    return bool(get_ui_menu_capabilities()) and _live_menu_probe()["ready"]
 
 
 def get_ui_menu_baseline_metrics() -> dict:
-    return {"module": "ui_menu", "contract_valid": validate_ui_menu_contract(), "menu_ready": True}
+    return {"module": "ui_menu", "contract_valid": validate_ui_menu_contract(), "menu_ready": _live_menu_probe()["ready"]}
 
 
 def get_ui_menu_readiness_status() -> dict:
@@ -147,5 +150,3 @@ def get_menu_readiness_probe() -> dict:
 
 def get_menu_audit_summary() -> dict:
     return {"module": "menu", "audit_passed": validate_menu_contract(), "probe": get_menu_readiness_probe()}
-
-

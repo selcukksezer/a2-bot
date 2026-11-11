@@ -1,15 +1,13 @@
-import os
-import sys
 import logging
 import json
+import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List, Sequence, Union
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QRect, QPoint, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QPoint, pyqtSignal
 from PyQt6.QtGui import (
     QPixmap,
     QImage,
@@ -32,12 +30,12 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QWidget,
     QFileDialog,
-    QMessageBox,
     QFrame,
     QSizePolicy,
 )
 
 from ui.shell_page_frame import wrap_shell_tab_root_layout
+from version import __version__
 
 logger = logging.getLogger("CalibrationWizard")
 
@@ -285,8 +283,8 @@ class InteractiveROICanvas(QWidget):
         painter.fillRect(self.rect(), QColor("#111318"))
 
         if self._pixmap is None or self._pixmap.isNull():
-            painter.setPen(QColor("#7f8c8d"))
-            painter.setFont(QFont("Segoe UI", 11))
+            painter.setPen(QColor("#94a3b8"))
+            painter.setFont(QFont("Segoe UI", 12))
             painter.drawText(
                 self.rect(),
                 Qt.AlignmentFlag.AlignCenter,
@@ -342,7 +340,7 @@ class InteractiveROICanvas(QWidget):
 
                 lbl = str(item.get("label", ""))
                 if lbl:
-                    painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                    painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
                     fm = painter.fontMetrics()
                     tw = fm.horizontalAdvance(lbl) + 10
                     th = fm.height() + 4
@@ -379,6 +377,336 @@ class InteractiveROICanvas(QWidget):
         painter.end()
 
 
+def _quarantine_corrupt_json(path: Path) -> Optional[Path]:
+    """Moves a corrupt JSON file aside instead of deleting it.
+
+    Returns the backup path (``<name>.corrupt-<UTC timestamp>`` next to the
+    original) or None when the file could not be preserved — the caller must
+    then refuse to overwrite it, so no recorded data is ever silently lost.
+    """
+    try:
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        backup = path.with_name(f"{path.name}.corrupt-{ts}")
+        counter = 1
+        while backup.exists():
+            counter += 1
+            backup = path.with_name(f"{path.name}.corrupt-{ts}-{counter}")
+        path.replace(backup)
+        logger.warning("Corrupt JSON preserved at %s (original: %s)", backup, path)
+        return backup
+    except Exception as exc:
+        logger.error("Failed preserving corrupt JSON %s: %s", path, exc)
+        return None
+
+
+# =============================================================================
+# P0-2 (K-11) — quarantine for crops / ROI entries labelled with the old
+# legacy prompt/crest ids 6/7/8.
+# =============================================================================
+# Before this fix, TEMPLATE_TARGETS wrote the crest / F / E prompt templates
+# with yolo_class_id 6/7/8, which dataset/data.yaml assigns to herb_edana /
+# herb_lumina / ore_obsidian. The poison lives in three places, all keyed by
+# the template "key" (NOT by class id alone — 6/7/8 are valid canonical ids
+# for real herbs/ores, so the scan is always scoped to these three keys):
+#   * templates/calibrated/<key>/crop_<ts>.png — archived crops;
+#   * config/calibrated_rois.json — ROI entries for these keys;
+#   * dataset/review/train/calib_<legacy-name>_*.json (+ labels/train/*.txt)
+#     — hand labels the wizard registered (detection only; moving dataset
+#     files would break review-sync invariants, so they are LISTED, never
+#     moved here — that pass belongs to the dataset side, see P0-1).
+_P02_POISONED_TEMPLATE_KEYS: Tuple[str, ...] = (
+    "gather_prompt",
+    "e_gather_icon",
+    "crest_white_wing",
+)
+_P02_LEGACY_POISON_IDS = frozenset({6, 7, 8})
+_P02_LEGACY_CLASS_NAMES = frozenset(
+    {"f_gather_prompt", "e_gather_icon", "world_gather_crest"}
+)
+
+
+def _p02_unique_path(path: Path) -> Path:
+    """Collision-safe sibling path (``<stem>-2.<ext>``, ``-3``, ...)."""
+    if not path.exists():
+        return path
+    counter = 2
+    while True:
+        cand = path.with_name(f"{path.stem}-{counter}{path.suffix}")
+        if not cand.exists():
+            return cand
+        counter += 1
+
+
+def scan_mislabelled_template_crops(
+    base_dir: Path,
+    templates_dir: Optional[Path] = None,
+    *,
+    include_dataset: bool = False,
+) -> Dict[str, Any]:
+    """Read-only scan for crest/F/E material labelled with legacy ids 6/7/8.
+
+    Returns ``{"roi_entries": [...], "archived_crops": [...],
+    "dataset_hand_labels": [...]}``. Nothing is moved, rewritten or
+    deleted — safe to call from the wizard startup check. Set
+    ``include_dataset=True`` only for an explicit audit: it globs
+    ``dataset/review/train/calib_*.json`` and can be slow on a large
+    dataset, so the startup check leaves it off.
+    """
+    base = Path(base_dir)
+    tdir = Path(templates_dir) if templates_dir is not None else base / "templates"
+    found: Dict[str, Any] = {
+        "roi_entries": [],
+        "archived_crops": [],
+        "dataset_hand_labels": [],
+    }
+
+    # 1. ROI entries in config/calibrated_rois.json (both the canonical
+    #    data["rois"][key] home and pre-S-3801 top-level duplicates).
+    rois_path = base / "config" / "calibrated_rois.json"
+    try:
+        if rois_path.exists():
+            data = json.loads(rois_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                homes = []
+                rois = data.get("rois")
+                if isinstance(rois, dict):
+                    homes.append(("rois", rois))
+                homes.append(("top-level", data))
+                for home_name, home in homes:
+                    for key in _P02_POISONED_TEMPLATE_KEYS:
+                        entry = home.get(key)
+                        if not isinstance(entry, dict):
+                            continue
+                        cid = entry.get("yolo_class_id")
+                        if isinstance(cid, int) and cid in _P02_LEGACY_POISON_IDS:
+                            found["roi_entries"].append(
+                                {
+                                    "key": key,
+                                    "location": home_name,
+                                    "yolo_class_id": cid,
+                                    "class_name": entry.get("class_name"),
+                                    "target": entry.get("target"),
+                                }
+                            )
+    except Exception as exc:
+        logger.warning("P0-2 scan could not read %s: %s", rois_path, exc)
+
+    # 2. Archived calibration crops for the three poisoned keys.
+    try:
+        calib_dir = tdir / "calibrated"
+        if calib_dir.exists():
+            for key in _P02_POISONED_TEMPLATE_KEYS:
+                key_dir = calib_dir / key
+                if not key_dir.exists():
+                    continue
+                for pattern in ("crop_*.png", "crop_*.jpg"):
+                    for crop_path in sorted(key_dir.glob(pattern)):
+                        found["archived_crops"].append(
+                            {"key": key, "path": str(crop_path)}
+                        )
+    except Exception as exc:
+        logger.warning("P0-2 scan could not list %s: %s", calib_dir, exc)
+
+    # 3. Dataset hand labels the wizard registered (detection only).
+    if include_dataset:
+        try:
+            review_dir = base / "dataset" / "review" / "train"
+            labels_dir = base / "dataset" / "labels" / "train"
+            if review_dir.exists():
+                for rev_path in sorted(review_dir.glob("calib_*.json")):
+                    try:
+                        payload = json.loads(rev_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    for box in payload.get("trusted") or []:
+                        if not isinstance(box, dict):
+                            continue
+                        cid = box.get("class_id")
+                        if (
+                            box.get("source") == "calibration_wizard"
+                            and isinstance(cid, int)
+                            and cid in _P02_LEGACY_POISON_IDS
+                            and str(box.get("class_name") or "")
+                            in _P02_LEGACY_CLASS_NAMES
+                        ):
+                            stem = str(payload.get("stem") or rev_path.stem)
+                            lbl_path = labels_dir / f"{stem}.txt"
+                            found["dataset_hand_labels"].append(
+                                {
+                                    "stem": stem,
+                                    "class_id": cid,
+                                    "class_name": box.get("class_name"),
+                                    "review_path": str(rev_path),
+                                    "label_path": str(lbl_path),
+                                    "label_exists": lbl_path.exists(),
+                                }
+                            )
+                            break
+        except Exception as exc:
+            logger.warning("P0-2 dataset scan failed: %s", exc)
+
+    return found
+
+
+def quarantine_mislabelled_template_crops(
+    base_dir: Path,
+    templates_dir: Optional[Path] = None,
+    *,
+    dry_run: bool = True,
+    include_dataset: bool = False,
+) -> Dict[str, Any]:
+    """Quarantine crest/F/E material labelled with legacy ids 6/7/8.
+
+    ``dry_run=True`` (default) only scans and logs — nothing moves.
+    With ``dry_run=False``:
+      * each archived crop under ``templates/calibrated/<key>/`` is MOVED
+        (never deleted) to ``templates/calibrated-quarantine/<key>/``;
+      * the poisoned ROI entries are copied to
+        ``config/calibrated_rois.quarantine-<UTC timestamp>.json`` and then
+        removed from the live ``calibrated_rois.json`` (atomic tmp+replace,
+        same pattern as :func:`save_calibrated_roi`);
+      * dataset hand labels are LISTED ONLY — they are not moved (see the
+        module note above); the caller must run the dataset-side pass.
+    A corrupt/unreadable live ROI file refuses the ROI step (crops still
+    move); every failure is logged and reported in ``"errors"``.
+    """
+    base = Path(base_dir)
+    tdir = Path(templates_dir) if templates_dir is not None else base / "templates"
+    report = scan_mislabelled_template_crops(
+        base, tdir, include_dataset=include_dataset
+    )
+    report["dry_run"] = bool(dry_run)
+    report["moved_crops"] = []
+    report["quarantined_roi_entries"] = []
+    report["quarantine_file"] = None
+    report["errors"] = []
+
+    n_roi = len(report["roi_entries"])
+    n_crops = len(report["archived_crops"])
+    n_data = len(report["dataset_hand_labels"])
+    if dry_run:
+        if n_roi or n_crops or n_data:
+            logger.warning(
+                "P0-2 mislabelled crest/F/E material found (dry run, nothing "
+                "moved): %d ROI entries, %d archived crops, %d dataset hand "
+                "labels with legacy ids 6/7/8. Re-run with dry_run=False to "
+                "quarantine crops + ROI entries.",
+                n_roi,
+                n_crops,
+                n_data,
+            )
+        return report
+
+    # 1. Move archived crops aside (never delete).
+    for crop in report["archived_crops"]:
+        try:
+            src = Path(crop["path"])
+            dest_dir = tdir / "calibrated-quarantine" / str(crop["key"])
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = _p02_unique_path(dest_dir / src.name)
+            src.replace(dest)
+            report["moved_crops"].append({"key": crop["key"], "src": str(src), "dst": str(dest)})
+            logger.warning("P0-2 quarantined mislabelled crop %s -> %s", src, dest)
+        except Exception as exc:
+            report["errors"].append(f"crop {crop['path']}: {exc}")
+            logger.error("P0-2 failed quarantining crop %s: %s", crop["path"], exc)
+
+    # 2. Quarantine + remove poisoned ROI entries.
+    if report["roi_entries"]:
+        rois_path = base / "config" / "calibrated_rois.json"
+        try:
+            data = json.loads(rois_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("calibrated_rois.json is not a JSON object")
+            ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            q_path = rois_path.with_name(
+                f"calibrated_rois.quarantine-{ts}.json"
+            )
+            q_path = _p02_unique_path(q_path)
+            q_path.write_text(
+                json.dumps(
+                    {"quarantined_roi_entries": report["roi_entries"]},
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            report["quarantine_file"] = str(q_path)
+            for entry in report["roi_entries"]:
+                key = entry["key"]
+                rois = data.get("rois")
+                if isinstance(rois, dict):
+                    rois.pop(key, None)
+                if isinstance(data.get(key), dict):
+                    data.pop(key, None)
+            data["updated_at"] = ts
+            tmp_path = rois_path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            tmp_path.replace(rois_path)
+            report["quarantined_roi_entries"] = list(report["roi_entries"])
+            logger.warning(
+                "P0-2 quarantined %d ROI entries to %s",
+                len(report["quarantined_roi_entries"]),
+                q_path,
+            )
+        except Exception as exc:
+            report["errors"].append(f"roi entries: {exc}")
+            logger.error(
+                "P0-2 failed quarantining ROI entries in %s: %s "
+                "(live file left untouched)",
+                rois_path,
+                exc,
+            )
+
+    if report["dataset_hand_labels"]:
+        logger.warning(
+            "P0-2: %d dataset hand labels with legacy ids 6/7/8 listed only — "
+            "NOT moved by this helper; run the dataset-side pass (P0-1) for them.",
+            n_data,
+        )
+    return report
+
+
+def _load_json_dict_or_quarantine(path: Path) -> Tuple[Dict[str, Any], bool]:
+    """Reads a JSON-object file, preserving corrupt content instead of dropping it.
+
+    Returns ``(data, True)``; on unreadable or non-dict content the original
+    file is moved aside by :func:`_quarantine_corrupt_json` and ``({}, True)``
+    is returned so the caller can start fresh without losing the old records.
+    Returns ``({}, False)`` only when the corrupt file could not be preserved —
+    the caller must then refuse to overwrite it.
+    """
+    if not path.exists():
+        return {}, True
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.error(
+            "Corrupt JSON in %s (%s) — quarantining it and starting fresh; "
+            "previous records are preserved in the .corrupt-* backup, not deleted",
+            path,
+            exc,
+        )
+        if _quarantine_corrupt_json(path) is None:
+            return {}, False
+        return {}, True
+    if not isinstance(data, dict):
+        logger.error(
+            "JSON in %s is not an object (%s) — quarantining it and starting fresh; "
+            "previous content is preserved in the .corrupt-* backup, not deleted",
+            path,
+            type(data).__name__,
+        )
+        if _quarantine_corrupt_json(path) is None:
+            return {}, False
+        return {}, True
+    return data, True
+
+
 def save_calibrated_roi(
     base_dir: Path,
     key: str,
@@ -397,14 +725,16 @@ def save_calibrated_roi(
         config_dir = Path(base_dir) / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
         rois_path = config_dir / "calibrated_rois.json"
-        data: Dict[str, Any] = {}
-        if rois_path.exists():
-            try:
-                data = json.loads(rois_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        if not isinstance(data, dict):
-            data = {}
+        # S-3801: a corrupt calibrated_rois.json must never be silently
+        # reset to {} (that deleted every recorded ROI). The old content
+        # is quarantined to a .corrupt-* backup first; if it cannot be
+        # preserved, refuse to overwrite it at all.
+        data, _load_ok = _load_json_dict_or_quarantine(rois_path)
+        if not _load_ok:
+            logger.error(
+                "Refusing to overwrite unpreservable corrupt file: %s", rois_path
+            )
+            return False
         if "rois" not in data or not isinstance(data["rois"], dict):
             data["rois"] = {}
 
@@ -423,8 +753,9 @@ def save_calibrated_roi(
             "class_name": class_name,
             "updated_at": now_iso,
         }
+        # One canonical home for the record (data["rois"][key]); the old
+        # top-level duplicate (data[key]) wrote every ROI twice.
         data["rois"][key] = entry
-        data[key] = entry
         data["updated_at"] = now_iso
 
         tmp_path = rois_path.with_suffix(".tmp")
@@ -437,104 +768,64 @@ def save_calibrated_roi(
         return False
 
 
-def _persist_learned_exemplar(
-    crop: np.ndarray,
-    class_id: int,
-    class_name: str,
-    base_dir: Path,
-) -> bool:
-    """Extracts HSV histogram & texture summary from crop and persists into dataset/learned_exemplars.json."""
-    try:
-        if crop is None or crop.size == 0:
-            return False
-        dataset_dir = Path(base_dir) / "dataset"
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-        json_path = dataset_dir / "learned_exemplars.json"
-        data: Dict[str, Any] = {}
-        if json_path.exists():
-            try:
-                data = json.loads(json_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        if not isinstance(data, dict):
-            data = {}
-        classes = data.setdefault("classes", {})
-        cid_str = str(class_id)
-        cls_entry = classes.setdefault(cid_str, {
-            "class_id": class_id,
-            "class_name": class_name,
-            "positive_exemplars": [],
-            "negative_exemplars": [],
-        })
-
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV) if crop.ndim == 3 else None
-        h_hist: List[float] = []
-        s_hist: List[float] = []
-        v_hist: List[float] = []
-        mean_hsv = [0.0, 0.0, 0.0]
-        if hsv is not None and hsv.size > 0:
-            h_h = cv2.calcHist([hsv], [0], None, [16], [0, 180]).flatten()
-            s_h = cv2.calcHist([hsv], [1], None, [8], [0, 256]).flatten()
-            v_h = cv2.calcHist([hsv], [2], None, [8], [0, 256]).flatten()
-            h_sum = float(np.sum(h_h)) or 1.0
-            s_sum = float(np.sum(s_h)) or 1.0
-            v_sum = float(np.sum(v_h)) or 1.0
-            h_hist = [round(float(v) / h_sum, 4) for v in h_h]
-            s_hist = [round(float(v) / s_sum, 4) for v in s_h]
-            v_hist = [round(float(v) / v_sum, 4) for v in v_h]
-            mean_hsv = [
-                round(float(np.mean(hsv[:, :, 0])), 2),
-                round(float(np.mean(hsv[:, :, 1])), 2),
-                round(float(np.mean(hsv[:, :, 2])), 2),
-            ]
-
-        aspect_ratio = round(float(crop.shape[1]) / float(max(1, crop.shape[0])), 4)
-        exemplar_record = {
-            "class_id": class_id,
-            "class_name": class_name,
-            "aspect_ratio": aspect_ratio,
-            "dimensions": [int(crop.shape[1]), int(crop.shape[0])],
-            "mean_hsv": mean_hsv,
-            "hist_h": h_hist,
-            "hist_s": s_hist,
-            "hist_v": v_hist,
-            "source": "calibration_wizard",
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-
-        pos_list = cls_entry.setdefault("positive_exemplars", [])
-        pos_list.append(exemplar_record)
-        if len(pos_list) > 50:
-            cls_entry["positive_exemplars"] = pos_list[-50:]
-
-        data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        tmp_path = json_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp_path.replace(json_path)
-        logger.info("Persisted positive exemplar for class %d (%s)", class_id, class_name)
-        return True
-    except Exception as exc:
-        logger.error("Failed persisting learned exemplar: %s", exc)
-        return False
-
-
 def save_positive_exemplar(
     crop: np.ndarray,
     class_id: int,
     class_name: str,
     base_dir: Path,
 ) -> bool:
-    """Saves positive exemplar to dataset_factory.exemplar_memory and syncs learned_exemplars.json."""
-    success = False
-    try:
-        from dataset_factory.exemplar_memory import add_positive_exemplar
-        add_positive_exemplar(crop, class_id=class_id, class_name=class_name)
-        success = True
-    except Exception as exc:
-        logger.debug("exemplar_memory module not directly callable: %s", exc)
+    """Save a positive exemplar through ExemplarMemory (the single writer).
 
-    direct_ok = _persist_learned_exemplar(crop, class_id=class_id, class_name=class_name, base_dir=base_dir)
-    return success or direct_ok
+    O-3 (tarama): the old code imported a non-existent module-level
+    `add_positive_exemplar` (ImportError, swallowed by the except), then
+    always fell back to the direct writer `_persist_learned_exemplar`,
+    which wrote 1D-only histograms into the `classes` dict — no 432-bin
+    hsv_hist, no texture, no dedup/cap/gates, and invisible to the
+    matching matrices until a reload. All wizard exemplars now go
+    through ExemplarMemory.add_positive_exemplar (canonicalization,
+    degenerate gate, duplicate refresh, per-class cap, atomic save).
+    A near-duplicate (add returns False with a >=0.96 match) counts as
+    saved — the exemplar IS learned. A gate rejection or an exception
+    returns False; there is no direct-write fallback.
+    """
+    try:
+        from dataset_factory.exemplar_memory import ExemplarMemory
+
+        mem = ExemplarMemory(
+            json_path=Path(base_dir) / "dataset" / "learned_exemplars.json"
+        )
+        if mem.add_positive_exemplar(
+            crop, class_id=class_id, class_name=class_name, source="calibration_wizard"
+        ):
+            return True
+        # False means duplicate OR gate rejection. A duplicate refreshes
+        # the existing record (>=0.96 match) and is a successful learn.
+        try:
+            sim, _, _, _ = mem.match_positive(crop)
+        except Exception:
+            sim = 0.0
+        if sim >= 0.96:
+            logger.info(
+                "Wizard exemplar for class %s (%s) already learned (sim=%.2f); kept existing.",
+                class_id,
+                class_name,
+                sim,
+            )
+            return True
+        logger.warning(
+            "Wizard exemplar rejected for class %s (%s) — see ExemplarMemory gate log.",
+            class_id,
+            class_name,
+        )
+        return False
+    except Exception as exc:
+        logger.error(
+            "Failed saving wizard exemplar for class %s (%s): %s",
+            class_id,
+            class_name,
+            exc,
+        )
+        return False
 
 
 def register_dataset_hand_label(
@@ -544,8 +835,22 @@ def register_dataset_hand_label(
     class_id: int,
     class_name: str,
     source: str = "calibration_wizard",
+    stem_name: Optional[str] = None,
 ) -> bool:
-    """Registers calibrated sample into dataset/ with trusted=True, hand_label=True."""
+    """Registers calibrated sample into dataset/ with trusted=True, hand_label=True.
+
+    The file stem (``calib_<stem_name>_<ms>``) is the sample's stable file
+    identity and is deliberately NOT derived from ``class_name``: since
+    P0-2 the crest / F / E templates all share the canonical class_name
+    ``skill_ui_prompt`` (id 13), so a ``calib_{class_name}`` stem would
+    collapse all three templates under ``calib_skill_ui_prompt_*`` and
+    drop the historical ``calib_f_gather_prompt_*`` /
+    ``calib_e_gather_icon_*`` / ``calib_world_gather_crest_*`` filenames.
+    Callers pass the template's ``label_stem``; when omitted the stem
+    falls back to ``class_name`` (unchanged behaviour for every other
+    template). The label CONTENT still carries the canonical
+    ``class_id`` / ``class_name`` — only the filename token differs.
+    """
     try:
         if frame_bgr is None or frame_bgr.size == 0 or roi_rect is None or roi_rect.isNull():
             return False
@@ -565,7 +870,12 @@ def register_dataset_hand_label(
         nh = max(0.001, min(1.0, nh))
 
         ts = int(time.time() * 1000)
-        stem = f"calib_{class_name}_{ts}"
+        # v18-F1 (w48): stem token comes from stem_name, NOT class_name
+        # (see docstring) — P0-2 renamed the F/E template's class_name to
+        # skill_ui_prompt, which silently moved its hand labels from
+        # calib_f_gather_prompt_* to calib_skill_ui_prompt_*.
+        stem_token = str(stem_name or class_name).replace("/", "_").replace("\\", "_")
+        stem = f"calib_{stem_token}_{ts}"
 
         dataset_dir = Path(base_dir) / "dataset"
         images_dir = dataset_dir / "images" / "train"
@@ -576,9 +886,13 @@ def register_dataset_hand_label(
         labels_dir.mkdir(parents=True, exist_ok=True)
         review_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Save training image
+        # 1. Save training image — a failed write must fail the whole
+        # registration instead of leaving a label/review pair that points
+        # at a missing image.
         img_path = images_dir / f"{stem}.jpg"
-        imwrite_unicode(img_path, frame_bgr)
+        if not imwrite_unicode(img_path, frame_bgr):
+            logger.error("Failed writing training image for hand label: %s", img_path)
+            return False
 
         # 2. Save YOLO txt label
         lbl_path = labels_dir / f"{stem}.txt"
@@ -617,12 +931,42 @@ def register_dataset_hand_label(
             seed_path.parent.mkdir(parents=True, exist_ok=True)
             seed_path.write_text(json.dumps({"has_trusted_seed": True}, indent=2), encoding="utf-8")
 
-        # 5. Mark model as stale
+        # 5. Mark model as stale. S-3803: the old `except Exception: pass`
+        # swallowed a failed marking and then logged the hand label as
+        # registered — the model kept being used as if it were fresh, with
+        # no trace. A failure is now logged, and the marking is verified:
+        # mark_model_stale itself never raises when nothing was written
+        # (no state file / no models dir), so check the post-condition.
+        # Directories are passed explicitly (the old call relied on the
+        # process CWD, so it usually marked nothing under base_dir at all).
+        stale_ok = False
         try:
             from dataset_factory.label_trust import mark_model_stale
-            mark_model_stale(f"Calibration wizard hand label for {class_name}")
-        except Exception:
-            pass
+            from dataset_factory.dataset_validator import is_model_stale
+
+            mark_model_stale(
+                f"Calibration wizard hand label for {class_name}",
+                dataset_dir=dataset_dir,
+                models_dir=Path(base_dir) / "models",
+            )
+            stale_ok, _stale_reason = is_model_stale(
+                dataset_dir=dataset_dir,
+                models_dir=Path(base_dir) / "models",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed marking model stale after hand label %s: %s — "
+                "model may still be treated as fresh",
+                stem,
+                exc,
+            )
+        if not stale_ok:
+            logger.warning(
+                "Model could not be marked stale after hand label %s "
+                "(label itself is registered, but the model may still be "
+                "treated as fresh until retrained)",
+                stem,
+            )
 
         logger.info("Registered calibration hand-label in dataset: %s", stem)
         return True
@@ -645,9 +989,20 @@ class CalibrationWizard(QDialog):
         # 1. Preserved first 3 compatibility targets
         "F/E Toplama Butonu Şablonu Kes": {
             "filename": "f_gather_template.png",
-            "yolo_class_id": 7,
-            "class_name": "f_gather_prompt",
+            # P0-2 (K-11): kanonik id 13 (skill_ui_prompt). Kanıt:
+            # dataset/data.yaml (13: skill_ui_prompt) +
+            # dataset_factory/class_taxonomy.py LEGACY_YOLO_CLASS_TO_CANONICAL
+            # (7 -> 13) ve isim haritası (f_gather_prompt -> 13). Eski id 7,
+            # data.yaml'da herb_lumina'dır; bu şablonla yazılan her etiket
+            # "lumina bitkisi" diye zehirlenirdi.
+            "yolo_class_id": 13,
+            "class_name": "skill_ui_prompt",
             "key": "gather_prompt",
+            # v18-F1 (w48): hand-label file stem. P0-2 renamed class_name
+            # f_gather_prompt -> skill_ui_prompt; the stem must keep the
+            # template identity (calib_f_gather_prompt_*) instead of
+            # collapsing to calib_skill_ui_prompt_*.
+            "label_stem": "f_gather_prompt",
             "category": "interaction",
             "desc": "Toplanabilir materyallerin yanında beliren etkileşim butonu ('F Gather' / 'E' toplama ikonu).",
         },
@@ -670,17 +1025,32 @@ class CalibrationWizard(QDialog):
         # 2. Interaction & Emblems
         "E Yüzen Kaynak İkonu Şablonu Kes": {
             "filename": "e_gather_icon_template.png",
-            "yolo_class_id": 8,
-            "class_name": "e_gather_icon",
+            # P0-2 (K-11): kanonik id 13 (skill_ui_prompt) — legacy 8 -> 13
+            # (class_taxonomy.py LEGACY_YOLO_CLASS_TO_CANONICAL; e_gather_icon
+            # -> 13). Eski id 8, data.yaml'da ore_obsidian'dır.
+            "yolo_class_id": 13,
+            "class_name": "skill_ui_prompt",
             "key": "e_gather_icon",
+            # v18-F1 (w48): hand-label file stem — keeps the template
+            # identity (calib_e_gather_icon_*) now that class_name is the
+            # shared canonical skill_ui_prompt.
+            "label_stem": "e_gather_icon",
             "category": "interaction",
             "desc": "Dünya üzerinde toplanabilir kaynak üzerinde yüzen dinamik 'E' etkileşim ikonu.",
         },
         "3B Beyaz Kanatlı Toplama Amblemi (Crest) Kes": {
             "filename": "world_gather_crest_template.png",
-            "yolo_class_id": 6,
-            "class_name": "world_gather_crest",
+            # P0-2 (K-11): kanonik id 13 (skill_ui_prompt) — legacy 6 -> 13
+            # (class_taxonomy.py LEGACY_YOLO_CLASS_TO_CANONICAL; crest /
+            # world_gather_crest -> 13; sözleşme no 29). Eski id 6,
+            # data.yaml'da herb_edana'dır.
+            "yolo_class_id": 13,
+            "class_name": "skill_ui_prompt",
             "key": "crest_white_wing",
+            # v18-F1 (w48): hand-label file stem — keeps the template
+            # identity (calib_world_gather_crest_*) now that class_name is
+            # the shared canonical skill_ui_prompt.
+            "label_stem": "world_gather_crest",
             "category": "crest",
             "desc": "3B oyun dünyasında toplanabilir kaynak üzerinde süzülen beyaz kanatlı amblem.",
         },
@@ -809,19 +1179,15 @@ class CalibrationWizard(QDialog):
         },
         "Tüy / Parçacık Efekti (Negatif) Kes": {
             "filename": "feather_particle_template.png",
-            "yolo_class_id": 12,
+            # No YOLO class: this is a negative-filter template, not a
+            # dataset class. The old id 12 is world_material in
+            # dataset/data.yaml (and the sanitizer would relabel it as
+            # crystal_blood) — writing it would poison the dataset.
+            "yolo_class_id": None,
             "class_name": "feather_particle_negative",
             "key": "feather_particle_negative",
             "category": "crest",
             "desc": "Beyaz kanat amblemiyle karışabilen tüy veya parlak parçacık negatif şablonu.",
-        },
-        "Hedef Canavar Can Barı (#18 target_hp_bar) Kes": {
-            "filename": "target_hp_bar_template.png",
-            "yolo_class_id": 18,
-            "class_name": "target_hp_bar",
-            "key": "target_hp_bar_18",
-            "category": "hud",
-            "desc": "Üst ortadaki seçili hedef / canavar can barı HUD bölgesi (Sınıf 18).",
         },
         "Yetenek Çubuğu (skill_bar) Kes": {
             "filename": "skill_bar_template.png",
@@ -858,9 +1224,14 @@ class CalibrationWizard(QDialog):
         # Compatibility aliases (English and short keys)
         "F Gather": {
             "filename": "f_gather_template.png",
-            "yolo_class_id": 7,
-            "class_name": "f_gather_prompt",
+            # P0-2 (K-11): "F/E Toplama Butonu Şablonu Kes" alias'ı — aynı
+            # kanonik id 13 (skill_ui_prompt); eski 7 herb_lumina'ydı.
+            "yolo_class_id": 13,
+            "class_name": "skill_ui_prompt",
             "key": "gather_prompt",
+            # v18-F1 (w48): same label_stem as the "F/E Toplama Butonu
+            # Şablonu Kes" entry this aliases.
+            "label_stem": "f_gather_prompt",
             "category": "interaction",
             "desc": "Toplanabilir materyallerin yanında beliren etkileşim butonu ('F Gather' / 'E' toplama ikonu).",
         },
@@ -882,20 +1253,37 @@ class CalibrationWizard(QDialog):
         },
     }
 
+    # Canonical 25-class table, kept in sync with
+    # dataset_factory/class_taxonomy.py::CANONICAL_NAMES (0..24) and
+    # dataset/data.yaml (27-class training taxonomy: 18 target_hp_bar,
+    # 19 skill_bar, 22 hp_potion, 23 mp_potion, 24 buff_scroll).
+    # P0-2 (K-11, fixed): TEMPLATE_TARGETS used to reuse class IDs 6/7/8
+    # for the crest / F / E prompt templates, but data.yaml assigns 6/7/8
+    # to herb_edana / herb_lumina / ore_obsidian — every crop saved from
+    # those templates was labelled as a herb/ore. All three templates (and
+    # the "F Gather" alias) now carry the canonical id 13 with class_name
+    # "skill_ui_prompt", per data.yaml and class_taxonomy.py's legacy map
+    # (6 -> 13, 7 -> 13, 8 -> 13) and name map (world_gather_crest,
+    # f_gather_prompt, e_gather_icon -> 13). The read side
+    # (_locate_world_gather_crest / _locate_e_gather_icon) resolves its
+    # class id from this same table via _template_yolo_class_id(), so the
+    # write and read directions can no longer drift apart. The older
+    # 23-class YOLO_CLASSES table in yolo_auto_labeler.py (18 hp_potion,
+    # 20 target_hp_bar) is stale vs data.yaml and is not this slice's to fix.
     CANONICAL_25_CLASSES: Dict[int, Dict[str, Any]] = {
         0: {"class_id": 0, "class_name": "herb_aria", "label_tr": "Aria Bitkisi", "filename": "herb_aria_template.png", "key": "node_aria", "category": "resource", "target": "Kaynak: Aria Bitkisi (herb_aria) Kes"},
         1: {"class_id": 1, "class_name": "herb_mela", "label_tr": "Mela Bitkisi", "filename": "herb_mela_template.png", "key": "node_mela", "category": "resource", "target": "Kaynak: Mela Bitkisi (herb_mela) Kes"},
         2: {"class_id": 2, "class_name": "herb_targena", "label_tr": "Targena Bitkisi", "filename": "herb_targena_template.png", "key": "node_targena", "category": "resource", "target": "Kaynak: Targena / Bitki (herb_targena) Kes"},
         3: {"class_id": 3, "class_name": "ore_orichalcum", "label_tr": "Orichalcum Cevheri", "filename": "ore_orichalcum_template.png", "key": "node_orichalcum", "category": "resource", "target": "Kaynak: Orichalcum / Maden Cevheri (ore_orichalcum) Kes"},
         4: {"class_id": 4, "class_name": "gem_crystal", "label_tr": "Kristal / Gem", "filename": "gem_crystal_template.png", "key": "node_crystal", "category": "resource", "target": "Kaynak: Kristal / Gem (gem_crystal) Kes"},
-        5: {"class_id": 5, "class_name": "wood_tree", "label_tr": "Ağaç / Kereste", "filename": "wood_tree_template.png", "key": "node_wood", "category": "resource", "target": "Kaynak: Ağaç / Kereste (wood_tree) Kes"},
-        6: {"class_id": 6, "class_name": "world_gather_crest", "label_tr": "3B Beyaz Kanatlı Toplama Amblemi", "filename": "world_gather_crest_template.png", "key": "crest_white_wing", "category": "crest", "target": "3B Beyaz Kanatlı Toplama Amblemi (Crest) Kes"},
-        7: {"class_id": 7, "class_name": "f_gather_prompt", "label_tr": "F/E Toplama Butonu", "filename": "f_gather_template.png", "key": "gather_prompt", "category": "interaction", "target": "F/E Toplama Butonu Şablonu Kes"},
-        8: {"class_id": 8, "class_name": "e_gather_icon", "label_tr": "E Yüzen Kaynak İkonu", "filename": "e_gather_icon_template.png", "key": "e_gather_icon", "category": "interaction", "target": "E Yüzen Kaynak İkonu Şablonu Kes"},
+        5: {"class_id": 5, "class_name": "tree_log", "label_tr": "Ağaç / Kereste", "filename": "wood_tree_template.png", "key": "node_wood", "category": "resource", "target": "Kaynak: Ağaç / Kereste (wood_tree) Kes"},
+        6: {"class_id": 6, "class_name": "herb_edana", "label_tr": "Edana Bitkisi", "filename": "herb_edana_template.png", "key": "herb_edana", "category": "resource", "target": "Edana Bitkisi (herb_edana) Kes"},
+        7: {"class_id": 7, "class_name": "herb_lumina", "label_tr": "Lumina Bitkisi", "filename": "herb_lumina_template.png", "key": "herb_lumina", "category": "resource", "target": "Lumina Bitkisi (herb_lumina) Kes"},
+        8: {"class_id": 8, "class_name": "ore_obsidian", "label_tr": "Obsidyen Cevheri", "filename": "ore_obsidian_template.png", "key": "ore_obsidian", "category": "resource", "target": "Obsidyen Cevheri (ore_obsidian) Kes"},
         9: {"class_id": 9, "class_name": "minimap_sprout", "label_tr": "Minimap 3 Yapraklı Filiz", "filename": "minimap_sprout_template.png", "key": "minimap_sprout", "category": "minimap", "target": "Minimap 3 Yapraklı Filiz (Kaynak İkonu) Kes"},
         10: {"class_id": 10, "class_name": "monster_3d", "label_tr": "3B Canavar / İsim Plakası", "filename": "monster_3d_template.png", "key": "mob_nameplate", "category": "combat", "target": "3B Canavar / İsim Plakası (Hedef) Kes"},
-        11: {"class_id": 11, "class_name": "minimap_monster_negative", "label_tr": "Minimap Canavar Noktası", "filename": "minimap_monster_template.png", "key": "minimap_mob", "category": "minimap", "target": "Minimap Canavar Noktası (Negatif) Kes"},
-        12: {"class_id": 12, "class_name": "feather_particle_negative", "label_tr": "Tüy / Parçacık Negatif", "filename": "feather_particle_template.png", "key": "feather_particle_negative", "category": "crest", "target": "Tüy / Parçacık Efekti (Negatif) Kes"},
+        11: {"class_id": 11, "class_name": "minimap_monster_dot", "label_tr": "Minimap Canavar Noktası", "filename": "minimap_monster_template.png", "key": "minimap_mob", "category": "minimap", "target": "Minimap Canavar Noktası (Negatif) Kes"},
+        12: {"class_id": 12, "class_name": "crystal_blood", "label_tr": "Kan Kristali", "filename": "crystal_blood_template.png", "key": "crystal_blood", "category": "resource", "target": "Kan Kristali (crystal_blood) Kes"},
         13: {"class_id": 13, "class_name": "skill_ui_prompt", "label_tr": "Yetenek / Skill Yuvası", "filename": "skill_slot_template.png", "key": "skill_slot", "category": "hud", "target": "Yetenek / Skill Bar Yuvası Kes"},
         14: {"class_id": 14, "class_name": "obstacle", "label_tr": "Engel / Kaya / Duvar", "filename": "obstacle_template.png", "key": "obstacle", "category": "navigation", "target": "Engel / Kaya / Duvar (Obstacle) Kes"},
         15: {"class_id": 15, "class_name": "path_ground", "label_tr": "Yürünebilir Yol / Zemin", "filename": "path_ground_template.png", "key": "path_ground", "category": "navigation", "target": "Yürünebilir Yol / Zemin (Path) Kes"},
@@ -903,14 +1291,19 @@ class CalibrationWizard(QDialog):
         17: {"class_id": 17, "class_name": "player_mp_bar", "label_tr": "Oyuncu Mana (MP) Barı", "filename": "player_mp_bar_template.png", "key": "player_mp_bar", "category": "hud", "target": "Oyuncu Mana (MP) Barı Kes"},
         18: {"class_id": 18, "class_name": "target_hp_bar", "label_tr": "Hedef Canavar Can (HP) Barı", "filename": "target_hp_bar_template.png", "key": "target_hp_bar", "category": "hud", "target": "Hedef Canavar Can (HP) Barı Kes"},
         19: {"class_id": 19, "class_name": "skill_bar", "label_tr": "Yetenek Çubuğu (Skill Bar)", "filename": "skill_bar_template.png", "key": "skill_bar", "category": "hud", "target": "Yetenek Çubuğu (skill_bar) Kes"},
-        20: {"class_id": 20, "class_name": "minimap_player_arrow", "label_tr": "Minimap Oyuncu Oku", "filename": "player_arrow.png", "key": "minimap_arrow", "category": "minimap", "target": "Minimap Oyuncu Oku Şablonu Kes"},
-        21: {"class_id": 21, "class_name": "map_header", "label_tr": "Harita Başlığı", "filename": "map_header.png", "key": "map_title", "category": "map", "target": "Harita Başlığı Şablonu Kes"},
+        20: {"class_id": 20, "class_name": "skill_slot_ready", "label_tr": "Hazır Yetenek Yuvası", "filename": "skill_slot_ready_template.png", "key": "skill_slot_ready", "category": "hud", "target": "Hazır Yetenek Yuvası (skill_slot_ready) Kes"},
+        21: {"class_id": 21, "class_name": "skill_slot_cooldown", "label_tr": "Beklemedeki Yetenek Yuvası", "filename": "skill_slot_cooldown_template.png", "key": "skill_slot_cooldown", "category": "hud", "target": "Beklemedeki Yetenek Yuvası (skill_slot_cooldown) Kes"},
         22: {"class_id": 22, "class_name": "hp_potion", "label_tr": "Can İksiri (HP Potion)", "filename": "hp_potion_template.png", "key": "hp_potion", "category": "consumable", "target": "Can İksiri (hp_potion) Kes"},
         23: {"class_id": 23, "class_name": "mp_potion", "label_tr": "Mana İksiri (MP Potion)", "filename": "mp_potion_template.png", "key": "mp_potion", "category": "consumable", "target": "Mana İksiri (mp_potion) Kes"},
         24: {"class_id": 24, "class_name": "buff_scroll", "label_tr": "Parşömen / Scroll (Buff Scroll)", "filename": "buff_scroll_template.png", "key": "buff_scroll", "category": "consumable", "target": "Parşömen / Scroll (buff_scroll) Kes"},
     }
 
-    # Short key lookup aliases
+    # Short key lookup aliases. NOTE (P0-2): "skill_ui_prompt" is now the
+    # shared class_name of the crest / F / E templates AND the skill-slot
+    # target, so the first claimant in dict order (the F/E entry) wins this
+    # alias. No in-repo lookup indexes TEMPLATE_TARGETS by that alias key
+    # (all lookups use display names or "key" values), so the repoint is
+    # unobservable; display-name and key lookups are unaffected.
     for _k, _info in list(TEMPLATE_TARGETS.items()):
         if "key" in _info and _info["key"] not in TEMPLATE_TARGETS:
             TEMPLATE_TARGETS[_info["key"]] = _info
@@ -959,6 +1352,7 @@ class CalibrationWizard(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Görsel Şablon ve Kalibrasyon Sihirbazı")
         self.resize(1020, 720)
+        self.setMinimumSize(900, 620)
         self.setModal(True)
 
         self.base_dir: Path = (
@@ -973,6 +1367,31 @@ class CalibrationWizard(QDialog):
             self.templates_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             logger.warning("Could not ensure templates directory: %s", exc)
+
+        # P0-2 (K-11) startup check: warn (read-only) when crest/F/E crops
+        # or ROI entries still carry the old legacy ids 6/7/8. Nothing is
+        # moved here — quarantine is an explicit
+        # quarantine_mislabelled_template_crops(..., dry_run=False) call.
+        try:
+            _poison = scan_mislabelled_template_crops(
+                self.base_dir, self.templates_dir
+            )
+            _n_poison = len(_poison.get("roi_entries", [])) + len(
+                _poison.get("archived_crops", [])
+            )
+            if _n_poison:
+                logger.warning(
+                    "P0-2: %d mislabelled crest/F/E record(s) with legacy ids "
+                    "6/7/8 (%d ROI entries, %d archived crops) — run "
+                    "quarantine_mislabelled_template_crops(base_dir, "
+                    "dry_run=False) to move them to "
+                    "templates/calibrated-quarantine/.",
+                    _n_poison,
+                    len(_poison.get("roi_entries", [])),
+                    len(_poison.get("archived_crops", [])),
+                )
+        except Exception as exc:
+            logger.debug("P0-2 startup scan failed: %s", exc)
 
         self._apply_dark_theme()
         self._init_ui()
@@ -995,7 +1414,7 @@ class CalibrationWizard(QDialog):
                 margin-top: 10px;
                 padding-top: 12px;
                 font-weight: bold;
-                color: #94a3b8;
+                color: #cbd5e1;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
@@ -1072,6 +1491,7 @@ class CalibrationWizard(QDialog):
 
         # Eylem çubuğu (başlık ortak çerçevede)
         header_layout = QHBoxLayout()
+        header_layout.setSpacing(8)
         header_layout.addStretch()
 
         self.btn_grab_screen = QPushButton("Canlı Ekran Yakala")
@@ -1101,6 +1521,7 @@ class CalibrationWizard(QDialog):
         # 1. Target Template Selector Group
         target_group = QGroupBox("1. Şablon Hedefi ve Kesim Önizlemesi")
         target_layout = QVBoxLayout(target_group)
+        target_layout.setSpacing(8)
 
         self.combo_target = QComboBox()
         for name in self.PRIMARY_TARGETS:
@@ -1116,10 +1537,15 @@ class CalibrationWizard(QDialog):
 
         # Previews side by side: Saved Template vs Selected Crop
         previews_row = QHBoxLayout()
+        previews_row.setSpacing(8)
         saved_col = QVBoxLayout()
+        saved_col.setSpacing(4)
         saved_col.addWidget(QLabel("Aktif Şablon:"))
         self.lbl_saved_preview = QLabel("Yok")
-        self.lbl_saved_preview.setFixedSize(130, 80)
+        self.lbl_saved_preview.setMinimumSize(110, 80)
+        self.lbl_saved_preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.lbl_saved_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_saved_preview.setStyleSheet(
             "background-color: #111318; border: 1px solid #2e3444; border-radius: 4px;"
@@ -1127,17 +1553,21 @@ class CalibrationWizard(QDialog):
         saved_col.addWidget(self.lbl_saved_preview)
 
         crop_col = QVBoxLayout()
+        crop_col.setSpacing(4)
         crop_col.addWidget(QLabel("Seçili Kesim (ROI):"))
         self.lbl_crop_preview = QLabel("Tuvalde seçin")
-        self.lbl_crop_preview.setFixedSize(130, 80)
+        self.lbl_crop_preview.setMinimumSize(110, 80)
+        self.lbl_crop_preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.lbl_crop_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_crop_preview.setStyleSheet(
             "background-color: #111318; border: 1px solid #2e3444; border-radius: 4px;"
         )
         crop_col.addWidget(self.lbl_crop_preview)
 
-        previews_row.addLayout(saved_col)
-        previews_row.addLayout(crop_col)
+        previews_row.addLayout(saved_col, 1)
+        previews_row.addLayout(crop_col, 1)
         target_layout.addLayout(previews_row)
 
         self.lbl_roi_coords = QLabel("Seçili Alan (ROI): Yok")
@@ -1164,6 +1594,7 @@ class CalibrationWizard(QDialog):
         # 2. Live Vision Test Mode Group
         vision_group = QGroupBox("2. Canlı Görsel Eşleşme Test Modu")
         vision_layout = QVBoxLayout(vision_group)
+        vision_layout.setSpacing(8)
 
         slider_header = QHBoxLayout()
         slider_header.addWidget(QLabel("Güven Eşiği (Confidence):"))
@@ -1186,9 +1617,9 @@ class CalibrationWizard(QDialog):
 
         range_hint = QHBoxLayout()
         lbl_min = QLabel("%50 (Esnek)")
-        lbl_min.setStyleSheet("font-size: 10px; color: #64748b;")
+        lbl_min.setStyleSheet("font-size: 10px; color: #94a3b8;")
         lbl_max = QLabel("%95 (Hassas)")
-        lbl_max.setStyleSheet("font-size: 10px; color: #64748b;")
+        lbl_max.setStyleSheet("font-size: 10px; color: #94a3b8;")
         range_hint.addWidget(lbl_min)
         range_hint.addStretch()
         range_hint.addWidget(lbl_max)
@@ -1299,16 +1730,36 @@ class CalibrationWizard(QDialog):
         ref_path = self.frames_dir / "frame_33s.jpg"
         if ref_path.exists():
             self.load_reference_frame()
-        else:
-            try:
-                if self.frames_dir.exists():
-                    jpgs = sorted(self.frames_dir.glob("*.jpg"))
-                    if jpgs:
-                        img = imread_unicode(jpgs[0], cv2.IMREAD_COLOR)
-                        if img is not None:
-                            self.canvas.set_image(img)
-            except Exception as exc:
-                logger.warning("Could not load fallback reference frame: %s", exc)
+            return
+        try:
+            if not self.frames_dir.exists():
+                self.lbl_match_status.setText(
+                    f"Durum: Referans kare dizini yok: {self.frames_dir}"
+                )
+                self.lbl_match_status.setStyleSheet("color: #f59e0b; font-weight: bold;")
+                logger.warning("Reference frame dir missing: %s", self.frames_dir)
+                return
+            jpgs = sorted(self.frames_dir.glob("*.jpg"))
+            if not jpgs:
+                self.lbl_match_status.setText(
+                    f"Durum: {self.frames_dir} dizininde referans kare (.jpg) bulunamadı"
+                )
+                self.lbl_match_status.setStyleSheet("color: #f59e0b; font-weight: bold;")
+                logger.warning("No reference frames in %s", self.frames_dir)
+                return
+            img = imread_unicode(jpgs[0], cv2.IMREAD_COLOR)
+            if img is None or img.size == 0:
+                self.lbl_match_status.setText(
+                    f"Durum: Referans kare okunamadı: {jpgs[0].name}"
+                )
+                self.lbl_match_status.setStyleSheet("color: #ef4444; font-weight: bold;")
+                logger.warning("Could not decode fallback reference frame: %s", jpgs[0])
+                return
+            self.canvas.set_image(img)
+        except Exception as exc:
+            logger.warning("Could not load fallback reference frame: %s", exc)
+            self.lbl_match_status.setText(f"Durum: Referans kare yüklenemedi: {exc}")
+            self.lbl_match_status.setStyleSheet("color: #ef4444; font-weight: bold;")
 
     def load_reference_frame(self, path: Optional[Union[str, Path]] = None) -> bool:
         """Loads a reference frame (default: video_frames/frame_33s.jpg) onto the interactive ROI canvas."""
@@ -1392,6 +1843,12 @@ class CalibrationWizard(QDialog):
                         f"Durum: {Path(file_path).name} yüklendi"
                     )
                     self.lbl_match_status.setStyleSheet("color: #38bdf8; font-weight: bold;")
+                else:
+                    self.lbl_match_status.setText(
+                        f"Durum: Seçilen kare okunamadı: {Path(file_path).name}"
+                    )
+                    self.lbl_match_status.setStyleSheet("color: #ef4444; font-weight: bold;")
+                    logger.warning("Could not decode custom frame: %s", file_path)
         except Exception as exc:
             logger.error("Failed browsing custom frame: %s", exc)
 
@@ -1414,25 +1871,29 @@ class CalibrationWizard(QDialog):
                 self.lbl_match_status.setStyleSheet("color: #f59e0b; font-weight: bold;")
                 return result
 
-            # Prefer the currently selected target template, fallback to F Gather template
+            # Use exactly the selected target's saved template file. Two old
+            # fallbacks are removed: silently switching to the F Gather
+            # template when the selected one is missing, and matching the
+            # current ROI crop against the frame it was cut from (a self
+            # match that always scores ~100%).
             tpl_path = self._get_target_template_path()
             target_label = self.combo_target.currentText()
+            result["target"] = target_label
             if not tpl_path.exists():
-                fg_path = self.templates_dir / "f_gather_template.png"
-                if fg_path.exists():
-                    tpl_path = fg_path
-                    target_label = "F/E Toplama Butonu Şablonu Kes"
+                result["reason"] = "template_missing"
+                self.lbl_match_status.setText(
+                    f"Durum: '{target_label}' için şablon dosyası yok ({tpl_path.name}) — önce şablon kaydedin"
+                )
+                self.lbl_match_status.setStyleSheet("color: #ef4444; font-weight: bold;")
+                logger.warning("Template file missing for '%s': %s", target_label, tpl_path)
+                return result
 
-            tpl_bgr: Optional[np.ndarray] = None
-            if tpl_path.exists():
-                tpl_bgr = imread_unicode(tpl_path, cv2.IMREAD_COLOR)
-
-            # Fallback to current ROI crop if template file doesn't exist yet
+            tpl_bgr: Optional[np.ndarray] = imread_unicode(tpl_path, cv2.IMREAD_COLOR)
             if tpl_bgr is None or tpl_bgr.size == 0:
-                tpl_bgr = self.canvas.get_cropped_bgr()
-
-            if tpl_bgr is None or tpl_bgr.size == 0:
-                self.lbl_match_status.setText("Durum: Şablon dosyası veya seçili alan yok")
+                result["reason"] = "template_unreadable"
+                self.lbl_match_status.setText(
+                    f"Durum: Şablon dosyası okunamadı: {tpl_path.name}"
+                )
                 self.lbl_match_status.setStyleSheet("color: #ef4444; font-weight: bold;")
                 return result
 
@@ -1530,6 +1991,9 @@ class CalibrationWizard(QDialog):
             filename = info["filename"]
             key = str(info.get("key") or "template")
             class_name = str(info.get("class_name") or key)
+            # v18-F1 (w48): hand-label stem from the template identity
+            # (label_stem), not the canonical class_name.
+            label_stem = str(info.get("label_stem") or class_name)
             yolo_cid = info.get("yolo_class_id")
 
             # 1. Save active template file
@@ -1549,6 +2013,7 @@ class CalibrationWizard(QDialog):
             # 3. Save normalized ROI to config/calibrated_rois.json
             frame_bgr = self.canvas.get_source_image()
             rect = self.canvas.get_selected_roi_rect()
+            roi_ok = False
             if frame_bgr is not None and not rect.isNull():
                 fh, fw = frame_bgr.shape[:2]
                 rx, ry, rw, rh = rect.x(), rect.y(), rect.width(), rect.height()
@@ -1556,7 +2021,7 @@ class CalibrationWizard(QDialog):
                 norm_y = round(float(ry) / float(fh), 6)
                 norm_w = round(float(rw) / float(fw), 6)
                 norm_h = round(float(rh) / float(fh), 6)
-                save_calibrated_roi(
+                roi_ok = bool(save_calibrated_roi(
                     base_dir=self.base_dir,
                     key=key,
                     target_name=target_name,
@@ -1568,30 +2033,46 @@ class CalibrationWizard(QDialog):
                     resolution=(fw, fh),
                     yolo_class_id=yolo_cid,
                     class_name=class_name,
-                )
+                ))
 
             # 4. Save positive exemplar via exemplar_memory / learned_exemplars.json
+            exemplar_ok = False
+            label_ok = False
             if yolo_cid is not None:
-                save_positive_exemplar(
-                    crop=crop_bgr,
-                    class_id=int(yolo_cid),
-                    class_name=class_name,
-                    base_dir=self.base_dir,
+                exemplar_ok = bool(
+                    save_positive_exemplar(
+                        crop=crop_bgr,
+                        class_id=int(yolo_cid),
+                        class_name=class_name,
+                        base_dir=self.base_dir,
+                    )
                 )
 
                 # 5. Register sample in dataset/ with trusted=True, hand_label=True
                 if frame_bgr is not None and not rect.isNull():
-                    register_dataset_hand_label(
-                        base_dir=self.base_dir,
-                        frame_bgr=frame_bgr,
-                        roi_rect=rect,
-                        class_id=int(yolo_cid),
-                        class_name=class_name,
-                        source="calibration_wizard",
+                    label_ok = bool(
+                        register_dataset_hand_label(
+                            base_dir=self.base_dir,
+                            frame_bgr=frame_bgr,
+                            roi_rect=rect,
+                            class_id=int(yolo_cid),
+                            class_name=class_name,
+                            source="calibration_wizard",
+                            stem_name=label_stem,
+                        )
                     )
 
             self._refresh_current_template_preview()
-            self.lbl_match_status.setText(f"Durum: ✔ Kaydedildi ({out_path.name}) + YZ Eğitildi")
+            # Honest status: only the template file is guaranteed saved here.
+            # No model training happens in this dialog, so never claim
+            # "YZ Eğitildi"; report each downstream step as it really went.
+            done_parts = [f"Kaydedildi ({out_path.name})"]
+            if frame_bgr is not None and not rect.isNull():
+                done_parts.append("ROI kaydı " + ("tamam" if roi_ok else "BAŞARISIZ"))
+            if yolo_cid is not None:
+                done_parts.append("örnek " + ("kaydedildi" if exemplar_ok else "kaydedilemedi"))
+                done_parts.append("etiket " + ("kaydedildi" if label_ok else "kaydedilemedi"))
+            self.lbl_match_status.setText("Durum: ✔ " + ", ".join(done_parts))
             self.lbl_match_status.setStyleSheet("color: #2ecc71; font-weight: bold;")
             logger.info("Saved new template to %s and archived to %s", out_path, arch_path)
 
@@ -1634,6 +2115,9 @@ class CalibrationWizard(QDialog):
                 info = self.TEMPLATE_TARGETS.get(target_name, {})
                 key = str(info.get("key") or "template")
                 class_name = str(info.get("class_name") or key)
+                # v18-F1 (w48): hand-label stem from the template identity
+                # (label_stem), not the canonical class_name.
+                label_stem = str(info.get("label_stem") or class_name)
                 yolo_cid = info.get("yolo_class_id")
 
                 if item.get("saved") and item.get("bbox") is not None:
@@ -1693,6 +2177,7 @@ class CalibrationWizard(QDialog):
                                 class_id=int(yolo_cid),
                                 class_name=class_name,
                                 source="calibration_wizard_auto",
+                                stem_name=label_stem,
                             )
                         except Exception as e:
                             logger.debug("Exemplar/Dataset save failed: %s", e)
@@ -1759,17 +2244,27 @@ class CalibrationWizard(QDialog):
         )
         self.lbl_match_coords.setText(f"Koordinatlar: X={x}, Y={y}, G={w}, Y={h}")
 
-    def run_vision_filters_diagnostic(self, frame: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    def run_vision_filters_diagnostic(
+        self, frame: Optional[np.ndarray] = None, threshold: float = 0.70
+    ) -> Dict[str, Any]:
         """
         Runs FeatherNegativeFilter, Pyramid3DCrestDetector, and DynamicInteractionKeyReader
         on a sample frame (wrapped in try/except) and returns a diagnostic dict without
         modifying any existing UI widgets, methods, or smoke tests.
+
+        The interaction-key reader gets a real prompt patch (the detected
+        gather-prompt box, or the central viewport patch where prompts
+        appear) — never the whole frame. ``success`` means the run actually
+        found something (a crest, a confident key read, or a feather
+        candidate), not merely that nothing crashed.
         """
         diagnostic: Dict[str, Any] = {
             "success": False,
             "feather_filter": None,
             "crest_detector": [],
             "interaction_key": None,
+            "detections_found": 0,
+            "threshold": float(threshold),
             "error": None,
         }
         try:
@@ -1791,10 +2286,9 @@ class CalibrationWizard(QDialog):
                 DynamicInteractionKeyReader,
             )
 
-            # 1. FeatherNegativeFilter
+            # 1. FeatherNegativeFilter (small centre patch, as before)
             feather_filter = FeatherNegativeFilter()
             h, w = target_frame.shape[:2]
-            # Test a sample patch or center region
             cy, cx = h // 2, w // 2
             patch_r = 16
             x1, x2 = max(0, cx - patch_r), min(w, cx + patch_r)
@@ -1803,17 +2297,49 @@ class CalibrationWizard(QDialog):
             feather_res = feather_filter.analyze_candidate(patch) if patch.size > 0 else {}
             diagnostic["feather_filter"] = feather_res
 
-            # 2. Pyramid3DCrestDetector
+            # 2. Pyramid3DCrestDetector (caller-controlled threshold)
             crest_detector = Pyramid3DCrestDetector()
-            crests = crest_detector.detect(target_frame, threshold=0.70)
+            crests = crest_detector.detect(target_frame, threshold=float(threshold))
             diagnostic["crest_detector"] = crests
 
-            # 3. DynamicInteractionKeyReader
+            # 3. DynamicInteractionKeyReader on a real prompt patch: prefer
+            # the detected gather-prompt box; fall back to the central
+            # viewport band where F/E prompts appear.
             key_reader = DynamicInteractionKeyReader()
-            key_res = key_reader.inspect_prompt_patch(target_frame) if target_frame.size > 0 else {}
+            prompt_patch = None
+            try:
+                engine = _vision_engine()
+                _found, _pct, prompt_bbox = engine.detect_gather_prompt(
+                    target_frame, threshold=max(float(threshold), AUTO_CUT_SCORE_FLOOR),
+                    use_roi=True,
+                )
+                if _found and prompt_bbox is not None:
+                    px, py, pw, ph = (int(v) for v in prompt_bbox)
+                    prompt_patch = target_frame[
+                        max(0, py) : py + ph, max(0, px) : px + pw
+                    ]
+            except Exception as exc:
+                logger.debug("Gather-prompt patch lookup failed: %s", exc)
+            if prompt_patch is None or prompt_patch.size == 0:
+                px1, px2 = int(w * 0.30), int(w * 0.70)
+                py1, py2 = int(h * 0.40), int(h * 0.62)
+                prompt_patch = target_frame[py1:py2, px1:px2]
+            key_res = (
+                key_reader.inspect_prompt_patch(prompt_patch)
+                if prompt_patch is not None and prompt_patch.size > 0
+                else {"key": None, "confidence": 0.0, "reason": "no_prompt_patch"}
+            )
             diagnostic["interaction_key"] = key_res
 
-            diagnostic["success"] = True
+            found = 0
+            if crests:
+                found += len(crests)
+            if float(key_res.get("confidence", 0.0) or 0.0) >= 0.5:
+                found += 1
+            if isinstance(feather_res, dict) and feather_res.get("is_feather"):
+                found += 1
+            diagnostic["detections_found"] = found
+            diagnostic["success"] = found > 0
         except Exception as exc:
             logger.error("Error in run_vision_filters_diagnostic: %s", exc)
             diagnostic["error"] = str(exc)
@@ -1823,6 +2349,20 @@ class CalibrationWizard(QDialog):
         """
         Automatically calibrates the upper consumable bar (F1..F8, X, B: hp_potion, mp_potion, buff_scroll)
         and lower combat skill bar (1..8, Q, E, R) from a game frame.
+
+        Every consumable slot is classified by the real
+        :func:`dataset_factory.scroll_potion_classifier.classify_hud_slot_crop`;
+        empty / unclassified crops are reported as such (``valid=False``,
+        ``class_id=None``) — never silently relabelled as hp_potion with a
+        made-up confidence. Every skill slot is measured by the real
+        :meth:`core.skill_bar_reader.SkillBarReader.inspect_skill_bar`
+        (``ready``/``score`` per slot, ``valid`` mirrors ``ready``); a slot
+        is ``skill_slot_ready`` (class 20) only when the reader really
+        measured it ready, otherwise ``skill_slot_cooldown`` (class 21).
+        Classified consumable slots and ready skill slots are persisted to
+        ``config/calibrated_rois.json`` when this wizard has a ``base_dir``.
+        ``calibrated`` is True only when at least one consumable slot was
+        really classified or at least one skill slot was really ready.
         """
         target = frame_bgr
         if target is None and "canvas" in self.__dict__ and self.canvas is not None:
@@ -1837,8 +2377,14 @@ class CalibrationWizard(QDialog):
         fh, fw = target.shape[:2]
         try:
             from dataset_factory.scroll_potion_classifier import classify_hud_slot_crop
-        except Exception:
-            classify_hud_slot_crop = None  # type: ignore[assignment]
+        except Exception as exc:
+            logger.error("HUD slot classifier unavailable: %s", exc)
+            return {
+                "calibrated": False,
+                "consumable_slots": [],
+                "skill_slots": [],
+                "reason": "classifier_unavailable",
+            }
 
         consumable_slots: List[Dict[str, Any]] = []
         for idx, norm_cx in enumerate((0.31, 0.34, 0.37, 0.40, 0.59, 0.62, 0.65, 0.68, 0.72)):
@@ -1848,61 +2394,198 @@ class CalibrationWizard(QDialog):
             bx = max(0, min(fw - bw, int(round(norm_cx * fw - bw * 0.5))))
             by = max(0, min(fh - bh, int(round(norm_cy * fh - bh * 0.5))))
             crop = target[by : by + bh, bx : bx + bw]
-            cls_info = (
-                classify_hud_slot_crop(crop, norm_cx=norm_cx, norm_cy=norm_cy)
-                if callable(classify_hud_slot_crop) and crop.size > 0
-                else {"class_id": 22, "class_name": "hp_potion", "confidence": 0.78, "valid": True}
-            )
+            if crop.size == 0:
+                cls_info: Dict[str, Any] = {
+                    "class_id": None,
+                    "class_name": "empty_slot",
+                    "confidence": 0.0,
+                    "valid": False,
+                }
+            else:
+                cls_info = classify_hud_slot_crop(crop, norm_cx=norm_cx, norm_cy=norm_cy)
             consumable_slots.append({
                 "slot_index": idx + 1,
                 "bbox": (bx, by, bw, bh),
-                "class_id": int(cls_info.get("class_id", 22)),
-                "class_name": str(cls_info.get("class_name", "hp_potion")),
-                "confidence": float(cls_info.get("confidence", 0.78)),
+                "class_id": cls_info.get("class_id"),
+                "class_name": str(cls_info.get("class_name", "unclassified")),
+                "confidence": float(cls_info.get("confidence", 0.0) or 0.0),
+                "valid": bool(cls_info.get("valid", False)),
+                "row_type": str(cls_info.get("row_type", "upper_consumable_row")),
             })
+
+        classified = [slt for slt in consumable_slots if slt["valid"]]
+
+        # Lower combat skill bar (1..8, Q, E, R, T): measured by the real
+        # SkillBarReader, not assumed. Boxes use the same ROI the reader
+        # inspected, so a persisted ROI points at the measured slot. Box
+        # edges are the MEASURED slot bounds (slot_bounds_fractions, G2) —
+        # equal split put slot 5 at 0.514 (true 0.463) and missed T/6/7/8.
+        skill_slots: List[Dict[str, Any]] = []
+        try:
+            from core.skill_bar_reader import SkillBarReader, slot_bounds_fractions
+
+            sbr = SkillBarReader()
+            bar_res = sbr.inspect_skill_bar(target) or {}
+            roi = sbr.current_skill_bar_roi
+            sx1 = max(0, int(round(roi[0] * fw)))
+            sy1 = max(0, int(round(roi[1] * fh)))
+            sx2 = min(fw, int(round(roi[2] * fw)))
+            sy2 = min(fh, int(round(roi[3] * fh)))
+            bar_w = max(1, sx2 - sx1)
+            edges = slot_bounds_fractions()
+            slot_h = max(1, sy2 - sy1)
+            for idx, slot_key in enumerate(sbr.SKILL_SLOTS):
+                info = bar_res.get(str(slot_key), {}) or {}
+                ready = bool(info.get("ready"))
+                bx1 = sx1 + int(round(edges[idx] * bar_w))
+                bx2 = sx1 + int(round(edges[idx + 1] * bar_w))
+                skill_slots.append({
+                    "slot": str(slot_key),
+                    "slot_index": idx + 1,
+                    "bbox": (bx1, sy1, max(1, bx2 - bx1), slot_h),
+                    "ready": ready,
+                    "score": float(info.get("score", 0.0) or 0.0),
+                    "valid": ready,
+                    "class_id": 20 if ready else 21,
+                    "class_name": "skill_slot_ready" if ready else "skill_slot_cooldown",
+                    "row_type": "lower_skill_bar",
+                })
+        except Exception as exc:
+            logger.debug("Skill-bar calibration failed: %s", exc)
+            skill_slots = []
+        skill_ready = [slt for slt in skill_slots if slt["valid"]]
+
+        persisted = 0
+        skill_persisted = 0
+        base_dir = self.__dict__.get("base_dir")
+        if classified and base_dir is not None:
+            for slt in classified:
+                bx, by, bw, bh = slt["bbox"]
+                try:
+                    if save_calibrated_roi(
+                        base_dir=Path(base_dir),
+                        key=f"consumable_slot_{slt['slot_index']}",
+                        target_name=f"Consumable slot {slt['slot_index']} ({slt['class_name']})",
+                        norm_x=round(float(bx) / float(fw), 6),
+                        norm_y=round(float(by) / float(fh), 6),
+                        norm_w=round(float(bw) / float(fw), 6),
+                        norm_h=round(float(bh) / float(fh), 6),
+                        bbox_px=(bx, by, bw, bh),
+                        resolution=(int(fw), int(fh)),
+                        yolo_class_id=slt["class_id"],
+                        class_name=str(slt["class_name"]),
+                    ):
+                        persisted += 1
+                except Exception as exc:
+                    logger.debug("Consumable ROI persist failed: %s", exc)
+        if skill_ready and base_dir is not None:
+            for slt in skill_ready:
+                bx, by, bw, bh = slt["bbox"]
+                try:
+                    if save_calibrated_roi(
+                        base_dir=Path(base_dir),
+                        key=f"skill_slot_{str(slt['slot']).lower()}",
+                        target_name=f"Skill slot {slt['slot']} (skill_slot_ready)",
+                        norm_x=round(float(bx) / float(fw), 6),
+                        norm_y=round(float(by) / float(fh), 6),
+                        norm_w=round(float(bw) / float(fw), 6),
+                        norm_h=round(float(bh) / float(fh), 6),
+                        bbox_px=(bx, by, bw, bh),
+                        resolution=(int(fw), int(fh)),
+                        yolo_class_id=20,
+                        class_name="skill_slot_ready",
+                    ):
+                        skill_persisted += 1
+                except Exception as exc:
+                    logger.debug("Skill slot ROI persist failed: %s", exc)
         return {
-            "calibrated": True,
+            "calibrated": len(classified) > 0 or len(skill_ready) > 0,
             "resolution": (int(fw), int(fh)),
             "consumable_slots": consumable_slots,
-            "consumable_count": len(consumable_slots),
+            "consumable_count": len(classified),
+            "persisted_count": persisted,
+            "skill_slots": skill_slots,
+            "skill_count": len(skill_ready),
+            "skill_persisted_count": skill_persisted,
+            "reason": None if (classified or skill_ready) else "no_classified_slots",
         }
 
     def get_calibration_completeness_report(self) -> Dict[str, Any]:
-        """Returns template existence and completeness stats across all calibration targets."""
+        """Returns template existence and completeness stats.
+
+        Targets are counted by unique template *file* (TEMPLATE_TARGETS
+        holds 64 label/alias entries for 25 files, so counting entries
+        inflates the total). ``ready`` is True only when every template
+        file exists; the full missing list is returned, not a 10-item cut.
+        """
         tdir = self.__dict__.get("templates_dir") or Path("templates")
         targets = getattr(self, "TEMPLATE_TARGETS", {}) or {}
-        existing = 0
-        missing: List[str] = []
+        unique_files: Dict[str, str] = {}
         for label, meta in targets.items():
             fname = str(meta.get("filename", ""))
-            if fname and (Path(tdir) / fname).exists():
+            if fname:
+                unique_files.setdefault(fname, label)
+        existing = 0
+        missing: List[str] = []
+        for fname in sorted(unique_files):
+            if (Path(tdir) / fname).exists():
                 existing += 1
             else:
-                missing.append(label)
-        total = max(1, len(targets))
+                missing.append(fname)
+        total = max(1, len(unique_files))
+        # Canonical coverage: how many of the 25 canonical classes have a
+        # template target at all (CANONICAL_25_CLASSES is the reference).
+        canonical_names = {
+            str(info.get("class_name", "")) for info in self.CANONICAL_25_CLASSES.values()
+        }
+        target_names = {
+            str(meta.get("class_name", "")) for meta in targets.values()
+        }
         return {
-            "total_targets": len(targets),
+            "total_targets": len(unique_files),
             "calibrated_count": existing,
             "missing_count": len(missing),
             "completeness_pct": round((existing / float(total)) * 100.0, 1),
-            "missing_targets": missing[:10],
-            "ready": True,
+            "missing_targets": missing,
+            "canonical_class_count": len(self.CANONICAL_25_CLASSES),
+            "canonical_targets_covered": len(canonical_names & target_names),
+            "ready": len(missing) == 0,
         }
 
     def get_calibration_wizard_health_summary(self) -> dict:
         try:
-            return {"calibration_wizard_ready": True}
+            report = self.get_calibration_completeness_report()
+            return {
+                "calibration_wizard_ready": bool(report.get("ready", False)),
+                "calibrated_count": report.get("calibrated_count", 0),
+                "total_targets": report.get("total_targets", 0),
+                "missing_count": report.get("missing_count", 0),
+            }
         except Exception:
             return {"calibration_wizard_ready": False}
 
     def get_calibration_wizard_ready_flag(self) -> dict:
-        return {"module": "calibration_wizard", "ready": True}
+        try:
+            ready = bool(self.get_calibration_completeness_report().get("ready", False))
+        except Exception:
+            ready = False
+        return {"module": "calibration_wizard", "ready": ready}
 
     def get_calibration_wizard_version_info(self) -> dict:
-        return {"module": "calibration_wizard", "version": "2.0.0", "ready": True}
+        try:
+            ready = bool(self.get_calibration_completeness_report().get("ready", False))
+        except Exception:
+            ready = False
+        return {"module": "calibration_wizard", "version": __version__, "ready": ready}
 
     def get_calibration_wizard_diagnostic_snapshot(self) -> dict:
-        return {"module": "calibration_wizard", "status": "ok", "ready": True}
+        try:
+            report = self.get_calibration_completeness_report()
+            ready = bool(report.get("ready", False))
+            status = "ok" if ready else "incomplete"
+        except Exception:
+            ready, status = False, "error"
+        return {"module": "calibration_wizard", "status": status, "ready": ready}
 
 
 # Auto-cut refuses weak matches even when the test slider is dragged to its 50% floor.
@@ -1929,18 +2612,28 @@ _AUTO_TARGET_SHORT = {
     "Yetenek / Skill Bar Yuvası Kes": "Skill slot",
     "Engel / Kaya / Duvar (Obstacle) Kes": "Engel",
     "Yürünebilir Yol / Zemin (Path) Kes": "Yol/Zemin",
+    "Tüy / Parçacık Efekti (Negatif) Kes": "Tüy",
+    "Yetenek Çubuğu (skill_bar) Kes": "Skill bar",
+    "Can İksiri (hp_potion) Kes": "HP iksir",
+    "Mana İksiri (mp_potion) Kes": "MP iksir",
+    "Parşömen / Scroll (buff_scroll) Kes": "Parşömen",
 }
 
 _vision_engine_singleton: Any = None
+# S081 (v19/P3-8): kilitsiz lazy singleton — çift kontrollü kilit
+# (navigation_intel.py yedek motorlarıyla aynı desen).
+_vision_engine_lock = threading.Lock()
 
 
 def _vision_engine() -> Any:
     """Lazy VisionEngine. Reads templates and monitor geometry; does not grab the game."""
     global _vision_engine_singleton
     if _vision_engine_singleton is None:
-        from core.vision import VisionEngine
+        with _vision_engine_lock:
+            if _vision_engine_singleton is None:
+                from core.vision import VisionEngine
 
-        _vision_engine_singleton = VisionEngine()
+                _vision_engine_singleton = VisionEngine()
     return _vision_engine_singleton
 
 
@@ -1971,6 +2664,119 @@ def _box_is_small(
     if w * h > fw * fh * 0.04:
         return False
     return True
+
+
+def _clamp_bbox(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[Tuple[int, int, int, int]]:
+    """Clamp an (x, y, w, h) box to the frame; None if nothing visible remains.
+
+    YOLO / scanner boxes are not guaranteed in-bounds — cropping already
+    clamped silently while the *returned* bbox stayed out-of-frame.
+    """
+    fh, fw = frame.shape[:2]
+    x, y, w, h = (int(v) for v in bbox)
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(fw, x + w), min(fh, y + h)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def _frame_gray(frame: np.ndarray, kwargs: Optional[Dict[str, Any]] = None) -> np.ndarray:
+    """Full-frame BGR→GRAY, reusing the gray frame ``auto_cut_templates``
+    precomputed for this run when it matches this frame's shape.
+
+    Every template-matching locator used to convert the whole frame on its
+    own (14 full-frame conversions per auto-cut run); the shared copy is
+    read-only here — matchTemplate never writes its inputs — so reuse is
+    safe and the per-locator fallback keeps standalone calls working.
+    """
+    if kwargs:
+        gray = kwargs.get("frame_gray")
+        if (
+            isinstance(gray, np.ndarray)
+            and gray.ndim == 2
+            and gray.shape[:2] == frame.shape[:2]
+        ):
+            return gray
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+def _template_yolo_class_id(target_name: str) -> Optional[int]:
+    """Canonical YOLO class id for one TEMPLATE_TARGETS display name.
+
+    P0-2 (K-11): the single read-side accessor for the write side's map.
+    The save paths (``save_cropped_region_as_template`` / the auto-cut loop)
+    take ``yolo_class_id`` straight from ``TEMPLATE_TARGETS``; the YOLO
+    locators below must do the same instead of hard-coding a second copy
+    of the id — the old literals (crest 6, E icon 8) were the legacy scheme
+    and read herb/ore boxes as prompts. Returns None when the target has
+    no YOLO class (caller then skips the YOLO branch).
+    """
+    try:
+        info = CalibrationWizard.TEMPLATE_TARGETS.get(target_name) or {}
+    except Exception:
+        return None
+    cid = info.get("yolo_class_id")
+    if isinstance(cid, bool) or not isinstance(cid, int):
+        return None
+    return cid
+
+
+def _best_yolo_ann(
+    yolo_anns: Sequence[Dict[str, Any]], class_id: int
+) -> Optional[Dict[str, Any]]:
+    """Highest-confidence YOLO annotation for one class, or None.
+
+    S079 (v19/P3-8): `confidence`/`area`/`class_id` JSON'dan açık
+    `None` gelebiliyordu — `.get(k, varsayılan)` yalnızca anahtar
+    yokken korur, değer `None` iken `float(None)` TypeError atardı.
+    None değerler varsayılana çevrilir (class_id 0 geçerlidir,
+    `or -1` kullanılmaz).
+    """
+    def _ann_class(a: Dict[str, Any]) -> int:
+        cid = a.get("class_id")
+        return -1 if cid is None else int(cid)
+
+    def _ann_conf(a: Dict[str, Any]) -> float:
+        conf = a.get("confidence")
+        return 0.0 if conf is None else float(conf)
+
+    matching = [a for a in (yolo_anns or []) if _ann_class(a) == class_id]
+    if not matching:
+        return None
+    return max(matching, key=_ann_conf)
+
+
+def _minimap_detection_box(det: Dict[str, Any]) -> Optional[Tuple[Tuple[int, int, int, int], float]]:
+    """Build a bbox + score from a MinimapScanner detection dict.
+
+    ``scan_minimap_crop`` entries carry no ``"box_xywh"`` key (they have
+    ``screen_x``/``screen_y`` + ``area``) — reading ``box_xywh`` raised
+    KeyError on every fallback hit. The box is centred on the detection
+    with a side derived from its measured area; the score comes from the
+    detection's own ``confidence``/``ncc_score`` (sprouts) or
+    ``circularity`` (dots), never a constant.
+    """
+    sx = det.get("screen_x")
+    sy = det.get("screen_y")
+    if sx is None or sy is None:
+        pos = det.get("screen_pos") or det.get("pos")
+        if pos is None:
+            return None
+        sx, sy = int(pos[0]), int(pos[1])
+    # S079 (v19/P3-8): area/confidence açık None olabilir (bkz.
+    # _best_yolo_ann) — float(None) TypeError atardı.
+    _area = det.get("area")
+    side = int(round(max(1.0, float(256.0 if _area is None else _area)) ** 0.5))
+    side = max(8, min(48, side))
+    half = side // 2
+    _score = det.get("confidence")
+    if _score is None:
+        _score = det.get("ncc_score")
+    if _score is None:
+        _score = det.get("circularity", 0.0)
+    score = float(0.0 if _score is None else _score) or 0.0
+    return ((int(sx) - half, int(sy) - half, side, side), score)
 
 
 def _locate_gather_prompt(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
@@ -2134,12 +2940,9 @@ def _locate_minimap_arrow(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict
             return miss
         delta = float(np.mean(fg)) - float(np.mean(bg))
         peak = float(np.max(fg))
-        if peak >= 240.0 and delta >= 55.0 and 8 <= area <= 80:
-            score = 0.91
-        elif peak >= 200.0 and delta >= 40.0:
-            score = 0.72
-        else:
-            score = max(0.0, min(0.59, delta / 255.0))
+        # Continuous score from the measured contrast (delta) and peak
+        # brightness — no fixed 0.91/0.72 steps.
+        score = max(0.0, min(0.98, 0.5 * (delta / 100.0) + 0.5 * (peak / 255.0)))
         abs_box = (int(mx1 + x), int(my1 + y), int(w), int(h))
         if not _box_is_small(w, h, fw, fh, 0.06, 0.08, min_w=8, min_h=8):
             return {
@@ -2171,7 +2974,14 @@ def _locate_minimap_arrow(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict
 
 
 def _locate_map_header(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
-    """Saves the world-map header only when VisionEngine.is_map_open locks a small box."""
+    """Saves the world-map header only when VisionEngine.is_map_open locks a small box.
+
+    G sözleşmesi (üç durumlu): is_map_open True/False/None döner — None
+    "bilinmiyor" demektir, "kapalı" değil. None durumunda başlık eşleşmesi
+    denenir; bulunamazsa zaten eşik-altı miss döner. Eskiden `not
+    engine.is_map_open(...)` None'u kapalı sayıp başlık aramasını hiç
+    denemiyordu.
+    """
     miss_closed = {
         "ok": False,
         "score": 0.0,
@@ -2181,9 +2991,14 @@ def _locate_map_header(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[st
     }
     try:
         engine = _vision_engine()
-        if not engine.is_map_open(frame):
+        map_status = engine.is_map_open(frame)
+        if map_status is False:
             return miss_closed
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if map_status is None:
+            logger.debug(
+                "Harita durumu bilinmiyor (is_map_open=None) — başlık eşleşmesi deneniyor."
+            )
+        gray = _frame_gray(frame, kwargs)
         fh, fw = gray.shape[:2]
         top = gray[int(fh * 0.02) : int(fh * 0.14), int(fw * 0.25) : int(fw * 0.78)]
         if top.size == 0:
@@ -2267,10 +3082,18 @@ def _locate_world_gather_crest(frame: np.ndarray, gate: float, **kwargs: Any) ->
     except Exception as exc:
         logger.debug("Pyramid3DCrestDetector error in auto-cut: %s", exc)
 
-    yolo_anns = kwargs.get("yolo_anns") or []
-    crest_anns = [a for a in yolo_anns if int(a.get("class_id", -1)) == 6]
-    if crest_anns:
-        best = max(crest_anns, key=lambda a: float(a.get("confidence", 0.0)))
+    # P0-2 (K-11): class id comes from TEMPLATE_TARGETS via the shared
+    # helper — never a literal here. Canonical 13 (skill_ui_prompt); the
+    # old literal 6 is herb_edana in dataset/data.yaml.
+    _crest_cid = _template_yolo_class_id(
+        "3B Beyaz Kanatlı Toplama Amblemi (Crest) Kes"
+    )
+    best = (
+        _best_yolo_ann(kwargs.get("yolo_anns") or [], _crest_cid)
+        if _crest_cid is not None
+        else None
+    )
+    if best is not None:
         bx, by, bw, bh = (int(v) for v in best["bbox"])
         score = float(best.get("confidence", 0.0))
         crop = frame[by : by + bh, bx : bx + bw]
@@ -2283,7 +3106,7 @@ def _locate_world_gather_crest(frame: np.ndarray, gate: float, **kwargs: Any) ->
         if t_path.exists():
             tpl = imread_unicode(t_path, cv2.IMREAD_COLOR)
             if tpl is not None and tpl.size > 0:
-                res = cv2.matchTemplate(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY), cv2.TM_CCOEFF_NORMED)
+                res = cv2.matchTemplate(_frame_gray(frame, kwargs), cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY), cv2.TM_CCOEFF_NORMED)
                 _, max_v, _, max_loc = cv2.minMaxLoc(res)
                 if float(max_v) >= gate:
                     tw, th = tpl.shape[1], tpl.shape[0]
@@ -2296,10 +3119,16 @@ def _locate_world_gather_crest(frame: np.ndarray, gate: float, **kwargs: Any) ->
 
 def _locate_e_gather_icon(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
     """Detects floating [E] resource icon using YOLOAutoLabeler or VisionEngine."""
-    yolo_anns = kwargs.get("yolo_anns") or []
-    e_anns = [a for a in yolo_anns if int(a.get("class_id", -1)) == 8]
-    if e_anns:
-        best = max(e_anns, key=lambda a: float(a.get("confidence", 0.0)))
+    # P0-2 (K-11): class id comes from TEMPLATE_TARGETS via the shared
+    # helper — never a literal here. Canonical 13 (skill_ui_prompt); the
+    # old literal 8 is ore_obsidian in dataset/data.yaml.
+    _e_cid = _template_yolo_class_id("E Yüzen Kaynak İkonu Şablonu Kes")
+    best = (
+        _best_yolo_ann(kwargs.get("yolo_anns") or [], _e_cid)
+        if _e_cid is not None
+        else None
+    )
+    if best is not None:
         bx, by, bw, bh = (int(v) for v in best["bbox"])
         score = float(best.get("confidence", 0.0))
         crop = frame[by : by + bh, bx : bx + bw]
@@ -2311,11 +3140,25 @@ def _locate_e_gather_icon(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict
         found, conf, center, _key = engine.detect_floating_resource_icon(frame, threshold=gate, use_roi=True)
         if found and center is not None:
             cx, cy = int(center[0]), int(center[1])
-            bw, bh = 42, 42
-            bx, by = max(0, cx - 21), max(0, cy - 21)
-            crop = frame[by : by + bh, bx : bx + bw]
-            if crop.size > 0:
-                return {"ok": True, "score": float(conf), "bbox": (bx, by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
+            # Icon size from the saved template when available; otherwise
+            # scale the 42 px @1080p reference to this frame's height.
+            # A fixed 42x42 box is wrong at any other resolution.
+            fh, _fw = frame.shape[:2]
+            bw = bh = max(16, int(round(42 * fh / 1080.0)))
+            t_dir = kwargs.get("templates_dir")
+            for cand_name in ("e_gather_icon_template.png", "e_gather_icon.png"):
+                cand = (Path(t_dir) / cand_name) if t_dir else Path("templates") / cand_name
+                if cand.exists():
+                    tpl = imread_unicode(cand, cv2.IMREAD_COLOR)
+                    if tpl is not None and tpl.size > 0:
+                        bh, bw = int(tpl.shape[0]), int(tpl.shape[1])
+                    break
+            box = _clamp_bbox(frame, (cx - bw // 2, cy - bh // 2, bw, bh))
+            if box is not None:
+                bx, by, bw, bh = box
+                crop = frame[by : by + bh, bx : bx + bw]
+                if crop.size > 0:
+                    return {"ok": True, "score": float(conf), "bbox": (bx, by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
     except Exception as exc:
         logger.debug("VisionEngine floating icon error: %s", exc)
 
@@ -2332,15 +3175,14 @@ def _locate_resource_node(
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Generic locator for 3D resource nodes (Aria, Mela, Targena, Orichalcum, Crystal, Wood)."""
-    yolo_anns = kwargs.get("yolo_anns") or []
-    matching = [a for a in yolo_anns if int(a.get("class_id", -1)) == class_id]
-    if matching:
-        best = max(matching, key=lambda a: float(a.get("confidence", 0.0)))
+    best = _best_yolo_ann(kwargs.get("yolo_anns") or [], class_id)
+    if best is not None:
         bx, by, bw, bh = (int(v) for v in best["bbox"])
         score = float(best.get("confidence", 0.0))
-        fh, fw = frame.shape[:2]
-        if 0 <= bx < fw and 0 <= by < fh:
-            crop = frame[by : min(fh, by + bh), bx : min(fw, bx + bw)]
+        clamped = _clamp_bbox(frame, (bx, by, bw, bh))
+        if clamped is not None:
+            bx, by, bw, bh = clamped
+            crop = frame[by : by + bh, bx : bx + bw]
             if crop.size > 0 and score >= gate:
                 return {"ok": True, "score": score, "bbox": (bx, by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
             elif score < gate:
@@ -2353,7 +3195,7 @@ def _locate_resource_node(
         if t_path.exists():
             tpl = imread_unicode(t_path, cv2.IMREAD_COLOR)
             if tpl is not None and tpl.size > 0 and tpl.shape[0] < frame.shape[0] and tpl.shape[1] < frame.shape[1]:
-                fg = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                fg = _frame_gray(frame, kwargs)
                 tg = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
                 res = cv2.matchTemplate(fg, tg, cv2.TM_CCOEFF_NORMED)
                 _, max_v, _, max_loc = cv2.minMaxLoc(res)
@@ -2393,10 +3235,8 @@ def _locate_node_wood(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str
 
 def _locate_minimap_sprout(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
     """Detects 3-leaf sprout on minimap via YOLOAutoLabeler or MinimapScanner."""
-    yolo_anns = kwargs.get("yolo_anns") or []
-    sprout_anns = [a for a in yolo_anns if int(a.get("class_id", -1)) == 9]
-    if sprout_anns:
-        best = max(sprout_anns, key=lambda a: float(a.get("confidence", 0.0)))
+    best = _best_yolo_ann(kwargs.get("yolo_anns") or [], 9)
+    if best is not None:
         bx, by, bw, bh = (int(v) for v in best["bbox"])
         score = float(best.get("confidence", 0.0))
         crop = frame[by : by + bh, bx : bx + bw]
@@ -2411,12 +3251,19 @@ def _locate_minimap_sprout(frame: np.ndarray, gate: float, **kwargs: Any) -> Dic
             res = scanner.scan_minimap_crop(m_crop, offset_xy=(mx1, my1), frame_shape=frame.shape)
             nodes = res.get("gatherable_nodes", [])
             if nodes:
-                best = max(nodes, key=lambda n: float(n.get("score", 0.85)))
-                bx, by, bw, bh = (int(v) for v in best["box_xywh"])
-                score = float(best.get("score", 0.88))
-                crop = frame[by : by + bh, bx : bx + bw]
-                if crop.size > 0 and score >= gate:
-                    return {"ok": True, "score": score, "bbox": (bx, by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
+                best = max(
+                    nodes,
+                    key=lambda n: float(n.get("confidence", n.get("ncc_score", 0.0)) or 0.0),
+                )
+                built = _minimap_detection_box(best)
+                if built is not None:
+                    (bx, by, bw, bh), score = built
+                    clamped = _clamp_bbox(frame, (bx, by, bw, bh))
+                    if clamped is not None:
+                        bx, by, bw, bh = clamped
+                        crop = frame[by : by + bh, bx : bx + bw]
+                        if crop.size > 0 and score >= gate:
+                            return {"ok": True, "score": score, "bbox": (bx, by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
     except Exception as exc:
         logger.debug("MinimapScanner sprout error: %s", exc)
 
@@ -2425,10 +3272,8 @@ def _locate_minimap_sprout(frame: np.ndarray, gate: float, **kwargs: Any) -> Dic
 
 def _locate_minimap_mob(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
     """Detects hostile/monster dot on minimap."""
-    yolo_anns = kwargs.get("yolo_anns") or []
-    mob_anns = [a for a in yolo_anns if int(a.get("class_id", -1)) == 11]
-    if mob_anns:
-        best = max(mob_anns, key=lambda a: float(a.get("confidence", 0.0)))
+    best = _best_yolo_ann(kwargs.get("yolo_anns") or [], 11)
+    if best is not None:
         bx, by, bw, bh = (int(v) for v in best["bbox"])
         score = float(best.get("confidence", 0.0))
         crop = frame[by : by + bh, bx : bx + bw]
@@ -2443,12 +3288,19 @@ def _locate_minimap_mob(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[s
             res = scanner.scan_minimap_crop(m_crop, offset_xy=(mx1, my1), frame_shape=frame.shape)
             m_dots = res.get("monster_dots", []) or res.get("hostile_dots", [])
             if m_dots:
-                best = max(m_dots, key=lambda n: float(n.get("score", 0.80)))
-                bx, by, bw, bh = (int(v) for v in best["box_xywh"])
-                score = float(best.get("score", 0.82))
-                crop = frame[by : by + bh, bx : bx + bw]
-                if crop.size > 0 and score >= gate:
-                    return {"ok": True, "score": score, "bbox": (bx, by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
+                best = max(
+                    m_dots,
+                    key=lambda n: float(n.get("confidence", n.get("circularity", 0.0)) or 0.0),
+                )
+                built = _minimap_detection_box(best)
+                if built is not None:
+                    (bx, by, bw, bh), score = built
+                    clamped = _clamp_bbox(frame, (bx, by, bw, bh))
+                    if clamped is not None:
+                        bx, by, bw, bh = clamped
+                        crop = frame[by : by + bh, bx : bx + bw]
+                        if crop.size > 0 and score >= gate:
+                            return {"ok": True, "score": score, "bbox": (bx, by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
     except Exception as exc:
         logger.debug("MinimapScanner mob dot error: %s", exc)
 
@@ -2457,10 +3309,8 @@ def _locate_minimap_mob(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[s
 
 def _locate_mob_nameplate(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
     """Detects 3D monster body or nameplate via YOLOAutoLabeler."""
-    yolo_anns = kwargs.get("yolo_anns") or []
-    mob_anns = [a for a in yolo_anns if int(a.get("class_id", -1)) == 10]
-    if mob_anns:
-        best = max(mob_anns, key=lambda a: float(a.get("confidence", 0.0)))
+    best = _best_yolo_ann(kwargs.get("yolo_anns") or [], 10)
+    if best is not None:
         bx, by, bw, bh = (int(v) for v in best["bbox"])
         score = float(best.get("confidence", 0.0))
         crop = frame[by : by + bh, bx : bx + bw]
@@ -2492,7 +3342,11 @@ def _locate_target_hp_bar(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict
             aspect = float(bw) / float(max(1, bh))
             if bw >= 28 and 2 <= bh <= 32 and aspect >= 2.4 and area >= 40:
                 crop = roi[by : by + bh, bx : bx + bw]
-                score = min(0.98, max(0.65, 0.65 + float(area) / 300.0))
+                # Score from the measured fill of the component inside its
+                # own box (a solid bar fills ~all of it; a sparse artefact
+                # does not) — not from raw pixel area.
+                fill = float(area) / float(max(1, bw * bh))
+                score = min(0.97, max(0.60, 0.55 + 0.40 * fill))
                 if score >= gate and crop.size > 0:
                     return {"ok": True, "score": score, "bbox": (x1 + bx, y1 + by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
 
@@ -2511,9 +3365,17 @@ def _locate_player_hp_bar(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict
         red_mask = (roi[:, :, 2] > 100) & (roi[:, :, 0] < 90)
         ratio = float(np.mean(red_mask))
         if ratio >= 0.10:
-            score = min(0.96, max(0.65, ratio * 2.6))
+            # Tight box around the actually-red pixels, not the fixed ROI
+            # strip; score grows with the measured red fill of that box.
+            ys, xs = np.where(red_mask)
+            tx1, ty1 = int(xs.min()), int(ys.min())
+            tx2, ty2 = int(xs.max()) + 1, int(ys.max()) + 1
+            tight = red_mask[ty1:ty2, tx1:tx2]
+            fill = float(np.mean(tight)) if tight.size else ratio
+            score = min(0.95, max(0.60, 0.55 + 0.40 * fill))
             if score >= gate:
-                return {"ok": True, "score": score, "bbox": (x1, y1, x2 - x1, y2 - y1), "crop": roi.copy(), "reason": "kaydedildi"}
+                crop = roi[ty1:ty2, tx1:tx2]
+                return {"ok": True, "score": score, "bbox": (x1 + tx1, y1 + ty1, tx2 - tx1, ty2 - ty1), "crop": crop.copy(), "reason": "kaydedildi"}
 
     return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": "oyuncu HP barı bu karede yok"}
 
@@ -2530,9 +3392,15 @@ def _locate_player_mp_bar(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict
         blue_mask = (roi[:, :, 0] > 100) & (roi[:, :, 2] < 90)
         ratio = float(np.mean(blue_mask))
         if ratio >= 0.10:
-            score = min(0.96, max(0.65, ratio * 2.6))
+            ys, xs = np.where(blue_mask)
+            tx1, ty1 = int(xs.min()), int(ys.min())
+            tx2, ty2 = int(xs.max()) + 1, int(ys.max()) + 1
+            tight = blue_mask[ty1:ty2, tx1:tx2]
+            fill = float(np.mean(tight)) if tight.size else ratio
+            score = min(0.95, max(0.60, 0.55 + 0.40 * fill))
             if score >= gate:
-                return {"ok": True, "score": score, "bbox": (x1, y1, x2 - x1, y2 - y1), "crop": roi.copy(), "reason": "kaydedildi"}
+                crop = roi[ty1:ty2, tx1:tx2]
+                return {"ok": True, "score": score, "bbox": (x1 + tx1, y1 + ty1, tx2 - tx1, ty2 - ty1), "crop": crop.copy(), "reason": "kaydedildi"}
 
     return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": "oyuncu MP barı bu karede yok"}
 
@@ -2541,27 +3409,35 @@ def _locate_skill_slot(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[st
     """Detects active skill slot in hotbar using SkillBarReader."""
     fh, fw = frame.shape[:2]
     try:
-        from core.skill_bar_reader import SkillBarReader
+        from core.skill_bar_reader import SkillBarReader, slot_bounds_fractions
         sbr = SkillBarReader()
         res = sbr.inspect_skill_bar(frame)
         ready_slots = [v for v in res.values() if v.get("ready")]
-        best_slot = max(ready_slots, key=lambda s: float(s.get("score", 0.0))) if ready_slots else None
-        score = float(best_slot.get("score", 0.75)) if best_slot else 0.70
-        slot_key = best_slot.get("slot", "1") if best_slot else "1"
+        if not ready_slots:
+            # No ready slot was measured: report a miss instead of
+            # inventing slot "1" with a fabricated 0.70 score.
+            return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": "hazır skill yuvası yok"}
+        best_slot = max(ready_slots, key=lambda s: float(s.get("score", 0.0) or 0.0))
+        score = float(best_slot.get("score", 0.0) or 0.0)
+        if score <= 0.0:
+            return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": "hazır skill yuvası skorsuz"}
+        slot_key = str(best_slot.get("slot") or "1")
 
         x1 = max(0, int(round(sbr.SKILL_BAR_ROI[0] * fw)))
         y1 = max(0, int(round(sbr.SKILL_BAR_ROI[1] * fh)))
         x2 = min(fw, int(round(sbr.SKILL_BAR_ROI[2] * fw)))
         y2 = min(fh, int(round(sbr.SKILL_BAR_ROI[3] * fh)))
-        num_slots = len(sbr.SKILL_SLOTS)
-        slot_w = max(1, (x2 - x1) // num_slots)
+        # Olculmus slot kenarlari (G2) — esit bolunme degil.
+        edges = slot_bounds_fractions()
+        bar_w = max(1, x2 - x1)
         slot_h = max(1, y2 - y1)
         idx = 0
         for i, name in enumerate(sbr.SKILL_SLOTS):
             if str(name).lower() == slot_key.lower():
                 idx = i
                 break
-        sx = x1 + idx * slot_w
+        sx = x1 + int(round(edges[idx] * bar_w))
+        slot_w = max(1, int(round(edges[idx + 1] * bar_w)) - int(round(edges[idx] * bar_w)))
         crop = frame[y1 : y1 + slot_h, sx : sx + slot_w]
         if crop.size > 0 and score >= gate:
             return {"ok": True, "score": score, "bbox": (sx, y1, slot_w, slot_h), "crop": crop.copy(), "reason": "kaydedildi"}
@@ -2571,12 +3447,26 @@ def _locate_skill_slot(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[st
     return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": "skill yuvası bu karede yok"}
 
 
-def _locate_obstacle(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
-    """Detects obstacle / boulder / cliff in viewport."""
-    yolo_anns = kwargs.get("yolo_anns") or []
-    obs_anns = [a for a in yolo_anns if int(a.get("class_id", -1)) == 14]
-    if obs_anns:
-        best = max(obs_anns, key=lambda a: float(a.get("confidence", 0.0)))
+def _locate_yolo_or_template(
+    frame: np.ndarray,
+    gate: float,
+    class_id: int,
+    template_filename: str,
+    missing_reason: str,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """YOLO-first, saved-template fallback; a miss when neither fires.
+
+    Shared by the obstacle / path locators, which were line-for-line
+    identical except for class id, template file and miss reason. The
+    fallback order is preserved exactly: a below-gate YOLO hit still
+    falls through to template matching, and a below-gate template match
+    still reports the plain miss reason (no size guard — a too-large
+    template raises into auto_cut_templates' per-locator handler, as
+    before).
+    """
+    best = _best_yolo_ann(kwargs.get("yolo_anns") or [], class_id)
+    if best is not None:
         bx, by, bw, bh = (int(v) for v in best["bbox"])
         score = float(best.get("confidence", 0.0))
         crop = frame[by : by + bh, bx : bx + bw]
@@ -2585,11 +3475,11 @@ def _locate_obstacle(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str,
 
     templates_dir = kwargs.get("templates_dir")
     if templates_dir:
-        t_path = Path(templates_dir) / "obstacle_template.png"
+        t_path = Path(templates_dir) / template_filename
         if t_path.exists():
             tpl = imread_unicode(t_path, cv2.IMREAD_COLOR)
             if tpl is not None and tpl.size > 0:
-                res = cv2.matchTemplate(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY), cv2.TM_CCOEFF_NORMED)
+                res = cv2.matchTemplate(_frame_gray(frame, kwargs), cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY), cv2.TM_CCOEFF_NORMED)
                 _, max_v, _, max_loc = cv2.minMaxLoc(res)
                 if float(max_v) >= gate:
                     tw, th = tpl.shape[1], tpl.shape[0]
@@ -2597,36 +3487,135 @@ def _locate_obstacle(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str,
                     crop = frame[ty : ty + th, tx : tx + tw]
                     return {"ok": True, "score": float(max_v), "bbox": (tx, ty, tw, th), "crop": crop.copy(), "reason": "kaydedildi"}
 
-    return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": "engel bu karede yok"}
+    return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": missing_reason}
+
+
+def _locate_obstacle(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
+    """Detects obstacle / boulder / cliff in viewport."""
+    return _locate_yolo_or_template(
+        frame, gate, 14, "obstacle_template.png", "engel bu karede yok", **kwargs
+    )
 
 
 def _locate_path_ground(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
     """Detects walkable path / ground patch."""
-    yolo_anns = kwargs.get("yolo_anns") or []
-    path_anns = [a for a in yolo_anns if int(a.get("class_id", -1)) == 15]
-    if path_anns:
-        best = max(path_anns, key=lambda a: float(a.get("confidence", 0.0)))
-        bx, by, bw, bh = (int(v) for v in best["bbox"])
-        score = float(best.get("confidence", 0.0))
-        crop = frame[by : by + bh, bx : bx + bw]
-        if crop.size > 0 and score >= gate:
-            return {"ok": True, "score": score, "bbox": (bx, by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
+    return _locate_yolo_or_template(
+        frame, gate, 15, "path_ground_template.png", "yol/zemin bu karede yok", **kwargs
+    )
 
-    templates_dir = kwargs.get("templates_dir")
-    if templates_dir:
-        t_path = Path(templates_dir) / "path_ground_template.png"
-        if t_path.exists():
-            tpl = imread_unicode(t_path, cv2.IMREAD_COLOR)
-            if tpl is not None and tpl.size > 0:
-                res = cv2.matchTemplate(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY), cv2.TM_CCOEFF_NORMED)
-                _, max_v, _, max_loc = cv2.minMaxLoc(res)
-                if float(max_v) >= gate:
-                    tw, th = tpl.shape[1], tpl.shape[0]
-                    tx, ty = int(max_loc[0]), int(max_loc[1])
-                    crop = frame[ty : ty + th, tx : tx + tw]
-                    return {"ok": True, "score": float(max_v), "bbox": (tx, ty, tw, th), "crop": crop.copy(), "reason": "kaydedildi"}
 
-    return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": "yol/zemin bu karede yok"}
+def _locate_by_template(
+    frame: np.ndarray,
+    gate: float,
+    template_filename: str,
+    missing_reason: str,
+    templates_dir: Optional[Path] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Template-match a saved template file; a miss when no file exists."""
+    t_dir = templates_dir or kwargs.get("templates_dir") or Path("templates")
+    t_path = Path(t_dir) / template_filename
+    if not t_path.exists():
+        return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": missing_reason}
+    tpl = imread_unicode(t_path, cv2.IMREAD_COLOR)
+    if tpl is None or tpl.size == 0 or tpl.shape[0] >= frame.shape[0] or tpl.shape[1] >= frame.shape[1]:
+        return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": "şablon okunamadı"}
+    res = cv2.matchTemplate(
+        _frame_gray(frame, kwargs),
+        cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY),
+        cv2.TM_CCOEFF_NORMED,
+    )
+    _, max_v, _, max_loc = cv2.minMaxLoc(res)
+    score = float(max_v)
+    if score < gate:
+        return {"ok": False, "score": score, "bbox": None, "crop": None, "reason": f"skor {score:.2f}, eşik {gate:.2f}"}
+    tw, th = tpl.shape[1], tpl.shape[0]
+    tx, ty = int(max_loc[0]), int(max_loc[1])
+    crop = frame[ty : ty + th, tx : tx + tw]
+    if crop.size == 0:
+        return {"ok": False, "score": score, "bbox": None, "crop": None, "reason": "kırpıntı boş"}
+    return {"ok": True, "score": score, "bbox": (tx, ty, tw, th), "crop": crop.copy(), "reason": "kaydedildi"}
+
+
+def _locate_feather_particle(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
+    """Feather/particle negative template (saved-template match only)."""
+    return _locate_by_template(
+        frame, gate, "feather_particle_template.png", "tüy şablonu yok", **kwargs
+    )
+
+
+def _locate_skill_bar(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
+    """Full skill-bar strip (saved-template match only)."""
+    return _locate_by_template(
+        frame, gate, "skill_bar_template.png", "skill bar şablonu yok", **kwargs
+    )
+
+
+def _locate_consumable_slot(
+    frame: np.ndarray, gate: float, category: str, **kwargs: Any
+) -> Dict[str, Any]:
+    """One consumable class (hp_potion / mp_potion / buff_scroll) via the
+    real HUD slot classifier's full-frame scan."""
+    try:
+        from dataset_factory.scroll_potion_classifier import HUDConsumableClassifier
+
+        found = HUDConsumableClassifier().scan_hud_slots(frame)
+    except Exception as exc:
+        logger.debug("HUD consumable scan failed: %s", exc)
+        return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": "tarama hatası"}
+    matches = [d for d in found if d.get("class_name") == category]
+    if not matches:
+        return {"ok": False, "score": 0.0, "bbox": None, "crop": None, "reason": f"{category} bu karede yok"}
+    best = max(matches, key=lambda d: float(d.get("confidence", 0.0) or 0.0))
+    score = float(best.get("confidence", 0.0) or 0.0)
+    bx, by, bw, bh = (int(v) for v in best["bbox"])
+    crop = frame[by : by + bh, bx : bx + bw]
+    if crop.size == 0 or score < gate:
+        return {"ok": False, "score": score, "bbox": None, "crop": None, "reason": f"skor {score:.2f}, eşik {gate:.2f}"}
+    return {"ok": True, "score": score, "bbox": (bx, by, bw, bh), "crop": crop.copy(), "reason": "kaydedildi"}
+
+
+def _locate_hp_potion(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
+    return _locate_consumable_slot(frame, gate, "hp_potion", **kwargs)
+
+
+def _locate_mp_potion(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
+    return _locate_consumable_slot(frame, gate, "mp_potion", **kwargs)
+
+
+def _locate_buff_scroll(frame: np.ndarray, gate: float, **kwargs: Any) -> Dict[str, Any]:
+    return _locate_consumable_slot(frame, gate, "buff_scroll", **kwargs)
+
+
+# Module-level locator registry: every PRIMARY_TARGETS entry must have one.
+# validate_calibration_wizard_contract() checks this coverage.
+_AUTO_CUT_LOCATORS: Dict[str, Any] = {
+    "F/E Toplama Butonu Şablonu Kes": _locate_gather_prompt,
+    "Minimap Oyuncu Oku Şablonu Kes": _locate_minimap_arrow,
+    "Harita Başlığı Şablonu Kes": _locate_map_header,
+    "E Yüzen Kaynak İkonu Şablonu Kes": _locate_e_gather_icon,
+    "3B Beyaz Kanatlı Toplama Amblemi (Crest) Kes": _locate_world_gather_crest,
+    "Kaynak: Aria Bitkisi (herb_aria) Kes": _locate_node_aria,
+    "Kaynak: Mela Bitkisi (herb_mela) Kes": _locate_node_mela,
+    "Kaynak: Targena / Bitki (herb_targena) Kes": _locate_node_targena,
+    "Kaynak: Orichalcum / Maden Cevheri (ore_orichalcum) Kes": _locate_node_orichalcum,
+    "Kaynak: Kristal / Gem (gem_crystal) Kes": _locate_node_crystal,
+    "Kaynak: Ağaç / Kereste (wood_tree) Kes": _locate_node_wood,
+    "Minimap 3 Yapraklı Filiz (Kaynak İkonu) Kes": _locate_minimap_sprout,
+    "Minimap Canavar Noktası (Negatif) Kes": _locate_minimap_mob,
+    "3B Canavar / İsim Plakası (Hedef) Kes": _locate_mob_nameplate,
+    "Hedef Canavar Can (HP) Barı Kes": _locate_target_hp_bar,
+    "Oyuncu Can (HP) Barı Kes": _locate_player_hp_bar,
+    "Oyuncu Mana (MP) Barı Kes": _locate_player_mp_bar,
+    "Yetenek / Skill Bar Yuvası Kes": _locate_skill_slot,
+    "Engel / Kaya / Duvar (Obstacle) Kes": _locate_obstacle,
+    "Yürünebilir Yol / Zemin (Path) Kes": _locate_path_ground,
+    "Tüy / Parçacık Efekti (Negatif) Kes": _locate_feather_particle,
+    "Yetenek Çubuğu (skill_bar) Kes": _locate_skill_bar,
+    "Can İksiri (hp_potion) Kes": _locate_hp_potion,
+    "Mana İksiri (mp_potion) Kes": _locate_mp_potion,
+    "Parşömen / Scroll (buff_scroll) Kes": _locate_buff_scroll,
+}
 
 
 def auto_cut_templates(
@@ -2662,6 +3651,11 @@ def auto_cut_templates(
     gate = max(AUTO_CUT_SCORE_FLOOR, float(min_score))
     out_dir = Path(templates_dir)
 
+    # One shared BGR→GRAY conversion for this run: every template-matching
+    # locator reuses it via _frame_gray instead of converting the full
+    # frame again (14 conversions per run before this change).
+    frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
     # Run YOLOAutoLabeler once as shared cache
     yolo_anns = []
     try:
@@ -2670,28 +3664,7 @@ def auto_cut_templates(
     except Exception as exc:
         logger.debug("YOLOAutoLabeler run failed in auto_cut_templates: %s", exc)
 
-    locators = {
-        "F/E Toplama Butonu Şablonu Kes": _locate_gather_prompt,
-        "Minimap Oyuncu Oku Şablonu Kes": _locate_minimap_arrow,
-        "Harita Başlığı Şablonu Kes": _locate_map_header,
-        "E Yüzen Kaynak İkonu Şablonu Kes": _locate_e_gather_icon,
-        "3B Beyaz Kanatlı Toplama Amblemi (Crest) Kes": _locate_world_gather_crest,
-        "Kaynak: Aria Bitkisi (herb_aria) Kes": _locate_node_aria,
-        "Kaynak: Mela Bitkisi (herb_mela) Kes": _locate_node_mela,
-        "Kaynak: Targena / Bitki (herb_targena) Kes": _locate_node_targena,
-        "Kaynak: Orichalcum / Maden Cevheri (ore_orichalcum) Kes": _locate_node_orichalcum,
-        "Kaynak: Kristal / Gem (gem_crystal) Kes": _locate_node_crystal,
-        "Kaynak: Ağaç / Kereste (wood_tree) Kes": _locate_node_wood,
-        "Minimap 3 Yapraklı Filiz (Kaynak İkonu) Kes": _locate_minimap_sprout,
-        "Minimap Canavar Noktası (Negatif) Kes": _locate_minimap_mob,
-        "3B Canavar / İsim Plakası (Hedef) Kes": _locate_mob_nameplate,
-        "Hedef Canavar Can (HP) Barı Kes": _locate_target_hp_bar,
-        "Oyuncu Can (HP) Barı Kes": _locate_player_hp_bar,
-        "Oyuncu Mana (MP) Barı Kes": _locate_player_mp_bar,
-        "Yetenek / Skill Bar Yuvası Kes": _locate_skill_slot,
-        "Engel / Kaya / Duvar (Obstacle) Kes": _locate_obstacle,
-        "Yürünebilir Yol / Zemin (Path) Kes": _locate_path_ground,
-    }
+    locators = _AUTO_CUT_LOCATORS
 
     for name in CalibrationWizard.PRIMARY_TARGETS:
         info = CalibrationWizard.TEMPLATE_TARGETS[name]
@@ -2712,6 +3685,7 @@ def auto_cut_templates(
                     gate,
                     yolo_anns=yolo_anns,
                     templates_dir=out_dir,
+                    frame_gray=frame_gray,
                 )
             except Exception as exc:
                 logger.error("Auto-cut locator failed for %s: %s", name, exc)
@@ -2762,43 +3736,92 @@ def get_calibration_wizard_capabilities() -> list:
 
 
 def validate_calibration_wizard_contract() -> bool:
-    return bool(get_calibration_wizard_capabilities())
+    """Real structural check: capabilities exist, the canonical table has
+    all 25 classes, and every PRIMARY target has an auto-cut locator."""
+    try:
+        return bool(
+            get_calibration_wizard_capabilities()
+            and len(CalibrationWizard.CANONICAL_25_CLASSES) == 25
+            and set(CalibrationWizard.PRIMARY_TARGETS) <= set(_AUTO_CUT_LOCATORS)
+        )
+    except Exception:
+        return False
 
 
 def get_calibration_wizard_baseline_metrics() -> dict:
-    return {"module": "calibration_wizard", "contract_valid": validate_calibration_wizard_contract(), "capability_count": len(get_calibration_wizard_capabilities())}
+    contract_valid = validate_calibration_wizard_contract()
+    return {
+        "module": "calibration_wizard",
+        "contract_valid": contract_valid,
+        "capability_count": len(get_calibration_wizard_capabilities()),
+        "primary_target_count": len(CalibrationWizard.PRIMARY_TARGETS),
+        "locator_count": len(_AUTO_CUT_LOCATORS),
+        "canonical_class_count": len(CalibrationWizard.CANONICAL_25_CLASSES),
+    }
 
 
 def get_calibration_wizard_readiness_status() -> dict:
-    return {"module": "calibration_wizard", "ready": validate_calibration_wizard_contract(), "metrics": get_calibration_wizard_baseline_metrics()}
+    return {
+        "module": "calibration_wizard",
+        "ready": validate_calibration_wizard_contract(),
+        "metrics": get_calibration_wizard_baseline_metrics(),
+    }
 
 
 def get_calibration_wizard_audit_record() -> dict:
-    return {"module": "calibration_wizard", "audit_passed": validate_calibration_wizard_contract(), "readiness": get_calibration_wizard_readiness_status()}
+    return {
+        "module": "calibration_wizard",
+        "audit_passed": validate_calibration_wizard_contract(),
+        "metrics": get_calibration_wizard_baseline_metrics(),
+    }
 
 
 def get_calibration_wizard_operational_digest() -> dict:
-    return {"module": "calibration_wizard", "operational": validate_calibration_wizard_contract(), "audit": get_calibration_wizard_audit_record()}
+    return {
+        "module": "calibration_wizard",
+        "operational": validate_calibration_wizard_contract(),
+        "metrics": get_calibration_wizard_baseline_metrics(),
+    }
 
 
 def get_calibration_wizard_telemetry_payload() -> dict:
-    return {"module": "calibration_wizard", "telemetry_ready": validate_calibration_wizard_contract(), "digest": get_calibration_wizard_operational_digest()}
+    return {
+        "module": "calibration_wizard",
+        "telemetry_ready": validate_calibration_wizard_contract(),
+        "metrics": get_calibration_wizard_baseline_metrics(),
+    }
 
 
 def get_calibration_wizard_integrity_seal() -> dict:
-    return {"module": "calibration_wizard", "sealed": validate_calibration_wizard_contract(), "telemetry": get_calibration_wizard_telemetry_payload()}
+    return {
+        "module": "calibration_wizard",
+        "sealed": validate_calibration_wizard_contract(),
+        "metrics": get_calibration_wizard_baseline_metrics(),
+    }
 
 
 def get_calibration_wizard_compliance_certificate() -> dict:
-    return {"module": "calibration_wizard", "certified": validate_calibration_wizard_contract(), "seal": get_calibration_wizard_integrity_seal()}
+    return {
+        "module": "calibration_wizard",
+        "certified": validate_calibration_wizard_contract(),
+        "metrics": get_calibration_wizard_baseline_metrics(),
+    }
 
 
 def get_calibration_wizard_readiness_probe() -> dict:
-    return {"module": "calibration_wizard", "ready": validate_calibration_wizard_contract(), "certificate": get_calibration_wizard_compliance_certificate()}
+    return {
+        "module": "calibration_wizard",
+        "ready": validate_calibration_wizard_contract(),
+        "metrics": get_calibration_wizard_baseline_metrics(),
+    }
 
 
 def get_calibration_wizard_audit_summary() -> dict:
-    return {"module": "calibration_wizard", "audit_passed": validate_calibration_wizard_contract(), "probe": get_calibration_wizard_readiness_probe()}
+    return {
+        "module": "calibration_wizard",
+        "audit_passed": validate_calibration_wizard_contract(),
+        "metrics": get_calibration_wizard_baseline_metrics(),
+    }
 
 
 # Module-level aliases for targets

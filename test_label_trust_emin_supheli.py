@@ -10,12 +10,53 @@ Tests for Work Package G: Emin (Güvenilir) vs Şüpheli Classification & Rich F
 
 import json
 from pathlib import Path
+import sys
 import tempfile
 import shutil
 import pytest
 
-from dataset_factory.label_trust import requeue_labeled_dataset_for_review, train_txt_boxes
+from PyQt6.QtWidgets import QApplication
+
+_app = QApplication.instance()
+if _app is None:
+    _app = QApplication(sys.argv)
+
+from dataset_factory.label_trust import (
+    _legacy_weak_from_txt,
+    _normalize_requeue_box,
+    requeue_labeled_dataset_for_review,
+    train_txt_boxes,
+)
 from dataset_factory.yolo_auto_labeler import YOLOAutoLabeler
+from ui.yolo_factory_dialog import YOLOFactoryDialog
+
+
+@pytest.fixture
+def factory_dialog(tmp_path: Path) -> YOLOFactoryDialog:
+    """YOLOFactoryDialog with its dataset dir redirected to tmp_path."""
+    dlg = YOLOFactoryDialog()
+    dlg._auto_confirm_dialogs = True
+    dlg._dataset_dir = lambda: tmp_path  # type: ignore[assignment]
+    (tmp_path / "review" / "train").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "labels" / "train").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "images" / "train").mkdir(parents=True, exist_ok=True)
+    return dlg
+
+
+def _filtered_stems(dlg: YOLOFactoryDialog, mode: str, class_id: int = -1, search: str = ""):
+    """Drive the REAL production filter: set mode/class/search on the dialog and
+    return the stems selected by YOLOFactoryDialog._filtered_review_indices()."""
+    if class_id >= 0:
+        idx = dlg.review_class_filter.findData(class_id)
+        assert idx >= 0, f"class filter has no entry for class_id={class_id}"
+        dlg.review_class_filter.setCurrentIndex(idx)
+    else:
+        idx_all = dlg.review_class_filter.findData(-1)
+        if idx_all >= 0:
+            dlg.review_class_filter.setCurrentIndex(idx_all)
+    dlg.review_search_edit.setText(search)
+    dlg.set_queue_filter_mode(mode)
+    return [dlg._review_items[i]["stem"] for i in dlg._filtered_review_indices()]
 
 
 @pytest.fixture
@@ -60,7 +101,16 @@ def test_yolo_auto_labeler_emin_vs_supheli():
 
 
 def test_requeue_labeled_dataset_separates_emin_and_supheli(temp_dataset_dir):
-    """Verify requeue_labeled_dataset_for_review segregates boxes into trusted (Emin) and weak (Şüpheli)."""
+    """Verify requeue separates boxes into trusted (Emin) and weak (Şüpheli).
+
+    §7 P0-8 requeue kararı: TXT-only kare requeue'da hand_label damgası
+    alır (diskteki 5-alanlı TXT satırı el etiketiyle ayırt edilemez) ve
+    damgalı kare korumalı sayılır — kare düzeyinde atlanır, review JSON
+    yazılmaz. Bu yüzden uçtan uca requeue artık bu kareyi kuyruğa almaz;
+    Emin/Şüpheli ayrımı damgasız kutuların doğrudan
+    _normalize_requeue_box geçişiyle denetlenir: ölçülmüş güven >= 0.85
+    trusted olur, kanıtsız kutu (0.60 / varsayılan 0.58) weak kalır.
+    """
     # Create an image and label txt in train
     img_path = temp_dataset_dir / "images" / "train" / "frame_001.jpg"
     img_path.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)  # Dummy JPEG header
@@ -69,8 +119,8 @@ def test_requeue_labeled_dataset_separates_emin_and_supheli(temp_dataset_dir):
     # Format: class cx cy w h [conf]
     lines = [
         "0 0.5 0.5 0.1 0.1 0.95",  # Emin (conf >= 0.85)
-        "1 0.3 0.3 0.1 0.1 0.60",  # Şüpheli (conf < 0.85)
-        "2 0.7 0.7 0.1 0.1",       # Default 0.58 unverified -> Şüpheli
+        "1 0.3 0.3 0.1 0.1 0.60",  # §7: kanıtsız -> weak
+        "2 0.7 0.7 0.1 0.1",       # §7: default 0.58 -> weak
     ]
     lbl_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -80,61 +130,50 @@ def test_requeue_labeled_dataset_separates_emin_and_supheli(temp_dataset_dir):
     )
 
     assert stats["ok"] is True
-    assert stats["samples"] >= 1
-    assert stats["boxes"] == 3
+    assert stats["samples"] == 0
+    assert stats["boxes"] == 0
+    assert stats["skipped_protected"] == 1
 
     rev_file = temp_dataset_dir / "review" / "train" / "frame_001.json"
-    assert rev_file.is_file()
-    payload = json.loads(rev_file.read_text(encoding="utf-8"))
+    assert not rev_file.is_file()
 
-    trusted = payload["trusted"]
-    weak = payload["weak"]
-
-    assert len(trusted) == 1  # class 0 (0.95)
-    assert len(weak) == 2     # class 1 (0.60) and class 2 (0.58 unverified)
-    assert all(b.get("trusted") is True and b.get("weak") is False for b in trusted)
+    # Emin/Şüpheli ayrımı damgasız kutularda korunur (§7: güven yalnızca
+    # ölçülmüş güven >= emin ile kazanılır, kanıtsız kutu weak kalır).
+    parsed = _legacy_weak_from_txt(lbl_path)
+    assert len(parsed) == 3
+    normalized = [
+        _normalize_requeue_box(dict(b), stem="frame_001", emin_threshold=0.85)
+        for b in parsed
+    ]
+    assert all(n is not None for n in normalized)
+    trusted = [n for n in normalized if n["trusted"] is True]
+    weak = [n for n in normalized if n["trusted"] is False]
+    assert len(trusted) == 1
+    assert len(weak) == 2
+    assert trusted[0]["confidence"] == 0.95
+    assert trusted[0]["weak"] is False
+    assert weak[0]["confidence"] == 0.60
+    assert weak[1]["confidence"] == 0.58
     assert all(b.get("trusted") is False and b.get("weak") is True for b in weak)
 
 
-def test_rich_filter_categorization():
-    """Verify queue items match the 6 rich filter categories: all, suspicious, confident, mixed, empty, unlabeled_and_suspicious."""
-    items = [
+def test_rich_filter_categorization(factory_dialog: YOLOFactoryDialog):
+    """Verify queue items match the 6 rich filter categories via the REAL
+    production filter (YOLOFactoryDialog._filtered_review_indices):
+    all, suspicious, confident, mixed, empty, unlabeled_and_suspicious."""
+    dlg = factory_dialog
+    dlg._review_items = [
         {"stem": "item_empty", "trusted": [], "weak": []},
-        {"stem": "item_suspicious", "trusted": [], "weak": [{"class_id": 0, "conf": 0.50}]},
-        {"stem": "item_confident", "trusted": [{"class_id": 1, "conf": 0.95}], "weak": []},
-        {"stem": "item_mixed", "trusted": [{"class_id": 2, "conf": 0.92}], "weak": [{"class_id": 3, "conf": 0.40}]},
+        {"stem": "item_suspicious", "trusted": [], "weak": [{"class_id": 0, "conf": 0.50, "confidence": 0.50}]},
+        {"stem": "item_confident", "trusted": [{"class_id": 1, "conf": 0.95, "confidence": 0.95}], "weak": []},
+        {"stem": "item_mixed", "trusted": [{"class_id": 2, "conf": 0.92, "confidence": 0.92}], "weak": [{"class_id": 3, "conf": 0.40, "confidence": 0.40}]},
     ]
 
-    def filter_items(mode, class_id=-1, search=""):
-        out = []
-        for it in items:
-            stem = it["stem"]
-            if search and search not in stem:
-                continue
-            all_b = it["trusted"] + it["weak"]
-            if class_id >= 0 and not any(b["class_id"] == class_id for b in all_b):
-                continue
-            n_t, n_w = len(it["trusted"]), len(it["weak"])
-            n_tot = n_t + n_w
-
-            if mode == "suspicious" and not (n_w > 0 and n_t == 0):
-                continue
-            if mode == "confident" and not (n_t > 0 and n_w == 0):
-                continue
-            if mode == "mixed" and not (n_t > 0 and n_w > 0):
-                continue
-            if mode == "empty" and n_tot > 0:
-                continue
-            if mode == "unlabeled_and_suspicious" and not (n_tot == 0 or n_w > 0):
-                continue
-            out.append(it["stem"])
-        return out
-
-    assert len(filter_items("all")) == 4
-    assert filter_items("empty") == ["item_empty"]
-    assert filter_items("suspicious") == ["item_suspicious"]
-    assert filter_items("confident") == ["item_confident"]
-    assert filter_items("mixed") == ["item_mixed"]
-    assert set(filter_items("unlabeled_and_suspicious")) == {"item_empty", "item_suspicious", "item_mixed"}
-    assert filter_items("all", class_id=2) == ["item_mixed"]
-    assert filter_items("all", search="confident") == ["item_confident"]
+    assert len(_filtered_stems(dlg, "all")) == 4
+    assert _filtered_stems(dlg, "empty") == ["item_empty"]
+    assert _filtered_stems(dlg, "suspicious") == ["item_suspicious"]
+    assert _filtered_stems(dlg, "confident") == ["item_confident"]
+    assert _filtered_stems(dlg, "mixed") == ["item_mixed"]
+    assert set(_filtered_stems(dlg, "unlabeled_and_suspicious")) == {"item_empty", "item_suspicious", "item_mixed"}
+    assert _filtered_stems(dlg, "all", class_id=2) == ["item_mixed"]
+    assert _filtered_stems(dlg, "all", search="confident") == ["item_confident"]

@@ -18,10 +18,13 @@ Combines:
 """
 
 from __future__ import annotations
+from version import __version__
 
 import logging
 import math
 import os
+import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -32,80 +35,48 @@ from config.materials_db import classify_3d_material_patch, is_rejected_non_mate
 from core.material_scanner import DetectedMaterial, MaterialScanner
 from core.minimap_scanner import MinimapScanner
 from core.vision import VisionEngine
+from dataset_factory.class_taxonomy import CANONICAL_LABELS_TR, CANONICAL_NAMES
+from dataset_factory.label_trust import CONF_EMIN
+# B1: the Stage B2 monster nameplate scan lives in exactly one place —
+# monster_diamond_detector (single copy). The labeler delegates to it and
+# only re-wraps the results in its own annotation contract below.
+from dataset_factory.monster_diamond_detector import get_monster_diamond_detector
+from dataset_factory.player_self_exclusion_guard import PlayerSelfExclusionGuard
 
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 12 Official Gatherion YOLO Classes (English & Turkish)
+# Canonical YOLO Classes — single authority is
+# dataset_factory.class_taxonomy.CANONICAL_NAMES (27 classes, 0..26).
+#
+# NOTE (F-0824, R60): this table USED to be the legacy 0..22 layout
+# (6=world_gather_crest, 7=f_gather_prompt, 8=e_floating_icon,
+# 18=hp_potion, 19=mp_potion, 20=target_hp_bar, 21=skill_slot,
+# 22=buff_scroll). It is now the canonical layout: crest / prompt /
+# floating icon all resolve to 13=skill_ui_prompt, hp_potion=22,
+# mp_potion=23, target_hp_bar=18, skill_slot_ready=20, buff_scroll=24,
+# and 6/7/8 are the 3D materials herb_edana / herb_lumina / ore_obsidian.
+# Every numeric class id used in this file follows the canonical layout;
+# legacy ids must never be reintroduced here.
 # ==============================================================================
-YOLO_CLASSES: Dict[int, str] = {
-    0: "herb_aria",
-    1: "herb_mela",
-    2: "herb_targena",
-    3: "ore_orichalcum",
-    4: "gem_crystal",
-    5: "tree_log",
-    6: "world_gather_crest",
-    7: "f_gather_prompt",
-    8: "e_floating_icon",
-    9: "minimap_sprout",
-    10: "monster_3d",
-    11: "minimap_monster_dot",
-    12: "world_material",
-    13: "skill_ui_prompt",
-    14: "obstacle",
-    15: "path_ground",
-    16: "player_hp_bar",
-    17: "player_mp_bar",
-    18: "hp_potion",
-    19: "mp_potion",
-    20: "target_hp_bar",
-    21: "skill_slot",
-    22: "buff_scroll",
-}
+YOLO_CLASSES: Dict[int, str] = dict(CANONICAL_NAMES)
 
-YOLO_CLASSES_TR: Dict[int, str] = {
-    0: "Aria / Mor Kristal Bitki",
-    1: "Mela / Kırmızı Meyveli Çalı",
-    2: "Targena / Azpha / Calendula Bitkisi",
-    3: "Orichalcum / Maden Cevheri",
-    4: "Sapphire / Ruby / Diamond Gem Taşı",
-    5: "Yggdrasil / Asvata Ağaç Kerestesi",
-    6: r"3B Beyaz Kanatlı Toplama Amblemi \Y/",
-    7: "[F Gather] Etkileşim Butonu",
-    8: "[E] / [F] Yüzen Kaynak Kutusu",
-    9: "Minimap 3 Yapraklı Filiz İkonu",
-    10: "3B Canavar & İsim Plakası - Negatif Sınıf",
-    11: "Minimap Yuvarlak Canavar Noktası • - Negatif Sınıf",
-    12: "Adı bilinmeyen dünya malzemesi",
-    13: "Skill / arayüz istemi (F ve E değil)",
-    14: "Engel",
-    15: "Yol / zemin",
-    16: "Oyuncu Can Barı (HP)",
-    17: "Oyuncu Mana Barı (MP)",
-    18: "Can İksiri (HP Potion)",
-    19: "Mana İksiri (MP Potion)",
-    20: "Hedef Can Barı (Target HP)",
-    21: "Skill Yuvası",
-    22: "Güçlendirme Parşömeni (Buff Scroll)",
-}
+YOLO_CLASSES_TR: Dict[int, str] = dict(CANONICAL_LABELS_TR)
 
-YOLO_NAME_TO_ID: Dict[str, int] = {name: cid for cid, name in YOLO_CLASSES.items()}
+YOLO_NAME_TO_ID: Dict[str, int] = {}
+for _cid, _name in YOLO_CLASSES.items():
+    if _name in YOLO_NAME_TO_ID:
+        raise ValueError(f"duplicate YOLO class name {_name!r} for ids {YOLO_NAME_TO_ID[_name]} and {_cid}")
+    YOLO_NAME_TO_ID[_name] = _cid
+if sorted(YOLO_CLASSES) != list(range(len(YOLO_CLASSES))):
+    raise ValueError("YOLO_CLASSES ids must be contiguous starting at 0")
 
-try:
-    from dataset_factory.class_taxonomy import dataset_class_names as _taxonomy_class_names
-    from dataset_factory.class_taxonomy import dataset_labels_tr as _taxonomy_labels_tr
-
-    for _cid, _name in _taxonomy_class_names().items():
-        if int(_cid) >= 16 and int(_cid) not in YOLO_CLASSES:
-            YOLO_CLASSES[int(_cid)] = _name
-            YOLO_CLASSES_TR[int(_cid)] = _taxonomy_labels_tr().get(int(_cid), _name)
-    YOLO_NAME_TO_ID.clear()
-    YOLO_NAME_TO_ID.update({name: cid for cid, name in YOLO_CLASSES.items()})
-except Exception:
-    pass
-
-POSITIVE_CLASS_IDS: Sequence[int] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22)
+# NOTE (F-0824, R60): YOLO_CLASSES is now CANONICAL_NAMES itself, so no
+# import-time merge of taxonomy ids can ever inject a second id for an
+# existing name (the old D43 failure mode: mp_potion 19->23, buff_scroll
+# 22->24). Canonical names are honoured by
+# map_material_name_to_yolo_class_id, which now returns canonical ids.
+POSITIVE_CLASS_IDS: Sequence[int] = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26)
 NEGATIVE_CLASS_IDS: Sequence[int] = (10, 11, 14)
 
 UNVERIFIED_HEURISTIC_SOURCES = {
@@ -122,6 +93,7 @@ UNVERIFIED_HEURISTIC_SOURCES = {
     "legacy_auto",
     "center_anchor_fallback",
     "gather_material_hint",
+    "extra_detections",
 }
 
 
@@ -130,10 +102,8 @@ def is_path_learning_stem(stem: str) -> bool:
     s = str(stem or "").strip().lower()
     return (
         s.startswith("learn_paths_")
-        or "learn_paths" in s
         or "learn_obstacles" in s
         or "_path_ground" in s
-        or "_path_" in s
         or s.startswith("path_")
     )
 
@@ -156,50 +126,104 @@ YOLO_CLASS_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
     3: (40, 175, 255),   # ore_orichalcum: warm amber/copper
     4: (255, 215, 45),   # gem_crystal: cyan/sapphire blue
     5: (55, 135, 195),   # tree_log: woody bronze
-    6: (255, 255, 110),  # world_gather_crest: bright sky-cyan
-    7: (85, 255, 85),    # f_gather_prompt: lime green
-    8: (65, 240, 200),   # e_floating_icon: mint/teal
+    6: (247, 85, 168),   # herb_edana: purple (canonical palette)
+    7: (8, 179, 234),    # herb_lumina: golden yellow (canonical palette)
+    8: (241, 102, 99),   # ore_obsidian: dark indigo (canonical palette)
     9: (120, 255, 120),  # minimap_sprout: bright green
     10: (35, 35, 235),   # monster_3d: danger crimson red
     11: (70, 95, 250),   # minimap_monster_dot: orange-red negative dot
     12: (180, 180, 180),
-    13: (200, 160, 255),
+    13: (200, 160, 255),  # skill_ui_prompt (incl. crest / gather prompt / floating icon)
     14: (40, 90, 200),
     15: (160, 200, 120),
     16: (60, 60, 230),
     17: (230, 160, 50),
-    18: (40, 40, 240),    # hp_potion: vibrant red
-    19: (240, 160, 40),   # mp_potion: vibrant blue/cyan
-    20: (30, 30, 220),    # target_hp_bar: target health bar
-    21: (200, 140, 240),  # skill_slot: slot outline
-    22: (80, 200, 230),   # buff_scroll: golden parchment scroll
+    18: (30, 30, 220),    # target_hp_bar: target health bar
+    19: (191, 212, 45),   # skill_bar: teal (canonical palette)
+    20: (200, 140, 240),  # skill_slot_ready: slot outline
+    21: (184, 163, 148),  # skill_slot_cooldown: slate (canonical palette)
+    22: (40, 40, 240),    # hp_potion: vibrant red
+    23: (240, 160, 40),   # mp_potion: vibrant blue/cyan
+    24: (80, 200, 230),   # buff_scroll: golden parchment scroll
+    25: (8, 179, 234),    # kinah: shiny gold (canonical palette)
+    26: (255, 210, 0),    # player_character: electric cyan (canonical palette)
 }
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    """Plain-Python clamp for scalar floats.
+
+    D60: ``np.clip`` on a Python scalar builds a 0-d array per call, which
+    dominates ``_pixel_xywh_to_yolo_norm`` (16 clips per box) and
+    ``format_yolo_txt``. ``min``/``max`` give identical results for finite
+    floats (NaN propagates unchanged, infinities clamp to the bound) at a
+    fraction of the cost — D60 bench on this VM (best of 3, 20k calls of
+    ``_pixel_xywh_to_yolo_norm``): ~15.6s -> ~0.5s.
+    """
+    return lo if value < lo else hi if value > hi else value
 
 
 def map_material_name_to_yolo_class_id(material_name: str, default_id: int = 3) -> int:
     """
-    Map any canonical or raw Aion 2 material name / category string to one of the
-    6 3D resource mesh YOLO class IDs (`0..5`), or UI/monster classes (`6..11`) if specified.
+    Map any canonical or raw Aion 2 material name / category string to its
+    canonical YOLO class ID (F-0824: single authority CANONICAL_NAMES,
+    0..26). 3D resource meshes are `0..8` + `12`, UI/monster classes are
+    `9..11` / `13..26`.
+
+    P1-14 (F4): only a NAME match for a genuine canonical material asserts
+    a specific class. 21 ores are not orichalcum, 36 herbs are not
+    targena, odyle/aether is not a gem: "Iron Ore", "Lura", "Odyle",
+    "Gold Ore", ... resolve to NO specific class and fall through to the
+    caller's default (the generic world-material bucket 12 when
+    default_id is 3 — the labeler's deliberate "unidentified mesh" class,
+    never a guessed ore/herb). Generic categories keep their generic
+    class: gemstones -> 4 gem_crystal, logs/trees -> 5 tree_log.
     """
     if not material_name or not isinstance(material_name, str):
-        return int(default_id)
+        # Empty input names no material: never fabricate the default ore (3).
+        # A non-3 default (e.g. the -1 "no hint" sentinel) is preserved.
+        return 12 if int(default_id) == 3 else int(default_id)
 
     norm = material_name.strip().lower()
     if not norm:
-        return int(default_id)
+        return 12 if int(default_id) == 3 else int(default_id)
 
+    return _map_material_name_to_yolo_class_id_cached(norm, int(default_id))
+
+
+@lru_cache(maxsize=1024)
+def _map_material_name_to_yolo_class_id_cached(norm: str, default_id: int) -> int:
+    """Memoized core of :func:`map_material_name_to_yolo_class_id`.
+
+    D60: the uncached version re-imported ``dataset_factory.class_taxonomy``
+    and re-ran ~30 substring scans on EVERY call, although dataset labeling
+    passes the same small set of material names thousands of times
+    (per crest, per floating icon, per salient patch, per extra detection).
+    Memoizing on the normalized ``(norm, default_id)`` pair is safe: every
+    branch below is a pure function of those two inputs and the canonical
+    taxonomy it consults is static module data (no caller mutates it).
+    Identical outputs, verified by ``tests/test_yolo_auto_labeler_d60_dev.py``.
+    """
     # Direct match against YOLO_CLASSES names
     if norm in YOLO_NAME_TO_ID:
         return YOLO_NAME_TO_ID[norm]
 
     try:
-        from dataset_factory.class_taxonomy import class_id_for_material_text
+        from dataset_factory.class_taxonomy import (
+            class_id_for_material_text,
+            dataset_class_names as _canonical_class_names,
+        )
 
         specific = class_id_for_material_text(norm)
     except Exception:
         specific = None
     if specific is not None:
-        return int(specific)
+        # F-0824: this file's table IS the canonical table now, so a
+        # canonical id is always correct here (e.g. "crest" -> 13
+        # skill_ui_prompt, "hp_potion" -> 22, "world_material" -> 12).
+        if int(specific) in YOLO_CLASSES:
+            return int(specific)
+        specific = None
 
     # Negative / monster keywords
     if any(k in norm for k in ("monster_dot", "minimap_monster", "yuvarlak canavar")):
@@ -209,55 +233,55 @@ def map_material_name_to_yolo_class_id(material_name: str, default_id: int = 3) 
 
     # UI / Icon / HUD classes
     if "buff_scroll" in norm or "scroll" in norm or "parşömen" in norm or "parcsomen" in norm:
-        return 22
+        return 24
     if "hp_potion" in norm or "can iksiri" in norm or ("potion" in norm and "hp" in norm):
-        return 18
+        return 22
     if "mp_potion" in norm or "mana iksiri" in norm or ("potion" in norm and "mp" in norm):
-        return 19
+        return 23
     if "target_hp_bar" in norm or "target_hp" in norm:
-        return 20
-    if "skill_slot" in norm or "skill_bar" in norm:
+        return 18
+    if "skill_slot_cooldown" in norm or "skill_cd" in norm:
         return 21
+    if "skill_slot" in norm:
+        return 20
+    if "skill_bar" in norm:
+        return 19
     if "player_hp_bar" in norm or "player_hp" in norm:
         return 16
     if "player_mp_bar" in norm or "player_mp" in norm:
         return 17
     if "crest" in norm or "amblem" in norm:
-        return 6
+        return 13
     if "f_gather" in norm or "gather_prompt" in norm or "f gather" in norm:
-        return 7
+        return 13
     if "floating" in norm or "e_floating" in norm or "e_gather" in norm:
-        return 8
+        return 13
     if "sprout" in norm or "filiz" in norm or norm == "minimap":
         return 9
 
-    # 3D Mesh classes (0..5)
-    if "aria" in norm or "pella" in norm or "valerian" in norm or "amilis" in norm:
+    # 3D Mesh classes (0..8, 12) — canonical ids.
+    # P1-14 (F4): ONLY the canonical material's own name asserts its class.
+    # "pella"/"valerian"/"amilis" are distinct herbs, not aria; bare
+    # "berry"/"meyve"/"çalı" is not mela; "lura"/"miana"/.../"herb"/"bitki"
+    # are not targena (36 herbs are not targena); "odyle"/"aether"/
+    # "lunime" are not gems; "iron"/"copper"/"silver"/"gold"/.../"ore" are
+    # not orichalcum (21 ores are not orichalcum). Those names fall through
+    # to the caller's default instead of a false specific class.
+    # v19 F4: "branch" was removed from the tree keywords below — the only
+    # catalog item containing it is "Withered Branch", an Alchemy herb
+    # (not a log), which the keyword wrongly mapped to 5 (tree_log). All
+    # 29 Logs & Trees specs still match via "log"/"wood"/species names.
+    if "edana" in norm:
+        return 6
+    if "lumina" in norm:
+        return 7
+    if "obsidian" in norm:
+        return 8
+    if "aria" in norm:
         return 0
-    if "mela" in norm or "berry" in norm or "meyve" in norm or "çalı" in norm:
+    if "mela" in norm:
         return 1
-    if any(
-        k in norm
-        for k in (
-            "targena",
-            "azpha",
-            "calendula",
-            "lura",
-            "gravi",
-            "leaf",
-            "miana",
-            "rina",
-            "mandragora",
-            "atri",
-            "kalgelly",
-            "lolo",
-            "marle",
-            "caprauna",
-            "herb",
-            "bitki",
-            "ot",
-        )
-    ):
+    if any(k in norm for k in ("targena", "azpha", "calendula")):
         return 2
     if any(
         k in norm
@@ -275,9 +299,6 @@ def map_material_name_to_yolo_class_id(material_name: str, default_id: int = 3) 
             "opal",
             "emerald",
             "amethyst",
-            "odyle",
-            "aether",
-            "lunime",
             "kristal",
         )
     ):
@@ -290,7 +311,6 @@ def map_material_name_to_yolo_class_id(material_name: str, default_id: int = 3) 
             "log",
             "tree",
             "wood",
-            "branch",
             "acacia",
             "cypress",
             "elm",
@@ -302,29 +322,18 @@ def map_material_name_to_yolo_class_id(material_name: str, default_id: int = 3) 
         )
     ):
         return 5
-    if any(
-        k in norm
-        for k in (
-            "orichalcum",
-            "iron",
-            "titanium",
-            "adamantium",
-            "copper",
-            "silver",
-            "gold",
-            "platinum",
-            "mithril",
-            "catalium",
-            "ore",
-            "maden",
-            "cevher",
-        )
-    ):
+    if "orichalcum" in norm:
         return 3
 
-    if any(k in norm for k in ("gatherable plant", "gatherable material", "world_material")):
+    # "world_material" is the taxonomy-sanctioned generic bucket (12).
+    # Bare "gatherable plant"/"gatherable material" name NO material and
+    # must not be forced onto crystal_blood (12) either — they fall
+    # through to the caller's default.
+    if "world_material" in norm:
         return 12
-    if any(k in norm for k in ("skill_ui", "skill", "cooldown", "vitality")):
+    if "cooldown" in norm or "skill_cd" in norm:
+        return 21
+    if any(k in norm for k in ("skill_ui", "skill", "vitality")):
         return 13
     if any(k in norm for k in ("obstacle", "engel", "cliff")):
         return 14
@@ -342,12 +351,13 @@ class YOLOAutoLabeler:
     Multi-Class 3D + Minimap Automatic Bounding Box & YOLO `.txt` Labeler.
 
     Automatically detects and generates normalized `[0.000000, 1.000000]` YOLO bounding boxes for:
-    - `0..5`: 3D resource meshes (`herb_aria`, `herb_mela`, `herb_targena`, `ore_orichalcum`,
-              `gem_crystal`, `tree_log`) segmented below every `world_gather_crest` (`x-36..x+36, y+18..y+115`)
+    - `0..8`: 3D resource meshes (`herb_aria`, `herb_mela`, `herb_targena`, `ore_orichalcum`,
+              `gem_crystal`, `tree_log`, `herb_edana`, `herb_lumina`, `ore_obsidian`)
+              segmented below every `world_gather_crest` (`x-36..x+36, y+18..y+115`)
               and around floating `[E]`/`[F]` resource boxes.
-    - `6`: `world_gather_crest` (`3B Beyaz Kanatlı Toplama Amblemi \Y/`)
-    - `7`: `f_gather_prompt` (`[F Gather] Etkileşim Butonu`)
-    - `8`: `e_floating_icon` (`[E] / [F] Yüzen Kaynak Kutusu`)
+    - `13`: `skill_ui_prompt` — covers `world_gather_crest` (`3B Beyaz Kanatlı Toplama Amblemi \Y/`),
+              `f_gather_prompt` (`[F Gather] Etkileşim Butonu`) and `e_floating_icon`
+              (`[E] / [F] Yüzen Kaynak Kutusu`) (canonical remap, F-0824)
     - `9`: `minimap_sprout` (`Minimap 3 Yapraklı Filiz İkonu`)
     - `10`: `monster_3d` (`3B Canavar & İsim Plakası - Negatif Sınıf`)
     - `11`: `minimap_monster_dot` (`Minimap Yuvarlak Canavar Noktası • - Negatif Sınıf`)
@@ -393,6 +403,7 @@ class YOLOAutoLabeler:
         prompt_threshold: float = 0.68,
         floating_icon_threshold: float = 0.65,
         exemplar_memory: Optional[Any] = None,
+        yolo_detector: Optional[Any] = None,
     ) -> None:
         self.vision_engine: VisionEngine = (
             vision_engine if vision_engine is not None else VisionEngine()
@@ -403,17 +414,44 @@ class YOLOAutoLabeler:
         self.minimap_scanner: MinimapScanner = (
             minimap_scanner if minimap_scanner is not None else MinimapScanner()
         )
+        # v20-onnx-reload: MaterialScanner.get_yolo_detector() otherwise
+        # lazy-builds a private ONNXYolo3DDetector (extra CUDA session).
+        if yolo_detector is not None and hasattr(
+            self.material_scanner, "set_yolo_detector"
+        ):
+            try:
+                self.material_scanner.set_yolo_detector(yolo_detector)
+            except Exception as exc:
+                logger.debug("YOLOAutoLabeler shared detector wire skipped: %s", exc)
         self.crest_threshold: float = float(crest_threshold)
         self.prompt_threshold: float = float(prompt_threshold)
         self.floating_icon_threshold: float = float(floating_icon_threshold)
-        if exemplar_memory is not None:
+        # S-2501: oyuncu/binek merkez-koruma guard'ı — etiket yazımına
+        # gitmeden önce kanıtsız merkez 3D kutuları düşürür. Kurulamazsa
+        # None kalır ve _apply_self_exclusion_guard filtresiz geçirir.
+        try:
+            self._self_exclusion_guard = PlayerSelfExclusionGuard()
+        except Exception as exc:
+            logger.warning("PlayerSelfExclusionGuard kurulamadı, merkez koruması kapalı: %s", exc)
+            self._self_exclusion_guard = None
+        if exemplar_memory is False:
+            # Explicit opt-out (used by tests): refinement disabled, not a
+            # broken memory object. Previously False was stored as-is and
+            # every auto_label_frame call logged a spurious
+            # "'bool' object has no attribute 'refine_annotations'" warning.
+            self.exemplar_memory = None
+        elif exemplar_memory is not None:
             self.exemplar_memory = exemplar_memory
         else:
             try:
                 from dataset_factory.exemplar_memory import get_exemplar_memory
 
                 self.exemplar_memory = get_exemplar_memory()
-            except Exception:
+            except Exception as exc:
+                # Silent fallback used to hide a broken exemplar memory:
+                # log it, the labeler keeps working without exemplar
+                # correction (sweep slice 14 B-13).
+                logger.warning("Exemplar memory yüklenemedi, exemplar düzeltmesi kapalı: %s", exc)
                 self.exemplar_memory = None
 
     # ------------------------------------------------------------------
@@ -458,31 +496,31 @@ class YOLOAutoLabeler:
         fw = float(max(1, img_w))
         fh = float(max(1, img_h))
 
-        x1 = float(np.clip(x, 0.0, fw - 1.0))
-        y1 = float(np.clip(y, 0.0, fh - 1.0))
-        x2 = float(np.clip(x + max(1.0, w), x1 + 1.0, fw))
-        y2 = float(np.clip(y + max(1.0, h), y1 + 1.0, fh))
+        x1 = _clamp(x, 0.0, fw - 1.0)
+        y1 = _clamp(y, 0.0, fh - 1.0)
+        x2 = _clamp(x + max(1.0, w), x1 + 1.0, fw)
+        y2 = _clamp(y + max(1.0, h), y1 + 1.0, fh)
 
         bw = max(1.0, x2 - x1)
         bh = max(1.0, y2 - y1)
         cx = x1 + 0.5 * bw
         cy = y1 + 0.5 * bh
 
-        cx_norm = float(np.clip(cx / fw, 0.0, 1.0))
-        cy_norm = float(np.clip(cy / fh, 0.0, 1.0))
-        w_norm = float(np.clip(bw / fw, 0.0, 1.0))
-        h_norm = float(np.clip(bh / fh, 0.0, 1.0))
+        cx_norm = _clamp(cx / fw, 0.0, 1.0)
+        cy_norm = _clamp(cy / fh, 0.0, 1.0)
+        w_norm = _clamp(bw / fw, 0.0, 1.0)
+        h_norm = _clamp(bh / fh, 0.0, 1.0)
 
         # Guarantee [cx ± w/2, cy ± h/2] stays within [0.0, 1.0]
-        nx1 = float(np.clip(cx_norm - 0.5 * w_norm, 0.0, 1.0))
-        ny1 = float(np.clip(cy_norm - 0.5 * h_norm, 0.0, 1.0))
-        nx2 = float(np.clip(cx_norm + 0.5 * w_norm, 0.0, 1.0))
-        ny2 = float(np.clip(cy_norm + 0.5 * h_norm, 0.0, 1.0))
+        nx1 = _clamp(cx_norm - 0.5 * w_norm, 0.0, 1.0)
+        ny1 = _clamp(cy_norm - 0.5 * h_norm, 0.0, 1.0)
+        nx2 = _clamp(cx_norm + 0.5 * w_norm, 0.0, 1.0)
+        ny2 = _clamp(cy_norm + 0.5 * h_norm, 0.0, 1.0)
 
-        w_norm = round(float(np.clip(nx2 - nx1, 0.0005, 1.0)), 6)
-        h_norm = round(float(np.clip(ny2 - ny1, 0.0005, 1.0)), 6)
-        cx_norm = round(float(np.clip(nx1 + 0.5 * w_norm, 0.0, 1.0)), 6)
-        cy_norm = round(float(np.clip(ny1 + 0.5 * h_norm, 0.0, 1.0)), 6)
+        w_norm = round(_clamp(nx2 - nx1, 0.0005, 1.0), 6)
+        h_norm = round(_clamp(ny2 - ny1, 0.0005, 1.0), 6)
+        cx_norm = round(_clamp(nx1 + 0.5 * w_norm, 0.0, 1.0), 6)
+        cy_norm = round(_clamp(ny1 + 0.5 * h_norm, 0.0, 1.0), 6)
 
         px_xywh = (int(round(x1)), int(round(y1)), int(round(bw)), int(round(bh)))
         px_xyxy = (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)))
@@ -497,29 +535,41 @@ class YOLOAutoLabeler:
         h: float,
         img_w: int,
         img_h: int,
-        confidence: float = 0.90,
+        confidence: float = 0.50,
         source: str = "auto_labeler",
         material_name: str = "",
         hand_label: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Construct a standardized YOLO annotation dictionary with normalized and pixel bounds."""
+        """Construct a standardized YOLO annotation dictionary with normalized and pixel bounds.
+
+        Unknown class ids are rejected (ValueError) instead of silently
+        relabelled as ore (3) — a wrong class in training data is worse
+        than a dropped box. Callers must validate ids first.
+        """
         cid = int(class_id)
         if cid not in YOLO_CLASSES:
-            cid = 3
+            raise ValueError(f"unknown YOLO class_id {cid!r}; valid ids are 0..{len(YOLO_CLASSES) - 1}")
 
         cx_n, cy_n, w_n, h_n, px_xywh, px_xyxy = self._pixel_xywh_to_yolo_norm(
             x, y, w, h, img_w, img_h
         )
         cls_name = YOLO_CLASSES[cid]
         cls_name_tr = YOLO_CLASSES_TR[cid]
-        conf_clamped = round(float(np.clip(confidence, 0.01, 1.0)), 4)
+        conf_clamped = round(_clamp(float(confidence), 0.01, 1.0), 4)
+        # S112 (v19/P3-8): eski `"hand" in source` ham alt-dizeydi —
+        # "handcrafted_heuristic" gibi bir kaynak da el etiketi
+        # sayılır, kutu güvenilir (emin) damgası alırdı (P0-8
+        # hassas: el etiketi asla kuyruğa dönmez). Artık yalnızca
+        # "hand" ayrı bir belirteçse sayılır: hand_label,
+        # hand_label_txt evet; handcrafted hayır.
+        src_tokens = re.split(r"[^a-z0-9]+", str(source).lower())
         is_hand = bool(
             hand_label
             or kwargs.get("is_hand_label")
             or kwargs.get("human_approved")
             or kwargs.get("approved")
-            or "hand" in str(source).lower()
+            or "hand" in src_tokens
         )
         src_str = str(source).strip().lower()
         is_heuristic = any(src_str == s or src_str.startswith(s) for s in UNVERIFIED_HEURISTIC_SOURCES)
@@ -535,13 +585,13 @@ class YOLOAutoLabeler:
             is_emin = False
         else:
             is_emin = bool(
-                conf_clamped >= 0.85
+                conf_clamped >= CONF_EMIN
                 and (
                     source.startswith("vision_3d_crest")
+                    or source.startswith("material_scanner_3d_crest")
                     or "gather_prompt" in source
                     or "floating" in source
                     or "exemplar" in source
-                    or "target_hp_bar" in source
                     or "minimap" in source
                     or "monster" in source
                 )
@@ -576,23 +626,37 @@ class YOLOAutoLabeler:
         box_a: Sequence[Union[int, float]],
         box_b: Sequence[Union[int, float]],
     ) -> float:
-        """Compute Intersection-over-Union (IoU) between two `(x1, y1, x2, y2)` pixel boxes."""
-        ax1, ay1, ax2, ay2 = float(box_a[0]), float(box_a[1]), float(box_a[2]), float(box_a[3])
-        bx1, by1, bx2, by2 = float(box_b[0]), float(box_b[1]), float(box_b[2]), float(box_b[3])
+        """Compute Intersection-over-Union (IoU) between two `(x1, y1, x2, y2)` pixel boxes.
 
-        ix1 = max(ax1, bx1)
-        iy1 = max(ay1, by1)
-        ix2 = min(ax2, bx2)
-        iy2 = min(ay2, by2)
+        D60: the old body coerced every coordinate through ``float()`` and
+        ``max(0.0, ...)`` per call; this is the inner loop of
+        ``_deduplicate_annotations`` (one call per same-class pair), so the
+        coercions dominated NMS time (D60 bench on this VM, best of 3,
+        200k calls: ~0.90s -> ~0.41s).
+        Plain arithmetic on the inputs gives bit-identical results for
+        int/float pixel boxes (exact for coords < 2**53); the final
+        ``float(...)`` keeps the return type a plain ``float``.
+        """
+        ax1, ay1, ax2, ay2 = box_a[0], box_a[1], box_a[2], box_a[3]
+        bx1, by1, bx2, by2 = box_b[0], box_b[1], box_b[2], box_b[3]
 
-        iw = max(0.0, ix2 - ix1)
-        ih = max(0.0, iy2 - iy1)
-        inter = iw * ih
-        if inter <= 0.0:
+        ix1 = ax1 if ax1 > bx1 else bx1
+        iy1 = ay1 if ay1 > by1 else by1
+        ix2 = ax2 if ax2 < bx2 else bx2
+        iy2 = ay2 if ay2 < by2 else by2
+
+        iw = ix2 - ix1
+        ih = iy2 - iy1
+        if iw <= 0 or ih <= 0:
             return 0.0
+        inter = iw * ih
 
-        area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
-        area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        area_b = (bx2 - bx1) * (by2 - by1)
+        if area_a < 1.0:
+            area_a = 1.0
+        if area_b < 1.0:
+            area_b = 1.0
         return float(inter / (area_a + area_b - inter + 1e-6))
 
     def _deduplicate_annotations(
@@ -612,6 +676,12 @@ class YOLOAutoLabeler:
             key=lambda a: (int(a["class_id"]), -float(a.get("confidence", 0.0))),
         )
         kept: List[Dict[str, Any]] = []
+        # D60: duplicates can only occur within the same class, so compare a
+        # candidate only against the kept boxes of ITS class instead of
+        # scanning the whole kept list (O(n^2) over all classes). The kept
+        # list itself is preserved unchanged so the returned order is
+        # identical to before; only the comparison set is narrowed.
+        kept_by_class: Dict[int, List[Dict[str, Any]]] = {}
 
         for cand in ordered:
             cid = int(cand["class_id"])
@@ -620,24 +690,26 @@ class YOLOAutoLabeler:
             c_cy = 0.5 * (c_xyxy[1] + c_xyxy[3])
 
             duplicate = False
-            for existing in kept:
-                if int(existing["class_id"]) != cid:
-                    continue
+            for existing in kept_by_class.get(cid, ()):
                 e_xyxy = existing["bbox_xyxy"]
                 iou = self._compute_iou_xyxy(c_xyxy, e_xyxy)
                 if iou >= iou_threshold:
                     duplicate = True
                     break
-                # Also merge if centers are extremely close for the same class
+                # Also merge if centers are extremely close for the same class.
+                # Factor 0.35 (not 0.65): two distinct nearby objects of the
+                # same class (e.g. adjacent sprouts/monster dots) must not be
+                # collapsed into one box just because their centers are near.
                 e_cx = 0.5 * (e_xyxy[0] + e_xyxy[2])
                 e_cy = 0.5 * (e_xyxy[1] + e_xyxy[3])
-                min_dim = max(8.0, min(c_xyxy[2] - c_xyxy[0], c_xyxy[3] - c_xyxy[1]) * 0.65)
+                min_dim = max(8.0, min(c_xyxy[2] - c_xyxy[0], c_xyxy[3] - c_xyxy[1]) * 0.35)
                 if math.hypot(c_cx - e_cx, c_cy - e_cy) <= min_dim:
                     duplicate = True
                     break
 
             if not duplicate:
                 kept.append(cand)
+                kept_by_class.setdefault(cid, []).append(cand)
 
         return kept
 
@@ -691,8 +763,12 @@ class YOLOAutoLabeler:
             canonical_crop if canonical_crop.size > 0 else extended_crop,
             label_width_px=int(crest_bbox[2]),
         )
-        detected_mat_name = str(patch_info.get("name", "Orichalcum Ore"))
-        patch_conf = float(patch_info.get("confidence", 0.85))
+        # Never fabricate a material name when the classifier stays silent:
+        # an unknown mesh is "world_material" (12), not a made-up ore.
+        detected_mat_name = str(patch_info.get("name") or "")
+        if detected_mat_name and is_rejected_non_material(detected_mat_name):
+            detected_mat_name = ""
+        patch_conf = float(patch_info.get("confidence", 0.50))
 
         # If caller or MaterialScanner provided a specific material name, honor it when consistent
         if hint_material_name and not is_rejected_non_material(hint_material_name):
@@ -715,7 +791,28 @@ class YOLOAutoLabeler:
                 else:
                     mesh_class_id = named
         else:
-            mesh_class_id = map_material_name_to_yolo_class_id(detected_mat_name, default_id=3)
+            if not detected_mat_name:
+                # Classifier said nothing and there is no hint: generic
+                # world material (12), never a guessed ore/herb class.
+                mesh_class_id = 12
+                detected_mat_name = "world_material"
+            else:
+                mesh_class_id = map_material_name_to_yolo_class_id(detected_mat_name, default_id=3)
+                if mesh_class_id == 3 and not detected_mat_name:
+                    mesh_class_id = 12
+
+        if not detected_mat_name:
+            # Classifier silent: a fallback to ore (3) through any branch
+            # above would be a fabricated label — generic material instead.
+            if mesh_class_id == 3:
+                mesh_class_id = 12
+            detected_mat_name = "world_material"
+
+        # S-6002: an unidentified mesh (world_material, 12) never claims
+        # the classifier's default confidence — same 0.50 cap as the
+        # floating-icon branch, so it cannot outrank real boxes in NMS.
+        if mesh_class_id == 12 and detected_mat_name == "world_material":
+            patch_conf = min(patch_conf, 0.50)
 
         # Refine 3D mesh bounding box via HSV saturation/value contour segmentation
         roi_hsv = hsv[ext_y1:ext_y2, ext_x1:ext_x2]
@@ -757,14 +854,14 @@ class YOLOAutoLabeler:
             h=rh,
             img_w=img_w,
             img_h=img_h,
-            confidence=float(np.clip(patch_conf, 0.05, 0.99)),
+            confidence=_clamp(float(patch_conf), 0.05, 0.99),
             source="3d_mesh_below_crest",
             material_name=detected_mat_name,
         )
 
     @staticmethod
     def _build_class_hsv_mesh_mask(roi_hsv: np.ndarray, mesh_class_id: int) -> np.ndarray:
-        """Build an HSV foreground segmentation mask tailored to the 3D resource class (`0..5`)."""
+        """Build an HSV foreground segmentation mask tailored to the 3D resource class (`0..8, 12`)."""
         if mesh_class_id == 0:  # herb_aria: purple/violet crystal petals
             mask = cv2.inRange(roi_hsv, np.array([120, 55, 65]), np.array([168, 255, 255]))
         elif mesh_class_id == 1:  # herb_mela: red/coral berries + green bush foliage
@@ -787,6 +884,12 @@ class YOLOAutoLabeler:
             bark = cv2.inRange(roi_hsv, np.array([8, 45, 35]), np.array([23, 175, 155]))
             canopy = cv2.inRange(roi_hsv, np.array([30, 50, 45]), np.array([78, 255, 235]))
             mask = cv2.bitwise_or(bark, canopy)
+        elif mesh_class_id == 6:  # herb_edana: purple/pink petals (like aria)
+            mask = cv2.inRange(roi_hsv, np.array([125, 55, 65]), np.array([175, 255, 255]))
+        elif mesh_class_id == 7:  # herb_lumina: golden-yellow glow
+            mask = cv2.inRange(roi_hsv, np.array([18, 90, 120]), np.array([38, 255, 255]))
+        elif mesh_class_id == 8:  # ore_obsidian: dark crystalline rock
+            mask = cv2.inRange(roi_hsv, np.array([0, 0, 22]), np.array([180, 65, 95]))
         else:  # 3: ore_orichalcum (metallic copper/amber/teal vein on dark rock)
             warm_vein = cv2.inRange(roi_hsv, np.array([5, 65, 55]), np.array([26, 245, 245]))
             teal_vein = cv2.inRange(roi_hsv, np.array([72, 45, 65]), np.array([98, 220, 235]))
@@ -867,9 +970,9 @@ class YOLOAutoLabeler:
     ) -> List[Dict[str, Any]]:
         """
         Detect 3D monster nameplates, bodies, and hostile HP bars (`class_id = 10: monster_3d`)
-        and target HP bars (`class_id = 20: target_hp_bar`), such as:
+        and target HP bars (`class_id = 18: target_hp_bar`), such as:
         - Hostile red monster HP bars / nameplates in 3D viewport (Hue 0..10 | 168..180, Sat >= 125, Val >= 115).
-        - Top boss / target enemy health bar (0.02*H..0.12*H, 0.30*W..0.70*W) -> class_id 20: target_hp_bar.
+        - Top boss / target enemy health bar (0.02*H..0.12*H, 0.30*W..0.70*W) -> class_id 18: target_hp_bar.
         - Targeted monsters with cyan diamond bracket tips + yellow text + green/red health bar +
           red '4' agro badge (e.g. `< Yellow-Maned Zaif >`).
         - Untargeted yellow/olive monster nameplates in the 3D world (e.g. `Highland Odyle Sparkie`).
@@ -913,7 +1016,11 @@ class YOLOAutoLabeler:
                 if aspect >= 3.5 and min_tw <= tw <= max_tw and 4 <= th_b <= int(32 * scale_y):
                     abs_tx = top_x1 + tx
                     abs_ty = top_y1 + ty
-                    target_bar_cid = YOLO_NAME_TO_ID.get("target_hp_bar", 20)
+                    target_bar_cid = YOLO_NAME_TO_ID.get("target_hp_bar", 18)
+                    # S-2201: a red-contour bar passing the aspect/size gates
+                    # is NOT a directly segmented bar — same treatment as the
+                    # F-0909 extrapolated monster body box: never
+                    # high-confidence / trusted (conf 0.55, weak=True).
                     monsters.append(
                         self._make_annotation(
                             class_id=target_bar_cid,
@@ -923,9 +1030,11 @@ class YOLOAutoLabeler:
                             h=th_b,
                             img_w=img_w,
                             img_h=img_h,
-                            confidence=0.92,
+                            confidence=0.55,
                             source="target_hp_bar_scanner",
                             material_name="target_hp_bar",
+                            trusted=False,
+                            weak=True,
                         )
                     )
 
@@ -954,6 +1063,9 @@ class YOLOAutoLabeler:
             aspect = float(rcw) / float(max(1, rch))
             if aspect < 3.2:
                 continue
+            # Body height is only an ESTIMATE extrapolated from the HP-bar
+            # width (the body itself is not segmented here), so this box is
+            # never high-confidence / trusted: conf 0.55, weak=True.
             m_x = max(0, rx - int(round(12 * scale_x)))
             m_y = max(0, ry - int(round(6 * scale_y)))
             m_w = min(img_w - m_x, rcw + int(round(24 * scale_x)))
@@ -971,143 +1083,74 @@ class YOLOAutoLabeler:
                     h=m_h,
                     img_w=img_w,
                     img_h=img_h,
-                    confidence=0.90,
+                    confidence=0.55,
                     source="hostile_red_hp_bar_monster",
                     material_name="monster_3d",
+                    trusted=False,
+                    weak=True,
                 )
             )
 
         # ------------------------------------------------------------------
         # Stage B2: Yellow/Olive Monster Nameplate Glyph Detector
         # ------------------------------------------------------------------
-        th_sz = max(5, int(round(7 * scale_x)) | 1)
-        tophat = cv2.morphologyEx(
-            gray,
-            cv2.MORPH_TOPHAT,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (th_sz, th_sz)),
+        # B1: single copy — the inline duplicate of the monster nameplate
+        # scan (yellow strokes + turquoise diamond tips + red agro badge)
+        # lived here and drifted from dataset_factory.monster_diamond_detector
+        # (different cyan ranges, tip/red thresholds, min widths, IoU 0.25
+        # vs 0.45, red-only 0.55 weak vs 0.90 trusted, untargeted 0.68 vs
+        # 0.92). The detector module is now the only implementation; its
+        # confidence/trust follow the harmonized live contract (tips 0.95
+        # trusted, red-only 0.55 weak, untargeted capped 0.68 weak).
+        # Stage B1 (red HP bars, incl. the class-18 target bar above) is a
+        # different stage and stays inline in this method.
+        # is_hflip=False on purpose: this stage never mirrored its HUD
+        # masks for flipped frames, so the frame is scanned as-is (the
+        # detector's tip check is symmetric anyway). existing_positive_boxes
+        # is passed through unchanged — B2 never deduped against the B1
+        # monsters produced above, and that behaviour is preserved.
+        detector_dets = get_monster_diamond_detector().detect(
+            frame_bgr,
+            hsv=hsv,
+            gray=gray,
+            existing_positive_boxes=existing_positive_boxes,
+            is_hflip=False,
+            include_untargeted=True,
         )
-
-        yellow_stroke = (
-            (hsv[:, :, 0] >= 20)
-            & (hsv[:, :, 0] <= 32)
-            & (hsv[:, :, 1] >= 90)
-            & (hsv[:, :, 2] >= 110)
-            & (tophat >= 8)
-        )
-        ym_u8 = (yellow_stroke.astype(np.uint8)) * 255
-
-        ym_u8[: int(img_h * 0.11), :] = 0
-        ym_u8[int(img_h * 0.78) :, :] = 0
-        ym_u8[:, int(img_w * 0.852) :] = 0
-        ym_u8[: int(img_h * 0.30), int(img_w * 0.71) :] = 0
-        ym_u8[int(img_h * 0.66) :, : int(img_w * 0.26)] = 0
-        ym_u8[
-            int(img_h * 0.42) : int(img_h * 0.58),
-            int(img_w * 0.44) : int(img_w * 0.56),
-        ] = 0
-
-        kw = max(10, int(round(16 * scale_x)))
-        kh = max(3, int(round(4 * scale_y)))
-        closed = cv2.morphologyEx(
-            ym_u8,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh)),
-        )
-        cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        min_w = max(72, int(round(115 * scale_x)))
-        max_w = max(160, int(round(250 * scale_x)))
-        min_h = max(6, int(round(7 * scale_y)))
-        max_h = max(20, int(round(28 * scale_y)))
-
-        for cnt in cnts:
-            x, y, cw, ch = cv2.boundingRect(cnt)
-            if not (min_w <= cw <= max_w and min_h <= ch <= max_h):
-                continue
-
-            aspect = float(cw) / float(max(1, ch))
-            if aspect < 4.5:
-                continue
-
-            sub_ym = ym_u8[y : y + ch, x : x + cw]
-            stroke_px = int(np.count_nonzero(sub_ym))
-            min_stroke = max(35, int(round(90 * scale_x * scale_y)))
-
-            lx1 = max(0, x - int(round(26 * scale_x)))
-            lx2 = min(img_w, x + int(round(6 * scale_x)))
-            rx1 = max(0, x + cw - int(round(6 * scale_x)))
-            rx2 = min(img_w, x + cw + int(round(26 * scale_x)))
-            ty1 = max(0, y - int(round(6 * scale_y)))
-            ty2 = min(img_h, y + ch + int(round(6 * scale_y)))
-
-            left_cyan = cv2.inRange(hsv[ty1:ty2, lx1:lx2], np.array([75, 70, 120]), np.array([105, 255, 255]))
-            right_cyan = cv2.inRange(hsv[ty1:ty2, rx1:rx2], np.array([75, 70, 120]), np.array([105, 255, 255]))
-            has_diamond_tips = (
-                int(np.count_nonzero(left_cyan)) >= max(4, int(round(8 * scale_x * scale_y)))
-                and int(np.count_nonzero(right_cyan)) >= max(4, int(round(8 * scale_x * scale_y)))
+        for det in detector_dets:
+            # Re-wrap in the labeler's own annotation contract: the pinned
+            # output shape (source "3d_monster_scanner", is_negative,
+            # class_name_tr, clamped confidence) is unchanged, and the
+            # recalibration tool's _VERIFIED_SEED_SOURCES entry for this
+            # source keeps working. Detector evidence is attached for
+            # traceability (additive keys only).
+            ann = self._make_annotation(
+                class_id=10,
+                x=det["bbox"][0],
+                y=det["bbox"][1],
+                w=det["bbox"][2],
+                h=det["bbox"][3],
+                img_w=img_w,
+                img_h=img_h,
+                confidence=det["confidence"],
+                source="3d_monster_scanner",
+                material_name="monster_3d",
+                trusted=det["trusted"],
+                weak=det["weak"],
             )
-
-            cx_label = x + cw // 2
-            bx1 = max(0, cx_label - int(round(18 * scale_x)))
-            bx2 = min(img_w, cx_label + int(round(18 * scale_x)))
-            by1 = min(img_h, y + ch)
-            by2 = min(img_h, y + ch + int(round(48 * scale_y)))
-            below_hsv = hsv[by1:by2, bx1:bx2]
-            red1 = cv2.inRange(below_hsv, np.array([0, 135, 95]), np.array([8, 255, 255]))
-            red2 = cv2.inRange(below_hsv, np.array([170, 135, 95]), np.array([180, 255, 255]))
-            red_badge_px = int(np.count_nonzero(red1 | red2))
-            has_agro_badge = has_diamond_tips or (
-                red_badge_px >= max(24, int(round(45 * scale_x * scale_y)))
-            )
-
-            num_labels, _ = cv2.connectedComponents(sub_ym)
-            if not has_agro_badge and (stroke_px < min_stroke or num_labels < 7):
-                continue
-
-            dilated_stroke = cv2.dilate(sub_ym, np.ones((3, 3), dtype=np.uint8))
-            border_ring = dilated_stroke - sub_ym
-            ring_gray = gray[y : y + ch, x : x + cw][border_ring > 0]
-            if ring_gray.size == 0:
-                continue
-            dark_outline_ratio = float(np.mean(ring_gray < 120))
-            if not has_agro_badge and dark_outline_ratio < 0.20:
-                continue
-
-            if has_agro_badge:
-                final_x = max(0, x - int(round(24 * scale_x)))
-                final_y = max(0, y - int(round(8 * scale_y)))
-                final_w = min(img_w - final_x, cw + int(round(48 * scale_x)))
-                final_h = min(img_h - final_y, ch + int(round(105 * scale_y)))
-                conf = 0.95
-                is_weak = False
-            else:
-                final_x = max(0, x - int(round(6 * scale_x)))
-                final_y = max(0, y - int(round(4 * scale_y)))
-                final_w = min(img_w - final_x, cw + int(round(12 * scale_x)))
-                final_h = min(img_h - final_y, ch + int(round(8 * scale_y)))
-                conf = round(min(0.68, 0.52 + min(0.16, stroke_px / 900.0)), 4)
-                is_weak = True
-
-            cand_xyxy = (final_x, final_y, final_x + final_w, final_y + final_h)
-            if any(self._compute_iou_xyxy(cand_xyxy, pos_box) >= 0.25 for pos_box in existing_positive_boxes):
-                continue
-
-            monsters.append(
-                self._make_annotation(
-                    class_id=10,
-                    x=final_x,
-                    y=final_y,
-                    w=final_w,
-                    h=final_h,
-                    img_w=img_w,
-                    img_h=img_h,
-                    confidence=conf,
-                    source="3d_monster_scanner",
-                    material_name="monster_3d",
-                    weak=is_weak,
-                    trusted=not is_weak,
-                )
-            )
+            ann["detector_source"] = det.get("source", "")
+            ann["has_diamond_tips"] = bool(det.get("has_diamond_tips", False))
+            ann["has_red_agro"] = bool(det.get("has_red_agro", False))
+            ann["has_agro_badge"] = bool(det.get("has_agro_badge", False))
+            ann["left_diamond_px"] = int(det.get("left_diamond_px", 0))
+            ann["right_diamond_px"] = int(det.get("right_diamond_px", 0))
+            ann["red_agro_px"] = int(det.get("red_agro_px", 0))
+            ann["stroke_px"] = int(det.get("stroke_px", 0))
+            ann["dark_outline_ratio"] = float(det.get("dark_outline_ratio", 0.0))
+            ann["nameplate_bbox_xywh"] = det.get("nameplate_bbox_xywh")
+            ann["nameplate_bbox_xyxy"] = det.get("nameplate_bbox_xyxy")
+            ann["is_hflip"] = bool(det.get("is_hflip", False))
+            monsters.append(ann)
 
         return monsters
 
@@ -1124,12 +1167,15 @@ class YOLOAutoLabeler:
         shared_frame_context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Stage A: Salient 3D Resources & Crestless Nodes (classes 0..5, 12).
+        Stage A: Salient 3D Resources & Crestless Nodes (classes 0..8, 12).
         Fallback ONLY when NO 3D crest (`vision_3d_crest`) or prompt icon is found.
         Uses chromatic contour segmentation for ore/herb/crystal even if white wing crest is dim or occluded.
         Validates candidate patches with `classify_3d_material_patch`.
         Never assigns class_id > 12 (never assigns essence_*).
-        Confidence is strictly calibrated: conf = min(0.68, max(0.38, round(p_score * 0.75, 4))).
+        Confidence is strictly calibrated with NO artificial floor:
+        conf = round(min(0.68, p_score * 0.75), 4). p_score < 0.20 is
+        filtered earlier, so the lowest honest value here is 0.15 — never
+        inflated to a 0.38 floor.
         Marked as trusted=False, weak=True.
         """
         if has_crest_or_prompt:
@@ -1190,14 +1236,17 @@ class YOLOAutoLabeler:
                 continue
 
             cid = map_material_name_to_yolo_class_id(mat_name, default_id=12)
-            # Never assign class_id > 12 (never essence_*) or UI/monster classes in salient 3D resources
-            if cid > 12 or cid in (6, 7, 8, 9, 10, 11):
+            # Never assign class_id > 12 (never essence_*) or UI/monster classes in salient 3D resources.
+            # F-0824: 6/7/8 are 3D materials now (herb_edana / herb_lumina /
+            # ore_obsidian), so only minimap/monster ids (9, 10, 11) are demoted.
+            if cid > 12 or cid in (9, 10, 11):
                 cid = 12
                 mat_name = "world_material"
 
             # Strict calibrated confidence without artificial floors:
-            # conf = min(0.68, max(0.38, round(p_score * 0.75, 4)))
-            calibrated_conf = min(0.68, max(0.38, round(p_score * 0.75, 4)))
+            # p_score < 0.20 was already filtered above, so the lowest honest
+            # value here is 0.15 — never inflated to a 0.38 floor.
+            calibrated_conf = round(min(0.68, p_score * 0.75), 4)
 
             salient_anns.append(
                 self._make_annotation(
@@ -1219,7 +1268,7 @@ class YOLOAutoLabeler:
         return salient_anns
 
     # ------------------------------------------------------------------
-    # Stage C: Genuine HUD & Skill Bar Detection (16, 17, 18, 19, 21, 22)
+    # Stage C: Genuine HUD & Skill Bar Detection (16, 17, 18, 19, 20, 22, 23, 24)
     # ------------------------------------------------------------------
     def _scan_hud_and_skills(
         self,
@@ -1228,19 +1277,24 @@ class YOLOAutoLabeler:
         gray: np.ndarray,
         source_stem: str = "",
         shared_frame_context: Optional[Dict[str, Any]] = None,
+        *,
+        allow_full_scan: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Genuine HUD & Skill Bar Detection (classes 16, 17, 18, 19, 21, 22):
+        Genuine HUD & Skill Bar Detection (classes 16, 17, 18, 19, 20, 22, 23, 24):
         - Player HP bar (16: player_hp_bar): horizontal red/green health bar in bottom HUD
         - Player MP bar (17: player_mp_bar): horizontal blue mana bar in bottom HUD
-        - Upper Consumable Row (0.870*H..0.938*H): Buff scrolls (22: buff_scroll), HP potions (18: hp_potion), MP potions (19: mp_potion)
-        - Lower Combat Skills Row (>=0.940*H): Active combat skill slots (21: skill_slot)
+        - Upper Consumable Row (0.870*H..0.938*H): Buff scrolls (24: buff_scroll), HP potions (22: hp_potion), MP potions (23: mp_potion)
+        - Lower Combat Skills Row (>=0.940*H): Active combat skill slots (20: skill_slot_ready)
         - Center emblem exclusion: skips center level emblem (0.44..0.56*W, 0.85..0.95*H)
         STRICT STEM GATING: ONLY execute on "learn_skills" or "learn_vitality" stems!
         Normal gameplay/gathering frames must NEVER receive HUD annotations!
         Without human approval, confidence capped at <= 0.70 (weak=True).
+        allow_full_scan=True (yalnızca öğrenme yakalama / yeniden etiketleme
+        bağlamları — auto_label_frame(full_scan=True)) stem kapısını atlar;
+        varsayılan False, W29 kilidi korunur.
         """
-        if not is_skill_learning_stem(source_stem):
+        if not allow_full_scan and not is_skill_learning_stem(source_stem):
             return []
 
         hud_anns: List[Dict[str, Any]] = []
@@ -1403,7 +1457,7 @@ class YOLOAutoLabeler:
                     if hp_red_px >= min_colored and hp_red_px > mp_blue_yellow_px and hp_red_px > scroll_px:
                         hud_anns.append(
                             self._make_annotation(
-                                class_id=18,
+                                class_id=22,
                                 x=abs_x,
                                 y=abs_y,
                                 w=bw,
@@ -1420,7 +1474,7 @@ class YOLOAutoLabeler:
                     elif mp_blue_yellow_px >= min_colored and mp_blue_yellow_px > scroll_px:
                         hud_anns.append(
                             self._make_annotation(
-                                class_id=19,
+                                class_id=23,
                                 x=abs_x,
                                 y=abs_y,
                                 w=bw,
@@ -1437,7 +1491,7 @@ class YOLOAutoLabeler:
                     elif scroll_px >= max(10, int(0.09 * slot_area)):
                         hud_anns.append(
                             self._make_annotation(
-                                class_id=22,
+                                class_id=24,
                                 x=abs_x,
                                 y=abs_y,
                                 w=bw,
@@ -1459,7 +1513,7 @@ class YOLOAutoLabeler:
                     if slot_edge_cnt >= max(10, int(15 * scale_x)):
                         hud_anns.append(
                             self._make_annotation(
-                                class_id=21,
+                                class_id=20,
                                 x=abs_x,
                                 y=abs_y,
                                 w=bw,
@@ -1486,6 +1540,8 @@ class YOLOAutoLabeler:
         gray: np.ndarray,
         source_stem: str = "",
         shared_frame_context: Optional[Dict[str, Any]] = None,
+        *,
+        allow_full_scan: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Genuine Walkable Path & Obstacle Segmentation (classes 14: obstacle, 15: path_ground):
@@ -1494,8 +1550,11 @@ class YOLOAutoLabeler:
         Normal gather/monster/boot frames (`boot_*`, `gather_*`, etc.) must NEVER receive 15: path_ground
         or 14: obstacle annotations!
         Without human approval, cap confidence at <= 0.68 (weak=True).
+        allow_full_scan=True (yalnızca öğrenme yakalama / yeniden etiketleme
+        bağlamları — auto_label_frame(full_scan=True)) stem kapısını atlar;
+        varsayılan False, W29 kilidi korunur.
         """
-        if not is_path_learning_stem(source_stem):
+        if not allow_full_scan and not is_path_learning_stem(source_stem):
             return []
 
         path_anns: List[Dict[str, Any]] = []
@@ -1546,8 +1605,10 @@ class YOLOAutoLabeler:
                     abs_x = px1 + bx
                     abs_y = py1 + by
                     # Without human approval, cap confidence at <= 0.68 (weak=True)
-                    raw_conf = float(np.clip(float(bw * bh) / float(max(1, rw * rh)) * 1.4, 0.25, 0.68))
-                    conf = min(0.68, max(0.35, round(raw_conf, 4)))
+                    raw_conf = _clamp(float(bw * bh) / float(max(1, rw * rh)) * 1.4, 0.25, 0.68)
+                    # S-6004: no 0.35 floor — weak evidence stays weak;
+                    # raw_conf is already clipped to [0.25, 0.68].
+                    conf = min(0.68, round(raw_conf, 4))
                     path_anns.append(
                         self._make_annotation(
                             class_id=15,
@@ -1575,8 +1636,10 @@ class YOLOAutoLabeler:
                     abs_ox = px1 + obx
                     abs_oy = py1 + oby
                     # Without human approval, cap confidence at <= 0.68 (weak=True)
-                    raw_obs_conf = float(np.clip(float(cv2.contourArea(oc)) / float(max(1, rw * rh)) * 3.5, 0.25, 0.68))
-                    obs_conf = min(0.68, max(0.35, round(raw_obs_conf, 4)))
+                    raw_obs_conf = _clamp(float(cv2.contourArea(oc)) / float(max(1, rw * rh)) * 3.5, 0.25, 0.68)
+                    # S-6004: no 0.35 floor — weak evidence stays weak;
+                    # raw_obs_conf is already clipped to [0.25, 0.68].
+                    obs_conf = min(0.68, round(raw_obs_conf, 4))
                     path_anns.append(
                         self._make_annotation(
                             class_id=14,
@@ -1599,6 +1662,70 @@ class YOLOAutoLabeler:
     # ------------------------------------------------------------------
     # 3. Core Frame Auto-Labeling Pipeline
     # ------------------------------------------------------------------
+    def _apply_self_exclusion_guard(
+        self, annotations: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """S-2501: ekran merkezindeki oyuncu/bineği 3D materyal/canavar sanıp etiketlemekten koru.
+
+        Karedeki `[F Gather]` / crest kanıtı, karenin kendi prompt/crest
+        anotasyonlarından (kaynakta `f_gather_prompt` / `3d_crest` /
+        `floating`) okunur: gerçek crest altındaki mesh ya da gerçek
+        prompt altındaki kutu korunur; karede hiç prompt/crest yokken
+        merkez bölgedeki korumalı 3D kutu oyuncu/binektir ve düşürülür.
+        3D dışı sınıflar guard'ın kendi `strict_3d_only` kapısıyla
+        zaten muaftır. Guard hatası etiketlemeyi öldürmez: filtresiz
+        liste döner (aşağıdaki HUD filtresiyle aynı politika).
+        """
+        guard = getattr(self, "_self_exclusion_guard", None)
+        if guard is None or not annotations:
+            return annotations
+        try:
+            sources = [
+                str(a.get("source", ""))
+                for a in annotations
+                if isinstance(a, dict)
+            ]
+            f_gather = any("f_gather_prompt" in s or "floating" in s for s in sources)
+            crest = any("3d_crest" in s for s in sources)
+            kept: List[Dict[str, Any]] = []
+            for ann in annotations:
+                if not isinstance(ann, dict) or "cx" not in ann or "cy" not in ann:
+                    kept.append(ann)
+                    continue
+                try:
+                    decision = guard.evaluate(
+                        float(ann["cx"]),
+                        float(ann["cy"]),
+                        category=str(
+                            ann.get("class_name", ann.get("material_name", "3d_material"))
+                        ),
+                        f_gather_detected=f_gather,
+                        crest_detected=crest,
+                    )
+                except (TypeError, ValueError) as exc:
+                    logger.warning(
+                        "Self-exclusion guard: kutu değerlendirilemedi, korunuyor: %s", exc
+                    )
+                    kept.append(ann)
+                    continue
+                if decision.allowed:
+                    kept.append(ann)
+                else:
+                    logger.debug(
+                        "Self-exclusion guard: merkez kutu düşürüldü "
+                        "(class=%s cx=%s cy=%s): %s",
+                        ann.get("class_name"),
+                        ann.get("cx"),
+                        ann.get("cy"),
+                        decision.reason,
+                    )
+            return kept
+        except Exception as exc:
+            logger.warning(
+                "Self-exclusion guard çalışmadı, filtresiz kutular dönüyor: %s", exc
+            )
+            return annotations
+
     def auto_label_frame(
         self,
         frame: np.ndarray,
@@ -1608,20 +1735,29 @@ class YOLOAutoLabeler:
         fast_mode: bool = False,
         source_path: Union[str, os.PathLike, None] = None,
         shared_frame_context: Optional[Dict[str, Any]] = None,
+        full_scan: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Automatically detect and label all Gatherion YOLO classes in `frame`:
-        1. 3D White Winged Gather Crests (`6: world_gather_crest`) & 3D Resource Mesh (`0..5`).
-        2. `[F Gather]` prompt (`7`) & `[E]/[F]` floating resource box (`8`).
+        1. 3D White Winged Gather Crests (`13: skill_ui_prompt`) & 3D Resource Mesh (`0..8, 12`).
+        2. `[F Gather]` prompt (`13`) & `[E]/[F]` floating resource box (`13`).
         3. Minimap 3-leaf sprout (`9`) & monster dot (`11`).
-        4. 3D Monsters & bodies (`10: monster_3d`) and Target HP Bars (`20: target_hp_bar`).
-        5. Salient 3D Resources & Crestless Nodes (Stage A, `0..5, 12`).
-        6. Genuine HUD & Skill Bar (Stage C, `16, 17, 18, 19, 21, 22`).
+        4. 3D Monsters & bodies (`10: monster_3d`) and Target HP Bars (`18: target_hp_bar`).
+        5. Salient 3D Resources & Crestless Nodes (Stage A, `0..8, 12`).
+        6. Genuine HUD & Skill Bar (Stage C, `16, 17, 18, 19, 20, 22, 23, 24`).
         7. Walkable Path & Obstacles (Stage D, `14, 15`).
 
         When `fast_mode=True`, reuses buffers and avoids running redundant template scans
         if already resolved by `material_scanner`.
         Reuses cached gray, hsv, and edge representations in `shared_frame_context` across sub-scanners.
+
+        ``full_scan=True``: Stage C (HUD) ve Stage D (yol/engel) stem kapısını
+        atlar — karedeki HER ŞEY etiketlenir (27 sınıf). Yalnızca öğrenme
+        yakalama (OmniGameLearner) ve yeniden etiketleme (toplu/tekli relabel,
+        fabrika on_gather/roaming/F8/shadow) bağlamları geçirir; varsayılan
+        False, W29 stem kilidi korunur (boot/gather stem'lerinde HUD/yol
+        kutusu üretilmez). Çıkan kutular zayıf-cap'lidir (HUD <= 0.70,
+        yol/engel <= 0.68) ve insan onayı olmadan train TXT'ye girmez.
         """
         if shared_frame_context is None:
             shared_frame_context = {}
@@ -1691,6 +1827,7 @@ class YOLOAutoLabeler:
                     "bbox": (int(cb[0]), int(cb[1]), int(cb[2]), int(cb[3])),
                     "confidence": float(c.get("confidence", 0.92)),
                     "material_hint": mat_hint,
+                    "origin": "vision_engine",
                 }
             )
 
@@ -1717,6 +1854,7 @@ class YOLOAutoLabeler:
                     "bbox": (crest_x, crest_y, crest_w, crest_h),
                     "confidence": float(md.confidence),
                     "material_hint": md.material_type or known_material_name,
+                    "origin": "material_scanner",
                 }
             )
 
@@ -1726,10 +1864,17 @@ class YOLOAutoLabeler:
             c_conf = float(crest_item["confidence"])
             mat_hint = str(crest_item.get("material_hint", "") or known_material_name)
 
-            # 1A. Emit `6: world_gather_crest`
+            # 1A. Emit `13: skill_ui_prompt` (world_gather_crest) — source names the REAL
+            # detector: a crest box reconstructed from a MaterialScanner
+            # 3D-world box must not claim to be a VisionEngine detection.
+            crest_source = (
+                "vision_3d_crest"
+                if crest_item.get("origin", "vision_engine") == "vision_engine"
+                else "material_scanner_3d_crest"
+            )
             annotations.append(
                 self._make_annotation(
-                    class_id=6,
+                    class_id=13,
                     x=cbx,
                     y=cby,
                     w=cbw,
@@ -1737,7 +1882,7 @@ class YOLOAutoLabeler:
                     img_w=img_w,
                     img_h=img_h,
                     confidence=c_conf,
-                    source="vision_3d_crest",
+                    source=crest_source,
                     material_name="world_gather_crest",
                 )
             )
@@ -1757,7 +1902,6 @@ class YOLOAutoLabeler:
         # Stage 2: `[F Gather]` Prompt (`7`) & Floating Resource Box (`8`)
         # ------------------------------------------------------------------
         floating_centers: List[Tuple[int, int]] = []
-        has_ms_floating = any(md.source == "3d_floating_icon" for md in ms_detections)
 
         # In fast_mode, reuse ms_detections from material_scanner and skip redundant vision_engine scan
         if not fast_mode:
@@ -1775,7 +1919,7 @@ class YOLOAutoLabeler:
                 floating_centers.append((ecx, ecy))
                 annotations.append(
                     self._make_annotation(
-                        class_id=8,
+                        class_id=13,
                         x=ex,
                         y=ey,
                         w=ew,
@@ -1796,7 +1940,7 @@ class YOLOAutoLabeler:
                     floating_centers.append((mcx, mcy))
                     annotations.append(
                         self._make_annotation(
-                            class_id=8,
+                            class_id=13,
                             x=bx,
                             y=by,
                             w=bw,
@@ -1822,8 +1966,21 @@ class YOLOAutoLabeler:
             patch_bgr = bgr[my1:my2, mx1:mx2]
             if patch_bgr.size > 0:
                 p_info = classify_3d_material_patch(patch_bgr)
-                mat_name = known_material_name or str(p_info.get("name", "Targena"))
-                cid = map_material_name_to_yolo_class_id(mat_name, default_id=2)
+                # Never default an unidentified mesh to "Targena": unknown
+                # material under a floating icon is generic world_material.
+                mat_name = known_material_name or str(p_info.get("name") or "")
+                if not mat_name or is_rejected_non_material(mat_name):
+                    mat_name = "world_material"
+                    cid = 12
+                else:
+                    # S-5901: never default an unidentified mesh to Targena
+                    # (2). An unmatched name resolves to -1 here, so it
+                    # becomes generic world_material (12) with the 0.50
+                    # confidence cap below instead of a trusted Targena box.
+                    cid = map_material_name_to_yolo_class_id(mat_name, default_id=-1)
+                    if cid == -1:
+                        cid = 12
+                        mat_name = "world_material"
                 annotations.append(
                     self._make_annotation(
                         class_id=cid,
@@ -1833,7 +1990,13 @@ class YOLOAutoLabeler:
                         h=my2 - my1,
                         img_w=img_w,
                         img_h=img_h,
-                        confidence=float(p_info.get("confidence", 0.90)),
+                        # Unknown-material fallback (cid 12) never claims the
+                        # classifier's 0.90 default confidence either.
+                        confidence=(
+                            0.50
+                            if cid == 12 and mat_name == "world_material"
+                            else float(p_info.get("confidence", 0.50))
+                        ),
                         source="3d_mesh_under_floating_icon",
                         material_name=mat_name,
                     )
@@ -1856,7 +2019,7 @@ class YOLOAutoLabeler:
                 if not is_e_box:
                     annotations.append(
                         self._make_annotation(
-                            class_id=7,
+                            class_id=13,
                             x=px,
                             y=py,
                             w=pw,
@@ -1874,7 +2037,7 @@ class YOLOAutoLabeler:
                 bx, by, bw, bh = md.bbox
                 annotations.append(
                     self._make_annotation(
-                        class_id=7,
+                        class_id=13,
                         x=bx,
                         y=by,
                         w=bw,
@@ -1890,9 +2053,9 @@ class YOLOAutoLabeler:
         # ------------------------------------------------------------------
         # Stage 3: Top-Right Minimap 3-Leaf Sprouts (`9`) & Monster Dots (`11`)
         # ------------------------------------------------------------------
-        has_ms_minimap = any(md.source == "minimap" for md in ms_detections)
         # In fast_mode, reuse ms_detections from material_scanner and skip redundant minimap scan
         if not fast_mode:
+            sprout_icon_sz = max(16, int(round(24 * scale_x)))
             mm_res = self.minimap_scanner.scan_gatherable_materials(bgr)
             for snode in mm_res.get("gatherable_nodes", []):
                 sx = int(snode.get("screen_x", 0))
@@ -1901,10 +2064,10 @@ class YOLOAutoLabeler:
                 annotations.append(
                     self._make_annotation(
                         class_id=9,
-                        x=sx - sprout_Icon_sz // 2,
-                        y=sy - sprout_Icon_sz // 2,
-                        w=sprout_Icon_sz,
-                        h=sprout_Icon_sz,
+                        x=sx - sprout_icon_sz // 2,
+                        y=sy - sprout_icon_sz // 2,
+                        w=sprout_icon_sz,
+                        h=sprout_icon_sz,
                         img_w=img_w,
                         img_h=img_h,
                         confidence=s_conf,
@@ -1927,7 +2090,9 @@ class YOLOAutoLabeler:
                         h=dot_sz,
                         img_w=img_w,
                         img_h=img_h,
-                        confidence=min(0.95, max(0.75, circ)),
+                        # Circularity is the only signal here — no 0.75 floor:
+                        # a barely-round blob must not claim high confidence.
+                        confidence=round(_clamp(float(circ), 0.01, 0.95), 4),
                         source="minimap_scanner_monster_dot",
                         material_name="minimap_monster_dot",
                     )
@@ -1969,7 +2134,7 @@ class YOLOAutoLabeler:
         # Fallback ONLY when NO 3D crest or prompt icon found in frame
         # ------------------------------------------------------------------
         has_crest_or_prompt = any(
-            int(a.get("class_id", -1)) in (6, 7, 8)
+            int(a.get("class_id", -1)) == 13
             or a.get("source") in ("vision_3d_crest", "vision_floating_icon", "vision_f_gather_prompt", "material_scanner_floating_icon", "material_scanner_f_gather_prompt")
             or "crest" in str(a.get("source", ""))
             or "gather_prompt" in str(a.get("source", ""))
@@ -1989,7 +2154,7 @@ class YOLOAutoLabeler:
             annotations.extend(salient_anns)
 
         # ------------------------------------------------------------------
-        # Stage C: Genuine HUD & Skill Bar (16, 17, 18, 19, 21, 22)
+        # Stage C: Genuine HUD & Skill Bar (16, 17, 18, 19, 20, 22, 23, 24)
         # ------------------------------------------------------------------
         hud_anns = self._scan_hud_and_skills(
             frame_bgr=bgr,
@@ -1997,6 +2162,7 @@ class YOLOAutoLabeler:
             gray=gray,
             source_stem=source_stem,
             shared_frame_context=shared_frame_context,
+            allow_full_scan=full_scan,
         )
         annotations.extend(hud_anns)
 
@@ -2009,6 +2175,7 @@ class YOLOAutoLabeler:
             gray=gray,
             source_stem=source_stem,
             shared_frame_context=shared_frame_context,
+            allow_full_scan=full_scan,
         )
         annotations.extend(path_anns)
 
@@ -2019,7 +2186,7 @@ class YOLOAutoLabeler:
             kx, ky = int(known_target_xy[0]), int(known_target_xy[1])
             if 0 <= kx < img_w and 0 <= ky < img_h:
                 covered = any(
-                    0 <= int(a["class_id"]) <= 5
+                    int(a["class_id"]) in (0, 1, 2, 3, 4, 5, 6, 7, 8, 12)
                     and math.hypot(
                         (a["bbox_xyxy"][0] + a["bbox_xyxy"][2]) * 0.5 - kx,
                         (a["bbox_xyxy"][1] + a["bbox_xyxy"][3]) * 0.5 - ky,
@@ -2036,8 +2203,12 @@ class YOLOAutoLabeler:
                     ty2 = min(img_h, ky + khalf_h)
                     crop_t = bgr[ty1:ty2, tx1:tx2]
                     p_info = classify_3d_material_patch(crop_t)
-                    mat_name = known_material_name or str(p_info.get("name", "Orichalcum Ore"))
+                    mat_name = known_material_name or str(p_info.get("name") or "")
+                    if not mat_name or is_rejected_non_material(mat_name):
+                        mat_name = "world_material"
                     cid = map_material_name_to_yolo_class_id(mat_name, default_id=3)
+                    if mat_name == "world_material":
+                        cid = 12
                     annotations.append(
                         self._make_annotation(
                             class_id=cid,
@@ -2047,24 +2218,45 @@ class YOLOAutoLabeler:
                             h=ty2 - ty1,
                             img_w=img_w,
                             img_h=img_h,
-                            confidence=float(p_info.get("confidence", 0.88)),
+                            # S-6003: unknown material (cid 12) never claims
+                            # the classifier's 0.88 default confidence — same
+                            # 0.50 cap as the floating-icon branch.
+                            confidence=(
+                                0.50
+                                if cid == 12
+                                else float(p_info.get("confidence", 0.50))
+                            ),
                             source="known_target_xy",
                             material_name=mat_name,
                         )
                     )
 
         if extra_detections:
+            # Untrusted external input: a caller-supplied dict must never be
+            # able to inject a trusted source name (e.g. "vision_3d_crest"),
+            # a foreign class id, or a made-up material name/confidence.
+            # Unknown ids are dropped, the source is forced to
+            # "extra_detections" (an unverified-heuristic source, so the box
+            # is always weak), and the material name comes from our table.
             for extra in extra_detections:
                 if not isinstance(extra, dict):
                     continue
-                if "class_id" in extra:
-                    cid = int(extra["class_id"])
-                else:
-                    cid = map_material_name_to_yolo_class_id(
-                        str(extra.get("class_name", extra.get("material_type", extra.get("name", "")))),
-                        default_id=3,
-                    )
-                e_conf = float(extra.get("confidence", 0.90))
+                try:
+                    if "class_id" in extra:
+                        cid = int(extra["class_id"])
+                    else:
+                        cid = map_material_name_to_yolo_class_id(
+                            str(extra.get("class_name", extra.get("material_type", extra.get("name", "")))),
+                            default_id=3,
+                        )
+                except (TypeError, ValueError):
+                    logger.warning("extra_detections: skipping entry with non-numeric class_id: %r", extra)
+                    continue
+                if cid not in YOLO_CLASSES:
+                    logger.warning("extra_detections: skipping unknown class_id %r", cid)
+                    continue
+                e_conf = float(extra.get("confidence", 0.50))
+                extra_material = YOLO_CLASSES[cid]
                 if "cx" in extra and "cy" in extra and ("w" in extra or "width" in extra):
                     cx_v = float(extra["cx"])
                     cy_v = float(extra["cy"])
@@ -2087,8 +2279,10 @@ class YOLOAutoLabeler:
                             img_w=img_w,
                             img_h=img_h,
                             confidence=e_conf,
-                            source=str(extra.get("source", "extra_detections")),
-                            material_name=str(extra.get("material_name", YOLO_CLASSES.get(cid, ""))),
+                            source="extra_detections",
+                            material_name=extra_material,
+                            trusted=False,
+                            weak=True,
                         )
                     )
                 elif "bbox" in extra and isinstance(extra["bbox"], (list, tuple)) and len(extra["bbox"]) == 4:
@@ -2103,44 +2297,84 @@ class YOLOAutoLabeler:
                             img_w=img_w,
                             img_h=img_h,
                             confidence=e_conf,
-                            source=str(extra.get("source", "extra_detections")),
-                            material_name=str(extra.get("material_name", YOLO_CLASSES.get(cid, ""))),
+                            source="extra_detections",
+                            material_name=extra_material,
+                            trusted=False,
+                            weak=True,
                         )
                     )
 
         deduped = self._deduplicate_annotations(annotations)
         if self.exemplar_memory is not None:
             try:
+                _n_before_refine = len(deduped)
                 deduped = self.exemplar_memory.refine_annotations(bgr, deduped)
+                if len(deduped) != _n_before_refine:
+                    # Refinement may silently drop caller-supplied boxes
+                    # (e.g. extra_detections): make the change visible.
+                    logger.debug(
+                        "Exemplar memory refinement changed annotation count %d -> %d",
+                        _n_before_refine,
+                        len(deduped),
+                    )
             except Exception as exc:
-                logger.debug("Exemplar memory refinement skipped: %s", exc)
+                # A failed refinement is not silent: it means the returned
+                # boxes did NOT get exemplar-memory correction.
+                logger.warning("Exemplar memory refinement failed, using unrefined annotations: %s", exc)
+
+        # S-2501: etiket yazımına gitmeden önce oyuncu/binek merkez
+        # koruması — kanıtsız merkez 3D kutuları düşür.
+        deduped = self._apply_self_exclusion_guard(deduped)
 
         try:
             from dataset_factory.label_trust import filter_hud_false_positives
 
             return filter_hud_false_positives(deduped, stem=source_stem, remap_sprout=False)
-        except Exception:
+        except Exception as exc:
+            # A failed HUD filter must not silently return unfiltered
+            # boxes: log it, the caller still gets the deduped set
+            # (sweep slice 14 B-13).
+            logger.warning("HUD false-positive filtresi çalışmadı, filtresiz kutular dönüyor: %s", exc)
             return deduped
 
     # ------------------------------------------------------------------
     # 4. YOLO `.txt` Formatting & File Export
     # ------------------------------------------------------------------
-    def format_yolo_txt(self, annotations: List[Dict[str, Any]]) -> str:
+    def format_yolo_txt(
+        self,
+        annotations: List[Dict[str, Any]],
+        trusted_only: bool = False,
+    ) -> str:
         """
         Format a list of annotation dictionaries into standard YOLO `.txt` label lines:
         `f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}"`
         with all normalized coordinates strictly clamped inside `[0.000000, 1.000000]`.
+
+        WARNING — default is verbatim / review-only: weak / untrusted
+        annotations are written as-is unless `trusted_only=True` is passed.
+        The default stays `False` only because the module contract
+        (`validate_yolo_auto_labeler_contract`) and the smoke test pin
+        verbatim output for review tooling. Pass `trusted_only=True` when
+        writing TRAINING labels: then only hand-approved or trusted
+        (`trusted=True`, `weak=False`) boxes are emitted, so unverified
+        heuristic guesses never reach a `.txt` file indistinguishable from
+        verified labels. For writing files to disk, prefer `save_yolo_txt`,
+        which defaults to `trusted_only=True`.
         """
         if not annotations:
             return ""
 
         lines: List[str] = []
+        _dropped_nonfinite = 0
         for ann in annotations:
             if not isinstance(ann, dict):
                 continue
             cls_id = int(ann.get("class_id", 0))
             if cls_id not in YOLO_CLASSES:
                 continue
+            if trusted_only and not ann.get("hand_label", False):
+                if not ann.get("trusted", False) or ann.get("weak", True):
+                    continue
 
             if "cx" in ann and "cy" in ann and ("w" in ann or "width" in ann) and ("h" in ann or "height" in ann):
                 cx = float(ann["cx"])
@@ -2154,24 +2388,66 @@ class YOLOAutoLabeler:
             else:
                 continue
 
-            cx = float(np.clip(cx, 0.0, 1.0))
-            cy = float(np.clip(cy, 0.0, 1.0))
-            w = float(np.clip(w, 0.0, 1.0))
-            h = float(np.clip(h, 0.0, 1.0))
+            cx = _clamp(float(cx), 0.0, 1.0)
+            cy = _clamp(float(cy), 0.0, 1.0)
+            w = _clamp(float(w), 0.0, 1.0)
+            h = _clamp(float(h), 0.0, 1.0)
+
+            # S111 (v19/P3-8): `_clamp` NaN'u aynen geçirir (D60, belgeli)
+            # ve `f"{nan:.6f}"` TXT'ye "nan" yazar — YOLO eğitiminde
+            # zehirli satır olur. Sonlu olmayan kutu atılır, sayılır.
+            if not (
+                math.isfinite(cx)
+                and math.isfinite(cy)
+                and math.isfinite(w)
+                and math.isfinite(h)
+            ):
+                _dropped_nonfinite += 1
+                continue
 
             lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
 
+        if _dropped_nonfinite:
+            logger.warning(
+                "format_yolo_txt: %d sonlu-olmayan (NaN/inf) kutu atıldı, TXT'ye yazılmadı.",
+                _dropped_nonfinite,
+            )
         return "\n".join(lines)
 
     def save_yolo_txt(
         self,
         annotations: List[Dict[str, Any]],
         output_txt_path: Union[str, os.PathLike],
+        trusted_only: bool = True,
     ) -> Path:
-        """Write formatted YOLO `.txt` annotations to disk (UTF-8)."""
+        """Write formatted YOLO `.txt` annotations to disk (UTF-8).
+
+        Defaults to `trusted_only=True`: weak/untrusted boxes are NOT
+        written as if they were verified labels (see `format_yolo_txt`).
+        Pass `trusted_only=False` explicitly only for review tooling that
+        needs a verbatim dump of every box — never for training labels.
+        """
         out_path = Path(output_txt_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        txt_content = self.format_yolo_txt(annotations)
+        txt_content = self.format_yolo_txt(annotations, trusted_only=trusted_only)
+        # P0-1 (K-10): boş içerik mevcut (dolu) dosyayı 0 bayta
+        # indirmesin — yazım reddedilir, eski dosya korunur ve mevcut
+        # yol aynen döner. Zayıf-kutu karesi (hiç trusted kutu yok)
+        # daha önce buradan geçip mevcut etiketi siliyordu. Yeni
+        # dosya (veya zaten boş dosya) için boş yazım eskisi gibi
+        # 0 bayt oluşturur — kaybolacak veri yoktur.
+        if not txt_content.strip():
+            try:
+                _existing_nonempty = out_path.is_file() and out_path.stat().st_size > 0
+            except OSError:
+                _existing_nonempty = False
+            if _existing_nonempty:
+                logger.warning(
+                    "[KORUMA] %s boş içerikle yazılmadı — mevcut etiket korundu "
+                    "(0 bayt yazımı veri kaybıdır, K-10)",
+                    out_path,
+                )
+                return out_path
         out_path.write_text(txt_content + ("\n" if txt_content else ""), encoding="utf-8")
         return out_path
 
@@ -2279,19 +2555,20 @@ class YOLOAutoLabeler:
 
     def get_auto_labeler_health_summary(self) -> dict:
         """Return auto-labeler readiness and class count."""
-        try:
-            return {"auto_labeler_ready": True, "classes": 12}
-        except Exception:
-            return {"auto_labeler_ready": False, "classes": 0}
+        ready = validate_yolo_auto_labeler_contract()
+        return {"auto_labeler_ready": bool(ready), "classes": len(YOLO_CLASSES)}
 
     def get_yolo_auto_labeler_ready_flag(self) -> dict:
-        return {"module": "yolo_auto_labeler", "ready": True}
+        # S-5902/S-6005: actually run the contract instead of asserting
+        # readiness — a broken contract must not report ready=True.
+        return {"module": "yolo_auto_labeler", "ready": bool(validate_yolo_auto_labeler_contract())}
 
     def get_yolo_auto_labeler_version_info(self) -> dict:
-        return {"module": "yolo_auto_labeler", "version": "2.0.0", "ready": True}
+        return {"module": "yolo_auto_labeler", "version": __version__, "ready": bool(validate_yolo_auto_labeler_contract())}
 
     def get_yolo_auto_labeler_diagnostic_snapshot(self) -> dict:
-        return {"module": "yolo_auto_labeler", "status": "ok", "ready": True}
+        ready = bool(validate_yolo_auto_labeler_contract())
+        return {"module": "yolo_auto_labeler", "status": "ok" if ready else "failed", "ready": ready}
 
 
 __all__ = [
@@ -2319,7 +2596,61 @@ def get_yolo_auto_labeler_capabilities() -> list:
 
 
 def validate_yolo_auto_labeler_contract() -> bool:
-    return bool(get_yolo_auto_labeler_capabilities())
+    """Actually verify the labeler contract instead of asserting it.
+
+    Checks: class table is contiguous 0..26 (canonical) with unique names
+    and an injective name->id map; positive/negative sets are disjoint and
+    cover every class; material mapping resolves the key names to the
+    canonical ids; unknown class ids are rejected by _make_annotation; and
+    the trusted-only txt gate drops weak boxes. Any failure returns False.
+    """
+    try:
+        if sorted(YOLO_CLASSES) != list(range(len(YOLO_CLASSES))):
+            return False
+        if len(set(YOLO_CLASSES.values())) != len(YOLO_CLASSES):
+            return False
+        if any(YOLO_NAME_TO_ID.get(name) != cid for cid, name in YOLO_CLASSES.items()):
+            return False
+        if set(POSITIVE_CLASS_IDS) & set(NEGATIVE_CLASS_IDS):
+            return False
+        if set(POSITIVE_CLASS_IDS) | set(NEGATIVE_CLASS_IDS) != set(YOLO_CLASSES):
+            return False
+        if len(YOLO_CLASSES_TR) != len(YOLO_CLASSES):
+            return False
+        _probe = {
+            "aria": 0,
+            "targena": 2,
+            "world_gather_crest": 13,
+            "monster": 10,
+            "hp_potion": 22,
+            "buff_scroll": 24,
+            "target_hp_bar": 18,
+            "skill_slot": 20,
+            "herb_edana": 6,
+            "ore_obsidian": 8,
+        }
+        for _name, _want in _probe.items():
+            if map_material_name_to_yolo_class_id(_name, default_id=-1) != _want:
+                return False
+        _labeler = YOLOAutoLabeler.__new__(YOLOAutoLabeler)
+        try:
+            _labeler._make_annotation(
+                class_id=98, x=0, y=0, w=10, h=10, img_w=100, img_h=100
+            )
+            return False
+        except ValueError:
+            pass
+        _weak = _labeler._make_annotation(
+            class_id=0, x=0, y=0, w=10, h=10, img_w=100, img_h=100,
+            confidence=0.5, source="extra_detections",
+        )
+        if _labeler.format_yolo_txt([_weak], trusted_only=True) != "":
+            return False
+        if _labeler.format_yolo_txt([_weak]) == "":
+            return False
+        return bool(get_yolo_auto_labeler_capabilities())
+    except Exception:
+        return False
 
 
 def get_yolo_auto_labeler_baseline_metrics() -> dict:

@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -28,11 +30,40 @@ def _settings_path(override: str = "") -> Path:
     return ROOT / "config" / "settings.json"
 
 
+def stored_hid_tcp_endpoint(endpoint: str) -> str:
+    """Canonical endpoint -> the form persisted in settings.json / env.
+
+    TCP keeps bare host:port (scheme stripped, the historical storage form);
+    UDP keeps its scheme so the transport is not lost. Single source of
+    truth — setup_android_usb_hid.py used to duplicate this derivation
+    inline, and the two copies could drift (e.g. one stripping udp://).
+    """
+    canonical = normalize_hid_endpoint(str(endpoint or "").strip())
+    if canonical.lower().startswith("tcp://"):
+        return canonical[6:]
+    return canonical
+
+
 def write_settings_hid_tcp(endpoint: str, settings_path: Path | None = None) -> Path:
     path = settings_path or _settings_path()
     data: dict = {}
     if path.is_file():
-        data = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            # Corrupt settings.json must not crash the tool or be silently
+            # wiped: back it up, then start from an empty dict.
+            backup = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+            try:
+                os.replace(path, backup)
+            except OSError:
+                backup = path.with_name(f"{path.name}.corrupt")
+            print(
+                f"WARNING: corrupt settings.json ({exc}); "
+                f"backed up to {backup}, starting fresh",
+                file=sys.stderr,
+            )
+            data = {}
     if not isinstance(data, dict):
         data = {}
     input_cfg = data.get("input")
@@ -41,7 +72,10 @@ def write_settings_hid_tcp(endpoint: str, settings_path: Path | None = None) -> 
         data["input"] = input_cfg
     input_cfg["hid_tcp"] = endpoint
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
+    # Atomic write: temp file in the same dir, then replace.
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
     return path
 
 
@@ -91,12 +125,31 @@ def main() -> int:
         return 2
 
     canonical = normalize_hid_endpoint(endpoint)
+    # Validate: hid_tcp must be a network endpoint (tcp://, udp://, or bare
+    # host:port). A COM port (e.g. COM5) or a malformed host:port must never
+    # be written into input.hid_tcp.
+    if not (
+        canonical.lower().startswith("tcp://")
+        or canonical.lower().startswith("udp://")
+    ):
+        print(
+            "ERROR: invalid HID TCP endpoint "
+            f"{endpoint!r} — expected host:port, tcp://host:port or "
+            "udp://host:port (not a COM port)",
+            file=sys.stderr,
+        )
+        return 2
+    hostport = canonical.split("://", 1)[1]
+    host, _, port_s = hostport.rpartition(":")
+    if not host or not port_s.isdigit() or not 1 <= int(port_s) <= 65535:
+        print(
+            f"ERROR: invalid HID TCP endpoint {endpoint!r} — "
+            "host:port with port 1-65535 expected",
+            file=sys.stderr,
+        )
+        return 2
     # settings / env historically store host:port or udp://… without requiring tcp://
-    stored = endpoint
-    if canonical.lower().startswith("tcp://"):
-        stored = canonical[6:]
-    elif canonical.lower().startswith("udp://"):
-        stored = canonical
+    stored = stored_hid_tcp_endpoint(endpoint)
 
     print(f"set GATHERION_HID_TCP={stored}")
     if args.dry_run:

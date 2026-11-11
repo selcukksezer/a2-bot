@@ -1,11 +1,24 @@
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+_MASK64 = (1 << 64) - 1
+
+
+def _popcount_u64(values: np.ndarray) -> np.ndarray:
+    """Vectorized population count of a uint64 array (bit counts per element).
+
+    Byte order does not matter for a popcount: unpacking the little-endian
+    bytes and summing the bits gives the same total as any other order.
+    """
+    return np.unpackbits(
+        np.ascontiguousarray(values).view(np.uint8).reshape(-1, 8), axis=1
+    ).sum(axis=1)
 
 
 @dataclass
@@ -71,12 +84,8 @@ class DatasetQualityGate:
         raise ValueError(f"Unsupported frame shape: {frame.shape}")
 
     @staticmethod
-    def compute_dhash(frame: np.ndarray) -> int:
-        """
-        Resizes grayscale frame to 9x8 (width=9, height=8) and computes
-        64-bit horizontal gradient bits as a Python int.
-        """
-        gray = DatasetQualityGate._to_grayscale(frame)
+    def _compute_dhash_gray(gray: np.ndarray) -> int:
+        """dHash over an already-grayscale frame (shared by compute_dhash)."""
         resized = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
         diff = resized[:, 1:] > resized[:, :-1]
         flat_bits = diff.flatten()
@@ -84,6 +93,15 @@ class DatasetQualityGate:
         for bit in flat_bits:
             dhash_val = (dhash_val << 1) | int(bool(bit))
         return int(dhash_val)
+
+    @staticmethod
+    def compute_dhash(frame: np.ndarray) -> int:
+        """
+        Resizes grayscale frame to 9x8 (width=9, height=8) and computes
+        64-bit horizontal gradient bits as a Python int.
+        """
+        gray = DatasetQualityGate._to_grayscale(frame)
+        return DatasetQualityGate._compute_dhash_gray(gray)
 
     @staticmethod
     def hamming_distance(h1: int, h2: int) -> int:
@@ -94,13 +112,46 @@ class DatasetQualityGate:
         return int(xor_val.bit_count())
 
     @staticmethod
+    def _measure_sharpness_gray(gray: np.ndarray) -> float:
+        """Laplacian variance over an already-grayscale frame."""
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        return float(laplacian.var())
+
+    @staticmethod
     def measure_sharpness(frame: np.ndarray) -> float:
         """
         Computes Laplacian variance on the grayscale frame to measure sharpness.
         """
         gray = DatasetQualityGate._to_grayscale(frame)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        return float(laplacian.var())
+        return DatasetQualityGate._measure_sharpness_gray(gray)
+
+    @staticmethod
+    def _iou_from_corners(
+        ax1: float, ay1: float, ax2: float, ay2: float,
+        bx1: float, by1: float, bx2: float, by2: float,
+    ) -> float:
+        """IoU between two boxes given as precomputed corner coordinates.
+
+        Bit-identical math to compute_iou_xywh; kept separate so the NMS
+        inner loop does not recompute corners for every pair.
+        """
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+        if inter_area <= 0.0:
+            return 0.0
+
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union_area = area_a + area_b - inter_area
+        if union_area <= 1e-12:
+            return 0.0
+        return float(inter_area / union_area)
 
     @staticmethod
     def compute_iou_xywh(
@@ -121,23 +172,44 @@ class DatasetQualityGate:
         bx2 = box_b[0] + box_b[2] * 0.5
         by2 = box_b[1] + box_b[3] * 0.5
 
-        inter_x1 = max(ax1, bx1)
-        inter_y1 = max(ay1, by1)
-        inter_x2 = min(ax2, bx2)
-        inter_y2 = min(ay2, by2)
+        return DatasetQualityGate._iou_from_corners(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2)
 
-        inter_w = max(0.0, inter_x2 - inter_x1)
-        inter_h = max(0.0, inter_y2 - inter_y1)
+    @staticmethod
+    def _iou_xywh_against_many(
+        box: Tuple[float, float, float, float],
+        others: np.ndarray,
+    ) -> np.ndarray:
+        """Vectorized IoU of one (cx, cy, w, h) box against an (N, 4) array.
+
+        Same float64 operations, in the same order, as compute_iou_xywh, so
+        each element is bit-identical to the scalar result (the early
+        ``0.0`` returns of the scalar version are reproduced with
+        ``np.where``). Empty input returns an empty (0,) array.
+        """
+        if others.shape[0] == 0:
+            return np.empty((0,), dtype=np.float64)
+        ax1 = box[0] - box[2] * 0.5
+        ay1 = box[1] - box[3] * 0.5
+        ax2 = box[0] + box[2] * 0.5
+        ay2 = box[1] + box[3] * 0.5
+
+        bx1 = others[:, 0] - others[:, 2] * 0.5
+        by1 = others[:, 1] - others[:, 3] * 0.5
+        bx2 = others[:, 0] + others[:, 2] * 0.5
+        by2 = others[:, 1] + others[:, 3] * 0.5
+
+        inter_w = np.maximum(0.0, np.minimum(ax2, bx2) - np.maximum(ax1, bx1))
+        inter_h = np.maximum(0.0, np.minimum(ay2, by2) - np.maximum(ay1, by1))
         inter_area = inter_w * inter_h
-        if inter_area <= 0.0:
-            return 0.0
 
         area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        area_b = np.maximum(0.0, bx2 - bx1) * np.maximum(0.0, by2 - by1)
         union_area = area_a + area_b - inter_area
-        if union_area <= 1e-12:
-            return 0.0
-        return float(inter_area / union_area)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            iou = inter_area / union_area
+        return np.where(
+            (inter_area <= 0.0) | (union_area <= 1e-12), 0.0, iou
+        ).astype(np.float64, copy=False)
 
     def validate_yolo_annotations(
         self, annotations: List[Dict[str, Any]]
@@ -155,37 +227,59 @@ class DatasetQualityGate:
             if not isinstance(raw, dict):
                 continue
 
-            class_id = int(raw.get("class_id", raw.get("cls", 0)))
-            if class_id < 0:
+            try:
+                class_id = int(raw.get("class_id", raw.get("cls", 0)))
+            except (TypeError, ValueError):
+                # D37/F-0811: one broken class_id (e.g. "abc") must not
+                # crash the whole quality gate -- skip that annotation.
+                continue
+            if class_id < 0 or class_id > 26:
                 continue
 
-            cx_raw = raw.get("cx", raw.get("x_center"))
-            cy_raw = raw.get("cy", raw.get("y_center"))
-            w_raw = raw.get("w", raw.get("width"))
-            h_raw = raw.get("h", raw.get("height"))
+            try:
+                cx_raw = raw.get("cx", raw.get("x_center"))
+                cy_raw = raw.get("cy", raw.get("y_center"))
+                w_raw = raw.get("w", raw.get("width"))
+                h_raw = raw.get("h", raw.get("height"))
 
-            if cx_raw is None or cy_raw is None or w_raw is None or h_raw is None:
-                bbox = raw.get("bbox")
-                img_w = float(raw.get("image_width", 1.0))
-                img_h = float(raw.get("image_height", 1.0))
-                if isinstance(bbox, (list, tuple)) and len(bbox) == 4 and img_w > 0 and img_h > 0:
-                    x1, y1, x2, y2 = [float(v) for v in bbox]
-                    cx_raw = ((x1 + x2) * 0.5) / img_w
-                    cy_raw = ((y1 + y2) * 0.5) / img_h
-                    w_raw = abs(x2 - x1) / img_w
-                    h_raw = abs(y2 - y1) / img_h
-                else:
-                    continue
+                if cx_raw is None or cy_raw is None or w_raw is None or h_raw is None:
+                    bbox = raw.get("bbox")
+                    img_w = float(raw.get("image_width", 1.0))
+                    img_h = float(raw.get("image_height", 1.0))
+                    if isinstance(bbox, (list, tuple)) and len(bbox) == 4 and img_w > 0 and img_h > 0:
+                        x1, y1, x2, y2 = [float(v) for v in bbox]
+                        cx_raw = ((x1 + x2) * 0.5) / img_w
+                        cy_raw = ((y1 + y2) * 0.5) / img_h
+                        w_raw = abs(x2 - x1) / img_w
+                        h_raw = abs(y2 - y1) / img_h
+                    else:
+                        continue
 
-            cx = float(cx_raw)
-            cy = float(cy_raw)
-            w = float(w_raw)
-            h = float(h_raw)
+                cx = float(cx_raw)
+                cy = float(cy_raw)
+                w = float(w_raw)
+                h = float(h_raw)
+                conf = float(raw.get("confidence", raw.get("conf", raw.get("score", 1.0))))
+            except (TypeError, ValueError):
+                # D37/F-0811: broken coordinates/confidence skip the box,
+                # they never abort the whole validation.
+                continue
 
             if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(w) and np.isfinite(h)):
                 continue
 
             if w <= 0.0 or h <= 0.0:
+                continue
+
+            # D37/F-0987: a box outside [0, 1] is dropped, not silently
+            # clamped/shifted into "valid" (a 0.001 tolerance absorbs
+            # float noise). Only in-tolerance values are clamped below.
+            if (
+                cx < -0.001 or cx > 1.001
+                or cy < -0.001 or cy > 1.001
+                or w < 0.0 or w > 1.001
+                or h < 0.0 or h > 1.001
+            ):
                 continue
 
             # Clamp cx, cy, w, h in [0.001, 0.999]
@@ -198,7 +292,6 @@ class DatasetQualityGate:
             if area < self.min_box_area:
                 continue
 
-            conf = float(raw.get("confidence", raw.get("conf", raw.get("score", 1.0))))
             entry = dict(raw)
             entry["class_id"] = class_id
             entry["cx"] = round(clamped_cx, 6)
@@ -225,27 +318,50 @@ class DatasetQualityGate:
                 key=lambda x: (float(x.get("confidence", 1.0)), float(x.get("area", 0.0))),
                 reverse=True,
             )
-            kept_class: List[Dict[str, Any]] = []
-            for cand in candidates:
-                box_cand = (
-                    float(cand["cx"]),
-                    float(cand["cy"]),
-                    float(cand["w"]),
-                    float(cand["h"]),
-                )
-                duplicate = False
-                for existing in kept_class:
-                    box_exist = (
-                        float(existing["cx"]),
-                        float(existing["cy"]),
-                        float(existing["w"]),
-                        float(existing["h"]),
+            # Vectorized class-aware NMS: repeatedly take the
+            # highest-priority remaining box, keep it, and drop every
+            # remaining box whose IoU with it exceeds the threshold.
+            # Exactly the reference loop's decisions: candidates are
+            # processed in priority order, a box is kept iff no kept
+            # box overlaps it above the threshold, and the kept set is
+            # built in that same order — but with one vector IoU call
+            # per kept box instead of one scalar call per pair.
+            # Corner coordinates are likewise computed once (into the
+            # boxes array below), never rebuilt per pair.
+            boxes = np.array(
+                [
+                    (
+                        float(c["cx"]),
+                        float(c["cy"]),
+                        float(c["w"]),
+                        float(c["h"]),
                     )
-                    if self.compute_iou_xywh(box_cand, box_exist) > self.nms_iou_threshold:
-                        duplicate = True
-                        break
-                if not duplicate:
-                    kept_class.append(cand)
+                    for c in candidates
+                ],
+                dtype=np.float64,
+            )
+            remaining = list(range(len(candidates)))
+            kept_class: List[Dict[str, Any]] = []
+            while remaining:
+                top = remaining[0]
+                kept_class.append(candidates[top])
+                if len(remaining) == 1:
+                    break
+                rest_idx = remaining[1:]
+                ious = self._iou_xywh_against_many(
+                    (
+                        float(boxes[top, 0]),
+                        float(boxes[top, 1]),
+                        float(boxes[top, 2]),
+                        float(boxes[top, 3]),
+                    ),
+                    boxes[rest_idx],
+                )
+                remaining = [
+                    idx
+                    for idx, iou in zip(rest_idx, ious)
+                    if iou <= self.nms_iou_threshold
+                ]
             kept_all.extend(kept_class)
 
         return kept_all
@@ -280,21 +396,44 @@ class DatasetQualityGate:
         """
         ratio = self.val_ratio if val_ratio is None else float(val_ratio)
         if annotations:
-            dominant_cls = min(int(a.get("class_id", 0)) for a in annotations)
-            cls_idx = self._class_sample_counts.get(dominant_cls, 0)
-            self._class_sample_counts[dominant_cls] = cls_idx + 1
-            return self.choose_split(cls_idx, val_ratio=ratio)
+            # D37/F-0887: the dominant class is the MOST FREQUENT class,
+            # not the smallest class_id (the old `min(...)` made class 0
+            # dominant whenever a single class-0 box was present).
+            counts: Counter = Counter()
+            for a in annotations:
+                if not isinstance(a, dict):
+                    continue
+                try:
+                    counts[int(a.get("class_id", 0))] += 1
+                except (TypeError, ValueError):
+                    continue
+            if counts:
+                dominant_cls = min(counts, key=lambda c: (-counts[c], c))
+                cls_idx = self._class_sample_counts.get(dominant_cls, 0)
+                self._class_sample_counts[dominant_cls] = cls_idx + 1
+                return self.choose_split(cls_idx, val_ratio=ratio)
         return self.choose_split(self._sample_index, val_ratio=ratio)
 
     def is_duplicate_hash(self, dhash_val: int) -> Tuple[bool, int]:
         """
         Compares dhash_val against rolling history of saved hashes.
         Returns (is_duplicate, min_hamming_distance_found).
+
+        Vectorized (D52): one XOR + popcount over the whole history
+        instead of a Python-level hamming_distance() call per entry.
+        Bit-identical result: the probe and every history entry are
+        masked to 64 bits exactly like hamming_distance() does.
         """
         if not self._hash_history:
             return False, 64
-        min_dist = min(self.hamming_distance(dhash_val, prev) for prev in self._hash_history)
-        return (min_dist < self.min_hamming_distance), int(min_dist)
+        probe = int(dhash_val) & _MASK64
+        hist = np.fromiter(
+            (int(h) & _MASK64 for h in self._hash_history),
+            dtype=np.uint64,
+            count=len(self._hash_history),
+        )
+        min_dist = int(_popcount_u64(hist ^ np.uint64(probe)).min())
+        return (min_dist < self.min_hamming_distance), min_dist
 
     def evaluate_frame(
         self,
@@ -324,7 +463,10 @@ class DatasetQualityGate:
                 validated_annotations=[],
             )
 
-        sharpness = self.measure_sharpness(frame)
+        # Grayscale is computed once and shared by the sharpness and dHash
+        # steps (both previously converted the full frame separately).
+        gray = self._to_grayscale(frame)
+        sharpness = self._measure_sharpness_gray(gray)
         if sharpness < self.min_sharpness_threshold:
             self.stats["rejected_blur"] += 1
             return QualityGateDecision(
@@ -337,7 +479,7 @@ class DatasetQualityGate:
                 validated_annotations=[],
             )
 
-        dhash_val = self.compute_dhash(frame)
+        dhash_val = self._compute_dhash_gray(gray)
         is_dup, min_dist = self.is_duplicate_hash(dhash_val)
         if is_dup:
             self.stats["rejected_duplicate"] += 1
@@ -353,8 +495,26 @@ class DatasetQualityGate:
 
         valid_anns = self.validate_yolo_annotations(annotations or [])
 
+        # D37/F-0888: a sharp frame with no (valid) annotations is not
+        # "ok" -- it must not enter the dataset as an accepted sample.
+        if not annotations or not valid_anns:
+            reason = "no_annotations" if not annotations else "no_valid_annotations"
+            return QualityGateDecision(
+                accepted=False,
+                reason=reason,
+                sharpness=sharpness,
+                dhash=dhash_val,
+                min_hamming_seen=min_dist,
+                split="train",
+                validated_annotations=[],
+            )
+
+        # D37/F-0988: the hash is always recorded on acceptance. With
+        # record_on_accept=False the same frame used to pass the dedup
+        # check again on every call; the flag now only controls whether
+        # the acceptance is counted in stats / advances the split index.
+        self._hash_history.append(dhash_val)
         if record_on_accept:
-            self._hash_history.append(dhash_val)
             split = self.choose_stratified_split(valid_anns, val_ratio=self.val_ratio)
             self._sample_index += 1
             self.stats["accepted"] += 1

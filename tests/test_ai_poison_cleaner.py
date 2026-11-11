@@ -26,12 +26,39 @@ import cv2
 
 from dataset_factory.label_trust import (
     UNVERIFIED_HEURISTIC_SOURCES,
+    _legacy_weak_from_txt,
+    _normalize_requeue_box,
     calibrate_box_confidence_and_trust,
     clean_poison_labels_ai,
     prune_low_confidence_boxes_in_dataset,
     requeue_labeled_dataset_for_review,
 )
-from dataset_factory.exemplar_memory import ExemplarMemory
+from dataset_factory.exemplar_memory import ExemplarMemory, extract_box_crop
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cwd(tmp_path, monkeypatch):
+    """Redirect CWD-relative production writes into a throwaway dir.
+
+    ``mark_model_stale`` writes ``models/stale_manifest.json`` and
+    ``dataset/pipeline_ui_state.json`` relative to the current working
+    directory, so a run from the repo root rewrote repo files. All dataset
+    paths in this file are absolute, so changing CWD is safe here.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
+def _isolated_memory(tmp_path: Path) -> ExemplarMemory:
+    """Empty exemplar memory backed by a temp file.
+
+    The cleaner constructs the repo's shared
+    ``dataset/learned_exemplars.json`` when no memory is passed, and with
+    ``teach_negatives=True`` it appends negative exemplars to that shared
+    store (and pays a ~1.2 MB JSON load+save per call). Tests must neither
+    mutate the shared store nor depend on its contents — a test that passed
+    or failed depending on previously taught negatives is order-dependent.
+    """
+    return ExemplarMemory(json_path=tmp_path / "exemplars.json")
 
 
 @pytest.fixture
@@ -50,12 +77,33 @@ def _create_synthetic_test_image(path: Path, width: int = 400, height: int = 400
     if flat:
         img = np.full((height, width, 3), 128, dtype=np.uint8)
     else:
-        # Rich textured image (Laplacian variance >> 10)
-        img = np.random.randint(0, 256, (height, width, 3), dtype=np.uint8)
+        # Rich textured image (Laplacian variance >> 10). Seeded: the
+        # unseeded np.random.randint made every run generate a different
+        # image, so failures were not reproducible byte-for-byte.
+        rng = np.random.default_rng(7)
+        img = rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
     cv2.imwrite(str(path), img)
 
 
-def test_layer0_immunity_shield(temp_dataset_dir):
+def _create_two_tone_test_image(path: Path, width: int = 400, height: int = 400):
+    """Deterministic two-tone textured image: red noise on the left half,
+    blue noise on the right half (BGR). The halves have near-orthogonal HSV
+    histograms, so a crop from one half does NOT match an exemplar learned
+    from the other half — while a crop from the same half matches ~1.0.
+    Laplacian variance is far above the Layer 2 flat threshold (10.0)."""
+    rng = np.random.default_rng(7)
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    half = width // 2
+    img[:, :half, 0] = rng.integers(0, 60, size=(height, half), dtype=np.uint8)
+    img[:, :half, 1] = rng.integers(0, 60, size=(height, half), dtype=np.uint8)
+    img[:, :half, 2] = rng.integers(180, 256, size=(height, half), dtype=np.uint8)
+    img[:, half:, 0] = rng.integers(180, 256, size=(height, width - half), dtype=np.uint8)
+    img[:, half:, 1] = rng.integers(0, 60, size=(height, width - half), dtype=np.uint8)
+    img[:, half:, 2] = rng.integers(0, 60, size=(height, width - half), dtype=np.uint8)
+    cv2.imwrite(str(path), img)
+
+
+def test_layer0_immunity_shield(temp_dataset_dir, tmp_path):
     """Layer 0: Hand-labeled, approved, or seed boxes MUST NEVER be deleted or demoted."""
     img_path = temp_dataset_dir / "images" / "train" / "img_immune.jpg"
     _create_synthetic_test_image(img_path, flat=True)  # flat image would normally fail layer 2
@@ -87,53 +135,83 @@ def test_layer0_immunity_shield(temp_dataset_dir):
         "weak": [],
     }
     rev_path.write_text(json.dumps(payload), encoding="utf-8")
+    before = rev_path.read_text(encoding="utf-8")
 
-    stats = clean_poison_labels_ai(dataset_dir=temp_dataset_dir)
+    stats = clean_poison_labels_ai(dataset_dir=temp_dataset_dir, exemplar_memory=_isolated_memory(tmp_path))
     assert stats["ok"] is True
     assert stats["protected_boxes"] >= 2
     assert stats["poison_deleted_boxes"] == 0
+    assert stats["files_rewritten"] == 0
 
-    saved = json.loads(rev_path.read_text(encoding="utf-8"))
+    # K-16 (P1-15): 0 silmede dosyaya dokunulmaz — koruma bellekte
+    # uygulanır, review JSON bayt-bayt aynen durur. `trusted` bayrağı
+    # diske ancak bir silme/onarım/NMS yazımı tetiklenince çıkar.
+    assert rev_path.read_text(encoding="utf-8") == before
+    saved = json.loads(before)
     assert len(saved["trusted"]) == 2
-    assert all(b.get("trusted") is True for b in saved["trusted"])
+    assert saved["trusted"][0].get("hand_label") is True
+    assert saved["trusted"][1].get("human_approved") is True
 
 
-def test_layer1_exemplar_memory_repair_and_suppression(temp_dataset_dir):
-    """Layer 1: Auto-repair class if positive exemplar matches >= 0.82; suppress if negative matches."""
+def test_layer1_exemplar_memory_repair_and_suppression(temp_dataset_dir, tmp_path):
+    """Layer 1: Auto-repair class if positive exemplar matches >= 0.82; suppress if negative matches.
+
+    REAL exemplar matching: the cleaner is given an ExemplarMemory that
+    learned one positive exemplar (class 2, from the red left-half crop)
+    and one negative exemplar (from the blue right-half crop). The input
+    boxes carry NO exemplar_* answer fields — the repair class and the
+    suppression must come out of match_positive / match_negative on the
+    actual image crops.
+    """
     img_path = temp_dataset_dir / "images" / "train" / "img_repair.jpg"
-    _create_synthetic_test_image(img_path, flat=False)
+    _create_two_tone_test_image(img_path)
+    frame = cv2.imread(str(img_path))
+    assert frame is not None
+
+    repair_box = {
+        "class_id": 0,
+        "cx": 0.25,
+        "cy": 0.5,
+        "w": 0.2,
+        "h": 0.2,
+        "confidence": 0.88,
+    }
+    poison_box = {
+        "class_id": 1,
+        "cx": 0.75,
+        "cy": 0.5,
+        "w": 0.2,
+        "h": 0.2,
+        "confidence": 0.70,
+    }
+
+    memory = ExemplarMemory(json_path=tmp_path / "exemplars.json")
+    # Canonical name must match the id: herb_aria IS cid 0, so the cid-2
+    # positive exemplar is herb_targena (K canonicalization stores the
+    # name-resolved class; a (2, "herb_aria") pair would land on cid 0).
+    assert memory.add_positive_exemplar(
+        extract_box_crop(frame, repair_box), 2, "herb_targena", source="ui_approval"
+    )
+    assert memory.add_negative_exemplar(
+        extract_box_crop(frame, poison_box), 1, "herb_mela", source="ui_rejection"
+    )
+
+    # Sanity: the real matcher really fires on these crops before the cleaner runs.
+    pos_sim, pos_cid, _, _ = memory.match_positive(extract_box_crop(frame, repair_box))
+    assert pos_sim >= 0.82 and pos_cid == 2
+    neg_sim, _ = memory.match_negative(extract_box_crop(frame, poison_box), class_id=1)
+    assert neg_sim >= 0.82
 
     rev_path = temp_dataset_dir / "review" / "train" / "img_repair.json"
     payload = {
         "stem": "img_repair",
         "split": "train",
         "trusted": [],
-        "weak": [
-            {
-                "class_id": 0,
-                "cx": 0.5,
-                "cy": 0.5,
-                "w": 0.2,
-                "h": 0.2,
-                "confidence": 0.88,
-                "exemplar_repair_class_id": 2,  # Simulated positive match to class 2
-                "exemplar_repair_sim": 0.90,
-            },
-            {
-                "class_id": 1,
-                "cx": 0.8,
-                "cy": 0.8,
-                "w": 0.1,
-                "h": 0.1,
-                "confidence": 0.70,
-                "exemplar_neg_sim": 0.92,       # High negative similarity -> poison
-                "exemplar_pos_sim": 0.60,       # Margin 0.32 >= 0.15
-            },
-        ],
+        "weak": [repair_box, poison_box],
     }
     rev_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    stats = clean_poison_labels_ai(dataset_dir=temp_dataset_dir)
+    stats = clean_poison_labels_ai(dataset_dir=temp_dataset_dir, exemplar_memory=memory)
     assert stats["ok"] is True
     assert stats["auto_repaired_boxes"] >= 1
     assert stats["poison_deleted_boxes"] >= 1
@@ -142,10 +220,11 @@ def test_layer1_exemplar_memory_repair_and_suppression(temp_dataset_dir):
     # One box repaired and kept, the other deleted
     remaining = saved["trusted"] + saved["weak"]
     assert len(remaining) == 1
-    assert remaining[0]["class_id"] == 2  # Repaired from 0 to 2
+    assert remaining[0]["class_id"] == 2  # Repaired from 0 to 2 by real exemplar match
+    assert remaining[0].get("repaired_by_exemplar") is True
 
 
-def test_layer2_flat_surface_and_hud_poison(temp_dataset_dir):
+def test_layer2_flat_surface_and_hud_poison(temp_dataset_dir, tmp_path):
     """Layer 2: Boxes on flat texture (Laplacian var < 10) or illegal HUD zones pruned."""
     img_path = temp_dataset_dir / "images" / "train" / "img_flat.jpg"
     _create_synthetic_test_image(img_path, flat=True)  # Completely uniform/flat image
@@ -168,7 +247,7 @@ def test_layer2_flat_surface_and_hud_poison(temp_dataset_dir):
     }
     rev_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    stats = clean_poison_labels_ai(dataset_dir=temp_dataset_dir)
+    stats = clean_poison_labels_ai(dataset_dir=temp_dataset_dir, exemplar_memory=_isolated_memory(tmp_path))
     assert stats["ok"] is True
     assert stats["poison_deleted_boxes"] >= 1
 
@@ -177,7 +256,133 @@ def test_layer2_flat_surface_and_hud_poison(temp_dataset_dir):
     assert len(saved["weak"]) == 0
 
 
-def test_work_package_j_bulk_prune_preserves_image_and_good_boxes(temp_dataset_dir):
+def test_layer2_hud_region_poison(temp_dataset_dir, tmp_path):
+    """Layer 2 HUD: a world-resource box centred in the minimap HUD region
+    (top-right, x 0.82..1.0 / y 0.02..0.32) is poison and must be deleted,
+    while an allowed minimap class (sprout, 9) centred in the same region
+    survives. Uses an empty temp ExemplarMemory so no exemplar match
+    interferes with the HUD decision."""
+    img_path = temp_dataset_dir / "images" / "train" / "img_hud.jpg"
+    _create_synthetic_test_image(img_path, flat=False)
+
+    rev_path = temp_dataset_dir / "review" / "train" / "img_hud.json"
+    payload = {
+        "stem": "img_hud",
+        "split": "train",
+        "trusted": [],
+        "weak": [
+            {
+                "class_id": 0,  # world resource — NOT allowed inside the minimap HUD
+                "cx": 0.9,
+                "cy": 0.15,
+                "w": 0.1,
+                "h": 0.1,
+                "confidence": 0.70,
+            },
+            {
+                "class_id": 9,  # minimap sprout — allowed inside the minimap HUD
+                "cx": 0.9,
+                "cy": 0.15,
+                "w": 0.05,
+                "h": 0.05,
+                "confidence": 0.70,
+            },
+        ],
+    }
+    rev_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    memory = ExemplarMemory(json_path=tmp_path / "exemplars.json")
+    stats = clean_poison_labels_ai(dataset_dir=temp_dataset_dir, exemplar_memory=memory)
+    assert stats["ok"] is True
+    assert stats["hud_poison_deleted"] >= 1
+    assert stats["poison_deleted_boxes"] >= 1
+
+    saved = json.loads(rev_path.read_text(encoding="utf-8"))
+    remaining = saved["trusted"] + saved["weak"]
+    assert len(remaining) == 1
+    assert remaining[0]["class_id"] == 9  # Only the allowed HUD class survives
+
+
+def test_layer3_omni_synthetic_cull(temp_dataset_dir, tmp_path):
+    """Layer 3: omni synthetic boxes are culled even with high confidence."""
+    img_path = temp_dataset_dir / "images" / "train" / "img_omni.jpg"
+    _create_synthetic_test_image(img_path, flat=False)
+
+    rev_path = temp_dataset_dir / "review" / "train" / "img_omni.json"
+    payload = {
+        "stem": "img_omni",
+        "split": "train",
+        "trusted": [],
+        "weak": [
+            {
+                "class_id": 3,
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.2,
+                "confidence": 0.88,
+                "source": "omni_synthetic_test",
+            }
+        ],
+    }
+    rev_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    memory = ExemplarMemory(json_path=tmp_path / "exemplars.json")
+    stats = clean_poison_labels_ai(dataset_dir=temp_dataset_dir, exemplar_memory=memory)
+    assert stats["ok"] is True
+    assert stats["omni_demoted_boxes"] >= 1
+    assert stats["poison_deleted_boxes"] >= 1
+
+    saved = json.loads(rev_path.read_text(encoding="utf-8"))
+    assert len(saved["trusted"]) == 0
+    assert len(saved["weak"]) == 0
+
+
+def test_layer3_nms_deduplication(temp_dataset_dir, tmp_path):
+    """Layer 3: two same-class boxes with IoU > 0.65 collapse to the
+    higher-confidence one (IoU of the pair below is ~0.82)."""
+    img_path = temp_dataset_dir / "images" / "train" / "img_nms.jpg"
+    _create_synthetic_test_image(img_path, flat=False)
+
+    rev_path = temp_dataset_dir / "review" / "train" / "img_nms.json"
+    payload = {
+        "stem": "img_nms",
+        "split": "train",
+        "trusted": [],
+        "weak": [
+            {
+                "class_id": 0,
+                "cx": 0.5,
+                "cy": 0.5,
+                "w": 0.2,
+                "h": 0.2,
+                "confidence": 0.88,
+            },
+            {
+                "class_id": 0,
+                "cx": 0.51,
+                "cy": 0.51,
+                "w": 0.2,
+                "h": 0.2,
+                "confidence": 0.80,
+            },
+        ],
+    }
+    rev_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    memory = ExemplarMemory(json_path=tmp_path / "exemplars.json")
+    stats = clean_poison_labels_ai(dataset_dir=temp_dataset_dir, exemplar_memory=memory)
+    assert stats["ok"] is True
+    assert stats["deduped_boxes"] >= 1
+
+    saved = json.loads(rev_path.read_text(encoding="utf-8"))
+    remaining = saved["trusted"] + saved["weak"]
+    assert len(remaining) == 1
+    assert remaining[0]["class_id"] == 0
+    assert remaining[0]["confidence"] == 0.88  # Higher-confidence duplicate kept
+
+
+def test_work_package_j_bulk_prune_preserves_image_and_good_boxes(temp_dataset_dir, tmp_path):
     """Work Package J: Image with 4 boxes (3 high: %92, %95, %91; 1 low: %35).
     Verifies that ONLY the 1 low-confidence box is pruned, the image is preserved,
     the 3 good boxes are kept as Emin (trusted=True), and both .json and .txt labels are updated.
@@ -188,11 +393,13 @@ def test_work_package_j_bulk_prune_preserves_image_and_good_boxes(temp_dataset_d
     lbl_path = temp_dataset_dir / "labels" / "train" / "frame_wpj.txt"
     rev_path = temp_dataset_dir / "review" / "train" / "frame_wpj.json"
 
-    # 4 boxes: 3 high conf (0.92, 0.95, 0.91), 1 low conf (0.35)
+    # 4 boxes: 3 high conf (0.92, 0.95, 0.91), 1 low conf (0.35).
+    # E-07: high confidence alone never trusts — the 3 good boxes carry
+    # per-box human approval so they survive as Emin (trusted=True).
     boxes = [
-        {"class_id": 0, "cx": 0.2, "cy": 0.2, "w": 0.1, "h": 0.1, "confidence": 0.92},
-        {"class_id": 1, "cx": 0.4, "cy": 0.4, "w": 0.1, "h": 0.1, "confidence": 0.95},
-        {"class_id": 2, "cx": 0.6, "cy": 0.6, "w": 0.1, "h": 0.1, "confidence": 0.91},
+        {"class_id": 0, "cx": 0.2, "cy": 0.2, "w": 0.1, "h": 0.1, "confidence": 0.92, "human_approved": True},
+        {"class_id": 1, "cx": 0.4, "cy": 0.4, "w": 0.1, "h": 0.1, "confidence": 0.95, "human_approved": True},
+        {"class_id": 2, "cx": 0.6, "cy": 0.6, "w": 0.1, "h": 0.1, "confidence": 0.91, "human_approved": True},
         {"class_id": 3, "cx": 0.8, "cy": 0.8, "w": 0.1, "h": 0.1, "confidence": 0.35},
     ]
 
@@ -212,11 +419,13 @@ def test_work_package_j_bulk_prune_preserves_image_and_good_boxes(temp_dataset_d
     }
     rev_path.write_text(json.dumps(rev_payload, indent=2), encoding="utf-8")
 
-    # Execute box-level bulk pruning with threshold 0.85
+    # Execute box-level bulk pruning with threshold 0.85, teaching the
+    # pruned box into an isolated temp memory (never the shared store).
     stats = prune_low_confidence_boxes_in_dataset(
         dataset_dir=temp_dataset_dir,
         min_confidence=0.85,
         teach_negative=True,
+        exemplar_memory=_isolated_memory(tmp_path),
     )
 
     assert stats["ok"] is True
@@ -261,35 +470,49 @@ def test_unverified_heuristic_sources_constant():
 
 
 def test_calibrate_box_confidence_and_trust_human_and_seeds():
-    """Human approvals and gather seeds MUST be trusted=True, weak=False, conf >= 0.90."""
-    # Hand label
+    """P1-12 (K-32/K-34, F-1212 never inflate): explicit human decisions
+    (hand_label / human_approved) trust WITHOUT inflating confidence —
+    the measured value is kept as-is. A bare "approved" pipeline flag and
+    a gather seed are NOT human decisions: they stay weak/untrusted."""
+    # Hand label: trusted, confidence kept at the measured 0.40 (no 0.90 floor).
     b1 = calibrate_box_confidence_and_trust({"class_id": 0, "confidence": 0.40, "hand_label": True})
     assert b1["trusted"] is True
     assert b1["weak"] is False
-    assert b1["confidence"] >= 0.90
+    assert b1["confidence"] == 0.40
 
-    # Human approved
+    # Human approved: trusted, confidence kept at the measured 0.60.
     b2 = calibrate_box_confidence_and_trust({"class_id": 1, "confidence": 0.60, "human_approved": True})
     assert b2["trusted"] is True
     assert b2["weak"] is False
-    assert b2["confidence"] >= 0.90
+    assert b2["confidence"] == 0.60
 
-    # Approved flag
+    # Hand label with NO measured confidence: trusted, but confidence is
+    # 0.0 and flagged fabricated (never invented as 0.90).
+    b0 = calibrate_box_confidence_and_trust({"class_id": 0, "hand_label": True})
+    assert b0["trusted"] is True
+    assert b0["weak"] is False
+    assert b0["confidence"] == 0.0
+    assert b0["confidence_fabricated"] is True
+
+    # Bare "approved" flag: pipeline flag, not a human decision — weak.
     b3 = calibrate_box_confidence_and_trust({"class_id": 2, "confidence": 0.50, "approved": True})
-    assert b3["trusted"] is True
-    assert b3["weak"] is False
-    assert b3["confidence"] >= 0.90
+    assert b3["trusted"] is False
+    assert b3["weak"] is True
+    assert b3["confidence"] == 0.50
 
-    # F gather prompt template seed
+    # F gather prompt template seed — Y1: the seed is cid 13
+    # (skill_ui_prompt); cid 7 is herb_lumina, a material, not a prompt.
+    # P1-12: a seed alone is not a human decision — weak, confidence kept.
     b4 = calibrate_box_confidence_and_trust({
-        "class_id": 7,
+        "class_id": 13,
+        "class_name": "skill_ui_prompt",
         "gather_key": "f",
         "source": "vision_f_gather_prompt",
         "confidence": 0.70,
     })
-    assert b4["trusted"] is True
-    assert b4["weak"] is False
-    assert b4["confidence"] >= 0.90
+    assert b4["trusted"] is False
+    assert b4["weak"] is True
+    assert b4["confidence"] == 0.70
 
 
 def test_calibrate_box_confidence_and_trust_unverified_heuristics():
@@ -332,12 +555,15 @@ def test_calibrate_box_confidence_and_trust_material_conflicts():
     assert cal2["weak"] is True
     assert cal2["confidence"] <= 0.45
 
-    # 3. Matching material: herb_aria on aria frame -> NOT conflicting
+    # 3. Matching material: herb_aria on aria frame -> NOT conflicting.
+    # E-07: high confidence alone never trusts, so the matching box
+    # carries per-box human approval to stay trusted at 0.92.
     box_match = {
         "class_id": 0,
         "class_name": "herb_aria",
         "confidence": 0.92,
         "source": "vision_3d_crest",
+        "human_approved": True,
     }
     cal3 = calibrate_box_confidence_and_trust(box_match, stem="boot_478467_000_aria_3d_crest_far")
     assert cal3["trusted"] is True
@@ -346,16 +572,27 @@ def test_calibrate_box_confidence_and_trust_material_conflicts():
 
 
 def test_requeue_labeled_dataset_default_conf_and_unverified_weak(temp_dataset_dir):
-    """Requeue with default_conf=0.58 correctly sends unverified .txt boxes to weak (Şüpheli)."""
+    """Requeue with default_conf=0.58 keeps the 0.58 default (imza aynen).
+
+    §7 P0-8 requeue kararı: TXT-only kare requeue'da hand_label damgası
+    alır (diskteki 5-alanlı TXT satırı el etiketiyle ayırt edilemez) ve
+    damgalı kare korumalı sayılır — kare düzeyinde atlanır, review JSON
+    yazılmaz. Uçtan uca requeue artık bu kareyi kuyruğa almaz; kutuların
+    Emin/Şüpheli hükmü damgasız kutuların doğrudan
+    _normalize_requeue_box geçişiyle denetlenir: ölçülmüş güven >= 0.85
+    trusted olur; kanıtsız kutu (0.60 / varsayılan 0.58) ve materyal
+    çatışmalı satır (orichalcum/aria, <= 0.45 kapağı) weak kalır — damga
+    artık çatışma kapağını aşmaz.
+    """
     img_path = temp_dataset_dir / "images" / "train" / "boot_001_aria_3d_crest_far.jpg"
     _create_synthetic_test_image(img_path, flat=False)
 
     lbl_path = temp_dataset_dir / "labels" / "train" / "boot_001_aria_3d_crest_far.txt"
     lines = [
-        "0 0.5 0.5 0.1 0.1 0.92",  # Verified explicit >= 0.85 -> trusted (Emin)
-        "1 0.3 0.3 0.1 0.1 0.60",  # Explicit < 0.85 -> weak (Şüpheli)
-        "0 0.7 0.7 0.1 0.1",       # No explicit conf -> default 0.58 -> weak (Şüpheli)
-        "3 0.8 0.8 0.1 0.1 0.90",  # orichalcum on aria stem -> material conflict -> weak (Şüpheli)
+        "0 0.5 0.5 0.1 0.1 0.92",  # Explicit >= 0.85 -> trusted (Emin)
+        "1 0.3 0.3 0.1 0.1 0.60",  # §7: kanıtsız -> weak
+        "0 0.7 0.7 0.1 0.1",       # §7: default 0.58 -> weak
+        "3 0.8 0.8 0.1 0.1 0.90",  # §7: orichalcum/aria çatışması -> weak (<= 0.45)
     ]
     lbl_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -365,21 +602,36 @@ def test_requeue_labeled_dataset_default_conf_and_unverified_weak(temp_dataset_d
     )
     assert stats["ok"] is True
     assert stats["default_conf"] == 0.58
+    assert stats["samples"] == 0
+    assert stats["boxes"] == 0
+    assert stats["skipped_protected"] == 1
 
     rev_file = temp_dataset_dir / "review" / "train" / "boot_001_aria_3d_crest_far.json"
-    assert rev_file.is_file()
-    payload = json.loads(rev_file.read_text(encoding="utf-8"))
+    assert not rev_file.is_file()
 
-    trusted = payload["trusted"]
-    weak = payload["weak"]
+    # Damgasız kutularda Emin/Şüpheli ayrımı korunur (§7: güven yalnızca
+    # ölçülmüş güven >= emin ile kazanılır; damga güven vermez).
+    parsed = _legacy_weak_from_txt(lbl_path)
+    assert len(parsed) == 4
+    normalized = [
+        _normalize_requeue_box(
+            dict(b), stem="boot_001_aria_3d_crest_far", emin_threshold=0.85
+        )
+        for b in parsed
+    ]
+    assert all(n is not None for n in normalized)
 
-    # Only line 0 (class 0, conf 0.92, matching material) is trusted!
+    trusted = [n for n in normalized if n["trusted"] is True]
+    weak = [n for n in normalized if n["trusted"] is False]
+
     assert len(trusted) == 1
     assert trusted[0]["class_id"] == 0
     assert trusted[0]["confidence"] == 0.92
     assert trusted[0]["trusted"] is True
 
-    # Lines 1 (conf 0.60), 2 (unverified default 0.58), and 3 (conflict <= 0.45) are weak!
     assert len(weak) == 3
+    assert weak[0]["confidence"] <= 0.45  # materyal çatışması kapağı
+    assert weak[1]["confidence"] == 0.58  # varsayılan yer tutucu
+    assert weak[2]["confidence"] <= 0.45  # orichalcum/aria çatışması
     assert all(b["trusted"] is False and b["weak"] is True for b in weak)
 

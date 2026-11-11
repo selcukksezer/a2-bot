@@ -17,12 +17,21 @@ import logging
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 from PyQt6.QtCore import QObject, Qt, QTimer, QUrl, pyqtSlot
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QApplication, QVBoxLayout, QWidget
+
+# P3-7 (v18): tier renkleri/eşikleri tek kaynaktan — ui.shell_theme (o da
+# dataset_factory/confidence_tier_coloring'dan okur).
+from ui.shell_theme import (
+    CONFIDENCE_HIGH_THRESHOLD,
+    CONFIDENCE_MEDIUM_THRESHOLD,
+    CONFIDENCE_TIER_COLORS,
+)
 
 logger = logging.getLogger("Gatherion.YoloPipelineWeb")
 
@@ -84,6 +93,41 @@ html, body {
 }
 .err-card .thumb-a, .err-card .thumb-b { background-image: none !important; }
 """
+
+
+def _tier_override_css() -> str:
+    """Tier box colours for the served web page, generated from the single
+    Python source (CONFIDENCE_TIER_COLORS).
+
+    P3-7 (v18): the prototype's own CSS vars resolve the same tiers to
+    different hexes (--green #2ED573, --amber #FFB92E, --red #FF5A5F in
+    assets/prototypes/yolo-fabrikasi.html) than the Qt panel
+    (#22c55e/#fb923c/#ef4444). This injected block — appended to the head
+    after the prototype styles, with !important — makes the served page
+    follow the canonical colours even if the prototype theme drifts again.
+    """
+    from dataset_factory.confidence_tier_coloring import hex_to_rgb
+
+    def _rgba(hex_color: str, alpha: float) -> str:
+        r, g, b = hex_to_rgb(hex_color)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    green = CONFIDENCE_TIER_COLORS["confident"]
+    amber = CONFIDENCE_TIER_COLORS["suspicious"]
+    red = CONFIDENCE_TIER_COLORS["low"]
+    return (
+        "\n/* P3-7: tier box colours — single source ui.shell_theme.CONFIDENCE_TIER_COLORS */\n"
+        f".bbox.green{{border-color:{green} !important;color:{green} !important;"
+        f"box-shadow:0 0 20px {_rgba(green, 0.35)},inset 0 0 18px {_rgba(green, 0.10)} !important}}\n"
+        f".bbox.green label{{background:{green} !important}}\n"
+        f".bbox.amber{{border-color:{amber} !important;color:{amber} !important;"
+        f"box-shadow:0 0 20px {_rgba(amber, 0.35)},inset 0 0 18px {_rgba(amber, 0.10)} !important}}\n"
+        f".bbox.amber label{{background:{amber} !important}}\n"
+        f".bbox.red{{border-color:{red} !important;color:{red} !important;"
+        f"box-shadow:0 0 20px {_rgba(red, 0.40)},inset 0 0 18px {_rgba(red, 0.12)} !important}}\n"
+        f".bbox.red label{{background:{red} !important}}\n"
+    )
+
 
 _BRIDGE_JS = r"""
 (function () {
@@ -176,7 +220,7 @@ _BRIDGE_JS = r"""
     if (!empty) {
       empty = document.createElement('div');
       empty.className = 'gatherion-empty';
-      empty.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#6d8093;font-size:14px;z-index:5;pointer-events:none;';
+      empty.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#8A9BB0;font-size:15px;z-index:5;pointer-events:none;';
       empty.textContent = 'Canlı kare yok';
       scene.appendChild(empty);
     }
@@ -191,7 +235,7 @@ _BRIDGE_JS = r"""
     if (!empty) {
       empty = document.createElement('div');
       empty.className = 'gatherion-empty';
-      empty.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#6d8093;font-size:14px;z-index:5;pointer-events:none;';
+      empty.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#8A9BB0;font-size:15px;z-index:5;pointer-events:none;';
       empty.textContent = 'Kuyruk boş';
       scene.appendChild(empty);
     }
@@ -203,15 +247,24 @@ _BRIDGE_JS = r"""
     (boxes || []).forEach(function (bx) {
       var el = document.createElement('div');
       var conf = Number(bx.conf || 0);
-      el.className = 'bbox ' + (conf >= 0.9 ? 'green' : conf >= 0.75 ? 'amber' : 'red');
-      var left = Math.max(0, (Number(bx.cx) - Number(bx.w) / 2) * 100);
-      var top = Math.max(0, (Number(bx.cy) - Number(bx.h) / 2) * 100);
+      if (!isFinite(conf)) conf = 0;
+      // P2-23 (D061/D063-K1): el etiketli (trusted) kutu yeşil + ✓
+      // rozetle çizilir; güveni ölçülmemiş el kutusu "%0" değil "el" yazar.
+      // Thresholds must match CONFIDENCE_COLOR_TIERS in Python (high >= 0.85, medium >= 0.70).
+      var isTrusted = !!bx.trusted;
+      el.className = 'bbox ' + (isTrusted ? 'green' : (conf >= 0.85 ? 'green' : conf >= 0.70 ? 'amber' : 'red'));
+      var wPct = Math.max(0, Number(bx.w) * 100 || 0);
+      var hPct = Math.max(0, Number(bx.h) * 100 || 0);
+      var left = Math.min(100, Math.max(0, (Number(bx.cx) - Number(bx.w) / 2) * 100 || 0));
+      var top = Math.min(100, Math.max(0, (Number(bx.cy) - Number(bx.h) / 2) * 100 || 0));
       el.style.left = left + '%';
       el.style.top = top + '%';
-      el.style.width = (Number(bx.w) * 100) + '%';
-      el.style.height = (Number(bx.h) * 100) + '%';
+      // Clamp size so the box never overflows the scene (F-0780).
+      el.style.width = Math.max(0, Math.min(wPct, 100 - left)) + '%';
+      el.style.height = Math.max(0, Math.min(hPct, 100 - top)) + '%';
       var lab = document.createElement('label');
-      lab.textContent = (bx.class_name || '?') + ' · ' + conf.toFixed(2);
+      lab.textContent = (isTrusted ? '✓ ' : '') + (bx.class_name || '?') +
+        ' · ' + ((isTrusted && conf <= 0) ? 'el' : conf.toFixed(2));
       el.appendChild(lab);
       scene.appendChild(el);
     });
@@ -252,7 +305,7 @@ _BRIDGE_JS = r"""
         var short = String(it.stem || '');
         if (short.length > 28) short = short.slice(0, 12) + '…' + short.slice(-12);
         btn.innerHTML = '<b>#' + short + '</b><small>' + it.split + ' · ' + it.n_weak +
-          ' zayıf · ' + Number(it.conf || 0).toFixed(2) + '</small>';
+          ' zayıf · ' + (it.n_trusted || 0) + ' emin · ' + Number(it.conf || 0).toFixed(2) + '</small>';
         btn.addEventListener('click', function (ev) {
           ev.preventDefault();
           if (window.bridge && typeof window.bridge.selectReview === 'function') {
@@ -280,7 +333,10 @@ _BRIDGE_JS = r"""
       scene.style.setProperty('background-size', 'cover', 'important');
       scene.style.setProperty('background-position', 'center', 'important');
       if (empty) empty.style.display = 'none';
-      paintBoxes(scene, cur.weak || []);
+      // P2-23 (D061/D063-K1): trusted kutular da çizilir — eskiden
+      // yalnızca weak ihraç ediliyor, TXT-only el etiketli karede
+      // "Kutu yok" yazıyordu.
+      paintBoxes(scene, (cur.weak || []).concat(cur.trusted || []));
       setText('reviewTitle', cur.title || ('Kare #' + cur.stem));
       setText('reviewSub', cur.sub || '');
       var det = $('detList');
@@ -289,7 +345,14 @@ _BRIDGE_JS = r"""
         (cur.weak || []).forEach(function (bx) {
           var row = document.createElement('div');
           row.className = 'det-row';
-          row.textContent = (bx.class_name || '?') + ' · ' + Number(bx.conf || 0).toFixed(2);
+          row.textContent = (bx.class_name || '?') + ' · ' + Number(bx.conf || 0).toFixed(2) + ' · şüpheli';
+          det.appendChild(row);
+        });
+        (cur.trusted || []).forEach(function (bx) {
+          var row = document.createElement('div');
+          row.className = 'det-row';
+          row.textContent = '✓ ' + (bx.class_name || '?') + ' · ' +
+            (Number(bx.conf || 0) <= 0 ? 'el' : Number(bx.conf || 0).toFixed(2)) + ' · emin';
           det.appendChild(row);
         });
       }
@@ -533,11 +596,41 @@ class _YoloWebBridge(QObject):
         self._host = host
 
     def _be(self) -> Any:
-        return self._host.backend
+        try:
+            return self._host.backend
+        except Exception as exc:
+            logger.warning("YOLO bridge: backend unavailable: %s", exc)
+            return None
+
+    def _call_backend(self, method_name: str, *args: Any) -> bool:
+        """Call a backend method if it exists; never raise into a Qt slot.
+
+        Previously several slots called backend methods directly
+        (e.g. ``self._be().on_open_dataset_folder_clicked()``) so a missing
+        method raised AttributeError, and the guarded slots silently no-op'd
+        with no trace (F-0703). Missing/non-callable/failed calls now log a
+        warning and return False.
+        """
+        be = self._be()
+        if be is None:
+            logger.warning("YOLO bridge: no backend for %s; action ignored", method_name)
+            return False
+        fn = getattr(be, method_name, None)
+        if not callable(fn):
+            logger.warning(
+                "YOLO bridge: backend has no callable %s; action ignored", method_name
+            )
+            return False
+        try:
+            fn(*args)
+        except Exception as exc:
+            logger.warning("YOLO bridge: backend.%s failed: %s", method_name, exc)
+            return False
+        return True
 
     @pyqtSlot()
     def openDataset(self) -> None:
-        self._be().on_open_dataset_folder_clicked()
+        self._call_backend("on_open_dataset_folder_clicked")
 
     @pyqtSlot()
     def refresh(self) -> None:
@@ -545,107 +638,92 @@ class _YoloWebBridge(QObject):
 
     @pyqtSlot()
     def freeze(self) -> None:
-        self._be()._freeze_dataset()
+        self._call_backend("_freeze_dataset")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def train(self) -> None:
-        self._be().on_train_rtx_clicked()
+        self._call_backend("on_train_rtx_clicked")
 
     @pyqtSlot()
     def stopTrain(self) -> None:
-        fn = getattr(self._be(), "_stop_training", None)
-        if callable(fn):
-            fn()
+        self._call_backend("_stop_training")
 
     @pyqtSlot()
     def bootstrap(self) -> None:
-        self._be().on_bootstrap_clicked()
+        self._call_backend("on_bootstrap_clicked")
 
     @pyqtSlot()
     def validate(self) -> None:
-        fn = getattr(self._be(), "_run_validate", None)
-        if callable(fn):
-            fn()
+        self._call_backend("_run_validate")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def finishValidate(self) -> None:
-        fn = getattr(self._be(), "_finish_validate", None)
-        if callable(fn):
-            fn()
+        self._call_backend("_finish_validate")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def publish(self) -> None:
-        fn = getattr(self._be(), "_publish_model", None)
-        if callable(fn):
-            fn()
+        self._call_backend("_publish_model")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def rollback(self) -> None:
-        fn = getattr(self._be(), "_rollback_model", None)
-        if callable(fn):
-            fn()
+        self._call_backend("_rollback_model")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def finishCapture(self) -> None:
-        fn = getattr(self._be(), "_finish_capture_to_review", None)
-        if callable(fn):
-            fn()
+        self._call_backend("_finish_capture_to_review")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def reviewApprove(self) -> None:
-        self._be()._review_done("ok")
+        self._call_backend("_review_done", "ok")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def reviewReject(self) -> None:
-        self._be()._review_done("no")
+        self._call_backend("_review_done", "no")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def reviewSkip(self) -> None:
-        self._be()._review_skip()
+        self._call_backend("_review_skip")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def reviewBulk(self) -> None:
-        self._be()._bulk_approve()
+        self._call_backend("_bulk_approve")
         self._host.push_state_to_web()
 
     @pyqtSlot(int)
     def selectReview(self, index: int) -> None:
         be = self._be()
+        if be is None:
+            return
         items = getattr(be, "_review_items", None) or []
         if not items:
+            logger.debug("YOLO bridge: selectReview with empty review queue; ignored")
             return
         idx = max(0, min(int(index), len(items) - 1))
         be._review_index = idx
-        fn = getattr(be, "_render_review_frame", None)
-        if callable(fn):
-            fn()
+        self._call_backend("_render_review_frame")
         self._host.push_state_to_web()
 
     @pyqtSlot()
     def clearLog(self) -> None:
-        fn = getattr(self._be(), "_clear_log", None)
-        if callable(fn):
-            fn()
+        self._call_backend("_clear_log")
 
     @pyqtSlot()
     def toggleCapture(self) -> None:
-        fn = getattr(self._be(), "_on_capture_toggle", None)
-        if callable(fn):
-            fn()
+        self._call_backend("_on_capture_toggle")
         self._host.push_state_to_web()
 
     @pyqtSlot(int)
     def goStep(self, step: int) -> None:
-        self._be()._go_step(int(step))
+        self._call_backend("_go_step", int(step))
         self._host.push_state_to_web()
 
 
@@ -665,6 +743,7 @@ class YoloPipelineWebPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        self._layout = layout
 
         self._web_ok = False
         self.view: Optional[Any] = None
@@ -672,6 +751,7 @@ class YoloPipelineWebPage(QWidget):
         self._channel: Optional[Any] = None
         self._sync_timer: Optional[QTimer] = None
         self._backend: Optional[Any] = None
+        self._qt_fallback_mounted = False
 
         if self._should_use_webengine():
             try:
@@ -679,6 +759,8 @@ class YoloPipelineWebPage(QWidget):
                 return
             except Exception as exc:
                 logger.warning("WebEngine mount failed (%s) — Qt fallback", exc)
+                self._fall_back_to_qt()
+                return
 
         self._mount_qt_fallback(layout)
 
@@ -686,9 +768,41 @@ class YoloPipelineWebPage(QWidget):
     def _should_use_webengine() -> bool:
         return webengine_allowed()
 
+    def _fall_back_to_qt(self) -> None:
+        """Drop the WebEngine view (if any) and mount the Qt page (F-0616).
+
+        Previously _on_load_finished only logged a load failure and returned,
+        leaving an empty page with no recovery path.
+        """
+        if self._qt_fallback_mounted:
+            return
+        if self._sync_timer is not None and self._sync_timer.isActive():
+            self._sync_timer.stop()
+        self._web_ok = False
+        if self.view is not None:
+            view = self.view
+            self.view = None
+            try:
+                self._layout.removeWidget(view)
+            except Exception:
+                pass
+            view.deleteLater()
+        self._mount_qt_fallback(self._layout)
+
     def _mount_qt_fallback(self, layout: QVBoxLayout) -> None:
-        layout.addWidget(self.backend, stretch=1)
-        self.backend.show()
+        if self._qt_fallback_mounted:
+            return
+        self._qt_fallback_mounted = True
+        # A QDialog must NOT be added to a layout as a widget (F-0615):
+        # reparent it as a plain embedded widget first.
+        backend = self.backend
+        backend.setParent(self)
+        backend.setWindowFlags(Qt.WindowType.Widget)
+        layout.addWidget(backend, stretch=1)
+        backend.show()
+        timer = getattr(backend, "_refresh_timer", None)
+        if timer is not None and not timer.isActive():
+            timer.start()
         logger.info("YOLO page using Qt FactoryDialog fallback")
 
     def _mount_webengine(self, layout: QVBoxLayout) -> None:
@@ -749,9 +863,10 @@ class YoloPipelineWebPage(QWidget):
 
     def _on_load_finished(self, ok: bool) -> None:
         if not ok or self.view is None:
-            logger.error("Failed to load YOLO prototype HTML")
+            logger.error("Failed to load YOLO prototype HTML — falling back to Qt UI")
+            self._fall_back_to_qt()
             return
-        css_json = json.dumps(_SHELL_INJECT_CSS)
+        css_json = json.dumps(_SHELL_INJECT_CSS + _tier_override_css())
         inject = (
             "(function(){"
             f"var css={css_json};"
@@ -808,61 +923,75 @@ class YoloPipelineWebPage(QWidget):
         super().closeEvent(event)
 
 
-CANONICAL_25_CLASSES: dict[int, str] = {
-    0: "player_self",
-    1: "player_other",
-    2: "monster_hostile",
-    3: "monster_passive",
-    4: "monster_boss",
-    5: "npc_vendor",
-    6: "npc_quest",
-    7: "resource_herb",
-    8: "resource_ore",
-    9: "resource_wood",
-    10: "resource_fish_spot",
-    11: "loot_bag",
-    12: "loot_chest",
-    13: "portal_gate",
-    14: "ui_health_bar",
-    15: "ui_mana_bar",
-    16: "ui_minimap",
-    17: "ui_dialog_box",
-    18: "ui_captcha_prompt",
-    19: "ui_inventory_slot",
-    20: "obstacle_rock",
-    21: "mount_entity",
-    22: "hp_potion",
-    23: "mp_potion",
-    24: "buff_scroll",
-}
-
+# Confidence tiers — P3-7 (v18): tek kaynak ui.shell_theme (o da
+# dataset_factory/confidence_tier_coloring'dan okur; test-pinned 0.85/0.70).
+# Eskiden bu modül ile ui/yolo_panel.py orta eşiği 0.60 sayıyordu (F-0704
+# o değeri "birleştirme" diye not etmişti) ama fabrika tarafı 0.70'te
+# kalmıştı; 0.60-0.69 güven panelde "şüpheli", fabrikada "düşük" çıkıyordu.
+# Kanonik orta eşik 0.70'tir; CONFIDENCE_* sabitleri yukarıdaki importtan gelir.
 CONFIDENCE_COLOR_TIERS: dict[str, dict[str, Any]] = {
-    "high": {"min": 0.85, "max": 1.0, "color": "#22c55e", "label": "Yuksek Guven"},
-    "medium": {"min": 0.60, "max": 0.85, "color": "#fb923c", "label": "Orta Guven"},
-    "low": {"min": 0.0, "max": 0.60, "color": "#ef4444", "label": "Dusuk Guven"},
+    "high": {"min": CONFIDENCE_HIGH_THRESHOLD, "max": 1.0, "color": CONFIDENCE_TIER_COLORS["confident"], "label": "Yuksek Guven"},
+    "medium": {"min": CONFIDENCE_MEDIUM_THRESHOLD, "max": CONFIDENCE_HIGH_THRESHOLD, "color": CONFIDENCE_TIER_COLORS["suspicious"], "label": "Orta Guven"},
+    "low": {"min": 0.0, "max": CONFIDENCE_MEDIUM_THRESHOLD, "color": CONFIDENCE_TIER_COLORS["low"], "label": "Dusuk Guven"},
 }
 
 
 def confidence_to_hex_color(conf: float) -> str:
     """Return 3-tier confidence hex color (#22c55e, #fb923c, #ef4444)."""
     val = float(conf or 0.0)
-    if val >= 0.85:
-        return "#22c55e"
-    if val >= 0.60:
-        return "#fb923c"
-    return "#ef4444"
+    if val >= CONFIDENCE_HIGH_THRESHOLD:
+        return CONFIDENCE_TIER_COLORS["confident"]
+    if val >= CONFIDENCE_MEDIUM_THRESHOLD:
+        return CONFIDENCE_TIER_COLORS["suspicious"]
+    return CONFIDENCE_TIER_COLORS["low"]
+
+
+def _canonical_classes() -> dict[int, str]:
+    """The 27 canonical classes (0..26), single-sourced from ui.yolo_panel.
+
+    Previously this module carried its own invented map (player_self,
+    monster_hostile, npc_vendor, ...) that conflicted with the panel /
+    calibration map on every id except the consumables (F-0545). The import
+    is function-level to avoid a top-level cycle (yolo_panel re-exports
+    create_yolo_factory_page from this module). S-1801: the panel map is
+    now the canonical 27 (0..26, incl. kinah=25, player_character=26).
+    """
+    from ui.yolo_panel import CLASS_ID_TO_NAME
+
+    return dict(CLASS_ID_TO_NAME)
+
+
+def _canonical_25_classes() -> dict[int, str]:
+    """Deprecated alias of _canonical_classes (legacy name, now 27 classes)."""
+    return _canonical_classes()
+
+
+def __getattr__(name: str) -> Any:
+    # Back-compat: CANONICAL_25_CLASSES as a module attribute, resolved lazily.
+    # The name is legacy (the map now holds the canonical 27 classes, 0..26);
+    # prefer CANONICAL_27_CLASSES / CANONICAL_CLASSES.
+    if name in ("CANONICAL_25_CLASSES", "CANONICAL_27_CLASSES", "CANONICAL_CLASSES"):
+        return _canonical_classes()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class ApprovedDatasetPool:
     """Lightweight web-bridge view over the approved dataset pool directory."""
 
+    # Counts are re-scanned at most once per TTL; previously every
+    # push_state_to_web() (every 2.5 s) ran three full rglobs (F-0705).
+    _COUNTS_CACHE_TTL_S = 5.0
+
     def __init__(self, dataset_dir: Optional[str] = None, only_approved: bool = True) -> None:
-        base = Path(dataset_dir) if dataset_dir else Path("dataset")
+        # Never CWD-relative: default to <repo-root>/dataset (F-0705).
+        base = Path(dataset_dir) if dataset_dir else Path(__file__).resolve().parent.parent / "dataset"
         self.dataset_dir = base
         self.approved_dir = base / "approved"
         self.pending_dir = base / "review"
         self.rejected_dir = base / "rejected"
         self.only_approved = bool(only_approved)
+        self._counts_cache: dict[str, int] = {}
+        self._counts_cached_at: float = 0.0
 
     def _count_images(self, folder: Path) -> int:
         if not folder.is_dir():
@@ -873,6 +1002,16 @@ class ApprovedDatasetPool:
         except Exception:
             return 0
 
+    def _cached_count(self, folder: Path) -> int:
+        now = time.monotonic()
+        if now - self._counts_cached_at >= self._COUNTS_CACHE_TTL_S:
+            self._counts_cache = {}
+            self._counts_cached_at = now
+        key = str(folder)
+        if key not in self._counts_cache:
+            self._counts_cache[key] = self._count_images(folder)
+        return self._counts_cache[key]
+
     def summary(self) -> dict[str, Any]:
         return {
             "pool": "ApprovedDatasetPool",
@@ -880,32 +1019,57 @@ class ApprovedDatasetPool:
             "approved_dir": str(self.approved_dir),
             "pending_dir": str(self.pending_dir),
             "rejected_dir": str(self.rejected_dir),
-            "approved_count": self._count_images(self.approved_dir),
-            "pending_count": self._count_images(self.pending_dir),
-            "rejected_count": self._count_images(self.rejected_dir),
+            "approved_count": self._cached_count(self.approved_dir),
+            "pending_count": self._cached_count(self.pending_dir),
+            "rejected_count": self._cached_count(self.rejected_dir),
             "only_approved": self.only_approved,
             "only_approved_label": "Sadece Onaylananlarla Eğit",
         }
 
 
+# Shared ApprovedDatasetPool instances, keyed by resolved dataset_dir (F-0705).
+# get_web_pipeline_extended_state() is called every 2.5 s by push_state_to_web;
+# it used to build a NEW pool on every call, so the per-instance
+# _COUNTS_CACHE_TTL_S cache never hit and every push ran three full rglobs.
+# Reusing one pool per dataset_dir makes the TTL cache actually work: counts
+# are re-scanned at most once per TTL instead of once per push.
+_WEB_POOL_CACHE: dict[str, ApprovedDatasetPool] = {}
+
+
+def _get_web_pool(dataset_dir: Optional[str] = None) -> ApprovedDatasetPool:
+    """Return the shared ApprovedDatasetPool for dataset_dir (F-0705)."""
+    key = str(Path(dataset_dir).resolve()) if dataset_dir else "__default__"
+    pool = _WEB_POOL_CACHE.get(key)
+    if pool is None:
+        pool = ApprovedDatasetPool(dataset_dir=dataset_dir, only_approved=True)
+        _WEB_POOL_CACHE[key] = pool
+    return pool
+
+
 def get_web_pipeline_extended_state(dataset_dir: Optional[str] = None) -> dict:
     """Return extended web pipeline state for ApprovedDatasetPool, 3-tier confidence colors,
-    only_approved training mode, and the 25 canonical classes (0..24).
+    only_approved training mode, and the 27 canonical classes (0..26) from
+    ui.yolo_panel.CLASS_ID_TO_NAME (F-0545, S-1801).
     """
-    pool = ApprovedDatasetPool(dataset_dir=dataset_dir, only_approved=True)
+    pool = _get_web_pool(dataset_dir)
     pool_summary = pool.summary()
-    class_list = [CANONICAL_25_CLASSES[i] for i in range(25)]
+    canonical_classes = _canonical_classes()
+    class_list = [canonical_classes[i] for i in range(27)]
     return {
         "pool_name": "ApprovedDatasetPool",
         "approved_dataset_pool": pool_summary,
         "only_approved": True,
         "only_approved_label": "Sadece Onaylananlarla Eğit",
-        "confidence_colors": ["#22c55e", "#fb923c", "#ef4444"],
+        "confidence_colors": [
+            CONFIDENCE_TIER_COLORS["confident"],
+            CONFIDENCE_TIER_COLORS["suspicious"],
+            CONFIDENCE_TIER_COLORS["low"],
+        ],
         "confidence_tiers": CONFIDENCE_COLOR_TIERS,
-        "num_classes": 25,
-        "canonical_class_count": 25,
-        "class_ids": list(range(25)),
-        "canonical_classes": dict(CANONICAL_25_CLASSES),
+        "num_classes": 27,
+        "canonical_class_count": 27,
+        "class_ids": list(range(27)),
+        "canonical_classes": dict(canonical_classes),
         "class_names": class_list,
     }
 

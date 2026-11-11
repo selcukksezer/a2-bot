@@ -29,14 +29,25 @@ from dataset_factory.scroll_potion_classifier import (
 from dataset_factory.yolo_auto_labeler import YOLOAutoLabeler, YOLO_CLASSES
 
 
-def _make_hsv_slot(
-    h_val: int,
-    s_val: int,
-    v_val: int,
+def _hsv_of_rgb(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Real-world RGB reference color -> OpenCV HSV triple (via cv2, not hand-tuned)."""
+    px = np.uint8([[[rgb[2], rgb[1], rgb[0]]]])
+    return tuple(int(v) for v in cv2.cvtColor(px, cv2.COLOR_BGR2HSV)[0][0])
+
+
+def _make_rgb_slot(
+    rgb: tuple[int, int, int],
     size: int = 36,
     with_border_variation: bool = True,
 ) -> np.ndarray:
-    """Create a synthetic slot crop in HSV with realistic inner icon and frame edges."""
+    """Create a synthetic slot crop in BGR from a real-world RGB reference color.
+
+    The color is specified as an RGB pigment (e.g. parchment, potion red) and
+    converted with cv2 -- never hand-picked from the classifier's own HSV
+    thresholds. The classifier receives BGR (is_hsv=False) and does its own
+    conversion, so the test exercises the production conversion path too.
+    """
+    h_val, s_val, v_val = _hsv_of_rgb(rgb)
     slot_hsv = np.zeros((size, size, 3), dtype=np.uint8)
     slot_hsv[:, :] = (h_val, s_val, v_val)
     if with_border_variation:
@@ -45,7 +56,16 @@ def _make_hsv_slot(
         slot_hsv[-4:, :, 2] = max(10, int(v_val) - 55)
         slot_hsv[8:14, 8:14, 2] = max(15, int(v_val) - 60)
         slot_hsv[18:26, 18:26, 2] = min(255, int(v_val) + 40)
-    return slot_hsv
+    return cv2.cvtColor(slot_hsv, cv2.COLOR_HSV2BGR)
+
+
+# Real-world RGB reference colors (pigment names, not classifier thresholds).
+PARCHMENT_RGB = (230, 211, 163)  # rolled parchment / buff scroll (#E6D3A3)
+HP_POTION_RGB = (200, 50, 50)  # red potion liquid (#C83232)
+MP_BLUE_RGB = (46, 111, 216)  # blue mana potion (#2E6FD8)
+MP_YELLOW_RGB = (229, 193, 0)  # golden-yellow serum (#E5C100)
+GOLDEN_SERUM_RGB = (242, 194, 0)  # saturated golden serum (#F2C200)
+SKILL_VIOLET_RGB = (150, 90, 220)  # violet-blue combat skill icon (#965ADC)
 
 
 def test_upper_row_buff_scroll_classification_and_no_skill_mislabel():
@@ -54,17 +74,17 @@ def test_upper_row_buff_scroll_classification_and_no_skill_mislabel():
     as `buff_scroll` and never as `skill_slot` or `skill_ui_prompt`.
     """
     classifier = HUDConsumableClassifier()
-    # Parchment HSV: H=20 (in [12, 28]), S=110 (in [30, 175]), V=180 (in [85, 235])
-    # Note: keep S < 95 or H=16 so it matches scroll_mask ([12..28, 30..175, 85..235])
-    # without triggering yellow MP potion mask ([20..35, 95..255, 95..255]).
-    scroll_hsv = _make_hsv_slot(h_val=16, s_val=110, v_val=180)
+    # Parchment RGB reference (#E6D3A3) converts to HSV ~(21, 74, 230): a tan
+    # parchment tone. It must read as a scroll, never as a yellow MP serum --
+    # the serum reference below (high saturation) is the boundary control.
+    scroll_bgr = _make_rgb_slot(PARCHMENT_RGB)
 
     for norm_cy in (UPPER_CONSUMABLE_ROW_Y_MIN, 0.900, UPPER_CONSUMABLE_ROW_Y_MAX):
         res = classifier.classify_slot(
-            scroll_hsv,
+            scroll_bgr,
             norm_cx=0.38,
             norm_cy=norm_cy,
-            is_hsv=True,
+            is_hsv=False,
         )
         assert res.should_label is True
         assert res.row_type == "upper_consumable_row"
@@ -74,6 +94,20 @@ def test_upper_row_buff_scroll_classification_and_no_skill_mislabel():
         assert res.category not in ("skill_slot", "skill_ui_prompt")
         assert res.class_id not in (13, 21)
 
+    # The same parchment slot given as HSV must classify identically -- the
+    # classifier's own BGR->HSV conversion must agree with the pre-converted input.
+    scroll_hsv = cv2.cvtColor(scroll_bgr, cv2.COLOR_BGR2HSV)
+    res_hsv = classifier.classify_slot(scroll_hsv, norm_cx=0.38, norm_cy=0.900, is_hsv=True)
+    assert res_hsv.category == "buff_scroll"
+    assert res_hsv.class_id == 22
+
+    # Boundary control: a saturated golden serum (same hue family as parchment,
+    # but high saturation) must be an MP potion, never a scroll.
+    serum_bgr = _make_rgb_slot(GOLDEN_SERUM_RGB)
+    serum_res = classifier.classify_slot(serum_bgr, norm_cx=0.38, norm_cy=0.900, is_hsv=False)
+    assert serum_res.category == "mp_potion"
+    assert serum_res.category != "buff_scroll"
+
 
 def test_upper_row_hp_potion_classification_and_no_skill_mislabel():
     """
@@ -81,15 +115,15 @@ def test_upper_row_hp_potion_classification_and_no_skill_mislabel():
     as `hp_potion` and never as `skill_slot` or `skill_ui_prompt`.
     """
     classifier = HUDConsumableClassifier()
-    # Red HP potion liquid: H=5 (in [0, 12]), S=200 (>= 105), V=200 (>= 75)
-    hp_hsv = _make_hsv_slot(h_val=5, s_val=200, v_val=200)
+    # Red potion RGB reference (#C83232) converts to HSV ~(0, 191, 200).
+    hp_bgr = _make_rgb_slot(HP_POTION_RGB)
 
     for norm_cy in (0.865, 0.895, 0.938):
         res = classifier.classify_slot(
-            hp_hsv,
+            hp_bgr,
             norm_cx=0.34,
             norm_cy=norm_cy,
-            is_hsv=True,
+            is_hsv=False,
         )
         assert res.should_label is True
         assert res.row_type == "upper_consumable_row"
@@ -106,17 +140,16 @@ def test_upper_row_mp_potion_blue_and_yellow_classification():
     slots must both be classified as `mp_potion` and never as `skill_slot` or `skill_ui_prompt`.
     """
     classifier = HUDConsumableClassifier()
-    # Blue MP potion: H=110 (in [95, 135]), S=180 (>= 85), V=190 (>= 75)
-    mp_blue_hsv = _make_hsv_slot(h_val=110, s_val=180, v_val=190)
-    # Yellow MP potion: H=30 (in [20, 35], outside scroll H<=28), S=200 (>= 95), V=200 (>= 95)
-    mp_yellow_hsv = _make_hsv_slot(h_val=30, s_val=200, v_val=200)
+    # Blue mana potion (#2E6FD8) and golden-yellow serum (#E5C100) RGB references.
+    mp_blue_bgr = _make_rgb_slot(MP_BLUE_RGB)
+    mp_yellow_bgr = _make_rgb_slot(MP_YELLOW_RGB)
 
-    for slot_hsv in (mp_blue_hsv, mp_yellow_hsv):
+    for slot_bgr in (mp_blue_bgr, mp_yellow_bgr):
         res = classifier.classify_slot(
-            slot_hsv,
+            slot_bgr,
             norm_cx=0.36,
             norm_cy=0.912,
-            is_hsv=True,
+            is_hsv=False,
         )
         assert res.should_label is True
         assert res.row_type == "upper_consumable_row"
@@ -146,16 +179,16 @@ def test_lower_row_skill_slot_separation_at_boundary():
     assert classifier.is_lower_skill_row(0.939) is True
 
     # Create a high-contrast combat skill icon (even if it has red/gold hues, in lower row it is skill_slot)
-    skill_hsv = _make_hsv_slot(h_val=5, s_val=200, v_val=200)
+    skill_bgr = _make_rgb_slot(HP_POTION_RGB)
     edges = np.zeros((36, 36), dtype=np.uint8)
     cv2.rectangle(edges, (6, 6), (30, 30), 255, 2)
 
     # At norm_cy = 0.938 -> upper consumable row -> hp_potion
     upper_res = classifier.classify_slot(
-        skill_hsv,
+        skill_bgr,
         norm_cx=0.40,
         norm_cy=0.938,
-        is_hsv=True,
+        is_hsv=False,
         slot_edges=edges,
     )
     assert upper_res.row_type == "upper_consumable_row"
@@ -165,10 +198,10 @@ def test_lower_row_skill_slot_separation_at_boundary():
     # At norm_cy = 0.939 and 0.960 -> lower skill row -> skill_slot
     for norm_cy in (0.939, 0.960):
         lower_res = classifier.classify_slot(
-            skill_hsv,
+            skill_bgr,
             norm_cx=0.40,
             norm_cy=norm_cy,
-            is_hsv=True,
+            is_hsv=False,
             slot_edges=edges,
         )
         assert lower_res.should_label is True
@@ -187,14 +220,14 @@ def test_center_emblem_and_empty_f8_slot_exclusion_never_skill_ui_prompt():
     labeled as `skill_slot` or `skill_ui_prompt`.
     """
     classifier = HUDConsumableClassifier()
-    scroll_hsv = _make_hsv_slot(h_val=16, s_val=110, v_val=180)
+    scroll_bgr = _make_rgb_slot(PARCHMENT_RGB)
 
     # Center level emblem in upper consumable row Y range
     emblem_res = classifier.classify_slot(
-        scroll_hsv,
+        scroll_bgr,
         norm_cx=0.50,
         norm_cy=0.900,
-        is_hsv=True,
+        is_hsv=False,
     )
     assert emblem_res.is_center_emblem is True
     assert emblem_res.should_label is False
@@ -223,17 +256,28 @@ def test_center_emblem_and_empty_f8_slot_exclusion_never_skill_ui_prompt():
 def test_full_frame_hud_scan_and_yolo_auto_labeler_never_emits_skill_ui_prompt():
     """
     Test 6: Full-frame HUD scan via both `HUDConsumableClassifier.scan_hud_slots` and
-    `YOLOAutoLabeler._scan_hud_and_skills` on a 1920x1080 synthetic HUD frame must:
-    - Classify upper row (`0.865 <= cy <= 0.938`) slots into `hp_potion` (18), `mp_potion` (19),
-      and `buff_scroll` (22), never `skill_slot` (21) or `skill_ui_prompt` (13).
-    - Classify lower row (`cy >= 0.939`) slots into `skill_slot` (21), never consumables or
+    `YOLOAutoLabeler._scan_hud_and_skills` on a 960x540 synthetic HUD frame must:
+    - Classify upper row (`0.865 <= cy <= 0.938`) slots into `hp_potion` (22), `mp_potion` (23),
+      and `buff_scroll` (24), never `skill_slot` (20) or `skill_ui_prompt` (13).
+    - Classify lower row (`cy >= 0.939`) slots into `skill_slot` (20), never consumables or
       `skill_ui_prompt` (13).
-    """
-    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
 
-    def _draw_hud_slot(x1: int, y1: int, size: int, hsv_color: tuple[int, int, int]) -> None:
-        bgr_px = cv2.cvtColor(np.uint8([[list(hsv_color)]]), cv2.COLOR_HSV2BGR)[0][0]
-        bgr_color = (int(bgr_px[0]), int(bgr_px[1]), int(bgr_px[2]))
+    NOTE (canonical ids): the classifier's `scan_hud_slots` still emits the
+    legacy HUD ids (18/19/22/21, `YOLO_HUD_CLASS_IDS`) — that is its own
+    pinned contract (tests 1-5 above). The labeler's `_scan_hud_and_skills`
+    emits the CANONICAL taxonomy ids (22/23/24/20,
+    `dataset_factory/class_taxonomy.py`; `yolo_auto_labeler.py` header:
+    "legacy ids must never be reintroduced here"), so part 2 below pins
+    the canonical ids, not the legacy ones.
+    """
+    # Half-resolution frame (960x540) with half-size slots: slot centres land
+    # on the same normalized cy (0.90185 upper / 0.94630 lower), so the row
+    # separation and every class assertion below are identical to 1080p input.
+    frame = np.zeros((540, 960, 3), dtype=np.uint8)
+
+    def _draw_hud_slot(x1: int, y1: int, size: int, rgb: tuple[int, int, int]) -> None:
+        # RGB reference color -> BGR fill (no hand-tuned HSV).
+        bgr_color = (rgb[2], rgb[1], rgb[0])
         # Outer metallic slot frame for contour detection
         cv2.rectangle(frame, (x1, y1), (x1 + size, y1 + size), (190, 190, 190), 2)
         # Inner colored consumable / skill fill
@@ -241,13 +285,14 @@ def test_full_frame_hud_scan_and_yolo_auto_labeler_never_emits_skill_ui_prompt()
         # Inner detail for realistic value variance & Canny edges
         cv2.rectangle(frame, (x1 + 10, y1 + 10), (x1 + size - 10, y1 + size - 10), (245, 245, 245), 1)
 
-    # Upper row slots: y1=956, size=36 -> cy = 974 / 1080 = 0.90185 (in [0.865, 0.938])
-    _draw_hud_slot(660, 956, 36, (5, 210, 210))    # Red HP Potion
-    _draw_hud_slot(710, 956, 36, (110, 200, 210))  # Blue MP Potion
-    _draw_hud_slot(760, 956, 36, (16, 120, 195))   # Parchment Buff Scroll
+    # Upper row slots: y1=478, size=18 -> cy = 487 / 540 = 0.90185 (in [0.865, 0.938])
+    # Colors are RGB references (see module constants), not hand-tuned HSV.
+    _draw_hud_slot(330, 478, 18, HP_POTION_RGB)    # Red HP Potion
+    _draw_hud_slot(355, 478, 18, MP_BLUE_RGB)      # Blue MP Potion
+    _draw_hud_slot(380, 478, 18, PARCHMENT_RGB)    # Parchment Buff Scroll
 
-    # Lower row slot: y1=1004, size=36 -> cy = 1022 / 1080 = 0.94630 (>= 0.939)
-    _draw_hud_slot(810, 1004, 36, (140, 180, 210))  # Combat Skill Slot
+    # Lower row slot: y1=502, size=18 -> cy = 511 / 540 = 0.94630 (>= 0.939)
+    _draw_hud_slot(405, 502, 18, SKILL_VIOLET_RGB)  # Combat Skill Slot
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -278,16 +323,33 @@ def test_full_frame_hud_scan_and_yolo_auto_labeler_never_emits_skill_ui_prompt()
         gray=gray,
         source_stem="learn_skills_w31_hud_test",
     )
-    assert len(yolo_anns) >= 4
+    # Exact count and exact class multiset: the labeler must emit one annotation
+    # per drawn slot and nothing else (no extras, no missing slots, no duplicates).
+    # Canonical ids (22/23/24/20) — the labeler never emits the legacy HUD ids
+    # (18/19/22/21) that the classifier's scan_hud_slots still returns in part 1.
+    assert len(yolo_anns) == 4, f"Expected exactly 4 HUD annotations, got: {yolo_anns}"
+    assert {ann["class_id"] for ann in yolo_anns} == {20, 22, 23, 24}
+
+    # Exact per-slot mapping: upper-row slots at cy ~= 0.90185 are the three
+    # consumables, the lower-row slot at cy ~= 0.94630 is the skill slot.
+    by_class = {ann["class_id"]: ann for ann in yolo_anns}
+    assert by_class[22]["material_name"] == "hp_potion"
+    assert abs(by_class[22]["cy"] - 487 / 540) < 0.005
+    assert by_class[23]["material_name"] == "mp_potion"
+    assert abs(by_class[23]["cy"] - 487 / 540) < 0.005
+    assert by_class[24]["material_name"] == "buff_scroll"
+    assert abs(by_class[24]["cy"] - 487 / 540) < 0.005
+    assert by_class[20]["material_name"] == "skill_slot"
+    assert abs(by_class[20]["cy"] - 511 / 540) < 0.005
 
     for ann in yolo_anns:
         assert ann["class_id"] != 13, "HUD scanner must NEVER emit class_id 13 (skill_ui_prompt)"
         assert ann.get("material_name") != "skill_ui_prompt"
         assert YOLO_CLASSES.get(ann["class_id"]) != "skill_ui_prompt"
-        if 0.865 <= ann["cy"] <= 0.938 and ann["class_id"] in (18, 19, 21, 22):
-            assert ann["class_id"] in (18, 19, 22)
-            assert ann["class_id"] != 21
+        if 0.865 <= ann["cy"] <= 0.938 and ann["class_id"] in (20, 22, 23, 24):
+            assert ann["class_id"] in (22, 23, 24)
+            assert ann["class_id"] != 20
             assert ann["material_name"] in ("hp_potion", "mp_potion", "buff_scroll")
-        elif ann["cy"] >= 0.939 and ann["class_id"] in (18, 19, 21, 22):
-            assert ann["class_id"] == 21
+        elif ann["cy"] >= 0.939 and ann["class_id"] in (20, 22, 23, 24):
+            assert ann["class_id"] == 20
             assert ann["material_name"] == "skill_slot"

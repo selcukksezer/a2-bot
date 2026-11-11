@@ -24,7 +24,7 @@ from core.mana_phase_combat import (
     ManaPhase,
     ManaPhaseCombat,
 )
-from core.skill_bar_reader import SkillBarReader
+from core.skill_bar_reader import SkillBarReader, slot_bounds_fractions
 from dataset_factory.exemplar_memory import ExemplarMemory
 
 
@@ -46,10 +46,17 @@ def _draw_skill_slot_icon(
     y2 = int(round(roi[3] * fh))
 
     slots = list(reader.SKILL_SLOTS)
-    idx = slots.index(slot_key.upper() if slot_key.upper() in ("Q", "E", "R") else slot_key)
-    slot_w = float(x2 - x1) / float(len(slots))
-    sx1 = x1 + int(round(idx * slot_w))
-    sx2 = x1 + int(round((idx + 1) * slot_w))
+    idx = slots.index(slot_key.upper() if slot_key.upper() in ("Q", "E", "R", "T") else slot_key)
+    # G2: reader windows are the MEASURED-centre Voronoi edges
+    # (slot_bounds_fractions), not an equal split of the ROI. Drawing with
+    # the old equal split spilled each icon into the neighbouring reader
+    # window, so scores/order no longer matched the slot drawn. Use the
+    # same edges inspect_skill_bar() uses, so a patch drawn for slot N is
+    # read (only) in slot N's window.
+    edges = slot_bounds_fractions()
+    bw = float(x2 - x1)
+    sx1 = x1 + int(round(edges[idx] * bw))
+    sx2 = x1 + int(round(edges[idx + 1] * bw))
     sh = max(2, y2 - y1)
     sw = max(2, sx2 - sx1)
 
@@ -75,20 +82,20 @@ def _draw_skill_slot_icon(
     frame[y1:y2, sx1:sx2] = patch
 
 
-def test_seven_key_fast_round_robin_burst_rotation() -> None:
-    """1. Verify 7-key ('1,2,3,4,q,e,r') sub-100ms round-robin rotation cycles evenly without sticking to '2'."""
+def test_eight_key_fast_round_robin_burst_rotation() -> None:
+    """1. Verify 8-key ('1,2,3,4,q,e,r,t') sub-100ms round-robin rotation cycles evenly without sticking to '2'."""
     combat = ManaPhaseCombat(burst_skill_interval_sec=0.08, gcd_delay_sec=0.12)
     combat.reset_rotation()
 
-    assert combat.combat_skill_keys == ["1", "2", "3", "4", "q", "e", "r"]
+    assert combat.combat_skill_keys == ["1", "2", "3", "4", "q", "e", "r", "t"]
     assert combat.burst_skill_interval_sec == DEFAULT_BURST_INTERVAL_SEC == 0.08
 
     cast_counts: Dict[str, int] = {k: 0 for k in DEFAULT_COMBAT_SKILL_KEYS}
     cast_sequence: List[str] = []
     t = 1000.0
 
-    # Run 21 fast combat burst cycles (3 full rotations of 7 keys)
-    for _ in range(21):
+    # Run 24 fast combat burst cycles (3 full rotations of 8 keys)
+    for _ in range(24):
         assert combat.should_cast_skill(now=t) is True
         decision = combat.decide(player_mp=1.0, player_hp=1.0, now=t)
         assert decision.phase == ManaPhase.BURST
@@ -98,11 +105,34 @@ def test_seven_key_fast_round_robin_burst_rotation() -> None:
         combat.record_skill_cast(primary, now=t)
         t += 0.085  # Sub-100ms fast burst interval
 
-    # Every one of the 7 keys must be cast exactly 3 times, with no consecutive duplicates
+    # Every one of the 8 keys must be cast exactly 3 times, with no consecutive duplicates
     for key in DEFAULT_COMBAT_SKILL_KEYS:
         assert cast_counts[key] == 3, f"Expected key '{key}' to be cast 3 times, got {cast_counts[key]}"
     for i in range(1, len(cast_sequence)):
         assert cast_sequence[i] != cast_sequence[i - 1], f"Stuck on key '{cast_sequence[i]}' at step {i}"
+
+
+def test_burst_gate_rejects_casts_before_interval_elapses() -> None:
+    """1b. should_cast_skill must REJECT casts that come too early.
+
+    Fake clock: a second call at the same timestamp, and a call 40ms after a
+    cast (gap is 80ms), must both return False; a call exactly one interval
+    later must return True again. Real clock: two immediate back-to-back
+    calls must return True then False (the 80ms gap cannot have elapsed).
+    """
+    combat = ManaPhaseCombat(burst_skill_interval_sec=0.08, gcd_delay_sec=0.12)
+    combat.reset_rotation()
+
+    assert combat.should_cast_skill(now=1000.0) is True
+    assert combat.should_cast_skill(now=1000.0) is False  # same instant
+    assert combat.should_cast_skill(now=1000.04) is False  # 40ms < 80ms gap
+    assert combat.should_cast_skill(now=1000.08) is True  # one interval later
+    assert combat.should_cast_skill(now=1000.12) is False  # 40ms after that
+
+    combat2 = ManaPhaseCombat(burst_skill_interval_sec=0.08, gcd_delay_sec=0.12)
+    combat2.reset_rotation()
+    assert combat2.should_cast_skill() is True
+    assert combat2.should_cast_skill() is False  # real clock, no time elapsed
 
 
 def test_anti_sticky_key_2_guard_when_only_key_2_reported_ready() -> None:
@@ -168,6 +198,13 @@ def test_skill_bar_reader_selects_only_ready_and_mana_ok_skills(tmp_path: Path) 
     assert "2" not in picked
     assert "1" not in picked
 
+    # Sweep G — tek "hazır" tanımı: üçü de 0,15 sn kilit içinde basıldığı
+    # için hiçbiri artık hazır sayılmaz; eskiden get_ready_skills()
+    # `ready` VEYA (off_cooldown ve mana_ok) döndürüyordu ve kilitli
+    # skill listeye giriyordu. Artık yalnızca `ready` alanı sayılır.
+    assert reader.get_ready_skills(frame) == []
+    assert reader.select_best_ready_skill(frame, record_use=True) == ""
+
 
 def test_skill_bar_reader_7_key_round_robin_without_slot_2_bias(tmp_path: Path) -> None:
     """4. Verify SkillBarReader rotates across all 7 combat slots ('1,2,3,4,Q,E,R') even if slot '2' is brightest."""
@@ -182,24 +219,40 @@ def test_skill_bar_reader_7_key_round_robin_without_slot_2_bias(tmp_path: Path) 
     seven_slots = ["1", "2", "3", "4", "Q", "E", "R"]
     for slot in seven_slots:
         _draw_skill_slot_icon(frame, reader, slot, ready=True, mana_ok=True)
-    # Keep slot '5' on cooldown so only the 7 combat keys are ready
-    _draw_skill_slot_icon(frame, reader, "5", ready=False, mana_ok=False)
+    # Keep slot '5' on cooldown (dark, low-saturation patch) so only the 7 combat keys are ready
+    _draw_skill_slot_icon(frame, reader, "5", ready=False, mana_ok=True)
 
     # Equal baseline priority weights ensure no artificial bias toward slot '2'
     assert reader.DEFAULT_PRIORITY_WEIGHTS["2"] == reader.DEFAULT_PRIORITY_WEIGHTS["1"] == 1.0
 
     selected_order: List[str] = []
-    for _ in range(14):
+    for _ in range(7):
         chosen = reader.select_best_ready_skill(frame, preferred_order=seven_slots, record_use=True)
         selected_order.append(chosen)
 
-    # First 7 selections and second 7 selections must both be the exact 7-key round-robin sequence
+    # First 7 selections must be the exact 7-key round-robin sequence.
     assert selected_order[:7] == seven_slots
+
+    # Sweep G — tek "hazır" tanımı: 7'si de 0,50 sn kilit içinde basıldı,
+    # o yüzden 8. seçimde hazır aday yok ve select_best_ready_skill ""
+    # döner (fail-closed). Eskiden kilit gevşetilip mana kontrolsüz en iyi
+    # off_cooldown slot seçiliyordu — o geri dönüş artık yok.
+    assert reader.select_best_ready_skill(frame, preferred_order=seven_slots, record_use=True) == ""
+    assert reader.get_ready_skills(frame) == []
+
+    # Kilit süresi dolmuş sayılır (reset_history basım kilitlerini
+    # temizler): ikinci tur aynı sırayla dönmelidir.
+    reader.reset_history()
+    for _ in range(7):
+        chosen = reader.select_best_ready_skill(frame, preferred_order=seven_slots, record_use=True)
+        selected_order.append(chosen)
+
+    # Second 7 selections must both be the exact 7-key round-robin sequence
     assert selected_order[7:14] == seven_slots
 
 
 def test_integrated_skill_bar_reader_and_mana_phase_combat_rotation(tmp_path: Path) -> None:
-    """5. Verify end-to-end integration of SkillBarReader ready skills feeding ManaPhaseCombat 7-key rotation."""
+    """5. Verify end-to-end integration of SkillBarReader ready skills feeding ManaPhaseCombat 8-key rotation."""
     mem = ExemplarMemory(json_path=tmp_path / "empty_exemplars.json")
     reader = SkillBarReader(
         calibrated_rois_path=tmp_path / "missing_rois.json",
@@ -212,14 +265,26 @@ def test_integrated_skill_bar_reader_and_mana_phase_combat_rotation(tmp_path: Pa
     frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
     for slot in ("1", "2", "3", "4", "Q", "E", "R"):
         _draw_skill_slot_icon(frame, reader, slot, ready=True, mana_ok=True)
-    _draw_skill_slot_icon(frame, reader, "5", ready=False, mana_ok=False)
+    # Slot '5' is on cooldown (dark patch), so it must NOT be reported ready.
+    _draw_skill_slot_icon(frame, reader, "5", ready=False, mana_ok=True)
 
-    ready_from_bar = [s.lower() for s in reader.get_ready_skills(frame) if s != "5"]
+    # Corroborate with per-slot inspection first: exactly the 7 combat slots
+    # are ready and slot '5' is not. get_ready_skills() has a fallback that
+    # returns ALL slots when nothing is ready, so the assertion below must
+    # NOT filter '5' out — with the filter, a fallback return would be
+    # indistinguishable from a real detection.
+    states = reader.inspect_skill_bar(frame)
+    assert sorted(s for s, st in states.items() if st["ready"]) == [
+        "1", "2", "3", "4", "E", "Q", "R",
+    ]
+    assert states["5"]["ready"] is False
+
+    ready_from_bar = [s.lower() for s in reader.get_ready_skills(frame)]
     assert ready_from_bar == ["1", "2", "3", "4", "q", "e", "r"]
 
     executed_skills: List[str] = []
     t = 5000.0
-    for _ in range(7):
+    for _ in range(8):
         assert combat.should_cast_skill(now=t) is True
         decision = combat.decide(
             player_mp=1.0,
@@ -233,7 +298,14 @@ def test_integrated_skill_bar_reader_and_mana_phase_combat_rotation(tmp_path: Pa
         reader.mark_slot_pressed(primary)
         t += 0.08
 
-    # All 7 combat skills were executed once in 7 decisions without getting stuck on '2'
-    assert executed_skills == ["1", "4", "r", "3", "e", "2", "q"]
+    # All 8 combat skills were executed exactly once in 8 decisions without
+    # getting stuck on '2'. The executed set is a permutation of the 8 combat
+    # keys — the exact order is internal rotation arithmetic, not a spec, so
+    # it is asserted as a set/permutation, not as a literal snapshot.
+    assert len(executed_skills) == 8
+    assert sorted(executed_skills) == sorted(DEFAULT_COMBAT_SKILL_KEYS)
+    assert len(set(executed_skills)) == 8
     assert set(executed_skills) == set(DEFAULT_COMBAT_SKILL_KEYS)
     assert executed_skills.count("2") == 1
+    for i in range(1, len(executed_skills)):
+        assert executed_skills[i] != executed_skills[i - 1]

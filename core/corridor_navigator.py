@@ -37,6 +37,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+from version import __version__
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -50,6 +51,185 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 Point2D = Tuple[float, float]
+
+
+# --- Tek doğruluk kaynağı: metre/piksel ölçekleri (P1-7 / K-20 kararı) ---
+# İki farklı piksel uzayı, iki farklı ölçek vardır; tek sayıya indirgenemezler:
+#  * MINIMAP_METERS_PER_PX — sağ-üst minimap pikseli -> metre: 0.55.
+#    material_scanner/explorer yolundaki 0.65 değeri bu sabite bağlandı.
+#    (P1-12 doğrulaması: 0.65'in minimap uzayı olduğu kanıtlı —
+#    scan_minimap_materials, minimap kırpıntısı merkezine göre göreli
+#    piksel — yani bağlama doğru uzaya yapıldı; değerin kendisi hâlâ
+#    canlı ölçümle kalibre edilmedi.)
+#  * WORLD_MAP_METERS_PER_PX — açık dünya haritası (M) pikseli -> metre: 0.28.
+#    vision.py'deki eski 0.25 değeri bu sabite bağlandı.
+# ÖLÇEK KARARI — DOĞRULANAMADI: iki değer de canlı ölçümle kalibre edilmiş
+# DEĞİLDİR (oyun açıkken bilinen mesafede minimap/dünya-harita pikseli
+# ölçülmedi). 0.55 seçildi çünkü minimap yolunda 3 modülde (navigator.py
+# PIXEL_TO_METER_DEFAULT, sequential_router, navigation_intel) zaten
+# kullanılan değerdir; 0.65 yalnızca material_scanner/explorer yolundaydı.
+# 0.28 seçildi çünkü dünya-harita yolunda route_manager / economy_broker /
+# cartography_radar üçlüsünde zaten kullanılan değerdir; 0.25 yalnızca
+# vision.py'deydi ve route_manager artık onu okumuyordu. Seçim gerekçesi
+# ÇOĞUNLUK + TEK-KAYNAK tutarlılığıdır; kalibrasyon açık soru olarak
+# kalır — bu sabitler "ölçüldü" diye okunmamalıdır.
+MINIMAP_METERS_PER_PX: float = 0.55
+WORLD_MAP_METERS_PER_PX: float = 0.28
+
+# --- Kalibrasyon kancası (v19, P1-7/P1-12) ---
+# Yukarıdaki iki değer CANLI ÖLÇÜMLE kalibre edilmiş DEĞİLDİR — çoğunluk +
+# tek-kaynak tutarlılığıyla seçilmiş varsayılanlardır, "ölçüldü" diye
+# okunmamalıdır. Gerçek kalibrasyon PC'de, oyun açıkken yapılır ve sonucu
+# `config/settings.json` -> `route.minimap_meters_per_px` /
+# `route.world_map_meters_per_px` anahtarlarına yazılır
+# (bkz. `config/schema.py::RouteSettings`, `None` = kalibre edilmedi).
+# `resolve_*_meters_per_px(settings)` config geçersiz kılmasını okur,
+# yoksa yerleşik sabiti döndürür; hiçbir çağrı yerinde artık literal
+# 0.55/0.65/0.28/0.25 yazılmaz.
+SCALE_CALIBRATION_MIN_M_PER_PX: float = 0.05
+SCALE_CALIBRATION_MAX_M_PER_PX: float = 5.0
+
+
+def calibrate_meters_per_px(
+    known_distance_m: float,
+    pixel_distance: float,
+) -> float:
+    """Ölçülmüş bir çiftinden metre/piksel ölçeği hesaplar.
+
+    Kalibrasyon ölçüm fonksiyonu — saf fonksiyondur, disk/ayar okumaz.
+    `known_distance_m`: oyunda bilinen gerçek mesafe (metre, örn. iki
+    düğüm arası tabelâ mesafesi veya karakter adım sayacından mesafe);
+    `pixel_distance`: aynı iki nokta arası minimap / dünya-haritası
+    piksel mesafesi (aynı karede, aynı yakınlaştırma düzeyinde ölçülür).
+    Döndürür: `known_distance_m / pixel_distance` (m/px).
+    Girdi geçersizse (sıfır/negatif/sonsuz) ValueError fırlatır — uydurma
+    ölçek üretilemez.
+    """
+    try:
+        known = float(known_distance_m)
+        pixels = float(pixel_distance)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Kalibrasyon girdileri sayı olmalı: known_distance_m=%r, pixel_distance=%r"
+            % (known_distance_m, pixel_distance)
+        )
+    if not (math.isfinite(known) and math.isfinite(pixels)):
+        raise ValueError("Kalibrasyon girdileri sonlu olmalı.")
+    if known <= 0 or pixels <= 0:
+        raise ValueError(
+            "Kalibrasyon girdileri pozitif olmalı: known_distance_m=%r, pixel_distance=%r"
+            % (known_distance_m, pixel_distance)
+        )
+    value = known / pixels
+    if not (SCALE_CALIBRATION_MIN_M_PER_PX <= value <= SCALE_CALIBRATION_MAX_M_PER_PX):
+        raise ValueError(
+            "Hesaplanan ölçek %.4f m/px makul aralık dışında (%.2f..%.2f); "
+            "ölçümü tekrarlayın." % (value, SCALE_CALIBRATION_MIN_M_PER_PX, SCALE_CALIBRATION_MAX_M_PER_PX)
+        )
+    return value
+
+
+def _resolve_scale_override(settings: Any, key: str) -> Optional[float]:
+    """`settings` içinden `route.<key>` geçersiz kılmasını okur.
+
+    `settings` BotSettings, RouteSettings, dict veya `route` özniteliği
+    taşıyan herhangi bir nesne olabilir. Geçersiz kılma yoksa / sayı
+    değilse / aralık dışındaysa None döner (yerleşik sabit kullanılır);
+    aralık dışı değer loglanır, sessizce kabul edilmez.
+    """
+    raw: Any = None
+    try:
+        if settings is None:
+            return None
+        route = settings
+        if isinstance(settings, dict):
+            route = settings.get("route", settings)
+        else:
+            route = getattr(settings, "route", settings)
+        if isinstance(route, dict):
+            raw = route.get(key)
+        else:
+            raw = getattr(route, key, None)
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ölçek geçersiz kılması sayı değil (%s=%r); yok sayılıyor.", key, raw)
+        return None
+    if not math.isfinite(value):
+        logger.warning("Ölçek geçersiz kılması sonlu değil (%s=%r); yok sayılıyor.", key, raw)
+        return None
+    if not (SCALE_CALIBRATION_MIN_M_PER_PX <= value <= SCALE_CALIBRATION_MAX_M_PER_PX):
+        logger.warning(
+            "Ölçek geçersiz kılması aralık dışı (%s=%r, aralık %.2f..%.2f); yok sayılıyor.",
+            key,
+            raw,
+            SCALE_CALIBRATION_MIN_M_PER_PX,
+            SCALE_CALIBRATION_MAX_M_PER_PX,
+        )
+        return None
+    return value
+
+
+def resolve_minimap_meters_per_px(settings: Any = None) -> float:
+    """Minimap m/px: config geçersiz kılması varsa onu, yoksa `MINIMAP_METERS_PER_PX`."""
+    override = _resolve_scale_override(settings, "minimap_meters_per_px")
+    return override if override is not None else MINIMAP_METERS_PER_PX
+
+
+def resolve_world_map_meters_per_px(settings: Any = None) -> float:
+    """Dünya-haritası m/px: config geçersiz kılması varsa onu, yoksa `WORLD_MAP_METERS_PER_PX`."""
+    override = _resolve_scale_override(settings, "world_map_meters_per_px")
+    return override if override is not None else WORLD_MAP_METERS_PER_PX
+
+
+def scale_calibration_status(settings: Any = None) -> Dict[str, Any]:
+    """Ölçek kalibrasyon durumunu raporlar.
+
+    `calibrated` yalnızca config'te geçerli bir geçersiz kılma varken
+    True'dur; yerleşik sabitler kalibre edilmiş sayılmaz.
+    """
+    minimap_override = _resolve_scale_override(settings, "minimap_meters_per_px")
+    world_override = _resolve_scale_override(settings, "world_map_meters_per_px")
+    return {
+        "minimap_meters_per_px": minimap_override if minimap_override is not None else MINIMAP_METERS_PER_PX,
+        "minimap_calibrated": minimap_override is not None,
+        "minimap_source": "config-override" if minimap_override is not None else "builtin-uncalibrated",
+        "world_map_meters_per_px": world_override if world_override is not None else WORLD_MAP_METERS_PER_PX,
+        "world_map_calibrated": world_override is not None,
+        "world_map_source": "config-override" if world_override is not None else "builtin-uncalibrated",
+    }
+
+
+def jump_length_threshold(lengths: List[float]) -> float:
+    """Zikzak-sıçrama eşiği — TEK TANIM (P1-12 / v18).
+
+    "Ping-pong jump" (zikzak sıçrama) = yerel adımın çok üstündeki bağ
+    (yanlış çözünürlük / sahte köşe noktası). Bu fonksiyon eşiğin tek
+    tanımıdır; `ui/cartography_radar.py` (calculate_route_metrics,
+    _jump_mask) ve `core/sequential_router.py` (calculate_route_metrics)
+    aynı tanımı buradan okur. Önceden iki farklı `ping_pong_jumps`
+    tanımı vardı: radar uzun-bağ sayıyordu, sequential_router ise
+    `sharp_turns_count` (> 90° dönüş) sayısını aynı anahtara yazıyordu —
+    keskin dönüş ayrı bir metriktir (`sharp_turns_count`), sıçrama değil.
+    """
+    if not lengths:
+        return 280.0
+    core = sorted(lengths)[: max(1, int(math.ceil(len(lengths) * 0.8)))]
+    typical = core[len(core) // 2]
+    return max(typical * 6.0, 280.0)
+# --- Tek doğruluk kaynağı: manevra / dönüş varsayılanları (P3-3) ---
+# `__init__` ve fonksiyon varsayılanlarında tekrar eden literal'lar; değerler aynı.
+# Not: `UNSTUCK_STUCK_THRESHOLD_PX` (1.2 px) ile `UNSTUCK_STEP_DURATION_SEC`
+# (1.2 sn) aynı sayı ama farklı anlam/birimdir; bilerek ayrı sabittirler.
+UNSTUCK_STUCK_THRESHOLD_PX: float = 1.2
+UNSTUCK_STUCK_DURATION_SEC: float = 2.5
+UNSTUCK_STEP_DURATION_SEC: float = 1.2
+TURN_MIN_DURATION_SEC: float = 0.04
+TURN_MAX_DURATION_SEC: float = 0.35
 
 
 def _get_node_attr(node: Any, key: str, default: Any = None) -> Any:
@@ -70,12 +250,115 @@ def _set_node_attr(node: Any, key: str, value: Any) -> None:
             logger.debug("Düğüm özniteliği yazılamadı (%s=%r): %s", key, value, exc)
 
 
+def _node_has_coordinates(node: Any) -> bool:
+    """Düğümün gerçek harita koordinatı var mı?
+
+    `NodeData` varsayılanları (`map_x=0, map_y=0, norm_x=0.5, norm_y=0.5`)
+    "koordinat yok" demektir; `(0, 0)` + norm `(0.5, 0.5)` bir düğümün
+    harita merkezinde (960, 540) olduğu anlamına gelmez (dilim 12 K-3).
+    Tam merkezde (norm tam 0.5, 0.5) gerçekten haritalanmış bir düğüm bu
+    testte koordinatsız sayılır — merkezdeki düğüm yeniden haritalanmalıdır.
+    """
+    try:
+        if isinstance(node, (tuple, list, np.ndarray)) and len(node) >= 2:
+            return bool(float(node[0]) != 0.0 or float(node[1]) != 0.0)
+        if isinstance(node, dict):
+            mx = node.get("map_x", node.get("x"))
+            my = node.get("map_y", node.get("y"))
+            if mx is not None and my is not None and (float(mx) != 0.0 or float(my) != 0.0):
+                return True
+            nx = node.get("norm_x")
+            ny = node.get("norm_y")
+            if nx is None or ny is None:
+                return False
+            return bool(abs(float(nx) - 0.5) > 1e-9 or abs(float(ny) - 0.5) > 1e-9)
+        mx = getattr(node, "map_x", getattr(node, "x", None))
+        my = getattr(node, "map_y", getattr(node, "y", None))
+        if mx is not None and my is not None and (float(mx) != 0.0 or float(my) != 0.0):
+            return True
+        nx = getattr(node, "norm_x", None)
+        ny = getattr(node, "norm_y", None)
+        if nx is None or ny is None:
+            return False
+        return bool(abs(float(nx) - 0.5) > 1e-9 or abs(float(ny) - 0.5) > 1e-9)
+    except (TypeError, ValueError):
+        return False
+
+
+def _extract_node_xy_or_none(
+    node: Any,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
+) -> Optional[Point2D]:
+    """Koordinatsız düğümde `None` döner; uydurma merkez koordinat üretmez.
+
+    `_extract_node_xy` geriye dönük uyumluluk için `(0, 0)` / `(960, 540)`
+    döndürmeye devam eder; rota kararı veren yeni kod bu varyantı kullanır.
+    Boyut verilmezse norm dönüşümü harita kanvası 1280x720 ile yapılır
+    (B-01: eski sessiz 1920x1080 varsayılanı kaldırıldı).
+    """
+    if not _node_has_coordinates(node):
+        return None
+    return _extract_node_xy(node, fallback_width=fallback_width, fallback_height=fallback_height)
+
+
+# B-01 (sweep-slice30): norm_x/norm_y HARİTA KANVASI (1280x720) uzayında
+# tanımlıdır (kanonik değer core/route_manager.py MAP_CANVAS_*).
+MAP_CANVAS_WIDTH = 1280.0
+MAP_CANVAS_HEIGHT = 720.0
+_NORM_CANVAS_FALLBACK_WARNED = False
+
+
+def _warn_norm_canvas_fallback_once() -> None:
+    """Norm dalı boyutsuz çağrıldı: kanvas varsayıldı — süreçte bir kez uyar."""
+    global _NORM_CANVAS_FALLBACK_WARNED
+    if not _NORM_CANVAS_FALLBACK_WARNED:
+        _NORM_CANVAS_FALLBACK_WARNED = True
+        logger.warning(
+            "Norm-koordinat dönüşümünde boyut verilmedi; harita kanvası "
+            "1280x720 varsayıldı (eski sessiz 1920x1080 yanlış ölçekti). "
+            "Çağıran gerçek boyutu geçirmeli."
+        )
+
+
+def _norm_xy_to_px(
+    nx: Any,
+    ny: Any,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
+) -> Optional[Point2D]:
+    """norm_x/norm_y -> piksel. Boyut yoksa kanvas varsayılır (bir kez uyarılır).
+
+    (0.5, 0.5) yer tutucu merkezdir, gerçek koordinat değil — reddedilir
+    (None döner). Ölçülemeyen norm da None döner.
+    """
+    if nx is None or ny is None:
+        return None
+    try:
+        fx = float(nx)
+        fy = float(ny)
+    except (TypeError, ValueError):
+        return None
+    if fx == 0.5 and fy == 0.5:
+        return None
+    if fallback_width is None or fallback_height is None:
+        _warn_norm_canvas_fallback_once()
+    width = MAP_CANVAS_WIDTH if fallback_width is None else float(fallback_width)
+    height = MAP_CANVAS_HEIGHT if fallback_height is None else float(fallback_height)
+    return fx * width, fy * height
+
+
 def _extract_node_xy(
     node: Any,
-    fallback_width: float = 1920.0,
-    fallback_height: float = 1080.0,
+    fallback_width: Optional[float] = None,
+    fallback_height: Optional[float] = None,
 ) -> Point2D:
-    """Düğüm nesnesinden `(x, y)` 2B harita koordinatını güvenli şekilde çıkarır."""
+    """Düğüm nesnesinden `(x, y)` 2B harita koordinatını güvenli şekilde çıkarır.
+
+    Boyut verilmezse norm dönüşümü harita kanvası 1280x720 ile yapılır
+    (B-01: eski sessiz 1920x1080 varsayılanı kaldırıldı) ve bir kez uyarı
+    loglanır. (0.5, 0.5) norm yer tutucusu her dalda reddedilir.
+    """
     try:
         if isinstance(node, (tuple, list, np.ndarray)) and len(node) >= 2:
             return float(node[0]), float(node[1])
@@ -83,23 +366,49 @@ def _extract_node_xy(
             mx = node.get("map_x", node.get("x", 0.0))
             my = node.get("map_y", node.get("y", 0.0))
             if (mx is None or float(mx) == 0.0) and (my is None or float(my) == 0.0):
-                nx = node.get("norm_x")
-                ny = node.get("norm_y")
-                if nx is not None and ny is not None:
-                    return float(nx) * fallback_width, float(ny) * fallback_height
+                px = _norm_xy_to_px(
+                    node.get("norm_x"), node.get("norm_y"),
+                    fallback_width, fallback_height,
+                )
+                if px is not None:
+                    return px
             return float(mx or 0.0), float(my or 0.0)
 
         mx = getattr(node, "map_x", getattr(node, "x", 0.0))
         my = getattr(node, "map_y", getattr(node, "y", 0.0))
         if (mx is None or float(mx) == 0.0) and (my is None or float(my) == 0.0):
-            nx = getattr(node, "norm_x", None)
-            ny = getattr(node, "norm_y", None)
-            if nx is not None and ny is not None:
-                return float(nx) * fallback_width, float(ny) * fallback_height
+            px = _norm_xy_to_px(
+                getattr(node, "norm_x", None), getattr(node, "norm_y", None),
+                fallback_width, fallback_height,
+            )
+            if px is not None:
+                return px
         return float(mx or 0.0), float(my or 0.0)
     except Exception as exc:
         logger.debug("Koordinat çıkarılamadı (%r): %s", node, exc)
         return 0.0, 0.0
+
+
+def _get_node_z(node: Any) -> Optional[float]:
+    """Düğümün Z/irtifa değerini okur; yoksa veya 0.0 (ayarlanmamış) ise None döner.
+
+    Gerçek rota düğümlerinde (NodeData) z/altitude_z alanı yoktur; bu yüzden
+    altitude/elevation gibi diğer adlar da yoklanır. Bu kod tabanında 0.0
+    "ayarlanmamış" anlamındadır (map_x/map_y ile aynı kural); gerçek irtifa
+    gibi yorumlanıp düğümün yanlış dışlanmasına yol açardı (F-0249).
+    """
+    for key in ("z", "altitude_z", "altitude", "elevation", "height", "pos_z"):
+        val = _get_node_attr(node, key, None)
+        if val is None:
+            continue
+        try:
+            z = float(val)
+        except (TypeError, ValueError):
+            continue
+        if z == 0.0:
+            continue
+        return z
+    return None
 
 
 def _node_identifier(node: Any) -> Union[int, str]:
@@ -157,8 +466,8 @@ def compute_angle_diff(target_bearing: float, player_heading: float) -> float:
 def apply_turn_damping(
     angle_diff: float,
     deadband_deg: float = DEFAULT_DEADBAND_DEG,
-    min_turn_sec: float = 0.04,
-    max_turn_sec: float = 0.35,
+    min_turn_sec: float = TURN_MIN_DURATION_SEC,
+    max_turn_sec: float = TURN_MAX_DURATION_SEC,
     max_error_deg: float = 180.0,
 ) -> Dict[str, Any]:
     """
@@ -206,8 +515,8 @@ class TurnDampingController:
     def __init__(
         self,
         deadband_deg: float = DEFAULT_DEADBAND_DEG,
-        min_turn_sec: float = 0.04,
-        max_turn_sec: float = 0.35,
+        min_turn_sec: float = TURN_MIN_DURATION_SEC,
+        max_turn_sec: float = TURN_MAX_DURATION_SEC,
         reversal_cooldown_sec: float = 0.12,
     ):
         self.deadband_deg = max(MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg)))
@@ -265,10 +574,10 @@ class PhaseCorrelateUnstuckManeuver:
 
     def __init__(
         self,
-        stuck_threshold_px: float = 1.2,
-        stuck_duration_sec: float = 2.0,
-        strafe_duration_sec: float = 1.2,
-        reverse_duration_sec: float = 1.2,
+        stuck_threshold_px: float = UNSTUCK_STUCK_THRESHOLD_PX,
+        stuck_duration_sec: float = UNSTUCK_STUCK_DURATION_SEC,
+        strafe_duration_sec: float = UNSTUCK_STEP_DURATION_SEC,
+        reverse_duration_sec: float = UNSTUCK_STEP_DURATION_SEC,
         reverse_pivot_duration_sec: float = 0.4,
         optical_flow_threshold_px: float = 0.6,
         minimap_roi: Tuple[int, int, int, int] = (1640, 40, 240, 240),
@@ -302,6 +611,7 @@ class PhaseCorrelateUnstuckManeuver:
         self._last_shift_px = 0.0
         self._last_flow_px = 0.0
         self._recent_shifts.clear()
+        self._unstuck_count = 0
 
     def extract_minimap_terrain_gray(
         self,
@@ -318,12 +628,34 @@ class PhaseCorrelateUnstuckManeuver:
         if frame_or_minimap.size == 0:
             return None
 
-        roi = minimap_roi if minimap_roi is not None else self.minimap_roi
         h_img, w_img = frame_or_minimap.shape[:2]
 
-        # Eğer tam ekran kare verilmişse sağ üst minimap bölgesini kırp
+        # Eğer tam ekran kare verilmişse sağ üst minimap bölgesini kırp.
+        # Varsayılan ROI 1920x1080 içindir (F-0247): başka çözünürlükte
+        # orantılı ölçeklenir. Zaten minimap kırpımı olan küçük karelere
+        # ROI uygulanmaz (tam ekran varsayımı yalnızca >= 800x450 karede).
+        if minimap_roi is not None:
+            roi = minimap_roi
+            roi_is_fullscreen = True
+        else:
+            sx = w_img / 1920.0
+            sy = h_img / 1080.0
+            rx0, ry0, rw0, rh0 = self.minimap_roi
+            roi = (
+                int(round(rx0 * sx)),
+                int(round(ry0 * sy)),
+                int(round(rw0 * sx)),
+                int(round(rh0 * sy)),
+            )
+            roi_is_fullscreen = w_img >= 800 and h_img >= 450
         rx, ry, rw, rh = roi
-        if w_img > rw + 60 and h_img > rh + 60 and rx + rw <= w_img and ry + rh <= h_img:
+        if (
+            roi_is_fullscreen
+            and w_img > rw + 60
+            and h_img > rh + 60
+            and rx + rw <= w_img
+            and ry + rh <= h_img
+        ):
             crop = frame_or_minimap[ry : ry + rh, rx : rx + rw]
         else:
             crop = frame_or_minimap
@@ -413,7 +745,7 @@ class PhaseCorrelateUnstuckManeuver:
 
         if self._prev_viewport_gray is None or self._prev_viewport_gray.shape != small_gray.shape:
             self._prev_viewport_gray = small_gray
-            return 1.0  # İlk kare referansı
+            return 0.0  # İlk kare referansı: henüz ölçüm yok (F-0428)
 
         try:
             flow = cv2.calcOpticalFlowFarneback(
@@ -449,7 +781,7 @@ class PhaseCorrelateUnstuckManeuver:
         """
         Karakter yürürken (`is_walking=True`, `W` basılı) her karede çağrılır.
         Minimap phaseCorrelate kayması (< 1.2 px) ve 3B koridor optik akışı
-        birlikte değerlendirilir; < 2.5s (varsayılan 2.0s) boyunca takılma sürerse
+        birlikte değerlendirilir; < 2.5s (varsayılan 2.5s) boyunca takılma sürerse
         `is_stuck=True` döndürür.
         """
         curr_ts = time.time() if now is None else float(now)
@@ -470,6 +802,10 @@ class PhaseCorrelateUnstuckManeuver:
             frame_or_minimap, minimap_roi=minimap_roi
         )
         if curr_terrain is None:
+            # F-0427: arazi kırpımı yokken takılma zamanlayıcısını sıfırla;
+            # aksi halde bir sonraki geçerli karede şişmiş elapsed ile
+            # erken takılma ilan edilebilir.
+            self._stuck_start_ts = None
             return {
                 "is_stuck": False,
                 "shift_px": 0.0,
@@ -496,7 +832,7 @@ class PhaseCorrelateUnstuckManeuver:
                 "dx": 0.0,
                 "dy": 0.0,
                 "stuck_elapsed_sec": 0.0,
-                "phase_response": 1.0,
+                "phase_response": 0.0,  # F-0428: henüz kayma ölçülmedi
             }
 
         shift_px, (dx, dy), response = self.compute_terrain_shift(
@@ -510,10 +846,24 @@ class PhaseCorrelateUnstuckManeuver:
         if len(self._recent_shifts) > 30:
             self._recent_shifts.pop(0)
 
-        # Takılma tespiti: minimap shift < eşik (1.2px)
-        minimap_stuck = shift_px < self.stuck_threshold_px
+        # Takılma tespiti (F-0079, F-0426): minimap kayması tek başına
+        # yetmez. Son 3 karenin medyan kayması eşiğin altındaysa minimap
+        # takılıdır; tam ekran karede optik akış da ölçüldüyse akışın da
+        # durmuş olması gerekir (optical_flow_threshold_px artık ölü bir
+        # sabit değil). Minimap kırpımı verildiğinde akış ölçülemez; o
+        # durumda yalnızca minimap kararı geçerlidir.
+        recent_window = self._recent_shifts[-3:]
+        smoothed_shift_px = float(np.median(recent_window)) if recent_window else shift_px
+        minimap_stuck = smoothed_shift_px < self.stuck_threshold_px
+        flow_measured = bool(
+            frame_or_minimap.ndim >= 2
+            and frame_or_minimap.shape[1] >= 300
+            and frame_or_minimap.shape[0] >= 200
+        )
+        flow_stuck = bool(flow_measured and flow_px < self.optical_flow_threshold_px)
+        stuck_candidate = bool(minimap_stuck and flow_stuck) if flow_measured else bool(minimap_stuck)
 
-        if minimap_stuck:
+        if stuck_candidate:
             if self._stuck_start_ts is None:
                 self._stuck_start_ts = curr_ts
             stuck_elapsed = max(0.0, curr_ts - self._stuck_start_ts)
@@ -525,12 +875,35 @@ class PhaseCorrelateUnstuckManeuver:
         return {
             "is_stuck": is_stuck,
             "shift_px": round(shift_px, 4),
+            "shift_px_smoothed": round(smoothed_shift_px, 4),
             "flow_px": round(flow_px, 4),
+            "flow_measured": flow_measured,
+            "minimap_stuck": bool(minimap_stuck),
+            "flow_stuck": flow_stuck,
             "dx": round(dx, 4),
             "dy": round(dy, 4),
             "stuck_elapsed_sec": round(stuck_elapsed, 3),
             "phase_response": round(response, 4),
         }
+
+    @staticmethod
+    def _press_key_hold(input_controller: Any, key: str, duration: float) -> bool:
+        """
+        S-2801: press_key-only kontrolcüde süreli basılı tutma.
+
+        `InputDriver.press_key` varsayılan 40-90 ms tap'tir; süreli tutma
+        yalnızca `hold_sec` verilirse olur (bkz. core/input_driver.py:3340
+        ve combat.py LoS kurtarma). `hold_sec` desteklemeyen kontrolcüde
+        tap + boş bekleme sahte manevradır — o durumda False döner;
+        çağıran `executed: True` raporlamaz. press_key-only API ile iki
+        tuş aynı anda tutulamaz; A+W strafe burada ardışık tutuşlarla
+        yapılır (combat.py'daki LoS yaklaşımıyla aynı yaklaşıklık).
+        """
+        try:
+            input_controller.press_key(key, hold_sec=float(duration))
+        except TypeError:
+            return False
+        return True
 
     def execute_jump(
         self,
@@ -538,17 +911,26 @@ class PhaseCorrelateUnstuckManeuver:
         wait_fn: Optional[Callable[[float], None]] = None,
     ) -> bool:
         """Fiziksel zıplama (Space) komutunu yürütür."""
-        fn = wait_fn if callable(wait_fn) else (lambda s: None)
-        if input_controller is not None:
-            if hasattr(input_controller, "tap_key") and callable(input_controller.tap_key):
-                input_controller.tap_key("space")
-            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
-                input_controller.press_key("space")
-            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
-                input_controller.key_down("space")
-                fn(0.06)
-                input_controller.key_up("space")
-        return True
+        # F-0011: kontrolcü yokken hiçbir tuşa basılmadı; True dönmek üst
+        # katmana manevra uygulandı yalanını söyler.
+        if input_controller is None:
+            return False
+        # F-0012: bekleme fonksiyonu verilmediyse gerçek bekleme
+        # (time.sleep) kullanılır; no-op varsayılan süreli manevrayı
+        # ~0 ms yapıyordu.
+        fn = wait_fn if callable(wait_fn) else time.sleep
+        if hasattr(input_controller, "tap_key") and callable(input_controller.tap_key):
+            input_controller.tap_key("space")
+            return True
+        if hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+            input_controller.press_key("space")
+            return True
+        if hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+            input_controller.key_down("space")
+            fn(0.06)
+            input_controller.key_up("space")
+            return True
+        return False
 
     def execute_lateral_strafe(
         self,
@@ -558,25 +940,33 @@ class PhaseCorrelateUnstuckManeuver:
         wait_fn: Optional[Callable[[float], None]] = None,
     ) -> bool:
         """Yanal sıyrılma (A+W veya D+W strafe) manevrasını yürütür."""
+        # F-0011: kontrolcü yokken strafe uygulanmadı.
+        if input_controller is None:
+            return False
         dur = float(duration if duration is not None else self.strafe_duration_sec)
-        fn = wait_fn if callable(wait_fn) else (lambda s: None)
+        # F-0012: bekleme verilmediyse gerçek bekleme kullanılır.
+        fn = wait_fn if callable(wait_fn) else time.sleep
         k = strafe_key.lower()
-        if input_controller is not None:
-            if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
-                input_controller.hold_keys([k, "w"], duration=dur)
-            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
-                input_controller.key_down("w")
-                input_controller.key_down(k)
-                fn(dur)
-                input_controller.key_up(k)
-                input_controller.key_up("w")
-            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
-                input_controller.press_key(k)
-                input_controller.press_key("w")
-                fn(dur)
-        else:
+        if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
+            input_controller.hold_keys([k, "w"], duration=dur)
+            return True
+        if hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+            input_controller.key_down("w")
+            input_controller.key_down(k)
             fn(dur)
-        return True
+            input_controller.key_up(k)
+            input_controller.key_up("w")
+            return True
+        if hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+            # S-2801: press_key varsayılan 40-90 ms tap'tir; hold_sec
+            # verilmeden 1.2 sn'lik A+W strafe gerçekleşmezdi, kod boş
+            # bekleyip True dönerdi. hold_sec desteklenmiyorsa False
+            # döner (sahte True yok); ardışık tutuş, press_key-only
+            # API'de mümkün olan en yakın karşılıktır.
+            strafe_held = self._press_key_hold(input_controller, k, dur)
+            forward_held = self._press_key_hold(input_controller, "w", dur)
+            return bool(strafe_held and forward_held)
+        return False
 
     def execute_reverse_backout(
         self,
@@ -592,53 +982,81 @@ class PhaseCorrelateUnstuckManeuver:
         3. S + A/D ile kuyruk açısı vererek engelin köşesinden çık (0.4 sn).
         4. Space ile zıpla (tümsek/kök kurtarma).
         """
+        # F-0011: kontrolcü yokken hiçbir tuşa basılmadı.
+        if input_controller is None:
+            return False
         dur = float(duration if duration is not None else self.reverse_duration_sec)
         pivot_dur = float(self.reverse_pivot_duration_sec)
-        fn = wait_fn if callable(wait_fn) else (lambda s: None)
+        # F-0012: bekleme verilmediyse gerçek bekleme kullanılır.
+        fn = wait_fn if callable(wait_fn) else time.sleep
         pk = pivot_direction.lower()
+        acted = False
+        # S-2801: manevrayı tanımlayan geri hareketin kendisi (adım 2/3)
+        # gerçekten uygulandı mı? Yalnızca W bırakma + Space zıplama
+        # gerçekleştiyse geri çekilme olmadı; True dönmek sahte olur.
+        reversed_ok = False
 
-        if input_controller is not None:
-            # 1. W tuşunu güvenli bırak
-            if hasattr(input_controller, "release_key") and callable(input_controller.release_key):
-                input_controller.release_key("w")
-            elif hasattr(input_controller, "key_up") and callable(input_controller.key_up):
-                input_controller.key_up("w")
+        # 1. W tuşunu güvenli bırak
+        if hasattr(input_controller, "release_key") and callable(input_controller.release_key):
+            input_controller.release_key("w")
+            acted = True
+        elif hasattr(input_controller, "key_up") and callable(input_controller.key_up):
+            input_controller.key_up("w")
+            acted = True
 
-            # 2. S ile geri çık
-            if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
-                input_controller.hold_keys(["s"], duration=dur)
-            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
-                input_controller.key_down("s")
-                fn(dur)
-                input_controller.key_up("s")
-            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
-                input_controller.press_key("s")
-                fn(dur)
-            else:
-                fn(dur)
-
-            # 3. Yanal geri dönüş (S + A veya S + D)
-            if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
-                input_controller.hold_keys(["s", pk], duration=pivot_dur)
-            elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
-                input_controller.key_down("s")
-                input_controller.key_down(pk)
-                fn(pivot_dur)
-                input_controller.key_up(pk)
-                input_controller.key_up("s")
-            elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
-                input_controller.press_key("s")
-                input_controller.press_key(pk)
-                fn(pivot_dur)
-            else:
-                fn(pivot_dur)
-
-            # 4. Zıpla
-            self.execute_jump(input_controller=input_controller, wait_fn=fn)
+        # 2. S ile geri çık
+        if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
+            input_controller.hold_keys(["s"], duration=dur)
+            acted = True
+            reversed_ok = True
+        elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+            input_controller.key_down("s")
+            fn(dur)
+            input_controller.key_up("s")
+            acted = True
+            reversed_ok = True
+        elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+            # S-2801: hold_sec verilmeden S tap'i 40-90 ms'de bırakılır,
+            # geri çekilme gerçekleşmezdi. Desteklenmiyorsa acted False
+            # kalır (sahte True yok).
+            if self._press_key_hold(input_controller, "s", dur):
+                acted = True
+                reversed_ok = True
         else:
-            fn(dur + pivot_dur)
+            fn(dur)
 
-        return True
+        # 3. Yanal geri dönüş (S + A veya S + D)
+        if hasattr(input_controller, "hold_keys") and callable(input_controller.hold_keys):
+            input_controller.hold_keys(["s", pk], duration=pivot_dur)
+            acted = True
+            reversed_ok = True
+        elif hasattr(input_controller, "key_down") and hasattr(input_controller, "key_up"):
+            input_controller.key_down("s")
+            input_controller.key_down(pk)
+            fn(pivot_dur)
+            input_controller.key_up(pk)
+            input_controller.key_up("s")
+            acted = True
+            reversed_ok = True
+        elif hasattr(input_controller, "press_key") and callable(input_controller.press_key):
+            # S-2801: hold_sec verilmeden S+A tap'i pivot dönüşü
+            # yapmazdı. Desteklenmiyorsa acted değişmez (sahte True yok).
+            if self._press_key_hold(input_controller, "s", pivot_dur):
+                acted = True
+                reversed_ok = True
+            if self._press_key_hold(input_controller, pk, pivot_dur):
+                acted = True
+                reversed_ok = True
+        else:
+            fn(pivot_dur)
+
+        # 4. Zıpla
+        if self.execute_jump(input_controller=input_controller, wait_fn=fn):
+            acted = True
+
+        # S-2801: geri hareket hiç uygulanmadıysa (yalnızca W bırakma /
+        # Space) manevra gerçekleşmedi sayılır.
+        return bool(acted and reversed_ok)
 
     def execute_unstuck_sequence(
         self,
@@ -663,7 +1081,9 @@ class PhaseCorrelateUnstuckManeuver:
         """
         tier = (self._unstuck_count) % 4
         self._unstuck_count += 1
-        wait_fn = sleep_fn if callable(sleep_fn) else (lambda s: None)
+        # F-0012: sleep_fn verilmediyse gerçek bekleme kullanılır; no-op
+        # varsayılan, süreli manevraları ~0 ms yapıyordu.
+        wait_fn = sleep_fn if callable(sleep_fn) else time.sleep
 
         # Manevra türü belirleme
         chosen_maneuver = maneuver_type
@@ -686,14 +1106,15 @@ class PhaseCorrelateUnstuckManeuver:
         actions_taken: List[str] = []
         combo_label = f"{strafe_key.upper()}+W"
         request_repath = False
+        maneuver_ok = False
 
         if chosen_maneuver == "jump":
             actions_taken.append("SPACE")
-            self.execute_jump(input_controller=input_controller, wait_fn=wait_fn)
+            maneuver_ok = self.execute_jump(input_controller=input_controller, wait_fn=wait_fn)
 
         elif chosen_maneuver == "lateral_strafe":
             actions_taken.append(combo_label)
-            self.execute_lateral_strafe(
+            maneuver_ok = self.execute_lateral_strafe(
                 strafe_key=strafe_key,
                 duration=self.strafe_duration_sec,
                 input_controller=input_controller,
@@ -702,7 +1123,7 @@ class PhaseCorrelateUnstuckManeuver:
 
         elif chosen_maneuver == "reverse_backout":
             actions_taken.extend(["STOP_W", "REVERSE_S", "REVERSE_STRAFE", "SPACE"])
-            self.execute_reverse_backout(
+            maneuver_ok = self.execute_reverse_backout(
                 duration=self.reverse_duration_sec,
                 pivot_direction=strafe_key,
                 input_controller=input_controller,
@@ -712,7 +1133,7 @@ class PhaseCorrelateUnstuckManeuver:
         elif chosen_maneuver == "repath":
             request_repath = True
             actions_taken.extend(["STOP_W", "EXTENDED_REVERSE", "PIVOT_90", "SPACE", "REQUEST_REPATH"])
-            self.execute_reverse_backout(
+            maneuver_ok = self.execute_reverse_backout(
                 duration=self.reverse_duration_sec * 1.3,
                 pivot_direction=strafe_key,
                 input_controller=input_controller,
@@ -728,15 +1149,16 @@ class PhaseCorrelateUnstuckManeuver:
         else:
             # Default "jump_strafe" (Tier 0 & 1): Space -> A+W/D+W
             actions_taken.append("SPACE")
-            self.execute_jump(input_controller=input_controller, wait_fn=wait_fn)
+            jump_ok = self.execute_jump(input_controller=input_controller, wait_fn=wait_fn)
 
             actions_taken.append(combo_label)
-            self.execute_lateral_strafe(
+            strafe_ok = self.execute_lateral_strafe(
                 strafe_key=strafe_key,
                 duration=self.strafe_duration_sec,
                 input_controller=input_controller,
                 wait_fn=wait_fn,
             )
+            maneuver_ok = bool(jump_ok and strafe_ok)
 
         # Hedefe yeniden hizalanma (Re-align toward target via shortest rotational path + deadband)
         actions_taken.append("REALIGN")
@@ -749,28 +1171,32 @@ class PhaseCorrelateUnstuckManeuver:
             damped_turn = apply_turn_damping(angle_delta, deadband_deg=deadband_deg)
 
         if callable(realign_callback) and target_angle_deg is not None:
-            realign_callback(target_angle_deg)
-            realigned_flag = True
+            # F-0080: callback'in dönüş değeri kontrol edilir.
+            cb_result = realign_callback(target_angle_deg)
+            realigned_flag = cb_result is not False
         elif input_controller is not None and target_angle_deg is not None:
             if damped_turn is None or damped_turn["turn_needed"]:
                 if hasattr(input_controller, "realign_to_target") and callable(
                     input_controller.realign_to_target
                 ):
-                    input_controller.realign_to_target(target_angle_deg)
-                    realigned_flag = True
+                    cb_result = input_controller.realign_to_target(target_angle_deg)
+                    realigned_flag = cb_result is not False
                 elif hasattr(input_controller, "turn_by_angle") and callable(
                     input_controller.turn_by_angle
                 ):
                     turn_dur = damped_turn.get("turn_duration_sec") if damped_turn else None
                     try:
-                        input_controller.turn_by_angle(angle_delta, duration=turn_dur)
+                        turn_result = input_controller.turn_by_angle(angle_delta, duration=turn_dur)
                     except TypeError:
-                        input_controller.turn_by_angle(angle_delta)
-                    realigned_flag = True
+                        turn_result = input_controller.turn_by_angle(angle_delta)
+                    realigned_flag = turn_result is not False
             else:
+                # Ölü bölgede: dönüş gerekmez, hedefe zaten hizalı sayılır.
                 realigned_flag = True
         else:
-            realigned_flag = True
+            # F-0080: ne callback ne kontrolcü ne de hedef açı var — hiçbir
+            # hizalama yapılmadı, bayrak True olamaz.
+            realigned_flag = False
 
         # Takılma sayacını sıfırla ki yeni manevra sonrası temiz ölçüm başlasın
         self._stuck_start_ts = None
@@ -787,7 +1213,8 @@ class PhaseCorrelateUnstuckManeuver:
         )
 
         return {
-            "executed": True,
+            # F-0011: executed yalnızca manevra gerçekten uygulandıysa True.
+            "executed": bool(maneuver_ok),
             "maneuver_type": chosen_maneuver,
             "sequence": actions_taken,
             "strafe_key": strafe_key,
@@ -834,8 +1261,8 @@ class ZAxisCliffFilter:
     def record_approach_attempt(
         self,
         node: Any,
-        minimap_dist_px: float,
-        interaction_succeeded: bool,
+        minimap_dist_px: Optional[float] = None,
+        interaction_succeeded: bool = False,
         now: Optional[float] = None,
     ) -> bool:
         """
@@ -858,7 +1285,10 @@ class ZAxisCliffFilter:
                 _set_node_attr(node, "altitude_band", "ground")
             return False
 
-        # Yalnızca 2B minimap üzerinde yakın (< 25 px) göründüğü halde ulaşılamayan düğümleri say
+        # Yalnızca 2B minimap üzerinde yakın (< 25 px) göründüğü halde ulaşılamayan düğümleri say;
+        # mesafe bilinmiyorsa (None) uçurum atfı yapılmaz.
+        if minimap_dist_px is None:
+            return bool(_get_node_attr(node, "unreachable_cliff", False))
         if float(minimap_dist_px) < self.close_minimap_radius_px:
             prev_fails = int(
                 _get_node_attr(
@@ -932,13 +1362,21 @@ class ZAxisCliffFilter:
         node_band = str(_get_node_attr(node, "altitude_band", "ground") or "ground").strip().lower()
 
         # Açık Z-koordinatı verilmişse ve irtifa farkı toleransı aşıyorsa
-        node_z = _get_node_attr(node, "z", _get_node_attr(node, "altitude_z", None))
+        node_z = _get_node_z(node)
         if player_z is not None and node_z is not None and not is_flying:
             try:
                 if abs(float(player_z) - float(node_z)) > self.z_elevation_tolerance:
                     return True
             except (TypeError, ValueError):
-                pass
+                # B-14 (fail-closed): Z karşılaştırması yapılamıyorsa düğüm
+                # "uçurum değil" sayılmaz — irtifa uyumu kanıtlanamadığı
+                # için düğüm dışlanır.
+                logger.warning(
+                    "Uçurum filtresi Z ayrıştırma hatası (player_z=%r, node_z=%r); "
+                    "düğüm irtifa uyumu kanıtlanamadığı için dışlandı.",
+                    player_z, node_z,
+                )
+                return True
 
         if not unreachable_cliff and node_band != "cliff_mismatch":
             # Eğer oyuncunun irtifa bandı belirtilmişse ve düğüm farklı bir özel irtifa bandındaysa
@@ -970,7 +1408,13 @@ class ZAxisCliffFilter:
                 if abs(float(player_z) - float(node_z)) <= self.z_elevation_tolerance:
                     return False
             except (TypeError, ValueError):
-                pass
+                # B-14: Z eşleşmesi kanıtlanamadı — akış zaten aşağıdaki
+                # "dışla" (return True) dalına düşer; arıza görünür olsun.
+                logger.warning(
+                    "Uçurum filtresi Z eşleşme hatası (player_z=%r, node_z=%r); "
+                    "düğüm dışlandı.",
+                    player_z, node_z,
+                )
 
         return True
 
@@ -1007,6 +1451,13 @@ class PredictivePreWalkScheduler:
     tahmini yürüyüş süresi `~10 sn` olan (`rest_remaining_sec <= estimated_walk_sec + 2.0`)
     düğümleri henüz cooldown bitmeden erken seçer ve yürüyüşü başlatır; böylece karakter
     materyalin yeniden doğduğu (`respawn`) tam saniyede kaynağın başında olur.
+
+    H-sweep (dilim 12 O-4) — AÇIK SORU, değerler kalibre edilmedi: 28 px/sn
+    x 0.55 m/px = 15.4 m/sn "yürüme" hızı binek mertebesindedir; gerçek
+    yürüme hızı, respawn süresi (300 sn varsayımı) ve konumsuz 10 sn
+    varsayımı oyun içi ölçümle doğrulanmadan değiştirilmedi. Yanlış hız
+    yalnızca erken-yürüyüş zamanlamasını kaydırır (toplama kaybı değil,
+    zaman kaybı).
     """
 
     def __init__(
@@ -1081,12 +1532,28 @@ class PredictivePreWalkScheduler:
             try:
                 return max(0.5, float(explicit_walk))
             except (TypeError, ValueError):
-                pass
+                # B-14: kayıtlı yürüyüş süresi ayrıştırılamadı — varsayılan
+                # süreye sessizce düşülmez, arıza loglanır.
+                logger.warning(
+                    "Tahmini yürüyüş süresi ayrıştırılamadı "
+                    "(estimated_walk_sec=%r); varsayılan süre kullanılıyor.",
+                    explicit_walk,
+                )
 
         if player_pos is None:
             return self.default_walk_sec
 
-        nx, ny = _extract_node_xy(node)
+        # P1-7 (K-20): koordinatsız düğümün yürüme süresi (0,0)
+        # hayaletine göre ölçülmez — varsayılan süre döner.
+        _node_xy = _extract_node_xy_or_none(node)
+        if _node_xy is None:
+            logger.warning(
+                "Tahmini yürüyüş süresi: koordinatsız düğüm; varsayılan "
+                "süre (%.1f sn) kullanılıyor.",
+                self.default_walk_sec,
+            )
+            return self.default_walk_sec
+        nx, ny = _node_xy
         px, py = float(player_pos[0]), float(player_pos[1])
         dist_px = math.hypot(nx - px, ny - py)
         speed = float(walk_speed_px_per_sec or self.walk_speed_px_per_sec)
@@ -1115,7 +1582,10 @@ class PredictivePreWalkScheduler:
 
         is_resting = rem_sec > 0.0
         within_walk_window = rem_sec <= threshold_sec
-        within_prewalk_cap = rem_sec <= max(self.max_prewalk_remaining_sec, threshold_sec)
+        # F-0073: 8 sn sınırı gerçek bir sınır olmalı; max(8, threshold)
+        # her zaman threshold'a eşit/büyük olduğundan eski cap koşulu,
+        # walk-window sağlandığında otomatik doğruydu (ölü kod).
+        within_prewalk_cap = rem_sec <= self.max_prewalk_remaining_sec
 
         eligible = bool(is_resting and within_walk_window and within_prewalk_cap)
         arrival_delta_sec = walk_sec - rem_sec  # >= 0 ise varıldığında kaynak çoktan doğmuş olur
@@ -1126,6 +1596,9 @@ class PredictivePreWalkScheduler:
             "estimated_walk_sec": round(walk_sec, 3),
             "threshold_sec": round(threshold_sec, 3),
             "arrival_delta_sec": round(arrival_delta_sec, 3),
+            "within_walk_window": bool(within_walk_window),
+            "within_prewalk_cap": bool(within_prewalk_cap),
+            "max_prewalk_remaining_sec": round(self.max_prewalk_remaining_sec, 3),
         }
 
     def should_pre_walk_to_node(
@@ -1161,10 +1634,13 @@ class CentroidDriftCorrector:
 
     def __init__(
         self,
-        ema_alpha: float = 0.65,
-        far_mapped_first_gather_alpha: float = 0.85,
-        map_width: float = 1920.0,
-        map_height: float = 1080.0,
+        # F-0239: oyuncu düğümün tam üstünde değil, etkileşim mesafesinde
+        # durur; düğümü oyuncu konumuna %85 çekmek kayıtlı koordinatı bozar.
+        # Muhafazakâr EMA: ilk uzaktan-haritalı hasatta %50, sonra %35.
+        ema_alpha: float = 0.35,
+        far_mapped_first_gather_alpha: float = 0.50,
+        map_width: float = MAP_CANVAS_WIDTH,
+        map_height: float = MAP_CANVAS_HEIGHT,
     ) -> None:
         self.ema_alpha: float = float(min(1.0, max(0.05, ema_alpha)))
         self.far_mapped_first_gather_alpha: float = float(
@@ -1199,6 +1675,22 @@ class CentroidDriftCorrector:
         old_x, old_y = _extract_node_xy(
             node, fallback_width=self.map_width, fallback_height=self.map_height
         )
+
+        # H-sweep (dilim 12 O-1 + K-3): koordinatsız düğümün eski konumu
+        # yoktur; oyuncu konumuna "exact_snap" yapmak yer tutucu (0, 0)
+        # koordinatı kalıcı "gerçek" konuma çevirirdi. İyileştirme yok.
+        if not _node_has_coordinates(node):
+            return {
+                "updated": False,
+                "old_x": float(old_x),
+                "old_y": float(old_y),
+                "new_x": float(old_x),
+                "new_y": float(old_y),
+                "drift_px": 0.0,
+                "alpha_used": 0.0,
+                "reason": "no_coordinates",
+            }
+
         target_x = float(actual_x)
         target_y = float(actual_y)
 
@@ -1207,7 +1699,7 @@ class CentroidDriftCorrector:
             _get_node_attr(node, "discovery_source", _get_node_attr(node, "source", "")) or ""
         ).strip().lower()
 
-        if exact_snap or (abs(old_x) < 1e-6 and abs(old_y) < 1e-6):
+        if exact_snap:
             eff_alpha = 1.0
         elif alpha is not None:
             eff_alpha = float(min(1.0, max(0.05, alpha)))
@@ -1303,6 +1795,33 @@ def refine_node_coordinates_on_gather(
 # ==============================================================================
 # MADDE 30 — RAKİP OYUNCU TESPİTİ (ContestedNodeDetector)
 # ==============================================================================
+# İsimlik (nameplate) yatay-şekil kuralı: genişlik >= 18 px, yükseklik >= 3 px,
+# en/boy >= 2.0, alan >= 24 px. Gri ve renkli dallarda aynı kural geçerliydi;
+# iki ayrı kopya yerine tek yardımcıda tanımlanır (D07).
+_NAMEPLATE_MIN_WIDTH_PX = 18
+_NAMEPLATE_MIN_HEIGHT_PX = 3
+_NAMEPLATE_MIN_ASPECT = 2.0
+_NAMEPLATE_MIN_AREA_PX = 24
+# Yatay morfolojik kapama çekirdeği (7x2): isimlik metni/barı yatay süreklidir.
+_NAMEPLATE_HORIZ_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 2))
+
+
+def _has_valid_nameplate_blob(num_labels: int, stats: np.ndarray) -> bool:
+    """`connectedComponentsWithStats` çıktısında yatay isimlik bloğu var mı?"""
+    for lbl in range(1, num_labels):
+        bw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        bh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if (
+            bw >= _NAMEPLATE_MIN_WIDTH_PX
+            and bh >= _NAMEPLATE_MIN_HEIGHT_PX
+            and bw >= bh * _NAMEPLATE_MIN_ASPECT
+            and area >= _NAMEPLATE_MIN_AREA_PX
+        ):
+            return True
+    return False
+
+
 class ContestedNodeDetector:
     """
     Madde 30 — Rakip Oyuncu (`ContestedNodeDetector`):
@@ -1329,7 +1848,6 @@ class ContestedNodeDetector:
         self.min_nameplate_pixels: int = int(max(10, min_nameplate_pixels))
         self.min_gather_glow_pixels: int = int(max(8, min_gather_glow_pixels))
         self.contested_cooldown_sec: float = float(max(5.0, contested_cooldown_sec))
-        self._prev_node_patch_gray: Optional[np.ndarray] = None
 
     def is_node_contested(
         self,
@@ -1354,14 +1872,23 @@ class ContestedNodeDetector:
         if sx < 0 or sx >= w or sy < 0 or sy >= h:
             return False
 
+        # H-sweep (dilim 12 O-2): ROI sabitleri 1920x1080 içindir; canlı
+        # çözünürlük (2560x1440) farklıysa orantılı ölçeklenir, yoksa 1440p'de
+        # isimlik ROI dışında kalıp contested tespiti hep False dönerdi.
+        sx_scale = float(w) / 1920.0
+        sy_scale = float(h) / 1080.0
+        np_half_w = max(25, int(round(self.nameplate_roi_half_w * sx_scale)))
+        np_top_off = max(35, int(round(self.nameplate_roi_top_offset * sy_scale)))
+        ga_radius = max(20, int(round(self.gather_aura_radius_px * sx_scale)))
+
         # 1) Düğümün hemen üstündeki Nameplate (Oyuncu İsimliği / Bar) ROI analizi
-        np_x1 = max(0, sx - self.nameplate_roi_half_w)
-        np_x2 = min(w, sx + self.nameplate_roi_half_w)
-        np_y1 = max(0, sy - self.nameplate_roi_top_offset)
+        np_x1 = max(0, sx - np_half_w)
+        np_x2 = min(w, sx + np_half_w)
+        np_y1 = max(0, sy - np_top_off)
         np_y2 = min(h, max(np_y1 + 12, sy - 10))
 
         # 2) Düğümün tam üzerindeki Karakter + Gather Animasyon Parıltısı ROI analizi
-        ga_r = self.gather_aura_radius_px
+        ga_r = ga_radius
         ga_x1 = max(0, sx - ga_r)
         ga_x2 = min(w, sx + ga_r)
         ga_y1 = max(0, sy - ga_r)
@@ -1375,6 +1902,21 @@ class ContestedNodeDetector:
             np_patch = frame[np_y1:np_y2, np_x1:np_x2]
             ga_patch = frame[ga_y1:ga_y2, ga_x1:ga_x2]
             bright_np = int(np.count_nonzero(np_patch > 215))
+            # Kısa devre (D07): geçerli isimlik bloğu en az 24 px alan ister;
+            # daha az parlak piksel varsa ne şekil ne kenar sonucu True yapamaz
+            # (sonuç zaten `bright_np >= min_nameplate_pixels` gerektirir).
+            if bright_np < _NAMEPLATE_MIN_AREA_PX:
+                return False
+            # F-0074: parlak piksel sayısına ek olarak isimliğin yatay şekli
+            # de doğrulanır (renkli daldaki kuralın gri karşılığı:
+            # genişlik >= 18 px, en/boy >= 2.0, alan >= 24).
+            bright_mask = (np_patch > 215).astype(np.uint8)
+            closed_np = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, _NAMEPLATE_HORIZ_KERNEL)
+            num_labels, _, stats, _ = cv2.connectedComponentsWithStats(closed_np, connectivity=8)
+            # Kısa devre (D07): geçerli isimlik yoksa sonuç False'dur
+            # (son dönüş `has_valid_nameplate and ...` idi); Canny boşa çalışmaz.
+            if not _has_valid_nameplate_blob(num_labels, stats):
+                return False
             edges_ga = cv2.Canny(ga_patch, 80, 180)
             edge_cnt = int(np.count_nonzero(edges_ga))
             return bool(
@@ -1418,23 +1960,23 @@ class ContestedNodeDetector:
             cv2.bitwise_or(mask_hostile_1, mask_hostile_2),
         )
 
+        # Kısa devre (D07): geçerli isimlik bloğu en az 24 px alan ister;
+        # daha az isimlik pikseli varsa şekil aramak boşa morfoloji +
+        # connectedComponents maliyetidir.
+        total_np_pixels = int(np.count_nonzero(nameplate_mask))
+        if total_np_pixels < _NAMEPLATE_MIN_AREA_PX:
+            return False
+
         # İsimlik yatay süreklilik doğrulaması (morfolojik yatay kapama ile yatay metin/bar bloğu bul)
-        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 2))
-        closed_np = cv2.morphologyEx(nameplate_mask, cv2.MORPH_CLOSE, horiz_kernel)
+        closed_np = cv2.morphologyEx(nameplate_mask, cv2.MORPH_CLOSE, _NAMEPLATE_HORIZ_KERNEL)
         num_labels, _, stats, _ = cv2.connectedComponentsWithStats(closed_np, connectivity=8)
 
-        has_valid_nameplate = False
-        total_np_pixels = int(np.count_nonzero(nameplate_mask))
-        for lbl in range(1, num_labels):
-            bw = int(stats[lbl, cv2.CC_STAT_WIDTH])
-            bh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
-            area = int(stats[lbl, cv2.CC_STAT_AREA])
-            # İsimlik yatay uzanımlı (genişlik >= 18px, en/boy >= 2.2) olmalıdır
-            if bw >= 18 and bh >= 3 and bw >= bh * 2.0 and area >= 24:
-                has_valid_nameplate = True
-                break
-
-        if not has_valid_nameplate and total_np_pixels < self.min_nameplate_pixels * 2:
+        # Kısa devre (D07): geçerli isimlik yoksa son dönüş
+        # (`has_valid_nameplate and has_gather_activity`) zaten False'dur;
+        # gather maskeleri + hareket farkı boşa çalışmaz. Eski koşul
+        # (`not has_valid and total < min*2`) yalnızca küçük toplamda
+        # erken dönerdi, büyük toplamda aynı False'a pahalı yoldan varırdı.
+        if not _has_valid_nameplate_blob(num_labels, stats):
             return False
 
         # Gather animasyonu (parlak mavi/camgöbeği/altın toplama efektleri + karakter silüeti/hareketi)
@@ -1471,7 +2013,8 @@ class ContestedNodeDetector:
             or motion_pixels >= self.min_gather_glow_pixels
         )
 
-        return bool(has_valid_nameplate and has_gather_activity)
+        # Geçerli isimlik yukarıda doğrulandı (yoksa erken False dönüldü).
+        return bool(has_gather_activity)
 
     def mark_node_contested(
         self,
@@ -1554,6 +2097,115 @@ class CorridorNavigator:
         self.drift_corrector = drift_corrector or CentroidDriftCorrector()
         self.contested_detector = contested_detector or ContestedNodeDetector()
         self.turn_damper = turn_damper or TurnDampingController()
+        # ExemplarMemory tutamacı önbelleği (D07): `get_exemplar_memory()`
+        # singleton döndürür; her karede yeniden import + kilit + çağrı
+        # yapmak yerine tutamaç bir kez çözülür. Yükleme başarısız olursa
+        # her karede yeniden denenip uyarı seli üretilmez; yalnızca
+        # `exemplar_memory_retry_sec` geçtikten sonra bir kez daha denenir.
+        # (v2r-R04: bu 4 satır D07'de `attach_to_sequential_planner`
+        # içindeki `return True` sonrasına düşmüş, ölü kod olmuştu;
+        # `__init__` hiç çalıştırmadığı için `_get_exemplar_memory`
+        # her `evaluate_corridor_path` çağrısında AttributeError veriyordu.
+        # v2r-R02 aynı kök nedeni bağımsız doğruladı — 8 koridor testi
+        # bu blokla onarılır. v2r-R05 de aynı düzeltmeyi yaptı; birleşmede
+        # bloğun ikinci kopyası oluştuğu için temizlendi. v2r-R10a da
+        # aynı düzeltmeyi byte-birebir yaptı — 3 d07 testi bu blokla onarılır.)
+        self._exemplar_memory: Any = None
+        self._exemplar_memory_loaded: bool = False
+        self._exemplar_memory_failed_at: float = 0.0
+        self.exemplar_memory_retry_sec: float = 60.0
+        # F-0075 groundwork: route_planner verildiyse planner'ın kendi
+        # alt nesneleri benimsenir (tek durum; çift filtre/zamanlayıcı
+        # yok) ve navigator planner'a kaydedilir. isinstance kontrolü
+        # Mock planner'ların otomatik özniteliklerini benimsemeyi
+        # engeller. Bu tek başına üretimi bağlamaz — üretimde
+        # CorridorNavigator kurulması (main.py / state_machine.py)
+        # dilim dışıdır; bkz. attach_to_sequential_planner.
+        if route_planner is not None:
+            self._adopt_planner_subobjects(route_planner)
+            try:
+                route_planner.corridor_navigator = self
+            except Exception:
+                pass
+
+    def _adopt_planner_subobjects(self, planner: Any) -> None:
+        """Planner'ın paylaşımlı alt nesnelerini benimser (yalnızca
+        gerçek sınıf örnekleri; Mock öznitelikler benimsenmez)."""
+        for attr, cls in (
+            ("cliff_filter", ZAxisCliffFilter),
+            ("prewalk_scheduler", PredictivePreWalkScheduler),
+            ("contested_detector", ContestedNodeDetector),
+            # H-sweep (dilim 12 D-3): eskiden yalnızca 3 alt nesne benimseniyordu;
+            # planner'ın unstuck/drift/turn-damper ayarları yok sayılıp navigator
+            # kendi varsayılanlarını kuruyor, iki ayrı "gerçek" oluşuyordu.
+            ("unstuck_maneuver", PhaseCorrelateUnstuckManeuver),
+            ("drift_corrector", CentroidDriftCorrector),
+            ("turn_damper", TurnDampingController),
+        ):
+            try:
+                candidate = getattr(planner, attr, None)
+            except Exception:
+                continue
+            if isinstance(candidate, cls):
+                try:
+                    setattr(self, attr, candidate)
+                except Exception:
+                    pass
+
+    def attach_to_sequential_planner(self, planner: Any) -> bool:
+        """
+        F-0075 groundwork — CorridorNavigator'ı üretimdeki
+        SequentialRoutePlanner örneğine bağlar: planner'ın alt
+        nesneleri benimsenir ve ``planner.corridor_navigator = self``
+        kurulur; üretim döngüsü artık
+        ``planner.corridor_navigator.step_navigation(...)`` çağırabilir
+        (contested/cliff/unstuck tek noktadan çalışır).
+
+        Kalan adım dilim dışıdır: üretimde CorridorNavigator
+        kurulmadığı için bu metodun çağıranı yok — main.py'da
+        ``SequentialRoutePlanner()`` kurulumunun yanına tek satır
+        (``CorridorNavigator(route_planner=planner)``) ve
+        state_machine.py düğüm seçim döngüsünde step_navigation
+        çağrısı gerekir. O yüzden F-0075 bu dilimde fixed değil,
+        blocked — cross-slice kalır. İdempotenttir.
+        """
+        if planner is None:
+            return False
+        self.route_planner = planner
+        self._adopt_planner_subobjects(planner)
+        try:
+            planner.corridor_navigator = self
+        except Exception as exc:
+            logger.warning("CorridorNavigator: planner'a kaydedilemedi: %s", exc)
+            return False
+        return True
+
+    def _get_exemplar_memory(self) -> Tuple[Any, bool]:
+        """Önbelleğe alınmış ExemplarMemory tutamacını döndürür.
+
+        Dönüş: `(memory_or_None, load_failed)`. Başarılı yükleme (None
+        dönmesi dahil — örn. test mock'u) bir kez çözülür ve saklanır;
+        başarısızlık 60 sn boyunca hatırlanır, bu sürede yeniden deneme
+        ve uyarı günlüğü yapılmaz.
+        """
+        if self._exemplar_memory_loaded:
+            return self._exemplar_memory, False
+        if self._exemplar_memory_failed_at > 0.0 and (
+            time.time() - self._exemplar_memory_failed_at
+        ) < self.exemplar_memory_retry_sec:
+            return None, True
+        try:
+            from dataset_factory.exemplar_memory import get_exemplar_memory
+
+            self._exemplar_memory = get_exemplar_memory()
+            self._exemplar_memory_loaded = True
+            self._exemplar_memory_failed_at = 0.0
+            return self._exemplar_memory, False
+        except Exception as exc:
+            # F-0076: yükleme hatası sessizce "temiz koridor" sayılmamalı.
+            self._exemplar_memory_failed_at = time.time()
+            logger.warning("ExemplarMemory yüklenemedi; koridor temiz sayılmayacak: %s", exc)
+            return None, True
 
     def compute_bearing(self, from_pos: Point2D, to_pos: Point2D) -> float:
         """Calculates compass bearing (0°=North, 90°=East) from from_pos to to_pos."""
@@ -1567,8 +2219,8 @@ class CorridorNavigator:
         self,
         angle_diff: float,
         deadband_deg: float = DEFAULT_DEADBAND_DEG,
-        min_turn_sec: float = 0.04,
-        max_turn_sec: float = 0.35,
+        min_turn_sec: float = TURN_MIN_DURATION_SEC,
+        max_turn_sec: float = TURN_MAX_DURATION_SEC,
     ) -> Dict[str, Any]:
         """Applies deadband zone (±5° to ±8°) and smooth turn duration interpolation."""
         return apply_turn_damping(
@@ -1585,8 +2237,16 @@ class CorridorNavigator:
         deadband_deg: float = DEFAULT_DEADBAND_DEG,
     ) -> Dict[str, Any]:
         """Calculates damped steering turn command towards target bearing."""
-        diff = compute_angle_diff(target_bearing, player_heading)
-        return apply_turn_damping(diff, deadband_deg=deadband_deg)
+        # F-0240: durum taşıyan turn_damper kullanılır; stateless
+        # apply_turn_damping tersine-dönüş sönümlemesini (reversal damping)
+        # hiç uygulamıyordu.
+        self.turn_damper.deadband_deg = max(
+            MIN_DEADBAND_DEG, min(MAX_DEADBAND_DEG, float(deadband_deg))
+        )
+        return self.turn_damper.calculate_turn(
+            target_bearing=target_bearing,
+            player_heading=player_heading,
+        )
 
     def evaluate_corridor_path(
         self,
@@ -1617,13 +2277,16 @@ class CorridorNavigator:
                 "steering_bias": "clear",
                 "recommended_turn_offset_deg": 0.0,
                 "lane_scores": {"left": 0.5, "center": 0.5, "right": 0.5},
+                "clear_terrain_found": False,
+                "exemplar_memory_available": False,
+                "exemplar_memory_error": False,
+                "yolo_detections_used": 0,
+                "yolo_detections_ignored": 0,
             }
 
-        try:
-            from dataset_factory.exemplar_memory import get_exemplar_memory
-            mem = get_exemplar_memory()
-        except Exception:
-            mem = None
+        # D07: tutamaç navigator başına bir kez çözülür
+        # (`_get_exemplar_memory`); başarısızlık 60 sn hatırlanır.
+        mem, mem_load_failed = self._get_exemplar_memory()
 
         h, w = frame.shape[:2]
         y1, y2 = int(h * 0.52), int(h * 0.82)
@@ -1655,25 +2318,33 @@ class CorridorNavigator:
 
                 # Class-specific positive exemplar checks:
                 # 14: obstacle
+                matched_specific = False
                 obs_sim, _ = mem.match_class(patch, class_id=14)
                 if obs_sim >= 0.70:
                     obstacle_detected = True
                     score -= 0.50 * float(obs_sim)
+                    matched_specific = True
 
                 # 10: monster_3d (steer around aggro/patrol monsters while pathing)
                 mob_sim, _ = mem.match_class(patch, class_id=10)
                 if mob_sim >= 0.70:
                     monster_detected = True
                     score -= 0.60 * float(mob_sim)
+                    matched_specific = True
 
                 # 15: path_ground (walkable ground corridor)
                 ground_sim, _ = mem.match_class(patch, class_id=15)
                 if ground_sim >= 0.68:
                     path_detected = True
                     score += 0.45 * float(ground_sim)
+                    matched_specific = True
 
-                # General positive exemplar classification fallback
-                pos_cid, pos_cname, pos_sim = mem.classify_patch(patch, min_sim=0.70)
+                # General positive exemplar classification fallback — yalnızca
+                # sınıf-özel eşleşme bulunamadıysa (F-0241: aynı yama iki kez
+                # cezalandırılmasın / ödüllendirilmesin).
+                pos_cid, pos_cname, pos_sim = (None, None, 0.0)
+                if not matched_specific:
+                    pos_cid, pos_cname, pos_sim = mem.classify_patch(patch, min_sim=0.70)
                 if pos_cid is not None:
                     cname_low = str(pos_cname or "").lower()
                     if pos_cid == 14 or "obstacle" in cname_low or "engel" in cname_low:
@@ -1689,6 +2360,8 @@ class CorridorNavigator:
             lane_scores[lane_name] = round(float(np.clip(score, 0.05, 0.95)), 3)
 
         # 2. Live YOLO Detections Integration (class 14, 10, 15)
+        yolo_used = 0
+        yolo_ignored = 0
         if yolo_detections:
             for det in yolo_detections:
                 if not isinstance(det, dict):
@@ -1701,11 +2374,15 @@ class CorridorNavigator:
                 if "cx" in det and "cy" in det:
                     cx, cy = float(det["cx"]), float(det["cy"])
                 elif "bbox" in det and len(det["bbox"]) == 4:
+                    # F-0077: bbox xyxy'dir; merkezi sol-üst köşe değil,
+                    # köşelerin ortalamasıdır (bbox_xyxy dalıyla aynı kural).
                     b = det["bbox"]
                     if max(b) <= 1.0:
-                        cx, cy = float(b[0]), float(b[1])
+                        cx = (float(b[0]) + float(b[2])) / 2.0
+                        cy = (float(b[1]) + float(b[3])) / 2.0
                     else:
-                        cx, cy = float(b[0]) / float(w), float(b[1]) / float(h)
+                        cx = (float(b[0]) + float(b[2])) / (2.0 * float(w))
+                        cy = (float(b[1]) + float(b[3])) / (2.0 * float(h))
                 elif "bbox_xyxy" in det and len(det["bbox_xyxy"]) == 4:
                     b = det["bbox_xyxy"]
                     cx = (float(b[0]) + float(b[2])) / (2.0 * float(w))
@@ -1716,6 +2393,9 @@ class CorridorNavigator:
                     cy = (float(b[1]) + 0.5 * float(b[3])) / float(h)
 
                 if cx is None or cy is None or not (0.30 <= cy <= 0.95):
+                    # F-0242: şerit aralığı dışı tespit sessizce atılmaz;
+                    # sayılır ve sonuçta raporlanır.
+                    yolo_ignored += 1
                     continue
 
                 det_lane = None
@@ -1727,7 +2407,10 @@ class CorridorNavigator:
                     det_lane = "right"
 
                 if not det_lane:
+                    yolo_ignored += 1
                     continue
+
+                yolo_used += 1
 
                 is_obstacle = (cid == 14) or ("obstacle" in cname) or ("engel" in cname)
                 is_monster = (cid == 10) or ("monster" in cname) or ("mob" in cname)
@@ -1771,6 +2454,12 @@ class CorridorNavigator:
                 steering_bias = "steer_right"
                 turn_offset = 10.0
 
+        if yolo_ignored:
+            logger.debug(
+                "Koridor dışı %d YOLO tespiti şerit aralığı dışında bırakıldı (kullanılan: %d)",
+                yolo_ignored,
+                yolo_used,
+            )
         return {
             "obstacle_detected": obstacle_detected,
             "monster_detected": monster_detected,
@@ -1778,7 +2467,16 @@ class CorridorNavigator:
             "steering_bias": steering_bias,
             "recommended_turn_offset_deg": turn_offset,
             "lane_scores": lane_scores,
-            "clear_terrain_found": bool(max(lane_scores.values()) >= 0.45),
+            # F-0076: nötr 0.50 şerit skoru tek başına "temiz" sayılmaz;
+            # exemplar memory yoksa ve YOLO patika kanıtı da yoksa temiz
+            # ilan edilmez.
+            "clear_terrain_found": bool(
+                max(lane_scores.values()) >= 0.45 and (mem is not None or path_detected)
+            ),
+            "exemplar_memory_available": bool(mem is not None),
+            "exemplar_memory_error": bool(mem_load_failed),
+            "yolo_detections_used": yolo_used,
+            "yolo_detections_ignored": yolo_ignored,
         }
 
     def steer_step(
@@ -1834,21 +2532,53 @@ class CorridorNavigator:
         yolo_detections: Optional[Sequence[Dict[str, Any]]] = None,
         live_detections: Optional[Sequence[Any]] = None,
         force_unstick_maneuver: Optional[str] = None,
+        prev_frame: Optional[np.ndarray] = None,
+        player_z: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Her navigasyon adımında:
-        1. Hedef düğümde rakip oyuncu (`ContestedNodeDetector`) varsa anında
+        1. Uçurum/irtifa filtresi (`ZAxisCliffFilter`) aktif düğümü dışlıyorsa
+           sıradaki uygun düğüme geçer.
+        2. Hedef düğümde rakip oyuncu (`ContestedNodeDetector`) varsa anında
            sıradaki (`Next in Sequence`) düğüme geçer.
-        2. Yürürken (`W` basılı) minimap `cv2.phaseCorrelate` + optik akış ile `< 2.5 sn`
+        3. Yürürken (`W` basılı) minimap `cv2.phaseCorrelate` + optik akış ile `< 2.5 sn`
            kayma tespit edilirse fiziksel kurtulma (jump, lateral strafe, reverse-backout) uygular.
-        3. Açısal hizalama ve ±5°..±8° ölü bölge sönümlemesiyle yalpalanmayı önler.
-        4. İleri koridor görsel analizi (engel/canavar kaçınma, patika zemin önceliği).
+        4. Açısal hizalama ve ±5°..±8° ölü bölge sönümlemesiyle yalpalanmayı önler.
+        5. İleri koridor görsel analizi (engel/canavar kaçınma, patika zemin önceliği).
+        6. Erken yürüyüş (`PredictivePreWalkScheduler`) değerlendirmesi sonuca eklenir.
+        Not: drift düzeltmesi burada değil, gerçek toplama anında
+        `on_gather_success` üzerinden çağrılır (gerçek oyuncu konumu gerekir).
         """
         curr_ts = time.time() if now is None else float(now)
         node_list = list(nodes) if nodes else []
         n = len(node_list)
         active_idx = int(current_seq_pos) % n if (n > 0 and current_seq_pos >= 0) else 0
         active_node = node_list[active_idx] if n > 0 else None
+
+        # H-sweep (dilim 12 K-3): koordinatsız düğüm harita merkezi (960, 540)
+        # sayılmaz — hedef yapılmaz, sıradaki seçilebilir düğüme geçilir.
+        if active_node is not None and not _node_has_coordinates(active_node):
+            next_node, next_idx = self._advance_to_next_node(
+                node_list,
+                active_idx,
+                player_pos=player_pos,
+                is_flying=is_flying,
+                player_altitude_band=player_altitude_band,
+                now=curr_ts,
+                player_z=player_z,
+            )
+            return {
+                "status": "node_no_coordinates",
+                "contested": False,
+                "cliff_excluded": False,
+                "no_coordinates": True,
+                "unstuck_triggered": False,
+                "selected_node": next_node,
+                "selected_index": next_idx,
+                "no_alternative_node": bool(next_node is None),
+                "turn_evaluation": None,
+                "prewalk": None,
+            }
 
         # Turn evaluation if angles are provided
         turn_eval: Optional[Dict[str, Any]] = None
@@ -1859,12 +2589,83 @@ class CorridorNavigator:
                 deadband_deg=deadband_deg,
             )
 
-        # Madde 30: Rakip oyuncu kontrolü
+        # Madde 28: erken yürüyüş değerlendirmesi (F-0078).
+        prewalk_info: Optional[Dict[str, Any]] = None
+        if active_node is not None:
+            prewalk_info = self.prewalk_scheduler.evaluate_prewalk_candidate(
+                active_node, player_pos=player_pos, now=curr_ts
+            )
+
+        # Madde 27: uçurum/irtifa filtresi (F-0078) — aktif düğüm dışlanmışsa
+        # sıradaki uygun düğüme geç.
+        if (
+            active_node is not None
+            and self.cliff_filter.is_node_excluded_by_cliff(
+                active_node,
+                is_flying=is_flying,
+                player_altitude_band=player_altitude_band,
+                player_z=player_z,
+            )
+        ):
+            next_node, next_idx = self._advance_to_next_node(
+                node_list,
+                active_idx,
+                player_pos=player_pos,
+                is_flying=is_flying,
+                player_altitude_band=player_altitude_band,
+                now=curr_ts,
+                player_z=player_z,
+            )
+            return {
+                "status": "cliff_skipped",
+                "contested": False,
+                "cliff_excluded": True,
+                "unstuck_triggered": False,
+                "selected_node": next_node,
+                "selected_index": next_idx,
+                "no_alternative_node": bool(next_node is None),
+                "turn_evaluation": turn_eval,
+                "prewalk": prewalk_info,
+            }
+
+        # Madde 30a (P1-11): 45 sn contested kilidi ana yolda okunur.
+        # Düğüm önceki tick'te mark_node_contested ile kilitlendiyse,
+        # bu karede görsel tespit ateşlenmese (kare yok / rakip ROI
+        # dışında) bile kilit süresince hedef yapılmaz — kilit
+        # tanımlıydı ama ana yol okumuyordu; _advance_to_next_node
+        # zaten kilitli adayları atlar (F-0244), o yüzden sıradaki
+        # uygun düğüme geçilir. Görsel tespit (Madde 30) bunun ardından
+        # yeni kilitleri yakalamaya devam eder.
+        if (
+            active_node is not None
+            and self.contested_detector.is_node_currently_contested_flag(active_node, now=curr_ts)
+        ):
+            next_node, next_idx = self._advance_to_next_node(
+                node_list,
+                active_idx,
+                player_pos=player_pos,
+                is_flying=is_flying,
+                player_altitude_band=player_altitude_band,
+                now=curr_ts,
+                player_z=player_z,
+            )
+            return {
+                "status": "contested_skipped",
+                "contested": True,
+                "unstuck_triggered": False,
+                "selected_node": next_node,
+                "selected_index": next_idx,
+                "no_alternative_node": bool(next_node is None),
+                "turn_evaluation": turn_eval,
+                "prewalk": prewalk_info,
+            }
+
+        # Madde 30: Rakip oyuncu kontrolü (F-0078: prev_frame artık geçiliyor)
         if (
             frame is not None
             and target_screen_xy is not None
             and active_node is not None
-            and self.contested_detector.is_node_contested(frame, target_screen_xy)
+            and self.contested_detector.is_node_contested(frame, target_screen_xy, prev_frame=prev_frame)
         ):
             self.contested_detector.mark_node_contested(active_node, now=curr_ts)
             next_node, next_idx = self._advance_to_next_node(
@@ -1874,6 +2675,7 @@ class CorridorNavigator:
                 is_flying=is_flying,
                 player_altitude_band=player_altitude_band,
                 now=curr_ts,
+                player_z=player_z,
             )
             return {
                 "status": "contested_skipped",
@@ -1881,7 +2683,9 @@ class CorridorNavigator:
                 "unstuck_triggered": False,
                 "selected_node": next_node,
                 "selected_index": next_idx,
+                "no_alternative_node": bool(next_node is None),
                 "turn_evaluation": turn_eval,
+                "prewalk": prewalk_info,
             }
 
         # Madde 26: 3B Engel Aşma & Fiziksel Kurtulma (PhaseCorrelate + Optical Flow Unstuck)
@@ -1956,20 +2760,30 @@ class CorridorNavigator:
                 is_flying=is_flying,
                 player_altitude_band=player_altitude_band,
                 now=curr_ts,
+                player_z=player_z,
             )
             selected_node = next_node
             selected_index = next_idx
 
+        unstuck_executed = bool(unstuck_result and unstuck_result.get("executed"))
         return {
-            "status": "unstuck_executed" if unstuck_result else "navigating",
+            "status": (
+                "unstuck_executed"
+                if unstuck_executed
+                else "unstuck_failed"
+                if unstuck_result
+                else "navigating"
+            ),
             "contested": False,
             "unstuck_triggered": bool(unstuck_result is not None),
             "unstuck_info": unstuck_result,
             "selected_node": selected_node,
             "selected_index": selected_index,
+            "no_alternative_node": bool(repath_requested and selected_node is None),
             "turn_evaluation": turn_eval,
             "corridor_eval": corridor_eval,
             "repath_requested": repath_requested,
+            "prewalk": prewalk_info,
         }
 
     def execute_physical_unstick(
@@ -1996,7 +2810,12 @@ class CorridorNavigator:
     ) -> bool:
         """İleri koridorun engellerden ve canavarlardan tamamen temiz olup olmadığını döndürür."""
         eval_res = self.evaluate_corridor_path(frame, yolo_detections=live_detections)
-        return bool(eval_res.get("steering_bias") == "clear" and not eval_res.get("obstacle_detected") and not eval_res.get("monster_detected"))
+        return bool(
+            eval_res.get("steering_bias") == "clear"
+            and not eval_res.get("obstacle_detected")
+            and not eval_res.get("monster_detected")
+            and eval_res.get("clear_terrain_found", False)
+        )
 
     def get_corridor_steering_recommendation(
         self,
@@ -2013,15 +2832,18 @@ class CorridorNavigator:
         actual_x: float,
         actual_y: float,
         now: Optional[float] = None,
+        minimap_dist_px: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         `[F Gather]` başarılı olduğunda:
         - Madde 27: Yaklaşma başarısızlık sayacını sıfırlar.
         - Madde 29: Düğümün `(x, y)` merkezini gerçek oyuncu konumuyla (EMA) iyileştirir.
         """
+        # F-0243: başarı dalında mesafe bilinmiyorsa 0.0 uydurulmaz;
+        # record_approach_attempt başarıda mesafeyi zaten kullanmaz.
         self.cliff_filter.record_approach_attempt(
             node=node,
-            minimap_dist_px=0.0,
+            minimap_dist_px=minimap_dist_px,
             interaction_succeeded=True,
             now=now,
         )
@@ -2056,6 +2878,7 @@ class CorridorNavigator:
         is_flying: bool = False,
         player_altitude_band: Optional[str] = None,
         now: Optional[float] = None,
+        player_z: Optional[float] = None,
     ) -> Tuple[Optional[Any], int]:
         """Rakip oyuncu veya uçurum durumunda sıradaki uygun düğüme ilerler."""
         if self.route_planner is not None and hasattr(
@@ -2073,27 +2896,51 @@ class CorridorNavigator:
         n = len(nodes)
         if n == 0:
             return None, -1
-        next_idx = (int(current_seq_pos) + 1) % n
-        return nodes[next_idx], next_idx
+        if n == 1:
+            # F-0245: tek düğümlü rotada "sıradaki" aynı düğümdür; contested /
+            # uçurum atlaması aynı düğüme dönmemeli.
+            return None, -1
+        # F-0244: yedek yol uçurum filtresini ve contested kilidini yok
+        # saymamalı — sıradaki uygun düğüm bulunana kadar tara.
+        for step in range(1, n):
+            idx = (int(current_seq_pos) + step) % n
+            cand = nodes[idx]
+            if self.cliff_filter.is_node_excluded_by_cliff(
+                cand,
+                is_flying=is_flying,
+                player_altitude_band=player_altitude_band,
+                player_z=player_z,
+            ):
+                continue
+            if self.contested_detector.is_node_currently_contested_flag(cand, now=now):
+                continue
+            return cand, idx
+        return None, -1
 
     def get_corridor_navigator_health_summary(self) -> dict:
-        return {"module": "corridor_navigator", "ready": True}
+        ready, checks = _corridor_navigator_self_check()
+        return {"module": "corridor_navigator", "ready": ready, "checks": checks}
 
     def get_corridor_status_summary(self) -> dict:
-        try:
-            return {"corridor_ready": True, "metrics": {}}
-        except Exception:
-            return {"corridor_ready": True}
+        ready, checks = _corridor_navigator_self_check()
+        return {"corridor_ready": ready, "metrics": checks}
 
     def get_corridor_navigator_ready_flag(self) -> dict:
-        return {"module": "corridor_navigator", "ready": True}
+        ready, checks = _corridor_navigator_self_check()
+        return {"module": "corridor_navigator", "ready": ready, "checks": checks}
 
     def get_corridor_navigator_version_info(self) -> dict:
-        return {"module": "corridor_navigator", "version": "2.0.0", "ready": True}
+        ready, checks = _corridor_navigator_self_check()
+        return {"module": "corridor_navigator", "version": __version__, "ready": ready, "checks": checks}
 
     def get_corridor_navigator_diagnostic_snapshot(self) -> dict:
-        return {"module": "corridor_navigator", "status": "ok", "ready": True}
-
+        ready, checks = _corridor_navigator_self_check()
+        return {
+            "module": "corridor_navigator",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+            "checks": checks,
+        }
 
 def get_corridor_navigator_capabilities() -> list:
     return [
@@ -2114,8 +2961,62 @@ def get_corridor_navigator_capabilities() -> list:
 CorridorStuckDetector = PhaseCorrelateUnstuckManeuver
 
 
+# H-sweep (dilim 12 K-1): üretim bağlantı bayrağı. Varsayılan False'dur;
+# yalnızca install_corridor_navigator() True yapar. "ready" bayrakları
+# öz-deneyi anlatır, üretime bağlılığı anlatmaz — ikisi karıştırılmaz.
+_PRODUCTION_WIRED: bool = False
+
+
+def install_corridor_navigator(planner: Any = None, **kwargs: Any) -> "CorridorNavigator":
+    """Üretim kurulumu (state_machine / main tarafı çağırır — C grubu işi).
+
+    `CorridorNavigator` kurar, verilirse `SequentialRoutePlanner`'a bağlar
+    (`attach_to_sequential_planner`) ve `_PRODUCTION_WIRED` bayrağını
+    kaldırır. Çağrılmadığı sürece readiness "production_wired: False"
+    döner; sınıfın kurulabiliyor olması üretime bağlı olduğu anlamına gelmez.
+    """
+    global _PRODUCTION_WIRED
+    nav = CorridorNavigator(**kwargs)
+    if planner is not None:
+        nav.attach_to_sequential_planner(planner)
+    _PRODUCTION_WIRED = True
+    return nav
+
+
+def _corridor_navigator_self_check() -> Tuple[bool, Dict[str, Any]]:
+    """Alt bileşenleri ve kritik yöntemleri gerçekten yoklayarak hazır durumu ölçer (F-0246)."""
+    try:
+        nav = CorridorNavigator()
+        checks: Dict[str, Any] = {
+            "unstuck_maneuver": nav.unstuck_maneuver is not None,
+            "cliff_filter": nav.cliff_filter is not None,
+            "prewalk_scheduler": nav.prewalk_scheduler is not None,
+            "drift_corrector": nav.drift_corrector is not None,
+            "contested_detector": nav.contested_detector is not None,
+            "turn_damper": nav.turn_damper is not None,
+            "methods": all(
+                callable(getattr(nav, name, None))
+                for name in (
+                    "step_navigation",
+                    "evaluate_corridor_path",
+                    "steer_step",
+                    "execute_physical_unstick",
+                    "on_gather_success",
+                    "calculate_turn",
+                )
+            ),
+            "capabilities": len(get_corridor_navigator_capabilities()) > 0,
+        }
+        return bool(all(checks.values())), checks
+    except Exception as exc:
+        return False, {"error": str(exc)}
+
+
 def validate_corridor_navigator_contract() -> bool:
-    return bool(get_corridor_navigator_capabilities())
+    # F-0246: yetenek listesinin boş olmaması yetmez; navigatör gerçekten
+    # kurulabilmeli ve tüm alt bileşenleri + yöntemleri mevcut olmalı.
+    ready, _checks = _corridor_navigator_self_check()
+    return bool(ready and get_corridor_navigator_capabilities())
 
 
 def get_corridor_navigator_baseline_metrics() -> dict:
@@ -2123,9 +3024,14 @@ def get_corridor_navigator_baseline_metrics() -> dict:
 
 
 def get_corridor_navigator_readiness_status() -> dict:
+    # H-sweep (dilim 12 K-1): "ready" yalnızca modül öz-deneyidir (sınıf
+    # kurulabiliyor + alt bileşenler mevcut). Üretime bağlı olup olmadığı
+    # ayrı bayraktır — ölü modül "hazır" görünmesin diye production_wired
+    # yalnızca install_corridor_navigator() çağrılınca True olur.
     return {
         "module": "corridor_navigator",
         "ready": validate_corridor_navigator_contract(),
+        "production_wired": bool(_PRODUCTION_WIRED),
         "metrics": get_corridor_navigator_baseline_metrics(),
     }
 

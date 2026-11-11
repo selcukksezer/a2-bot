@@ -27,8 +27,8 @@ from dataset_factory.class_taxonomy import (
 )
 
 
-def test_canonical_classes_0_to_24_exact_mapping() -> None:
-    """Verify 0..24 classes from herb_aria to buff_scroll and core/consumable splits."""
+def test_canonical_classes_0_to_26_exact_mapping() -> None:
+    """Verify 0..26 classes from herb_aria to player_character and core/consumable splits."""
     expected_names = {
         0: "herb_aria",
         1: "herb_mela",
@@ -90,7 +90,7 @@ def test_turkish_labels_completeness_and_consistency() -> None:
     assert CANONICAL_LABELS_TR[23] == "Mana İksiri"
     assert CANONICAL_LABELS_TR[24] == "Parşömen"
 
-    for cid in range(25):
+    for cid in range(27):
         full_tr = CANONICAL_LABELS_TR[cid]
         short_tr = CANONICAL_SHORT_LABELS_TR[cid]
         assert isinstance(full_tr, str) and len(full_tr.strip()) > 0
@@ -102,7 +102,7 @@ def test_turkish_labels_completeness_and_consistency() -> None:
 
 
 def test_sanitize_class_id_and_name_canonical_roundtrip() -> None:
-    """Verify sanitize_class_id_and_name resolves all 0..24 IDs, names, and formatting variants."""
+    """Verify sanitize_class_id_and_name resolves all 0..26 IDs, names, and formatting variants."""
     for cid, cname in CANONICAL_NAMES.items():
         # By ID only
         assert sanitize_class_id_and_name(cid, "") == (cid, cname)
@@ -143,7 +143,7 @@ def test_sanitize_class_id_and_name_rejects_non_canonical_and_supports_fallback(
     with pytest.raises(ValueError, match="Non-canonical class cannot be resolved"):
         sanitize_class_id_and_name(999, "invalid_item", allow_fallback=True, default_fallback=98)
 
-    # Valid fallback when allow_fallback=True and default_fallback is in 0..24
+    # Valid fallback when allow_fallback=True and default_fallback is in 0..26
     assert sanitize_class_id_and_name(
         98, "completely_unknown_xyz", allow_fallback=True, default_fallback=0
     ) == (0, "herb_aria")

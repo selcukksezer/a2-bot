@@ -8,18 +8,27 @@ demotes the box confidence to `<= 0.45` and sets:
     `trusted = False`
     `weak = True`
     `demoted_reason = "stem_material_conflict"`
+
+Wiring (F-2001): exported from `dataset_factory/__init__.py` and used as
+the material-conflict detector by `tools/recalibrate_dataset_trust.py`
+Rule 4 (`is_conflicting_material` delegates to
+`is_stem_material_conflict`); the inline stem->class table that used to
+live in the recalibration tool was removed in favour of this module.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 import re
 from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 
 MAX_CONFLICT_CONFIDENCE: float = 0.45
-DEFAULT_FALLBACK_CONFIDENCE: float = 0.40
+# B-09: olculmemis guvene varsayilan yazilmaz — DEFAULT_FALLBACK_CONFIDENCE
+# (0.40) kaldirildi. _extract_confidence guven alani yoksa None doner;
+# eksiklik StemValidationResult.confidence_missing ile acikca isaretlenir.
 DEMOTED_REASON_STEM_MATERIAL_CONFLICT: str = "stem_material_conflict"
 
 # Canonical material family keys -> all synonym tokens in stems or class names
@@ -117,6 +126,58 @@ for _family, _tokens in MATERIAL_FAMILY_SYNONYMS.items():
             if _sub and _sub not in ("herb", "ore", "gem", "fresh", "taze", "fruit"):
                 TOKEN_TO_MATERIAL_FAMILY.setdefault(_sub, _family)
 
+# --- Precompiled patterns (D59) -------------------------------------------------
+# The hot paths below used to call re.findall / re.split / re.search on every
+# invocation. The patterns are built once here from the module constants above
+# (nothing else mutates them), so per-call work is dict lookups + one scan.
+_STEM_EXTENSIONS: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".json", ".txt")
+
+_BOOT_MATERIAL_RE = re.compile(
+    r"boot(?:_[a-z0-9]+)*?_(aria|mela|targena|orichalcum|obsidian|wood|tree|log|crystal|gem|edana|lumina|blood)(?:_|$)"
+)
+_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+# Concatenated-stem substring fallback (same (token, family) pairs and order
+# as the old per-token re.search loop, longest token first so a compound
+# token wins over its prefix, e.g. "calendula" over "aria"-style overlaps).
+_STEM_SUBSTRING_TOKENS: Tuple[Tuple[str, str], ...] = (
+    ("orichalcum", "orichalcum"),
+    ("obsidian", "obsidian"),
+    ("targena", "targena"),
+    ("calendula", "targena"),
+    ("yggdrasil", "wood"),
+    ("asvata", "wood"),
+    ("aria", "aria"),
+    ("mela", "mela"),
+    ("wood", "wood"),
+    ("edana", "edana"),
+    ("lumina", "lumina"),
+)
+_STEM_SUBSTRING_FAMILY: Dict[str, str] = dict(_STEM_SUBSTRING_TOKENS)
+_STEM_SUBSTRING_RE = re.compile(
+    r"(?<![a-z])(?:"
+    + "|".join(re.escape(tok) for tok, _ in sorted(_STEM_SUBSTRING_TOKENS, key=lambda kv: -len(kv[0])))
+    + r")(?![a-z])"
+)
+
+# Box-class substring fallback: one compiled alternation over every
+# TOKEN_TO_MATERIAL_FAMILY key with len >= 4 (exactly the set the old loop
+# scanned, ~100 re.search calls per invocation). Longest first so compound
+# tokens ("crystal_blood", "gem_crystal") win over their parts. Every
+# compound key's parts map to the same family, except crystal_blood /
+# blood_crystal, whose "crystal" part is guarded by has_blood_crystal at the
+# call site exactly as before -- so a single left-to-right finditer pass
+# returns the same family set as the old "check every token" loop.
+_BOX_SUBSTRING_KEYS: Tuple[str, ...] = tuple(
+    sorted(
+        (tok for tok in TOKEN_TO_MATERIAL_FAMILY if len(tok) >= 4),
+        key=lambda tok: (-len(tok), tok),
+    )
+)
+_BOX_SUBSTRING_RE = re.compile(
+    r"(?<![a-z])(?:" + "|".join(re.escape(tok) for tok in _BOX_SUBSTRING_KEYS) + r")(?![a-z])"
+)
+
 # Canonical 22/25-class IDs -> canonical material family
 CLASS_ID_TO_MATERIAL_FAMILY: Dict[int, str] = {
     0: "aria",
@@ -163,10 +224,14 @@ class StemValidationResult:
     box_materials: Tuple[str, ...]
     class_id: int
     class_name: str
-    original_confidence: float
-    calibrated_confidence: float
+    # B-09: guven olculmemisse None'dir (uydurma varsayilan yok).
+    original_confidence: Optional[float]
+    calibrated_confidence: Optional[float]
     trusted: bool
     weak: bool
+    # B-09: kutuda hic guven alani yoksa True — cagiran bu kutunun
+    # guvenini olculmemis saymalidir.
+    confidence_missing: bool = False
     demoted_reason: Optional[str] = None
     box: Dict[str, Any] = field(default_factory=dict)
 
@@ -182,9 +247,52 @@ class StemValidationResult:
             "calibrated_confidence": self.calibrated_confidence,
             "trusted": self.trusted,
             "weak": self.weak,
+            "confidence_missing": self.confidence_missing,
             "demoted_reason": self.demoted_reason,
             "box": dict(self.box),
         }
+
+
+@lru_cache(maxsize=1024)
+def _cached_stem_materials(s_lower: str) -> FrozenSet[str]:
+    """Memoized stem-material extraction over an already-normalized stem.
+
+    The alias map and the heuristic fallback depend only on the lowered
+    string, so repeated labels -- the same few stems on every frame --
+    resolve from cache. Returns a frozenset; callers must copy before
+    mutating.
+    """
+    found: Set[str] = set()
+
+    # Check explicit boot_*_<material>_* pattern first
+    for token in _BOOT_MATERIAL_RE.findall(s_lower):
+        fam = TOKEN_TO_MATERIAL_FAMILY.get(token)
+        if fam:
+            found.add(fam)
+
+    # Compound blood crystal check before generic crystal check
+    has_blood_crystal = "blood_crystal" in s_lower or "crystal_blood" in s_lower
+    if has_blood_crystal:
+        found.add("blood")
+
+    # Tokenize stem on non-alphanumeric separators
+    tokens = [t for t in _TOKEN_SPLIT_RE.split(s_lower) if t]
+    for tok in tokens:
+        if tok == "crystal" and has_blood_crystal:
+            continue
+        fam = TOKEN_TO_MATERIAL_FAMILY.get(tok)
+        if fam is not None:
+            found.add(fam)
+
+    # Substring fallback for concatenated stems (e.g., `boot01aria`, `orichalcum02`).
+    # A bare `in` check matched unrelated words mid-token (e.g. "aria"
+    # inside "barista"), so a token must start/end at a non-letter
+    # boundary; digits next to it are still allowed (boot01aria).
+    if not found:
+        for match in _STEM_SUBSTRING_RE.finditer(s_lower):
+            found.add(_STEM_SUBSTRING_FAMILY[match.group(0)])
+
+    return frozenset(found)
 
 
 class StemMaterialValidator:
@@ -199,94 +307,69 @@ class StemMaterialValidator:
     def __init__(
         self,
         max_conflict_confidence: float = MAX_CONFLICT_CONFIDENCE,
-        default_fallback_confidence: float = DEFAULT_FALLBACK_CONFIDENCE,
         demoted_reason: str = DEMOTED_REASON_STEM_MATERIAL_CONFLICT,
-        protect_hand_labels: bool = False,
+        protect_hand_labels: bool = True,
     ) -> None:
+        # B-09: default_fallback_confidence parametresi kaldirildi — olculmemis
+        # guvene varsayilan yazan tek tuketici _extract_confidence idi ve o da
+        # artik None donuyor; nitelik hicbir yerde okunmuyordu.
         if max_conflict_confidence > MAX_CONFLICT_CONFIDENCE or max_conflict_confidence <= 0.0:
             raise ValueError(
                 f"max_conflict_confidence must be in (0.0, {MAX_CONFLICT_CONFIDENCE}], "
                 f"got {max_conflict_confidence}"
             )
         self.max_conflict_confidence: float = float(max_conflict_confidence)
-        self.default_fallback_confidence: float = min(
-            float(default_fallback_confidence), self.max_conflict_confidence
-        )
         self.demoted_reason: str = str(demoted_reason or DEMOTED_REASON_STEM_MATERIAL_CONFLICT)
         self.protect_hand_labels: bool = bool(protect_hand_labels)
 
     @staticmethod
     def normalize_stem(stem_or_path: Union[str, Path, None]) -> str:
-        """Extract normalized lowercase stem from a filename, path, or stem string."""
+        """Extract normalized lowercase stem from a filename, path, or stem string.
+
+        Pure-string fast path with ``pathlib.Path(...).name`` parity on POSIX
+        (backslash is NOT a separator): drop trailing slashes, keep the part
+        after the last ``"/"``, lowercase, strip known extensions repeatedly.
+        """
         if stem_or_path is None:
             return ""
         raw = str(stem_or_path).strip()
         if not raw:
             return ""
-        name = Path(raw).name
+        name = (
+            raw
+            if "/" not in raw and "\\" not in raw and raw not in (".", "..")
+            else Path(raw).name
+        )
+        # Fast path above: with no path separator Path(raw).name == raw
+        # (except "." / ".."); avoids a Path() build per call —
+        # normalize_stem runs 3x per validate_box call.
         lower_name = name.lower()
-        for ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".json", ".txt"):
-            if lower_name.endswith(ext):
-                lower_name = lower_name[: -len(ext)]
-                break
+        # Strip ALL known extensions (e.g. "img.png.json" -> "img"), not
+        # just the first one: the old code broke out after a single strip.
+        stripped = True
+        while stripped:
+            stripped = False
+            for ext in _STEM_EXTENSIONS:
+                if lower_name.endswith(ext):
+                    lower_name = lower_name[: -len(ext)]
+                    stripped = True
+                    break
         return lower_name.strip()
 
     @classmethod
     def extract_stem_materials(cls, stem_or_path: Union[str, Path, None]) -> Set[str]:
         """Extract canonical material families hinted by the filename/stem.
 
-        Handles patterns like `boot_001_aria_node`, `ref_mela_02`, `targena`,
+        Handles patterns like `boot_*_aria_*`, `ref_mela_02`, `targena`,
         `orichalcum`, `obsidian`, `wood`, `herb_edana`, `crystal_blood`, etc.
+        Results are memoized on the normalized stem (the same few stems
+        recur on every frame); a fresh ``set`` copy is returned so callers
+        cannot poison the cache by mutating the result.
         """
         s_lower = cls.normalize_stem(stem_or_path)
         if not s_lower:
             return set()
-
-        found: Set[str] = set()
-
-        # Check explicit boot_*_<material>_* pattern first
-        boot_match = re.findall(
-            r"boot(?:_[a-z0-9]+)*?_(aria|mela|targena|orichalcum|obsidian|wood|tree|log|crystal|gem|edana|lumina|blood)(?:_|$)",
-            s_lower,
-        )
-        for token in boot_match:
-            fam = TOKEN_TO_MATERIAL_FAMILY.get(token)
-            if fam:
-                found.add(fam)
-
-        # Compound blood crystal check before generic crystal check
-        has_blood_crystal = "blood_crystal" in s_lower or "crystal_blood" in s_lower
-        if has_blood_crystal:
-            found.add("blood")
-
-        # Tokenize stem on non-alphanumeric separators
-        tokens = [t for t in re.split(r"[^a-z0-9]+", s_lower) if t]
-        for tok in tokens:
-            if tok == "crystal" and has_blood_crystal:
-                continue
-            fam = TOKEN_TO_MATERIAL_FAMILY.get(tok)
-            if fam is not None:
-                found.add(fam)
-
-        # Substring fallback for concatenated stems (e.g., `boot01aria`, `orichalcum02`)
-        if not found:
-            for key_token, fam in (
-                ("orichalcum", "orichalcum"),
-                ("obsidian", "obsidian"),
-                ("targena", "targena"),
-                ("calendula", "targena"),
-                ("yggdrasil", "wood"),
-                ("asvata", "wood"),
-                ("aria", "aria"),
-                ("mela", "mela"),
-                ("wood", "wood"),
-                ("edana", "edana"),
-                ("lumina", "lumina"),
-            ):
-                if key_token in s_lower:
-                    found.add(fam)
-
-        return found
+        return set(_cached_stem_materials(s_lower))
 
     @classmethod
     def extract_box_materials(
@@ -317,7 +400,7 @@ class StemMaterialValidator:
             if has_blood_crystal:
                 found.add("blood")
 
-            tokens = [t for t in re.split(r"[^a-z0-9]+", c_lower) if t]
+            tokens = [t for t in _TOKEN_SPLIT_RE.split(c_lower) if t]
             for tok in tokens:
                 if tok == "crystal" and has_blood_crystal:
                     continue
@@ -326,11 +409,16 @@ class StemMaterialValidator:
                     found.add(fam)
 
             if not found:
-                for key_token, fam in TOKEN_TO_MATERIAL_FAMILY.items():
-                    if len(key_token) >= 4 and key_token in c_lower:
-                        if key_token == "crystal" and has_blood_crystal:
-                            continue
-                        found.add(fam)
+                # Single compiled alternation over the same >=4-char token
+                # set the old loop re.search'ed one by one (~100 regex
+                # calls per invocation). Longest token first, so compound
+                # tokens win over their parts; the "crystal" guard is kept
+                # exactly as before.
+                for match in _BOX_SUBSTRING_RE.finditer(c_lower):
+                    token = match.group(0)
+                    if token == "crystal" and has_blood_crystal:
+                        continue
+                    found.add(TOKEN_TO_MATERIAL_FAMILY[token])
 
         # Resolve from canonical class_id if class_name didn't already resolve to a conflicting family
         if cid in CLASS_ID_TO_MATERIAL_FAMILY and not found:
@@ -369,13 +457,11 @@ class StemMaterialValidator:
         if not is_3d_stem and not mats:
             return False
 
-        # Raw essence class or out-of-taxonomy class ID (>= 25)
-        if "essence" in c_lower or c_lower.startswith("essence_") or cid >= 25:
-            # If essence has a material token that matches the stem material, check if it conflicts
-            box_mats = cls.extract_box_materials(c_lower, cid)
-            if mats and box_mats and (mats & box_mats):
-                # Still an unmapped essence class on a 3D frame if cid >= 25 or raw essence_*
-                return True
+        # Raw essence class or out-of-taxonomy class ID (>= 25) on a
+        # 3D/material stem is invalid regardless of whether its material
+        # token happens to match the stem's. (The old code computed the
+        # match and then returned True on both branches — dead code.)
+        if "essence" in c_lower or cid >= 25:
             return True
 
         return False
@@ -403,14 +489,55 @@ class StemMaterialValidator:
         if self.is_invalid_essence_on_material_or_3d_stem(stem_str, cname, cid, stem_mats):
             return True
 
+        box_mats = self.extract_box_materials(cname, cid)
+        return self._has_material_conflict(stem_mats, box_mats, cname, cid)
+
+    @classmethod
+    def _has_material_conflict(
+        cls,
+        stem_mats: Set[str],
+        box_mats: Set[str],
+        cname: str,
+        cid: int,
+    ) -> bool:
+        """True when a stem material hint disagrees with the box class.
+
+        A box whose class resolves to a different material family conflicts.
+        A box whose class resolves to NO material family at all (unknown /
+        unmapped class) also conflicts when the stem carries a material
+        hint: it used to pass silently even though it cannot be verified
+        against the hint. Known non-material canonical classes (monster,
+        UI prompts, potions, ...) are not material claims and do not
+        conflict; neither does a box with no class information at all.
+        """
         if not stem_mats:
             return False
+        if box_mats:
+            return not (stem_mats & box_mats)
+        return cls._is_unresolved_class(cname, cid)
 
-        box_mats = self.extract_box_materials(cname, cid)
-        if box_mats and not (stem_mats & box_mats):
-            return True
+    @classmethod
+    def _is_unresolved_class(cls, cname: str, cid: int) -> bool:
+        """True when the box claims a class that maps to no known family
+        and is not a known non-material class."""
+        if not cname and cid < 0:
+            return False  # no class claim at all; nothing to judge
+        if cname in _NON_MATERIAL_UI_CLASS_TOKENS or any(
+            ui_tok in cname
+            for ui_tok in ("f_gather", "e_floating", "e_gather", "gather_prompt", "gather_crest")
+        ):
+            return False  # known non-material UI class, not a material claim
+        if cid >= 0:
+            try:
+                from dataset_factory.class_taxonomy import dataset_class_names
 
-        return False
+                if cid in dataset_class_names():
+                    return False  # known canonical class (e.g. monster_3d)
+            except Exception:
+                if 0 <= cid <= 26:
+                    return False
+            return True  # class id outside the canonical taxonomy
+        return True  # named class that resolves to no material family
 
     def validate_box(
         self,
@@ -443,12 +570,29 @@ class StemMaterialValidator:
         stem_str, raw_box = self._resolve_stem_and_box(stem_or_box, box_or_stem)
         target_box = raw_box if in_place else dict(raw_box)
 
+        norm_stem = self.normalize_stem(stem_str)
+        stem_mats = self.extract_stem_materials(norm_stem)
+        return self._evaluate_box_prepared(norm_stem, stem_mats, target_box)
+
+    def _evaluate_box_prepared(
+        self,
+        norm_stem: str,
+        stem_mats: Set[str],
+        target_box: Dict[str, Any],
+    ) -> StemValidationResult:
+        """Evaluate one (already copied, if needed) box against precomputed stem data.
+
+        Batch entry point: `validate_boxes` / `validate_review_payload`
+        normalize the stem and extract its materials once instead of once
+        per box. Behaviour is identical to `evaluate_box`; only the repeated
+        stem work is hoisted. `target_box` is mutated on demotion.
+        """
         cid = self._extract_class_id(target_box)
         cname = self._extract_class_name(target_box, cid)
         orig_conf = self._extract_confidence(target_box)
+        # B-09: guven yoksa None kalir; asla 0.40 yazilmaz.
+        conf_missing = orig_conf is None
 
-        norm_stem = self.normalize_stem(stem_str)
-        stem_mats = self.extract_stem_materials(norm_stem)
         box_mats = self.extract_box_materials(cname, cid)
 
         if self.protect_hand_labels and self._is_protected_hand_label(target_box):
@@ -463,6 +607,7 @@ class StemMaterialValidator:
                 calibrated_confidence=orig_conf,
                 trusted=bool(target_box.get("trusted", True)),
                 weak=bool(target_box.get("weak", False)),
+                confidence_missing=conf_missing,
                 demoted_reason=target_box.get("demoted_reason"),
                 box=target_box,
             )
@@ -470,16 +615,23 @@ class StemMaterialValidator:
         conflict = False
         if self.is_invalid_essence_on_material_or_3d_stem(norm_stem, cname, cid, stem_mats):
             conflict = True
-        elif stem_mats and box_mats and not (stem_mats & box_mats):
+        elif self._has_material_conflict(stem_mats, box_mats, cname, cid):
             conflict = True
 
         if conflict:
-            demoted_conf = round(min(orig_conf, self.max_conflict_confidence), 4)
-            if demoted_conf <= 0.0:
-                demoted_conf = round(self.default_fallback_confidence, 4)
-            target_box["confidence"] = demoted_conf
-            if "conf" in target_box:
-                target_box["conf"] = demoted_conf
+            # Never inflate: a zero/negative confidence stays zero. The old
+            # code replaced it with the 0.40 fallback, promoting a
+            # zero-confidence box to 0.40 by the demotion itself.
+            # B-09: guven olculmemisse dusurulecek deger yoktur — kutuya
+            # uydurma guven yazilmaz; yalnizca trusted/weak/demoted_reason
+            # isaretlenir ve confidence_missing tasinir.
+            if orig_conf is None:
+                demoted_conf = None
+            else:
+                demoted_conf = round(max(0.0, min(orig_conf, self.max_conflict_confidence)), 4)
+                target_box["confidence"] = demoted_conf
+                if "conf" in target_box:
+                    target_box["conf"] = demoted_conf
             target_box["trusted"] = False
             target_box["weak"] = True
             target_box["demoted_reason"] = self.demoted_reason
@@ -495,6 +647,7 @@ class StemMaterialValidator:
                 calibrated_confidence=demoted_conf,
                 trusted=False,
                 weak=True,
+                confidence_missing=conf_missing,
                 demoted_reason=self.demoted_reason,
                 box=target_box,
             )
@@ -508,8 +661,11 @@ class StemMaterialValidator:
             class_name=cname,
             original_confidence=orig_conf,
             calibrated_confidence=orig_conf,
-            trusted=bool(target_box.get("trusted", False)),
-            weak=bool(target_box.get("weak", True)),
+            # No conflict: a box without explicit flags is trusted, not weak.
+            # The old defaults were inverted (trusted=False, weak=True).
+            trusted=bool(target_box.get("trusted", True)),
+            weak=bool(target_box.get("weak", False)),
+            confidence_missing=conf_missing,
             demoted_reason=target_box.get("demoted_reason"),
             box=target_box,
         )
@@ -521,8 +677,27 @@ class StemMaterialValidator:
         *,
         in_place: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Validate a sequence of bounding boxes for a given stem."""
+        """Validate a sequence of bounding boxes for a given stem.
+
+        The stem is normalized and its materials extracted once for the
+        whole batch instead of once per box; each box is then evaluated
+        against the precomputed stem data (`_evaluate_box_prepared`).
+        When no stem is given, boxes fall back to their own `"stem"` key,
+        so the per-box path is used unchanged.
+        """
         validated: List[Dict[str, Any]] = []
+        stem_str = str(stem_or_path or "")
+        if stem_str.strip():
+            norm_stem = self.normalize_stem(stem_str)
+            stem_mats = self.extract_stem_materials(norm_stem)
+            for b in boxes or []:
+                if not isinstance(b, dict):
+                    continue
+                target = b if in_place else dict(b)
+                validated.append(
+                    self._evaluate_box_prepared(norm_stem, stem_mats, target).box
+                )
+            return validated
         for b in boxes or []:
             if not isinstance(b, dict):
                 continue
@@ -541,21 +716,47 @@ class StemMaterialValidator:
         Any box in `trusted` that has a stem material conflict is demoted (`confidence <= 0.45`,
         `trusted=False`, `weak=True`, `demoted_reason="stem_material_conflict"`) and moved to `weak`.
         Any conflicting box already in `weak` is also demoted in-place.
+
+        S359 (v19/P3-8): dict-dışı payload artık sessizce geri
+        dönmüyor — imza `Dict[str, Any]` diyor, çağıran "doğrulandı"
+        sanmasın diye TypeError fırlatır.
         """
         if not isinstance(payload, dict):
-            return payload
+            raise TypeError(
+                "validate_review_payload expects a dict payload, "
+                f"got {type(payload).__name__}"
+            )
 
         target = payload if in_place else dict(payload)
         resolved_stem = str(stem or target.get("stem") or "")
 
-        trusted_in = [b for b in (target.get("trusted") or []) if isinstance(b, dict)]
-        weak_in = [b for b in (target.get("weak") or []) if isinstance(b, dict)]
+        # Non-dict entries are not boxes: keep them in their list instead of
+        # silently dropping them.
+        trusted_in = target.get("trusted") or []
+        weak_in = target.get("weak") or []
+
+        # Hoist the stem work (normalize + material extraction) once for the
+        # whole payload; per-box evaluation reuses it. With an empty stem,
+        # boxes fall back to their own stem key, so the per-box path applies.
+        use_prepared = bool(resolved_stem.strip())
+        if use_prepared:
+            norm_stem = self.normalize_stem(resolved_stem)
+            stem_mats = self.extract_stem_materials(norm_stem)
+
+        def _evaluate(b: Dict[str, Any]) -> StemValidationResult:
+            if use_prepared:
+                target_box = b if in_place else dict(b)
+                return self._evaluate_box_prepared(norm_stem, stem_mats, target_box)
+            return self.evaluate_box(resolved_stem, b, in_place=in_place)
 
         new_trusted: List[Dict[str, Any]] = []
         demoted_to_weak: List[Dict[str, Any]] = []
 
         for b in trusted_in:
-            res = self.evaluate_box(resolved_stem, b, in_place=in_place)
+            if not isinstance(b, dict):
+                new_trusted.append(b)
+                continue
+            res = _evaluate(b)
             if res.conflict:
                 demoted_to_weak.append(res.box)
             else:
@@ -563,7 +764,10 @@ class StemMaterialValidator:
 
         new_weak: List[Dict[str, Any]] = list(demoted_to_weak)
         for b in weak_in:
-            res = self.evaluate_box(resolved_stem, b, in_place=in_place)
+            if not isinstance(b, dict):
+                new_weak.append(b)
+                continue
+            res = _evaluate(b)
             new_weak.append(res.box)
 
         target["trusted"] = new_trusted
@@ -686,6 +890,10 @@ class StemMaterialValidator:
                 return str(names[int(class_id)])
         except Exception:
             pass
+        # Canonical fallback (mirrors dataset_class_names(), 0..26). The old
+        # table covered only 10 ids, so _lookup_class_name() returned
+        # "class_<id>" for every other canonical class when the taxonomy
+        # import was unavailable.
         fallback = {
             0: "herb_aria",
             1: "herb_mela",
@@ -696,20 +904,39 @@ class StemMaterialValidator:
             6: "herb_edana",
             7: "herb_lumina",
             8: "ore_obsidian",
+            9: "minimap_sprout",
+            10: "monster_3d",
+            11: "minimap_monster_dot",
             12: "crystal_blood",
+            13: "skill_ui_prompt",
+            14: "obstacle",
+            15: "path_ground",
+            16: "player_hp_bar",
+            17: "player_mp_bar",
+            18: "target_hp_bar",
+            19: "skill_bar",
+            20: "skill_slot_ready",
+            21: "skill_slot_cooldown",
+            22: "hp_potion",
+            23: "mp_potion",
+            24: "buff_scroll",
+            25: "kinah",
+            26: "player_character",
         }
         return fallback.get(int(class_id), f"class_{int(class_id)}")
 
     @staticmethod
-    def _extract_confidence(box: Mapping[str, Any]) -> float:
+    def _extract_confidence(box: Mapping[str, Any]) -> Optional[float]:
+        """Kutunun olculmus guvenini doner; guven alani yoksa/ayristirilamazsa
+        None doner (B-09: olculmemis guvene 0.40 gibi uydurma varsayilan
+        yazilmaz — eksiklik confidence_missing ile isaretlenir)."""
         for key in ("confidence", "conf", "score"):
             if key in box and box[key] is not None:
                 try:
-                    val = float(box[key])
-                    return val
+                    return float(box[key])
                 except (TypeError, ValueError):
                     continue
-        return DEFAULT_FALLBACK_CONFIDENCE
+        return None
 
     @staticmethod
     def _is_protected_hand_label(box: Mapping[str, Any]) -> bool:
@@ -750,7 +977,6 @@ def validate_and_demote_box(
 
 __all__ = [
     "CLASS_ID_TO_MATERIAL_FAMILY",
-    "DEFAULT_FALLBACK_CONFIDENCE",
     "DEMOTED_REASON_STEM_MATERIAL_CONFLICT",
     "MATERIAL_FAMILY_SYNONYMS",
     "MAX_CONFLICT_CONFIDENCE",

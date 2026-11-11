@@ -1,4 +1,3 @@
-import os
 import sys
 import ctypes
 import logging
@@ -7,7 +6,7 @@ from typing import Optional, List, Dict, Any
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 from PyQt6.QtWidgets import (
     QDialog,
@@ -19,14 +18,67 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QFrame,
-    QGridLayout,
-    QSizePolicy,
 )
 
 from ui.calibration_wizard import CalibrationWizard, numpy_bgr_to_qpixmap, imread_unicode
 from ui.shell_page_frame import wrap_shell_tab_root_layout
+from version import __version__
 
 logger = logging.getLogger("GuideDialog")
+
+# P2-2: çalışan tanılama thread'leri dialog yok edilse bile hayatta kalır —
+# worker ebeveynsiz kurulur, bitince finished zinciri siler. Dialog
+# kapanırken closeEvent işbirlikçi stop + sınırlı wait uygular.
+_ACTIVE_DIAG_THREADS: set = set()
+
+
+class _DiagnosticsWorker(QThread):
+    """Runs the 4 system diagnostic checks off the GUI thread (P2-2).
+
+    The checks only read plain attributes (``templates_dir``) and do
+    disk / ctypes / mss work when given their GUI-thread inputs, so no
+    QWidget is touched here. Screen size and the Qt fallback frame are
+    captured on the GUI thread before start (QPixmap must not leave the
+    GUI thread); the worker prefers mss and uses them only as fallback.
+    """
+
+    finished = pyqtSignal(object)  # List[Dict[str, Any]]
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        dialog: "GuideDialog",
+        screen_size: Optional[Any],
+        qt_frame: Optional[np.ndarray],
+        parent: Optional[Any] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._dialog = dialog
+        self._screen_size = screen_size
+        self._qt_frame = qt_frame
+
+    def run(self) -> None:
+        try:
+            checks = [
+                lambda: self._dialog._check_resolution_and_monitor(
+                    size=self._screen_size
+                ),
+                lambda: self._dialog._check_screen_capture(
+                    frame_bgr=self._qt_frame
+                ),
+                self._dialog._check_template_files,
+                self._dialog._check_admin_and_input_driver,
+            ]
+            results: List[Dict[str, Any]] = []
+            for check in checks:
+                if self.isInterruptionRequested():
+                    self.failed.emit("Tanılama durduruldu.")
+                    return
+                results.append(check())
+            self.finished.emit(results)
+        except Exception as exc:
+            logger.error("Background diagnostics failed: %s", exc, exc_info=True)
+            self.failed.emit(str(exc))
 
 
 class GuideDialog(QDialog):
@@ -126,12 +178,40 @@ class GuideDialog(QDialog):
 
         self._current_step_idx: int = 0
         self._diagnostic_results: List[Dict[str, Any]] = []
+        # P2-2: çalışan arka plan tanılama işi (varsa) — bitince
+        # finished zinciri referansı temizler.
+        self._diag_thread: Optional[Any] = None
         self._labeling_readiness: Dict[str, Any] = {}
+        # Diskten okunan kare pixmap'leri (dosya adı -> QPixmap). Adım
+        # ileri/geri gezinmede aynı kare tekrar tekrar imread + numpy
+        # dönüşümünden geçiyordu (~300 ms/çağrı); en fazla 6 adım karesi
+        # olduğu için önbellek küçük ve sınırlı tutulur.
+        self._frame_pixmap_cache: Dict[str, QPixmap] = {}
 
         self._apply_dark_theme()
         self._init_ui()
         self._update_step_view()
-        self.run_diagnostics()
+        # P2-2: tanılama artık __init__'te senkron çalışmıyor — dialog
+        # önce boyanır, tanılama event loop başladıktan sonra arka planda
+        # koşar; sonuçlar _on_diagnostics_finished slotunda çizilir.
+        QTimer.singleShot(0, self.run_diagnostics)
+
+    def closeEvent(self, event: Any) -> None:  # noqa: N802
+        """Stop a running background diagnostics job on close (P2-2)."""
+        thread = getattr(self, "_diag_thread", None)
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    thread.requestInterruption()
+                    thread.quit()
+                    if not thread.wait(2000):
+                        logger.warning(
+                            "Tanılama kapanışta 2 sn içinde durmadı; "
+                            "arka plan işi bitince kapanacak."
+                        )
+            except RuntimeError:
+                pass  # C++ nesnesi zaten silinmiş
+        super().closeEvent(event)
 
     def _apply_dark_theme(self) -> None:
         self.setStyleSheet(
@@ -154,7 +234,7 @@ class GuideDialog(QDialog):
                 border-bottom: none;
                 border-top-left-radius: 6px;
                 border-top-right-radius: 6px;
-                padding: 9px 18px;
+                padding: 10px 20px;
                 margin-right: 4px;
                 font-weight: 600;
             }
@@ -171,7 +251,7 @@ class GuideDialog(QDialog):
                 color: #f1f5f9;
                 border: 1px solid #3b455e;
                 border-radius: 5px;
-                padding: 8px 16px;
+                padding: 9px 18px;
                 font-weight: 600;
             }
             QPushButton:hover {
@@ -209,6 +289,7 @@ class GuideDialog(QDialog):
         header_row = QHBoxLayout()
         header_row.addStretch()
         self.btn_header_calib = QPushButton("Görsel Şablon ve Kalibrasyon Sihirbazı...")
+        self.btn_header_calib.setMinimumHeight(34)
         self.btn_header_calib.setObjectName("accentBtn")
         self.btn_header_calib.clicked.connect(self.open_calibration_wizard)
         header_row.addWidget(self.btn_header_calib)
@@ -230,6 +311,7 @@ class GuideDialog(QDialog):
         footer_row = QHBoxLayout()
         footer_row.addStretch()
         btn_close = QPushButton("Kılavuzu Kapat")
+        btn_close.setMinimumHeight(34)
         btn_close.clicked.connect(self.accept)
         footer_row.addWidget(btn_close)
         root_layout.addLayout(footer_row)
@@ -262,7 +344,7 @@ class GuideDialog(QDialog):
             "<b>Ctrl+Alt+F10</b> (Duraklat/Devam) &nbsp;|&nbsp; <b>Ctrl+Alt+F12</b> (Acil Durdurma / Panik)"
         )
         self.lbl_guide_highlights.setWordWrap(True)
-        self.lbl_guide_highlights.setStyleSheet("color: #e2e8f0; font-size: 12px; border: none;")
+        self.lbl_guide_highlights.setStyleSheet("color: #e2e8f0; font-size: 13px; border: none;")
         hl_layout.addWidget(self.lbl_guide_highlights)
         layout.addWidget(highlights_frame)
 
@@ -273,6 +355,7 @@ class GuideDialog(QDialog):
         for idx, step_info in enumerate(self.GUIDE_STEPS):
             btn = QPushButton(f"Adım {idx + 1} ({step_info['frame']})")
             btn.setCheckable(True)
+            btn.setMinimumHeight(32)
             btn.clicked.connect(lambda checked, i=idx: self.set_step_index(i))
             self._step_buttons.append(btn)
             step_bar.addWidget(btn)
@@ -289,7 +372,7 @@ class GuideDialog(QDialog):
 
         self.lbl_step_title = QLabel("")
         self.lbl_step_title.setStyleSheet(
-            "font-size: 15px; font-weight: bold; color: #f8fafc;"
+            "font-size: 16px; font-weight: bold; color: #f8fafc;"
         )
         card_layout.addWidget(self.lbl_step_title)
 
@@ -304,18 +387,20 @@ class GuideDialog(QDialog):
         self.lbl_step_desc = QLabel("")
         self.lbl_step_desc.setWordWrap(True)
         self.lbl_step_desc.setStyleSheet(
-            "font-size: 13px; color: #cbd5e1; padding: 4px 2px;"
+            "font-size: 14px; color: #cbd5e1; padding: 4px 2px;"
         )
         card_layout.addWidget(self.lbl_step_desc)
 
         # Prev / Next navigation row
         nav_row = QHBoxLayout()
         self.btn_prev_step = QPushButton("◀ Önceki Adım")
+        self.btn_prev_step.setMinimumHeight(34)
         self.btn_prev_step.clicked.connect(self.prev_step)
         self.lbl_step_counter = QLabel("Adım 1 / 6")
         self.lbl_step_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_step_counter.setStyleSheet("color: #38bdf8; font-weight: bold;")
         self.btn_next_step = QPushButton("Sonraki Adım ▶")
+        self.btn_next_step.setMinimumHeight(34)
         self.btn_next_step.setObjectName("primaryBtn")
         self.btn_next_step.clicked.connect(self.next_step)
 
@@ -337,7 +422,7 @@ class GuideDialog(QDialog):
         lbl_info = QLabel(
             "Sistem Öz-Tanılama aracı ekran çözünürlüğünü, ekran yakalama bütünlüğünü, şablon dosyalarını ve yönetici yetkilerini doğrular."
         )
-        lbl_info.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        lbl_info.setStyleSheet("color: #94a3b8; font-size: 13px;")
         top_bar.addWidget(lbl_info)
         top_bar.addStretch()
 
@@ -383,14 +468,46 @@ class GuideDialog(QDialog):
             self._current_step_idx -= 1
             self._update_step_view()
 
+    # Diskten yüklenen kare pixmap önbelleğinin üst sınırı (en fazla 6 adım
+    # karesi kullanılır; sınır, genel amaçlı çağrılarda büyümesini engeller).
+    _FRAME_PIXMAP_CACHE_MAX_ENTRIES = 16
+
     def _load_frame_pixmap(self, frame_filename: str, title: str) -> QPixmap:
-        """Loads a reference frame from video_frames/ or synthesizes an informative preview banner."""
+        """Loads a reference frame from video_frames/ or synthesizes an informative preview banner.
+
+        Diskten okunan kareler dosya adına göre önbelleğe alınır: adım
+        gezinmesinde aynı kareye dönüldüğünde imread + numpy dönüşümü
+        tekrarlanmaz. Önbelleğe alınan pixmap çağrıcı tarafından
+        değiştirilmez (``_update_step_view`` yalnızca ``scaled()`` ile
+        yeni bir pixmap üretir), bu yüzden aynı nesneyi döndürmek güvenlidir.
+        Eksik dosya için çizilen yedek banner önbelleğe alınmaz; dosya
+        sonradan eklenirse bir sonraki çağrı diski tekrar görür.
+        """
+        # __dict__ lookup (not getattr): on a __new__-constructed dialog
+        # whose __init__ never ran, PyQt raises RuntimeError for a missing
+        # attribute instead of AttributeError.
+        cache = self.__dict__.get("_frame_pixmap_cache")
+        if cache is None:
+            cache = {}
+            try:
+                setattr(self, "_frame_pixmap_cache", cache)
+            except Exception:
+                pass
+        key = str(frame_filename)
+        cached = cache.get(key)
+        if cached is not None and not cached.isNull():
+            return cached
         try:
             frame_path = self.frames_dir / frame_filename
             if frame_path.exists():
                 img_bgr = imread_unicode(frame_path, cv2.IMREAD_COLOR)
                 if img_bgr is not None and img_bgr.size > 0:
-                    return numpy_bgr_to_qpixmap(img_bgr)
+                    pix = numpy_bgr_to_qpixmap(img_bgr)
+                    if pix is not None and not pix.isNull():
+                        if len(cache) >= self._FRAME_PIXMAP_CACHE_MAX_ENTRIES:
+                            cache.pop(next(iter(cache)))
+                        cache[key] = pix
+                    return pix
         except Exception as exc:
             logger.warning("Failed reading guide frame %s: %s", frame_filename, exc)
 
@@ -442,23 +559,33 @@ class GuideDialog(QDialog):
         except Exception as exc:
             logger.error("Failed updating guide step view: %s", exc)
 
-    def _check_resolution_and_monitor(self) -> Dict[str, Any]:
-        """1. Resolution & Monitor Check (1920x1080 / 2560x1440)."""
+    def _check_resolution_and_monitor(
+        self, size: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """1. Resolution & Monitor Check (1920x1080 / 2560x1440).
+
+        P2-2: ``size`` verilirse (GUI thread'inde yakalanmış Qt ekran
+        boyutu) prob atlanır; verilmezse eski davranış (önce mss, yoksa
+        Qt) aynen korunur.
+        """
         try:
             width, height = 0, 0
-            try:
-                import mss
+            if size is not None:
+                width, height = int(size[0]), int(size[1])
+            else:
+                try:
+                    import mss
 
-                with mss.mss() as sct:
-                    mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                    width, height = int(mon["width"]), int(mon["height"])
-            except Exception:
-                from PyQt6.QtGui import QGuiApplication
+                    with mss.mss() as sct:
+                        mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                        width, height = int(mon["width"]), int(mon["height"])
+                except Exception:
+                    from PyQt6.QtGui import QGuiApplication
 
-                screen = QGuiApplication.primaryScreen()
-                if screen is not None:
-                    sz = screen.size()
-                    width, height = sz.width(), sz.height()
+                    screen = QGuiApplication.primaryScreen()
+                    if screen is not None:
+                        sz = screen.size()
+                        width, height = sz.width(), sz.height()
 
             standard_resolutions = {(1920, 1080), (2560, 1440)}
             passed = (width, height) in standard_resolutions
@@ -486,33 +613,62 @@ class GuideDialog(QDialog):
                 "detail": f"Birincil monitör çözünürlüğü sorgulanamadı: {exc}",
             }
 
-    def _check_screen_capture(self) -> Dict[str, Any]:
-        """2. Screen Capture Check (Black screen / Fullscreen Exclusive test)."""
+    @staticmethod
+    def _grab_frame_mss() -> Optional[np.ndarray]:
+        """One screen frame via mss (thread-safe); None when unavailable."""
         try:
-            frame_bgr: Optional[np.ndarray] = None
-            try:
-                import mss
+            import mss
 
-                with mss.mss() as sct:
-                    mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                    raw = np.array(sct.grab(mon))
-                    frame_bgr = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
-            except Exception:
-                from PyQt6.QtGui import QGuiApplication
+            with mss.mss() as sct:
+                mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                raw = np.array(sct.grab(mon))
+                return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+        except Exception:
+            return None
 
-                screen = QGuiApplication.primaryScreen()
-                if screen is not None:
-                    qpix = screen.grabWindow(0)
-                    qimg = qpix.toImage().convertToFormat(QImage.Format.Format_RGB888)
-                    w, h = qimg.width(), qimg.height()
-                    ptr = qimg.bits()
-                    if ptr is not None and w > 0 and h > 0:
-                        ptr.setsize(h * qimg.bytesPerLine())
-                        arr = np.frombuffer(ptr, np.uint8).reshape((h, qimg.bytesPerLine()))
-                        rgb = arr[:, : w * 3].reshape((h, w, 3))
-                        frame_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    @staticmethod
+    def _grab_frame_qt() -> Optional[np.ndarray]:
+        """One screen frame via Qt grabWindow — GUI THREAD ONLY.
 
-            if frame_bgr is None or frame_bgr.size == 0:
+        QPixmap must not leave the GUI thread; callers on a worker thread
+        must use a frame captured here beforehand (see
+        ``_capture_gui_diagnostics_inputs``).
+        """
+        try:
+            from PyQt6.QtGui import QGuiApplication
+
+            screen = QGuiApplication.primaryScreen()
+            if screen is None:
+                return None
+            qpix = screen.grabWindow(0)
+            qimg = qpix.toImage().convertToFormat(QImage.Format.Format_RGB888)
+            w, h = qimg.width(), qimg.height()
+            ptr = qimg.bits()
+            if ptr is None or w <= 0 or h <= 0:
+                return None
+            ptr.setsize(h * qimg.bytesPerLine())
+            arr = np.frombuffer(ptr, np.uint8).reshape((h, qimg.bytesPerLine()))
+            rgb = arr[:, : w * 3].reshape((h, w, 3))
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        except Exception:
+            return None
+
+    def _check_screen_capture(
+        self, frame_bgr: Optional[np.ndarray] = None
+    ) -> Dict[str, Any]:
+        """2. Screen Capture Check (Black screen / Fullscreen Exclusive test).
+
+        P2-2: ``frame_bgr`` GUI thread'inde yakalanmış Qt yedek karesidir;
+        worker önce mss dener (eski öncelik aynen), mss yoksa yedek kare
+        kullanılır, o da yoksa Qt yakalama denenir (yalnızca GUI
+        thread'inden doğrudan çağrıda).
+        """
+        try:
+            frame: Optional[np.ndarray] = self._grab_frame_mss()
+            if frame is None:
+                frame = frame_bgr if frame_bgr is not None else self._grab_frame_qt()
+
+            if frame is None or frame.size == 0:
                 return {
                     "title": "2. Ekran Yakalama Kontrolü (Siyah Ekran / Tam Ekran Özel Mod Testi)",
                     "passed": False,
@@ -520,9 +676,13 @@ class GuideDialog(QDialog):
                     "detail": "Ekran yakalama boş döndü. Oyunu Çerçevesiz Pencere (Borderless Windowed) moduna alın.",
                 }
 
-            mean_lum = float(np.mean(frame_bgr))
-            std_lum = float(np.std(frame_bgr))
-            is_black = mean_lum < 2.0 and std_lum < 2.0
+            mean_lum = float(np.mean(frame))
+            std_lum = float(np.std(frame))
+            max_lum = float(np.max(frame))
+            # A genuinely black capture has (near-)no bright pixel at all.
+            # A merely dark in-game scene (night, dungeon) still contains
+            # HUD text / icons, so max luminance separates the two.
+            is_black = mean_lum < 2.0 and std_lum < 2.0 and max_lum < 8.0
 
             if not is_black:
                 return {
@@ -530,7 +690,7 @@ class GuideDialog(QDialog):
                     "passed": True,
                     "badge": "✔ GEÇTİ",
                     "detail": (
-                        f"Canlı ekran görüntüsü sağlıklı yakalandı ({frame_bgr.shape[1]}x{frame_bgr.shape[0]}, "
+                        f"Canlı ekran görüntüsü sağlıklı yakalandı ({frame.shape[1]}x{frame.shape[0]}, "
                         f"ortalama parlaklık={mean_lum:.1f}). Tam Ekran engeli yok."
                     ),
                 }
@@ -553,44 +713,59 @@ class GuideDialog(QDialog):
             }
 
     def _check_template_files(self) -> Dict[str, Any]:
-        """3. Template Files Check (templates/f_gather_template.png existence and size check)."""
+        """3. Template Files Check: every unique template file the wizard needs."""
         try:
-            fg_path = self.templates_dir / "f_gather_template.png"
-            if not fg_path.exists():
-                return {
-                    "title": "3. Şablon Dosyaları Kontrolü (templates/f_gather_template.png)",
-                    "passed": False,
-                    "badge": "⚠ UYARI",
-                    "detail": (
-                        f"{self.templates_dir} dizininde '{fg_path.name}' bulunamadı. "
-                        "Şablon kesmek ve kaydetmek için 'Görsel Şablon ve Kalibrasyon Sihirbazı...' butonuna tıklayın."
-                    ),
-                }
+            # Unique template filenames from the wizard (64 label/alias
+            # entries share 25 files); checking only f_gather hid the rest.
+            filenames = sorted({
+                str(meta.get("filename", ""))
+                for meta in CalibrationWizard.TEMPLATE_TARGETS.values()
+            } - {""})
+            missing: List[str] = []
+            broken: List[str] = []
+            present = 0
+            for fname in filenames:
+                fpath = self.templates_dir / fname
+                if not fpath.exists():
+                    missing.append(fname)
+                    continue
+                try:
+                    img = imread_unicode(fpath, cv2.IMREAD_COLOR)
+                except Exception:
+                    img = None
+                if img is None or img.size == 0 or fpath.stat().st_size < 64:
+                    broken.append(fname)
+                    continue
+                h, w = img.shape[:2]
+                if w < 8 or h < 8:
+                    broken.append(fname)
+                    continue
+                present += 1
 
-            file_size = fg_path.stat().st_size
-            img = imread_unicode(fg_path, cv2.IMREAD_COLOR)
-            if img is None or img.size == 0 or file_size < 64:
-                return {
-                    "title": "3. Şablon Dosyaları Kontrolü (templates/f_gather_template.png)",
-                    "passed": False,
-                    "badge": "⚠ UYARI",
-                    "detail": f"'{fg_path.name}' şablon dosyası bozuk veya boş ({file_size} bayt).",
-                }
-
-            h, w = img.shape[:2]
-            passed = w >= 8 and h >= 8
+            total = len(filenames)
+            passed = not missing and not broken
+            if passed:
+                detail = (
+                    f"Tüm {total}/{total} şablon dosyası doğrulandı ve eşleşmeye hazır."
+                )
+            else:
+                parts = [f"{present}/{total} şablon mevcut."]
+                if missing:
+                    parts.append(f"Eksik ({len(missing)}): {', '.join(missing[:6])}" + ("…" if len(missing) > 6 else ""))
+                if broken:
+                    parts.append(f"Bozuk ({len(broken)}): {', '.join(broken[:6])}" + ("…" if len(broken) > 6 else ""))
+                parts.append("Şablon kesmek ve kaydetmek için 'Görsel Şablon ve Kalibrasyon Sihirbazı...' butonuna tıklayın.")
+                detail = " ".join(parts)
             return {
-                "title": "3. Şablon Dosyaları Kontrolü (templates/f_gather_template.png)",
+                "title": "3. Şablon Dosyaları Kontrolü (templates/*.png)",
                 "passed": passed,
                 "badge": "✔ GEÇTİ" if passed else "⚠ UYARI",
-                "detail": (
-                    f"'{fg_path.name}' ({w}x{h} piksel, {file_size} bayt) doğrulandı ve eşleşmeye hazır."
-                ),
+                "detail": detail,
             }
         except Exception as exc:
             logger.error("Template file check error: %s", exc)
             return {
-                "title": "3. Şablon Dosyaları Kontrolü (templates/f_gather_template.png)",
+                "title": "3. Şablon Dosyaları Kontrolü (templates/*.png)",
                 "passed": False,
                 "badge": "⚠ UYARI",
                 "detail": f"Şablon dosyaları kontrol edilirken hata oluştu: {exc}",
@@ -598,6 +773,20 @@ class GuideDialog(QDialog):
 
     def _check_admin_and_input_driver(self) -> Dict[str, Any]:
         """4. Administrator Privileges (ctypes.windll.shell32.IsUserAnAdmin()) & Input Driver Check."""
+        # This check is Windows-only: ctypes.windll does not exist elsewhere,
+        # so on Linux/macOS it warned permanently about something that can
+        # never apply. The bot drives input via Interception (hardware HID)
+        # on Windows; other platforms simply skip this check.
+        if sys.platform != "win32":
+            return {
+                "title": "4. Yönetici Yetkileri ve Girdi Sürücüsü Kontrolü",
+                "passed": True,
+                "badge": "ℹ BİLGİ",
+                "detail": (
+                    "Windows dışı platform — yönetici/SendInput kontrolü yalnızca "
+                    "Windows'ta geçerli; bu platformda uygulanmaz."
+                ),
+            }
         try:
             is_admin = False
             try:
@@ -647,15 +836,96 @@ class GuideDialog(QDialog):
                 "detail": f"Yetkiler doğrulanamadı: {exc}",
             }
 
-    def run_diagnostics(self) -> List[Dict[str, Any]]:
-        """Executes all 4 automated system diagnostic checks and renders PASS/WARN cards."""
+    def _capture_gui_diagnostics_inputs(self) -> Any:
+        """GUI-thread-only inputs for the background diagnostics run.
+
+        Returns ``(screen_size, qt_frame)``: the Qt screen size and one
+        Qt screen frame. Both are fallbacks — the worker prefers mss —
+        but QPixmap must not leave the GUI thread, so they are captured
+        here, before the worker starts. One frame grab on the GUI thread
+        is the remaining (small) blocking cost; everything else runs
+        off-thread.
+        """
+        size = None
         try:
-            self._diagnostic_results = [
-                self._check_resolution_and_monitor(),
-                self._check_screen_capture(),
-                self._check_template_files(),
-                self._check_admin_and_input_driver(),
-            ]
+            from PyQt6.QtGui import QGuiApplication
+
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                sz = screen.size()
+                size = (sz.width(), sz.height())
+        except Exception:
+            size = None
+        return size, self._grab_frame_qt()
+
+    def run_diagnostics(self) -> List[Dict[str, Any]]:
+        """Start the 4 automated system diagnostic checks (P2-2).
+
+        Async since P2-2: the checks run in a background thread and the
+        PASS/WARN cards are rendered in ``_on_diagnostics_finished``.
+        Returns the results of the last completed run (possibly empty
+        before the first run finishes). A run already in progress ignores
+        re-entry (button spam / wizard callback while running).
+        """
+        if getattr(self, "_diag_thread", None) is not None:
+            return list(self._diagnostic_results)
+        size, qt_frame = self._capture_gui_diagnostics_inputs()
+        try:
+            self.lbl_diag_summary.setText("Tanılama çalışıyor…")
+            self.lbl_diag_summary.setStyleSheet(
+                "font-weight: bold; color: #38bdf8; padding: 4px;"
+            )
+        except Exception:
+            pass
+        # P2-2: parentless on purpose — a running QThread must not be
+        # destroyed with the dialog; _ACTIVE_DIAG_THREADS keeps it alive
+        # until finished, which deletes it.
+        worker = _DiagnosticsWorker(self, size, qt_frame)
+        _ACTIVE_DIAG_THREADS.add(worker)
+        worker.finished.connect(self._on_diagnostics_finished)
+        worker.failed.connect(self._on_diagnostics_failed)
+        worker.finished.connect(self._clear_diag_thread)
+        worker.failed.connect(self._clear_diag_thread)
+        worker.finished.connect(
+            lambda: _ACTIVE_DIAG_THREADS.discard(worker)
+        )
+        worker.failed.connect(
+            lambda: _ACTIVE_DIAG_THREADS.discard(worker)
+        )
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        self._diag_thread = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            logger.error("Failed starting diagnostics thread: %s", exc)
+            _ACTIVE_DIAG_THREADS.discard(worker)
+            self._diag_thread = None
+        return list(self._diagnostic_results)
+
+    def _clear_diag_thread(self) -> None:
+        """Drop the finished diagnostics thread ref (worker finished/failed)."""
+        self._diag_thread = None
+
+    def _on_diagnostics_failed(self, message: str) -> None:
+        """GUI-thread slot: report a failed background diagnostics run."""
+        logger.error("Failed running diagnostics: %s", message)
+        try:
+            self.lbl_diag_summary.setText(
+                f"Tanılama çalıştırılamadı: {message}"
+            )
+            self.lbl_diag_summary.setStyleSheet(
+                "font-weight: bold; color: #e74c3c; padding: 4px;"
+            )
+        except Exception:
+            pass
+
+    def _on_diagnostics_finished(self, results: object) -> None:
+        """GUI-thread slot: store and render background diagnostic results."""
+        try:
+            self._diagnostic_results = (
+                list(results) if isinstance(results, list) else []
+            )
 
             # Clear old cards
             while self.diag_cards_layout.count():
@@ -691,11 +961,8 @@ class GuideDialog(QDialog):
                 self.lbl_diag_summary.setStyleSheet(
                     "font-weight: bold; color: #f59e0b; padding: 4px;"
                 )
-
-            return self._diagnostic_results
         except Exception as exc:
-            logger.error("Failed running diagnostics: %s", exc)
-            return []
+            logger.error("Failed rendering diagnostics: %s", exc)
 
     def _create_diagnostic_card(self, item: Dict[str, Any]) -> QFrame:
         passed = bool(item.get("passed", False))
@@ -732,10 +999,10 @@ class GuideDialog(QDialog):
         text_col = QVBoxLayout()
         text_col.setSpacing(4)
         lbl_t = QLabel(title_text)
-        lbl_t.setStyleSheet("font-weight: bold; font-size: 14px; color: #f1f5f9;")
+        lbl_t.setStyleSheet("font-weight: bold; font-size: 15px; color: #f1f5f9;")
         lbl_d = QLabel(detail_text)
         lbl_d.setWordWrap(True)
-        lbl_d.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        lbl_d.setStyleSheet("color: #94a3b8; font-size: 13px;")
         text_col.addWidget(lbl_t)
         text_col.addWidget(lbl_d)
         row.addLayout(text_col, stretch=1)
@@ -760,7 +1027,7 @@ class GuideDialog(QDialog):
     @staticmethod
     def get_enterprise_modules_guide() -> List[Dict[str, str]]:
         """
-        Returns a Turkish summary list of the 11 integrated enterprise & vision modules
+        Returns a Turkish summary list of the 12 integrated enterprise & vision modules
         and the RTX YOLO Dataset Factory.
         """
         return [
@@ -831,32 +1098,62 @@ class GuideDialog(QDialog):
         }
 
     def check_labeling_and_exemplar_readiness(self) -> Dict[str, Any]:
-        """Checks dataset/approved pool and exemplar memory readiness for the Guide diagnostics."""
+        """Checks dataset/approved pool and exemplar memory readiness for the Guide diagnostics.
+
+        ``ready`` is True only when both artefacts actually exist. (The
+        exemplar file lives under dataset/, with the legacy config/ path
+        accepted as a fallback.)
+        """
         base = Path(self.__dict__.get("base_dir") or ".")
         approved_dir = base / "dataset" / "approved"
-        exemplar_file = base / "config" / "learned_exemplars.json"
+        exemplar_candidates = [
+            base / "dataset" / "learned_exemplars.json",
+            base / "config" / "learned_exemplars.json",
+        ]
+        exemplar_file = next((c for c in exemplar_candidates if c.exists()), exemplar_candidates[0])
+        approved_exists = approved_dir.exists()
+        exemplar_exists = exemplar_file.exists()
         return {
             "approved_pool_dir": str(approved_dir),
-            "approved_pool_exists": approved_dir.exists(),
-            "exemplar_file_exists": exemplar_file.exists(),
-            "ready": True,
+            "approved_pool_exists": approved_exists,
+            "exemplar_file": str(exemplar_file),
+            "exemplar_file_exists": exemplar_exists,
+            "ready": bool(approved_exists and exemplar_exists),
         }
 
     def get_guide_dialog_health_summary(self) -> dict:
         """Returns health summary of the guide dialog safely."""
         try:
-            return {"guide_dialog_ready": True}
+            readiness = self.check_labeling_and_exemplar_readiness()
+            return {
+                "guide_dialog_ready": bool(readiness.get("ready", False)),
+                "approved_pool_exists": readiness.get("approved_pool_exists", False),
+                "exemplar_file_exists": readiness.get("exemplar_file_exists", False),
+            }
         except Exception:
             return {"guide_dialog_ready": False}
 
     def get_guide_dialog_ready_flag(self) -> dict:
-        return {"module": "guide_dialog", "ready": True}
+        try:
+            ready = bool(self.check_labeling_and_exemplar_readiness().get("ready", False))
+        except Exception:
+            ready = False
+        return {"module": "guide_dialog", "ready": ready}
 
     def get_guide_dialog_version_info(self) -> dict:
-        return {"module": "guide_dialog", "version": "2.0.0", "ready": True}
+        try:
+            ready = bool(self.check_labeling_and_exemplar_readiness().get("ready", False))
+        except Exception:
+            ready = False
+        return {"module": "guide_dialog", "version": __version__, "ready": ready}
 
     def get_guide_dialog_diagnostic_snapshot(self) -> dict:
-        return {"module": "guide_dialog", "status": "ok", "ready": True}
+        try:
+            ready = bool(self.check_labeling_and_exemplar_readiness().get("ready", False))
+            status = "ok" if ready else "incomplete"
+        except Exception:
+            ready, status = False, "error"
+        return {"module": "guide_dialog", "status": status, "ready": ready}
 
 
 def get_guide_dialog_capabilities() -> list:
@@ -864,41 +1161,88 @@ def get_guide_dialog_capabilities() -> list:
 
 
 def validate_guide_dialog_contract() -> bool:
-    return bool(get_guide_dialog_capabilities())
+    """Real structural check: capabilities exist, the enterprise guide
+    lists 12 modules, and the consumable classes carry canonical IDs."""
+    try:
+        modules = GuideDialog.get_enterprise_modules_guide()
+        return bool(
+            get_guide_dialog_capabilities()
+            and len(modules) == 12
+            and "buff_scroll (24)" in GuideDialog.__new__(GuideDialog).get_interactive_feature_guide_summary()["consumable_classes"]
+        )
+    except Exception:
+        return False
 
 
 def get_guide_dialog_baseline_metrics() -> dict:
-    return {"module": "guide_dialog", "contract_valid": validate_guide_dialog_contract(), "capability_count": len(get_guide_dialog_capabilities())}
+    contract_valid = validate_guide_dialog_contract()
+    return {
+        "module": "guide_dialog",
+        "contract_valid": contract_valid,
+        "capability_count": len(get_guide_dialog_capabilities()),
+        "module_count": len(GuideDialog.get_enterprise_modules_guide()),
+    }
 
 
 def get_guide_dialog_readiness_status() -> dict:
-    return {"module": "guide_dialog", "ready": validate_guide_dialog_contract(), "metrics": get_guide_dialog_baseline_metrics()}
+    return {
+        "module": "guide_dialog",
+        "ready": validate_guide_dialog_contract(),
+        "metrics": get_guide_dialog_baseline_metrics(),
+    }
 
 
 def get_guide_dialog_audit_record() -> dict:
-    return {"module": "guide_dialog", "audit_passed": validate_guide_dialog_contract(), "readiness": get_guide_dialog_readiness_status()}
+    return {
+        "module": "guide_dialog",
+        "audit_passed": validate_guide_dialog_contract(),
+        "metrics": get_guide_dialog_baseline_metrics(),
+    }
 
 
 def get_guide_dialog_operational_digest() -> dict:
-    return {"module": "guide_dialog", "operational": validate_guide_dialog_contract(), "audit": get_guide_dialog_audit_record()}
+    return {
+        "module": "guide_dialog",
+        "operational": validate_guide_dialog_contract(),
+        "metrics": get_guide_dialog_baseline_metrics(),
+    }
 
 
 def get_guide_dialog_telemetry_payload() -> dict:
-    return {"module": "guide_dialog", "telemetry_ready": validate_guide_dialog_contract(), "digest": get_guide_dialog_operational_digest()}
+    return {
+        "module": "guide_dialog",
+        "telemetry_ready": validate_guide_dialog_contract(),
+        "metrics": get_guide_dialog_baseline_metrics(),
+    }
 
 
 def get_guide_dialog_integrity_seal() -> dict:
-    return {"module": "guide_dialog", "sealed": validate_guide_dialog_contract(), "telemetry": get_guide_dialog_telemetry_payload()}
+    return {
+        "module": "guide_dialog",
+        "sealed": validate_guide_dialog_contract(),
+        "metrics": get_guide_dialog_baseline_metrics(),
+    }
 
 
 def get_guide_dialog_compliance_certificate() -> dict:
-    return {"module": "guide_dialog", "certified": validate_guide_dialog_contract(), "seal": get_guide_dialog_integrity_seal()}
+    return {
+        "module": "guide_dialog",
+        "certified": validate_guide_dialog_contract(),
+        "metrics": get_guide_dialog_baseline_metrics(),
+    }
 
 
 def get_guide_dialog_readiness_probe() -> dict:
-    return {"module": "guide_dialog", "ready": validate_guide_dialog_contract(), "certificate": get_guide_dialog_compliance_certificate()}
+    return {
+        "module": "guide_dialog",
+        "ready": validate_guide_dialog_contract(),
+        "metrics": get_guide_dialog_baseline_metrics(),
+    }
 
 
 def get_guide_dialog_audit_summary() -> dict:
-    return {"module": "guide_dialog", "audit_passed": validate_guide_dialog_contract(), "probe": get_guide_dialog_readiness_probe()}
-
+    return {
+        "module": "guide_dialog",
+        "audit_passed": validate_guide_dialog_contract(),
+        "metrics": get_guide_dialog_baseline_metrics(),
+    }

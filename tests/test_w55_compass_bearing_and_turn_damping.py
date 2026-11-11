@@ -194,7 +194,50 @@ def test_turn_damping_controller_reversal_damping_and_follower_integration():
     ]
     follower = CyclicalRouteFollower(nodes=nodes, waypoint_radius_px=20.0, deadband_deg=6.0)
     state_north = follower.step(player_pos=(100.0, 100.0), player_heading=0.0, now=60.0)
+    assert state_north["current_index"] == 0
+    assert state_north["active_node"]["id"] == 1
+    assert state_north["arrived"] is False
+    assert state_north["transitioned"] is False
+    assert state_north["closed_loop"] is True
     assert state_north["target_bearing"] == 0.0
     assert state_north["angle_diff"] == 0.0
     assert state_north["in_deadband"] is True
     assert state_north["turn_needed"] is False
+
+    # Step 5: Player arrives at node 1 (100, 50) -> advances to node 2 (East, 90°)
+    state_east = follower.step(player_pos=(100.0, 50.0), player_heading=0.0, now=61.0)
+    assert state_east["arrived"] is True
+    assert state_east["transitioned"] is True
+    assert state_east["current_index"] == 1
+    assert state_east["active_node"]["id"] == 2
+    assert state_east["target_bearing"] == 90.0
+    assert state_east["angle_diff"] == 90.0
+    assert state_east["in_deadband"] is False
+    assert state_east["turn_needed"] is True
+    assert state_east["turn_direction"] == "right"
+
+    # Step 6: Player arrives at node 2 (200, 50) -> advances to node 3 (South, 180°)
+    state_south = follower.step(player_pos=(200.0, 50.0), player_heading=90.0, now=62.0)
+    assert state_south["arrived"] is True
+    assert state_south["transitioned"] is True
+    assert state_south["current_index"] == 2
+    assert state_south["active_node"]["id"] == 3
+    assert state_south["target_bearing"] == 180.0
+    assert state_south["angle_diff"] == 90.0
+    assert state_south["in_deadband"] is False
+    assert state_south["turn_needed"] is True
+    assert state_south["turn_direction"] == "right"
+
+    # Step 7: Player arrives at node 3 (200, 150) -> wraps cyclically to node 1,
+    # completing one lap; bearing back to node 1 is NW (315°), +135° right turn.
+    state_wrap = follower.step(player_pos=(200.0, 150.0), player_heading=180.0, now=63.0)
+    assert state_wrap["arrived"] is True
+    assert state_wrap["transitioned"] is True
+    assert state_wrap["current_index"] == 0
+    assert state_wrap["active_node"]["id"] == 1
+    assert state_wrap["total_completed_laps"] == 1
+    assert state_wrap["target_bearing"] == 315.0
+    assert state_wrap["angle_diff"] == 135.0
+    assert state_wrap["in_deadband"] is False
+    assert state_wrap["turn_needed"] is True
+    assert state_wrap["turn_direction"] == "right"

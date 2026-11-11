@@ -29,6 +29,8 @@ Kapsam:
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import sys
@@ -38,11 +40,15 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from version import __version__
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -192,6 +198,38 @@ class _SmokeMockRouteManager:
         return True
 
 
+class _SmokeMockGatheringSettings:
+    """update_settings'in yazdığı gathering ayarları (F-1655 sahte nesnesi)."""
+
+    def __init__(self) -> None:
+        self.harvests_per_node: int = 3
+        self.gather_key: str = "f"
+        self.test_mode: bool = False
+
+
+class _SmokeMockRouteSettings:
+    """update_settings'in yazdığı route ayarları (F-1655 sahte nesnesi)."""
+
+    def __init__(self) -> None:
+        self.harvests_per_node: int = 3
+        self.minimap_auto_record: bool = False
+        self.hybrid_3d_and_minimap_record: bool = False
+        self.rest_minutes: int = 5
+        self.fight_back: bool = False
+
+
+class _SmokeMockSettings:
+    """Mobil sunucu update_settings aksiyonu için sahte settings nesnesi.
+
+    F-1655 (D24, merged): settings nesnesi yokken update_settings ok:True
+    dönmez — sunucuya gerçek (sahte) bir settings nesnesi verilmeli.
+    """
+
+    def __init__(self) -> None:
+        self.gathering = _SmokeMockGatheringSettings()
+        self.route = _SmokeMockRouteSettings()
+
+
 class _SmokeMockWorker:
     """Mobil sunucu aksiyonlarını doğrulamak için hafif sahte BotWorker."""
 
@@ -266,19 +304,46 @@ def _load_reference_screenshot() -> np.ndarray:
     """
     `reference_screenshots/pilgrims_ridge_1.jpg` dosyasını Windows Türkçe/Unicode
     dosya yolu uyumlu (`np.fromfile` + `cv2.imdecode`) şekilde yükler.
+
+    Referans kare yoksa/okunamazsa asla sessizce düz renkli sahte kareye
+    düşmez — eksik referansla geçen bir duman testi, gerçek görüntüyü hiç
+    görmeden geçmiş sayılır. Çağıran, hatayı başarısız test olarak kaydeder.
     """
     ref_path = os.path.join(PROJECT_ROOT, "reference_screenshots", "pilgrims_ridge_1.jpg")
-    if os.path.isfile(ref_path):
-        try:
-            raw_buf = np.fromfile(ref_path, dtype=np.uint8)
-            img = cv2.imdecode(raw_buf, cv2.IMREAD_COLOR)
-            if img is not None and img.size > 0:
-                return img
-        except Exception as exc:
-            _ = exc
-    fallback = np.zeros((1080, 1920, 3), dtype=np.uint8)
-    fallback[:, :] = (36, 48, 42)
-    return fallback
+    if not os.path.isfile(ref_path):
+        raise FileNotFoundError(
+            f"Referans ekran görüntüsü bulunamadı: {ref_path} — "
+            "duman testi sahte kareyle devam etmeyecek."
+        )
+    try:
+        raw_buf = np.fromfile(ref_path, dtype=np.uint8)
+        img = cv2.imdecode(raw_buf, cv2.IMREAD_COLOR)
+    except Exception as exc:
+        raise RuntimeError(f"Referans ekran görüntüsü okunamadı ({ref_path}): {exc}") from exc
+    if img is None or img.size == 0:
+        raise RuntimeError(f"Referans ekran görüntüsü çözümlenemedi (boş/gecersiz): {ref_path}")
+    return img
+
+
+def _decode_jpeg_bytes(raw: bytes, what: str) -> np.ndarray:
+    """Decode JPEG bytes and prove they are a real, non-blank image."""
+    assert len(raw) > 512 and raw[:2] == b"\xff\xd8", f"Geçersiz JPEG verisi ({what})"
+    buf = np.frombuffer(raw, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    assert img is not None and img.size > 0 and img.ndim == 3, f"JPEG çözümlenemedi ({what})"
+    assert float(img.std()) > 1.0, f"JPEG tek renk/boş kare ({what})"
+    return img
+
+
+def _http_get_status(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 5.0) -> int:
+    """GET and return only the HTTP status (401/403 etc. do not raise)."""
+    req = urllib.request.Request(url, method="GET", headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+            return int(resp.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
 
 
 def _http_get_json(url: str, timeout: float = 5.0) -> Tuple[int, Dict[str, Any]]:
@@ -336,7 +401,11 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             )
         except Exception as exc:
             elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-            tb_short = traceback.format_exc().splitlines()[-1]
+            # Hata detayı tek kaynaktan: traceback'in son satırı zaten
+            # "Tür: mesaj" içerir — eski `f"{exc} ({tb_short})"` biçimi
+            # aynı mesajı iki kez yazıyordu (örn. "X (AssertionError: X)").
+            tb_lines = traceback.format_exc().splitlines()
+            tb_short = tb_lines[-1] if tb_lines else f"{type(exc).__name__}: {exc}"
             results.append(
                 {
                     "id": test_id,
@@ -345,11 +414,27 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
                     "passed": False,
                     "status": "KALDI",
                     "elapsed_ms": elapsed_ms,
-                    "detail": f"{exc} ({tb_short})",
+                    "detail": tb_short,
                 }
             )
 
-    ref_frame = _load_reference_screenshot()
+    try:
+        ref_frame = _load_reference_screenshot()
+    except (FileNotFoundError, RuntimeError) as exc:
+        results.append(
+            {
+                "id": "REF",
+                "category": "Referans Görüntü",
+                "name": "reference_screenshots/pilgrims_ridge_1.jpg yüklenmeli",
+                "passed": False,
+                "status": "KALDI",
+                "elapsed_ms": 0.0,
+                "detail": f"{exc} (sahte kareye düşülmedi)",
+            }
+        )
+        if verbose:
+            _print_turkish_report_table(0, 1, results)
+        return 0, 1, results
 
     # =========================================================================
     # BÖLÜM 1: MADDE 31–40 (MOBİL UZAKTAN KUMANDA, PiP, SSE, PWA, QR TOKEN, INCIDENT)
@@ -361,6 +446,7 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
         mock_rm = _SmokeMockRouteManager()
         mock_worker = _SmokeMockWorker(mock_rm)
         mock_ic = _SmokeMockInputCtrl()
+        mock_settings = _SmokeMockSettings()
 
         server = MobileRemoteServer(
             host="127.0.0.1",
@@ -369,35 +455,85 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             worker=mock_worker,
             route_mgr=mock_rm,
             input_ctrl=mock_ic,
+            settings=mock_settings,
         )
         server.start()
         try:
             base_url = f"http://127.0.0.1:{server.port}"
 
+            # 1-6. Bağımsız GET'ler (status, nodes, 3 frame modu, pip_bundle,
+            # manifest, sw.js) birbirinin durumunu değiştirmez ve sunucu
+            # ThreadingHTTPServer'dır: ThreadPool (4 işçi) ile paralel
+            # çekilir, sonuçlar sabit sırada toplanır, assertion'lar aynen
+            # korunur. SSE akışı ve durum değiştiren POST aksiyonları
+            # sıralı kalır (POST'lar birbirine bağımlıdır).
+            _get_jobs: List[Tuple[str, Callable[[], Any]]] = [
+                ("status", lambda: _http_get_json(f"{base_url}/api/status")),
+                ("nodes", lambda: _http_get_json(f"{base_url}/api/nodes")),
+                ("frame_full", lambda: _http_get_bytes(f"{base_url}/api/frame.jpg?mode=full&quality=70")),
+                ("frame_minimap", lambda: _http_get_bytes(f"{base_url}/api/frame.jpg?mode=minimap&quality=70")),
+                ("frame_pip", lambda: _http_get_bytes(f"{base_url}/api/frame.jpg?mode=pip&quality=70")),
+                ("pip_bundle", lambda: _http_get_json(f"{base_url}/api/pip_bundle?quality=70")),
+                ("manifest", lambda: _http_get_bytes(f"{base_url}/manifest.json")),
+                ("sw.js", lambda: _http_get_bytes(f"{base_url}/sw.js")),
+            ]
+            with ThreadPoolExecutor(max_workers=4) as _pool:
+                _futures = [_pool.submit(_fn) for _, _fn in _get_jobs]
+                _fetched = [_f.result() for _f in _futures]
+            (
+                (code_st, st_data),
+                (code_nd, nd_data),
+                (f_full_code, f_full_bytes, f_full_ctype),
+                (f_mini_code, f_mini_bytes, f_mini_ctype),
+                (f_pip_code, f_pip_bytes, f_pip_ctype),
+                (code_pip, pip_data),
+                (m_code, m_bytes, _m_ctype),
+                (sw_code, sw_bytes, _sw_ctype),
+            ) = _fetched
+
             # 1. GET /api/status
-            code_st, st_data = _http_get_json(f"{base_url}/api/status")
             assert code_st == 200 and st_data.get("ok") is True, f"/api/status hatası: {st_data}"
             route_info = st_data.get("route", {})
             assert route_info.get("region_name") == "Altgard", f"Bölge adı eşleşmedi: {route_info}"
 
             # 2. GET /api/nodes
-            code_nd, nd_data = _http_get_json(f"{base_url}/api/nodes")
             nodes_list = nd_data if isinstance(nd_data, list) else nd_data.get("nodes", [])
             assert code_nd == 200 and len(nodes_list) == 4, f"/api/nodes hatası: {nd_data}"
 
             # 3. GET /api/frame.jpg?mode=full, mode=minimap, mode=pip
-            for fmode in ("full", "minimap", "pip"):
-                f_code, f_bytes, f_ctype = _http_get_bytes(f"{base_url}/api/frame.jpg?mode={fmode}&quality=70")
+            # Sihirli bayt + uzunluk yetmez: JPEG gerçekten çözümlenmeli,
+            # boyutlu ve tek renk/boş olmayan bir görüntü olmalı.
+            expected_shapes = {"full": (540, 960, 3)}
+            for fmode, (f_code, f_bytes, f_ctype) in (
+                ("full", (f_full_code, f_full_bytes, f_full_ctype)),
+                ("minimap", (f_mini_code, f_mini_bytes, f_mini_ctype)),
+                ("pip", (f_pip_code, f_pip_bytes, f_pip_ctype)),
+            ):
                 assert f_code == 200 and "image/jpeg" in f_ctype, f"JPEG içerik tipi hatalı ({fmode}): {f_ctype}"
-                assert len(f_bytes) > 512 and f_bytes[:2] == b"\xff\xd8", f"Geçersiz JPEG verisi ({fmode})"
+                decoded = _decode_jpeg_bytes(f_bytes, fmode)
+                if fmode in expected_shapes:
+                    assert decoded.shape == expected_shapes[fmode], (
+                        f"JPEG boyutu hatalı ({fmode}): {decoded.shape} != {expected_shapes[fmode]}"
+                    )
 
-            # 4. GET /api/pip_bundle
-            code_pip, pip_data = _http_get_json(f"{base_url}/api/pip_bundle?quality=70")
+            # 4. GET /api/pip_bundle — base64 alanlar da çözümlenip doğrulanmalı.
             assert code_pip == 200 and pip_data.get("ok") is True, "/api/pip_bundle başarısız"
             assert len(pip_data.get("minimap_b64", "")) > 100, "minimap_b64 boş"
             assert len(pip_data.get("gather_roi_b64", "")) > 100, "gather_roi_b64 boş"
+            for _b64_key in ("minimap_b64", "gather_roi_b64", "pip_b64"):
+                _b64 = pip_data.get(_b64_key, "")
+                if not _b64:
+                    continue
+                _decoded = _decode_jpeg_bytes(base64.b64decode(_b64), f"pip_bundle.{_b64_key}")
 
-            # 5. GET /api/stream (SSE <50ms Push)
+            # 6. GET /manifest.json & /sw.js (PWA)
+            manifest_obj = json.loads(m_bytes.decode("utf-8"))
+            assert m_code == 200 and manifest_obj.get("display") == "standalone", "PWA manifest hatalı"
+
+            sw_text = sw_bytes.decode("utf-8")
+            assert sw_code == 200 and "addEventListener" in sw_text, "PWA Service Worker hatalı"
+
+            # 5. GET /api/stream (SSE <50ms Push) — data satırları geçerli JSON olmalı.
             sse_code, sse_bytes, sse_ctype = _http_get_bytes(
                 f"{base_url}/api/stream?max_events=2&interval_ms=25",
                 timeout=5.0,
@@ -405,15 +541,11 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             sse_text = sse_bytes.decode("utf-8", errors="replace")
             assert sse_code == 200 and "text/event-stream" in sse_ctype, f"SSE başlığı hatalı: {sse_ctype}"
             assert "data:" in sse_text, "SSE akışında 'data:' satırı bulunamadı"
-
-            # 6. GET /manifest.json & /sw.js (PWA)
-            m_code, m_bytes, _ = _http_get_bytes(f"{base_url}/manifest.json")
-            manifest_obj = json.loads(m_bytes.decode("utf-8"))
-            assert m_code == 200 and manifest_obj.get("display") == "standalone", "PWA manifest hatalı"
-
-            sw_code, sw_bytes, _ = _http_get_bytes(f"{base_url}/sw.js")
-            sw_text = sw_bytes.decode("utf-8")
-            assert sw_code == 200 and "addEventListener" in sw_text, "PWA Service Worker hatalı"
+            sse_data_lines = [ln[5:].strip() for ln in sse_text.splitlines() if ln.startswith("data:")]
+            assert len(sse_data_lines) >= 2, f"SSE'de en az 2 data satırı bekleniyordu: {len(sse_data_lines)}"
+            for _payload in sse_data_lines:
+                _obj = json.loads(_payload)
+                assert isinstance(_obj, dict) and _obj, f"SSE data yükü JSON obje değil: {_payload[:120]}"
 
             # 7. POST /api/action -> pause, resume, record_f8, reset_node, quarantine_node, delete_node, tap_to_move_map, update_settings
             _, act_pause = _http_post_json(f"{base_url}/api/action", {"action": "pause", "reason": "SmokeTest"})
@@ -445,16 +577,69 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
                 {"action": "update_settings", "harvests_per_node": 4, "test_mode": True},
             )
             assert act_cfg.get("ok") is True, "update_settings başarısız"
+            # [O10] F-1655 (D24, merged): ayar yalnızca settings nesnesi
+            # varsa uygulanır — değerin gerçekten işlendiği kanıtlanır.
+            assert mock_settings.gathering.harvests_per_node == 4, (
+                "harvests_per_node ayara işlenmedi"
+            )
+            # v19-smoke: uzaktan test_mode BİLEREK reddedilir (O-1, dilim 22:
+            # uzaktan test_mode donanım güven kapısını baypas ederdi —
+            # test modunda soft SendInput "güvenilir" sayılırdı). Üretim
+            # davranışı değişmez; test reddi doğrular.
+            assert act_cfg.get("rejected", {}).get("test_mode"), (
+                "uzaktan test_mode reddedilen alanlarda bildirilmeli"
+            )
+            assert mock_settings.gathering.test_mode is False, (
+                "uzaktan test_mode ayara işlenmemeli (O-1: donanım güven kapısı)"
+            )
 
             return f"Port={server.port}, Status/Nodes/PiP/SSE/PWA + 8 POST Aksiyon doğrulandı"
         finally:
             server.stop()
+
+    def _test_mobile_server_token_auth() -> str:
+        # Kimlik doğrulama kapalı mock sunucu tek başına yeterli değil:
+        # gerçek token zorunluluğu ayrı bir sunucuda uçtan uca kanıtlanır.
+        from core.mobile_server import MobileRemoteServer
+
+        token = "SmokeTestTok1234"  # 16 karakter: D24 token politikası (F-1652) en az 16 ister; sunucu açık tokenı aynen alır
+        auth_server = MobileRemoteServer(
+            host="127.0.0.1",
+            port=0,
+            require_token=True,
+            access_token=token,
+            worker=_SmokeMockWorker(_SmokeMockRouteManager()),
+            route_mgr=_SmokeMockRouteManager(),
+            input_ctrl=_SmokeMockInputCtrl(),
+        )
+        assert auth_server.access_token == token, "Sunucu açık tokenı aynen almalı"
+        auth_server.start()
+        try:
+            auth_base = f"http://127.0.0.1:{auth_server.port}"
+            assert _http_get_status(f"{auth_base}/api/status") == 401, "Tokensuz /api/status 401 vermeli"
+            assert _http_get_status(f"{auth_base}/api/status?token=wrongtoken") == 401, "Yanlış token 401 vermeli"
+            assert _http_get_status(f"{auth_base}/api/status?token={token}") == 200, "Doğru token (query) 200 vermeli"
+            assert _http_get_status(
+                f"{auth_base}/api/status", headers={"Authorization": f"Bearer {token}"}
+            ) == 200, "Doğru token (Bearer) 200 vermeli"
+            code_ok, ok_data = _http_get_json(f"{auth_base}/api/status?token={token}")
+            assert code_ok == 200 and ok_data.get("ok") is True, f"Tokenlı /api/status hatası: {ok_data}"
+            return "Token zorunluluğu: tokensuz/yanlış=401, doğru token (query+Bearer)=200"
+        finally:
+            auth_server.stop()
 
     _run_case(
         "M31-35",
         "Mobil Kumanda & PWA/SSE/PiP",
         "MobileRemoteServer (/api/status, /api/nodes, /api/frame.jpg, /api/pip_bundle, /api/stream, POST /api/action)",
         _test_mobile_server_endpoints_and_actions,
+    )
+
+    _run_case(
+        "M31-AUTH",
+        "Mobil Kumanda & PWA/SSE/PiP",
+        "MobileRemoteServer token zorunluluğu (require_token=True: 401/200)",
+        _test_mobile_server_token_auth,
     )
 
     def _test_mobile_dashboard_html_features() -> str:
@@ -477,7 +662,55 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             or "webkitAudioContext" in served_html
             or "vibrate" in served_html
         ), "Web Audio / Titreşim alarm desteği eksik"
-        return f"ui/mobile_dashboard.html ({len(served_html)} bayt) PWA, Audio/Vibration ve Radar kontrolleri doğrulandı"
+        # Alt dize araması yetmez: HTML gerçekten ayrıştırılabilmeli, PWA
+        # manifest alanları dolu olmalı, SW fetch/cache mantığı içermeli.
+        # (Not: JS burada çalıştırılmıyor — statik doğrulama + sunulan
+        # manifest/sw.js içerik denetimi; tarayıcıda çalıştırma bu testin
+        # dışında kalır ve raporda böyle belirtilir.)
+        class _TagCollector(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tags: List[str] = []
+                self.errors: List[str] = []
+
+            def handle_starttag(self, tag: str, attrs: list) -> None:
+                self.tags.append(tag)
+
+            def error(self, message: str) -> None:  # noqa: D102
+                self.errors.append(message)
+
+        collector = _TagCollector()
+        collector.feed(served_html)
+        assert not collector.errors, f"mobile_dashboard.html ayrıştırma hatası: {collector.errors}"
+        for _needed in ("html", "head", "body", "script"):
+            assert _needed in collector.tags, f"mobile_dashboard.html içinde <{_needed}> yok"
+        assert "serviceWorker" in served_html and "register" in served_html, (
+            "Service Worker kaydı (navigator.serviceWorker.register) eksik"
+        )
+        assert "fetch('/api/status')" in served_html or 'fetch("/api/status")' in served_html or "withTokenUrl('/api/status')" in served_html, (
+            "Panel /api/status çekmiyor — canlı veri akışı yok"
+        )
+        # manifest/sw.js, M31-35'te doğrulanan uçlarla aynı sunucudan
+        # alınır: ikinci bir MobileRemoteServer kurmak (önceki server2)
+        # fazladan bir port bind + start/stop döngüsüydü.
+        server.start()
+        try:
+            m_url = f"http://127.0.0.1:{server.port}"
+            m_code, m_bytes, _ = _http_get_bytes(f"{m_url}/manifest.json")
+            manifest = json.loads(m_bytes.decode("utf-8"))
+            assert m_code == 200 and manifest.get("display") == "standalone", "PWA manifest hatalı"
+            assert manifest.get("name") and manifest.get("short_name"), "Manifest name/short_name eksik"
+            assert manifest.get("start_url"), "Manifest start_url eksik"
+            assert manifest.get("icons"), "Manifest icons eksik"
+            sw_code, sw_bytes, _ = _http_get_bytes(f"{m_url}/sw.js")
+            sw_text = sw_bytes.decode("utf-8")
+            assert sw_code == 200 and "addEventListener" in sw_text, "PWA Service Worker hatalı"
+            assert "fetch" in sw_text and ("caches" in sw_text or "Cache" in sw_text), (
+                "Service Worker fetch/cache mantığı eksik"
+            )
+        finally:
+            server.stop()
+        return f"ui/mobile_dashboard.html ({len(served_html)} bayt) PWA, Audio/Vibration ve Radar kontrolleri doğrulandı (JS çalıştırılmadan statik + sunulan manifest/SW denetimi)"
 
     _run_case(
         "M36-37",
@@ -517,8 +750,40 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             tunnel_mgr = FreeCloudTunnelManager(local_port=8765)
             assert tunnel_mgr.local_port == 8765, "FreeCloudTunnelManager port bilgisi hatalı"
 
+            # Tünel hiç başlatılmadan geçiliyordu: cloudflared indirmeden
+            # (ağ yok) başlatmayı gerçekten dene. Binary yoksa başlatma
+            # None dönmeli, gerekçeli hata kaydetmeli ve durum "çalışmıyor"
+            # demeli — sessiz geçme yok. Binary varsa URL beklenir.
+            assert tunnel_mgr.find_cloudflared_binary() is None or isinstance(
+                tunnel_mgr.find_cloudflared_binary(), str
+            )
+            tunnel_url = tunnel_mgr.start_cloudflare_tunnel(
+                local_port=8765, auto_download=False, timeout_sec=5.0
+            )
+            tunnel_status = tunnel_mgr.get_status()
+            if tunnel_mgr.find_cloudflared_binary() is None:
+                assert tunnel_url is None, f"Binary yokken tünel URL dönmemeli: {tunnel_url}"
+                assert tunnel_status.get("last_error"), "Binary yokken gerekçeli hata kaydedilmeli"
+                assert tunnel_mgr.is_tunnel_running() is False, "Binary yokken tünel çalışıyor görünmemeli"
+                tunnel_note = f"tünel başlatılamadı (beklenen): {tunnel_status.get('last_error')}"
+            else:
+                assert tunnel_url, "cloudflared varken tünel URL üretmeli"
+                tunnel_note = f"tünel URL={tunnel_url}"
+                tunnel_mgr.stop_tunnel()
+
+            # MobileConnectDialog da gerçekten kurulmalı (offscreen Qt):
+            # QR URL'i tünel/LAN hedefinden üretildiğini kanıtla.
+            os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+            from PyQt6.QtWidgets import QApplication
+
+            app = QApplication.instance() or QApplication([])
+            dialog = MobileConnectDialog(tunnel_mgr=tunnel_mgr)
             assert hasattr(MobileConnectDialog, "get_active_qr_url"), "MobileConnectDialog.get_active_qr_url eksik"
-            return f"LAN={lan_url}, QR=220x220x3 BGR, DataURI={len(qr_uri)} krk, NtfyTopic={relay.topic}"
+            dialog_qr = dialog.get_active_qr_url()
+            assert dialog_qr.startswith("http://") and "8765" in dialog_qr, (
+                f"Dialog QR URL LAN tabanlı olmalı: {dialog_qr}"
+            )
+            return f"LAN={lan_url}, QR=220x220x3 BGR, DataURI={len(qr_uri)} krk, NtfyTopic={relay.topic}, {tunnel_note}, DialogQR={dialog_qr}"
 
     _run_case(
         "M38",
@@ -557,7 +822,10 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             cleared = recorder.clear_incidents()
             assert cleared == 4 and len(recorder.get_incidents()) == 0, "Olay geçmişi temizlenemedi"
 
-            return f"256-Bit Token ({auth.token[:10]}...), 4 Olay (Death/Stuck/Combat/Inventory) JPEG doğrulandı"
+            # P1-9 (K-08): rapor/konsol çıktısına token parçası (ilk 10
+            # hex karakter dahil) yazılmaz; yalnızca SHA-256 parmak izi
+            # verilir — varlık/yokluk + hash özeti yeterlidir.
+            return f"256-Bit Token (parmak izi: {auth.token_fingerprint}), 4 Olay (Death/Stuck/Combat/Inventory) JPEG doğrulandı"
 
     _run_case(
         "M39-40",
@@ -652,7 +920,9 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
 
         reader = SkillBarReader()
         slots = reader.inspect_skill_bar(ref_frame)
-        assert len(slots) == 8, f"8 yetenek slotu (1..5, Q, E, R) bekleniyordu, {len(slots)} bulundu"
+        # v19-smoke: bar 12 slotludur (Sweep G2, bb91a71: 1..8, Q, E, R, T);
+        # eski 8'li beklenti bayattı.
+        assert len(slots) == 12, f"12 yetenek slotu (1..8, Q, E, R, T) bekleniyordu, {len(slots)} bulundu"
 
         best_skill = reader.select_best_ready_skill(ref_frame)
         assert best_skill in SkillBarReader.SKILL_SLOTS, f"Geçersiz yetenek seçimi: {best_skill}"
@@ -668,14 +938,14 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
         assert sway_res.get("total_micro_steps", 0) >= 4, "WindMouse mikro adım sayısı yetersiz"
 
         return (
-            f"8 Slot Okundu (Seçilen Hazır Yetenek='{best_skill}'), "
+            f"12 Slot Okundu (Seçilen Hazır Yetenek='{best_skill}'), "
             f"Kamera Salınımı={sway_res['angle_deg']}° ({sway_res['total_micro_steps']} mikro adım)"
         )
 
     _run_case(
         "M44-45",
         "Yetenek Barı & Kamera Salınımı",
-        "core/skill_bar_reader.py (SkillBarReader 8 Slot Analizi & MicroCameraLookAround ±8° Salınım)",
+        "core/skill_bar_reader.py (SkillBarReader 12 Slot Analizi & MicroCameraLookAround ±8° Salınım)",
         _test_skill_bar_reader_and_micro_camera_sway,
     )
 
@@ -689,10 +959,16 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             # Madde 46: 10-Min Rolling Route Backups
+            # v19-smoke: daemon kapalı kurulur — varsayılan açık daemon
+            # başlangıçta hemen backup_all_regions() çalıştırır
+            # (dpi_focus_guard.py _daemon_loop) ve testin yazdığı
+            # region_data.json'u testin force yedeğinden ÖNCE yedekleyip
+            # listeyi 2'ye çıkarabilir (tur-2'de 1/3 koşuda böyle kaldı).
             backup_mgr = RouteBackupManager(
                 base_dir=tmp_dir,
                 backup_interval_sec=600.0,
                 max_snapshots=5,
+                auto_start_daemon=False,
             )
             reg_json_path = backup_mgr.get_region_json_path("altgard")
             reg_json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -730,6 +1006,16 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             allowed_aion, _ = focus_guard.guard_keystroke("f")
             assert focused_aion is True and allowed_aion is True, "AION 2 aktifken tuş vuruşuna izin verilmeli"
 
+            # Simülasyon temizlenip GERÇEK ön-plan sorgusu da çalıştırılmalı:
+            # simüle pencereyle geçen test, gerçek Win32 yolunu hiç denemez.
+            focus_guard.set_simulated_foreground_window(None)
+            real_focused, real_reason = focus_guard.is_game_window_focused()
+            assert isinstance(real_focused, bool) and isinstance(real_reason, str), (
+                f"Gerçek odak sorgusu (bool, str) dönmeli: {(real_focused, real_reason)}"
+            )
+            if sys.platform != "win32":
+                assert real_focused is False, "Win32 yokken gerçek odak False olmalı"
+
             # Madde 49: Self-Healing Template Tuner
             tuner = SelfHealingTemplateTuner()
             patch_crop = ref_frame[500:580, 920:1000].copy()
@@ -740,7 +1026,8 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             assert heal_res.get("refreshed") is True, f"3 sınırda skor sonrası kendi kendini iyileştirme çalışmadı: {heal_res}"
 
             return (
-                f"Backup+AutoRestore=OK, DPI(125%)=800->1000px, FocusGuard(Discord=Blok/AION=İzin), "
+                f"Backup+AutoRestore=OK, DPI(125%)=800->1000px, FocusGuard(Discord=Blok/AION=İzin, "
+                f"GerçekSorgu=({real_focused}, '{real_reason}')), "
                 f"SelfHeal Eşik={heal_res.get('local_threshold')}"
             )
 
@@ -761,7 +1048,7 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             {"id": 3, "x": 700, "y": 430, "state": "active"},
             {"id": 4, "x": 1150, "y": 640, "state": "active"},
         ]
-        report = sim.run_8x_route_audit(nodes, execute_time_scaled_sleep=False)
+        report = sim.run_8x_route_audit(nodes, execute_time_scaled_sleep=True, max_total_sleep_sec=0.25)
         assert report.get("node_count") == 4 and report.get("speed_multiplier") == 8.0, f"8x denetim hatası: {report}"
         assert report.get("keyboard_mouse_touched") is False, "Simülatör donanım girdisine dokunmamalı"
         assert report.get("simulated_8x_duration_sec", 999) < report.get("estimated_real_total_sec", 0), (
@@ -773,7 +1060,8 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
 
         return (
             f"8x Süre={report['simulated_8x_duration_sec']}sn (1x={report['estimated_real_total_sec']}sn), "
-            f"Mesafe={report['total_distance_px']}px, Kesişim={report['self_intersection_count']}"
+            f"Mesafe={report['total_distance_px']}px, Kesişim={report['self_intersection_count']}, "
+            f"ÖlçekliUyku=Çalıştırıldı(max 0.25sn)"
         )
 
     _run_case(
@@ -798,7 +1086,19 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = os.path.join(tmp_dir, "market_prices.json")
             scanner = TradeBrokerPriceScanner(price_db_path=db_path)
+            # Sıfır satır okunması varsayılan fiyat sözlüğüyle geçmemeli:
+            # tarama gerçekten satır okuduysa scan_count artar ve
+            # price_history'ye yeni kayıt düşer. İkisi de kanıtlanmalı.
+            scan_count_before = int(getattr(scanner, "scan_count", 0))
+            history_before = sum(len(v) for v in getattr(scanner, "price_history", {}).values())
             prices = scanner.scan_broker_window(ref_frame)
+            scan_count_after = int(getattr(scanner, "scan_count", 0))
+            history_after = sum(len(v) for v in getattr(scanner, "price_history", {}).values())
+            assert scan_count_after > scan_count_before, "scan_broker_window scan_count artırmadı"
+            assert history_after > history_before, (
+                f"Pazar taraması sıfır satır okudu (price_history artmadı: {history_before}->{history_after}) — "
+                "varsayılan fiyatlarla geçilemez"
+            )
             assert len(prices) >= 3 and all(v > 0 for v in prices.values()), f"Pazar fiyatları okunamadı: {prices}"
 
             mock_rm = _SmokeMockRouteManager()
@@ -838,12 +1138,27 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
         from core.neural_audio_perception import AudioLoopbackFFTAnalyzer, ONNXYolo3DDetector
 
         detector = ONNXYolo3DDetector(conf_threshold=0.35, iou_threshold=0.45)
+        # ONNX'suz fallback ile geçen 3B tespiti sayılmaz: repo'daki
+        # models/yolov8n_gatherion.onnx ile gerçek ONNX/DNN backend kanıtlanmalı.
+        # v19-smoke: yükleme LAZY'dir (kurucu model yüklemez; ilk
+        # detect_3d_objects check_for_model_update ile yükler) — backend
+        # iddiası ilk tespitten SONRA okunur, yoksa kurucudaki
+        # "fast_3d_mesh_tensor_fallback" varsayılanı görülür.
         detections = detector.detect_3d_objects(ref_frame)
+        backend_name = str(getattr(detector, "backend_name", ""))
+        assert "fallback" not in backend_name.lower(), (
+            f"3B dedektör fallback backend kullanıyor ({backend_name}) — ONNX modeli yüklenmedi"
+        )
+        assert backend_name.startswith(("onnxruntime", "opencv_dnn")), (
+            f"Beklenen ONNX/DNN backend, gelen: {backend_name}"
+        )
         assert isinstance(detections, list) and len(detections) >= 1, "ONNXYolo3DDetector hiçbir 3B nesne tespit etmedi"
         first_det = detections[0]
         assert "class_name" in first_det and "confidence" in first_det and "bbox" in first_det, (
             f"Eksik 3B tespit alanı: {first_det}"
         )
+        assert 0.0 < float(first_det["confidence"]) <= 1.0, f"Geçersiz güven: {first_det['confidence']}"
+        assert len(first_det["bbox"]) == 4, f"bbox 4 eleman olmalı: {first_det['bbox']}"
 
         analyzer = AudioLoopbackFFTAnalyzer(sample_rate=44100)
         chime_pcm = analyzer.synthesize_crystal_chime(duration_sec=0.25)
@@ -858,9 +1173,24 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
         res_step = analyzer.analyze_pcm_buffer(step_pcm)
         assert res_step.get("danger_audio_alert") is True, f"Canavar ayak sesi (95Hz) algılanmadı: {res_step}"
 
+        # Negatif kontroller: kendi ürettiği sesi kendi analiz eden test,
+        # sessizliği ve ilgisiz tonu da reddetmeli — yoksa her girdiye
+        # "olumlu" diyen bir analizör de geçer.
+        silence = np.zeros(int(0.25 * 44100), dtype=np.float32)
+        res_silence = analyzer.analyze_pcm_buffer(silence)
+        assert res_silence.get("gather_success_chime") is False, "Sessizlik çınlama sayılmamalı"
+        assert res_silence.get("gather_fail_sound") is False, "Sessizlik kırılma sayılmamalı"
+        assert res_silence.get("danger_audio_alert") is False, "Sessizlik tehlike sayılmamalı"
+        t_axis = np.linspace(0.0, 0.25, int(0.25 * 44100), endpoint=False, dtype=np.float32)
+        off_tone = (0.5 * np.sin(2.0 * np.pi * 1000.0 * t_axis)).astype(np.float32)
+        res_off = analyzer.analyze_pcm_buffer(off_tone)
+        assert res_off.get("gather_success_chime") is False, "1000Hz ton çınlama sayılmamalı"
+        assert res_off.get("danger_audio_alert") is False, "1000Hz ton tehlike sayılmamalı"
+
         return (
-            f"3B YOLO Tespit={len(detections)} nesne ({first_det['class_name']} @{first_det['confidence']:.2f}), "
-            f"FFT: Chime=True, Fail=True, DangerFootstep=True"
+            f"3B YOLO Tespit={len(detections)} nesne ({first_det['class_name']} @{first_det['confidence']:.2f}, "
+            f"backend={backend_name}), "
+            f"FFT: Chime=True, Fail=True, DangerFootstep=True, NegatifKontroller(Sessizlik/1000Hz)=Reddedildi"
         )
 
     _run_case(
@@ -907,9 +1237,17 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             pet_mgr = PetAndBuffManager(pet_feed_interval_sec=1800.0)
             for slot in pet_mgr.buff_slots:
                 slot.last_used_ts = 0.0
-            buff_res = pet_mgr.check_and_refresh_buffs(frame=ref_frame, test_mode=True)
+            # test_mode=True donanıma dokunmaz ama sahte girdiye tuşları
+            # gerçekten göndermeli: dönen pressed_keys listesi, mock'un
+            # kaydettiği tuşlarla birebir eşleşmeli (yoksa test sadece
+            # sözlük döndürmüş olur).
+            mock_ic = _SmokeMockInputCtrl()
+            buff_res = pet_mgr.check_and_refresh_buffs(frame=ref_frame, input_ctrl=mock_ic, test_mode=True)
             assert buff_res.get("pet_fed") is True and len(buff_res.get("pressed_keys", [])) >= 1, (
                 f"Pet/Parşömen yenilemesi tetiklenmedi: {buff_res}"
+            )
+            assert mock_ic.pressed_keys == list(buff_res.get("pressed_keys", [])), (
+                f"Mock girdiye giden tuşlar dönen listeyle eşleşmiyor: {mock_ic.pressed_keys} != {buff_res.get('pressed_keys')}"
             )
 
             prev_name = rot_res.get("previous_character", {}).get("name", "Slot1")
@@ -917,7 +1255,7 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
             return (
                 f"AltRotasyon={prev_name}->{next_name}, "
                 f"Takvim(19:30=Rota, 21:45=ŞehirBekleme, 22:30=Morheim), "
-                f"Pet+Buff Tuşları={buff_res['pressed_keys']}"
+                f"Pet+Buff Tuşları={buff_res['pressed_keys']} (mock girdide doğrulandı, test_mode=True — donanım yok)"
             )
 
     _run_case(
@@ -955,6 +1293,15 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
         mock_ic = _SmokeMockInputCtrl()
         steer_res = depth_nav.apply_avoidance_steering(mock_ic, corridor, test_mode=True)
         assert "steer_deg" in steer_res, f"Direksiyon kaçınma sonucu hatalı: {steer_res}"
+        # test_mode=True donanıma dokunmamalı ama direksiyon hesabı
+        # tutarlı olmalı: mouse_dx = steer_deg x 4.2 px/deg.
+        assert steer_res.get("test_mode") is True, "Kaçınma test_mode kaydı eksik"
+        if corridor.get("obstacle_detected") and abs(float(corridor.get("recommended_steer_deg", 0.0))) >= 1.5:
+            assert steer_res.get("applied") is True, f"Engel varken kaçınma uygulanmadı: {steer_res}"
+            assert steer_res.get("mouse_dx") == int(round(float(steer_res["steer_deg"]) * 4.2)), (
+                f"mouse_dx hesabı tutarsız: {steer_res}"
+            )
+        assert mock_ic.moved_points == [], "test_mode=True iken fare hareket etmemeli"
 
         glide_ctrl = GlideWaypointController(min_elevation_drop=10.0, min_horizontal_dist=20.0)
         current_wp = {"id": 10, "x": 500, "y": 350, "z": 145.0, "is_glide_waypoint": True}
@@ -977,10 +1324,11 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
         assert glide_exec.get("success") is True and glide_exec.get("wings_deployed") is True, (
             f"Kanat süzülme manevrası başarısız: {glide_exec}"
         )
+        assert glide_exec.get("test_mode") is True, "Glide test_mode kaydı eksik"
 
         return (
             f"Derinlik={depth_map.shape}, Steer={corridor['recommended_steer_deg']} deg (Engel={corridor['obstacle_type']}), "
-            f"Glide(FarkZ=-{params['elevation_drop']}m, Sure={params['glide_duration_sec']}sn)"
+            f"Glide(FarkZ=-{params['elevation_drop']}m, Sure={params['glide_duration_sec']}sn, test_mode=True — donanım yok)"
         )
 
     _run_case(
@@ -988,6 +1336,52 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
         "Derinlik Engel Kaçınma & Glide (Bölüm 5)",
         "core/depth_glide_navigator.py (MonocularDepthObstacleAvoidance & GlideWaypointController)",
         _test_depth_obstacle_avoidance_and_glide_controller,
+    )
+
+    def _test_report_table_bounds_and_failure_format() -> str:
+        # Rapor tablosu kilit testi: (1) hiçbir satır 118 sütunu aşmamalı
+        # (uzun ENT-3 detayı eskiden ~1100 karakterlik tek satırdı),
+        # (2) alt bilgi toplam süre + en yavaş vakayı vermeli,
+        # (3) gerçek kategoriler tabloda kesilmeden görünmeli,
+        # (4) kalan vakaların hata detayı mesajı iki kez yazmamalı.
+        fake = [
+            {"id": "X1", "category": "Kısa Kategori", "name": "sahte", "passed": True,
+             "status": "GEÇTİ", "elapsed_ms": 12.3, "detail": "kısa"},
+            {"id": "X2", "category": "K" * 60, "name": "sahte", "passed": False,
+             "status": "KALDI", "elapsed_ms": 9876.5, "detail": "D" * 500},
+        ]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_turkish_report_table(1, 1, fake)
+        fake_lines = buf.getvalue().splitlines()
+        assert fake_lines, "rapor tablosu boş çıktı"
+        assert all(len(ln) <= 118 for ln in fake_lines), (
+            f"118 sütunu aşan satır var (en uzun {max(len(ln) for ln in fake_lines)})"
+        )
+        assert any("TOPLAM SÜRE" in ln for ln in fake_lines), "TOPLAM SÜRE satırı eksik"
+        assert any("EN YAVAŞ" in ln and "X2" in ln for ln in fake_lines), "EN YAVAŞ satırı eksik/yanlış"
+
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            _print_turkish_report_table(0, 0, list(results))
+        real_text = buf2.getvalue()
+        assert all(len(ln) <= 118 for ln in real_text.splitlines()), "gerçek sonuç tablosu 118 sütunu aşıyor"
+        for _row in results:
+            assert str(_row.get("category", "")) in real_text, (
+                f"Kategori tabloda kesilmiş: {_row.get('category', '')!r}"
+            )
+        for _row in results:
+            if not _row.get("passed"):
+                _det = str(_row.get("detail", ""))
+                assert " (AssertionError:" not in _det, f"Hata detayı mesajı iki kez yazılmış: {_det[:120]}"
+                assert _det.count("AssertionError") <= 1, f"Hata detayı tekrarlı: {_det[:120]}"
+        return "Rapor tablosu ≤118 sütun, TOPLAM SÜRE + EN YAVAŞ var, kategoriler tam, hata detayı tekrarsız"
+
+    _run_case(
+        "RPT",
+        "Raporlama",
+        "Rapor tablosu 118 sütun sınırı + toplam süre/en yavaş + tekrarsız hata detayı",
+        _test_report_table_bounds_and_failure_format,
     )
 
     passed_count = sum(1 for r in results if r["passed"])
@@ -1000,45 +1394,121 @@ def run_mobile_and_enterprise_smoke_tests(verbose: bool = True) -> Tuple[int, in
 
 
 def _print_turkish_report_table(passed_count: int, failed_count: int, results: List[dict]) -> None:
-    """Türkçe formatlı detaylı duman testi sonuç tablosunu konsola yazdırır."""
+    """Türkçe formatlı detaylı duman testi sonuç tablosunu konsola yazdırır.
+
+    Tablo 118 sütuna sığar: kategori sütunu en uzun gerçek kategoriye
+    (40 karakter) göre ayarlıdır, detay sütunu sığmayanı "…" ile kısaltır
+    (tam detay `results` sözlüğünde kalır). Alt bilgi toplam süreyi ve
+    en yavaş vakayı verir — en yavaş vaka, koşum süresi optimizasyonunda
+    ilk bakılacak yerdir.
+    """
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception as exc:
             _ = exc
     total = len(results)
-    sep = "=" * 118
-    thin = "-" * 118
-    print("\n" + sep)
-    print(" GATHERION v2.0 — MOBİL PWA/SSE/PiP, OPSEC/PERFORMANS (31-50) & KURUMSAL MODÜLLER DUMAN TESTİ RAPORU")
-    print(sep)
-    print(f" {'KOD':<8} | {'DURUM':<6} | {'SÜRE':>8} | {'KATEGORİ':<34} | {'DETAY / DOĞRULAMA SONUCU'}")
-    print(thin)
+    width = 118
+    cat_w = 40
+    # Satır: " {KOD:<8} | {DURUM:<6} | {SÜRE:>8} | {KATEGORİ:<40} | {DETAY}"
+    detail_w = width - (1 + 8 + 3 + 6 + 3 + 8 + 3 + cat_w + 3)
+    sep = "=" * width
+    thin = "-" * width
+
+    def _trunc(text: str, limit: int) -> str:
+        text = str(text)
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)] + "…"
+
+    def _out(line: str) -> None:
+        print(_trunc(line, width))
+
+    _out("")
+    _out(sep)
+    _out(f" GATHERION v{__version__} — MOBİL PWA/SSE/PiP, OPSEC/PERFORMANS (31-50) & KURUMSAL MODÜLLER DUMAN TESTİ RAPORU")
+    _out(sep)
+    _out(f" {'KOD':<8} | {'DURUM':<6} | {'SÜRE':>8} | {'KATEGORİ':<{cat_w}} | {'DETAY / DOĞRULAMA SONUCU'}")
+    _out(thin)
     for item in results:
-        code = str(item.get("id", ""))
-        status = str(item.get("status", ""))
+        code = _trunc(str(item.get("id", "")), 8)
+        status = _trunc(str(item.get("status", "")), 6)
         ms_str = f"{item.get('elapsed_ms', 0.0):.1f}ms"
-        cat = str(item.get("category", ""))[:34]
-        det = str(item.get("detail", ""))
-        print(f" {code:<8} | {status:<6} | {ms_str:>8} | {cat:<34} | {det}")
-    print(sep)
+        cat = _trunc(str(item.get("category", "")), cat_w)
+        det = _trunc(str(item.get("detail", "")), detail_w)
+        _out(f" {code:<8} | {status:<6} | {ms_str:>8} | {cat:<{cat_w}} | {det}")
+    _out(sep)
     rate = (passed_count / total * 100.0) if total > 0 else 0.0
-    print(
+    _out(
         f" TOPLAM TEST: {total}  |  GEÇEN: {passed_count}  |  KALAN: {failed_count}  |  BAŞARI ORANI: %{rate:.1f}"
     )
-    print(sep + "\n")
+    total_ms = sum(float(r.get("elapsed_ms", 0.0) or 0.0) for r in results)
+    slowest = max(results, key=lambda r: float(r.get("elapsed_ms", 0.0) or 0.0), default=None)
+    if slowest is not None:
+        _out(
+            f" TOPLAM SÜRE: {total_ms:.1f}ms  |  EN YAVAŞ: {slowest.get('id', '')} "
+            f"({float(slowest.get('elapsed_ms', 0.0) or 0.0):.1f}ms)"
+        )
+    _out(sep)
+    print()
+
+
+# S-4701 / karar 3: hazır/audit bayrakları hiçbir test çalıştırmadan
+# "ready: True" dönemez. Tek kaynak, mobil+kurumsal duman testlerinin
+# gerçek koşusudur (önbellekli — aynı süreçte bir kez koşulur, sonrası
+# aynı sonucu verir; desen: tools/smoke_test_vision_and_3x.py F-1129/F-1241).
+_MOBILE_ENTERPRISE_SMOKE_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _get_mobile_enterprise_smoke_ready_result() -> Dict[str, Any]:
+    """Mobil+kurumsal duman testlerini gerçekten koşup hazır sonucunu döndürür."""
+    global _MOBILE_ENTERPRISE_SMOKE_CACHE
+    if _MOBILE_ENTERPRISE_SMOKE_CACHE is None:
+        try:
+            passed, failed, results = run_mobile_and_enterprise_smoke_tests(verbose=False)
+            failed_ids = [str(r["id"]) for r in results if not r.get("passed")]
+            total = int(passed) + int(failed)
+            _MOBILE_ENTERPRISE_SMOKE_CACHE = {
+                "module": "smoke_test_mobile_and_enterprise",
+                "ready": bool(passed == total and total > 0),
+                "passed": int(passed),
+                "failed": int(failed),
+                "total": total,
+                "failed_checks": failed_ids,
+            }
+        except Exception as exc:  # noqa: BLE001 — koşu çökerse hazır değildir
+            _MOBILE_ENTERPRISE_SMOKE_CACHE = {
+                "module": "smoke_test_mobile_and_enterprise",
+                "ready": False,
+                "passed": 0,
+                "failed": 0,
+                "total": 0,
+                "failed_checks": [],
+                "error": str(exc),
+            }
+    return dict(_MOBILE_ENTERPRISE_SMOKE_CACHE)
 
 
 def get_mobile_enterprise_smoke_summary() -> dict:
-    """Returns the summary for mobile and enterprise smoke tests safely."""
-    try:
-        return {"mobile_enterprise_smoke_ready": True}
-    except Exception:
-        return {"mobile_enterprise_smoke_ready": False}
+    """Mobil+kurumsal duman testlerini gerçekten çalıştırır ve gerçek özeti döndürür."""
+    res = _get_mobile_enterprise_smoke_ready_result()
+    return {
+        "mobile_enterprise_smoke_ready": bool(res["ready"]),
+        "passed_checks": res["passed"],
+        "failed_checks": res["failed_checks"],
+        "total_checks": res["total"],
+    }
 
 
 def get_mobile_enterprise_smoke_ready_flag() -> dict:
-    return {"module": "smoke_test_mobile_and_enterprise", "ready": True}
+    res = _get_mobile_enterprise_smoke_ready_result()
+    return {
+        "module": "smoke_test_mobile_and_enterprise",
+        "ready": bool(res["ready"]),
+        "passed": res["passed"],
+        "total": res["total"],
+        "failed_checks": res["failed_checks"],
+    }
 
 
 if __name__ == "__main__":
@@ -1047,11 +1517,21 @@ if __name__ == "__main__":
 
 
 def get_smoke_test_mobile_and_enterprise_version_info() -> dict:
-    return {"module": "smoke_test_mobile_and_enterprise", "version": "2.0.0", "ready": True}
+    res = _get_mobile_enterprise_smoke_ready_result()
+    return {"module": "smoke_test_mobile_and_enterprise", "version": __version__, "ready": bool(res["ready"])}
 
 
 def get_smoke_test_mobile_and_enterprise_diagnostic_snapshot() -> dict:
-    return {"module": "smoke_test_mobile_and_enterprise", "status": "ok", "ready": True}
+    res = _get_mobile_enterprise_smoke_ready_result()
+    ready = bool(res["ready"])
+    return {
+        "module": "smoke_test_mobile_and_enterprise",
+        "status": "ok" if ready else "failing",
+        "ready": ready,
+        "passed": res["passed"],
+        "total": res["total"],
+        "failed_checks": res["failed_checks"],
+    }
 
 
 def get_smoke_test_mobile_and_enterprise_capabilities() -> list:
@@ -1059,7 +1539,10 @@ def get_smoke_test_mobile_and_enterprise_capabilities() -> list:
 
 
 def validate_smoke_test_mobile_and_enterprise_contract() -> bool:
-    return bool(get_smoke_test_mobile_and_enterprise_capabilities())
+    # S-4701: sözleşme, hardcoded capability listesinin bool'u değil,
+    # duman testlerinin gerçek koşu sonucudur (önbellekli prob).
+    res = _get_mobile_enterprise_smoke_ready_result()
+    return bool(get_smoke_test_mobile_and_enterprise_capabilities()) and bool(res["ready"])
 
 
 def get_smoke_test_mobile_and_enterprise_baseline_metrics() -> dict:
@@ -1067,11 +1550,14 @@ def get_smoke_test_mobile_and_enterprise_baseline_metrics() -> dict:
 
 
 def get_smoke_test_mobile_readiness_status() -> dict:
-    return {"module": "smoke_test_mobile_and_enterprise", "ready": True, "metrics": get_smoke_test_mobile_baseline_metrics() if 'get_smoke_test_mobile_baseline_metrics' in globals() else {}}
+    # S-4701 zinciri: "ready" hardcoded True değil, gerçek koşu sonucudur.
+    res = _get_mobile_enterprise_smoke_ready_result()
+    return {"module": "smoke_test_mobile_and_enterprise", "ready": bool(res["ready"]), "metrics": get_smoke_test_mobile_baseline_metrics() if 'get_smoke_test_mobile_baseline_metrics' in globals() else {}}
 
 
 def get_smoke_test_mobile_audit_record() -> dict:
-    return {"module": "smoke_test_mobile_and_enterprise", "audit_passed": True, "readiness": get_smoke_test_mobile_readiness_status()}
+    res = _get_mobile_enterprise_smoke_ready_result()
+    return {"module": "smoke_test_mobile_and_enterprise", "audit_passed": bool(res["ready"]), "readiness": get_smoke_test_mobile_readiness_status()}
 
 
 def get_smoke_test_mobile_and_enterprise_audit_record() -> dict:

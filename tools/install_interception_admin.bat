@@ -42,13 +42,13 @@ if "%EC%"=="0" (
 ) else (
   echo STATUS: FAIL or UAC cancelled / installer error
   echo Tip: open Admin CMD and run:
-  echo   cd /d F:\a2\vendor\interception
+  echo   cd /d %ROOT%\vendor\interception
   echo   install-interception.exe /install
   echo   pause
 )
 echo ----------------------------------------
 echo Next: reboot if asked, then:
-echo   cd /d F:\a2
+echo   cd /d %ROOT%
 echo   python tools\interception_status.py
 echo Optional smoke:
 echo   python tools\interception_status.py --smoke --confirm-smoke --key tab

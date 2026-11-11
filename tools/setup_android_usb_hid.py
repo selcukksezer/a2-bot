@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import shutil
 import subprocess
@@ -26,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.hardware_input_port import normalize_hid_endpoint
+from tools.set_hid_tcp import stored_hid_tcp_endpoint, write_settings_hid_tcp
 
 USB_GADGET = ROOT / "vendor" / "android_hid" / "usb_gadget"
 SERVER_PY = USB_GADGET / "android_usb_hid_server.py"
@@ -69,16 +69,38 @@ def _adb_bin() -> str:
     return "adb"
 
 
-def run_adb(args: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+# Default cap for a single adb invocation. adb has no built-in timeout and
+# a hung adb (unauthorized device, wedged server) used to hang this tool
+# forever; every call below is now bounded and reports rc 124 on timeout.
+ADB_TIMEOUT_SEC = 60.0
+
+
+def run_adb(
+    args: list[str],
+    *,
+    check: bool = False,
+    timeout_sec: float = ADB_TIMEOUT_SEC,
+) -> subprocess.CompletedProcess[str]:
     cmd = [_adb_bin(), *args]
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=check,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=check,
+            timeout=max(1.0, float(timeout_sec)),
+        )
+    except subprocess.TimeoutExpired:
+        # rc 124 = timeout(1) convention; callers already treat != 0 as failure,
+        # so a hung adb now fails fast instead of hanging the operator tool.
+        return subprocess.CompletedProcess(
+            cmd,
+            124,
+            "",
+            f"adb timed out after {float(timeout_sec):g}s: {' '.join(cmd)}",
+        )
 
 
 def adb_devices() -> list[str]:
@@ -92,20 +114,9 @@ def adb_devices() -> list[str]:
     return serials
 
 
-def write_settings_hid_tcp(endpoint: str) -> Path:
-    path = ROOT / "config" / "settings.json"
-    data: dict = {}
-    if path.is_file():
-        data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        data = {}
-    input_cfg = data.get("input")
-    if not isinstance(input_cfg, dict):
-        input_cfg = {}
-        data["input"] = input_cfg
-    input_cfg["hid_tcp"] = endpoint
-    path.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
-    return path
+# NOTE (D66): write_settings_hid_tcp used to be duplicated here (~35 lines,
+# same corrupt-backup + atomic-write logic as tools/set_hid_tcp.py).
+# It is now imported from tools.set_hid_tcp above (single implementation).
 
 
 def cmd_check() -> int:
@@ -149,7 +160,15 @@ def cmd_push() -> int:
         print(proc.stdout or proc.stderr or f"push {name}")
         if proc.returncode != 0:
             return proc.returncode
-        run_adb(["shell", "su", "-c", f"chmod 755 {dest}"])
+        chmod_proc = run_adb(["shell", "su", "-c", f"chmod 755 {dest}"])
+        if chmod_proc.returncode != 0:
+            print(
+                f"ERROR: chmod 755 {dest} failed "
+                f"(exit={chmod_proc.returncode}): "
+                f"{(chmod_proc.stderr or chmod_proc.stdout or '').strip()}",
+                file=sys.stderr,
+            )
+            return chmod_proc.returncode or 1
     print(f"OK pushed to {PHONE_DIR}/")
     return 0
 
@@ -202,6 +221,15 @@ def cmd_start_server() -> int:
     return proc.returncode
 
 
+def _port_arg(value: str) -> int:
+    """P3-8 (S-300): port 1-65535 aralığında olmalı; aralık dışı değer
+    argparse hatasıyla reddedilir (adb forward'a geçmeden)."""
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"port 1-65535 arasında olmalı (verilen: {value})")
+    return port
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Rooted Android USB HID → Gatherion (push/forward/check)"
@@ -213,8 +241,8 @@ def main() -> int:
         action="store_true",
         help=f"adb forward tcp:{DEFAULT_FORWARD_LOCAL} tcp:{DEFAULT_PHONE_PORT}",
     )
-    ap.add_argument("--local-port", type=int, default=DEFAULT_FORWARD_LOCAL)
-    ap.add_argument("--phone-port", type=int, default=DEFAULT_PHONE_PORT)
+    ap.add_argument("--local-port", type=_port_arg, default=DEFAULT_FORWARD_LOCAL)
+    ap.add_argument("--phone-port", type=_port_arg, default=DEFAULT_PHONE_PORT)
     ap.add_argument(
         "--write-settings",
         action="store_true",
@@ -281,8 +309,7 @@ def main() -> int:
     if args.write_settings:
         ep = (args.endpoint or f"127.0.0.1:{args.local_port}").strip()
         # Prefer host:port form for settings (normalize strips scheme for TCP)
-        canon = normalize_hid_endpoint(ep)
-        stored = canon[6:] if canon.lower().startswith("tcp://") else canon
+        stored = stored_hid_tcp_endpoint(ep)
         path = write_settings_hid_tcp(stored)
         print(f"OK wrote {path} → input.hid_tcp={stored}")
         print(f"set GATHERION_HID_TCP={stored}")

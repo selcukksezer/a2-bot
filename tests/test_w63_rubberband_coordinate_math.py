@@ -22,43 +22,57 @@ from dataset_factory.rubberband_box_converter import (
 )
 
 
-def test_reverse_drag_bottom_right_to_top_left_matches_forward() -> None:
+@pytest.fixture(scope="module")
+def converter() -> RubberBandBoxConverter:
+    # Module scope: the converter holds only a frozen config and every
+    # convert/convert_result call is pure (no mutable state), so one
+    # instance serves all tests in this file.
+    return RubberBandBoxConverter()
+
+
+# (start_x, start_y, end_x, end_y): the four drag directions over the
+# same canvas box — forward TL->BR plus the three reverse diagonals.
+_DRAG_DIRECTIONS = [
+    (260.0, 170.0, 500.0, 350.0),  # forward: top-left -> bottom-right
+    (500.0, 350.0, 260.0, 170.0),  # reverse: bottom-right -> top-left
+    (260.0, 350.0, 500.0, 170.0),  # reverse: bottom-left -> top-right
+    (500.0, 170.0, 260.0, 350.0),  # reverse: top-right -> bottom-left
+]
+
+
+@pytest.mark.parametrize("x1,y1,x2,y2", _DRAG_DIRECTIONS)
+def test_reverse_drag_bottom_right_to_top_left_matches_forward(
+    converter: RubberBandBoxConverter, x1: float, y1: float, x2: float, y2: float
+) -> None:
     """
     Dragging from bottom-right to top-left (and other reverse diagonals) must
     produce the exact same normalized YOLO (cx, cy, w, h) box as top-left to bottom-right.
     """
-    converter = RubberBandBoxConverter()
     # Canvas viewport offset at (100, 50) with size 800x600
     target_rect = (100.0, 50.0, 800.0, 600.0)
 
     # Top-left (260, 170) -> Bottom-right (500, 350)
     # Relative to rect: x in [160, 400] (cx=280/800=0.35, w=240/800=0.30)
     #                   y in [120, 300] (cy=210/600=0.35, h=180/600=0.30)
-    forward = converter.convert_result(260.0, 170.0, 500.0, 350.0, target_rect=target_rect)
-    reverse_br_tl = converter.convert_result(500.0, 350.0, 260.0, 170.0, target_rect=target_rect)
-    reverse_bl_tr = converter.convert_result(260.0, 350.0, 500.0, 170.0, target_rect=target_rect)
-    reverse_tr_bl = converter.convert_result(500.0, 170.0, 260.0, 350.0, target_rect=target_rect)
+    res = converter.convert_result(x1, y1, x2, y2, target_rect=target_rect)
 
-    assert forward.valid is True
-    assert reverse_br_tl.valid is True
-    assert reverse_bl_tr.valid is True
-    assert reverse_tr_bl.valid is True
+    assert res.valid is True
 
     expected_yolo = (0.35, 0.35, 0.30, 0.30)
-    for res in (forward, reverse_br_tl, reverse_bl_tr, reverse_tr_bl):
-        assert res.cx == pytest.approx(expected_yolo[0], abs=1e-6)
-        assert res.cy == pytest.approx(expected_yolo[1], abs=1e-6)
-        assert res.w == pytest.approx(expected_yolo[2], abs=1e-6)
-        assert res.h == pytest.approx(expected_yolo[3], abs=1e-6)
-        assert res.clipped_pixel_rect == pytest.approx((260.0, 170.0, 240.0, 180.0), abs=1e-6)
+    assert res.cx == pytest.approx(expected_yolo[0], abs=1e-6)
+    assert res.cy == pytest.approx(expected_yolo[1], abs=1e-6)
+    assert res.w == pytest.approx(expected_yolo[2], abs=1e-6)
+    assert res.h == pytest.approx(expected_yolo[3], abs=1e-6)
+    assert res.clipped_pixel_rect == pytest.approx((260.0, 170.0, 240.0, 180.0), abs=1e-6)
 
 
-def test_offscreen_overflow_clamped_to_target_rect_bounds() -> None:
+def test_offscreen_overflow_clamped_to_target_rect_bounds(
+    converter: RubberBandBoxConverter,
+) -> None:
     """
     Drags that start or end outside the target_rect (negative coordinates or beyond
     width/height, including reverse drags) must be clipped to target_rect and clamped to [0.0, 1.0].
     """
-    converter = RubberBandBoxConverter()
     # Target rect: left=50, top=40, width=200, height=100 -> right=250, bottom=140
     target_rect = {"left": 50.0, "top": 40.0, "width": 200.0, "height": 100.0}
 
@@ -79,12 +93,13 @@ def test_offscreen_overflow_clamped_to_target_rect_bounds() -> None:
     assert all(0.0 <= v <= 1.0 for v in full_span.yolo_box)
 
 
-def test_completely_offscreen_or_clipped_sliver_rejected() -> None:
+def test_completely_offscreen_or_clipped_sliver_rejected(
+    converter: RubberBandBoxConverter,
+) -> None:
     """
     Drags that occur entirely outside target_rect or whose clipped intersection with
     target_rect is smaller than 8px must be rejected.
     """
-    converter = RubberBandBoxConverter()
     target_rect = (100.0, 100.0, 400.0, 300.0)  # x in [100, 500], y in [100, 400]
 
     # Completely to the left/top of target_rect (large raw drag, zero intersection)
@@ -100,43 +115,46 @@ def test_completely_offscreen_or_clipped_sliver_rejected() -> None:
     assert res_clipped_short.clipped_w_px == pytest.approx(5.0)
 
 
-def test_click_vs_drag_under_8px_threshold_rejected() -> None:
+# (start_x, start_y, end_x, end_y, convert_returns_none): sub-8px drags that
+# must be rejected as 'drag_too_short' — a zero-distance click, a 7.9px
+# micro-drag (Euclidean ~11.17px but per-axis span < 8px), a reverse
+# micro-drag, and a single-axis sliver (dx=50px, dy=4px).
+_SHORT_DRAGS = [
+    (200.0, 200.0, 200.0, 200.0, True),   # zero-distance click
+    (200.0, 200.0, 207.9, 207.9, True),   # 7.9px micro-drag on both axes
+    (200.0, 200.0, 195.0, 194.0, False),  # reverse micro-drag (-5px, -6px)
+    (100.0, 100.0, 150.0, 104.0, False),  # single-axis sliver: dx=50px, dy=4px
+]
+
+
+@pytest.mark.parametrize("x1,y1,x2,y2,expect_convert_none", _SHORT_DRAGS)
+def test_click_vs_drag_under_8px_threshold_rejected(
+    converter: RubberBandBoxConverter,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    expect_convert_none: bool,
+) -> None:
     """
     Accidental clicks (0px), micro-drags (<8px), and single-axis slivers where one
     axis is <8px must be rejected as 'drag_too_short'.
     """
-    converter = RubberBandBoxConverter()
     assert converter.min_drag_px == pytest.approx(DEFAULT_MIN_DRAG_PX)
     target_rect = (0.0, 0.0, 1000.0, 1000.0)
 
-    # Zero-distance click
-    res_click = converter.convert_result(200.0, 200.0, 200.0, 200.0, target_rect=target_rect)
-    assert res_click.valid is False
-    assert res_click.reason == "drag_too_short"
-
-    # 7.9px drag on both axes (even though Euclidean distance is ~11.17px, axis span < 8px)
-    res_micro = converter.convert_result(200.0, 200.0, 207.9, 207.9, target_rect=target_rect)
-    assert res_micro.valid is False
-    assert res_micro.reason == "drag_too_short"
-    assert converter.convert(200.0, 200.0, 207.9, 207.9, target_rect=target_rect) is None
-
-    # Reverse micro-drag from bottom-right to top-left (-5px, -6px)
-    res_rev_micro = converter.convert_result(200.0, 200.0, 195.0, 194.0, target_rect=target_rect)
-    assert res_rev_micro.valid is False
-    assert res_rev_micro.reason == "drag_too_short"
-
-    # Single-axis sliver: dx=50px (>=8px), dy=4px (<8px)
-    res_sliver = converter.convert_result(100.0, 100.0, 150.0, 104.0, target_rect=target_rect)
-    assert res_sliver.valid is False
-    assert res_sliver.reason == "drag_too_short"
+    res = converter.convert_result(x1, y1, x2, y2, target_rect=target_rect)
+    assert res.valid is False
+    assert res.reason == "drag_too_short"
+    if expect_convert_none:
+        assert converter.convert(x1, y1, x2, y2, target_rect=target_rect) is None
 
 
-def test_exact_8px_boundary_drag_accepted() -> None:
+def test_exact_8px_boundary_drag_accepted(converter: RubberBandBoxConverter) -> None:
     """
     A drag of exactly 8.0px in both axes (forward or reverse) must pass the >=8px gate
     and produce valid normalized coordinates.
     """
-    converter = RubberBandBoxConverter()
     target_rect = (0.0, 0.0, 800.0, 400.0)
 
     # Reverse drag of exactly (-8px, -8px): from (408, 208) to (400, 200)

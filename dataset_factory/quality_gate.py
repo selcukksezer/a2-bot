@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 from dataset_factory.quality_dedup_gate import DatasetQualityGate, QualityGateDecision
+from version import __version__
 
 
 class QualityGate(DatasetQualityGate):
     """Quality Gate wrapper around DatasetQualityGate."""
 
     def get_quality_gate_ready_flag(self) -> dict:
-        return {"module": "quality_gate", "ready": True}
+        # S-1902 (Karar 3): ready is the live contract probe, not a constant.
+        return {"module": "quality_gate", "ready": validate_quality_gate_contract()}
 
     def get_quality_gate_version_info(self) -> dict:
-        return {"module": "quality_gate", "version": "2.0.0", "ready": True}
+        return {"module": "quality_gate", "version": __version__, "ready": validate_quality_gate_contract()}
 
     def get_quality_gate_diagnostic_snapshot(self) -> dict:
-        return {"module": "quality_gate", "status": "ok", "ready": True}
+        ready = validate_quality_gate_contract()
+        return {"module": "quality_gate", "status": "ok" if ready else "degraded", "ready": ready}
 
 
 __all__ = [
@@ -35,8 +38,37 @@ def get_quality_gate_capabilities() -> list:
     return ["quality_gate", "frame_validation", "diagnostic_snapshot"]
 
 
+def _probe_quality_gate() -> bool:
+    """Real readiness probe (S-1902, Karar 3): exercise DatasetQualityGate
+    instead of trusting a constant. The gate must construct with sane
+    thresholds, keep one valid annotation, and drop one degenerate box;
+    any failure means the gate is not actually ready."""
+    try:
+        gate = DatasetQualityGate()
+        if not (
+            gate.min_sharpness_threshold > 0
+            and 0.0 < gate.val_ratio < 1.0
+            and 0.0 < gate.nms_iou_threshold < 1.0
+            and gate.min_hamming_distance > 0
+        ):
+            return False
+        kept = gate.validate_yolo_annotations(
+            [{"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}]
+        )
+        if len(kept) != 1:
+            return False
+        dropped = gate.validate_yolo_annotations(
+            [{"class_id": 0, "cx": 0.5, "cy": 0.5, "w": 0.0, "h": 0.1}]
+        )
+        if dropped:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def validate_quality_gate_contract() -> bool:
-    return bool(get_quality_gate_capabilities())
+    return bool(get_quality_gate_capabilities()) and _probe_quality_gate()
 
 
 def get_quality_gate_baseline_metrics() -> dict:

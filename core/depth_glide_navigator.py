@@ -28,6 +28,7 @@ Mimari Bileşenler:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -36,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from version import __version__
 
 try:
     import onnxruntime as ort
@@ -143,6 +145,43 @@ class MonocularDepthObstacleAvoidance:
             if not os.path.isfile(candidate):
                 continue
 
+            # F-1832 / P2-10: ONNX modeli imzasız yüklenmesin — yükleme
+            # için `<model>.sha256` sidecar ZORUNLUDUR. Sidecar yoksa
+            # model yüklenmez (hash'i loglayıp yüklemek, kural ile
+            # çelişiyordu); sidecar varsa özet doğrulanır, uyuşmazlıkta
+            # yükleme reddedilir.
+            try:
+                with open(candidate, "rb") as fh:
+                    model_sha256 = hashlib.sha256(fh.read()).hexdigest()
+            except Exception as exc:
+                logger.warning("ONNX model dosyası okunamadı (%s): %s", candidate, exc)
+                continue
+            sidecar = candidate + ".sha256"
+            if not os.path.isfile(sidecar):
+                logger.error(
+                    "ONNX model SHA-256 sidecar yok, yükleme reddedildi: %s "
+                    "(%s eksik — hash doğrulaması yapılamaz; imzasız model yüklenmez)",
+                    candidate,
+                    sidecar,
+                )
+                continue
+            try:
+                with open(sidecar, "r", encoding="utf-8") as sfh:
+                    expected = sfh.read().strip().split()[0].lower()
+                if expected != model_sha256:
+                    logger.error(
+                        "ONNX model SHA-256 uyuşmazlığı, yükleme reddedildi: %s "
+                        "(beklenen=%s..., gerçek=%s...)",
+                        candidate,
+                        expected[:16],
+                        model_sha256[:16],
+                    )
+                    continue
+            except Exception as exc:
+                logger.warning("ONNX model SHA-256 sidecar okunamadı (%s): %s", candidate, exc)
+                continue
+            logger.info("ONNX derinlik modeli SHA-256: %s %s", model_sha256[:16], candidate)
+
             if HAS_ONNXRUNTIME and ort is not None:
                 try:
                     sess_opts = ort.SessionOptions()
@@ -230,8 +269,26 @@ class MonocularDepthObstacleAvoidance:
         t0 = time.perf_counter()
 
         if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            # F-1835: Boş/None karede 0.5'lik harita fail-open'dır (koridor "açık"
+            # görünür). Fail-closed: 0.0 (çok yakın/engelli) döndür ki koridor
+            # analizi engel saysın.
+            logger.warning("estimate_depth_map: boş/geçersiz kare, fail-closed 0.0 harita dönülüyor.")
             self._last_inference_ms = (time.perf_counter() - t0) * 1000.0
-            return np.full((self.work_height, self.work_width), 0.5, dtype=np.float32)
+            return np.zeros((self.work_height, self.work_width), dtype=np.float32)
+
+        # F-1822: Tek kanallı 3B kare (h, w, 1) / 2 kanallı kare BGR varsayımıyla
+        # çökerdi — kanal sayısını normalize et.
+        if frame.ndim == 3 and frame.shape[2] == 1:
+            frame = frame[:, :, 0]
+        elif frame.ndim == 3 and frame.shape[2] == 2:
+            frame = frame[:, :, 0]
+        elif frame.ndim not in (2, 3):
+            logger.warning(
+                "estimate_depth_map: beklenmeyen kare boyutu %s, fail-closed 0.0 harita dönülüyor.",
+                getattr(frame, "shape", None),
+            )
+            self._last_inference_ms = (time.perf_counter() - t0) * 1000.0
+            return np.zeros((self.work_height, self.work_width), dtype=np.float32)
 
         orig_h, orig_w = frame.shape[:2]
 
@@ -282,9 +339,12 @@ class MonocularDepthObstacleAvoidance:
         grad_norm = np.clip(grad_smooth * 1.15, 0.0, 1.0)
 
         # Dikey kenar baskınlığı (ağaç gövdesi / kaya sütunu / duvar tespiti için)
-        abs_gx = cv2.blur(np.abs(gx), (5, 9))
-        abs_gy = cv2.blur(np.abs(gy), (5, 9))
-        vertical_structure = np.clip((abs_gx - 0.60 * abs_gy) * 1.6, 0.0, 1.0)
+        # D10: blur doğrusal bir işlemdir: blur(a) - 0.6*blur(b) == blur(a - 0.6*b)
+        # (float32 yuvarlama farkı ~2.4e-07). İki (5,9) blur yerine tek blur
+        # çağrısı yapılır; çıktı pratikte aynıdır, çağrı başına ~0.7ms kazandırır.
+        vertical_structure = np.clip(
+            cv2.blur(np.abs(gx) - 0.60 * np.abs(gy), (5, 9)) * 1.6, 0.0, 1.0
+        )
 
         # 4. Gökyüzü / Atmosferik Perspektif / Uçurum Boşluğu Segmentasyonu
         # Uzak vadi, sis ve gökyüzü yüksek parlaklık + mavi/açık-gri ton + düşük doku gradyanı gösterir
@@ -309,11 +369,14 @@ class MonocularDepthObstacleAvoidance:
         )
 
         # 6. Dikey Perspektif Öncülü + Doku Gradyanı + Gökyüzü/Uçurum Birleşimi
+        # F-1824: Önceki ağırlıklar (0.56 öncül) haritayı büyük ölçüde sabit
+        # dikey öncüle bağlıyor, görüntü kanıtı (engel tepkisi) zayıf kalıyordu.
+        # Engel tepkisi artık baskın; öncül yalnızca zayıf bir önsel.
         depth_est = (
-            0.56 * self._vertical_prior
-            + 0.35 * sky_or_valley_score
-            - 0.42 * near_obstacle_response
-            + 0.16
+            0.34 * self._vertical_prior
+            + 0.40 * sky_or_valley_score
+            - 0.60 * near_obstacle_response
+            + 0.10
         )
         depth_est = depth_est * self._corridor_mask
 
@@ -386,9 +449,10 @@ class MonocularDepthObstacleAvoidance:
         upper_horizon_depth = float(np.mean(upper_horizon_center))
 
         # Normal zeminde lower_ground_depth ~0.25-0.48 aralığındadır; uçurum kenarında >0.66 olur
-        vertical_discontinuity = float(
-            np.percentile(sector_center, 90) - np.percentile(sector_center, 15)
-        )
+        # D10: üç ayrı np.percentile çağrısı üç kez sıralama yapar; [15, 22, 90]
+        # tek çağrıda hesaplanır (fark <= ~1.2e-08, float32 yuvarlama gürültüsü).
+        _p15, _p22, _p90 = np.percentile(sector_center, [15, 22, 90])
+        vertical_discontinuity = float(_p90 - _p15)
         cliff_drop_detected = bool(
             lower_ground_depth >= self.cliff_drop_threshold
             or (
@@ -399,7 +463,7 @@ class MonocularDepthObstacleAvoidance:
         )
 
         # Yakın engel tespiti ve sınıflandırması (`wall`, `rock`, `tree_trunk`)
-        near_quantile_center = float(np.percentile(sector_center, 22))
+        near_quantile_center = float(_p22)
         col_means = np.mean(sector_center, axis=0)
         min_col_clearance = float(np.min(col_means)) if col_means.size > 0 else clearance_center
         obstacle_detected = False
@@ -420,6 +484,13 @@ class MonocularDepthObstacleAvoidance:
                 clearance_right=clearance_right,
             )
         elif cliff_drop_detected:
+            obstacle_detected = True
+            obstacle_type = "cliff_drop"
+
+        # F-1823: Uçurum tespit edildiyse türü asla yakın-engel sınıfıyla
+        # (wall/rock/tree_trunk) maskelenmesin — uçurum güvenlik açısından
+        # önceliklidir, aksi halde uçurum tipi engel kaybolur.
+        if cliff_drop_detected:
             obstacle_detected = True
             obstacle_type = "cliff_drop"
 
@@ -490,7 +561,8 @@ class MonocularDepthObstacleAvoidance:
         """
         sh = sector_center.shape[0]
         # Dikey perspektif öncülünden arındırılmış engel tepkisi
-        residual = sector_center - 0.56 * prior_center
+        # (öncül ağırlığı estimate_depth_map ile aynı: 0.34)
+        residual = sector_center - 0.34 * prior_center
         top_half = float(np.mean(residual[: max(1, sh // 2), :]))
         bottom_half = float(np.mean(residual[max(1, sh // 2) :, :]))
         col_profile = np.mean(residual, axis=0)
@@ -518,12 +590,17 @@ class MonocularDepthObstacleAvoidance:
         input_ctrl: Optional[Any],
         corridor_info: Dict[str, Any],
         pixels_per_degree: float = 4.2,
-        test_mode: bool = True,
+        test_mode: bool = False,
     ) -> Dict[str, Any]:
         """
         `analyze_forward_corridor` çıktısındaki `recommended_steer_deg` değerini
         fare hareketine dönüştürerek botun kayalara ve ağaçlara takılmadan önce
         yumuşakça etrafından dolaşmasını sağlar.
+
+        F-0081: Varsayılan `test_mode=True` üretimde fareyi hiç oynatmıyor,
+        üstelik fare hatası yutulup `applied=True` dönüyordu. Varsayılan artık
+        `False` (üretimde gerçekten uygular); `applied` yalnızca fare gerçekten
+        oynatıldıysa (veya açıkça simülasyon istendiyse) `True` döner.
         """
         steer_deg = float(corridor_info.get("recommended_steer_deg", 0.0))
         if abs(steer_deg) < 1.5:
@@ -535,32 +612,146 @@ class MonocularDepthObstacleAvoidance:
             }
 
         mouse_dx = int(round(steer_deg * float(pixels_per_degree)))
-        if not test_mode and input_ctrl is not None:
+        if test_mode:
+            return {
+                "applied": True,
+                "steer_deg": steer_deg,
+                "mouse_dx": mouse_dx,
+                "obstacle_type": corridor_info.get("obstacle_type", "none"),
+                "test_mode": True,
+                "simulated": True,
+            }
+
+        moved = False
+        move_error: Optional[str] = None
+        if input_ctrl is not None:
             try:
                 if hasattr(input_ctrl, "get_cursor_position") and hasattr(
                     input_ctrl, "smooth_move_to"
                 ):
                     cx, cy = input_ctrl.get_cursor_position()
                     input_ctrl.smooth_move_to(cx + mouse_dx, cy, duration=0.045)
+                    moved = True
+                # smooth_move_to mutlak hedef alır; imleç konumu okunamıyorsa
+                # göreli kaydırma uydurulamaz — uygulanmadı sayılır.
             except Exception as exc:
-                logger.debug("Kaçınma fare yönlendirme uyarısı: %s", exc)
+                move_error = str(exc)
+                logger.warning("Kaçınma fare yönlendirme hatası: %s", exc)
 
         return {
-            "applied": True,
+            "applied": bool(moved),
             "steer_deg": steer_deg,
             "mouse_dx": mouse_dx,
             "obstacle_type": corridor_info.get("obstacle_type", "none"),
-            "test_mode": bool(test_mode),
+            "test_mode": False,
+            "simulated": False,
+            "reason": (
+                "steering_applied"
+                if moved
+                else ("mouse_move_failed: " + move_error if move_error else "no_usable_input_controller")
+            ),
         }
 
+    def _probe_depth_readiness(self) -> Dict[str, Any]:
+        """
+        S-0401: Gerçek hazır probu — eşik sağlığı + sentetik kare üzerinde
+        derinlik haritası ve koridor analizi ölçülür, sabit True döndürülmez
+        (S-0602'nin GlideWaypointController'daki proba bağlama kararı).
+        Pozitif kontrol: dikey gradyanlı sentetik kare geçerli, değişken bir
+        derinlik haritası ve sınırlı bir direksiyon açısı üretmeli.
+        Negatif kontrol: fail-closed sıfır harita (std 0) probu geçirmez.
+        """
+        checks: Dict[str, Any] = {}
+        try:
+            checks["thresholds_sane"] = bool(
+                self.work_width >= 64
+                and self.work_height >= 36
+                and 0.0 < self.obstacle_clearance_threshold < 1.0
+                and 0.0 < self.cliff_drop_threshold < 1.0
+                and self.max_steer_deg > 0
+                and self._vertical_prior.shape
+                == (self.work_height, self.work_width)
+                and self._corridor_mask.shape
+                == (self.work_height, self.work_width)
+            )
+            checks["backend_known"] = bool(
+                isinstance(self.backend_name, str) and self.backend_name
+            )
+            # Sentetik dikey gradyan kare: üst açık (parlak), alt yakın (koyu).
+            rows = np.linspace(255.0, 0.0, 180, dtype=np.float32)[:, None, None]
+            frame = np.repeat(np.repeat(rows, 320, axis=1), 3, axis=2).astype(
+                np.uint8
+            )
+            depth_map = self.estimate_depth_map(frame, return_full_resolution=False)
+            checks["depth_map_shape_ok"] = bool(
+                depth_map.shape == (self.work_height, self.work_width)
+                and depth_map.dtype == np.float32
+            )
+            checks["depth_map_finite_in_range"] = bool(
+                np.all(np.isfinite(depth_map))
+                and float(depth_map.min()) >= 0.0
+                and float(depth_map.max()) <= 1.0
+            )
+            checks["depth_map_varies"] = bool(float(np.std(depth_map)) > 0.0)
+            corridor = self.analyze_forward_corridor(frame)
+            steer = float(corridor.get("recommended_steer_deg", float("nan")))
+            checks["corridor_probe_ok"] = bool(
+                corridor.get("depth_map_shape")
+                == (self.work_height, self.work_width)
+                and np.isfinite(steer)
+                and abs(steer) <= self.max_steer_deg
+            )
+        except Exception as exc:
+            checks["error"] = str(exc)
+        checks["passed"] = bool(checks.get("thresholds_sane")) and all(
+            bool(v) for k, v in checks.items() if k not in ("error", "passed")
+        )
+        return checks
+
+    def _ready_state(self) -> bool:
+        """Gerçek hazır durumu: öncül matrisler doğru şekilde kurulu ve arka uç biliniyor."""
+        try:
+            return bool(
+                self._vertical_prior.shape == (self.work_height, self.work_width)
+                and self._corridor_mask.shape == (self.work_height, self.work_width)
+                and self.backend_name
+                and np.isfinite(self._last_inference_ms)
+            )
+        except Exception:
+            return False
+
+    def _combined_ready(self) -> bool:
+        # S-0401 probu (sentetik kare + koridor) VE D10 hazır durumu
+        # (öncül matrisler + arka uç + son çıkarım süresi) ikisi de geçmeli.
+        return bool(self._probe_depth_readiness().get("passed", False)) and bool(
+            self._ready_state()
+        )
+
     def get_depth_glide_navigator_ready_flag(self) -> dict:
-        return {"module": "depth_glide_navigator", "ready": True}
+        # S-0401 + D10: koşulsuz True değil; prob zinciri ve hazır durumu ikisi de bakılır.
+        ready = self._combined_ready()
+        return {
+            "module": "depth_glide_navigator",
+            "ready": ready,
+            "status": "ok" if ready else "not_initialized",
+            "backend": self.backend_name,
+            "last_inference_ms": round(float(self._last_inference_ms), 3),
+        }
 
     def get_depth_glide_navigator_version_info(self) -> dict:
-        return {"module": "depth_glide_navigator", "version": "2.0.0", "ready": True}
+        return {"module": "depth_glide_navigator", "version": __version__, "ready": self._combined_ready()}
 
     def get_depth_glide_navigator_diagnostic_snapshot(self) -> dict:
-        return {"module": "depth_glide_navigator", "status": "ok", "ready": True}
+        # S-0401: Sabit True yok — gerçek prob zincirine delege edilir.
+        probe = self._probe_depth_readiness()
+        ready = bool(probe.get("passed", False))
+        return {
+            "module": "depth_glide_navigator",
+            "status": "ok" if ready else "not_ready",
+            "ready": ready,
+            "backend": self.backend_name,
+            "probe": probe,
+        }
 
 
 
@@ -572,6 +763,12 @@ class GlideWaypointController:
     bir kaynağa (`next_node`) yürüyerek ~40 saniyede inmek yerine, uçurumdan atlayıp
     kanat açarak (Glide) ~4.5 - 5 saniyede doğrudan kaynağın üzerine inmeyi sağlar.
     """
+
+    # P1-11: süzülme süresi üst sınırı — düğümden gelen
+    # `glide_duration_sec` de, hesaplanan süre de bu aralığı aşamaz.
+    # (P2-10 da aynı sınıra dokunur; birleşimde tek kaynak kalmalı.)
+    MIN_GLIDE_DURATION_SEC: float = 2.5
+    MAX_GLIDE_DURATION_SEC: float = 8.5
 
     def __init__(
         self,
@@ -613,6 +810,44 @@ class GlideWaypointController:
         except (TypeError, ValueError):
             return (0.0, 0.0)
 
+    @staticmethod
+    def _is_glide_flag(value: Any) -> bool:
+        """P2-10: glide bayrağı katı ayrıştırma. Ham ``bool()`` ``"false"``
+        stringini bile ``True`` sayıyordu; yalnızca gerçek ``bool True``,
+        ``1`` sayısı veya ``"true"``/``"1"``/``"yes"`` stringi glide
+        bayrağı sayılır. ``"false"``/``"0"``/``"no"``/``None`` reddedilir."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value == 1
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes")
+        return False
+
+    def _pair_supports_glide(
+        self,
+        current_node: Dict[str, Any],
+        next_node: Dict[str, Any],
+    ) -> bool:
+        """P2-10: açık bayrak bile mesafe/yükseklik kontrolünden geçmek
+        zorunda — bayrak, uçurum/mesafe kanıtının yerini tutmaz.
+        Yatay mesafe ``[min_horizontal_dist, max_horizontal_dist]``
+        içinde olmalı (F-0250: mesafe 0 / eksik koordinat reddedilir);
+        iki düğümde de yükseklik biliniyorsa düşüş en az
+        ``min_elevation_drop`` olmalı. Yükseklik bilinmiyorsa yalnızca
+        mesafe denetlenir (bayrak + mesafe yeter)."""
+        x1, y1 = self._extract_xy(current_node)
+        x2, y2 = self._extract_xy(next_node)
+        horiz_dist = math.hypot(x2 - x1, y2 - y1)
+        if not (self.min_horizontal_dist <= horiz_dist <= self.max_horizontal_dist):
+            return False
+        cur_z = self._extract_elevation(current_node)
+        nxt_z = self._extract_elevation(next_node)
+        if cur_z is not None and nxt_z is not None:
+            if (cur_z - nxt_z) < self.min_elevation_drop:
+                return False
+        return True
+
     def is_glide_waypoint(
         self,
         current_node: Optional[Dict[str, Any]],
@@ -635,7 +870,10 @@ class GlideWaypointController:
 
         Kriterler:
         1. `current_node` veya `next_node` üzerinde açıkça `is_glide_waypoint=True`,
-           `glide=True`, `waypoint_type="glide"` veya `action="glide"` tanımlanmışsa `True`.
+           `glide=True`, `waypoint_type="glide"` veya `action="glide"` tanımlanmışsa
+           VE çift biliniyorsa mesafe/yükseklik kapısı da geçiliyorsa `True`
+           (P2-10: açık bayrak kapıyı baypas etmez; bayrak değeri katı
+           ayrıştırılır — `"false"` stringi bayrak sayılmaz).
         2. Her iki düğümde yükseklik (`elevation` / `z`) bilgisi varsa ve
            `elevation_drop >= min_elevation_drop` (varsayılan 12m) + yatay mesafe
            uygun aralıktaysa `True`.
@@ -644,25 +882,34 @@ class GlideWaypointController:
             return False
 
         # 1. Açık (Explicit) Glide Etiketi Kontrolü
+        # P2-10: ham bool() "false" stringini bile True sayıyordu —
+        # bayraklar katı ayrıştırma ile okunur; waypoint_type/action
+        # karşılaştırması zaten tam-eşleşme ("glide") ister.
         explicit_flags = (
-            current_node.get("is_glide_waypoint"),
-            current_node.get("glide"),
-            current_node.get("use_glide"),
+            self._is_glide_flag(current_node.get("is_glide_waypoint")),
+            self._is_glide_flag(current_node.get("glide")),
+            self._is_glide_flag(current_node.get("use_glide")),
             str(current_node.get("waypoint_type", "")).lower() == "glide",
             str(current_node.get("action", "")).lower() == "glide",
         )
-        if any(bool(flag) for flag in explicit_flags):
+        next_flags = False
+        if isinstance(next_node, dict):
+            next_flags = (
+                self._is_glide_flag(next_node.get("glide_from_prev"))
+                or self._is_glide_flag(next_node.get("is_glide_target"))
+                or str(next_node.get("approach", "")).lower() == "glide"
+            )
+        if any(explicit_flags) or next_flags:
+            # P2-10: açık bayrak mesafe/yükseklik kontrolünü baypas
+            # edemez — çift biliniyorsa çiftin kendisi doğrulanır
+            # (mesafe aralığı + bilinen yüksekliklerde düşüş).
+            # Tek düğüm sorgusunda doğrulanacak çift yoktur; bayrak
+            # tek başına geçer (çağıran çifti verince kapı çalışır).
+            if isinstance(next_node, dict):
+                return self._pair_supports_glide(current_node, next_node)
             return True
 
         if isinstance(next_node, dict):
-            next_flags = (
-                next_node.get("glide_from_prev"),
-                next_node.get("is_glide_target"),
-                str(next_node.get("approach", "")).lower() == "glide",
-            )
-            if any(bool(flag) for flag in next_flags):
-                return True
-
             # 2. Rakım Farkı (Elevation Drop) ve Yatay Vadi Mesafesi Analizi
             cur_z = self._extract_elevation(current_node)
             nxt_z = self._extract_elevation(next_node)
@@ -672,9 +919,9 @@ class GlideWaypointController:
                     x1, y1 = self._extract_xy(current_node)
                     x2, y2 = self._extract_xy(next_node)
                     horiz_dist = math.hypot(x2 - x1, y2 - y1)
-                    if horiz_dist == 0.0 or (
-                        self.min_horizontal_dist <= horiz_dist <= self.max_horizontal_dist
-                    ):
+                    # F-0250: Yatay mesafe 0 iken (aynı nokta / eksik koordinat)
+                    # glide onaylanmaz — süzülecek mesafe yok.
+                    if self.min_horizontal_dist <= horiz_dist <= self.max_horizontal_dist:
                         return True
 
         return False
@@ -694,28 +941,71 @@ class GlideWaypointController:
         dy = y2 - y1
         horiz_dist = math.hypot(dx, dy)
 
-        heading_deg = float(current_node.get("glide_heading_deg", 0.0))
-        if horiz_dist > 1e-3 and "glide_heading_deg" not in current_node:
+        # F-1825: `glide_heading_deg=None` (veya sayı-dışı) float() çökertir,
+        # eksik yükseklik `or 100.0/60.0` ile uydurulurdu. Güvenli ayrıştırma;
+        # bilinmeyen değer uydurulmaz, `None`/bayrak ile raporlanır.
+        heading_source = "unknown"
+        heading_deg: Optional[float] = None
+        raw_heading = current_node.get("glide_heading_deg") if isinstance(current_node, dict) else None
+        if raw_heading is not None:
+            try:
+                heading_deg = float(raw_heading)
+                heading_source = "node"
+            except (TypeError, ValueError):
+                heading_deg = None
+        if heading_deg is None and horiz_dist > 1e-3:
             heading_deg = math.degrees(math.atan2(dx, -dy)) % 360.0
+            heading_source = "geometry"
+        if heading_deg is None:
+            heading_deg = 0.0
 
-        cur_z = self._extract_elevation(current_node) or 100.0
-        nxt_z = self._extract_elevation(next_node) or 60.0
-        elevation_drop = max(0.0, cur_z - nxt_z)
+        cur_z = self._extract_elevation(current_node)
+        nxt_z = self._extract_elevation(next_node)
+        elevation_known = cur_z is not None and nxt_z is not None
+        elevation_drop: Optional[float] = None
+        if elevation_known:
+            elevation_drop = max(0.0, float(cur_z) - float(nxt_z))
 
+        glide_duration: Optional[float] = None
         if "glide_duration_sec" in current_node:
-            glide_duration = float(current_node["glide_duration_sec"])
-        elif horiz_dist > 1.0:
-            # Süzülme hızı ~22 birim/sn olarak modellenir (2.0sn - 8.5sn aralığında sınırlandırılır)
-            glide_duration = float(np.clip(horiz_dist / 22.0, 2.5, 8.5))
+            try:
+                glide_duration = float(current_node["glide_duration_sec"])
+            except (TypeError, ValueError):
+                glide_duration = None
+            # P1-11: sonlu olmayan düğüm süresi (NaN/inf) hesap yoluna düşer.
+            if glide_duration is not None and not math.isfinite(glide_duration):
+                glide_duration = None
+        if glide_duration is None:
+            if horiz_dist > 1.0:
+                # Süzülme hızı ~22 birim/sn olarak modellenir.
+                glide_duration = float(
+                    np.clip(
+                        horiz_dist / 22.0,
+                        self.MIN_GLIDE_DURATION_SEC,
+                        self.MAX_GLIDE_DURATION_SEC,
+                    )
+                )
+            else:
+                glide_duration = 4.5
         else:
-            glide_duration = 4.5
+            # P1-11: düğümden gelen süre de üst sınırsız geçemez —
+            # [MIN, MAX] aralığına çekilir.
+            glide_duration = float(
+                np.clip(
+                    glide_duration,
+                    self.MIN_GLIDE_DURATION_SEC,
+                    self.MAX_GLIDE_DURATION_SEC,
+                )
+            )
 
         walk_time_est = max(glide_duration * 6.5, 40.0)
         return {
             "should_glide": self.should_use_glide(current_node, next_node),
             "target_heading_deg": round(heading_deg, 2),
+            "heading_source": heading_source,
             "glide_duration_sec": round(glide_duration, 2),
-            "elevation_drop": round(elevation_drop, 2),
+            "elevation_drop": round(elevation_drop, 2) if elevation_drop is not None else None,
+            "elevation_known": bool(elevation_known),
             "horizontal_distance": round(horiz_dist, 2),
             "estimated_walk_sec": round(walk_time_est, 1),
             "estimated_time_saved_sec": round(max(0.0, walk_time_est - glide_duration), 1),
@@ -726,7 +1016,9 @@ class GlideWaypointController:
         input_ctrl: Optional[Any] = None,
         target_heading_deg: float = 0.0,
         glide_duration_sec: float = 4.5,
-        test_mode: bool = True,
+        test_mode: bool = False,
+        current_heading_deg: Optional[float] = None,
+        cancel_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Tam Otomatik Uçurum Atlama ve Süzülme (Glide) Manevrasını Yürütür:
@@ -739,9 +1031,28 @@ class GlideWaypointController:
            doğru süzülme açısını ve ileri momentumu korur.
         6. `fold_wings_and_land`: Hedef kaynağın tam üzerinde kanatları kapatıp (`Space`)
            yumuşak iniş yapar ve `W` tuşunu bırakır.
+
+        F-1815: Varsayılan `test_mode=True` üretimde hiçbir girdi göndermeden
+        `success=True` döndürüyordu. Varsayılan artık `False`; açıkça simülasyon
+        istenirse `test_mode=True` verilir ve sonuç `simulated=True` işaretlenir.
+        F-1816: Mutlak hedef açı fare deltasına çevrilemez; `current_heading_deg`
+        verilmezse yön düzeltmesi yapılmaz (0 px) ve bu kaydedilir.
+        F-1817: `W` tutuşu `try/finally` ile güvenceye alındı; basma dönüş
+        değerleri kontrol ediliyor.
+        F-1829: `cancel_event` (`.is_set()` olan nesne) her süzülme diliminde
+        kontrol edilir; iniş doğrulanamadığı için `landed_at_target` artık
+        doğrulanmış iniş yokken `False` + `landing_verified=False` döner.
+        P1-11: W tutuşu/tap'i, sıçrama veya kanat açma Space'i
+        gönderilemezse manevra durur (`success=False`, `reason` ile);
+        `glide_duration_sec` MAX_GLIDE_DURATION_SEC (8.5 sn) ile sınırlıdır.
         """
         t_start = time.perf_counter()
-        duration = max(0.8, float(glide_duration_sec))
+        # P1-11: süreye üst sınır — doğrudan çağrıda verilen
+        # glide_duration_sec de MAX_GLIDE_DURATION_SEC'i aşamaz.
+        duration = float(glide_duration_sec)
+        if not math.isfinite(duration):
+            duration = 4.5
+        duration = min(self.MAX_GLIDE_DURATION_SEC, max(0.8, duration))
         heading = float(target_heading_deg)
         timeline_events: List[Dict[str, Any]] = []
 
@@ -755,6 +1066,37 @@ class GlideWaypointController:
                 entry.update(extra)
             timeline_events.append(entry)
 
+        # F-1815: Kullanılabilir girdi denetleyicisi yoksa (ör. yanlışlıkla düğüm
+        # sözlüğü geçildiyse) beklemeye girmeden hızlıca başarısız dön — sahte
+        # başarı ve boş bekleme yok.
+        usable_input = False
+        if test_mode:
+            usable_input = True
+        elif input_ctrl is not None:
+            usable_input = any(
+                hasattr(input_ctrl, name)
+                for name in ("_hw_key_down", "_hw_key_up", "press_key", "smooth_move_to", "get_cursor_position")
+            )
+        if not usable_input:
+            logger.warning(
+                "[GlideController] Kullanılabilir girdi denetleyicisi yok; süzülme manevrası iptal edildi."
+            )
+            return {
+                "success": False,
+                "maneuver": "cliff_jump_glide",
+                "target_heading_deg": heading,
+                "planned_glide_duration_sec": duration,
+                "apex_deploy_delay_sec": self.apex_delay_sec,
+                "wings_deployed": False,
+                "landed_at_target": False,
+                "landing_verified": False,
+                "test_mode": bool(test_mode),
+                "simulated": bool(test_mode),
+                "reason": "no_usable_input_controller",
+                "execution_elapsed_sec": round(time.perf_counter() - t_start, 4),
+                "timeline": timeline_events,
+            }
+
         logger.info(
             "[GlideController] Süzülme manevrası başlatılıyor -> Yön: %.1f°, Süre: %.2fs (test_mode=%s)",
             heading,
@@ -763,7 +1105,15 @@ class GlideWaypointController:
         )
 
         # Adım 1: Uçurum kenarına ve hedef kaynağa kamera/yön hizalama
-        steer_offset_px = int(round(((heading + 180.0) % 360.0 - 180.0) * 3.2))
+        # F-1816: Mutlak açı delta değildir — yalnızca mevcut açı biliniyorsa
+        # göreli farktan fare kayması hesaplanır; bilinmiyorsa kayma 0'dır.
+        heading_delta_deg: Optional[float] = None
+        if current_heading_deg is not None:
+            try:
+                heading_delta_deg = (heading - float(current_heading_deg) + 180.0) % 360.0 - 180.0
+            except (TypeError, ValueError):
+                heading_delta_deg = None
+        steer_offset_px = int(round(heading_delta_deg * 3.2)) if heading_delta_deg is not None else 0
         if not test_mode and input_ctrl is not None and abs(steer_offset_px) > 4:
             try:
                 if hasattr(input_ctrl, "get_cursor_position") and hasattr(
@@ -776,88 +1126,245 @@ class GlideWaypointController:
         _record_step(
             "align_cliff_edge",
             "aligned_to_cliff_heading",
-            {"target_heading_deg": heading, "steer_offset_px": steer_offset_px},
+            {
+                "target_heading_deg": heading,
+                "current_heading_deg": current_heading_deg,
+                "heading_delta_deg": heading_delta_deg,
+                "steer_offset_px": steer_offset_px,
+            },
         )
 
-        # Adım 2: Uçurum kenarına ileri depar (W basılı tutma)
-        if not test_mode and input_ctrl is not None:
-            if hasattr(input_ctrl, "_hw_key_down"):
-                input_ctrl._hw_key_down("w")
-            elif hasattr(input_ctrl, "press_key"):
-                input_ctrl.press_key("w", min_hold=0.15, max_hold=0.22)
-            time.sleep(self.sprint_lead_sec)
-        _record_step(
-            "sprint_forward",
-            "key_down('w')",
-            {"sprint_lead_sec": self.sprint_lead_sec},
-        )
-
-        # Adım 3: Uçurum kenarından sıçrama (İlk Space)
-        if not test_mode and input_ctrl is not None and hasattr(input_ctrl, "press_key"):
-            input_ctrl.press_key("space", min_hold=0.045, max_hold=0.075)
-        _record_step("jump_off_ledge", "press_key('space') [jump]")
-
-        # Adım 4: Sıçrama tepe noktası (Apex = 0.35s) beklemesi ve Kanat Açma (İkinci Space)
-        if not test_mode:
-            time.sleep(self.apex_delay_sec)
-            if input_ctrl is not None and hasattr(input_ctrl, "press_key"):
-                input_ctrl.press_key("space", min_hold=0.045, max_hold=0.075)
-        _record_step(
-            "deploy_wings_apex",
-            "press_key('space') [wings_deployed_after_0.35s]",
-            {"apex_delay_sec": self.apex_delay_sec},
-        )
-
-        # Adım 5: Havada süzülme, irtifa/pitch koruma ve mikro yön düzeltmeleri
-        glide_segments = max(2, min(6, int(round(duration))))
-        segment_sleep = duration / float(glide_segments)
-        for seg_idx in range(glide_segments):
-            if not test_mode:
-                time.sleep(segment_sleep)
+        # Adım 2-6: W tutuşu try/finally güvencesinde (F-1817) — manevra
+        # iptal edilirse/çökerse bile W bırakılır.
+        w_held = False
+        w_hold_method: Optional[str] = None
+        wings_deployed = False
+        cancelled = False
+        # P1-11: W/sıçrama/kanat gönderim başarısızlığında manevra durur.
+        aborted = False
+        abort_reason: Optional[str] = None
+        try:
+            # Adım 2: Uçurum kenarına ileri depar (W basılı tutma)
+            # P1-11: W tutuşu/tap'i başarısızsa manevra DURUR — W'suz
+            # depar yok, uçurum kenarına varılmadan sıçranmaz.
+            if not test_mode and input_ctrl is not None:
+                if hasattr(input_ctrl, "_hw_key_down"):
+                    try:
+                        w_held = bool(input_ctrl._hw_key_down("w"))
+                    except Exception as exc:
+                        logger.warning("Glide W tutuşu başarısız: %s", exc)
+                        w_held = False
+                    if w_held:
+                        w_hold_method = "hw_key_down"
+                    else:
+                        w_hold_method = "hw_key_down_failed"
+                        aborted = True
+                        abort_reason = "w_hold_failed"
+                elif hasattr(input_ctrl, "press_key"):
+                    # press_key bas-bırak yapar; tutuş değildir — tap olarak kaydet.
+                    tap_result = input_ctrl.press_key("w", min_hold=0.15, max_hold=0.22)
+                    if isinstance(tap_result, (int, float)) and tap_result <= 0.0:
+                        logger.warning("Glide W tap gönderilemedi (press_key 0.0 döndü).")
+                        aborted = True
+                        abort_reason = "w_tap_failed"
+                    w_hold_method = "press_key_tap"
+                else:
+                    # W gönderecek yöntem yok — ileri momentum imkânsız.
+                    logger.warning("Glide W gönderilemedi: girdi denetleyicisinde W yöntemi yok.")
+                    aborted = True
+                    abort_reason = "no_w_dispatch_method"
+                if not aborted:
+                    time.sleep(self.sprint_lead_sec)
             _record_step(
-                "aerial_glide_hold",
-                f"maintaining_pitch_and_heading_segment_{seg_idx + 1}/{glide_segments}",
-                {
-                    "segment": seg_idx + 1,
-                    "planned_segment_sec": round(segment_sleep, 3),
-                },
+                "sprint_forward",
+                "key_down('w')" if w_held else "key_tap_or_simulated('w')",
+                {"sprint_lead_sec": self.sprint_lead_sec, "w_held": w_held, "w_hold_method": w_hold_method},
             )
 
-        # Adım 6: Hedef kaynak üzerinde kanatları kapatma (Space) ve ileri tuşunu (W) bırakma
-        if not test_mode and input_ctrl is not None:
-            if hasattr(input_ctrl, "press_key"):
-                input_ctrl.press_key("space", min_hold=0.045, max_hold=0.075)
-            if hasattr(input_ctrl, "_hw_key_up"):
-                input_ctrl._hw_key_up("w")
-        _record_step(
-            "fold_wings_and_land",
-            "press_key('space') [fold_wings] + key_up('w') [land_at_node]",
-        )
+            # Adım 3: Uçurum kenarından sıçrama (İlk Space)
+            # P1-11: sıçrama gönderilemezse manevra DURUR.
+            if not aborted and not test_mode and input_ctrl is not None:
+                if hasattr(input_ctrl, "press_key"):
+                    jump_result = input_ctrl.press_key("space", min_hold=0.045, max_hold=0.075)
+                    if isinstance(jump_result, (int, float)) and jump_result <= 0.0:
+                        logger.warning("Glide sıçrama Space gönderilemedi (press_key 0.0 döndü).")
+                        aborted = True
+                        abort_reason = "jump_failed"
+                else:
+                    logger.warning("Glide sıçrama gönderilemedi: press_key yok.")
+                    aborted = True
+                    abort_reason = "jump_no_press_key"
+            _record_step(
+                "jump_off_ledge",
+                "press_key('space') [jump]" if not aborted else "aborted: jump not dispatched",
+                {"abort_reason": abort_reason} if aborted else None,
+            )
+
+            # Adım 4: Sıçrama tepe noktası (Apex = 0.35s) beklemesi ve Kanat Açma (İkinci Space)
+            # P1-11: kanat açma Space'i gönderilemezse manevra DURUR —
+            # kanatsız süzülme yoktur, başarı sayılmaz.
+            if not aborted and not test_mode:
+                time.sleep(self.apex_delay_sec)
+                if input_ctrl is not None and hasattr(input_ctrl, "press_key"):
+                    wings_result = input_ctrl.press_key("space", min_hold=0.045, max_hold=0.075)
+                    if isinstance(wings_result, (int, float)) and wings_result <= 0.0:
+                        logger.warning("Glide kanat açma Space gönderilemedi (press_key 0.0 döndü).")
+                        aborted = True
+                        abort_reason = "wings_deploy_failed"
+                    else:
+                        wings_deployed = True
+                else:
+                    logger.warning("Glide kanat açma gönderilemedi: press_key yok.")
+                    aborted = True
+                    abort_reason = "wings_no_press_key"
+            elif not aborted:
+                wings_deployed = True  # simülasyon
+            _record_step(
+                "deploy_wings_apex",
+                "press_key('space') [wings_deployed_after_0.35s]",
+                {"apex_delay_sec": self.apex_delay_sec, "wings_deployed": wings_deployed},
+            )
+
+            # Adım 5: Havada süzülme, irtifa/pitch koruma ve mikro yön düzeltmeleri
+            # F-1829: Bu adım artık gerçekten W tutuşunu korur (canlıda) ve
+            # iptal bayrağını her dilimde kontrol eder; girdi gönderilmeden
+            # "irtifa koruyor" kaydedilmez.
+            glide_segments = max(2, min(6, int(round(duration))))
+            segment_sleep = duration / float(glide_segments)
+            for seg_idx in range(glide_segments):
+                # P1-11: W/sıçrama/kanat başarısızlığında süzülme
+                # dilimlerine girilmez — manevra durduruldu.
+                if aborted:
+                    _record_step(
+                        "aerial_glide_hold",
+                        "aborted_before_glide_hold",
+                        {"segment": seg_idx + 1, "abort_reason": abort_reason},
+                    )
+                    break
+                if cancel_event is not None:
+                    try:
+                        if bool(cancel_event.is_set()):
+                            cancelled = True
+                            _record_step(
+                                "aerial_glide_hold",
+                                "cancelled_by_cancel_event",
+                                {"segment": seg_idx + 1},
+                            )
+                            break
+                    except Exception:
+                        pass
+                if not test_mode:
+                    time.sleep(segment_sleep)
+                _record_step(
+                    "aerial_glide_hold",
+                    (
+                        "maintaining_pitch_and_heading_segment_%d/%d (w_held=%s)"
+                        % (seg_idx + 1, glide_segments, w_held)
+                        if not test_mode
+                        else "simulated_pitch_and_heading_segment_%d/%d" % (seg_idx + 1, glide_segments)
+                    ),
+                    {
+                        "segment": seg_idx + 1,
+                        "planned_segment_sec": round(segment_sleep, 3),
+                        "w_held": w_held,
+                        "input_sent": bool(not test_mode and w_held),
+                    },
+                )
+                if cancelled:
+                    break
+
+            # Adım 6: Hedef kaynak üzerinde kanatları kapatma (Space) ve ileri tuşunu (W) bırakma
+            # P1-11: durdurulan manevrada iniş adımı da çalışmaz.
+            if not cancelled and not aborted:
+                if not test_mode and input_ctrl is not None:
+                    if hasattr(input_ctrl, "press_key"):
+                        fold_result = input_ctrl.press_key("space", min_hold=0.045, max_hold=0.075)
+                        if isinstance(fold_result, (int, float)) and fold_result <= 0.0:
+                            logger.warning("Glide kanat kapatma Space gönderilemedi (press_key 0.0 döndü).")
+                _record_step(
+                    "fold_wings_and_land",
+                    "press_key('space') [fold_wings] + key_up('w') [land_at_node]",
+                )
+        finally:
+            # F-1817: W tutulduysa her durumda bırak (iptal/hata dahil).
+            if w_held and input_ctrl is not None and hasattr(input_ctrl, "_hw_key_up"):
+                try:
+                    input_ctrl._hw_key_up("w")
+                except Exception as exc:
+                    logger.warning("Glide W bırakma hatası: %s", exc)
+                w_held = False
 
         elapsed_total = round(time.perf_counter() - t_start, 4)
         logger.info(
-            "[GlideController] Süzülme manevrası tamamlandı (Adım sayısı: %d, Süre: %.3fs).",
+            "[GlideController] Süzülme manevrası tamamlandı (Adım sayısı: %d, Süre: %.3fs, iptal=%s, durdurma=%s).",
             len(timeline_events),
             elapsed_total,
+            cancelled,
+            abort_reason,
         )
 
         return {
-            "success": True,
+            # F-1815/F-1829: Başarı yalnızca manevra gerçekten yürütülüp
+            # iptal edilmediyse; P1-11: W/sıçrama/kanat gönderim
+            # başarısızlığı da manevrayı durdurur (success=False).
+            # İniş doğrulanamadığı için landed_at_target her zaman False
+            # + landing_verified=False (doğrulama yok).
+            "success": bool(not cancelled and not aborted),
             "maneuver": "cliff_jump_glide",
             "target_heading_deg": heading,
             "planned_glide_duration_sec": duration,
             "apex_deploy_delay_sec": self.apex_delay_sec,
-            "wings_deployed": True,
-            "landed_at_target": True,
+            "wings_deployed": bool(wings_deployed),
+            "landed_at_target": False,
+            "landing_verified": False,
+            "cancelled": bool(cancelled),
+            "reason": abort_reason,
             "test_mode": bool(test_mode),
+            "simulated": bool(test_mode),
             "execution_elapsed_sec": elapsed_total,
             "timeline": timeline_events,
         }
 
+    def _probe_glide_readiness(self) -> Dict[str, Any]:
+        """
+        S-0602: Gerçek hazır probu — eşik sağlığı + sentetik glide kararı
+        ölçülür, sabit True döndürülmez (Karar 3: proba bağlama).
+        Pozitif kontrol: yüksek->alçak sentetik çift glide olmalı;
+        negatif kontrol: düz (eş yükseltili) çift glide olmamalı.
+        """
+        checks: Dict[str, Any] = {}
+        try:
+            checks["thresholds_sane"] = bool(
+                self.min_elevation_drop > 0
+                and self.min_horizontal_dist > 0
+                and self.max_horizontal_dist > self.min_horizontal_dist
+                and self.apex_delay_sec >= 0
+                and self.sprint_lead_sec >= 0
+            )
+            high = {"x": 0.0, "y": 0.0, "elevation": 100.0}
+            low = {"x": 100.0, "y": 0.0, "elevation": 50.0}
+            checks["synthetic_glide_decision"] = bool(self.should_use_glide(high, low))
+            flat = {"x": 100.0, "y": 0.0, "elevation": 100.0}
+            checks["flat_pair_rejected"] = not bool(self.should_use_glide(high, flat))
+            params = self.estimate_glide_parameters(high, low)
+            checks["glide_estimate_sane"] = bool(
+                params.get("should_glide")
+                and params.get("glide_duration_sec") is not None
+                and 0 < float(params["glide_duration_sec"]) <= 8.5
+                and float(params.get("estimated_time_saved_sec") or 0) > 0
+            )
+        except Exception as exc:
+            checks["error"] = str(exc)
+        checks["passed"] = bool(checks.get("thresholds_sane")) and all(
+            bool(v) for k, v in checks.items() if k not in ("error", "passed")
+        )
+        return checks
+
     def get_navigator_telemetry_summary(self) -> dict:
         """Returns a telemetry summary of the navigator state and stats safely."""
         summary = {
-            "navigator_ready": True,
+            # S-0602: Sabit True yok — bu örneğin gerçek prob sonucu.
+            "navigator_ready": bool(self._probe_glide_readiness().get("passed", False)),
             "glide_enabled": True,
         }
         try:
@@ -872,92 +1379,227 @@ class GlideWaypointController:
 
     def get_depth_glide_health_summary(self) -> dict:
         try:
-            return {"depth_glide_ready": True}
+            # S-0602: Sabit True yok — bu örneğin gerçek prob sonucu.
+            return {"depth_glide_ready": bool(self._probe_glide_readiness().get("passed", False))}
         except Exception:
             return {"depth_glide_ready": False}
 
+    def _config_valid(self) -> bool:
+        """Yapılandırma tutarlılığı: eşikler pozitif ve mesafe aralığı sıralı."""
+        try:
+            return bool(
+                self.min_elevation_drop > 0.0
+                and 0.0 < self.min_horizontal_dist < self.max_horizontal_dist
+                and self.apex_delay_sec > 0.0
+                and self.sprint_lead_sec >= 0.0
+            )
+        except Exception:
+            return False
+
+    def _glide_not_ready_status(self) -> str:
+        """Hazır-olmama ayrımı (R04 S-0602 + D10 — iki testin de pinlediği
+        girdiler korunur):
+
+        - "misconfigured": mesafe aralığı kendi içinde çelişkili
+          (min_horizontal_dist >= max_horizontal_dist) — hiçbir girdi
+          aralığı sağlayamaz; D10 bunu pinler
+          (test_glide_ready_flag_rejects_misconfigured_thresholds).
+        - "not_ready": eşikler dejenere (pozitif olmayan düşüş/mesafe,
+          pozitif olmayan apex gecikmesi) — gerçek bir glide tarif
+          edilemez; R04/S-0602 bunu pinler
+          (test_degenerate_thresholds_report_not_ready, örn.
+          min_elevation_drop=-5.0).
+        """
+        if self.min_horizontal_dist >= self.max_horizontal_dist:
+            return "misconfigured"
+        return "not_ready"
+
     def get_depth_glide_navigator_ready_flag(self) -> dict:
-        return {"module": "depth_glide_navigator", "ready": True}
+        # S-0602 + D10: Sabit True yok — gerçek prob zinciri VE eşik/mesafe
+        # yapılandırma tutarlılığı ikisi de geçmeli.
+        probe_ready = bool(self._probe_glide_readiness().get("passed", False))
+        config_ready = self._config_valid()
+        ready = probe_ready and config_ready
+        status = (
+            "ok"
+            if ready
+            else (self._glide_not_ready_status() if not config_ready else "not_ready")
+        )
+        return {
+            "module": "depth_glide_navigator",
+            "ready": ready,
+            "status": status,
+            "min_elevation_drop": self.min_elevation_drop,
+            "min_horizontal_dist": self.min_horizontal_dist,
+            "max_horizontal_dist": self.max_horizontal_dist,
+        }
 
     def get_depth_glide_navigator_version_info(self) -> dict:
-        return {"module": "depth_glide_navigator", "version": "2.0.0", "ready": True}
+        ready = bool(self._probe_glide_readiness().get("passed", False)) and self._config_valid()
+        return {"module": "depth_glide_navigator", "version": __version__, "ready": ready}
 
     def get_depth_glide_navigator_diagnostic_snapshot(self) -> dict:
-        return {"module": "depth_glide_navigator", "status": "ok", "ready": True}
+        probe_ready = bool(self._probe_glide_readiness().get("passed", False))
+        config_ready = self._config_valid()
+        ready = probe_ready and config_ready
+        status = (
+            "ok"
+            if ready
+            else (self._glide_not_ready_status() if not config_ready else "not_ready")
+        )
+        return {"module": "depth_glide_navigator", "status": status, "ready": ready}
 
 
 def get_depth_glide_navigator_capabilities() -> list:
     return ["depth_glide_navigator", "vertical_glide_control", "diagnostic_snapshot"]
 
 
+def _run_depth_glide_navigator_contract_checks() -> dict:
+    """
+    S-0602: 'hazır/audit/certified' zinciri artık gerçek ölçüm yapar —
+    varsayılan GlideWaypointController üzerinde eşik + sentetik glide
+    kararı probu çalıştırılır (sabit True / boş-olmayan liste yok).
+    """
+    checks: Dict[str, Any] = {}
+    try:
+        checks["capabilities_present"] = bool(get_depth_glide_navigator_capabilities())
+        probe = GlideWaypointController()._probe_glide_readiness()
+        for key, value in probe.items():
+            if key != "passed":
+                checks["glide_" + key] = value
+        checks["passed"] = bool(checks["capabilities_present"]) and bool(probe.get("passed", False))
+    except Exception as exc:
+        checks["error"] = str(exc)
+        checks["passed"] = False
+    return checks
+
+
 def validate_depth_glide_navigator_contract() -> bool:
-    return bool(get_depth_glide_navigator_capabilities())
+    """Gerçek prob: sınıflar kurulur, tahminci sentetik karede çalışır, glide mantığı cevap verir.
+
+    D10: önceden yalnızca yetenek listesinin boş olmadığını döndürüyordu
+    (totoloji — liste sabitti, her zaman True). Artık kurulum + çıkarım +
+    glide kararı gerçekten denenir; herhangi biri başarısız olursa False.
+    S-0602 zinciri de ayrıca çalışır (yetenekler + GlideWaypointController probu).
+    """
+    contract_ok = bool(_run_depth_glide_navigator_contract_checks().get("passed", False))
+    d10_ok = _validate_depth_glide_d10_probe()
+    return bool(contract_ok and d10_ok)
 
 
-def get_depth_glide_navigator_baseline_metrics() -> dict:
-    return {"module": "depth_glide_navigator", "contract_valid": validate_depth_glide_navigator_contract(), "capability_count": len(get_depth_glide_navigator_capabilities())}
+def _validate_depth_glide_d10_probe() -> bool:
+    """D10 inline probu: sentetik karede derinlik çıkarımı + glide kararı pozitif/negatif kontrol."""
+    try:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            nav = MonocularDepthObstacleAvoidance(model_dir=tmp, work_size=(64, 36))
+            depth = nav.estimate_depth_map(np.zeros((72, 128, 3), dtype=np.uint8))
+            if depth.shape != (36, 64) or depth.dtype != np.float32:
+                return False
+            if not bool(np.all((depth >= 0.0) & (depth <= 1.0))):
+                return False
+        ctrl = GlideWaypointController()
+        if not ctrl.should_use_glide(
+            {"x": 0.0, "y": 0.0, "elevation": 100.0},
+            {"x": 100.0, "y": 0.0, "elevation": 50.0},
+        ):
+            return False
+        if ctrl.should_use_glide(
+            {"x": 0.0, "y": 0.0, "elevation": 50.0},
+            {"x": 100.0, "y": 0.0, "elevation": 50.0},
+        ):
+            return False
+        return True
+    except Exception:
+        return False
 
 
-def get_depth_glide_navigator_readiness_status() -> dict:
+def _depth_glide_navigator_contract_ok(_contract_ok: Optional[bool] = None) -> bool:
+    """P2-1: zincir ici tek dogrulama (bkz. telemetry.py'deki aciklama).
+
+    ``validate_depth_glide_navigator_contract()`` her cagrida iki agir
+    prob kosar: GlideWaypointController sentetik probu +
+    ``_validate_depth_glide_d10_probe`` (gecici dizin + MonocularDepth
+    kurulumu + sentetik cikarim + glide karari). Zincir bunu ust duzey
+    okuma basina bir kez yapar. Cagrilar arasi onbellek yoktur.
+    """
+    if _contract_ok is not None:
+        return bool(_contract_ok)
+    return bool(validate_depth_glide_navigator_contract())
+
+
+def get_depth_glide_navigator_baseline_metrics(_contract_ok: Optional[bool] = None) -> dict:
+    return {"module": "depth_glide_navigator", "contract_valid": _depth_glide_navigator_contract_ok(_contract_ok), "capability_count": len(get_depth_glide_navigator_capabilities())}
+
+
+def get_depth_glide_navigator_readiness_status(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _depth_glide_navigator_contract_ok(_contract_ok)
     return {
         "module": "depth_glide_navigator",
-        "ready": validate_depth_glide_navigator_contract(),
-        "metrics": get_depth_glide_navigator_baseline_metrics(),
+        "ready": ok,
+        "metrics": get_depth_glide_navigator_baseline_metrics(_contract_ok=ok),
     }
 
 
-def get_depth_glide_navigator_audit_record() -> dict:
+def get_depth_glide_navigator_audit_record(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _depth_glide_navigator_contract_ok(_contract_ok)
     return {
         "module": "depth_glide_navigator",
-        "audit_passed": validate_depth_glide_navigator_contract(),
-        "readiness": get_depth_glide_navigator_readiness_status(),
+        "audit_passed": ok,
+        "readiness": get_depth_glide_navigator_readiness_status(_contract_ok=ok),
     }
 
 
-def get_depth_glide_navigator_operational_digest() -> dict:
+def get_depth_glide_navigator_operational_digest(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _depth_glide_navigator_contract_ok(_contract_ok)
     return {
         "module": "depth_glide_navigator",
-        "operational": validate_depth_glide_navigator_contract(),
-        "audit": get_depth_glide_navigator_audit_record(),
+        "operational": ok,
+        "audit": get_depth_glide_navigator_audit_record(_contract_ok=ok),
     }
 
 
-def get_depth_glide_navigator_telemetry_payload() -> dict:
+def get_depth_glide_navigator_telemetry_payload(_contract_ok: Optional[bool] = None) -> dict:
     return {
         "module": "depth_glide_navigator",
-        "payload": get_depth_glide_navigator_operational_digest(),
+        "payload": get_depth_glide_navigator_operational_digest(_contract_ok=_contract_ok),
     }
 
 
-def get_depth_glide_navigator_integrity_seal() -> dict:
+def get_depth_glide_navigator_integrity_seal(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _depth_glide_navigator_contract_ok(_contract_ok)
     return {
         "module": "depth_glide_navigator",
-        "sealed": validate_depth_glide_navigator_contract(),
-        "telemetry": get_depth_glide_navigator_telemetry_payload(),
+        "sealed": ok,
+        "telemetry": get_depth_glide_navigator_telemetry_payload(_contract_ok=ok),
     }
 
 
-def get_depth_glide_navigator_compliance_certificate() -> dict:
+def get_depth_glide_navigator_compliance_certificate(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _depth_glide_navigator_contract_ok(_contract_ok)
     return {
         "module": "depth_glide_navigator",
-        "certified": validate_depth_glide_navigator_contract(),
-        "seal": get_depth_glide_navigator_integrity_seal(),
+        "certified": ok,
+        "seal": get_depth_glide_navigator_integrity_seal(_contract_ok=ok),
     }
 
 
-def get_depth_glide_navigator_readiness_probe() -> dict:
+def get_depth_glide_navigator_readiness_probe(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _depth_glide_navigator_contract_ok(_contract_ok)
     return {
         "module": "depth_glide_navigator",
-        "ready": validate_depth_glide_navigator_contract(),
-        "certificate": get_depth_glide_navigator_compliance_certificate(),
+        "ready": ok,
+        "certificate": get_depth_glide_navigator_compliance_certificate(_contract_ok=ok),
     }
 
 
-def get_depth_glide_navigator_audit_summary() -> dict:
+def get_depth_glide_navigator_audit_summary(_contract_ok: Optional[bool] = None) -> dict:
+    ok = _depth_glide_navigator_contract_ok(_contract_ok)
     return {
         "module": "depth_glide_navigator",
-        "audit_passed": validate_depth_glide_navigator_contract(),
-        "probe": get_depth_glide_navigator_readiness_probe(),
+        "audit_passed": ok,
+        "probe": get_depth_glide_navigator_readiness_probe(_contract_ok=ok),
     }
 
 

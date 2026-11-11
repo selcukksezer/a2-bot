@@ -26,7 +26,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from typing import Any, Dict, List
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -43,6 +44,26 @@ if _app is None:
 from ui.yolo_factory_dialog import YOLOFactoryDialog, YOLOPreviewCanvas
 
 
+@contextmanager
+def _counting_process_events() -> Iterator[Dict[str, int]]:
+    """Count QApplication.processEvents calls inside the block.
+
+    Both bulk tests spied on processEvents with an identical closure
+    (~11 lines each). One shared helper keeps the yield-count assertions
+    while removing the duplication; the counter dict is yielded so the
+    tests read ``counter["calls"]`` after the block.
+    """
+    counter = {"calls": 0}
+    orig_process_events = QApplication.processEvents
+
+    def counted_process_events(*args: object, **kwargs: object) -> object:
+        counter["calls"] += 1
+        return orig_process_events(*args, **kwargs)
+
+    with patch.object(QApplication, "processEvents", side_effect=counted_process_events):
+        yield counter
+
+
 @pytest.fixture
 def factory_dialog(tmp_path: Path) -> YOLOFactoryDialog:
     """Fixture providing an initialized YOLOFactoryDialog in Step 2 with test dataset directory."""
@@ -57,7 +78,38 @@ def factory_dialog(tmp_path: Path) -> YOLOFactoryDialog:
     (tmp_path / "images" / "train").mkdir(parents=True, exist_ok=True)
     (tmp_path / "previews").mkdir(parents=True, exist_ok=True)
     dlg._go_step(2)
+    # [YOLO-ASYNC] Adım 2 kuyruğu worker'da dolar; test gövdesi kuyruğu
+    # senkron okumadan önce yüklemenin bitmesini bekle, sonra tmp_path
+    # taramasını senkron tazele (başlangıç yüklemesi üretim dizinini
+    # taramış olabilir — _go_step isteği düşmüşse kuyruk üretim verisi kalır).
+    assert dlg.wait_for_yolo_load(), "async kuyruk yüklemesi 10 sn'de bitmedi"
+    dlg._reload_review_queue()
     return dlg
+
+
+def _box(confidence: float, class_id: int, bbox: List[float] | None = None) -> Dict[str, Any]:
+    """One fixture box in the canonical cx/cy schema (B-04).
+
+    ``bbox`` is [x1, y1, x2, y2] on a 100px canvas (all fixture corners
+    are <= 95); the normalizer only accepts normalized cx/cy/w/h, so a
+    bbox-only (or geometry-less) box is rejected as "cx eksik" and can
+    never persist. Boxes without a bbox get a centered default geometry.
+    The ``bbox`` key is kept for traceability; persist reads cx/cy/w/h.
+    """
+    box: Dict[str, Any] = {"confidence": confidence, "class_id": class_id}
+    if bbox is not None:
+        x1, y1, x2, y2 = (float(v) for v in bbox)
+        box["bbox"] = [x1, y1, x2, y2]
+        box["cx"] = round((x1 + x2) / 200.0, 6)
+        box["cy"] = round((y1 + y2) / 200.0, 6)
+        box["w"] = round((x2 - x1) / 100.0, 6)
+        box["h"] = round((y2 - y1) / 100.0, 6)
+    else:
+        box["cx"] = 0.5
+        box["cy"] = 0.5
+        box["w"] = 0.2
+        box["h"] = 0.2
+    return box
 
 
 def _make_dummy_sample(
@@ -72,8 +124,18 @@ def _make_dummy_sample(
     trusted_boxes = trusted if trusted is not None else []
     json_path = tmp_path / "review" / split / f"{stem}.json"
     json_path.write_text("{}", encoding="utf-8")
+    # A REAL decodable PNG (not dummy bytes no decoder ever reads):
+    # the preview canvas only forms its annotations from a decodable
+    # image, and single approve promotes weak->trusted through those
+    # canvas annotations — with dummy bytes the canvas stays empty and
+    # approve can never yield done="ok" with a promoted box.
+    import cv2
+    import numpy as np
+
     img_path = tmp_path / "images" / split / f"{stem}.png"
-    img_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    assert cv2.imwrite(str(img_path), np.full((200, 200, 3), (60, 120, 180), dtype=np.uint8))
+    decoded = cv2.imread(str(img_path))
+    assert decoded is not None and decoded.shape == (200, 200, 3)
     lbl_path = tmp_path / "labels" / split / f"{stem}.txt"
     lbl_path.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
 
@@ -110,8 +172,8 @@ def test_shortcuts_exist_and_alias_coverage(factory_dialog: YOLOFactoryDialog):
 def test_approve_shortcut_a_advances_queue(factory_dialog: YOLOFactoryDialog, tmp_path: Path):
     """Pressing 'A' approves the current item, promotes weak boxes, and advances review index."""
     dlg = factory_dialog
-    item0 = _make_dummy_sample(tmp_path, "frame_001", weak=[{"confidence": 0.65, "class_id": 0, "bbox": [10, 10, 50, 50]}])
-    item1 = _make_dummy_sample(tmp_path, "frame_002", weak=[{"confidence": 0.55, "class_id": 1, "bbox": [20, 20, 60, 60]}])
+    item0 = _make_dummy_sample(tmp_path, "frame_001", weak=[_box(0.65, 0, [10, 10, 50, 50])])
+    item1 = _make_dummy_sample(tmp_path, "frame_002", weak=[_box(0.55, 1, [20, 20, 60, 60])])
     dlg._review_items = [item0, item1]
     dlg._review_index = 0
     dlg._render_queue_list()
@@ -145,8 +207,8 @@ def test_approve_shortcut_a_advances_queue(factory_dialog: YOLOFactoryDialog, tm
 def test_reject_shortcut_r_deletes_and_advances(factory_dialog: YOLOFactoryDialog, tmp_path: Path):
     """Pressing 'R' deletes the current item from disk and advances the review queue."""
     dlg = factory_dialog
-    item0 = _make_dummy_sample(tmp_path, "del_001", weak=[{"confidence": 0.40, "class_id": 0}])
-    item1 = _make_dummy_sample(tmp_path, "del_002", weak=[{"confidence": 0.45, "class_id": 1}])
+    item0 = _make_dummy_sample(tmp_path, "del_001", weak=[_box(0.40, 0)])
+    item1 = _make_dummy_sample(tmp_path, "del_002", weak=[_box(0.45, 1)])
     dlg._review_items = [item0, item1]
     dlg._review_index = 0
     dlg._render_queue_list()
@@ -175,7 +237,7 @@ def test_reject_shortcut_r_deletes_and_advances(factory_dialog: YOLOFactoryDialo
 def test_text_input_focus_guard_prevents_shortcuts(factory_dialog: YOLOFactoryDialog, tmp_path: Path):
     """When a text entry widget (such as edit_search) has keyboard focus, pressing 'A' or 'R' types text and does NOT trigger review actions."""
     dlg = factory_dialog
-    item0 = _make_dummy_sample(tmp_path, "guard_001", weak=[{"confidence": 0.50, "class_id": 0}])
+    item0 = _make_dummy_sample(tmp_path, "guard_001", weak=[_box(0.50, 0)])
     dlg._review_items = [item0]
     dlg._review_index = 0
     dlg._render_queue_list()
@@ -208,38 +270,55 @@ def test_text_input_focus_guard_prevents_shortcuts(factory_dialog: YOLOFactoryDi
     assert dlg._is_text_input_focused() is False
 
 
-def test_live_window_shortcuts_trigger_actions(factory_dialog: YOLOFactoryDialog):
-    """Verify that pressing 'A', 'R', 'S' in a live window triggers handlers and is never ambiguous."""
+def test_live_window_shortcuts_trigger_actions(factory_dialog: YOLOFactoryDialog, tmp_path: Path):
+    """Verify that pressing 'A', 'R', 'S' in a live window triggers the
+    REAL review actions (no mocked handlers) and is never ambiguous.
+
+    'A' approves the current item for real (done="ok", item leaves the
+    queue), 'R' rejects it for real (files deleted from disk, item leaves
+    the queue), 'S' skips to the next item for real (index advances, the
+    skipped item stays unapproved).
+    """
     dlg = factory_dialog
     dlg.show()
     QApplication.processEvents()
     assert dlg._is_step_2_active()
 
-    called_actions = []
-    with patch.object(dlg, "_on_step2_approve", side_effect=lambda: called_actions.append("approve")), \
-         patch.object(dlg, "_on_step2_reject", side_effect=lambda: called_actions.append("reject")), \
-         patch.object(dlg, "_review_skip", side_effect=lambda: called_actions.append("skip")):
+    item_a = _make_dummy_sample(tmp_path, "live_001", weak=[_box(0.65, 0)])
+    item_b = _make_dummy_sample(tmp_path, "live_002", weak=[_box(0.55, 1)])
+    item_c = _make_dummy_sample(tmp_path, "live_003", weak=[_box(0.60, 0)])
+    item_d = _make_dummy_sample(tmp_path, "live_004", weak=[_box(0.60, 1)])
+    dlg._review_items = [item_a, item_b, item_c, item_d]
+    dlg._review_index = 0
+    dlg._render_queue_list()
 
-        # Test when btn_approve has focus
-        dlg.btn_approve.setFocus()
-        QApplication.processEvents()
-        QTest.keyPress(dlg.btn_approve, Qt.Key.Key_A)
-        QApplication.processEvents()
-        assert "approve" in called_actions
+    # 'A' when btn_approve has focus: real approve of live_001
+    dlg.btn_approve.setFocus()
+    QApplication.processEvents()
+    QTest.keyPress(dlg.btn_approve, Qt.Key.Key_A)
+    QApplication.processEvents()
+    assert item_a["done"] == "ok"
+    assert [it["stem"] for it in dlg._review_items] == ["live_002", "live_003", "live_004"]
+    assert dlg._review_index == 0
 
-        # Test 'R' when queue_list has focus
-        dlg.queue_list.setFocus()
-        QApplication.processEvents()
-        QTest.keyPress(dlg.queue_list, Qt.Key.Key_R)
-        QApplication.processEvents()
-        assert "reject" in called_actions
+    # 'R' when queue_list has focus: real reject of live_002 (files deleted)
+    dlg.queue_list.setFocus()
+    QApplication.processEvents()
+    QTest.keyPress(dlg.queue_list, Qt.Key.Key_R)
+    QApplication.processEvents()
+    assert not (tmp_path / "images" / "train" / "live_002.png").exists()
+    assert not (tmp_path / "review" / "train" / "live_002.json").exists()
+    assert [it["stem"] for it in dlg._review_items] == ["live_003", "live_004"]
+    assert dlg._review_index == 0
 
-        # Test 'S' when review_preview has focus
-        dlg.review_preview.setFocus()
-        QApplication.processEvents()
-        QTest.keyPress(dlg.review_preview, Qt.Key.Key_S)
-        QApplication.processEvents()
-        assert "skip" in called_actions
+    # 'S' when review_preview has focus: real skip to live_004
+    dlg.review_preview.setFocus()
+    QApplication.processEvents()
+    QTest.keyPress(dlg.review_preview, Qt.Key.Key_S)
+    QApplication.processEvents()
+    assert dlg._review_index == 1
+    assert dlg._review_items[dlg._review_index]["stem"] == "live_004"
+    assert item_c["done"] is None, "Skipped item must stay unapproved"
 
 
 # ============================================================================
@@ -263,7 +342,7 @@ def test_bulk_reject_batching_responsiveness_and_isolation(factory_dialog: YOLOF
         items.append(_make_dummy_sample(tmp_path, f"bulk_empty_{i:03d}", weak=[], trusted=[]))
     # 10 confident items
     for i in range(total_confident):
-        items.append(_make_dummy_sample(tmp_path, f"bulk_conf_{i:03d}", weak=[], trusted=[{"confidence": 0.95, "class_id": 3}]))
+        items.append(_make_dummy_sample(tmp_path, f"bulk_conf_{i:03d}", weak=[], trusted=[_box(0.95, 3)]))
 
     dlg._review_items = items
     dlg.set_queue_filter_mode("empty")
@@ -271,19 +350,16 @@ def test_bulk_reject_batching_responsiveness_and_isolation(factory_dialog: YOLOF
     assert len(filtered) == total_empty
 
     # Spy on QApplication.processEvents to verify non-blocking yielding
-    process_events_calls = 0
-    orig_process_events = QApplication.processEvents
-
-    def counted_process_events(*args, **kwargs):
-        nonlocal process_events_calls
-        process_events_calls += 1
-        return orig_process_events(*args, **kwargs)
-
-    with patch.object(QApplication, "processEvents", side_effect=counted_process_events):
+    with _counting_process_events() as counter:
         dlg._bulk_reject_filtered()
+    process_events_calls = counter["calls"]
 
-    # processEvents should have been called multiple times (every 15 items + completion)
-    assert process_events_calls >= (total_empty // 15)
+    # processEvents must yield at least once per 15-item chunk (plus the
+    # final flush): ceil(50 / 15) == 4. The old `>= total_empty // 15` (= 3)
+    # also passed if the loop yielded only every ~17 items.
+    assert process_events_calls == (total_empty + 14) // 15, (
+        f"Expected one processEvents yield per 15-item chunk (4 for 50 items), got {process_events_calls}"
+    )
 
     # All 50 empty items must be deleted from memory and disk
     remaining_stems = [it["stem"] for it in dlg._review_items]
@@ -313,28 +389,23 @@ def test_bulk_approve_batching_and_responsiveness(factory_dialog: YOLOFactoryDia
     n_items = 35
     items = []
     for i in range(n_items):
-        items.append(_make_dummy_sample(tmp_path, f"susp_{i:03d}", weak=[{"confidence": 0.50, "class_id": 1}]))
+        items.append(_make_dummy_sample(tmp_path, f"susp_{i:03d}", weak=[_box(0.50, 1)]))
 
     dlg._review_items = items
     dlg.set_queue_filter_mode("suspicious")
     assert len(dlg._filtered_review_indices()) == n_items
 
-    process_events_calls = 0
-    orig_process_events = QApplication.processEvents
-
-    def counted_process_events(*args, **kwargs):
-        nonlocal process_events_calls
-        process_events_calls += 1
-        return orig_process_events(*args, **kwargs)
-
-    with patch.object(QApplication, "processEvents", side_effect=counted_process_events):
+    with _counting_process_events() as counter:
         dlg._bulk_approve()
+    process_events_calls = counter["calls"]
 
     assert process_events_calls >= (n_items // 15)
-    # All items should now be approved
-    assert all(it["done"] == "ok" for it in dlg._review_items)
-    assert all(len(it["trusted"]) == 1 for it in dlg._review_items)
-    assert all(len(it["weak"]) == 0 for it in dlg._review_items)
+    # F-0609 [O3]: suspicious-mode bulk approve no longer approves
+    # sub-threshold boxes. All 35 items stay pending: the conf-0.50 weak
+    # boxes are kept (not promoted), nothing is marked done="ok".
+    assert all(it.get("done") is None for it in dlg._review_items)
+    assert all(len(it["trusted"]) == 0 for it in dlg._review_items)
+    assert all(len(it["weak"]) == 1 for it in dlg._review_items)
 
 
 # ============================================================================
@@ -386,25 +457,28 @@ def test_canvas_and_detail_rows_3_tier_color_coding(factory_dialog: YOLOFactoryD
 # ============================================================================
 
 def test_btn_refresh_triggers_forced_dashboard_and_queue_reload(factory_dialog: YOLOFactoryDialog):
-    """Verify that clicking '↻ Yenile' triggers on_refresh_clicked and reloads Step 2 queue."""
+    """Verify that clicking '↻ Yenile' triggers on_refresh_clicked and reloads Step 2 queue.
+
+    [YOLO-ASYNC] Yenile artık senkron `_reload_review_queue` yerine async
+    `_request_queue_reload` yolunu kullanır; mock da o yolu izler.
+    """
     dlg = factory_dialog
     reload_called = False
     refresh_force = None
 
-    orig_reload = dlg._reload_review_queue
     orig_refresh = dlg.refresh_dashboard
 
-    def mock_reload():
+    def mock_reload(*args, **kwargs):
         nonlocal reload_called
         reload_called = True
-        return orig_reload()
+        return True
 
     def mock_refresh(force=False, *args):
         nonlocal refresh_force
         refresh_force = force
         return orig_refresh(force=force, *args)
 
-    with patch.object(dlg, "_reload_review_queue", side_effect=mock_reload):
+    with patch.object(dlg, "_request_queue_reload", side_effect=mock_reload):
         with patch.object(dlg, "refresh_dashboard", side_effect=mock_refresh):
             dlg.btn_refresh.click()
 
@@ -440,7 +514,7 @@ def test_rejected_sample_purged_across_splits_and_persisted(factory_dialog: YOLO
     sample = {
         "stem": stem,
         "split": "train",
-        "weak": [{"confidence": 0.50, "class_id": 0}],
+        "weak": [_box(0.50, 0)],
         "trusted": [],
         "done": None,
         "path": str(tmp_path / "review" / "train" / f"{stem}.json"),

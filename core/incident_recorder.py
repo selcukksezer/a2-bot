@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from version import __version__
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_INCIDENTS_DIR = os.path.join(PROJECT_ROOT, "logs", "incidents")
@@ -47,71 +48,112 @@ logger = logging.getLogger("Gatherion.IncidentRecorder")
 logger.setLevel(logging.INFO)
 
 
-EVENT_METADATA_MAP: Dict[str, Dict[str, Any]] = {
-    "character_dead": {
-        "code": "character_dead",
-        "label_tr": "Ölüm",
-        "badge_tr": "KRİTİK: KARAKTER ÖLDÜ",
-        "color_bgr": (48, 48, 239),  # Crimson red in BGR
-        "severity": "critical",
-    },
-    "ölüm": {
-        "code": "character_dead",
-        "label_tr": "Ölüm",
-        "badge_tr": "KRİTİK: KARAKTER ÖLDÜ",
-        "color_bgr": (48, 48, 239),
-        "severity": "critical",
-    },
-    "death": {
-        "code": "character_dead",
-        "label_tr": "Ölüm",
-        "badge_tr": "KRİTİK: KARAKTER ÖLDÜ",
-        "color_bgr": (48, 48, 239),
-        "severity": "critical",
-    },
-    "stuck": {
-        "code": "stuck",
-        "label_tr": "Takılma",
-        "badge_tr": "UYARI: KARAKTER TAKILDI",
-        "color_bgr": (11, 158, 245),  # Amber in BGR
-        "severity": "warning",
-    },
-    "takılma": {
-        "code": "stuck",
-        "label_tr": "Takılma",
-        "badge_tr": "UYARI: KARAKTER TAKILDI",
-        "color_bgr": (11, 158, 245),
-        "severity": "warning",
-    },
-    "prolonged_combat": {
-        "code": "prolonged_combat",
-        "label_tr": "Uzun Savaş >2dk",
-        "badge_tr": "ALARM: UZUN SAVAŞ (>2 DK)",
-        "color_bgr": (80, 92, 246),  # Red-Orange in BGR
-        "severity": "critical",
-    },
-    "uzun savaş >2dk": {
-        "code": "prolonged_combat",
-        "label_tr": "Uzun Savaş >2dk",
-        "badge_tr": "ALARM: UZUN SAVAŞ (>2 DK)",
-        "color_bgr": (80, 92, 246),
-        "severity": "critical",
-    },
-    "inventory_near_full": {
-        "code": "inventory_near_full",
-        "label_tr": "Envanter %95 Dolu",
-        "badge_tr": "UYARI: ENVANTER %95+ DOLU",
-        "color_bgr": (212, 182, 6),  # Cyan in BGR
-        "severity": "warning",
-    },
-    "manual_snapshot": {
-        "code": "manual_snapshot",
-        "label_tr": "Manuel Ekran Kaydı",
-        "badge_tr": "BİLGİ: MANUEL OLAY KAYDI",
-        "color_bgr": (129, 185, 16),  # Emerald in BGR
-        "severity": "info",
-    },
+_META_CHARACTER_DEAD: Dict[str, Any] = {
+    "code": "character_dead",
+    "label_tr": "Ölüm",
+    "badge_tr": "KRİTİK: KARAKTER ÖLDÜ",
+    "color_bgr": (48, 48, 239),  # Crimson red in BGR
+    "severity": "critical",
 }
+_META_STUCK: Dict[str, Any] = {
+    "code": "stuck",
+    "label_tr": "Takılma",
+    "badge_tr": "UYARI: KARAKTER TAKILDI",
+    "color_bgr": (11, 158, 245),  # Amber in BGR
+    "severity": "warning",
+}
+_META_PROLONGED_COMBAT: Dict[str, Any] = {
+    "code": "prolonged_combat",
+    "label_tr": "Uzun Savaş >2dk",
+    "badge_tr": "ALARM: UZUN SAVAŞ (>2 DK)",
+    "color_bgr": (80, 92, 246),  # Red-Orange in BGR
+    "severity": "critical",
+}
+_META_INVENTORY_NEAR_FULL: Dict[str, Any] = {
+    "code": "inventory_near_full",
+    "label_tr": "Envanter %95 Dolu",
+    "badge_tr": "UYARI: ENVANTER %95+ DOLU",
+    "color_bgr": (212, 182, 6),  # Cyan in BGR
+    "severity": "warning",
+}
+_META_MANUAL_SNAPSHOT: Dict[str, Any] = {
+    "code": "manual_snapshot",
+    "label_tr": "Manuel Ekran Kaydı",
+    "badge_tr": "BİLGİ: MANUEL OLAY KAYDI",
+    "color_bgr": (129, 185, 16),  # Emerald in BGR
+    "severity": "info",
+}
+
+# Aliases share one canonical dict each (same code/label/badge/color/severity);
+# _resolve_event_meta() returns a copy so no caller can mutate the shared entry.
+EVENT_METADATA_MAP: Dict[str, Dict[str, Any]] = {
+    "character_dead": _META_CHARACTER_DEAD,
+    "ölüm": _META_CHARACTER_DEAD,
+    "death": _META_CHARACTER_DEAD,
+    "stuck": _META_STUCK,
+    "takılma": _META_STUCK,
+    "prolonged_combat": _META_PROLONGED_COMBAT,
+    "uzun savaş >2dk": _META_PROLONGED_COMBAT,
+    "inventory_near_full": _META_INVENTORY_NEAR_FULL,
+    "manual_snapshot": _META_MANUAL_SNAPSHOT,
+}
+
+
+def _to_ascii_tr(text: str) -> str:
+    """Fold Turkish letters to ASCII for cv2 Hershey text (no TTF support).
+
+    Single definition of the chain that _annotate_snapshot used to repeat
+    three times inline. Same replacements, same output, same speed
+    (measured: chained replaces beat str.translate for these short strings).
+    """
+    return (
+        str(text)
+        .replace("İ", "I")
+        .replace("ı", "i")
+        .replace("Ş", "S")
+        .replace("ş", "s")
+        .replace("Ğ", "G")
+        .replace("ğ", "g")
+        .replace("Ü", "U")
+        .replace("ü", "u")
+        .replace("Ö", "O")
+        .replace("ö", "o")
+        .replace("Ç", "C")
+        .replace("ç", "c")
+    )
+
+
+def _is_valid_256bit_token(candidate: Any) -> bool:
+    """A 256-bit token is exactly 64 hex characters — nothing shorter counts."""
+    if not isinstance(candidate, str):
+        return False
+    text = candidate.strip()
+    if len(text) != 64:
+        return False
+    try:
+        int(text, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _write_token_file(token_path: str, token: str) -> bool:
+    """Persist the token with owner-only permissions (0o600)."""
+    try:
+        os.makedirs(os.path.dirname(token_path) or ".", exist_ok=True)
+        fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, token.encode("utf-8"))
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(token_path, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+        return True
+    except Exception as exc:
+        logger.debug("256-bit token diske kaydedilemedi: %s", exc)
+        return False
 
 
 class MobileTokenAuthenticator:
@@ -136,39 +178,56 @@ class MobileTokenAuthenticator:
         with self._lock:
             if explicit_token and str(explicit_token).strip():
                 candidate = str(explicit_token).strip()
-                if len(candidate) >= 8:
+                if _is_valid_256bit_token(candidate):
                     return candidate
+                logger.warning(
+                    "Verilen açık token 256-bit (64 hex) değil, yok sayılıyor."
+                )
 
             try:
                 if os.path.isfile(self.token_path):
                     with open(self.token_path, "r", encoding="utf-8") as f:
                         saved = f.read().strip()
-                    if len(saved) >= 32:
+                    if _is_valid_256bit_token(saved):
                         return saved
+                    logger.warning(
+                        "Kayıtlı token 256-bit (64 hex) değil, yenisi üretiliyor."
+                    )
             except Exception as exc:
                 logger.debug("256-bit token dosyası okunamadı: %s", exc)
 
             # Generate a 256-bit (32 bytes = 64 hex chars) cryptographic token
             new_token = secrets.token_hex(32)
-            try:
-                os.makedirs(os.path.dirname(self.token_path), exist_ok=True)
-                with open(self.token_path, "w", encoding="utf-8") as f:
-                    f.write(new_token)
-            except Exception as exc:
-                logger.debug("256-bit token diske kaydedilemedi: %s", exc)
+            _write_token_file(self.token_path, new_token)
             return new_token
 
     def rotate_token(self) -> str:
         """Generates and persists a brand-new 256-bit security key."""
         with self._lock:
             self.token = secrets.token_hex(32)
-            try:
-                os.makedirs(os.path.dirname(self.token_path), exist_ok=True)
-                with open(self.token_path, "w", encoding="utf-8") as f:
-                    f.write(self.token)
-            except Exception as exc:
-                logger.debug("Yeni 256-bit token kaydedilemedi: %s", exc)
+            _write_token_file(self.token_path, self.token)
             return self.token
+
+    def bind_to_mobile_server(self, server: Any) -> bool:
+        """Wire this 256-bit authenticator into a MobileRemoteServer.
+
+        The live HTTP server (core/mobile_server.py) keeps its own token
+        attributes (``access_token`` / ``require_token``); setting them to
+        this authenticator's token is what actually enforces the 256-bit
+        token on HTTP requests. Call once after constructing the server
+        (e.g. in main.py right after ``MobileRemoteServer(...)``).
+        Returns False when the server object has no such attributes.
+        """
+        try:
+            if not hasattr(server, "access_token") or not hasattr(server, "require_token"):
+                logger.error("Mobil sunucuya token bağlanamadı: access_token/require_token yok.")
+                return False
+            server.access_token = self.token
+            server.require_token = True
+            return True
+        except Exception as exc:
+            logger.error("Mobil sunucuya token bağlanamadı: %s", exc)
+            return False
 
     @property
     def token_fingerprint(self) -> str:
@@ -257,9 +316,28 @@ class IncidentRecorder:
         self._lock = threading.RLock()
         self._last_event_ts: Dict[str, float] = {}
         self._incidents: List[Dict[str, Any]] = []
+        # O-3: sessiz kayıp sayaçları (health summary'de görünür).
+        self._skipped_cooldown: int = 0
+        self._skipped_below_threshold: int = 0
+        self._evicted_total: int = 0
+        self._corrupt_manifest_backups: int = 0
+        # Hız sınırlı skip uyarıları: (tür, kod) -> son warning ts.
+        self._last_skip_warn_ts: Dict[str, float] = {}
 
         os.makedirs(self.incidents_dir, exist_ok=True)
         self._load_manifest()
+
+    def _log_skip_limited(self, kind: str, code: str, message: str, *args: Any) -> None:
+        """Atlama uyarısı — 60 sn pencerede (tür, kod) başına 1 warning,
+        diğerleri debug (O-3: her tick warning spam'i yok)."""
+        key = f"{kind}:{code}"
+        now = time.time()
+        last = self._last_skip_warn_ts.get(key, 0.0)
+        if (now - last) >= 60.0:
+            self._last_skip_warn_ts[key] = now
+            logger.warning(message, *args)
+        else:
+            logger.debug(message, *args)
 
     # =========================================================================
     # Manifest Persistence
@@ -274,25 +352,57 @@ class IncidentRecorder:
             try:
                 with open(self.manifest_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                dropped = 0
                 if isinstance(data, list):
+                    dropped = max(0, len(data) - self.max_incidents)
                     self._incidents = data[-self.max_incidents :]
                 elif isinstance(data, dict) and isinstance(data.get("incidents"), list):
+                    dropped = max(0, len(data["incidents"]) - self.max_incidents)
                     self._incidents = data["incidents"][-self.max_incidents :]
                 else:
                     self._incidents = []
+                if dropped:
+                    # O-3: yüklemede sınır dışı bırakılan eski kayıtlar da
+                    # tahliye sayılır (sessiz kayıp olmasın).
+                    self._evicted_total += dropped
+                    logger.warning(
+                        "Manifest yüklenirken sınır (%d) aşıldığı için %d eski olay bırakıldı.",
+                        self.max_incidents,
+                        dropped,
+                    )
             except Exception as exc:
                 logger.warning("Olay kayıtları manifest dosyası okunamadı, sıfırlanıyor: %s", exc)
+                # Never discard a corrupt manifest without a backup copy.
+                try:
+                    # O-3: zaman damgalı yedek — sabit isim her bozuk
+                    # manifestte öncekinin üstüne yazıyordu.
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    backup_path = f"{self.manifest_path}.corrupt.{stamp}.bak"
+                    with open(self.manifest_path, "rb") as src, open(backup_path, "wb") as dst:
+                        dst.write(src.read())
+                    self._corrupt_manifest_backups += 1
+                    logger.warning("Bozuk manifest yedeklendi: %s", backup_path)
+                except Exception as backup_exc:
+                    # O-3: yedek alınamadıysa bozuk manifest kaybolur —
+                    # sessiz debug değil, warning.
+                    logger.warning("Bozuk manifest yedeklenemedi: %s", backup_exc)
                 self._incidents = []
 
     def _save_manifest_unlocked(self) -> None:
         try:
             os.makedirs(self.incidents_dir, exist_ok=True)
             tmp_path = self.manifest_path + ".tmp"
+            # Thumbnails live as sidecar .thumb.jpg files, not as base64 in
+            # the manifest: a 50-entry manifest must not carry 50 images.
+            stored = [
+                {key: value for key, value in entry.items() if key != "thumbnail_b64"}
+                for entry in self._incidents
+            ]
             payload = {
                 "updated_at": round(time.time(), 3),
                 "iso_updated": datetime.now().isoformat(timespec="seconds"),
-                "total": len(self._incidents),
-                "incidents": self._incidents,
+                "total": len(stored),
+                "incidents": stored,
             }
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -304,7 +414,12 @@ class IncidentRecorder:
     # Frame Capture & Visual Annotation
     # =========================================================================
 
-    def _acquire_frame(self, explicit_frame: Optional[np.ndarray] = None) -> np.ndarray:
+    def _acquire_frame(self, explicit_frame: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        """Returns a real captured frame, or None when no frame is available.
+
+        A synthetic grid canvas must never be saved as an "incident
+        screenshot": a fake image in the gallery is worse than no image.
+        """
         if explicit_frame is not None and isinstance(explicit_frame, np.ndarray) and explicit_frame.size > 0:
             if explicit_frame.ndim == 2:
                 return cv2.cvtColor(explicit_frame, cv2.COLOR_GRAY2BGR)
@@ -327,33 +442,21 @@ class IncidentRecorder:
             except Exception as exc:
                 logger.debug("IncidentRecorder ekran yakalama uyarısı: %s", exc)
 
-        return self._build_fallback_incident_canvas()
-
-    @staticmethod
-    def _build_fallback_incident_canvas() -> np.ndarray:
-        canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
-        canvas[:, :] = (22, 16, 12)
-        for gx in range(0, 1280, 80):
-            cv2.line(canvas, (gx, 0), (gx, 720), (36, 28, 22), 1)
-        for gy in range(0, 720, 80):
-            cv2.line(canvas, (0, gy), (1280, gy), (36, 28, 22), 1)
-        cv2.circle(canvas, (1140, 130), 85, (45, 38, 30), -1)
-        cv2.circle(canvas, (1140, 130), 85, (190, 165, 85), 2)
-        return canvas
+        return None
 
     @staticmethod
     def _resolve_event_meta(event_type: str) -> Dict[str, Any]:
         key = str(event_type or "manual_snapshot").strip().lower()
         if key in EVENT_METADATA_MAP:
-            return EVENT_METADATA_MAP[key]
+            return dict(EVENT_METADATA_MAP[key])
         if "ölüm" in key or "dead" in key or "death" in key:
-            return EVENT_METADATA_MAP["character_dead"]
+            return dict(EVENT_METADATA_MAP["character_dead"])
         if "takıl" in key or "stuck" in key:
-            return EVENT_METADATA_MAP["stuck"]
+            return dict(EVENT_METADATA_MAP["stuck"])
         if "savaş" in key or "combat" in key:
-            return EVENT_METADATA_MAP["prolonged_combat"]
+            return dict(EVENT_METADATA_MAP["prolonged_combat"])
         if "envanter" in key or "inventory" in key or "full" in key:
-            return EVENT_METADATA_MAP["inventory_near_full"]
+            return dict(EVENT_METADATA_MAP["inventory_near_full"])
         return {
             "code": key.replace(" ", "_") or "incident",
             "label_tr": str(event_type or "Olay Kaydı"),
@@ -391,15 +494,7 @@ class IncidentRecorder:
 
         # Colored severity pill on top-left
         cv2.rectangle(annotated, (12, 12), (310, 54), color_bgr, -1)
-        badge_ascii = (
-            str(meta.get("badge_tr", "OLAY KAYDI"))
-            .replace("İ", "I")
-            .replace("Ş", "S")
-            .replace("Ğ", "G")
-            .replace("Ü", "U")
-            .replace("Ö", "O")
-            .replace("Ç", "C")
-        )
+        badge_ascii = _to_ascii_tr(meta.get("badge_tr", "OLAY KAYDI"))
         cv2.putText(
             annotated,
             badge_ascii[:26],
@@ -416,20 +511,7 @@ class IncidentRecorder:
         reg_label = (region or "Altgard")[:22]
         hp_label = f"HP: {int(round(max(0.0, min(1.0, hp_ratio)) * 100))}%" if hp_ratio is not None else ""
         header_line = f"[{ts_str}] {reg_label} | {node_label} {hp_label}".strip()
-        header_ascii = (
-            header_line.replace("İ", "I")
-            .replace("ı", "i")
-            .replace("Ş", "S")
-            .replace("ş", "s")
-            .replace("Ğ", "G")
-            .replace("ğ", "g")
-            .replace("Ü", "U")
-            .replace("ü", "u")
-            .replace("Ö", "O")
-            .replace("ö", "o")
-            .replace("Ç", "C")
-            .replace("ç", "c")
-        )
+        header_ascii = _to_ascii_tr(header_line)
         cv2.putText(
             annotated,
             header_ascii,
@@ -442,21 +524,7 @@ class IncidentRecorder:
         )
 
         if details:
-            detail_ascii = (
-                str(details)[:78]
-                .replace("İ", "I")
-                .replace("ı", "i")
-                .replace("Ş", "S")
-                .replace("ş", "s")
-                .replace("Ğ", "G")
-                .replace("ğ", "g")
-                .replace("Ü", "U")
-                .replace("ü", "u")
-                .replace("Ö", "O")
-                .replace("ö", "o")
-                .replace("Ç", "C")
-                .replace("ç", "c")
-            )
+            detail_ascii = _to_ascii_tr(str(details)[:78])
             cv2.putText(
                 annotated,
                 detail_ascii,
@@ -484,28 +552,79 @@ class IncidentRecorder:
         node_id: Optional[int] = None,
         hp_ratio: Optional[float] = None,
         force: bool = False,
+        reason: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Captures, annotates, and persists an incident snapshot + thumbnail into
         `logs/incidents/` and updates `logs/incidents/incidents.json`.
+
+        Legacy callers (core/state_machine.py `_register_node_failure`) pass
+        the frame positionally with ``reason=`` / ``metadata=`` kwargs; those
+        are accepted here so a node-failure snapshot is actually recorded
+        instead of dying on a signature mismatch.
+        Returns None when nothing was recorded (cooldown, no real frame,
+        invalid input, or a failed JPEG write) — never a fake "saved" entry.
         """
+        # Legacy positional-frame call: record_incident(frame, reason=..., metadata=...)
+        if isinstance(event_type, np.ndarray):
+            frame = event_type
+            event_type = reason or "stuck"
+        if reason and not details:
+            details = str(reason)
+        if metadata:
+            try:
+                meta_text = ", ".join(f"{k}={v}" for k, v in dict(metadata).items())
+                details = f"{details} | {meta_text}" if details else meta_text
+            except Exception:
+                pass
+
+        # Validate hp_ratio up front: a corrupt value must not crash recording.
+        hp_value: Optional[float] = None
+        if hp_ratio is not None:
+            try:
+                hp_value = max(0.0, min(1.0, float(hp_ratio)))
+            except (TypeError, ValueError):
+                logger.warning("Geçersiz hp_ratio %r, olay kaydı atlanıyor.", hp_ratio)
+                return None
+
         now = time.time()
         meta = self._resolve_event_meta(event_type)
-        event_code = str(meta["code"])
+        raw_code = str(meta["code"])
+        event_code = "".join(
+            ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in raw_code
+        ).strip("_") or "incident"
 
         with self._lock:
             last_ts = self._last_event_ts.get(event_code, 0.0)
             if not force and self.cooldown_sec > 0.0 and (now - last_ts) < self.cooldown_sec:
+                # O-3: cooldown atlaması artık sessiz değil — sayaç +
+                # hız sınırlı warning (60 sn'de kod başına 1).
+                self._skipped_cooldown += 1
+                self._log_skip_limited(
+                    "cooldown",
+                    event_code,
+                    "Olay '%s' cooldown nedeniyle atlandı (%.1fs kaldı).",
+                    event_code,
+                    self.cooldown_sec - (now - last_ts),
+                )
                 return None
-            self._last_event_ts[event_code] = now
 
         raw_frame = self._acquire_frame(frame)
+        if raw_frame is None:
+            logger.warning("Olay '%s' için gerçek kare alınamadı, kayıt atlandı.", event_code)
+            return None
+
         dt = datetime.fromtimestamp(now)
         ts_display = dt.strftime("%Y-%m-%d %H:%M:%S")
-        file_stamp = dt.strftime("%Y%m%d_%H%M%S_%f")[:19]
+        # Full microsecond stamp: a millisecond-truncated stamp collides
+        # when two incidents land in the same millisecond.
+        file_stamp = dt.strftime("%Y%m%d_%H%M%S_%f")
         incident_id = f"inc_{file_stamp}_{event_code}"
         filename = f"{incident_id}.jpg"
+        thumb_filename = f"{incident_id}.thumb.jpg"
         file_path = os.path.join(self.incidents_dir, filename)
+        thumb_path = os.path.join(self.incidents_dir, thumb_filename)
 
         annotated = self._annotate_snapshot(
             frame=raw_frame,
@@ -514,27 +633,41 @@ class IncidentRecorder:
             details=details or meta["label_tr"],
             region=region,
             node_id=node_id,
-            hp_ratio=hp_ratio,
+            hp_ratio=hp_value,
         )
 
-        # Save full annotated JPEG (960x540) to logs/incidents/
+        # Save full annotated JPEG (960x540) to logs/incidents/. A failed
+        # encode or write means NOTHING is recorded — no entry, no "saved" log.
         os.makedirs(self.incidents_dir, exist_ok=True)
         ok_full, enc_full = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-        if ok_full:
+        if not ok_full:
+            logger.error("Olay ekran görüntüsü kodlanamadı (%s), kayıt atlandı.", filename)
+            return None
+        try:
+            with open(file_path, "wb") as f:
+                f.write(enc_full.tobytes())
+        except Exception as exc:
+            logger.error("Olay ekran görüntüsü diske yazılamadı (%s): %s", file_path, exc)
             try:
-                with open(file_path, "wb") as f:
-                    f.write(enc_full.tobytes())
-            except Exception as exc:
-                logger.error("Olay ekran görüntüsü diske yazılamadı (%s): %s", file_path, exc)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+            except OSError:
+                pass
+            return None
 
-        # Create compact base64 thumbnail (320x180) for instant JSON gallery loading
+        # Compact thumbnail (320x180) as a sidecar file only. The base64 data
+        # URI is NOT encoded eagerly here: _with_thumbnail() materializes it
+        # lazily from the sidecar file on read, so the 50-entry in-memory list
+        # does not carry 50 base64 thumbnails (~6 KB each).
         thumb_img = cv2.resize(annotated, (320, 180), interpolation=cv2.INTER_AREA)
         ok_thumb, enc_thumb = cv2.imencode(".jpg", thumb_img, [int(cv2.IMWRITE_JPEG_QUALITY), 68])
         if ok_thumb:
-            b64_str = base64.b64encode(enc_thumb.tobytes()).decode("ascii")
-            thumb_data_url = f"data:image/jpeg;base64,{b64_str}"
-        else:
-            thumb_data_url = ""
+            try:
+                with open(thumb_path, "wb") as f:
+                    f.write(enc_thumb.tobytes())
+            except Exception as exc:
+                logger.debug("Olay küçük resmi yazılamadı (%s): %s", thumb_path, exc)
+                thumb_path = ""
 
         entry: Dict[str, Any] = {
             "id": incident_id,
@@ -549,22 +682,47 @@ class IncidentRecorder:
             "region": str(region or "Altgard"),
             "route": str(route or "All"),
             "node_id": node_id,
-            "hp_ratio": round(float(hp_ratio), 3) if hp_ratio is not None else None,
+            "hp_ratio": round(float(hp_value), 3) if hp_value is not None else None,
             "filename": filename,
             "file_path": file_path,
-            "thumbnail_b64": thumb_data_url,
+            "thumbnail_file": thumb_filename if ok_thumb and thumb_path else "",
+            # Lazily materialized by _with_thumbnail() from the sidecar file.
+            "thumbnail_b64": "",
         }
 
         with self._lock:
+            # Cooldown stamp is set only now: a failed recording must not
+            # swallow the next real incident for a full cooldown window.
+            self._last_event_ts[event_code] = time.time()
             self._incidents.append(entry)
+            evicted = 0
             while len(self._incidents) > self.max_incidents:
                 removed = self._incidents.pop(0)
-                old_path = removed.get("file_path")
-                if old_path and os.path.isfile(old_path):
-                    try:
-                        os.remove(old_path)
-                    except OSError as rm_exc:
-                        logger.debug("Eski olay dosyası silinemedi: %s", rm_exc)
+                evicted += 1
+                for stale_key in ("file_path",):
+                    old_path = removed.get(stale_key)
+                    if old_path and os.path.isfile(old_path):
+                        try:
+                            os.remove(old_path)
+                        except OSError as rm_exc:
+                            logger.debug("Eski olay dosyası silinemedi: %s", rm_exc)
+                old_thumb = removed.get("thumbnail_file")
+                if old_thumb:
+                    old_thumb_path = os.path.join(self.incidents_dir, str(old_thumb))
+                    if os.path.isfile(old_thumb_path):
+                        try:
+                            os.remove(old_thumb_path)
+                        except OSError as rm_exc:
+                            logger.debug("Eski olay küçük resmi silinemedi: %s", rm_exc)
+            if evicted:
+                # O-3: tahliye artık sessiz değil — eski olay + dosyası
+                # silindi, sayaç ve warning ile görünür olur.
+                self._evicted_total += evicted
+                logger.warning(
+                    "Olay sınırı (%d) aşıldı: %d eski olay tahliye edildi (dosyaları silindi).",
+                    self.max_incidents,
+                    evicted,
+                )
             self._save_manifest_unlocked()
 
         logger.info(
@@ -573,7 +731,7 @@ class IncidentRecorder:
             event_code,
             filename,
         )
-        return entry
+        return self._with_thumbnail(entry)
 
     def record_death(
         self,
@@ -598,7 +756,22 @@ class IncidentRecorder:
         details: str = "",
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
-        msg = details or f"Uzun süreli savaş tespit edildi ({int(round(duration_sec))} sn > 2 dk)"
+        try:
+            duration = float(duration_sec)
+        except (TypeError, ValueError):
+            logger.warning("Geçersiz duration_sec %r, uzun savaş kaydı atlanıyor.", duration_sec)
+            return None
+        if duration < 120.0:
+            # O-3: eşik-altı atlama sayaç + hız sınırlı warning.
+            self._skipped_below_threshold += 1
+            self._log_skip_limited(
+                "below_threshold",
+                "prolonged_combat",
+                "Savaş süresi %.1fs < 120s, uzun savaş kaydı atlandı.",
+                duration,
+            )
+            return None
+        msg = details or f"Uzun süreli savaş tespit edildi ({int(round(duration))} sn > 2 dk)"
         return self.record_incident("Uzun Savaş >2dk", frame=frame, details=msg, **kwargs)
 
     def record_inventory_full(
@@ -608,7 +781,22 @@ class IncidentRecorder:
         details: str = "",
         **kwargs: Any,
     ) -> Optional[Dict[str, Any]]:
-        pct = int(round(max(0.0, min(1.0, float(fill_ratio))) * 100))
+        try:
+            fill = max(0.0, min(1.0, float(fill_ratio)))
+        except (TypeError, ValueError):
+            logger.warning("Geçersiz fill_ratio %r, envanter kaydı atlanıyor.", fill_ratio)
+            return None
+        if fill < 0.95:
+            # O-3: eşik-altı atlama sayaç + hız sınırlı warning.
+            self._skipped_below_threshold += 1
+            self._log_skip_limited(
+                "below_threshold",
+                "inventory_full",
+                "Envanter doluluk %d%% < 95%%, kayıt atlandı.",
+                int(round(fill * 100)),
+            )
+            return None
+        pct = int(round(fill * 100))
         msg = details or f"Envanter doluluk oranı kritik seviyede (%{pct})"
         return self.record_incident("Envanter %95 Dolu", frame=frame, details=msg, **kwargs)
 
@@ -616,12 +804,35 @@ class IncidentRecorder:
     # Query & Gallery Helpers
     # =========================================================================
 
+    def _with_thumbnail(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a copy with thumbnail_b64 materialized from the sidecar file.
+
+        The manifest stores only `thumbnail_file`; readers of get_incidents()
+        still get the data-URI thumbnail they expect.
+        """
+        out = dict(item)
+        if out.get("thumbnail_b64"):
+            return out
+        thumb_name = str(out.get("thumbnail_file") or "")
+        if thumb_name:
+            thumb_path = os.path.join(self.incidents_dir, os.path.basename(thumb_name))
+            if os.path.isfile(thumb_path):
+                try:
+                    with open(thumb_path, "rb") as f:
+                        raw = f.read()
+                    out["thumbnail_b64"] = (
+                        "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+                    )
+                except Exception as exc:
+                    logger.debug("Olay küçük resmi okunamadı (%s): %s", thumb_path, exc)
+        return out
+
     def get_incidents(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Returns the most recent incidents (newest first) for the mobile gallery."""
         with self._lock:
             items = list(self._incidents)
         items.reverse()
-        return items[: max(1, int(limit))]
+        return [self._with_thumbnail(item) for item in items[: max(1, int(limit))]]
 
     def get_incident_by_id(self, incident_id: str) -> Optional[Dict[str, Any]]:
         clean_id = str(incident_id or "").strip()
@@ -630,7 +841,7 @@ class IncidentRecorder:
         with self._lock:
             for item in reversed(self._incidents):
                 if item.get("id") == clean_id or item.get("filename") == clean_id:
-                    return dict(item)
+                    return self._with_thumbnail(dict(item))
         return None
 
     def get_incident_jpeg_bytes(self, incident_id: str) -> Optional[bytes]:
@@ -644,7 +855,21 @@ class IncidentRecorder:
                     return f.read()
             except Exception as exc:
                 logger.debug("Olay tam ekran JPEG okunamadı (%s): %s", fpath, exc)
-        # Fallback to decoding thumbnail_b64 if file was moved
+        # Full JPEG is gone: say so loudly instead of silently serving the
+        # 320x180 thumbnail as if it were the full screenshot.
+        logger.warning(
+            "Olay %s için tam ekran JPEG bulunamadı, küçük resim döndürülüyor.",
+            incident_id,
+        )
+        thumb_name = str(item.get("thumbnail_file") or "")
+        if thumb_name:
+            thumb_path = os.path.join(self.incidents_dir, os.path.basename(thumb_name))
+            if os.path.isfile(thumb_path):
+                try:
+                    with open(thumb_path, "rb") as f:
+                        return f.read()
+                except Exception as exc:
+                    logger.debug("Olay küçük resim dosyası okunamadı (%s): %s", thumb_path, exc)
         b64_url = str(item.get("thumbnail_b64") or "")
         if b64_url.startswith("data:image/jpeg;base64,"):
             try:
@@ -654,16 +879,30 @@ class IncidentRecorder:
         return None
 
     def clear_incidents(self) -> int:
-        """Deletes all stored incident JPEGs and resets `incidents.json`."""
+        """Deletes all stored incident JPEGs and resets `incidents.json`.
+
+        P3-8 (S-050/S-218): files are MOVED to `logs/incidents/.trash/<ts>/`
+        instead of deleted, so one (confirmed) clear cannot destroy evidence.
+        """
         with self._lock:
             count = len(self._incidents)
+            trash_dir = os.path.join(self.incidents_dir, ".trash", time.strftime("%Y%m%d-%H%M%S"))
+            os.makedirs(trash_dir, exist_ok=True)
             for item in self._incidents:
                 fpath = item.get("file_path")
                 if fpath and os.path.isfile(fpath):
                     try:
-                        os.remove(fpath)
+                        os.replace(fpath, os.path.join(trash_dir, os.path.basename(fpath)))
                     except OSError as rm_exc:
-                        logger.debug("Olay dosyası silinemedi: %s", rm_exc)
+                        logger.debug("Olay dosyası çöpe taşınamadı: %s", rm_exc)
+                thumb_name = str(item.get("thumbnail_file") or "")
+                if thumb_name:
+                    thumb_path = os.path.join(self.incidents_dir, os.path.basename(thumb_name))
+                    if os.path.isfile(thumb_path):
+                        try:
+                            os.replace(thumb_path, os.path.join(trash_dir, os.path.basename(thumb_path)))
+                        except OSError as rm_exc:
+                            logger.debug("Olay küçük resmi çöpe taşınamadı: %s", rm_exc)
             self._incidents = []
             self._last_event_ts.clear()
             self._save_manifest_unlocked()
@@ -671,15 +910,32 @@ class IncidentRecorder:
 
     def get_recorder_health_summary(self) -> dict:
         try:
-            return {"recorder_ready": True}
+            with self._lock:
+                count = len(self._incidents)
+                manifest_ok = os.path.isdir(self.incidents_dir)
+                skipped_cooldown = int(getattr(self, "_skipped_cooldown", 0) or 0)
+                skipped_below_threshold = int(getattr(self, "_skipped_below_threshold", 0) or 0)
+                evicted_total = int(getattr(self, "_evicted_total", 0) or 0)
+                corrupt_backups = int(getattr(self, "_corrupt_manifest_backups", 0) or 0)
+            return {
+                "recorder_ready": bool(manifest_ok),
+                "incident_count": count,
+                "max_incidents": int(self.max_incidents),
+                "cooldown_sec": float(self.cooldown_sec),
+                # O-3: sessiz kayıp sayaçları.
+                "skipped_cooldown": skipped_cooldown,
+                "skipped_below_threshold": skipped_below_threshold,
+                "evicted_total": evicted_total,
+                "corrupt_manifest_backups": corrupt_backups,
+            }
         except Exception:
             return {"recorder_ready": False}
 
     def get_incident_recorder_ready_flag(self) -> dict:
-        return {"module": "incident_recorder", "ready": True}
+        return {"module": "incident_recorder", "ready": bool(self.get_recorder_health_summary().get("recorder_ready"))}
 
     def get_incident_recorder_version_info(self) -> dict:
-        return {"module": "incident_recorder", "version": "2.0.0", "ready": True}
+        return {"module": "incident_recorder", "version": __version__, "ready": True}
 
     def get_incident_recorder_diagnostic_snapshot(self) -> dict:
         return {"module": "incident_recorder", "status": "ok", "ready": True}
@@ -688,12 +944,62 @@ class IncidentRecorder:
         return ["incident_recorder", "diagnostic_snapshot", "version_info"]
 
 
+def _probe_incident_recorder_contract() -> bool:
+    """Real probe in temp dirs only: a 256-bit token must generate, verify,
+    and reject a wrong token; a recorder must persist one incident."""
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tok_path = os.path.join(tmp_dir, "token.txt")
+            auth = MobileTokenAuthenticator(token_path=tok_path, require_token=True)
+            if not _is_valid_256bit_token(auth.token):
+                return False
+            if not auth.verify_request(query_string=f"token={auth.token}"):
+                return False
+            if auth.verify_request(query_string="token=deadbeef"):
+                return False
+            recorder = IncidentRecorder(
+                incidents_dir=os.path.join(tmp_dir, "incidents"),
+                max_incidents=5,
+                cooldown_sec=0.0,
+            )
+            frame = np.zeros((64, 64, 3), dtype=np.uint8)
+            entry = recorder.record_death(frame=frame)
+            if entry is None or not os.path.isfile(str(entry.get("file_path"))):
+                return False
+            return True
+    except Exception as exc:
+        logger.debug("Incident recorder contract probe failed: %s", exc)
+        return False
+
+
 def get_incident_recorder_capabilities() -> list:
     return ["incident_recorder", "diagnostic_snapshot", "version_info"]
 
 
+# Memoized contract probe: the module-level get_incident_recorder_* chain
+# (digest -> audit -> readiness -> metrics, telemetry -> seal -> certificate
+# -> probe -> summary -> heartbeat) used to re-run the full probe — temp dir,
+# token generation, file IO, one cv2 incident record — on EVERY call (~10
+# probes per heartbeat snapshot, ~0.2 s). The probe result only depends on
+# this process's environment, so a short TTL cache is sound: 1 probe per
+# 60 s window, identical True/False result inside the window.
+_PROBE_CACHE_TTL_SEC = 60.0
+_probe_cache: Dict[str, Any] = {"ts": 0.0, "value": None}
+_probe_cache_lock = threading.Lock()
+
+
 def validate_incident_recorder_contract() -> bool:
-    return bool(get_incident_recorder_capabilities())
+    now = time.monotonic()
+    with _probe_cache_lock:
+        if _probe_cache["value"] is not None and (now - _probe_cache["ts"]) < _PROBE_CACHE_TTL_SEC:
+            return bool(_probe_cache["value"])
+    result = _probe_incident_recorder_contract()
+    with _probe_cache_lock:
+        _probe_cache["ts"] = time.monotonic()
+        _probe_cache["value"] = bool(result)
+    return bool(result)
 
 
 def get_incident_recorder_baseline_metrics() -> dict:

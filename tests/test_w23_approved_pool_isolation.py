@@ -85,7 +85,7 @@ def test_manifest_json_updated_with_sample_metadata_and_stats(tmp_path: Path) ->
     ok = pool.add_approved_sample(
         stem="frame_alpha",
         split="train",
-        image_bytes=b"FAKE_JPEG_ALPHA",
+        image_bytes=b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xFF\xD9",
         trusted_boxes=[
             "0 0.5 0.5 0.2 0.2",
             "5 0.3 0.6 0.1 0.1",
@@ -117,8 +117,8 @@ def test_bulk_add_and_val_split_isolation_with_manifest_persistence(tmp_path: Pa
     src_dir.mkdir(parents=True, exist_ok=True)
     img_train = src_dir / "f_train.png"
     img_val = src_dir / "f_val.jpg"
-    img_train.write_bytes(b"PNG_TRAIN_BYTES")
-    img_val.write_bytes(b"JPG_VAL_BYTES")
+    img_train.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+    img_val.write_bytes(b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xFF\xD9")
 
     pool = ApprovedDatasetPool(project_root=tmp_path)
     added = pool.bulk_add_approved_samples(
@@ -165,7 +165,7 @@ def test_remove_and_prepare_approved_training_dataset_updates_manifest(tmp_path:
 
     approved_img = img_dir / "approved_01.jpg"
     unapproved_img = img_dir / "pending_02.jpg"
-    approved_img.write_bytes(b"APPROVED_IMG")
+    approved_img.write_bytes(b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xFF\xD9")
     unapproved_img.write_bytes(b"PENDING_IMG")
 
     (review_dir / "approved_01.json").write_text(
@@ -176,7 +176,8 @@ def test_remove_and_prepare_approved_training_dataset_updates_manifest(tmp_path:
                 "human_approved": True,
                 "done": "ok",
                 "image_path": str(approved_img),
-                "trusted": [{"class_id": 7, "cx": 0.5, "cy": 0.5, "w": 0.3, "h": 0.3}],
+                # P1-10 / K-21: per-box provenance — the frame flag alone admits nothing.
+                "trusted": [{"class_id": 7, "cx": 0.5, "cy": 0.5, "w": 0.3, "h": 0.3, "human_approved": True}],
             }
         ),
         encoding="utf-8",

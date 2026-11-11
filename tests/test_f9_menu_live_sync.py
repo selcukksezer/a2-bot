@@ -3,10 +3,24 @@
 Test suite for F9Menu Live Route & Gathering UI Synchronization (Agent G9).
 Validates multi-directional synchronization across F9Menu, RouteManager,
 OverlayHUD, BotWorker, and GatherionShell.
+
+Route data uses the REAL core.route_manager.RouteManager backed by a
+temporary directory (no hand-rolled route-manager double: the sync under
+test reads get_regions()/get_routes()/active_* from the real component,
+and route persistence is verified with a disk round-trip).
+
+Shell / Overlay / Worker are unittest.mock doubles, but spec'd against the
+REAL GatherionShell / OverlayHUD / BotWorker classes, so they only expose
+methods the real components actually have (a hand-written dummy previously
+invented BotWorker.set_minimap_auto_record, which the real worker does
+not have). Assertions on them are interaction assertions (recorded calls),
+not invented dummy state.
 """
 
+import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock
 
@@ -18,130 +32,79 @@ from PyQt6.QtWidgets import QApplication
 # Ensure single QApplication instance
 app = QApplication.instance() or QApplication(sys.argv)
 
+from core.route_manager import RouteManager
+from core.state_machine import BotWorker
+from ui.app_shell import GatherionShell
 from ui.f9_menu import (
     F9Menu,
+    get_f9_menu_baseline_metrics,
     get_f9_menu_capabilities,
     validate_f9_menu_contract,
     get_f9_menu_readiness_status,
 )
+from ui.overlay_hud import OverlayHUD
 
 
-class DummyRouteManager:
-    """Mock RouteManager simulating core/route_manager.py functionality."""
-
-    def __init__(self):
-        self.active_region = "Altgard"
-        self.active_route = "Dredgion Crash Site"
-        self.data = {
-            "active_region": "Altgard",
-            "active_route": "Dredgion Crash Site",
-            "regions": {
-                "Altgard": {
-                    "routes": ["All", "Dredgion Crash Site", "Safe Haven", "Quai Campsite"],
-                    "nodes": [],
-                },
-                "Verteron": {
-                    "routes": ["All", "Tolbas Forest", "Cantas Coast"],
-                    "nodes": [],
-                },
-            },
-        }
-        self.saved = False
-
-    def get_regions(self):
-        return list(self.data["regions"].keys())
-
-    def get_routes(self, region):
-        reg = self.data["regions"].get(region, {})
-        return list(reg.get("routes", ["All"]))
-
-    def load_region(self, region):
-        self.active_region = region
-        return True
-
-    def save_data(self):
-        self.saved = True
-        return True
+def _seed_route_manager(base_dir):
+    """Build a real RouteManager with Altgard + Verteron routes on disk."""
+    rm = RouteManager(base_dir=base_dir)
+    rm.create_region("Altgard")
+    for route in ("Dredgion Crash Site", "Safe Haven", "Quai Campsite"):
+        rm.create_route("Altgard", route)
+    rm.create_region("Verteron")
+    for route in ("Tolbas Forest", "Cantas Coast"):
+        rm.create_route("Verteron", route)
+    rm.active_region = "Altgard"
+    rm.active_route = "Dredgion Crash Site"
+    rm.data["active_region"] = "Altgard"
+    rm.data["active_route"] = "Dredgion Crash Site"
+    rm.save_data()
+    return rm
 
 
-class DummyShell:
-    """Mock GatherionShell to verify live UI synchronization."""
-
-    def __init__(self):
-        self.region = ""
-        self.route = ""
-        self.published = False
-
-    def get_active_region(self):
-        return self.region or "Altgard"
-
-    def get_active_route(self):
-        return self.route or "All"
-
-    def set_active_region(self, region, update_combo=True):
-        self.region = region
-
-    def set_active_route(self, route, update_combo=True):
-        self.route = route
-
-    def _publish_home(self):
-        self.published = True
-
-
-class DummyOverlay:
-    """Mock OverlayHUD to verify live status, logs, and harvest stage synchronization."""
-
-    def __init__(self):
-        self.logs = []
-        self.state_data = {}
-        self.harvest_stage = (0, 3)
-
-    def add_log(self, msg):
-        self.logs.append(msg)
-
-    def update_state(self, data):
-        self.state_data.update(data)
-
-    def update_harvest_stage(self, stage, max_s):
-        self.harvest_stage = (stage, max_s)
-
-
-class DummyWorker:
-    """Mock BotWorker to verify mode, auto-cartography, and snapshot synchronization."""
-
-    def __init__(self):
-        self.mode = "route"
-        self.auto_cartography_enabled = False
-        self.snapshots_emitted = 0
-        self.route_manager = DummyRouteManager()
-        self.hud_update = MagicMock()
-
-    def set_mode(self, mode):
-        self.mode = mode
-
-    def set_minimap_auto_record(self, enabled):
-        self.auto_cartography_enabled = bool(enabled)
-
-    def _auto_sort_sequential_route(self, mode="smooth_loop"):
-        pass
-
-    def _emit_hud_snapshot(self):
-        self.snapshots_emitted += 1
+def _log_texts(overlay_mock):
+    """Plain-text payloads of every add_log call recorded on a mock overlay."""
+    return [str(call.args[0]) for call in overlay_mock.add_log.call_args_list]
 
 
 class TestF9MenuLiveSync(unittest.TestCase):
     """Verifies live route and gathering synchronization in F9Menu."""
 
     def setUp(self):
-        self.route_mgr = DummyRouteManager()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.route_mgr = _seed_route_manager(self._tmp.name)
         self.menu = F9Menu(route_manager=self.route_mgr)
+        self.addCleanup(self.menu.deleteLater)
+
+    def _make_shell(self):
+        shell = MagicMock(spec=GatherionShell)
+        shell.get_active_region.return_value = "Altgard"
+        shell.get_active_route.return_value = "Dredgion Crash Site"
+        return shell
+
+    def _make_overlay(self):
+        return MagicMock(spec=OverlayHUD)
+
+    def _make_worker(self):
+        """Spec'd BotWorker double with its own real RouteManager instance.
+
+        A separate RouteManager object (same backing directory) proves the
+        propagation path really writes into the worker's manager instead of
+        passing trivially through a shared object.
+        """
+        worker = MagicMock(spec=BotWorker)
+        worker.route_manager = RouteManager(base_dir=self._tmp.name)
+        worker.route_manager.load_region("Altgard")
+        return worker
 
     def test_sync_from_route_manager_discovers_routes(self):
-        """Routes from RouteManager must be discovered correctly into _regions_routes."""
-        self.assertIn("Altgard", self.menu._regions_routes)
-        self.assertIn("Dredgion Crash Site", self.menu._regions_routes["Altgard"])
-        self.assertIn("Safe Haven", self.menu._regions_routes["Altgard"])
-        self.assertIn("Verteron", self.menu._regions_routes)
+        """Routes from the real RouteManager must be discovered correctly."""
+        regions_routes = self.menu.get_regions_routes()
+        self.assertIn("Altgard", regions_routes)
+        self.assertIn("Dredgion Crash Site", regions_routes["Altgard"])
+        self.assertIn("Safe Haven", regions_routes["Altgard"])
+        self.assertIn("Verteron", regions_routes)
         self.assertEqual(self.menu.get_active_region(), "Altgard")
         self.assertEqual(self.menu.get_active_route(), "Dredgion Crash Site")
 
@@ -156,14 +119,14 @@ class TestF9MenuLiveSync(unittest.TestCase):
         self.assertEqual(self.menu.get_active_route(), "Tolbas Forest")
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0], ("Verteron", "Tolbas Forest"))
-        self.assertIn("Verteron", self.menu._format_status_line())
-        self.assertIn("Tolbas Forest", self.menu._format_status_line())
+        self.assertIn("Verteron", self.menu.header_subtitle_label.text())
+        self.assertIn("Tolbas Forest", self.menu.header_subtitle_label.text())
 
     def test_select_route_propagates_to_route_manager_and_targets(self):
         """Selecting a route updates RouteManager and bound Shell, Overlay, and Worker."""
-        shell = DummyShell()
-        overlay = DummyOverlay()
-        worker = DummyWorker()
+        shell = self._make_shell()
+        overlay = self._make_overlay()
+        worker = self._make_worker()
 
         self.menu.bind_targets(shell=shell, overlay=overlay, worker=worker)
 
@@ -174,24 +137,37 @@ class TestF9MenuLiveSync(unittest.TestCase):
         self.assertEqual(self.menu.get_active_region(), "Altgard")
         self.assertEqual(self.menu.get_active_route(), "Quai Campsite")
 
-        # 2. RouteManager state
+        # 2. Real RouteManager state (attributes + in-memory mirror)
         self.assertEqual(self.route_mgr.active_region, "Altgard")
         self.assertEqual(self.route_mgr.active_route, "Quai Campsite")
+        self.assertEqual(self.route_mgr.data["active_region"], "Altgard")
+        self.assertEqual(self.route_mgr.data["active_route"], "Quai Campsite")
 
-        # 3. Shell state
-        self.assertEqual(shell.region, "Altgard")
-        self.assertEqual(shell.route, "Quai Campsite")
-        self.assertTrue(shell.published)
+        # 2b. Route persistence: selection must reach disk, not just attributes.
+        json_path = os.path.join(self._tmp.name, "Altgard", "region_data.json")
+        self.assertTrue(os.path.isfile(json_path))
+        with open(json_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved.get("region"), "Altgard")
+        self.assertIn("Quai Campsite", saved.get("routes", []))
+        reloaded = RouteManager(base_dir=self._tmp.name)
+        self.assertTrue(reloaded.load_region("Altgard"))
+        self.assertIn("Quai Campsite", reloaded.get_routes("Altgard"))
 
-        # 4. Overlay state
-        self.assertTrue(any("Quai Campsite" in msg for msg in overlay.logs))
-        self.assertEqual(overlay.state_data.get("region"), "Altgard")
-        self.assertEqual(overlay.state_data.get("route"), "Quai Campsite")
+        # 3. Shell state (recorded calls on the spec'd GatherionShell double)
+        shell.set_active_region.assert_called_with("Altgard", update_combo=True)
+        shell.set_active_route.assert_called_with("Quai Campsite", update_combo=True)
+        shell._publish_home.assert_called()
 
-        # 5. Worker state
+        # 4. Overlay state (recorded calls on the spec'd OverlayHUD double)
+        self.assertTrue(any("Quai Campsite" in msg for msg in _log_texts(overlay)))
+        overlay.update_state.assert_called_with({"region": "Altgard", "route": "Quai Campsite"})
+
+        # 5. Worker state (real RouteManager attached to the spec'd BotWorker double)
         self.assertEqual(worker.route_manager.active_region, "Altgard")
         self.assertEqual(worker.route_manager.active_route, "Quai Campsite")
-        self.assertGreaterEqual(worker.snapshots_emitted, 1)
+        worker._auto_sort_sequential_route.assert_called_with(mode="smooth_loop")
+        worker._emit_hud_snapshot.assert_called()
 
     def test_gathering_state_synchronization(self):
         """Setting gathering telemetry updates stage, badge, status line, and emits signals."""
@@ -214,18 +190,19 @@ class TestF9MenuLiveSync(unittest.TestCase):
 
         self.menu.set_gathering_state(payload)
 
-        # Verify state attributes
+        # Verify state attributes via the public summary
         self.assertEqual(self.menu.get_current_harvest_stage(), 2)
         self.assertEqual(self.menu.get_harvests_per_node(), 3)
         self.assertTrue(self.menu.is_gathering())
-        self.assertEqual(self.menu._current_resource, "Orichalcum Ore")
-        self.assertEqual(self.menu._gathered_count, 14)
+        summary = self.menu.get_gathering_summary()
+        self.assertEqual(summary["current_resource"], "Orichalcum Ore")
+        self.assertEqual(summary["gathered_count"], 14)
 
         # Verify harvest badge label
         self.assertEqual(self.menu.harvest_badge_label.text(), "2/3")
 
         # Verify status line formatting
-        status = self.menu._format_status_line()
+        status = self.menu.header_subtitle_label.text()
         self.assertIn("Topluyor", status)
         self.assertIn("[2/3]", status)
         self.assertIn("Orichalcum Ore", status)
@@ -237,58 +214,65 @@ class TestF9MenuLiveSync(unittest.TestCase):
 
     def test_update_harvest_stage_forwards_to_overlay(self):
         """Calling update_harvest_stage must update labels and forward to bound OverlayHUD."""
-        overlay = DummyOverlay()
+        overlay = self._make_overlay()
         self.menu.bind_targets(overlay=overlay)
 
         self.menu.update_harvest_stage(1, 3)
-        self.assertEqual(overlay.harvest_stage, (1, 3))
+        overlay.update_harvest_stage.assert_called_with(1, 3)
         self.assertEqual(self.menu.get_current_harvest_stage(), 1)
         self.assertEqual(self.menu.harvest_badge_label.text(), "1/3")
 
         self.menu.update_harvest_stage(3, 3)
-        self.assertEqual(overlay.harvest_stage, (3, 3))
+        overlay.update_harvest_stage.assert_called_with(3, 3)
         self.assertEqual(self.menu.get_current_harvest_stage(), 3)
         self.assertEqual(self.menu.harvest_badge_label.text(), "3/3")
 
     def test_mode_selection_and_action_propagation(self):
         """Clicking mode rows updates active mode and propagates to worker and overlay."""
-        overlay = DummyOverlay()
-        worker = DummyWorker()
-        shell = DummyShell()
+        overlay = self._make_overlay()
+        worker = self._make_worker()
+        shell = self._make_shell()
 
         self.menu.bind_targets(shell=shell, overlay=overlay, worker=worker)
 
         # Test Combat mode
         self.menu._trigger_action("combat")
         self.assertEqual(self.menu.get_active_mode(), "combat")
-        self.assertEqual(worker.mode, "combat")
-        self.assertTrue(any("Savaş" in log for log in overlay.logs))
-        self.assertTrue(shell.published)
+        worker.set_mode.assert_called_with("combat")
+        self.assertTrue(any("Savaş" in log for log in _log_texts(overlay)))
+        shell._publish_home.assert_called()
 
         # Test Explorer mode
         self.menu._trigger_action("explorer")
         self.assertEqual(self.menu.get_active_mode(), "explorer")
-        self.assertEqual(worker.mode, "explorer")
+        worker.set_mode.assert_called_with("explorer")
 
     def test_minimap_auto_record_toggle_propagation(self):
         """Toggling minimap auto record propagates to worker, overlay, and signals."""
         toggled_signals = []
         self.menu.minimap_auto_record_toggled.connect(lambda state: toggled_signals.append(state))
 
-        overlay = DummyOverlay()
-        worker = DummyWorker()
+        overlay = self._make_overlay()
+        worker = self._make_worker()
         self.menu.bind_targets(overlay=overlay, worker=worker)
 
         initial = self.menu.is_minimap_auto_record_enabled()
         self.menu._trigger_action("minimap_auto_record")
 
         self.assertEqual(self.menu.is_minimap_auto_record_enabled(), not initial)
+        # The real BotWorker has no set_minimap_auto_record method; the
+        # production code propagates via direct attribute assignment.
         self.assertEqual(worker.auto_cartography_enabled, not initial)
-        self.assertTrue(any("Minimap" in log for log in overlay.logs))
+        self.assertTrue(any("Minimap" in log for log in _log_texts(overlay)))
         self.assertEqual(len(toggled_signals), 1)
 
     def test_contract_integrity_and_summary(self):
-        """Validate F9Menu health snapshot, contract functions, and summary digest."""
+        """Validate F9Menu health snapshot, contract functions, and summary digest.
+
+        The contract is checked on its actual content (exact capability
+        list, instance/module agreement, metrics counts) — not merely by
+        converting a constant list to bool.
+        """
         summary = self.menu.get_gathering_summary()
         self.assertEqual(summary["active_region"], "Altgard")
         self.assertEqual(summary["active_route"], "Dredgion Crash Site")
@@ -298,9 +282,19 @@ class TestF9MenuLiveSync(unittest.TestCase):
         health = self.menu.get_f9_menu_health_summary()
         self.assertTrue(health.get("f9_menu_ready"))
 
+        capabilities = get_f9_menu_capabilities()
+        self.assertEqual(capabilities, ["f9_menu", "quick_actions", "diagnostic_snapshot"])
+        self.assertEqual(self.menu.get_f9_menu_capabilities(), capabilities)
         self.assertTrue(validate_f9_menu_contract())
+
+        metrics = get_f9_menu_baseline_metrics()
+        self.assertEqual(metrics["capability_count"], len(capabilities))
+        self.assertEqual(metrics["capability_count"], 3)
+        self.assertTrue(metrics["contract_valid"])
+
         readiness = get_f9_menu_readiness_status()
         self.assertTrue(readiness.get("ready"))
+        self.assertEqual(readiness["metrics"]["capability_count"], 3)
 
 
 if __name__ == "__main__":

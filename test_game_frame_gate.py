@@ -10,12 +10,16 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import cv2
 import numpy as np
 
 from dataset_factory.clean_dataset import purge_non_game_screenshots
-from dataset_factory.factory_controller import AutoLabelingDatasetFactory
+# AutoLabelingDatasetFactory bilerek üstte içe aktarılmaz: factory_controller
+# ağır veri kümesi bağımlılıkları çeker ve bu dosyanın yalnızca belirli bir
+# venv'de toplanmasına yol açar (F-1406). Onu kullanan tek test, tembel
+# içe aktarır ve içe aktarma başarısız olursa kendini atlar.
 from dataset_factory.game_frame_gate import (
     GameFrameGate,
     check_process_and_focus,
@@ -25,6 +29,25 @@ from dataset_factory.game_frame_gate import (
     get_default_frame_gate,
     is_valid_game_frame,
 )
+
+
+class _StubFocusGuard:
+    """Win32 ön plan sorgusunun yerine geçen sahte nesne (F-1323).
+
+    Yalnızca OS sınırı sahtedir: `query_foreground_window_info` hazır bir
+    (hwnd, pid, başlık) döndürür; Kapı 1'in başlık/süreç/odak kararı ise
+    gerçek `check_gate1_process_and_focus` koduyla çalışır.
+    """
+
+    def __init__(self, title: str, pid: int) -> None:
+        self._title = title
+        self._pid = pid
+
+    def query_foreground_window_info(self):
+        return (1234, self._pid, self._title)
+
+    def is_game_window_focused(self):
+        return (True, f"{self._title} (PID={self._pid})")
 
 
 class TestGameFrameGateSuite(unittest.TestCase):
@@ -41,57 +64,100 @@ class TestGameFrameGateSuite(unittest.TestCase):
         self.gate = GameFrameGate(max_hash_cache=64, min_dhash_distance=6)
         clear_frame_gate_cache()
 
+    def _real_path_gate(self, is_running: bool, title: str = "AION2 Client 64-bit", pid: int = 8888) -> GameFrameGate:
+        """Kapı 1'in gerçek dalını kullanan kapı (F-1323).
+
+        `set_simulated_game_state` simülasyon bayrağını atlar; burada oyun
+        durumu kurucuya enjekte edilen `is_game_running_fn` ile, ön plan
+        penceresi ise `_StubFocusGuard` ile verilir.
+        """
+        return GameFrameGate(
+            max_hash_cache=64,
+            min_dhash_distance=6,
+            focus_guard=_StubFocusGuard(title, pid),
+            is_game_running_fn=lambda: bool(is_running),
+        )
+
+    @staticmethod
+    def _hud_frame() -> np.ndarray:
+        """Gerçek oyun karesi yokken bile Kapı 2'den geçen sentetik HUD karesi (F-1324)."""
+        h, w = 1080, 1920
+        grad = np.tile(np.linspace(20, 80, w, dtype=np.uint8), (h, 1))
+        frame = cv2.cvtColor(grad, cv2.COLOR_GRAY2BGR)
+        cv2.rectangle(frame, (750, 920), (950, 936), (20, 20, 220), -1)
+        return frame
+
+    @staticmethod
+    def _desktop_canvas() -> np.ndarray:
+        """Sentetik masaüstü karesi: duvar kâğıdı + altta koyu görev çubuğu.
+
+        Kapı 2'nin masaüstü reddi ile purge testinin masaüstü girdisi aynı
+        kareyi kullanır; tek kaynaktan beslenir.
+        """
+        desktop = np.full((1080, 1920, 3), (180, 120, 40), dtype=np.uint8)
+        desktop[1035:, :] = (25, 25, 25)  # dark taskbar strip
+        return desktop
+
     # ==========================================================================
     # 1. Kapı 1: Process & Focus Guard Tests
     # ==========================================================================
     def test_gate1_rejects_when_game_not_running(self) -> None:
-        self.gate.set_simulated_game_state(is_running=False)
-        ok, reason = self.gate.check_gate1_process_and_focus()
+        gate = self._real_path_gate(is_running=False)
+        ok, reason = gate.check_gate1_process_and_focus()
         self.assertFalse(ok)
         self.assertIn("game_not_running", reason)
 
     def test_gate1_rejects_windows_desktop(self) -> None:
-        self.gate.set_simulated_game_state(is_running=True, foreground_title="Program Manager", foreground_pid=100)
-        ok, reason = self.gate.check_gate1_process_and_focus()
-        self.assertFalse(ok)
-        self.assertIn("desktop_focused", reason)
-
-        self.gate.set_simulated_game_state(is_running=True, foreground_title="Desktop", foreground_pid=101)
-        ok2, reason2 = self.gate.check_gate1_process_and_focus()
-        self.assertFalse(ok2)
-        self.assertIn("desktop_focused", reason2)
+        for title, pid in (("Program Manager", 100), ("Desktop", 101)):
+            with self.subTest(title=title):
+                gate = self._real_path_gate(is_running=True, title=title, pid=pid)
+                ok, reason = gate.check_gate1_process_and_focus()
+                self.assertFalse(ok)
+                self.assertIn("desktop_focused", reason)
 
     def test_gate1_rejects_gatherion_ui(self) -> None:
-        self.gate.set_simulated_game_state(is_running=True, foreground_title="Gatherion Autonomous Bot v2.4", foreground_pid=9999)
-        ok, reason = self.gate.check_gate1_process_and_focus()
-        self.assertFalse(ok)
-        self.assertIn("gatherion_ui_focused", reason)
-
-        self.gate.set_simulated_game_state(is_running=True, foreground_title="Overlay HUD", foreground_pid=os.getpid())
-        ok2, reason2 = self.gate.check_gate1_process_and_focus()
-        self.assertFalse(ok2)
-        self.assertIn("gatherion_ui_focused", reason2)
+        for title, pid in (("Gatherion Autonomous Bot v2.4", 9999), ("Overlay HUD", os.getpid())):
+            with self.subTest(title=title):
+                gate = self._real_path_gate(is_running=True, title=title, pid=pid)
+                ok, reason = gate.check_gate1_process_and_focus()
+                self.assertFalse(ok)
+                self.assertIn("gatherion_ui_focused", reason)
 
     def test_gate1_rejects_blocked_apps(self) -> None:
         for blocked_title in ["Google Chrome - New Tab", "Visual Studio Code", "File Explorer", "Task Manager"]:
-            self.gate.set_simulated_game_state(is_running=True, foreground_title=blocked_title, foreground_pid=5000)
-            ok, reason = self.gate.check_gate1_process_and_focus()
-            self.assertFalse(ok, f"Should reject {blocked_title}")
-            self.assertTrue("blocked_foreground" in reason or "window_not_focused" in reason)
+            with self.subTest(title=blocked_title):
+                gate = self._real_path_gate(is_running=True, title=blocked_title, pid=5000)
+                ok, reason = gate.check_gate1_process_and_focus()
+                self.assertFalse(ok, f"Should reject {blocked_title}")
+                # F-1409: 'veya'lı assertion sebebi gizliyordu; dört başlık da
+                # engellenen ön plan penceresi olarak reddedilir.
+                self.assertIn("blocked_foreground", reason, f"Unexpected reason for {blocked_title}: {reason}")
 
     def test_gate1_accepts_verified_game_window(self) -> None:
-        self.gate.set_simulated_game_state(is_running=True, foreground_title="AION2 Client 64-bit", foreground_pid=8888)
-        ok, reason = self.gate.check_gate1_process_and_focus()
+        gate = self._real_path_gate(is_running=True, title="AION2 Client 64-bit", pid=8888)
+        ok, reason = gate.check_gate1_process_and_focus()
         self.assertTrue(ok)
         self.assertIn("process_and_focus_ok", reason)
 
     def test_master_gate_bypasses_gate1_when_require_foreground_false(self) -> None:
-        self.gate.set_simulated_game_state(is_running=False)
+        # F-1324: gerçek oyun karesi yokken test boş geçiyordu. Sentetik HUD
+        # karesi her ortamda çalışır; oyun çalışmıyorken bile
+        # require_foreground=False atlaması doğrulanır.
+        gate = GameFrameGate(is_game_running_fn=lambda: False)
+        frame = self._hud_frame()
+        ok, reason = gate.is_valid_game_frame(frame, require_foreground=False)
+        self.assertTrue(ok)
+        self.assertIn("accepted_hud_evidence", reason)
+
+        # Aynı kare, Kapı 1 devredeyken oyun çalışmadığı için reddedilir.
+        ok2, reason2 = gate.is_valid_game_frame(frame, require_foreground=True)
+        self.assertFalse(ok2)
+        self.assertIn("game_not_running", reason2)
+
         if self.real_game_img is not None:
-            # Game is not running, but require_foreground=False allows offline analysis
-            ok, reason = self.gate.is_valid_game_frame(self.real_game_img, require_foreground=False)
-            self.assertTrue(ok)
-            self.assertIn("accepted_hud_evidence", reason)
+            ok3, reason3 = gate.is_valid_game_frame(self.real_game_img, require_foreground=False)
+            self.assertTrue(ok3)
+            self.assertIn("accepted_hud_evidence", reason3)
 
     # ==========================================================================
     # 2. Kapı 2: Visual HUD Evidence Tests
@@ -123,29 +189,23 @@ class TestGameFrameGateSuite(unittest.TestCase):
         self.assertFalse(ok3)
 
     def test_gate2_rejects_synthetic_desktop_canvas(self) -> None:
-        # Wallpaper + bottom taskbar
-        desktop = np.full((1080, 1920, 3), (180, 120, 40), dtype=np.uint8)
-        desktop[1035:, :] = (25, 25, 25)  # dark taskbar strip
+        # Wallpaper + bottom taskbar (tek kaynak: _desktop_canvas)
+        desktop = self._desktop_canvas()
         ok, reason = self.gate.check_gate2_visual_hud(desktop)
         self.assertFalse(ok)
         self.assertTrue("no_hud_evidence" in reason or "desktop" in reason)
 
     def test_gate2_accepts_player_hp_mp_bar(self) -> None:
-        # Create a non-flat frame with a realistic player HP bar in bottom-center
-        h, w = 1080, 1920
-        grad = np.tile(np.linspace(20, 80, w, dtype=np.uint8), (h, 1))
-        frame = cv2.cvtColor(grad, cv2.COLOR_GRAY2BGR)
-        # Draw red HP bar: y=920..936, x=750..950 (width=200, height=16)
-        cv2.rectangle(frame, (750, 920), (950, 936), (20, 20, 220), -1)
+        # _hud_frame zaten alt-ortada gerçekçi HP barı çizer (y=920..936,
+        # x=750..950); aynı kareyi tekrar kurmak yerine onu kullan.
+        frame = self._hud_frame()
         ok, reason = self.gate.check_gate2_visual_hud(frame)
         self.assertTrue(ok)
         self.assertIn("player_red_hp_bar", reason)
 
     def test_gate2_accepts_minimap_compass_arrow(self) -> None:
-        # Create a frame with a bright arrow in center of top-right minimap ROI
-        h, w = 1080, 1920
-        grad = np.tile(np.linspace(20, 80, w, dtype=np.uint8), (h, 1))
-        frame = cv2.cvtColor(grad, cv2.COLOR_GRAY2BGR)
+        # Taban kare _hud_frame'den; yalnızca minimap oku eklenir.
+        frame = self._hud_frame()
         # Radar center is at (1650, 195)
         pts = np.array([[1650, 185], [1640, 205], [1660, 205]], dtype=np.int32)
         cv2.fillPoly(frame, [pts], (250, 250, 250))
@@ -154,7 +214,13 @@ class TestGameFrameGateSuite(unittest.TestCase):
         self.assertIn("accepted_hud_evidence", reason)
 
     def test_gate2_accepts_skill_bar_slots(self) -> None:
-        frame = np.full((1080, 1920, 3), 30, dtype=np.uint8)
+        # Taban kare _hud_frame'den (gradyan zemin): düz koyu zemin
+        # (np.full 30) alt şeridi tekdüze karanlık gösterip kasıtlı
+        # Windows-görev-çubuğu vetosunu (F-0956) tetikliyordu — Kapı 2
+        # skill-bar kanıtına hiç bakmadan reddediyordu. Gerçek oyun
+        # karesinde alt şerit asla tekdüze değildir; kardeş kabul
+        # testleri de aynı gradyan tabanı kullanır.
+        frame = self._hud_frame()
         # Draw 4 aligned skill slot boxes at y=980
         for i in range(4):
             x = 600 + i * 60
@@ -164,32 +230,63 @@ class TestGameFrameGateSuite(unittest.TestCase):
         self.assertIn("skill_bar_slots", reason)
 
     def test_gate2_accepts_real_dataset_screenshot(self) -> None:
-        if self.real_game_img is not None:
-            ok, reason = self.gate.check_gate2_visual_hud(self.real_game_img)
-            self.assertTrue(ok)
-            self.assertIn("accepted_hud_evidence", reason)
+        # S-3502: dataset/ audit kopyasında yokken bu test sıfır assertion
+        # ile geçiyordu. Sentetik HUD karesi (_hud_frame) her ortamda
+        # Kapı 2'den geçer; gerçek kare varsa o da ayrıca doğrulanır.
+        frame = self._hud_frame()
+        ok, reason = self.gate.check_gate2_visual_hud(frame)
+        self.assertTrue(ok)
+        self.assertIn("accepted_hud_evidence", reason)
+
+        if self.real_game_img is None:
+            # Gerçek örnek yokken sessizce geçmek sahte yeşildir: sentetik
+            # kare yukarıda doğrulandı, ama gerçek-kare kısmı yapılmadı —
+            # bunu açıkça atla olarak işaretle.
+            self.skipTest("gerçek oyun örneği yok: dataset/images/train/boot_478467_000_aria_3d_crest_far.jpg")
+        ok, reason = self.gate.check_gate2_visual_hud(self.real_game_img)
+        self.assertTrue(ok)
+        self.assertIn("accepted_hud_evidence", reason)
 
     # ==========================================================================
     # 3. Kapı 3: Visual Novelty & dHash Tests
     # ==========================================================================
     def test_gate3_dhash_calculation_and_hamming_distance(self) -> None:
         img1 = np.zeros((100, 100, 3), dtype=np.uint8)
-        img2 = np.zeros((100, 100, 3), dtype=np.uint8)
-        # Draw horizontal ramp
-        for x in range(100):
-            img2[:, x] = x * 2
+        # Yatay rampa, vektörize: her sütun x*2 (x=0..99), 3 kanala yayılır.
+        img2 = np.tile((np.arange(100, dtype=np.uint8) * 2).reshape(1, 100, 1), (100, 1, 3))
 
         h1 = GameFrameGate.compute_dhash(img1)
         h2 = GameFrameGate.compute_dhash(img2)
         self.assertIsInstance(h1, int)
         self.assertIsInstance(h2, int)
         dist = GameFrameGate.hamming_distance(h1, h2)
-        self.assertGreaterEqual(dist, 0)
+        # F-1407: assertGreaterEqual(dist, 0) her zaman doğruydu. Düz siyah
+        # karenin hash'i 0'dır; yatay rampa 9x8 gradyanın 64 bitini de çevirir.
+        self.assertEqual(h1, 0)
+        self.assertGreater(dist, 0)
+        self.assertEqual(dist, 64)
         self.assertEqual(GameFrameGate.hamming_distance(h1, h1), 0)
 
     def test_gate3_rejects_identical_and_duplicate_frames(self) -> None:
+        # S-3501: gerçek kare yokken test assertion'sız dönüyordu.
+        # Kapı 3 yalnızca dHash'e bakar; sentetik kareyle duplicate
+        # reddi (distance 0 < 6) her ortamda doğrulanır. Gerçek kare
+        # varsa aynı senaryo onunla da tekrarlanır.
+        self.gate.clear_hash_cache()
+        frame = self._hud_frame()
+        ok1, _ = self.gate.check_gate3_visual_novelty(frame, update_cache=True)
+        self.assertTrue(ok1)
+        self.assertEqual(self.gate.hash_cache_size, 1)
+
+        # Same frame -> distance 0 < 6 -> rejected
+        ok2, r2 = self.gate.check_gate3_visual_novelty(frame, update_cache=True)
+        self.assertFalse(ok2)
+        self.assertIn("duplicate_frame", r2)
+        self.assertIn("0 < 6", r2)
+
         if self.real_game_img is None:
-            return
+            # Gerçek örnek yokken sessizce geçmek sahte yeşildir.
+            self.skipTest("gerçek oyun örneği yok: dataset/images/train/boot_478467_000_aria_3d_crest_far.jpg")
         self.gate.clear_hash_cache()
         ok1, _ = self.gate.check_gate3_visual_novelty(self.real_game_img, update_cache=True)
         self.assertTrue(ok1)
@@ -219,6 +316,12 @@ class TestGameFrameGateSuite(unittest.TestCase):
     # 4. Factory Controller Ingestion Hardening Tests
     # ==========================================================================
     def test_factory_controller_drops_black_live_capture(self) -> None:
+        # F-1406: tembel içe aktarma — bu dosya factory_controller olmadan
+        # da toplanabilsin; bağımlılık yoksa test kendini atlar.
+        try:
+            from dataset_factory.factory_controller import AutoLabelingDatasetFactory
+        except ImportError as exc:
+            self.skipTest(f"factory_controller içe aktarılamadı: {exc}")
         fc = AutoLabelingDatasetFactory(project_root=".")
         black = np.zeros((720, 1280, 3), dtype=np.uint8)
 
@@ -252,9 +355,8 @@ class TestGameFrameGateSuite(unittest.TestCase):
                 cv2.imwrite(str(train_img / "valid_aria.jpg"), self.real_game_img)
                 (train_lbl / "valid_aria.txt").write_text("0 0.5 0.5 0.1 0.1\n")
 
-            # Invalid desktop screenshot
-            desktop = np.full((1080, 1920, 3), (180, 120, 40), dtype=np.uint8)
-            desktop[1035:, :] = (25, 25, 25)
+            # Invalid desktop screenshot (tek kaynak: _desktop_canvas)
+            desktop = self._desktop_canvas()
             cv2.imwrite(str(val_img / "desktop_capture.jpg"), desktop)
             (val_lbl / "desktop_capture.txt").write_text("10 0.2 0.2 0.1 0.1\n")
 
@@ -330,10 +432,28 @@ class TestGameFrameGateSuite(unittest.TestCase):
         self.assertFalse(ok_hud)
         self.assertIn("black_frame", r_hud)
 
-        # check_process_and_focus on current workstation
-        ok_proc, r_proc = check_process_and_focus()
-        self.assertIsInstance(ok_proc, bool)
-        self.assertIsInstance(r_proc, str)
+        # F-1408: check_process_and_focus artık yalnızca tip kontrolü yapmıyor.
+        # Varsayılan kapının simüle durumu yoktur; oyun süreci ve ön plan
+        # penceresi mock sınırıyla verilir, gerçek Kapı 1 kararı doğrulanır.
+        gate = get_default_frame_gate()
+        with mock.patch.object(gate, "is_game_running_fn", return_value=False):
+            ok_proc, r_proc = check_process_and_focus()
+            self.assertFalse(ok_proc)
+            self.assertIn("game_not_running", r_proc)
+        with mock.patch.object(gate, "is_game_running_fn", return_value=True):
+            with mock.patch.object(
+                gate.focus_guard,
+                "query_foreground_window_info",
+                return_value=(1234, 8888, "AION2 Client 64-bit"),
+            ):
+                with mock.patch.object(
+                    gate.focus_guard,
+                    "is_game_window_focused",
+                    return_value=(True, "AION2 Client 64-bit (PID=8888)"),
+                ):
+                    ok_proc2, r_proc2 = check_process_and_focus()
+                    self.assertTrue(ok_proc2)
+                    self.assertIn("process_and_focus_ok", r_proc2)
 
         # check_visual_novelty
         img = np.full((100, 100, 3), 50, dtype=np.uint8)

@@ -11,11 +11,14 @@ Verifies rejection of:
 
 from __future__ import annotations
 
+import os
+from functools import lru_cache
 from pathlib import Path
 import sys
 
 import cv2
 import numpy as np
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -24,8 +27,34 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset_factory.game_frame_gate import GameFrameGate
 
 
-def _make_valid_game_frame(seed: int = 42, width: int = 1280, height: int = 720) -> np.ndarray:
-    """Builds a synthetic 720p gameplay frame with natural 3D texture and a valid player red HP bar."""
+class _Win32ForegroundStub:
+    """Win32 `GetForegroundWindow`/`GetWindowTextW` biçiminde (hwnd, pid, title)
+    döndüren odak koruyucusu — `set_simulated_game_state` kullanmadan Gate 1'in
+    gerçek (hwnd, pid, title) protokolünü tükettiğini kanıtlar."""
+
+    def __init__(self, title: str, pid: int = 424242) -> None:
+        self._title = title
+        self._pid = pid
+
+    def query_foreground_window_info(self):
+        return (1234, self._pid, self._title)
+
+    def is_game_window_focused(self, allow_gatherion_ui: bool = True):
+        title_lower = self._title.lower().strip()
+        if title_lower in ("program manager", "desktop", "masaüstü"):
+            return False, f"Masaüstü odakta: '{self._title}' (PID={self._pid})"
+        if "aion" in title_lower:
+            return True, f"{self._title} (PID={self._pid})"
+        return False, f"Unrecognized foreground window: '{self._title}' (PID={self._pid})"
+
+
+def _build_valid_game_frame(seed: int = 42, width: int = 1280, height: int = 720) -> np.ndarray:
+    """Builds a synthetic 720p gameplay frame with natural 3D texture and a valid player red HP bar.
+
+    NOTE: the RNG + sin/cos meshgrid build costs ~1.7 s per frame, and the
+    suite builds the same seeds repeatedly (seed 10 in three tests, seed 20
+    in two). The build is therefore cached; see _make_valid_game_frame.
+    """
     rng = np.random.default_rng(seed)
     frame = rng.integers(35, 165, size=(height, width, 3), dtype=np.uint8)
 
@@ -48,6 +77,19 @@ def _make_valid_game_frame(seed: int = 42, width: int = 1280, height: int = 720)
     # Pure bright red in BGR -> HSV ~(0, 255, 220)
     frame[bar_y1:bar_y2, bar_x1:bar_x2] = (0, 0, 220)
     return frame
+
+
+@lru_cache(maxsize=16)
+def _cached_valid_game_frame(seed: int = 42, width: int = 1280, height: int = 720) -> np.ndarray:
+    return _build_valid_game_frame(seed=seed, width=width, height=height)
+
+
+def _make_valid_game_frame(seed: int = 42, width: int = 1280, height: int = 720) -> np.ndarray:
+    """Cached build: same (seed, size) returns an equal frame without
+    rebuilding (~1.7 s saved per repeat). The copy matters: callers mutate
+    frames in place (duplicate-frame perturbation, taskbar strip), and the
+    cached base must never leak a mutation into another test."""
+    return _cached_valid_game_frame(seed=seed, width=width, height=height).copy()
 
 
 def _make_smooth_wallpaper_canvas(width: int = 1280, height: int = 720) -> np.ndarray:
@@ -181,12 +223,88 @@ def test_gate_accepts_distinct_valid_game_frames_and_rejects_no_hud() -> None:
     assert gate.stats["accepted"] == 2
 
     # Non-HUD mid-tone gradient frame without any AION UI elements
-    yy, xx = np.meshgrid(
-        np.linspace(60, 140, 720, dtype=np.uint8),
-        np.linspace(70, 150, 1280, dtype=np.uint8),
-        indexing="ij",
-    )
-    no_hud_frame = np.stack([xx, yy, ((xx.astype(np.uint16) + yy.astype(np.uint16)) // 2).astype(np.uint8)], axis=-1)
+    # (same smooth-wallpaper builder as the desktop-canvas test; the
+    # inline meshgrid here used to duplicate it with near-identical ranges).
+    no_hud_frame = _make_smooth_wallpaper_canvas(1280, 720)
     ok_no_hud, reason_no_hud = gate.is_valid_game_frame(no_hud_frame, require_foreground=True, require_novelty=True)
     assert ok_no_hud is False
     assert "no_hud_evidence" in reason_no_hud
+
+
+def test_frame_cache_returns_independent_copies() -> None:
+    """The _make_valid_game_frame cache must never leak an in-place
+    mutation from one test into another: two builds of the same seed are
+    equal but independent arrays."""
+    first = _make_valid_game_frame(seed=10)
+    second = _make_valid_game_frame(seed=10)
+    assert np.array_equal(first, second)
+    assert first is not second
+    first[0, 0] = (255, 255, 255)
+    third = _make_valid_game_frame(seed=10)
+    assert np.array_equal(third, second)
+    assert not np.array_equal(third, first)
+    """Gate 1 `set_simulated_game_state` olmadan da doğrulanır: gerçek foreground
+    sorgusu ve enjekte edilen oyun-durumu fonksiyonu üzerinden reddetme/kabul."""
+    if os.name == "nt":
+        pytest.skip("Gerçek Win32 foreground sorgusu yalnızca Windows'ta anlamlıdır")
+
+    # (a) Gerçek ForegroundFocusGuard, simülasyon yok: Linux'ta Win32 olmadığı için
+    # query_foreground_window_info() (0, 0, "") döner ve Gate 1 foreground_empty
+    # ile reddeder — simüle edilmiş "Program Manager" başlığı kullanılmaz.
+    gate = GameFrameGate(is_game_running_fn=lambda: True)
+    assert gate.focus_guard.query_foreground_window_info() == (0, 0, "")
+    ok, reason = gate.check_gate1_process_and_focus()
+    assert ok is False
+    assert "foreground_empty" in reason
+
+    valid_frame = _make_valid_game_frame(seed=10)
+    ok_frame, reason_frame = gate.is_valid_game_frame(valid_frame, require_foreground=True)
+    assert ok_frame is False
+    assert "foreground_empty" in reason_frame
+    assert gate.stats["rejected_gate1_process_or_focus"] == 1
+
+    # (b) Oyun çalışmıyorken (enjekte edilen fonksiyon) Gate 1 game_not_running döner.
+    stopped_gate = GameFrameGate(is_game_running_fn=lambda: False)
+    ok_stopped, reason_stopped = stopped_gate.check_gate1_process_and_focus()
+    assert ok_stopped is False
+    assert "game_not_running" in reason_stopped
+
+
+def test_gate1_consumes_win32_shaped_foreground_report_without_simulation() -> None:
+    """Gate 1, Win32'nin döndürdüğü (hwnd, pid, title) raporunu simülasyon
+    yardımcısı olmadan tüketir: masaüstü başlığı reddedilir, AION 2 başlığı
+    geçerli kareyi kabul ettirir."""
+    # Masaüstü odakta: Gate 1 desktop_focused ile reddeder.
+    desktop_gate = GameFrameGate(
+        focus_guard=_Win32ForegroundStub("Program Manager"),
+        is_game_running_fn=lambda: True,
+    )
+    ok_desktop, reason_desktop = desktop_gate.is_valid_game_frame(
+        _make_valid_game_frame(seed=10), require_foreground=True
+    )
+    assert ok_desktop is False
+    assert "desktop_focused" in reason_desktop
+    assert desktop_gate.stats["rejected_gate1_process_or_focus"] == 1
+
+    # Tarayıcı odakta: Gate 1 blocked_foreground_window ile reddeder.
+    browser_gate = GameFrameGate(
+        focus_guard=_Win32ForegroundStub("New Tab - Google Chrome"),
+        is_game_running_fn=lambda: True,
+    )
+    ok_browser, reason_browser = browser_gate.is_valid_game_frame(
+        _make_valid_game_frame(seed=20), require_foreground=True
+    )
+    assert ok_browser is False
+    assert "blocked_foreground_window" in reason_browser
+
+    # Oyun odakta: Gate 1 geçer, geçerli kare kabul edilir.
+    game_gate = GameFrameGate(
+        focus_guard=_Win32ForegroundStub("AION 2"),
+        is_game_running_fn=lambda: True,
+    )
+    ok_game, reason_game = game_gate.is_valid_game_frame(
+        _make_valid_game_frame(seed=30), require_foreground=True, require_novelty=True
+    )
+    assert ok_game is True
+    assert "valid_game_frame" in reason_game
+    assert game_gate.stats["accepted"] == 1

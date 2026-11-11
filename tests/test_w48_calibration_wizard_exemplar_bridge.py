@@ -146,6 +146,10 @@ def test_2_calibrated_rois_hot_reload_and_alias_resolution_across_consumers(
     Test 2: Verify that pre-initialized `CalibratedRoisManager` and `SkillBarReader`
     instances immediately detect disk writes from `save_calibrated_roi`, hot-reload
     normalized coordinates, resolve ROI aliases, and extract accurate pixel crops.
+
+    Hot-reload is verified with genuine successive disk writes only: no artificial
+    mtime push is used (D89/F-2057). The second write must be picked up by the
+    already-running managers purely from the natural mtime change.
     """
     base_dir: Path = w48_sandbox["base_dir"]
     rois_path: Path = w48_sandbox["rois_path"]
@@ -156,7 +160,10 @@ def test_2_calibrated_rois_hot_reload_and_alias_resolution_across_consumers(
     assert rois_mgr.has_roi("target_hp_bar") is False
     assert skill_reader.current_skill_bar_roi == SkillBarReader.DEFAULT_SKILL_BAR_ROI
 
-    # Save target_hp_bar and full-width skill_bar via calibration wizard bridge
+    # Save target_hp_bar and full-width skill_bar via calibration wizard bridge.
+    # NOTE (D89/F-2047): target_hp_bar is class 18 in the canonical taxonomy
+    # (dataset_factory/class_taxonomy.py) and in CalibrationWizard.TEMPLATE_TARGETS;
+    # an earlier draft used 20 here (the legacy minimap_player_arrow id).
     ok_hp = save_calibrated_roi(
         base_dir=base_dir,
         key="target_hp_bar",
@@ -167,7 +174,7 @@ def test_2_calibrated_rois_hot_reload_and_alias_resolution_across_consumers(
         norm_h=0.030,
         bbox_px=(730, 49, 460, 32),
         resolution=(1920, 1080),
-        yolo_class_id=20,
+        yolo_class_id=18,
         class_name="target_hp_bar",
     )
     ok_sb = save_calibrated_roi(
@@ -184,13 +191,32 @@ def test_2_calibrated_rois_hot_reload_and_alias_resolution_across_consumers(
         class_name="skill_ui_prompt",
     )
     assert ok_hp is True and ok_sb is True
-    _touch_future_mtime(rois_path)
 
-    # Without recreating rois_mgr, verify instant reload and alias lookup ('mob_nameplate' -> 'target_hp_bar')
+    # No _touch_future_mtime here: the managers must pick up the real disk
+    # writes above from their natural mtime change alone (D89/F-2057).
     assert rois_mgr.has_roi("target_hp_bar") is True
     assert rois_mgr.has_roi("mob_nameplate") is True
     rect_hp = rois_mgr.get_normalized_rect("mob_nameplate")
     assert rect_hp == pytest.approx((0.380, 0.045, 0.620, 0.075), abs=1e-4)
+
+    # A second, later disk write must also hot-reload without any mtime help:
+    # the pre-initialized manager tracks successive real writes.
+    ok_player_hp = save_calibrated_roi(
+        base_dir=base_dir,
+        key="player_hp_bar",
+        target_name="Oyuncu Can (HP) Barı Kes",
+        norm_x=0.345,
+        norm_y=0.880,
+        norm_w=0.140,
+        norm_h=0.030,
+        bbox_px=(662, 950, 269, 32),
+        resolution=(1920, 1080),
+        yolo_class_id=16,
+        class_name="player_hp_bar",
+    )
+    assert ok_player_hp is True
+    assert rois_mgr.has_roi("player_hp_bar") is True
+    assert rois_mgr.get_roi_entry("player_hp_bar")["yolo_class_id"] == 16
 
     # Verify pixel crop extraction matches the calibrated ROI region
     frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
@@ -240,7 +266,11 @@ def test_3_exemplar_memory_hot_reload_and_similarity_matching_from_wizard(
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     assert reloaded is True
-    assert elapsed_ms < 50.0, f"ExemplarMemory hot-reload took {elapsed_ms:.2f}ms (expected < 50ms)"
+    # Generous smoke bound only: hot-reload of a tiny JSON file is normally a few
+    # ms, but the exact figure is machine/load dependent (D89/F-2067). A 50 ms
+    # hard bound failed on slow or loaded machines; 1000 ms still catches a
+    # genuinely broken (e.g. full-rescan) reload path.
+    assert elapsed_ms < 1000.0, f"ExemplarMemory hot-reload took {elapsed_ms:.2f}ms (expected < 1000ms)"
     assert mem.has_positive_exemplars(class_id=3) is True
 
     stats = mem.get_stats()
@@ -288,19 +318,46 @@ def test_4_wizard_template_matching_and_registered_dataset_hand_label_bridge(
         out_path = wizard.save_cropped_region_as_template()
         assert out_path is not None and Path(out_path).exists()
 
-        # Run live template matching test inside the wizard
+        # Run live template matching test inside the wizard (self-match baseline)
         match_res = wizard.test_template_matching()
         assert match_res["found"] is True
         assert match_res["score"] >= 0.95
         assert match_res["bbox"] == (bx, by, bw, bh)
 
+        # Held-out frame check (D89/F-2058): the same pill, translated to a new
+        # position on a different background with distractor shapes, must still
+        # be found at its NEW location. Matching only the frame the template
+        # was cut from proves nothing about localization on unseen frames.
+        frame2 = np.full((720, 1280, 3), 55, dtype=np.uint8)
+        cv2.rectangle(frame2, (100, 100), (300, 200), (90, 90, 90), -1)
+        cv2.circle(frame2, (1000, 600), 40, (60, 60, 60), -1)
+        bx2, by2 = 180, 520
+        frame2[by2 : by2 + bh, bx2 : bx2 + bw] = pill
+
+        wizard.canvas.set_image(frame2)
+        held_out_res = wizard.test_template_matching()
+        assert held_out_res["found"] is True
+        assert held_out_res["score"] >= 0.95
+        assert held_out_res["bbox"] == (bx2, by2, bw, bh)
+
         # Verify ROI & ExemplarMemory bridge
         rois_mgr = CalibratedRoisManager(json_path=rois_path)
         assert rois_mgr.has_roi("gather_prompt") is True
-        assert rois_mgr.get_roi_entry("gather_prompt")["yolo_class_id"] == 7
+        # P0-2 (K-11): wizard artık kanonik id 13 (skill_ui_prompt) yazar —
+        # eski id 7, data.yaml'da herb_lumina'dır; 7 ile yazılan her etiket
+        # "lumina bitkisi" diye zehirlenirdi (ui/calibration_wizard.py
+        # TEMPLATE_TARGETS, "F/E Toplama Butonu Şablonu Kes").
+        assert rois_mgr.get_roi_entry("gather_prompt")["yolo_class_id"] == 13
 
         mem = ExemplarMemory(json_path=exemplars_path)
-        assert mem.has_positive_exemplars(class_id=7) is True
+        # Kanonik id: wizard (13, 'skill_ui_prompt') yazar; ExemplarMemory
+        # ayrıca legacy 7'yi de 13'e remap'ler
+        # (dataset_factory/class_taxonomy.py LEGACY_YOLO_CLASS_TO_CANONICAL,
+        # 7 -> 13; exemplar_memory.py _canonicalize_exemplar_class).
+        # O yüzden pozitif exemplar 13'te aranır; 7'de exemplar yoktur.
+        assert mem.has_positive_exemplars(class_id=7) is False
+        assert mem.has_positive_exemplars(class_id=13) is True
+        assert mem.get_positive_exemplars(class_id=13)[0]["class_name"] == "skill_ui_prompt"
 
         # Verify trusted hand-label registration in dataset/
         labels_dir = base_dir / "dataset" / "labels" / "train"
@@ -313,7 +370,8 @@ def test_4_wizard_template_matching_and_registered_dataset_hand_label_bridge(
         rev_payload = json.loads(rev_files[0].read_text(encoding="utf-8"))
         assert rev_payload["hand_label"] is True
         assert len(rev_payload["trusted"]) == 1
-        assert rev_payload["trusted"][0]["class_id"] == 7
+        # P0-2 (K-11): hand-label da kanonik 13 (skill_ui_prompt) taşır.
+        assert rev_payload["trusted"][0]["class_id"] == 13
         assert rev_payload["trusted"][0]["trusted"] is True
     finally:
         wizard.close()
@@ -373,9 +431,15 @@ def test_5_auto_calibrate_loaded_frame_end_to_end_rois_and_exemplars_sync(
         assert rois_mgr.has_roi("player_mp_bar") is True
         assert rois_mgr.has_roi("target_hp_bar") is True
 
-        # Verify immediate hot-reload in ExemplarMemory (classes 16, 17, 20)
+        # Verify immediate hot-reload in ExemplarMemory (classes 16, 17, 18).
+        # NOTE (D89/F-2047): target_hp_bar is class 18 in the canonical taxonomy
+        # (dataset_factory/class_taxonomy.py) and in CalibrationWizard.TEMPLATE_TARGETS;
+        # this test previously expected class 20 (the legacy minimap_player_arrow
+        # id), so the target-HP exemplar "never synced" although the wizard had
+        # saved it under class 18 all along.
         assert mem.has_positive_exemplars(class_id=16) is True
         assert mem.has_positive_exemplars(class_id=17) is True
-        assert mem.has_positive_exemplars(class_id=20) is True
+        assert mem.has_positive_exemplars(class_id=18) is True
+        assert rois_mgr.get_roi_entry("target_hp_bar")["yolo_class_id"] == 18
     finally:
         wizard.close()

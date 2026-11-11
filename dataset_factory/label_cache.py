@@ -33,6 +33,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import tempfile
 import threading
 import time
 from typing import (
@@ -58,19 +59,68 @@ DEFAULT_CACHE_PATH = PROJECT_ROOT / "dataset" / ".label_cache.json"
 DEFAULT_EXEMPLAR_PATH = PROJECT_ROOT / "dataset" / "learned_exemplars.json"
 
 
-def imread_unicode(path: Union[str, Path], flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndarray]:
-    """Safely decode an image file from disk supporting Windows Unicode paths."""
+# F-2000: use the canonical unicode-safe decoder from lru_frame_cache
+# instead of a local duplicate (same behaviour for valid images: ASCII
+# fast-path via cv2.imread, np.fromfile + cv2.imdecode fallback for
+# non-ASCII paths; None for missing/empty/undecodable files).
+from dataset_factory.lru_frame_cache import imread_unicode
+
+
+def _safe_class_id(value: Any, default: int = -1) -> int:
+    """Best-effort int() for class ids; returns `default` for non-numeric values."""
     try:
-        p = Path(path)
-        if not p.is_file():
-            return None
-        data = np.fromfile(str(p), dtype=np.uint8)
-        if data is None or data.size == 0:
-            return None
-        return cv2.imdecode(data, flags)
-    except Exception as exc:
-        logger.debug("imread_unicode failed for %s: %s", path, exc)
-        return None
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_confidence(value: Any, default: float = 0.0) -> float:
+    """Best-effort float() for confidences; returns `default` for non-numeric
+    (e.g. 'high' loaded from a disk cache) or non-finite values.
+
+    S-2103: a single non-numeric confidence in a cached candidate crop used
+    to raise ValueError and abort the whole file's delta relabel, even
+    though only the class_id parse was guarded. Callers pass the same
+    default they previously used with float(c.get("confidence", <default>)).
+    """
+    try:
+        conf = float(value)
+    except (TypeError, ValueError):
+        logger.warning("Non-numeric confidence %r; using default %s", value, default)
+        return default
+    if conf != conf or conf in (float("inf"), float("-inf")):
+        logger.warning("Non-finite confidence %r; using default %s", value, default)
+        return default
+    return conf
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Best-effort int() for cache metadata; returns `default` for non-numeric
+    values instead of raising.
+
+    S-5601: LabelCacheEntry.from_dict used bare int()/float() conversions, so
+    one corrupt value (e.g. file_mtime_ns='abc') raised and aborted the
+    whole cache load. Same guarded pattern as _safe_confidence (S-2103).
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Non-numeric int value %r; using default %s", value, default)
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Best-effort float() for cache metadata; returns `default` for
+    non-numeric or non-finite values instead of raising (S-5601)."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Non-numeric float value %r; using default %s", value, default)
+        return default
+    if val != val or val in (float("inf"), float("-inf")):
+        logger.warning("Non-finite float value %r; using default %s", value, default)
+        return default
+    return val
 
 
 def get_current_exemplar_revision(
@@ -134,15 +184,50 @@ class LabelCacheEntry:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], default_path: str = "") -> "LabelCacheEntry":
-        """Instantiate entry from a dictionary, supporting both new and legacy keys."""
+        """Instantiate entry from a dictionary, supporting both new and legacy keys.
+
+        S-5601: every conversion is guarded (_safe_int/_safe_float, dict/list
+        type checks) so a single corrupt value degrades to its default
+        instead of raising and aborting the whole cache load in load().
+        This method never raises for malformed field values.
+        """
+        if not isinstance(data, dict):
+            logger.warning(
+                "LabelCacheEntry.from_dict got non-dict data (%r); using defaults",
+                type(data).__name__,
+            )
+            data = {}
         path = str(data.get("file_path") or default_path or "")
-        mtime_ns = int(data.get("file_mtime_ns", data.get("mtime_ns", 0)))
-        size = int(data.get("file_size", data.get("size", 0)))
-        ex_rev = int(data.get("exemplar_revision", data.get("exemplar_rev", 0)))
-        box_count = int(data.get("box_count", 0))
-        candidate_crops = list(data.get("candidate_crops", []))
-        updated_at = float(data.get("updated_at", time.time()))
-        metadata = dict(data.get("metadata", {}))
+        mtime_ns = _safe_int(data.get("file_mtime_ns", data.get("mtime_ns", 0)), 0)
+        size = _safe_int(data.get("file_size", data.get("size", 0)), 0)
+        ex_rev = _safe_int(data.get("exemplar_revision", data.get("exemplar_rev", 0)), 0)
+        box_count = _safe_int(data.get("box_count", 0), 0)
+        raw_crops = data.get("candidate_crops", [])
+        if isinstance(raw_crops, (list, tuple)):
+            candidate_crops = [c for c in raw_crops if isinstance(c, dict)]
+            if len(candidate_crops) != len(raw_crops):
+                logger.warning(
+                    "Dropped %d non-dict candidate crop(s) for %r",
+                    len(raw_crops) - len(candidate_crops),
+                    path,
+                )
+        else:
+            logger.warning(
+                "Non-list candidate_crops %r for %r; using empty list",
+                raw_crops,
+                path,
+            )
+            candidate_crops = []
+        default_ts = time.time()
+        updated_at = _safe_float(data.get("updated_at", default_ts), default_ts)
+        raw_metadata = data.get("metadata", {})
+        if isinstance(raw_metadata, dict):
+            metadata = dict(raw_metadata)
+        else:
+            logger.warning(
+                "Non-dict metadata %r for %r; using empty dict", raw_metadata, path
+            )
+            metadata = {}
 
         return cls(
             file_path=path,
@@ -213,6 +298,14 @@ class LabelCache:
 
         self._lock = threading.RLock()
         self._entries: Dict[str, LabelCacheEntry] = {}
+        # Basename -> set of internal keys. The legacy bare-filename lookup
+        # in get_entry() used to scan every entry (O(n) per cache miss);
+        # the index keeps it O(1). It is keyed by BOTH the entry file
+        # basename and the internal-key basename, mirroring the old
+        # predicate (see _index_names_for), and is maintained at every
+        # mutation site (load / record_label / remove_entry / clear /
+        # __setitem__).
+        self._by_basename: Dict[str, Set[str]] = {}
         self._dirty: bool = False
 
         self.load()
@@ -228,45 +321,187 @@ class LabelCache:
                     return False
                 data = json.loads(raw_text)
                 if not isinstance(data, dict):
+                    logger.warning("Label cache %s is not a JSON object; backing it up", self.cache_path)
+                    self._backup_corrupt_cache()
                     return False
 
                 entries: Dict[str, LabelCacheEntry] = {}
+                skipped_malformed = 0
                 for key, val in data.items():
-                    if isinstance(val, dict):
+                    if not isinstance(val, dict):
+                        continue
+                    # S-5601: one corrupt entry must not abort the whole
+                    # load (the outer except would move the entire file
+                    # aside as .corrupt-* and drop every delta entry).
+                    # from_dict is guarded, but never let an unexpected
+                    # error in a single entry lose the rest of the cache.
+                    try:
                         entry = LabelCacheEntry.from_dict(val, default_path=key)
-                        entries[key] = entry
+                    except Exception as exc:
+                        # One malformed entry must not wipe the whole
+                        # cache (previously the outer except backed up
+                        # and dropped every entry). Skip it, keep the
+                        # healthy ones, and mark dirty so the next save
+                        # drops the bad entry (self-heal).
+                        logger.warning(
+                            "Skipping malformed label cache entry %r: %s", key, exc
+                        )
+                        skipped_malformed += 1
+                        continue
+                    # Re-key by resolved absolute path (old files are
+                    # keyed by bare filename — see _normalize_key).
+                    new_key = (
+                        self._normalize_key(entry.file_path)
+                        if entry.file_path
+                        else self._normalize_key(key)
+                    )
+                    prev = entries.get(new_key)
+                    if prev is None or entry.updated_at >= prev.updated_at:
+                        entries[new_key] = entry
 
                 self._entries = entries
-                self._dirty = False
+                self._rebuild_basename_index()
+                # _dirty=True only when entries were dropped, so the next
+                # save persists the healed cache; a clean load stays clean.
+                self._dirty = skipped_malformed > 0
                 logger.debug(
                     "Loaded %d label cache entries from %s", len(self._entries), self.cache_path
                 )
                 return True
             except Exception as exc:
                 logger.warning("Failed to load label cache from %s: %s", self.cache_path, exc)
+                self._backup_corrupt_cache()
                 return False
+
+    # -- basename index (see __init__) -------------------------------------
+    def _index_names_for(self, key: str, entry: Optional[LabelCacheEntry]) -> Set[str]:
+        """Basenames under which (key, entry) is findable by get_entry().
+
+        Mirrors the old linear-scan predicate exactly: an entry matched
+        when the queried name equalled the entry file's basename OR the
+        internal key's basename.
+        """
+        names: Set[str] = set()
+        if entry is not None:
+            base = Path(entry.file_path).name
+            if base:
+                names.add(base)
+        key_base = Path(key).name
+        if key_base:
+            names.add(key_base)
+        return names
+
+    def _index_add(self, key: str, entry: LabelCacheEntry) -> None:
+        for name in self._index_names_for(key, entry):
+            self._by_basename.setdefault(name, set()).add(key)
+
+    def _index_remove(self, key: str, entry: Optional[LabelCacheEntry]) -> None:
+        for name in self._index_names_for(key, entry):
+            bucket = self._by_basename.get(name)
+            if bucket is not None:
+                bucket.discard(key)
+                if not bucket:
+                    del self._by_basename[name]
+
+    def _rebuild_basename_index(self) -> None:
+        self._by_basename = {}
+        for key, entry in self._entries.items():
+            self._index_add(key, entry)
+
+    def _backup_corrupt_cache(self) -> None:
+        """
+        Preserve a corrupt cache file instead of silently wiping history:
+        move it aside as `<name>.corrupt-<timestamp>` so the entries can
+        still be recovered. In-memory entries are left untouched; they are
+        marked dirty (when non-empty) so the next save persists them.
+        """
+        try:
+            if self.cache_path.is_file() and self.cache_path.stat().st_size > 0:
+                backup = self.cache_path.with_name(
+                    f"{self.cache_path.name}.corrupt-{int(time.time())}"
+                )
+                self.cache_path.replace(backup)
+                logger.warning("Backed up corrupt label cache to %s", backup)
+                if self._entries:
+                    self._dirty = True
+        except Exception as exc:  # never let the backup break loading
+            logger.debug("Failed to back up corrupt label cache: %s", exc)
+
+    def _persist_keys(self) -> Dict[str, str]:
+        """
+        Map internal keys to JSON keys: the bare filename when it is unique
+        among entries (backward compatible with existing .label_cache.json
+        files and their tests), the full resolved path when two entries
+        share a filename (the F-0803 collision case).
+        """
+        counts: Dict[str, int] = {}
+        for entry in self._entries.values():
+            base = Path(entry.file_path).name
+            if base:
+                counts[base] = counts.get(base, 0) + 1
+        out: Dict[str, str] = {}
+        for key, entry in self._entries.items():
+            base = Path(entry.file_path).name
+            out[key] = base if base and counts.get(base, 0) == 1 else key
+        return out
 
     def save(self, force: bool = False) -> bool:
         """
         Atomically persist cache entries to JSON on disk.
-        Uses a temporary file and replace to guarantee no corrupted writes.
+
+        Uses a uniquely-named temporary file in the same directory +
+        os.replace, so two processes (or threads) saving the same cache
+        can no longer interleave into one shared `<name>.json.tmp` file
+        and publish a torn JSON. The temp file is fsynced before the
+        rename, and the directory is fsynced best-effort afterwards, so
+        a completed save() survives a crash; a failed save never leaves
+        a partial cache behind (the temp file is removed).
         """
         with self._lock:
             if not self._dirty and not force:
                 return True
             try:
                 self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+                persist_keys = self._persist_keys()
                 payload: Dict[str, Any] = {
-                    key: entry.to_dict() for key, entry in self._entries.items()
+                    persist_keys[key]: entry.to_dict()
+                    for key, entry in self._entries.items()
                 }
+                text = json.dumps(payload, ensure_ascii=False, indent=2)
 
-                tmp_path = self.cache_path.with_suffix(".json.tmp")
-                tmp_path.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                # Preserve the existing cache file's mode (default 0644).
+                try:
+                    mode = self.cache_path.stat().st_mode & 0o777
+                except OSError:
+                    mode = 0o644
+
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f".{self.cache_path.name}.",
+                    suffix=".tmp",
+                    dir=str(self.cache_path.parent),
                 )
-
-                if tmp_path.exists():
-                    tmp_path.replace(self.cache_path)
+                tmp_path = Path(tmp_name)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(text)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.chmod(tmp_path, mode)
+                    os.replace(tmp_path, self.cache_path)
+                except Exception:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+                try:  # best-effort directory fsync so the rename is durable
+                    dir_fd = os.open(str(self.cache_path.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
 
                 self._dirty = False
                 logger.debug("Saved %d label cache entries to %s", len(self._entries), self.cache_path)
@@ -276,8 +511,21 @@ class LabelCache:
                 return False
 
     def _normalize_key(self, file_path: Union[str, Path]) -> str:
-        """Return the normalized key for indexing (filename)."""
-        return Path(file_path).name
+        """
+        Return the normalized key for indexing: the resolved absolute path.
+
+        The old key was just the filename, so images with the same name in
+        different folders overwrote each other in the cache. Relative paths
+        resolve against dataset_dir. (Persisted JSON keys stay
+        basename-based when unique — see _persist_keys.)
+        """
+        p = Path(file_path)
+        if not p.is_absolute():
+            p = self.dataset_dir / p
+        try:
+            return str(p.resolve())
+        except Exception:
+            return str(p.absolute())
 
     def _resolve_existing_path(self, file_path: Union[str, Path]) -> Optional[Path]:
         """Resolve a file path to an existing Path object on disk if possible."""
@@ -298,8 +546,115 @@ class LabelCache:
 
         return None
 
+    def _lookup_entry_and_stat(
+        self, file_path: Union[str, Path]
+    ) -> Tuple[Optional[LabelCacheEntry], str, int, int]:
+        """
+        Single-pass lookup for the relabel decisions: one get_entry() and
+        one disk stat. Returns (entry, stat_kind, mtime_ns, size) where
+        stat_kind is "ok" (file stat'ed), "error" (file found but stat
+        failed) or "missing" (not found anywhere on disk). Previously
+        should_relabel() and can_delta_relabel() each did their own
+        lookup + resolve + stat, so plan_batch_relabel() paid for both.
+        """
+        entry = self.get_entry(file_path)
+        path_obj = self._resolve_existing_path(file_path)
+        if path_obj is not None and path_obj.is_file():
+            try:
+                st = path_obj.stat()
+                return entry, "ok", int(st.st_mtime_ns), int(st.st_size)
+            except Exception:
+                return entry, "error", 0, 0
+        return entry, "missing", 0, 0
+
+    @staticmethod
+    def _is_fresh(
+        entry: Optional[LabelCacheEntry],
+        stat_kind: str,
+        mtime_ns: int,
+        size: int,
+        exemplar_revision: int,
+        allow_zero_box_skip: bool,
+    ) -> bool:
+        """
+        True iff the cached entry is up to date and may be skipped — the
+        exact skip condition of should_relabel() (minus `force`).
+        """
+        if entry is None:
+            return False
+        # 0-box (unlabeled) images are never skipped unless explicitly allowed.
+        if not allow_zero_box_skip and entry.box_count <= 0:
+            return False
+        # Unparseable revision fails open to relabel instead of raising
+        # ValueError into the batch loop.
+        try:
+            exemplar_rev = int(exemplar_revision)
+        except (TypeError, ValueError):
+            return False
+        if entry.exemplar_revision != exemplar_rev:
+            return False
+        if stat_kind == "ok":
+            return mtime_ns == entry.file_mtime_ns and size == entry.file_size
+        if stat_kind == "error":
+            return False
+        # Missing from disk: only entries that never existed on disk
+        # (file_mtime_ns == 0) count as fresh; a recorded file that is
+        # now gone must be (re)considered, never silently skipped.
+        return entry.file_mtime_ns <= 0
+
+    @staticmethod
+    def _is_delta_eligible(
+        entry: Optional[LabelCacheEntry],
+        stat_kind: str,
+        mtime_ns: int,
+        size: int,
+        exemplar_revision: int,
+    ) -> bool:
+        """True iff fast candidate-crop delta relabeling applies."""
+        if entry is None or not entry.candidate_crops:
+            return False
+        # Only delta-relabel if exemplar revision has updated
+        # (unparseable revision: no delta, fall back to full relabel).
+        try:
+            exemplar_rev = int(exemplar_revision)
+        except (TypeError, ValueError):
+            return False
+        if entry.exemplar_revision == exemplar_rev:
+            return False
+        if stat_kind == "ok":
+            return mtime_ns == entry.file_mtime_ns and size == entry.file_size
+        if stat_kind == "error":
+            return False
+        return True
+
+    def classify(
+        self,
+        file_path: Union[str, Path],
+        exemplar_revision: int,
+        force: bool = False,
+    ) -> str:
+        """
+        Single-pass bucket for one image: "skip" | "delta" | "full" |
+        "missing". One get_entry() + one disk stat, where the old
+        should_relabel() + can_delta_relabel() pair paid for two of each.
+        Semantics are identical to plan_batch_relabel()'s old two-call
+        decision (skip iff not force and not should_relabel; delta iff
+        can_delta_relabel; missing iff the path is not a file on disk).
+        """
+        p_obj = Path(file_path)
+        if not p_obj.is_file():
+            return "missing"
+        entry, kind, mtime_ns, size = self._lookup_entry_and_stat(p_obj)
+        if not force and self._is_fresh(
+            entry, kind, mtime_ns, size, exemplar_revision, False
+        ):
+            return "skip"
+        if self._is_delta_eligible(entry, kind, mtime_ns, size, exemplar_revision):
+            return "delta"
+        return "full"
+
     def get_entry(self, file_path: Union[str, Path]) -> Optional[LabelCacheEntry]:
-        """Lookup cache entry by file path, key, or filename."""
+        """Lookup cache entry by resolved absolute path, raw key, or unique filename."""
         key = self._normalize_key(file_path)
         with self._lock:
             if key in self._entries:
@@ -308,6 +663,27 @@ class LabelCache:
             raw_key = str(file_path)
             if raw_key in self._entries:
                 return self._entries[raw_key]
+            # Legacy basename lookup — only when exactly one entry matches.
+            # An ambiguous bare name (the F-0803 collision) returns None
+            # instead of silently returning the wrong folder's entry.
+            # Served by the _by_basename index (O(1)) instead of a full
+            # scan; each candidate is re-checked against the original
+            # predicate so a stale bucket can never return a wrong entry.
+            name = Path(file_path).name
+            bucket = self._by_basename.get(name)
+            if not bucket:
+                return None
+            matches = [
+                self._entries[k]
+                for k in bucket
+                if k in self._entries
+                and (
+                    Path(self._entries[k].file_path).name == name
+                    or Path(k).name == name
+                )
+            ]
+            if len(matches) == 1:
+                return matches[0]
             return None
 
     def has_entry(self, file_path: Union[str, Path]) -> bool:
@@ -339,35 +715,10 @@ class LabelCache:
         if force:
             return True
 
-        entry = self.get_entry(file_path)
-        if entry is None:
-            return True
-
-        # CRITICAL MANDATE: Never skip 0-box (unlabeled) images when user requests relabeling!
-        if not allow_zero_box_skip and entry.box_count <= 0:
-            return True
-
-        # Check exemplar revision
-        if entry.exemplar_revision != int(exemplar_revision):
-            return True
-
-        # Check disk stat if file exists
-        path_obj = self._resolve_existing_path(file_path)
-        if path_obj is not None and path_obj.is_file():
-            try:
-                st = path_obj.stat()
-                disk_mtime = int(st.st_mtime_ns)
-                disk_size = int(st.st_size)
-                if disk_mtime != entry.file_mtime_ns or disk_size != entry.file_size:
-                    return True
-            except Exception:
-                return True
-        elif not Path(file_path).is_file() and entry.file_mtime_ns > 0:
-            # File previously had disk mtime recorded, but is now gone from disk
-            return False
-
-        # Unchanged on disk, exemplar revision matches, and has > 0 boxes -> skip
-        return False
+        entry, kind, mtime_ns, size = self._lookup_entry_and_stat(file_path)
+        return not self._is_fresh(
+            entry, kind, mtime_ns, size, exemplar_revision, allow_zero_box_skip
+        )
 
     def record_label(
         self,
@@ -438,6 +789,8 @@ class LabelCache:
             )
 
             self._entries[key] = entry
+            self._index_remove(key, existing)
+            self._index_add(key, entry)
             self._dirty = True
 
             should_save = self.auto_save if auto_save is None else auto_save
@@ -480,6 +833,11 @@ class LabelCache:
             entry = self.get_entry(file_path)
             if entry is not None:
                 entry.candidate_crops = stored_crops
+                # Do NOT overwrite box_count with len(crops): candidate
+                # crops are proposals, not labelled boxes. Overwriting let
+                # a 0-box image look labelled (box_count>0) and be skipped,
+                # defeating the zero-box safety in should_relabel. The
+                # real box_count is owned by record_label / re-evaluate.
                 entry.updated_at = time.time()
                 if exemplar_revision is not None:
                     entry.exemplar_revision = int(exemplar_revision)
@@ -487,12 +845,18 @@ class LabelCache:
                 if auto_save and self.auto_save:
                     self.save()
             else:
-                # Record initial entry
+                # Record initial entry. P2-9 (K-06): a fresh entry also
+                # starts at box_count=0 — candidate crops are proposals,
+                # not labelled boxes. Starting at len(stored_crops) let a
+                # 0-box image look labelled (box_count>0) and be skipped
+                # by should_relabel / plan_batch_relabel, piercing the
+                # zero-box guarantee. The real box_count is set later by
+                # record_label / re_evaluate_candidate_crops.
                 rev = int(exemplar_revision or 0)
                 self.record_label(
                     file_path=file_path,
                     exemplar_revision=rev,
-                    box_count=len(stored_crops),
+                    box_count=0,
                     candidate_crops=stored_crops,
                     auto_save=auto_save,
                 )
@@ -513,24 +877,8 @@ class LabelCache:
           2. Exemplar revision has changed (needs re-evaluation against new exemplars).
           3. If image exists on disk, disk mtime/size match cache (pixels unchanged).
         """
-        entry = self.get_entry(file_path)
-        if entry is None or not entry.candidate_crops:
-            return False
-
-        # Only delta-relabel if exemplar revision has updated
-        if entry.exemplar_revision == int(exemplar_revision):
-            return False
-
-        path_obj = self._resolve_existing_path(file_path)
-        if path_obj is not None and path_obj.is_file():
-            try:
-                st = path_obj.stat()
-                if int(st.st_mtime_ns) != entry.file_mtime_ns or int(st.st_size) != entry.file_size:
-                    return False
-            except Exception:
-                return False
-
-        return True
+        entry, kind, mtime_ns, size = self._lookup_entry_and_stat(file_path)
+        return self._is_delta_eligible(entry, kind, mtime_ns, size, exemplar_revision)
 
     def re_evaluate_candidate_crops(
         self,
@@ -572,16 +920,30 @@ class LabelCache:
                 loaded_frame = imread_unicode(resolved_p)
 
         surviving: List[Dict[str, Any]] = []
+        any_unverified = False
 
         for cand in entry.candidate_crops:
             c = dict(cand)
 
-            # Layer 0: Immunity Shield for human approved / hand labeled boxes
-            is_hand = bool(c.get("hand_label") or c.get("human_approved") or c.get("approved"))
+            # Layer 0: Immunity Shield for human approved / hand labeled boxes.
+            # P1-12 (K-34): çıplak "approved" boru hattı bayrağıdır,
+            # insan sayılmaz — is_hand yalnızca hand_label /
+            # human_approved'dir. Bu delta yolunun bağışıklık TABANI
+            # 0.95'tir (v16 davranışı; test_label_cache_delta + w43
+            # kilitler): el kutusu hayatta kalır ve güveni 0.95
+            # tabanına çekilir — bu, model ölçümünü şişirmek değil,
+            # insan-doğrulamalı kutunun güven TANIMIDIR (el kutusu
+            # ölçülmüş model skoru taşımaz; taban olmazsa insan kutusu
+            # Tier-3 "Düşük Güven"e düşer). calibrate yolu
+            # (label_trust) etkilenmez — oradaki F-1212 never-inflate
+            # (0.5 aynen 0.5 kalır) aynen korunur; şişirme yasağı
+            # ölçülmüş MODEL güvenleri içindir.
+            is_hand = bool(c.get("hand_label") or c.get("human_approved"))
             if is_hand:
                 c["trusted"] = True
                 c["weak"] = False
-                c["confidence"] = max(0.95, float(c.get("confidence", 0.95)))
+                c["confidence"] = max(0.95, _safe_confidence(c.get("confidence"), 0.95))
+                c["delta_reevaluated"] = True
                 surviving.append(c)
                 continue
 
@@ -594,22 +956,36 @@ class LabelCache:
                     if feat:
                         c["feature"] = feat
 
-            cid = int(c.get("class_id", 0))
+            try:
+                cid = int(c.get("class_id", 0))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Skipping candidate crop with non-numeric class_id %r in %s",
+                    c.get("class_id"),
+                    file_path,
+                )
+                continue
 
             # 1. Negative Exemplar Check (Suppression)
             suppressed = False
+            suppress_thresh = getattr(exemplar_memory, "suppress_neg_threshold", 0.82)
             if hasattr(exemplar_memory, "match_negative"):
                 if feat is not None and hasattr(exemplar_memory, "_negative"):
                     # Fast vector / dict similarity
                     best_neg_sim = 0.0
                     for neg_ex in getattr(exemplar_memory, "_negative", []):
-                        if cid is not None and int(neg_ex.get("class_id", -1)) != cid:
+                        if cid is not None and _safe_class_id(neg_ex.get("class_id", -1)) != cid:
                             sim = compute_similarity(feat, neg_ex) * 0.90
                         else:
                             sim = compute_similarity(feat, neg_ex)
                         if sim > best_neg_sim:
                             best_neg_sim = sim
-                    suppress_thresh = getattr(exemplar_memory, "suppress_neg_threshold", 0.82)
+                        # Early exit: best_neg_sim is only ever compared
+                        # against suppress_thresh below, so once the
+                        # threshold is reached the crop is suppressed no
+                        # matter what the remaining exemplars score.
+                        if best_neg_sim >= suppress_thresh:
+                            break
                     if best_neg_sim >= suppress_thresh:
                         suppressed = True
                 elif loaded_frame is not None:
@@ -632,9 +1008,18 @@ class LabelCache:
                     for pos_ex in getattr(exemplar_memory, "_positive", []):
                         sim = compute_similarity(feat, pos_ex)
                         if sim > best_pos_sim:
+                            pos_cid = _safe_class_id(pos_ex.get("class_id", 0), default=-1)
+                            if pos_cid < 0:
+                                continue
                             best_pos_sim = sim
-                            best_cid = int(pos_ex.get("class_id", 0))
+                            best_cid = pos_cid
                             best_cname = str(pos_ex.get("class_name", ""))
+                            # Early exit: compute_similarity() is clipped
+                            # to [0, 1], so no later exemplar can beat a
+                            # perfect 1.0 match (strict `>` keeps the
+                            # first maximum, which we already hold).
+                            if best_pos_sim >= 1.0:
+                                break
                 elif loaded_frame is not None:
                     crop = extract_box_crop(loaded_frame, c)
                     if crop is not None and crop.size > 0:
@@ -645,7 +1030,7 @@ class LabelCache:
 
                 if best_pos_sim >= reinforce_thresh and best_cid is not None:
                     if best_cid == cid:
-                        old_conf = float(c.get("confidence", 0.80))
+                        old_conf = _safe_confidence(c.get("confidence"), 0.80)
                         boost = (1.0 - old_conf) * (best_pos_sim - 0.50) * 0.70
                         c["confidence"] = round(float(np.clip(old_conf + boost, old_conf, 0.99)), 4)
                         c["exemplar_reinforced"] = True
@@ -655,15 +1040,28 @@ class LabelCache:
                         c["class_name"] = best_cname or f"class_{best_cid}"
                         c["exemplar_corrected"] = True
                         c["exemplar_sim"] = best_pos_sim
-                        old_c = float(c.get("confidence", 0.80))
+                        old_c = _safe_confidence(c.get("confidence"), 0.80)
                         c["confidence"] = round(
                             float(np.clip(max(old_c, best_pos_sim * 0.95), 0.85, 0.99)), 4
                         )
 
-            # Check confidence floor
-            conf = float(c.get("confidence", 0.0))
+            # Check confidence floor (S-2103: _safe_confidence so one bad
+            # cached value cannot abort the whole file's delta relabel).
+            conf = _safe_confidence(c.get("confidence"), 0.0)
             if conf < conf_floor:
                 continue
+
+            # If no visual feature could be obtained (neither cached nor
+            # extractable from a frame), the exemplar checks above were
+            # silently skipped: mark the crop unverified (kept, but NOT
+            # counted as re-evaluated) instead of letting it pass as a
+            # freshly re-evaluated box. A mere available frame is not
+            # enough — without a feature no exemplar comparison ran.
+            if feat is None:
+                c["delta_reevaluated"] = False
+                any_unverified = True
+            else:
+                c["delta_reevaluated"] = True
 
             # Assign trust / weak tags
             is_emin = (
@@ -681,7 +1079,17 @@ class LabelCache:
             entry.candidate_crops = surviving
             entry.box_count = len(surviving)
             if exemplar_revision is not None:
-                entry.exemplar_revision = int(exemplar_revision)
+                if any_unverified:
+                    # Do NOT advance the revision: some crops could not be
+                    # re-evaluated, so the entry must be retried next run.
+                    logger.warning(
+                        "Delta relabel of %s left %d crop(s) unverified (no feature/frame); "
+                        "exemplar_revision NOT advanced",
+                        file_path,
+                        sum(1 for c in surviving if not c.get("delta_reevaluated", True)),
+                    )
+                else:
+                    entry.exemplar_revision = int(exemplar_revision)
             entry.updated_at = time.time()
             self._dirty = True
             if auto_save and self.auto_save:
@@ -694,13 +1102,19 @@ class LabelCache:
         key = self._normalize_key(file_path)
         with self._lock:
             removed = False
-            if key in self._entries:
-                del self._entries[key]
-                removed = True
-            raw_key = str(file_path)
-            if raw_key in self._entries:
-                del self._entries[raw_key]
-                removed = True
+            for cand in (key, str(file_path)):
+                if cand in self._entries:
+                    self._index_remove(cand, self._entries[cand])
+                    del self._entries[cand]
+                    removed = True
+            if not removed:
+                entry = self.get_entry(file_path)
+                if entry is not None:
+                    for k, v in list(self._entries.items()):
+                        if v is entry:
+                            self._index_remove(k, v)
+                            del self._entries[k]
+                            removed = True
             if removed:
                 self._dirty = True
                 if auto_save and self.auto_save:
@@ -711,6 +1125,7 @@ class LabelCache:
         """Clear all entries from the cache."""
         with self._lock:
             self._entries.clear()
+            self._by_basename.clear()
             self._dirty = True
             if auto_save and self.auto_save:
                 self.save()
@@ -735,7 +1150,8 @@ class LabelCache:
     def to_dict(self) -> Dict[str, Any]:
         """Export cache contents as a serializable dictionary."""
         with self._lock:
-            return {k: entry.to_dict() for k, entry in self._entries.items()}
+            persist_keys = self._persist_keys()
+            return {persist_keys[k]: entry.to_dict() for k, entry in self._entries.items()}
 
     # Dict-like magic methods for complete backward compatibility
     def __len__(self) -> int:
@@ -753,12 +1169,16 @@ class LabelCache:
 
     def __setitem__(self, key: str, value: Any) -> None:
         with self._lock:
+            norm_key = self._normalize_key(key)
+            old = self._entries.get(norm_key)
             if isinstance(value, LabelCacheEntry):
-                self._entries[key] = value
+                self._entries[norm_key] = value
             elif isinstance(value, dict):
-                self._entries[key] = LabelCacheEntry.from_dict(value, default_path=key)
+                self._entries[norm_key] = LabelCacheEntry.from_dict(value, default_path=key)
             else:
                 raise TypeError(f"Value must be LabelCacheEntry or dict, got {type(value)}")
+            self._index_remove(norm_key, old)
+            self._index_add(norm_key, self._entries[norm_key])
             self._dirty = True
             if self.auto_save:
                 self.save()
@@ -800,11 +1220,28 @@ def get_label_cache(
     cache_path: Optional[Union[str, Path]] = None,
     dataset_dir: Optional[Union[str, Path]] = None,
 ) -> LabelCache:
-    """Get or create singleton LabelCache instance."""
+    """
+    Get or create singleton LabelCache instance.
+
+    A second call with a different cache_path OR a different dataset_dir
+    rebuilds the singleton: previously only cache_path was compared, so a
+    second call with another dataset_dir silently kept serving the first
+    dataset's cache.
+    """
     global _GLOBAL_LABEL_CACHE
     with _GLOBAL_LOCK:
+        if cache_path is not None:
+            effective_path = Path(cache_path).resolve()
+        elif dataset_dir is not None:
+            effective_path = (Path(dataset_dir) / ".label_cache.json").resolve()
+        else:
+            effective_path = DEFAULT_CACHE_PATH.resolve()
         if _GLOBAL_LABEL_CACHE is None or (
-            cache_path is not None and Path(cache_path).resolve() != _GLOBAL_LABEL_CACHE.cache_path
+            effective_path != _GLOBAL_LABEL_CACHE.cache_path
+            or (
+                dataset_dir is not None
+                and Path(dataset_dir).resolve() != _GLOBAL_LABEL_CACHE.dataset_dir
+            )
         ):
             _GLOBAL_LABEL_CACHE = LabelCache(cache_path=cache_path, dataset_dir=dataset_dir)
         return _GLOBAL_LABEL_CACHE
@@ -821,28 +1258,16 @@ def plan_batch_relabel(
       - 'skip': Unchanged images that can be skipped completely (< 0.01ms check).
       - 'delta': Images that have cached candidate crops and can be delta-re-evaluated.
       - 'full': Images that require full visual pipeline auto-labeling.
+      - 'missing': Paths that do not exist on disk (reported, never silently dropped).
 
     GUARANTEE: 0-box (unlabeled) images are NEVER assigned to 'skip'.
     """
     cache = label_cache or get_label_cache()
-    skipped: List[Path] = []
-    delta: List[Path] = []
-    full: List[Path] = []
+    buckets: Dict[str, List[Path]] = {"skip": [], "delta": [], "full": [], "missing": []}
 
     for p in image_paths:
-        p_obj = Path(p)
-        if not p_obj.is_file():
-            continue
+        # One classify() call per image (one lookup + one stat) instead of
+        # the old should_relabel() + can_delta_relabel() pair (two of each).
+        buckets[cache.classify(p, exemplar_revision, force=force)].append(Path(p))
 
-        if not force and not cache.should_relabel(p_obj, exemplar_revision):
-            skipped.append(p_obj)
-        elif cache.can_delta_relabel(p_obj, exemplar_revision):
-            delta.append(p_obj)
-        else:
-            full.append(p_obj)
-
-    return {
-        "skip": skipped,
-        "delta": delta,
-        "full": full,
-    }
+    return buckets

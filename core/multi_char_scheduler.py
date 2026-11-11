@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+from version import __version__
 
 logger = logging.getLogger("Gatherion.MultiCharScheduler")
 if not logger.handlers:
@@ -52,67 +53,232 @@ logger.propagate = False
 # YARDIMCI GİRDİ VE ZAMAN FONKSİYONLARI
 # ============================================================================
 
-def _send_key_safe(input_ctrl: Any, key: str, test_mode: bool = True) -> bool:
+def _controller_keyboard_trusted(input_ctrl: Any) -> Optional[bool]:
+    """
+    Kontrolcünün donanım klavye yolunu (Interception / HID) doğrulayıp
+    doğrulamadığını döndürür: True = güvenilir yol aktif, False = yok,
+    None = kontrolcü bu bilgiyi sunmuyor (bilinmiyor).
+    """
+    try:
+        if hasattr(input_ctrl, "is_keyboard_trusted") and callable(input_ctrl.is_keyboard_trusted):
+            return bool(input_ctrl.is_keyboard_trusted())
+        if hasattr(input_ctrl, "keyboard_inject_trusted"):
+            return bool(input_ctrl.keyboard_inject_trusted)
+        if hasattr(input_ctrl, "_hw_key_trusted_available") and callable(input_ctrl._hw_key_trusted_available):
+            return bool(input_ctrl._hw_key_trusted_available())
+    except Exception:
+        return None
+    return None
+
+
+def _controller_mouse_trusted(input_ctrl: Any) -> Optional[bool]:
+    """
+    Kontrolcünün donanım fare yolunu (Interception / HID) doğrulayıp
+    doğrulamadığını döndürür: True = güvenilir yol aktif, False = yok,
+    None = kontrolcü bu bilgiyi sunmuyor (bilinmiyor).
+    Klavye karşılığı `_controller_keyboard_trusted` ile aynı desen (S-0802);
+    üretim `input_driver` fare için böyle bir sinyal sunmaz, o durumda None
+    döner ve tıklama engellenmez — yalnızca açıkça False ise gönderilmez.
+    """
+    try:
+        if hasattr(input_ctrl, "is_mouse_trusted") and callable(input_ctrl.is_mouse_trusted):
+            return bool(input_ctrl.is_mouse_trusted())
+        if hasattr(input_ctrl, "mouse_inject_trusted"):
+            return bool(input_ctrl.mouse_inject_trusted)
+        if hasattr(input_ctrl, "_hw_mouse_trusted_available") and callable(input_ctrl._hw_mouse_trusted_available):
+            return bool(input_ctrl._hw_mouse_trusted_available())
+    except Exception:
+        return None
+    return None
+
+
+def _click_result_coords(result: Any, default_px: int, default_py: int) -> Tuple[int, int]:
+    """
+    Tıklama metodunun dönüş değerini koordinata çevirir (S-0802).
+    Yalnızca sayısal `(x, y[, ...])` tuple/list başarı sayılır; `None`,
+    `False`, `0` veya sayısal olmayan dönüş tıklamanın gerçekleşmediğini
+    bildirir ve RuntimeError yükseltir — eskisi gibi varsayılan koordinatla
+    "tıklandı" sayılmaz. Üretim `input_driver` tıklamaları her zaman
+    `(x, y, hold)` tuple döner; `None` dönen sahte/üçüncü taraf kontrolcüler
+    artık sessizce başarılı sayılmaz.
+    """
+    if isinstance(result, bool):
+        raise RuntimeError("Normalize tıklama başarısız döndü (False): tıklama gerçekleşmedi")
+    if result is None:
+        raise RuntimeError("Normalize tıklama dönüş değeri yok (None): tıklama doğrulanamadı")
+    if isinstance(result, (tuple, list)) and len(result) >= 2:
+        try:
+            return int(result[0]), int(result[1])
+        except (TypeError, ValueError):
+            raise RuntimeError("Normalize tıklama sayısal olmayan koordinat döndü: tıklama doğrulanamadı")
+    if isinstance(result, (int, float)):
+        # Tuş gönderimindeki `_dispatch_ok` konvansiyonu: 0/0.0 = iptal/başarısız,
+        # pozitif sayı (basılı tutma süresi) = başarı; koordinat bilinmediğinden
+        # varsayılan koordinat döner.
+        if float(result) == 0.0:
+            raise RuntimeError("Normalize tıklama başarısız döndü (0): tıklama gerçekleşmedi")
+        return default_px, default_py
+    raise RuntimeError("Normalize tıklama bilinmeyen dönüş değeri döndü: tıklama doğrulanamadı")
+
+
+def _dispatch_ok(result: Any) -> bool:
+    """Gönderim metodunun dönüş değerini başarıya çevirir (None = bilgi yok, sayıldı)."""
+    if result is None:
+        return True
+    if isinstance(result, bool):
+        return result
+    if isinstance(result, (int, float)):
+        # press_key basılı tutma süresini (sn) döner; 0.0 = iptal/başarısız.
+        return float(result) != 0.0
+    return bool(result)
+
+
+def _send_key_safe(input_ctrl: Any, key: str, test_mode: bool = False) -> bool:
     """
     Verilen `input_ctrl` nesnesi üzerinden güvenli tuş basımı gerçekleştirir.
-    `test_mode=True` ise veya `input_ctrl=None` ise fiziksel girdi göndermeden simüle eder.
+    `test_mode=True` ise fiziksel girdi göndermeden simüle eder (True döner).
+    Üretimde (`test_mode=False`) kontrolcü yoksa veya kontrolcü hiçbir gönderme
+    metoduna sahip değilse False döner — eskisi gibi sessizce True dönmez.
+    AION 2 yumuşak (SendInput) girdiyi yok saydığı için, üretimde kontrolcü
+    güvenilir bir donanım yolunu (Interception/HID) bildiriyorsa ve o yol
+    kapalıysa tuş hiç gönderilmez, False döner.
     """
     key_clean = str(key).strip().lower()
     if not key_clean:
         return False
 
     if input_ctrl is None:
-        logger.info("[Simülasyon] Tuş basımı: '%s' (test_mode=%s)", key_clean, test_mode)
-        return True
+        if test_mode:
+            logger.info("[Simülasyon] Tuş basımı: '%s' (test_mode=%s)", key_clean, test_mode)
+            return True
+        logger.error("Tuş gönderilemedi ('%s'): girdi kontrolcüsü yok ve test_mode kapalı", key_clean)
+        return False
+
+    if not test_mode:
+        trusted = _controller_keyboard_trusted(input_ctrl)
+        if trusted is False:
+            logger.error(
+                "Tuş gönderilmedi ('%s'): güvenilir donanım klavye yolu (Interception/HID) kapalı; "
+                "yumuşak girdi AION 2'de yok sayılır",
+                key_clean,
+            )
+            return False
 
     try:
         if hasattr(input_ctrl, "set_test_mode") and isinstance(test_mode, bool):
             input_ctrl.set_test_mode(test_mode)
 
         if hasattr(input_ctrl, "press_key"):
-            input_ctrl.press_key(key_clean)
-            return True
+            return _dispatch_ok(input_ctrl.press_key(key_clean))
         if hasattr(input_ctrl, "tap_key"):
-            input_ctrl.tap_key(key_clean)
-            return True
+            return _dispatch_ok(input_ctrl.tap_key(key_clean))
         if hasattr(input_ctrl, "send_key"):
-            input_ctrl.send_key(key_clean)
-            return True
+            return _dispatch_ok(input_ctrl.send_key(key_clean))
         if callable(input_ctrl):
-            input_ctrl(key_clean)
-            return True
+            return _dispatch_ok(input_ctrl(key_clean))
     except Exception as exc:
         logger.error("Tuş gönderim hatası ('%s'): %s", key_clean, exc)
         return False
 
-    return True
+    logger.error("Tuş gönderilemedi ('%s'): kontrolcü hiçbir tuş gönderme metoduna sahip değil", key_clean)
+    return False
+
+
+def _resolve_click_screen_size(input_ctrl: Any) -> Optional[Tuple[int, int]]:
+    """Tıklama piksel hesabı için ekran çözünürlüğünü okur.
+
+    P1-7 (K-20): 1920x1080 sabiti kaldırıldı — sıra: açıkça verilen
+    boyut > kontrolcünün `screen_width/screen_height` öznitelikleri >
+    kontrolcünün çözünürlük metodu (`_cached_screen_resolution` /
+    `get_screen_resolution`). Hiçbiri yoksa `None` döner; çağıran
+    1920x1080 son-çare yedeğini kullanır (test simülasyonu dahil).
+    """
+    if input_ctrl is None:
+        return None
+    for w_attr, h_attr in (
+        ("screen_width", "screen_height"),
+        ("screen_w", "screen_h"),
+    ):
+        try:
+            w = getattr(input_ctrl, w_attr, None)
+            h = getattr(input_ctrl, h_attr, None)
+            if w and h and int(w) > 0 and int(h) > 0:
+                return int(w), int(h)
+        except (TypeError, ValueError):
+            continue
+    for meth in ("_cached_screen_resolution", "get_screen_resolution"):
+        fn = getattr(input_ctrl, meth, None)
+        if callable(fn):
+            try:
+                w, h = fn()
+                if w and h and int(w) > 0 and int(h) > 0:
+                    return int(w), int(h)
+            except Exception:
+                continue
+    return None
 
 
 def _click_normalized_safe(
     input_ctrl: Any,
     nx: float,
     ny: float,
-    test_mode: bool = True,
+    test_mode: bool = False,
     double: bool = False,
+    screen_size: Optional[Tuple[int, int]] = None,
 ) -> Tuple[int, int]:
     """
     Çözünürlükten bağımsız normalize koordinata `(nx, ny)` güvenli tıklama yapar.
+    NOT: Bu tıklamalar oyun içi arayüz (karakter seçimi / oyuna gir) tıklamasıdır,
+    skill saldırısı değildir; R/T kuralı skill atışına uygulanır, arayüz
+    tıklaması fareyle kalır.
+    Üretimde (`test_mode=False`) kontrolcü yoksa veya kontrolcü hiçbir tıklama
+    metoduna sahip değilse RuntimeError yükseltir — sessizce "tıklandı"
+    sayılmaz; çağıran adımın başarısız olduğunu bilmelidir (F-1709).
+    S-0802: tıklama metodunun dönüş değeri denetlenir — `None`/`False`/`0`
+    dönen tıklama artık varsayılan koordinatla başarı sayılmaz, RuntimeError
+    yükseltir; kontrolcü açıkça güvenilir donanım fare yolunun kapalı olduğunu
+    bildiriyorsa (`_controller_mouse_trusted` False) tıklama hiç gönderilmez
+    (yumuşak düşüş YOK); güven bilgisi sunmayan kontrolcüde (bilinmiyor)
+    tıklama engellenmez.
     """
     clamped_nx = max(0.0, min(1.0, float(nx)))
     clamped_ny = max(0.0, min(1.0, float(ny)))
-    default_px = int(round(clamped_nx * 1920))
-    default_py = int(round(clamped_ny * 1080))
+    # P1-7 (K-20): piksel yedeği çözünürlükten okunur (2560x1440'da
+    # 1920x1080 pikseli yanlış olurdu). Son-çare 1920x1080 yalnızca
+    # çözünürlük hiçbir yerden okunamadığında kullanılır.
+    _res = screen_size or _resolve_click_screen_size(input_ctrl)
+    if _res is None:
+        logger.debug(
+            "Normalize tıklama: çözünürlük okunamadı, 1920x1080 "
+            "son-çare yedeği kullanılıyor."
+        )
+        _res = (1920, 1080)
+    default_px = int(round(clamped_nx * _res[0]))
+    default_py = int(round(clamped_ny * _res[1]))
 
     if input_ctrl is None:
-        logger.info(
-            "[Simülasyon] Normalize tıklama: (%.3f, %.3f) -> (%d, %d) double=%s",
-            clamped_nx,
-            clamped_ny,
-            default_px,
-            default_py,
-            double,
-        )
-        return default_px, default_py
+        if test_mode:
+            logger.info(
+                "[Simülasyon] Normalize tıklama: (%.3f, %.3f) -> (%d, %d) double=%s",
+                clamped_nx,
+                clamped_ny,
+                default_px,
+                default_py,
+                double,
+            )
+            return default_px, default_py
+        raise RuntimeError("Normalize tıklama yapılamadı: girdi kontrolcüsü yok ve test_mode kapalı")
+
+    if not test_mode:
+        mouse_trusted = _controller_mouse_trusted(input_ctrl)
+        if mouse_trusted is False:
+            logger.error(
+                "Normalize tıklama gönderilmedi (%.3f, %.3f): güvenilir donanım fare yolu "
+                "(Interception/HID) kapalı; yumuşak girdi AION 2'de yok sayılır",
+                clamped_nx,
+                clamped_ny,
+            )
+            raise RuntimeError("Normalize tıklama yapılamadı: güvenilir donanım fare yolu kapalı")
 
     try:
         if hasattr(input_ctrl, "set_test_mode") and isinstance(test_mode, bool):
@@ -120,25 +286,20 @@ def _click_normalized_safe(
 
         if hasattr(input_ctrl, "click_normalized"):
             res = input_ctrl.click_normalized(clamped_nx, clamped_ny, button="left", double=double)
-            if isinstance(res, (tuple, list)) and len(res) >= 2:
-                return int(res[0]), int(res[1])
-            return default_px, default_py
+            return _click_result_coords(res, default_px, default_py)
 
         if hasattr(input_ctrl, "human_click"):
             res = input_ctrl.human_click(x=default_px, y=default_py, button="left", double=double)
-            if isinstance(res, (tuple, list)) and len(res) >= 2:
-                return int(res[0]), int(res[1])
-            return default_px, default_py
+            return _click_result_coords(res, default_px, default_py)
 
         if hasattr(input_ctrl, "click_map"):
             res = input_ctrl.click_map(default_px, default_py, button="left", double=double)
-            if isinstance(res, (tuple, list)) and len(res) >= 2:
-                return int(res[0]), int(res[1])
-            return default_px, default_py
+            return _click_result_coords(res, default_px, default_py)
     except Exception as exc:
         logger.error("Normalize tıklama hatası (%.3f, %.3f): %s", clamped_nx, clamped_ny, exc)
+        raise
 
-    return default_px, default_py
+    raise RuntimeError("Normalize tıklama yapılamadı: kontrolcü hiçbir tıklama metoduna sahip değil")
 
 
 def _parse_hhmm_to_minutes(hhmm: str) -> int:
@@ -152,6 +313,19 @@ def _parse_hhmm_to_minutes(hhmm: str) -> int:
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         raise ValueError(f"Saat/dakika sınır dışı (00:00..23:59): {hhmm!r}")
     return hour * 60 + minute
+
+
+def _backup_corrupt_config(config_path: str) -> Optional[str]:
+    """Bozuk yapılandırma dosyasını üzerine yazmak yerine zaman damgalı yedeğe taşır."""
+    try:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = f"{config_path}.corrupt-{stamp}"
+        os.replace(config_path, backup_path)
+        logger.warning("Bozuk yapılandırma yedeğe taşındı: %s -> %s", config_path, backup_path)
+        return backup_path
+    except Exception as exc:
+        logger.error("Bozuk yapılandırma yedeklenemedi (%s): %s", config_path, exc)
+        return None
 
 
 # ============================================================================
@@ -269,6 +443,17 @@ class AltCharacterManager:
         self.active_slot_index: int = max(1, int(active_slot_index))
         self.rotation_history: List[Dict[str, Any]] = []
         self._profiles: List[CharacterProfile] = []
+        # F-0143 üretim bağlantısı: state_machine/main tek çağrıyla bu bağlamı
+        # bağlar (bind_runtime_context); bağlıysa record_gather her toplamada
+        # üç yöneticiyi de tetikler. Bağlı değilse None kalır ve record_gather
+        # eski davranışıyla yalnızca sayaç artırır.
+        self._runtime_input_ctrl: Any = None
+        self._runtime_route_mgr: Any = None
+        self._runtime_task_scheduler: Any = None
+        self._runtime_pet_buff_mgr: Any = None
+        self._runtime_frame_provider: Any = None
+        self._runtime_test_mode: bool = False
+        self._last_wired_tick: Optional[Dict[str, Any]] = None
 
         if profiles is not None:
             for item in profiles:
@@ -277,13 +462,18 @@ class AltCharacterManager:
                 elif isinstance(item, dict):
                     self._profiles.append(CharacterProfile.from_dict(item))
             self._sort_and_normalize_profiles()
-            self.save_characters()
+            # Profiller çağrıcı tarafından verildi: kalıcılık çağrıcınındır,
+            # kurulum tek başına dosyayı yazmaz (F-1736).
         else:
             self.load_characters()
 
     def _sort_and_normalize_profiles(self) -> None:
         """Karakter listesini `slot_index` sırasına göre düzenler ve aktif slotu doğrular."""
-        self._profiles.sort(key=lambda c: c.slot_index)
+        # Aynı slotta yinelenen profil varsa son gelen kazanır (tek kayıt kalır).
+        by_slot: Dict[int, CharacterProfile] = {}
+        for prof in self._profiles:
+            by_slot[int(prof.slot_index)] = prof
+        self._profiles = sorted(by_slot.values(), key=lambda c: c.slot_index)
         if not self._profiles:
             self._profiles = self._build_default_profiles()
         valid_slots = [c.slot_index for c in self._profiles]
@@ -336,6 +526,7 @@ class AltCharacterManager:
     def load_characters(self) -> List[CharacterProfile]:
         """`config/characters.json` dosyasından karakter kadrosunu yükler."""
         with self._lock:
+            corrupt = False
             if os.path.isfile(self.config_path):
                 try:
                     with open(self.config_path, "r", encoding="utf-8") as f:
@@ -355,10 +546,13 @@ class AltCharacterManager:
                         return list(self._profiles)
                 except Exception as exc:
                     logger.warning("Karakter yapılandırması okunamadı (%s): %s", self.config_path, exc)
+                    corrupt = True
+                    _backup_corrupt_config(self.config_path)
 
             self._profiles = self._build_default_profiles()
             self._sort_and_normalize_profiles()
-            self.save_characters()
+            if not corrupt:
+                self.save_characters()
             return list(self._profiles)
 
     def save_characters(self) -> bool:
@@ -412,6 +606,88 @@ class AltCharacterManager:
                 profile.last_reset_date = today_str
             self.save_characters()
 
+    def record_gather(self, count: int = 1, material_name: Optional[str] = None) -> int:
+        """
+        Aktif karakterin günlük toplama sayacını artırır ve kalıcı kaydeder.
+        `state_machine` her başarılı toplamada `record_gather(count=1)` çağırır;
+        bu metot yoksa kota takibi sessizce hiç çalışmaz (hasattr koruması).
+        Yeni güne geçildiyse önce sayaçlar sıfırlanır. Güncel sayacı döndürür.
+        F-0143: üretim bağlamı bağlıysa (bind_runtime_context) sayaç artımından
+        sonra kilit DIŞINDA bağlı yöneticiler tetiklenir (takvim/rotasyon/buff);
+        bağlam bağlı değilse yalnızca sayaç artar. Tetikleme hatası sayacı
+        ve dönüş değerini etkilemez.
+        """
+        with self._lock:
+            self.reset_daily_quotas_if_new_day()
+            active = self.get_active_character()
+            active.gathered_today = max(0, int(active.gathered_today) + max(0, int(count)))
+            self.save_characters()
+            total = int(active.gathered_today)
+        # Kilit dışında: donanım G/Ç yapan yönetici tetiklemesi kilit altında yapılmaz (F-1731).
+        self._run_wired_tick(total)
+        return total
+
+    def bind_runtime_context(
+        self,
+        input_ctrl: Any = None,
+        route_mgr: Any = None,
+        task_scheduler: Any = None,
+        pet_buff_mgr: Any = None,
+        frame_provider: Any = None,
+        test_mode: bool = False,
+    ) -> None:
+        """
+        F-0143 üretim bağlantısı: `state_machine`/`main` bu metodu bir kez
+        çağırarak üç yöneticiyi birbirine bağlar; sonrasında üretimde zaten
+        çalışan tek çağrı (`record_gather`, state_machine.py) her toplamada
+        takvim/rotasyon/buff yöneticilerini tetikler. `frame_provider`
+        çağrılabilirse buff denetimine güncel kare verir (None dönebilir).
+        Bağlam bağlanana kadar hiçbir davranış değişmez.
+        """
+        with self._lock:
+            self._runtime_input_ctrl = input_ctrl
+            self._runtime_route_mgr = route_mgr
+            self._runtime_task_scheduler = task_scheduler
+            self._runtime_pet_buff_mgr = pet_buff_mgr
+            self._runtime_frame_provider = frame_provider
+            self._runtime_test_mode = bool(test_mode)
+
+    def _run_wired_tick(self, current_gathered: int) -> Optional[Dict[str, Any]]:
+        """Bağlı üretim bağlamı varsa `tick_multi_char_managers` çalıştırır; yoksa None döner. Asla yükseltmez."""
+        with self._lock:
+            input_ctrl = self._runtime_input_ctrl
+            route_mgr = self._runtime_route_mgr
+            task_scheduler = self._runtime_task_scheduler
+            pet_buff_mgr = self._runtime_pet_buff_mgr
+            frame_provider = self._runtime_frame_provider
+            test_mode = self._runtime_test_mode
+        if input_ctrl is None and task_scheduler is None and pet_buff_mgr is None:
+            return None
+        frame = None
+        if callable(frame_provider):
+            try:
+                frame = frame_provider()
+            except Exception as exc:
+                logger.debug("Çerçeve sağlayıcı hatası (buff denetimi karesiz çalışır): %s", exc)
+                frame = None
+        try:
+            result = tick_multi_char_managers(
+                alt_char_mgr=self,
+                task_scheduler=task_scheduler,
+                pet_buff_mgr=pet_buff_mgr,
+                current_gathered=int(current_gathered),
+                input_ctrl=input_ctrl,
+                route_mgr=route_mgr,
+                frame=frame,
+                test_mode=test_mode,
+            )
+        except Exception as exc:
+            logger.error("Bağlı yönetici tick hatası: %s", exc)
+            return None
+        with self._lock:
+            self._last_wired_tick = result
+        return result
+
     def get_roster(self) -> List[CharacterProfile]:
         """Kayıtlı tüm karakter profillerinin kopyasını döndürür."""
         with self._lock:
@@ -429,6 +705,19 @@ class AltCharacterManager:
     def get_active_character(self) -> CharacterProfile:
         """Şu anda aktif olan karakterin `CharacterProfile` nesnesini döndürür."""
         with self._lock:
+            # Hızlı yol: kadro yalnızca değiştiren metotlar üzerinden değişir ve
+            # her değiştiren metot zaten `_sort_and_normalize_profiles` çağırır;
+            # aktif slot tekil ise tam sıralama/tekilleştirme gerekmez.
+            found: Optional[CharacterProfile] = None
+            matches = 0
+            for profile in self._profiles:
+                if profile.slot_index == self.active_slot_index:
+                    found = profile
+                    matches += 1
+            if matches == 1:
+                return found  # type: ignore[return-value]
+            # Aktif slot yoksa veya yineleniyorsa eski davranış: normalize et,
+            # aktif slotu düzelt ve tekrar dene.
             self._sort_and_normalize_profiles()
             for profile in self._profiles:
                 if profile.slot_index == self.active_slot_index:
@@ -467,7 +756,12 @@ class AltCharacterManager:
 
     def get_slot_normalized_coords(self, slot_index: int) -> Tuple[float, float]:
         """Karakter seçimi ekranında `slot_index` (1..8) için normalize `(nx, ny)` koordinatını hesaplar."""
-        idx_zero = max(0, min(7, int(slot_index) - 1))
+        slot = int(slot_index)
+        if slot < 1 or slot > 8:
+            # 9. ve üstü slotlar sessizce 8. slotun koordinatını almamalı:
+            # yanlış karakter seçilir. Aralık dışı slot açıkça hatadır.
+            raise ValueError(f"Karakter slotu 1..8 olmalı, gelen: {slot_index!r}")
+        idx_zero = slot - 1
         nx = self.SLOT_LIST_X_NORM
         ny = min(0.88, self.SLOT_FIRST_Y_NORM + idx_zero * self.SLOT_STEP_Y_NORM)
         return round(nx, 4), round(ny, 4)
@@ -553,89 +847,128 @@ class AltCharacterManager:
         self,
         target_slot_index: int,
         input_ctrl: Any = None,
-        test_mode: bool = True,
+        test_mode: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Güvenli karakter seçim ekranına çıkış ve yan karaktere giriş dizisini çalıştırır:
         1. `Esc` -> Sistem menüsünü aç
         2. `Karakter Seçimi` butonuna tıkla + Onay (`Tamam`) tıkla
         3. Karakter seçim ekranında `Slot #N` üzerine tıkla
-        4. `Oyuna Gir` butonuna tıkla / `Enter` tuşuna bas
+        4. `Oyuna Gir` butonuna tıkla
+        Her adım `ok` bayrağıyla döner; bir adım gönderilemezse dizi durur ve
+        kalan adımlar `ok=False, skipped=True` işaretlenir. Çağıran, tüm adımlar
+        `ok` değilse karakter değişimini kalıcı kayda GEÇİREMEZ (F-1709).
+        Hedef slot kadroda yoksa veya 1..8 dışında ise hiçbir girdi
+        gönderilmeden ValueError yükseltilir.
         """
+        target_slot = int(target_slot_index)
+        if self.get_character_by_slot(target_slot) is None:
+            raise ValueError(f"Hedef slot kadroda yok: Slot #{target_slot}")
+        slot_nx, slot_ny = self.get_slot_normalized_coords(target_slot)
+
         pause_dt = 0.01 if test_mode else self.step_delay_sec
         steps_log: List[Dict[str, Any]] = []
+        failed = False
+
+        def _record(step_no: int, action: str, description_tr: str, ok: bool, **extra: Any) -> None:
+            entry: Dict[str, Any] = {
+                "step": step_no,
+                "action": action,
+                "description_tr": description_tr,
+                "ok": bool(ok),
+            }
+            entry.update(extra)
+            steps_log.append(entry)
 
         # Adım 1: ESC ile Sistem Menüsünü Aç
-        _send_key_safe(input_ctrl, "esc", test_mode=test_mode)
-        steps_log.append({
-            "step": 1,
-            "action": "open_system_menu",
-            "description_tr": "Esc tuşu ile oyun sistem menüsü açıldı",
-            "key": "esc",
-        })
-        if pause_dt > 0:
+        ok1 = _send_key_safe(input_ctrl, "esc", test_mode=test_mode)
+        _record(1, "open_system_menu", "Esc tuşu ile oyun sistem menüsü açıldı", ok1, key="esc")
+        if not ok1:
+            failed = True
+        # Adım başarısızsa sonraki adımlar atlanacak; arayüzün oturması için
+        # beklemeye gerek yok — başarısız dizi hızlı dönsün.
+        if pause_dt > 0 and not failed:
             time.sleep(pause_dt)
 
         # Adım 2: Karakter Seçimi Butonuna Tıkla ve Onayla
-        cs_px, cs_py = _click_normalized_safe(
-            input_ctrl,
-            self.CHAR_SELECT_BTN_NORM[0],
-            self.CHAR_SELECT_BTN_NORM[1],
-            test_mode=test_mode,
-        )
-        if pause_dt > 0:
-            time.sleep(pause_dt * 0.5)
-        cf_px, cf_py = _click_normalized_safe(
-            input_ctrl,
-            self.CONFIRM_LOGOUT_BTN_NORM[0],
-            self.CONFIRM_LOGOUT_BTN_NORM[1],
-            test_mode=test_mode,
-        )
-        steps_log.append({
-            "step": 2,
-            "action": "click_character_selection",
-            "description_tr": "Karakter Seçimi ekranına çıkış onaylandı",
-            "coords": (cs_px, cs_py),
-            "confirm_coords": (cf_px, cf_py),
-        })
-        if pause_dt > 0:
+        if not failed:
+            try:
+                cs_px, cs_py = _click_normalized_safe(
+                    input_ctrl,
+                    self.CHAR_SELECT_BTN_NORM[0],
+                    self.CHAR_SELECT_BTN_NORM[1],
+                    test_mode=test_mode,
+                )
+                if pause_dt > 0:
+                    time.sleep(pause_dt * 0.5)
+                cf_px, cf_py = _click_normalized_safe(
+                    input_ctrl,
+                    self.CONFIRM_LOGOUT_BTN_NORM[0],
+                    self.CONFIRM_LOGOUT_BTN_NORM[1],
+                    test_mode=test_mode,
+                )
+                _record(
+                    2, "click_character_selection",
+                    "Karakter Seçimi ekranına çıkış onaylandı", True,
+                    coords=(cs_px, cs_py), confirm_coords=(cf_px, cf_py),
+                )
+            except Exception as exc:
+                logger.error("Karakter seçimi adımı başarısız: %s", exc)
+                _record(2, "click_character_selection", "Karakter Seçimi adımı gönderilemedi", False,
+                        error=str(exc))
+                failed = True
+        else:
+            _record(2, "click_character_selection", "Önceki adım başarısız olduğu için atlandı", False,
+                    skipped=True)
+        if pause_dt > 0 and not failed:
             time.sleep(pause_dt)
 
         # Adım 3: Hedef Karakter Slotunu Seç (Slot #N)
-        slot_nx, slot_ny = self.get_slot_normalized_coords(target_slot_index)
-        slot_px, slot_py = _click_normalized_safe(
-            input_ctrl,
-            slot_nx,
-            slot_ny,
-            test_mode=test_mode,
-            double=False,
-        )
-        steps_log.append({
-            "step": 3,
-            "action": f"select_slot_{int(target_slot_index)}",
-            "description_tr": f"Slot #{int(target_slot_index)} seçildi",
-            "slot_index": int(target_slot_index),
-            "norm_coords": (slot_nx, slot_ny),
-            "coords": (slot_px, slot_py),
-        })
-        if pause_dt > 0:
+        if not failed:
+            try:
+                slot_px, slot_py = _click_normalized_safe(
+                    input_ctrl, slot_nx, slot_ny, test_mode=test_mode, double=False,
+                )
+                _record(
+                    3, f"select_slot_{target_slot}",
+                    f"Slot #{target_slot} seçildi", True,
+                    slot_index=target_slot, norm_coords=(slot_nx, slot_ny),
+                    coords=(slot_px, slot_py),
+                )
+            except Exception as exc:
+                logger.error("Slot seçimi adımı başarısız: %s", exc)
+                _record(3, f"select_slot_{target_slot}", "Slot seçimi gönderilemedi", False,
+                        slot_index=target_slot, error=str(exc))
+                failed = True
+        else:
+            _record(3, f"select_slot_{target_slot}", "Önceki adım başarısız olduğu için atlandı", False,
+                    slot_index=target_slot, skipped=True)
+        if pause_dt > 0 and not failed:
             time.sleep(pause_dt)
 
-        # Adım 4: Oyuna Gir (Enter World)
-        enter_px, enter_py = _click_normalized_safe(
-            input_ctrl,
-            self.ENTER_WORLD_BTN_NORM[0],
-            self.ENTER_WORLD_BTN_NORM[1],
-            test_mode=test_mode,
-        )
-        _send_key_safe(input_ctrl, "enter", test_mode=test_mode)
-        steps_log.append({
-            "step": 4,
-            "action": "enter_game_world",
-            "description_tr": "Oyuna Gir butonuna tıklandı ve yeni karakterle dünyaya giriş yapıldı",
-            "coords": (enter_px, enter_py),
-            "key": "enter",
-        })
+        # Adım 4: Oyuna Gir (Enter World) — yalnızca tıklama; ardından Enter
+        # basmak çifte aksiyon olur (F-1734), o yüzden Enter gönderilmez.
+        if not failed:
+            try:
+                enter_px, enter_py = _click_normalized_safe(
+                    input_ctrl,
+                    self.ENTER_WORLD_BTN_NORM[0],
+                    self.ENTER_WORLD_BTN_NORM[1],
+                    test_mode=test_mode,
+                )
+                _record(
+                    4, "enter_game_world",
+                    "Oyuna Gir butonuna tıklandı ve yeni karakterle dünyaya giriş yapıldı", True,
+                    coords=(enter_px, enter_py),
+                )
+            except Exception as exc:
+                logger.error("Oyuna giriş adımı başarısız: %s", exc)
+                _record(4, "enter_game_world", "Oyuna giriş tıklaması gönderilemedi", False,
+                        error=str(exc))
+                failed = True
+        else:
+            _record(4, "enter_game_world", "Önceki adım başarısız olduğu için atlandı", False,
+                    skipped=True)
 
         return steps_log
 
@@ -645,7 +978,7 @@ class AltCharacterManager:
         energy_depleted: bool = False,
         input_ctrl: Any = None,
         route_mgr: Any = None,
-        test_mode: bool = True,
+        test_mode: bool = False,
     ) -> Dict[str, Any]:
         """
         Aktif karakterin günlük toplama sayısını (`current_gathered`) ve enerji durumunu
@@ -653,9 +986,14 @@ class AltCharacterManager:
 
         Limit dolmuşsa veya enerji tükenmişse:
         - `Esc -> Karakter Seçimi -> Slot #N Seç -> Oyuna Gir` dizisini çalıştırır,
-        - Aktif karakter profilini sıradaki uygun karaktere günceller ve kaydeder,
+        - Dizi adımlarının HEPSİ doğrulandıysa aktif karakter profilini sıradaki
+          uygun karaktere günceller ve kaydeder (doğrulanamayan değişim kalıcı
+          kayda geçmez, F-1709),
         - `route_mgr` varsa yeni karakterin `region_name` ve `route_name` değerlerine geçirir.
+        Kilit yalnızca kısa karar/kayıt bölümlerinde tutulur; uykulu ve G/Ç yapan
+        değişim dizisi kilit DIŞINDA çalışır (F-1731).
         """
+        # 1. aşama (kilitli, kısa): kararı ver, kalıcı sayacı güncelle.
         with self._lock:
             self.reset_daily_quotas_if_new_day()
             active_char = self.get_active_character()
@@ -709,53 +1047,121 @@ class AltCharacterManager:
                     "reason_tr": msg_exhausted,
                 }
 
+            if not 1 <= int(next_char.slot_index) <= 8:
+                msg_slot = (
+                    f"Yan karakter '{next_char.name}' Slot #{next_char.slot_index} arayüzde yok "
+                    f"(1..8); yanlış slota tıklanmaması için rotasyon iptal edildi."
+                )
+                logger.warning("[AltCharacterManager] %s", msg_slot)
+                return {
+                    "rotated": False,
+                    "all_exhausted": False,
+                    "recommended_state": "WALKING",
+                    "previous_character": active_char.to_dict(),
+                    "active_character": active_char.to_dict(),
+                    "route_switched": False,
+                    "sequence_steps": [],
+                    "reason_tr": msg_slot,
+                }
+
             prev_snapshot = active_char.to_dict()
+            decision_slot = int(self.active_slot_index)
+
+        # 2. aşama (kilitsiz): uykulu/G/Ç yapan değişim dizisi.
+        try:
             sequence_steps = self.execute_character_switch_sequence(
                 target_slot_index=next_char.slot_index,
                 input_ctrl=input_ctrl,
                 test_mode=test_mode,
             )
+        except ValueError as exc:
+            logger.error("[AltCharacterManager] Rotasyon iptal edildi: %s", exc)
+            return {
+                "rotated": False,
+                "all_exhausted": False,
+                "recommended_state": "WALKING",
+                "previous_character": prev_snapshot,
+                "active_character": active_char.to_dict(),
+                "route_switched": False,
+                "sequence_steps": [],
+                "reason_tr": f"Karakter değişimi doğrulanamadı, kalıcı kayıt değiştirilmedi: {exc}",
+            }
 
+        steps_ok = bool(sequence_steps) and all(bool(st.get("ok")) for st in sequence_steps)
+        if not steps_ok:
+            failed_steps = [st.get("step") for st in sequence_steps if not st.get("ok")]
+            return {
+                "rotated": False,
+                "all_exhausted": False,
+                "recommended_state": "WALKING",
+                "previous_character": prev_snapshot,
+                "active_character": active_char.to_dict(),
+                "route_switched": False,
+                "sequence_steps": sequence_steps,
+                "reason_tr": (
+                    f"Karakter değişimi doğrulanamadı (başarısız adım: {failed_steps}); "
+                    f"aktif karakter kaydı değiştirilmedi."
+                ),
+            }
+
+        # 3. aşama (kilitli, kısa): doğrulanmış değişimi kalıcı kayda geçir.
+        with self._lock:
+            if int(self.active_slot_index) != decision_slot:
+                return {
+                    "rotated": False,
+                    "all_exhausted": False,
+                    "recommended_state": "WALKING",
+                    "previous_character": prev_snapshot,
+                    "active_character": active_char.to_dict(),
+                    "route_switched": False,
+                    "sequence_steps": sequence_steps,
+                    "reason_tr": (
+                        "Karakter değişimi sırasında aktif slot başka bir işlemle değişti; "
+                        "kalıcı kayıt değiştirilmedi."
+                    ),
+                }
             now_ts = time.time()
             active_char.last_rotated_ts = now_ts
             next_char.last_rotated_ts = now_ts
             self.active_slot_index = next_char.slot_index
             self.save_characters()
 
-            route_switched = self._switch_route_manager_to_character(route_mgr, next_char)
+        # 4. aşama (kilitsiz): rota senkronizasyonu.
+        route_switched = self._switch_route_manager_to_character(route_mgr, next_char)
 
-            reason_tr = (
-                f"'{active_char.name}' (Slot #{active_char.slot_index}) için {trigger_reason}. "
-                f"Yan karakter '{next_char.name}' (Slot #{next_char.slot_index}) seçildi -> "
-                f"Bölge: {next_char.region_name}, Rota: {next_char.route_name}."
-            )
-            logger.info("[AltCharacterManager] %s", reason_tr)
+        reason_tr = (
+            f"'{active_char.name}' (Slot #{active_char.slot_index}) için {trigger_reason}. "
+            f"Yan karakter '{next_char.name}' (Slot #{next_char.slot_index}) seçildi -> "
+            f"Bölge: {next_char.region_name}, Rota: {next_char.route_name}."
+        )
+        logger.info("[AltCharacterManager] %s", reason_tr)
 
-            rotation_event = {
-                "timestamp": now_ts,
-                "from_slot": active_char.slot_index,
-                "from_name": active_char.name,
-                "to_slot": next_char.slot_index,
-                "to_name": next_char.name,
-                "region_name": next_char.region_name,
-                "route_name": next_char.route_name,
-                "route_switched": route_switched,
-                "reason_tr": reason_tr,
-            }
+        rotation_event = {
+            "timestamp": now_ts,
+            "from_slot": active_char.slot_index,
+            "from_name": active_char.name,
+            "to_slot": next_char.slot_index,
+            "to_name": next_char.name,
+            "region_name": next_char.region_name,
+            "route_name": next_char.route_name,
+            "route_switched": route_switched,
+            "reason_tr": reason_tr,
+        }
+        with self._lock:
             self.rotation_history.append(rotation_event)
 
-            return {
-                "rotated": True,
-                "all_exhausted": False,
-                "recommended_state": "WALKING",
-                "previous_character": prev_snapshot,
-                "active_character": next_char.to_dict(),
-                "target_region": next_char.region_name,
-                "target_route": next_char.route_name,
-                "route_switched": route_switched,
-                "sequence_steps": sequence_steps,
-                "reason_tr": reason_tr,
-            }
+        return {
+            "rotated": True,
+            "all_exhausted": False,
+            "recommended_state": "WALKING",
+            "previous_character": prev_snapshot,
+            "active_character": next_char.to_dict(),
+            "target_region": next_char.region_name,
+            "target_route": next_char.route_name,
+            "route_switched": route_switched,
+            "sequence_steps": sequence_steps,
+            "reason_tr": reason_tr,
+        }
 
     def get_scheduler_health_summary(self) -> Dict[str, Any]:
         """Returns a health summary of characters, active character name, and rotation history."""
@@ -763,7 +1169,8 @@ class AltCharacterManager:
             with self._lock:
                 act = self.get_active_character()
                 return {
-                    "total_characters": len(self._characters),
+                    "total_characters": len(self._profiles),
+                    "available_characters": sum(1 for c in self._profiles if c.is_available()),
                     "active_character_name": act.name if act else "Main",
                     "active_slot_index": int(self.active_slot_index),
                     "rotation_count": len(self.rotation_history),
@@ -777,14 +1184,43 @@ class AltCharacterManager:
                 "rotation_count": 0,
             }
 
+    def _is_ready(self) -> bool:
+        with self._lock:
+            return bool(self._profiles) and any(
+                c.slot_index == self.active_slot_index for c in self._profiles
+            )
+
     def get_multi_char_scheduler_ready_flag(self) -> dict:
-        return {"module": "multi_char_scheduler", "ready": True}
+        ready = self._is_ready()
+        return {
+            "module": "multi_char_scheduler",
+            "ready": ready,
+            "total_characters": len(self._profiles),
+            "active_slot_index": int(self.active_slot_index),
+        }
 
     def get_multi_char_scheduler_version_info(self) -> dict:
-        return {"module": "multi_char_scheduler", "version": "2.0.0", "ready": True}
+        return {"module": "multi_char_scheduler", "version": __version__, "ready": self._is_ready()}
 
     def get_multi_char_scheduler_diagnostic_snapshot(self) -> dict:
-        return {"module": "multi_char_scheduler", "status": "ok", "ready": True}
+        ready = self._is_ready()
+        with self._lock:
+            act = self.get_active_character() if self._profiles else None
+            return {
+                "module": "multi_char_scheduler",
+                "status": "ok" if ready else "degraded",
+                "ready": ready,
+                "total_characters": len(self._profiles),
+                "available_characters": sum(1 for c in self._profiles if c.is_available()),
+                "active_character_name": act.name if act else "Main",
+                "active_slot_index": int(self.active_slot_index),
+                "rotation_count": len(self.rotation_history),
+                "runtime_context_bound": bool(
+                    self._runtime_input_ctrl is not None
+                    or self._runtime_task_scheduler is not None
+                    or self._runtime_pet_buff_mgr is not None
+                ),
+            }
 
 
 
@@ -822,13 +1258,21 @@ class ScheduleEntry:
     days_of_week: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
     enabled: bool = True
     priority: int = 10
+    # `__post_init__` içinde bir kez hesaplanan önbellek: `matches_minutes` /
+    # `window_duration_minutes` her çağrıda "HH:MM" ayrıştırmasın diye.
+    # (Repo içinde `start_hhmm`/`end_hhmm`/`days_of_week` kurulum sonrası
+    # değiştirilmiyor; değiştirilirse önbellek tazelenmez.)
+    _start_min: int = field(default=0, init=False, repr=False, compare=False)
+    _end_min: int = field(default=0, init=False, repr=False, compare=False)
+    _days_set: frozenset = field(default=frozenset(), init=False, repr=False, compare=False)
+    _overnight_allowed_days: frozenset = field(default=frozenset(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.name = str(self.name or "Görev").strip()
         self.start_hhmm = str(self.start_hhmm or "00:00").strip()
         self.end_hhmm = str(self.end_hhmm or "23:59").strip()
-        _parse_hhmm_to_minutes(self.start_hhmm)
-        _parse_hhmm_to_minutes(self.end_hhmm)
+        self._start_min = _parse_hhmm_to_minutes(self.start_hhmm)
+        self._end_min = _parse_hhmm_to_minutes(self.end_hhmm)
 
         clean_action = str(self.action or "run_route").strip().lower()
         if clean_action not in VALID_SCHEDULE_ACTIONS:
@@ -842,6 +1286,8 @@ class ScheduleEntry:
             self.days_of_week = [0, 1, 2, 3, 4, 5, 6]
         else:
             self.days_of_week = sorted({int(d) % 7 for d in self.days_of_week})
+        self._days_set = frozenset(self.days_of_week)
+        self._overnight_allowed_days = self._days_set | frozenset((d + 1) % 7 for d in self.days_of_week)
         self.enabled = bool(self.enabled)
         self.priority = int(self.priority)
 
@@ -849,11 +1295,17 @@ class ScheduleEntry:
         """Verilen gün (`0=Pazartesi .. 6=Pazar`) ve gün içi dakikada bu kuralın aktif olup olmadığını döner."""
         if not self.enabled:
             return False
-        if (int(weekday) % 7) not in self.days_of_week:
-            return False
 
-        start_min = _parse_hhmm_to_minutes(self.start_hhmm)
-        end_min = _parse_hhmm_to_minutes(self.end_hhmm)
+        start_min = self._start_min
+        end_min = self._end_min
+        weekday = int(weekday) % 7
+        if start_min > end_min:
+            # Gece yarısını aşan pencerede gece yarısından sonraki kısım
+            # pencerenin BAŞLADIĞI güne aittir (hafta sınırında önceki gün).
+            if weekday not in self._overnight_allowed_days:
+                return False
+        elif weekday not in self._days_set:
+            return False
 
         if start_min <= end_min:
             # Aynı gün içi pencere: başlangıç dahil, bitiş hariç (ancak 23:59 ise gün sonuna kadar dahil)
@@ -861,13 +1313,22 @@ class ScheduleEntry:
                 return start_min <= current_minutes <= end_min
             return start_min <= current_minutes < end_min
         else:
-            # Gece yarısını aşan pencere (ör. 22:15 -> 02:00)
-            return current_minutes >= start_min or current_minutes < end_min
+            # Gece yarısını aşan pencere (ör. 22:15 -> 02:00): gece yarısından
+            # sonraki kısım pencerenin BAŞLADIĞI güne aittir; hafta sınırında
+            # önceki günün kuralı da geçerlidir.
+            # Gece yarısı ÖNCESİ kısım yalnızca pencerenin başladığı gün
+            # geçerlidir (F-1722): days=[0] (yalnızca Pazartesi) kuralı
+            # Salı 23:00'te eşleşmemeli — +1 gün yalnızca 00:00 sonrası
+            # kısım içindir.
+            if current_minutes >= start_min:
+                return weekday in self.days_of_week
+            prev_weekday = (int(weekday) - 1) % 7
+            return current_minutes < end_min and prev_weekday in self.days_of_week
 
     def window_duration_minutes(self) -> int:
         """Zaman penceresinin toplam dakika uzunluğunu döndürür (daha dar/özel pencerelere öncelik vermek için)."""
-        start_min = _parse_hhmm_to_minutes(self.start_hhmm)
-        end_min = _parse_hhmm_to_minutes(self.end_hhmm)
+        start_min = self._start_min
+        end_min = self._end_min
         if start_min <= end_min:
             return max(1, end_min - start_min)
         return max(1, (24 * 60 - start_min) + end_min)
@@ -935,7 +1396,8 @@ class AutomationTaskScheduler:
                     self._entries.append(item)
                 elif isinstance(item, dict):
                     self._entries.append(ScheduleEntry.from_dict(item))
-            self.save_schedule()
+            # Kurallar çağrıcı tarafından verildi: kalıcılık çağrıcınındır,
+            # kurulum tek başına dosyayı yazmaz (F-1736).
         else:
             self.load_schedule()
 
@@ -985,6 +1447,7 @@ class AutomationTaskScheduler:
     def load_schedule(self) -> List[ScheduleEntry]:
         """`config/schedule.json` dosyasından zamanlanmış görev kurallarını yükler."""
         with self._lock:
+            corrupt = False
             if os.path.isfile(self.config_path):
                 try:
                     with open(self.config_path, "r", encoding="utf-8") as f:
@@ -1000,9 +1463,12 @@ class AutomationTaskScheduler:
                         return list(self._entries)
                 except Exception as exc:
                     logger.warning("Takvim yapılandırması okunamadı (%s): %s", self.config_path, exc)
+                    corrupt = True
+                    _backup_corrupt_config(self.config_path)
 
             self._entries = self.build_default_schedule()
-            self.save_schedule()
+            if not corrupt:
+                self.save_schedule()
             return list(self._entries)
 
     def save_schedule(self) -> bool:
@@ -1069,7 +1535,7 @@ class AutomationTaskScheduler:
         now_dt: Optional[Union[datetime.datetime, datetime.time, str]] = None,
         route_mgr: Any = None,
         input_ctrl: Any = None,
-        test_mode: bool = True,
+        test_mode: bool = False,
     ) -> Dict[str, Any]:
         """
         Verilen zamana (`now_dt`, varsayılan şu an) göre aktif takvim kuralını değerlendirir
@@ -1082,6 +1548,11 @@ class AutomationTaskScheduler:
         - `"pause"` ise: `recommended_state = "PAUSED"` döner.
         - `"run_route"` ise: `recommended_state = "WALKING"` döner.
         """
+        # S-1202: kilit yalnizca kisa karar bolumunde tutulur; tus gonderimi
+        # ve route_mgr G/C'si kilit DISINDA calisir (check_and_rotate_character
+        # ile ayni 3 asamali desen, F-1731). Kilit altinda donanim G/C yapan
+        # cagri diger thread'leri blokluyordu.
+        # 1. asama (kilitli, kisa): eslesen kurali sec, karari ver.
         with self._lock:
             dt = self._coerce_datetime(now_dt)
             current_minutes = dt.hour * 60 + dt.minute
@@ -1097,13 +1568,13 @@ class AutomationTaskScheduler:
                     "matched": False,
                     "current_hhmm": current_hhmm,
                     "weekday": weekday,
-                    "action": "run_route",
-                    "recommended_state": "WALKING",
+                    "action": "pause",
+                    "recommended_state": "PAUSED",
                     "town_wait_active": False,
                     "region_switched": False,
                     "target_region": "",
                     "active_entry": None,
-                    "reason_tr": f"Saat {current_hhmm} için özel kısıtlama yok; standart rota akışı aktif.",
+                    "reason_tr": f"Saat {current_hhmm} için takvim kuralı yok; takvim dışı saatte bot duraklatıldı.",
                 }
 
             # En yüksek öncelikli ve en spesifik (dar) zaman penceresine sahip kuralı seç
@@ -1111,80 +1582,227 @@ class AutomationTaskScheduler:
             winner = matching[0]
             rec_state = self.ACTION_TO_STATE.get(winner.action, "WALKING")
             town_wait_active = winner.action == "town_wait_event"
-            region_switched = False
-            town_recall_sent = False
+            action = winner.action
+            target_region = winner.target_region
+            target_route = winner.target_route
+            winner_dict = winner.to_dict()
 
-            if winner.action == "town_wait_event":
-                if self._last_action != "town_wait_event" and input_ctrl is not None:
-                    town_recall_sent = _send_key_safe(input_ctrl, self.town_recall_key, test_mode=test_mode)
+            # Salt-okuma ("sadece bakayım") çağrısı _last_action'ı değiştirmemeli:
+            # aksi halde şehir dönüşü tuşu kalıcı olarak bastırılır (F-1720).
+            # Yalnızca gerçekten eylem yapan çağrılar (input_ctrl/route_mgr verilmiş)
+            # son aksiyonu günceller.
+            is_action_call = input_ctrl is not None or route_mgr is not None
+            need_town_recall = (
+                action == "town_wait_event"
+                and self._last_action != "town_wait_event"
+                and input_ctrl is not None
+            )
+            # S-0801: tuş gönderimi başarısız olursa sahiplenme geri alınabilsin
+            # diye önceki değer saklanır; başarısız gönderim kalıcı bastırmaya
+            # dönüşmesin, sonraki çağrı tuşu tekrar denesin.
+            prev_last_action = self._last_action
+            if need_town_recall or is_action_call:
+                # Şehir dönüşü geçişini kilit altında sahiplen: eşzamanlı
+                # ikinci çağrı aynı tuşu tekrar göndermesin.
+                self._last_action = action
+            need_region_switch = (
+                route_mgr is not None
+                and bool(target_region)
+                and action in ("switch_region", "run_route")
+            )
+
+            if action == "town_wait_event":
                 reason_tr = (
                     f"[{winner.start_hhmm}-{winner.end_hhmm}] '{winner.name}': "
                     f"Dünya Bossu (World Boss) / Etkinlik saatinde şehre dönüp bekleniyor."
                 )
-            elif winner.action == "pause":
+            elif action == "pause":
                 reason_tr = (
                     f"[{winner.start_hhmm}-{winner.end_hhmm}] '{winner.name}': "
                     f"Zamanlanmış mola/duraklatma aktif."
                 )
-            elif winner.action == "switch_region":
-                if route_mgr is not None and winner.target_region:
-                    try:
-                        if hasattr(route_mgr, "get_regions") and hasattr(route_mgr, "create_region"):
-                            if winner.target_region not in route_mgr.get_regions():
-                                route_mgr.create_region(winner.target_region)
-                        if hasattr(route_mgr, "active_region"):
-                            route_mgr.active_region = winner.target_region
-                        if hasattr(route_mgr, "active_route") and winner.target_route:
-                            route_mgr.active_route = winner.target_route
-                        if hasattr(route_mgr, "_sync_legacy_data") and callable(route_mgr._sync_legacy_data):
-                            route_mgr._sync_legacy_data()
-                        region_switched = True
-                    except Exception as exc:
-                        logger.error("Takvim bölge değiştirme hatası (%s): %s", winner.target_region, exc)
+            elif action == "switch_region":
                 reason_tr = (
                     f"[{winner.start_hhmm}-{winner.end_hhmm}] '{winner.name}': "
-                    f"Bölge '{winner.target_region or 'Varsayılan'}' rotası çalıştırılıyor."
+                    f"Bölge '{target_region or 'Varsayılan'}' rotası çalıştırılıyor."
                 )
             else:
-                if route_mgr is not None and winner.target_region:
-                    try:
-                        if hasattr(route_mgr, "active_region"):
-                            route_mgr.active_region = winner.target_region
-                        if hasattr(route_mgr, "active_route") and winner.target_route:
-                            route_mgr.active_route = winner.target_route
-                        region_switched = True
-                    except Exception as exc:
-                        logger.debug("Rota bölgesi güncellenemedi: %s", exc)
                 reason_tr = (
                     f"[{winner.start_hhmm}-{winner.end_hhmm}] '{winner.name}': "
                     f"Zamanlanmış toplama rotası aktif."
                 )
 
-            self._last_action = winner.action
+        # 2. asama (kilitsiz): donanim G/C — sehir donusu tusu + rota gecisi.
+        town_recall_sent = False
+        town_recall_pending = False
+        if need_town_recall:
+            town_recall_sent = _send_key_safe(input_ctrl, self.town_recall_key, test_mode=test_mode)
+            if not town_recall_sent:
+                # S-0801: tuş gönderilemediyse sahiplenmeyi geri al — sonraki
+                # çağrıda need_town_recall yeniden True olur ve tuş tekrar
+                # denenir; bot etkinlik penceresi boyunca WAITING'de sahada
+                # beklemez. Yalnızca hâlâ bizim sahiplenmemiz duruyorsa geri al.
+                with self._lock:
+                    if self._last_action == action:
+                        self._last_action = prev_last_action
+                town_recall_pending = True
+                logger.warning(
+                    "Şehir dönüşü tuşu gönderilemedi ('%s'); sonraki takvim "
+                    "değerlendirmesinde tekrar denenecek.",
+                    self.town_recall_key,
+                )
 
+        region_switched = False
+        if need_region_switch:
+            try:
+                # S-0803: yalnızca gerçekten uygulanan bir geçiş True sayılır;
+                # route_mgr hiçbir beklenen özniteliğe sahip değilse hiçbir
+                # işlem yapılmaz ve region_switched False kalır.
+                region_applied = False
+                if action == "switch_region":
+                    if hasattr(route_mgr, "get_regions") and hasattr(route_mgr, "create_region"):
+                        if target_region not in route_mgr.get_regions():
+                            route_mgr.create_region(target_region)
+                        region_applied = True
+                    if hasattr(route_mgr, "active_region"):
+                        route_mgr.active_region = target_region
+                        region_applied = True
+                    if hasattr(route_mgr, "active_route") and target_route:
+                        route_mgr.active_route = target_route
+                        region_applied = True
+                    if hasattr(route_mgr, "_sync_legacy_data") and callable(route_mgr._sync_legacy_data):
+                        route_mgr._sync_legacy_data()
+                        region_applied = True
+                else:  # run_route
+                    if hasattr(route_mgr, "active_region"):
+                        route_mgr.active_region = target_region
+                        region_applied = True
+                    if hasattr(route_mgr, "active_route") and target_route:
+                        route_mgr.active_route = target_route
+                        region_applied = True
+                region_switched = region_applied
+            except Exception as exc:
+                if action == "switch_region":
+                    logger.error("Takvim bölge değiştirme hatası (%s): %s", target_region, exc)
+                else:
+                    logger.debug("Rota bölgesi güncellenemedi: %s", exc)
+
+        return {
+            "matched": True,
+            "current_hhmm": current_hhmm,
+            "weekday": weekday,
+            "action": action,
+            "recommended_state": rec_state,
+            "town_wait_active": town_wait_active,
+            "town_recall_sent": town_recall_sent,
+            "town_recall_pending": town_recall_pending,
+            "region_switched": region_switched,
+            "target_region": target_region,
+            "target_route": target_route,
+            "active_entry": winner_dict,
+            "reason_tr": reason_tr,
+        }
+
+    def next_scheduled_change(
+        self,
+        now_dt: Optional[Union[datetime.datetime, datetime.time, str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Bir sonraki takvim geçişine (etkin kuralın başlangıcı veya bitişi) kadar
+        olan süreyi döndürür — çağıran `evaluate_current_schedule` ile yoklama
+        yapmak yerine bu ana kadar uyuyabilir.
+
+        Döndürür: `has_next` (etkin kural varsa True), `at` (geçiş anı, ISO),
+        `in_seconds` (kalan saniye), `transition` (`"start"`/`"end"`),
+        `entry` (ilgili kuralın sözlüğü). Etkin kural yoksa `has_next=False`
+        döner. Mevcut durumu değiştirmez (`_last_action` güncellenmez).
+        """
+        with self._lock:
+            now = self._coerce_datetime(now_dt)
+            best_dt: Optional[datetime.datetime] = None
+            best_entry: Optional[ScheduleEntry] = None
+            best_transition = ""
+
+            for entry in self._entries:
+                if not entry.enabled:
+                    continue
+                # -1: dün başlayan gece-yarısı-aşan pencerenin bugünkü bitişi
+                # de bir sonraki geçiş olabilir; 0..7: bu hafta içi.
+                for day_offset in range(-1, 8):
+                    day = now.date() + datetime.timedelta(days=day_offset)
+                    if day.weekday() not in entry._days_set:
+                        continue
+                    start_dt = datetime.datetime.combine(
+                        day, datetime.time(entry._start_min // 60, entry._start_min % 60)
+                    )
+                    end_day = day + (
+                        datetime.timedelta(days=1)
+                        if entry._start_min > entry._end_min
+                        else datetime.timedelta(0)
+                    )
+                    end_dt = datetime.datetime.combine(
+                        end_day, datetime.time(entry._end_min // 60, entry._end_min % 60)
+                    )
+                    for cand_dt, transition in ((start_dt, "start"), (end_dt, "end")):
+                        if cand_dt > now and (best_dt is None or cand_dt < best_dt):
+                            best_dt = cand_dt
+                            best_entry = entry
+                            best_transition = transition
+
+            if best_dt is None or best_entry is None:
+                return {
+                    "has_next": False,
+                    "at": None,
+                    "in_seconds": None,
+                    "transition": None,
+                    "entry": None,
+                    "current_hhmm": f"{now.hour:02d}:{now.minute:02d}",
+                    "weekday": now.weekday(),
+                    "reason_tr": "Etkin takvim kuralı yok; bir sonraki takvim geçişi bilinmiyor.",
+                }
+
+            in_seconds = (best_dt - now).total_seconds()
             return {
-                "matched": True,
-                "current_hhmm": current_hhmm,
-                "weekday": weekday,
-                "action": winner.action,
-                "recommended_state": rec_state,
-                "town_wait_active": town_wait_active,
-                "town_recall_sent": town_recall_sent,
-                "region_switched": region_switched,
-                "target_region": winner.target_region,
-                "target_route": winner.target_route,
-                "active_entry": winner.to_dict(),
-                "reason_tr": reason_tr,
+                "has_next": True,
+                "at": best_dt.isoformat(),
+                "in_seconds": round(float(in_seconds), 1),
+                "transition": best_transition,
+                "entry": best_entry.to_dict(),
+                "current_hhmm": f"{now.hour:02d}:{now.minute:02d}",
+                "weekday": now.weekday(),
+                "reason_tr": (
+                    f"Bir sonraki takvim geçişi {best_dt.strftime('%H:%M')} "
+                    f"({best_transition} — '{best_entry.name}'), "
+                    f"{int(in_seconds // 60)} dk {int(in_seconds % 60)} sn sonra."
+                ),
             }
 
+    def _is_ready(self) -> bool:
+        with self._lock:
+            return bool(self._entries)
+
     def get_multi_char_scheduler_ready_flag(self) -> dict:
-        return {"module": "multi_char_scheduler", "ready": True}
+        return {
+            "module": "multi_char_scheduler",
+            "ready": self._is_ready(),
+            "total_entries": len(self._entries),
+            "enabled_entries": sum(1 for e in self._entries if e.enabled),
+        }
 
     def get_multi_char_scheduler_version_info(self) -> dict:
-        return {"module": "multi_char_scheduler", "version": "2.0.0", "ready": True}
+        return {"module": "multi_char_scheduler", "version": __version__, "ready": self._is_ready()}
 
     def get_multi_char_scheduler_diagnostic_snapshot(self) -> dict:
-        return {"module": "multi_char_scheduler", "status": "ok", "ready": True}
+        ready = self._is_ready()
+        with self._lock:
+            return {
+                "module": "multi_char_scheduler",
+                "status": "ok" if ready else "degraded",
+                "ready": ready,
+                "total_entries": len(self._entries),
+                "enabled_entries": sum(1 for e in self._entries if e.enabled),
+                "last_action": self._last_action,
+            }
 
 
 
@@ -1228,13 +1846,18 @@ class BuffSlot:
         """Buff süresinin bitmesine kalan saniyeyi döndürür."""
         now = float(now_ts if now_ts is not None else time.time())
         if self.last_used_ts <= 0.0:
-            return 0.0
+            # Hiç kullanılmadıysa süre bilinmiyor: zamanlayıcı tek başına
+            # yenileme tetiklemez (F-1718); tam süre varsayılır, görsel kanıt gerekir.
+            return float(self.duration_sec)
         elapsed = max(0.0, now - self.last_used_ts)
         return max(0.0, self.duration_sec - elapsed)
 
     def is_expired_by_timer(self, now_ts: Optional[float] = None) -> bool:
         """Zamanlayıcıya göre buff süresinin dolup dolmadığını kontrol eder."""
         if not self.enabled:
+            return False
+        if self.last_used_ts <= 0.0:
+            # Kayıt yoksa süre doldu sayılmaz; açılışta koşulsuz tuş basılmaz.
             return False
         return self.remaining_sec(now_ts=now_ts) <= 0.0
 
@@ -1299,11 +1922,27 @@ class PetAndBuffManager:
 
         self.buff_slots: List[BuffSlot] = []
         if buff_slots is not None:
+            # S123 (v19/P3-8): görsel harita (`slot_visual_active`)
+            # yuva adıyla anahtarlanıyor — aynı adlı iki yuva
+            # çakışır, son yazan kazanırdı. Yinelenen ad
+            # benzersizleştirilir ("Ad (2)"), uyarı loglanır.
+            _seen_names: Dict[str, int] = {}
             for item in buff_slots:
-                if isinstance(item, BuffSlot):
-                    self.buff_slots.append(item)
-                elif isinstance(item, dict):
-                    self.buff_slots.append(BuffSlot.from_dict(item))
+                _slot = item if isinstance(item, BuffSlot) else (
+                    BuffSlot.from_dict(item) if isinstance(item, dict) else None
+                )
+                if _slot is None:
+                    continue
+                _count = _seen_names.get(_slot.name, 0) + 1
+                _seen_names[_slot.name] = _count
+                if _count > 1:
+                    _orig = _slot.name
+                    _slot.name = f"{_orig} ({_count})"
+                    logger.warning(
+                        "Yinelenen buff yuvası adı '%s' -> '%s' olarak "
+                        "benzersizleştirildi.", _orig, _slot.name
+                    )
+                self.buff_slots.append(_slot)
         else:
             self.buff_slots = self.build_default_buff_slots()
 
@@ -1345,7 +1984,20 @@ class PetAndBuffManager:
         """
         Oyun ekranındaki (`frame`) buff çubuğu bölgesini OpenCV HSV renk/parlaklık analiziyle inceler.
         Her bir `BuffSlot` için ikonun ekranda aktif (parlak/renkli) olup olmadığını tespit eder.
+
+        P2-3 (K-17): bu metod kilit TUTMAZ — OpenCV analizi
+        (connectedComponents + slot basina cvtColor) yalnizca kisa
+        kilitle kopyalanmis yuva listesi uzerinde calisir. Cagiran
+        (check_and_refresh_buffs) da analizi 1. asama kilidinin
+        disinda yapar; kilit yalnizca karar/kayit icin tutulur.
         """
+        # Yuva listesi yalnizca __init__'te kurulur; kisa kilitli kopya
+        # olasi bir eszamanli degisime karsi analizi sabit bir liste
+        # uzerinde tutar. Yuva nesnelerinin salt-okunur alanlari
+        # (name/icon_roi_norm/esikler) analizde kullanilir; last_used_ts
+        # gibi degisken alanlar burada okunmaz.
+        with self._lock:
+            slots = list(self.buff_slots)
         if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
             return {
                 "frame_analyzed": False,
@@ -1393,7 +2045,7 @@ class PetAndBuffManager:
                     active_icon_count += 1
 
             slot_visual_active: Dict[str, bool] = {}
-            for idx, slot in enumerate(self.buff_slots):
+            for idx, slot in enumerate(slots):
                 rx1, ry1, rx2, ry2 = slot.icon_roi_norm
                 if rx2 > rx1 and ry2 > ry1:
                     sx1 = max(0, min(w - 1, int(round(rx1 * w))))
@@ -1403,7 +2055,7 @@ class PetAndBuffManager:
                     slot_crop = bgr[sy1:sy2, sx1:sx2]
                 else:
                     # Otomatik dilimleme: buff bar içinde idx'inci yuva
-                    slot_w = max(1, (bx2 - bx1) // max(1, len(self.buff_slots) + 2))
+                    slot_w = max(1, (bx2 - bx1) // max(1, len(slots) + 2))
                     sx1 = bx1 + idx * slot_w
                     sx2 = min(bx2, sx1 + slot_w)
                     slot_crop = bgr[by1:by2, sx1:sx2]
@@ -1441,7 +2093,7 @@ class PetAndBuffManager:
         self,
         frame: Optional[np.ndarray] = None,
         input_ctrl: Any = None,
-        test_mode: bool = True,
+        test_mode: bool = False,
         now_ts: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
@@ -1452,31 +2104,26 @@ class PetAndBuffManager:
         - Süresi dolan veya ekranda buff ikonunun söndüğü tespit edilen `BuffSlot` öğelerini
           kısayol tuşlarına basarak otomatik yeniler.
         """
+        # S-1202: kilit yalnizca kisa karar/kayit bolumlerinde tutulur;
+        # tus gonderimi (donanim G/C) kilit DISINDA calisir
+        # (check_and_rotate_character ile ayni 3 asamali desen, F-1731).
+        # P2-3 (K-17): OpenCV buff-bar analizi de kilit DISINDA yapilir
+        # (onceki kod inspect_buff_bar'i 1. asama kilidi icinde
+        # cagiriyordu); kilit yalnizca karar/kayit icin tutulur.
+        # 0. asama (kilitsiz): buff cubugu goruntusunu analiz et.
+        buff_bar_status = self.inspect_buff_bar(frame)
+        frame_analyzed = bool(buff_bar_status.get("frame_analyzed", False))
+        slot_visual_map: Dict[str, bool] = buff_bar_status.get("slot_visual_active", {})
+
+        # 1. asama (kilitli, kisa): pet/buff kararlarini ver.
         with self._lock:
             now = float(now_ts if now_ts is not None else time.time())
-            buff_bar_status = self.inspect_buff_bar(frame)
-            frame_analyzed = bool(buff_bar_status.get("frame_analyzed", False))
-            slot_visual_map: Dict[str, bool] = buff_bar_status.get("slot_visual_active", {})
 
-            pressed_keys: List[str] = []
-            refreshed_buffs: List[str] = []
-            pet_fed = False
+            feed_pet = self.is_pet_hungry(now_ts=now)
+            pet_fed_ts_before = self.last_pet_fed_ts
 
-            # 1. Pet / Yoldaş Besleme Kontrolü
-            if self.is_pet_hungry(now_ts=now):
-                if _send_key_safe(input_ctrl, self.pet_key, test_mode=test_mode):
-                    self.last_pet_fed_ts = now
-                    self.pet_feed_count += 1
-                    pet_fed = True
-                    pressed_keys.append(self.pet_key)
-                    logger.info(
-                        "[PetAndBuffManager] '%s' beslendi (Tuş: '%s', Besleme #%d).",
-                        self.pet_name,
-                        self.pet_key,
-                        self.pet_feed_count,
-                    )
-
-            # 2. Yemek ve Parşömen Buff Kontrolü (Zamanlayıcı + Ekran Buff Çubuğu)
+            # Yenilenecek bufflar: (slot, sebep, karar anindaki last_used_ts)
+            slots_to_refresh: List[Tuple[BuffSlot, str, float]] = []
             for slot in self.buff_slots:
                 if not slot.enabled:
                     continue
@@ -1489,55 +2136,225 @@ class PetAndBuffManager:
                         visually_missing = True
 
                 if timer_expired or visually_missing:
-                    if _send_key_safe(input_ctrl, slot.hotkey, test_mode=test_mode):
-                        slot.last_used_ts = now
-                        refreshed_buffs.append(slot.name)
-                        pressed_keys.append(slot.hotkey)
-                        trigger_src = "zamanlayıcı süresi doldu" if timer_expired else "buff çubuğunda sönük algılandı"
-                        logger.info(
-                            "[PetAndBuffManager] Buff yenilendi: '%s' (Tuş: '%s', Sebep: %s, Süre: %ds).",
-                            slot.name,
-                            slot.hotkey,
-                            trigger_src,
-                            int(slot.duration_sec),
-                        )
+                    trigger_src = "zamanlayıcı süresi doldu" if timer_expired else "buff çubuğunda sönük algılandı"
+                    slots_to_refresh.append((slot, trigger_src, slot.last_used_ts))
 
-            reasons: List[str] = []
-            if pet_fed:
-                reasons.append(f"{self.pet_name} beslendi ('{self.pet_key}')")
-            if refreshed_buffs:
-                reasons.append(f"Buff yenilendi: {', '.join(refreshed_buffs)}")
-            if not reasons:
-                reasons.append("Pet tok ve tüm toplama buffları aktif.")
+        # 2. asama (kilitsiz): donanim G/C — tus gonderimleri.
+        pressed_keys: List[str] = []
+        refreshed_buffs: List[str] = []
+        pet_fed = False
 
-            return {
-                "pet_fed": pet_fed,
-                "pet_name": self.pet_name,
-                "pet_key": self.pet_key,
-                "pet_feed_count": self.pet_feed_count,
-                "pet_remaining_sec": round(self.pet_remaining_sec(now_ts=now), 1),
-                "refreshed_buffs": refreshed_buffs,
-                "pressed_keys": pressed_keys,
-                "buff_bar_status": buff_bar_status,
-                "buff_states": [s.to_dict(now_ts=now) for s in self.buff_slots],
-                "reason_tr": " | ".join(reasons),
-            }
+        if feed_pet:
+            if _send_key_safe(input_ctrl, self.pet_key, test_mode=test_mode):
+                pet_fed = True
+                pressed_keys.append(self.pet_key)
+
+        for slot, trigger_src, _last_used_before in slots_to_refresh:
+            if _send_key_safe(input_ctrl, slot.hotkey, test_mode=test_mode):
+                refreshed_buffs.append(slot.name)
+                pressed_keys.append(slot.hotkey)
+                logger.info(
+                    "[PetAndBuffManager] Buff yenilendi: '%s' (Tuş: '%s', Sebep: %s, Süre: %ds).",
+                    slot.name,
+                    slot.hotkey,
+                    trigger_src,
+                    int(slot.duration_sec),
+                )
+
+        # 3. asama (kilitli, kisa): basarili gonderimleri kalici kayda gecir.
+        # Eszamanli baska cagri arada ayni kaydi guncellediyse tekrar yazilmaz
+        # (karar anindaki zaman damgasi degismis olur).
+        with self._lock:
+            if pet_fed and self.last_pet_fed_ts == pet_fed_ts_before:
+                self.last_pet_fed_ts = now
+                self.pet_feed_count += 1
+                logger.info(
+                    "[PetAndBuffManager] '%s' beslendi (Tuş: '%s', Besleme #%d).",
+                    self.pet_name,
+                    self.pet_key,
+                    self.pet_feed_count,
+                )
+            refreshed_names = set(refreshed_buffs)
+            for slot, _trigger_src, last_used_before in slots_to_refresh:
+                if slot.name in refreshed_names and slot.last_used_ts == last_used_before:
+                    slot.last_used_ts = now
+            pet_feed_count = self.pet_feed_count
+            pet_remaining = round(self.pet_remaining_sec(now_ts=now), 1)
+            buff_states = [s.to_dict(now_ts=now) for s in self.buff_slots]
+
+        reasons: List[str] = []
+        if pet_fed:
+            reasons.append(f"{self.pet_name} beslendi ('{self.pet_key}')")
+        if refreshed_buffs:
+            reasons.append(f"Buff yenilendi: {', '.join(refreshed_buffs)}")
+        if not reasons:
+            reasons.append("Pet tok ve tüm toplama buffları aktif.")
+
+        return {
+            "pet_fed": pet_fed,
+            "pet_name": self.pet_name,
+            "pet_key": self.pet_key,
+            "pet_feed_count": pet_feed_count,
+            "pet_remaining_sec": pet_remaining,
+            "refreshed_buffs": refreshed_buffs,
+            "pressed_keys": pressed_keys,
+            "buff_bar_status": buff_bar_status,
+            "buff_states": buff_states,
+            "reason_tr": " | ".join(reasons),
+        }
+
+    def _is_ready(self) -> bool:
+        return bool(self.buff_slots) and bool(self.pet_key)
 
     def get_multi_char_ready_flag(self) -> bool:
-        """Returns True safely inside a try/except block."""
+        """Gerçek duruma göre hazır bayrağı; hata durumunda False döner."""
         try:
-            return True
+            return bool(self._is_ready())
         except Exception:
-            return True
+            return False
 
     def get_multi_char_scheduler_ready_flag(self) -> dict:
-        return {"module": "multi_char_scheduler", "ready": True}
+        return {
+            "module": "multi_char_scheduler",
+            "ready": self.get_multi_char_ready_flag(),
+            "buff_slot_count": len(self.buff_slots),
+            "pet_feed_count": int(self.pet_feed_count),
+        }
 
     def get_multi_char_scheduler_version_info(self) -> dict:
-        return {"module": "multi_char_scheduler", "version": "2.0.0", "ready": True}
+        return {"module": "multi_char_scheduler", "version": __version__, "ready": self.get_multi_char_ready_flag()}
 
     def get_multi_char_scheduler_diagnostic_snapshot(self) -> dict:
-        return {"module": "multi_char_scheduler", "status": "ok", "ready": True}
+        ready = self.get_multi_char_ready_flag()
+        return {
+            "module": "multi_char_scheduler",
+            "status": "ok" if ready else "degraded",
+            "ready": ready,
+            "buff_slot_count": len(self.buff_slots),
+            "enabled_buff_slots": sum(1 for b in self.buff_slots if b.enabled),
+            "pet_name": self.pet_name,
+            "pet_feed_count": int(self.pet_feed_count),
+            "pet_remaining_sec": round(self.pet_remaining_sec(), 1),
+        }
+
+
+# ============================================================================
+# 4. ÜRETİM BAĞLANTISI — TEK TICK'TE ÜÇ YÖNETİCİ (F-0143)
+# ============================================================================
+
+def tick_multi_char_managers(
+    alt_char_mgr: Any = None,
+    task_scheduler: Any = None,
+    pet_buff_mgr: Any = None,
+    *,
+    current_gathered: Optional[int] = None,
+    energy_depleted: bool = False,
+    frame: Optional[np.ndarray] = None,
+    input_ctrl: Any = None,
+    route_mgr: Any = None,
+    test_mode: bool = False,
+    now_dt: Optional[Union[datetime.datetime, datetime.time, str]] = None,
+) -> Dict[str, Any]:
+    """
+    F-0143 üretim bağlantısı: takvim (`evaluate_current_schedule`), karakter
+    rotasyonu (`check_and_rotate_character`) ve pet/buff (`check_and_refresh_buffs`)
+    metotlarını tek çağrıda, doğru sırada tetikler. `state_machine`/`main`
+    döngüsünden her toplama adımında veya periyodik tick'te çağrılır;
+    `AltCharacterManager.bind_runtime_context` + `record_gather` yoluyla da
+    otomatik tetiklenir (üretimde zaten çalışan tek çağrı record_gather'dır).
+
+    Öncelik: takvim WAITING/PAUSED diyorsa (etkinlik beklemesi / mola) karakter
+    rotasyonu atlanır — bekleme sırasında şehirden ayrılınmaz; buff yenileme
+    çalışmaya devam eder. Hiçbir yönetici verilmemişse veya metot eksikse o
+    bölüm `{"called": False}` döner; bir yöneticideki hata diğerlerini
+    durdurmaz ve asla yükseltilmez.
+    """
+    schedule_result: Dict[str, Any] = {"called": False, "reason_tr": "Takvim yöneticisi verilmedi."}
+    if task_scheduler is not None and hasattr(task_scheduler, "evaluate_current_schedule"):
+        try:
+            schedule_result = task_scheduler.evaluate_current_schedule(
+                now_dt=now_dt, route_mgr=route_mgr, input_ctrl=input_ctrl, test_mode=test_mode,
+            )
+            schedule_result = dict(schedule_result)
+            schedule_result["called"] = True
+        except Exception as exc:
+            logger.error("Takvim tick hatası: %s", exc)
+            schedule_result = {"called": False, "reason_tr": f"Takvim değerlendirmesi hatalı: {exc}"}
+
+    schedule_state = str(schedule_result.get("recommended_state", "")) if schedule_result.get("called") else ""
+    schedule_holds = schedule_state in ("WAITING", "PAUSED")
+
+    rotation_result: Dict[str, Any] = {"called": False, "reason_tr": "Karakter yöneticisi verilmedi."}
+    if alt_char_mgr is not None and hasattr(alt_char_mgr, "check_and_rotate_character"):
+        if schedule_holds:
+            rotation_result = {
+                "called": False,
+                "rotated": False,
+                "recommended_state": schedule_state,
+                "reason_tr": f"Takvim {schedule_state} diyor; etkinlik/mola sırasında karakter rotasyonu atlandı.",
+            }
+        else:
+            gathered = current_gathered
+            if gathered is None:
+                try:
+                    gathered = int(alt_char_mgr.get_active_character().gathered_today)
+                except Exception:
+                    gathered = None
+            if gathered is None:
+                rotation_result = {"called": False, "reason_tr": "Toplama sayısı bilinmiyor; rotasyon denetlenemedi."}
+            else:
+                try:
+                    rotation_result = alt_char_mgr.check_and_rotate_character(
+                        int(gathered),
+                        energy_depleted=bool(energy_depleted),
+                        input_ctrl=input_ctrl,
+                        route_mgr=route_mgr,
+                        test_mode=test_mode,
+                    )
+                    rotation_result = dict(rotation_result)
+                    rotation_result["called"] = True
+                except Exception as exc:
+                    logger.error("Rotasyon tick hatası: %s", exc)
+                    rotation_result = {"called": False, "reason_tr": f"Rotasyon denetimi hatalı: {exc}"}
+
+    buffs_result: Dict[str, Any] = {"called": False, "reason_tr": "Pet/buff yöneticisi verilmedi."}
+    if pet_buff_mgr is not None and hasattr(pet_buff_mgr, "check_and_refresh_buffs"):
+        try:
+            buffs_result = pet_buff_mgr.check_and_refresh_buffs(
+                frame=frame, input_ctrl=input_ctrl, test_mode=test_mode,
+            )
+            buffs_result = dict(buffs_result)
+            buffs_result["called"] = True
+        except Exception as exc:
+            logger.error("Pet/buff tick hatası: %s", exc)
+            buffs_result = {"called": False, "reason_tr": f"Pet/buff denetimi hatalı: {exc}"}
+
+    if schedule_holds:
+        recommended_state = schedule_state
+    elif rotation_result.get("called"):
+        recommended_state = str(rotation_result.get("recommended_state", "WALKING"))
+    elif schedule_result.get("called"):
+        recommended_state = str(schedule_result.get("recommended_state", "WALKING"))
+    else:
+        recommended_state = "WALKING"
+
+    reasons: List[str] = []
+    if schedule_result.get("called"):
+        reasons.append(f"Takvim: {schedule_result.get('reason_tr', '')}")
+    if rotation_result.get("called"):
+        reasons.append(f"Rotasyon: {rotation_result.get('reason_tr', '')}")
+    elif schedule_holds:
+        reasons.append(str(rotation_result.get("reason_tr", "")))
+    if buffs_result.get("called"):
+        reasons.append(f"Buff: {buffs_result.get('reason_tr', '')}")
+
+    return {
+        "recommended_state": recommended_state,
+        "schedule": schedule_result,
+        "rotation": rotation_result,
+        "buffs": buffs_result,
+        "reason_tr": " | ".join(r for r in reasons if r),
+    }
 
 
 def get_multi_char_scheduler_capabilities() -> list:
@@ -1545,7 +2362,20 @@ def get_multi_char_scheduler_capabilities() -> list:
 
 
 def validate_multi_char_scheduler_contract() -> bool:
-    return bool(get_multi_char_scheduler_capabilities())
+    """Sözleşme denetimi: üç yöneticinin çekirdek metotları gerçekten var mı?"""
+    try:
+        required = {
+            AltCharacterManager: ("record_gather", "check_and_rotate_character", "get_roster"),
+            AutomationTaskScheduler: ("evaluate_current_schedule", "get_entries"),
+            PetAndBuffManager: ("check_and_refresh_buffs", "get_multi_char_ready_flag"),
+        }
+        if not get_multi_char_scheduler_capabilities():
+            return False
+        return all(
+            hasattr(cls, method) for cls, methods in required.items() for method in methods
+        )
+    except Exception:
+        return False
 
 
 def get_multi_char_scheduler_baseline_metrics() -> dict:

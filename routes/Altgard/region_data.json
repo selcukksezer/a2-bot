@@ -539,7 +539,7 @@
       "routes": [
         "Dredgion Crash Site"
       ],
-      "patch_path": "routes/Altgard/patches/node_1.png",
+      "patch_path": "routes/Altgard/patches/node_01.png",
       "in_air": true,
       "gathered_count": 0,
       "last_visited_timestamp": 0.0,
@@ -3199,7 +3199,7 @@
       "routes": [
         "Dredgion Crash Site"
       ],
-      "patch_path": "routes/Altgard/patches/node_3.png",
+      "patch_path": "routes/Altgard/patches/node_03.png",
       "in_air": true,
       "gathered_count": 0,
       "last_visited_timestamp": 0.0,

@@ -1,0 +1,9 @@
+{
+  "region": "test_r04_region",
+  "routes": [
+    "All",
+    "test_r04_route"
+  ],
+  "nodes": [],
+  "updated_at": 1794343103.872469
+}

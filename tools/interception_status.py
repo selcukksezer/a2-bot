@@ -136,13 +136,15 @@ def main() -> int:
     print(f"  process elevated (Admin): {elevated}")
     print("  POLICY: do NOT auto-run install-interception.exe from Gatherion.")
 
-    bridge = object.__new__(InterceptionBridge)
-    paths = InterceptionBridge._candidate_dll_paths(bridge)
+    # Candidate paths need no instance state, so ask the already-created
+    # live bridge instead of instantiating an uninitialized object via
+    # object.__new__ (D66: the old hack broke if the method ever read self).
+    live = InterceptionBridge()
+    paths = live._candidate_dll_paths()
     print("  candidate search paths (first 8):")
     for p in paths[:8]:
         print(f"    {p}  exists={os.path.isfile(p)}")
 
-    live = InterceptionBridge()
     print(f"  live.available={live.available}")
     print(f"  live.dll_path={live.dll_path or '(none)'}")
     if not live.available:

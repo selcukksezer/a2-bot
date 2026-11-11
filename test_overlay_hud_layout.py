@@ -3,19 +3,83 @@
 
 import unittest
 
+from PyQt6.QtCore import QSize
 from PyQt6.QtWidgets import QApplication
 
+from ui.f9_menu import F9Menu
 from ui.overlay_hud import OverlayHUD
 
 
+def _isolate_disk_panic_history(testcase: unittest.TestCase) -> None:
+    """Neutralise the on-disk panic strip for HUD layout tests.
+
+    OverlayHUD.__init__ calls refresh_panic_from_disk(), which reads the
+    latest record under logs/alarms/ and shows the panic strip — growing
+    the card by ~5px (295 > 290/275). That directory is written by the
+    test suite itself, so whether the strip appears depends on test
+    ordering/history, not on the layout under test. Patching the reader
+    to return [] keeps the production behaviour (showing the strip)
+    intact while the geometry assertions measure the bare layout.
+    Test-side isolation only — no production code is touched.
+    """
+    from unittest import mock
+
+    from core.opsec_crypto import PanicAlertSystem
+
+    patcher = mock.patch.object(
+        PanicAlertSystem,
+        "load_panic_history_from_disk",
+        lambda *args, **kwargs: [],
+    )
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+
+
 class OverlayHudLayoutTests(unittest.TestCase):
+    # Both sizes the HUD geometry is verified at.
+    TEST_SIZES = (OverlayHUD.DEFAULT_SIZE, OverlayHUD.MINIMUM_SIZE)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        _isolate_disk_panic_history(self)
         self.hud = OverlayHUD()
         self.addCleanup(self.hud.deleteLater)
+
+    def _resize_hud(self, w: int, h: int) -> None:
+        """Resize the HUD and assert Qt honoured the request exactly.
+
+        Every size used by these tests is >= MINIMUM_SIZE (720, 275), so
+        a resize must land exactly. If a future minimum grows past a
+        listed size, this fails loudly instead of silently testing a
+        different (clamped) width under the requested size's subTest label.
+        """
+        self.hud.resize(w, h)
+        if hasattr(self.hud, "card"):
+            self.hud.card.resize(w, h)
+        self.hud.show()
+        self._app.processEvents()
+        self.assertEqual(
+            self.hud.width(), w,
+            f"HUD width {self.hud.width()} != requested {w} "
+            f"(minimum is {OverlayHUD.MINIMUM_SIZE})",
+        )
+        self.assertEqual(
+            self.hud.height(), h,
+            f"HUD height {self.hud.height()} != requested {h} "
+            f"(minimum is {OverlayHUD.MINIMUM_SIZE})",
+        )
+
+    def _show_at(self, width: int, height: int) -> None:
+        """Resize the HUD (and its card) to (width, height), show it and flush the event loop.
+
+        Thin alias for _resize_hud: same resize/show/flush, plus the
+        exact-size assertion (both sizes in TEST_SIZES are >= MINIMUM_SIZE,
+        so the assertion holds for every call site).
+        """
+        self._resize_hud(width, height)
 
     def test_old_horizontal_panel_keeps_stats_and_logs(self) -> None:
         self.assertEqual(self.hud.width(), OverlayHUD.DEFAULT_SIZE[0])
@@ -69,19 +133,18 @@ class OverlayHudLayoutTests(unittest.TestCase):
         self.hud.btn_quit.click()
         self.assertEqual(seen, ["f10", "f9", "f8", "quit"])
 
-        class _Menu:
-            def __init__(self) -> None:
-                self.actions = []
-
-            def _trigger_action(self, action_id: str) -> None:
-                self.actions.append(action_id)
-
-        menu = _Menu()
+        # Real F9 menu (ui/f9_menu.py), not a fake with a hand-rolled
+        # _trigger_action: the HUD buttons must drive the menu the user
+        # actually sees, and the menu must emit the real action signals.
+        menu = F9Menu()
+        self.addCleanup(menu.deleteLater)
+        menu_actions = []
+        menu.action_triggered.connect(menu_actions.append)
         self.hud.bind_f9_menu(menu)
         self.hud.btn_resume.click()
         self.hud.btn_combat.click()
         self.hud.btn_gather.click()
-        self.assertEqual(menu.actions, ["resume", "combat", "route"])
+        self.assertEqual(menu_actions, ["resume", "combat", "route"])
 
     def test_state_snapshot_still_fills_old_rows(self) -> None:
         self.hud.update_state(
@@ -103,14 +166,19 @@ class OverlayHudLayoutTests(unittest.TestCase):
         self.assertEqual(self.hud.mode_label.text(), "OTO KEŞİF")
         self.assertIn("191", self.hud.stat2_value.text())
         self.assertEqual(self.hud.ai_learned_label.text(), "YZ 34 Kare")
-        self.assertEqual(self.hud.minimap_mapped_label.text(), "Harita")
+        # Merge-fix (O8): D31/F-0586 shows the live mapped count in the label.
+        self.assertEqual(self.hud.minimap_mapped_label.text(), "Harita: 12")
         self.assertIn("12", self.hud.minimap_mapped_label.toolTip())
 
     def test_default_and_minimum_size_bounds(self) -> None:
-        """Verifies HUD supports default (540, 290) and minimum (500, 275) geometry."""
+        """Verifies HUD supports default (760, 290) and minimum (720, 275) geometry."""
         min_w, min_h = OverlayHUD.MINIMUM_SIZE
-        self.assertLessEqual(self.hud.minimumWidth(), 500)
-        self.assertLessEqual(self.hud.minimumHeight(), 275)
+        # Exact equality: a <= check would also pass if no minimum were
+        # defined at all (minimumWidth() == 0), so the minimum must be
+        # asserted as the declared value, not as an upper bound.
+        self.assertEqual(self.hud.minimumWidth(), min_w)
+        self.assertEqual(self.hud.minimumHeight(), min_h)
+        self.assertEqual(self.hud.minimumSize(), QSize(min_w, min_h))
 
         self.hud.resize(*OverlayHUD.DEFAULT_SIZE)
         self.hud.show()
@@ -133,13 +201,14 @@ class OverlayHudLayoutTests(unittest.TestCase):
             self.hud.btn_gather,
             self.hud.btn_quit,
         ]
-        test_sizes = [(540, 290), (500, 275)]
+        # Both sizes are >= MINIMUM_SIZE (720, 275): (760, 290) is the
+        # default, (720, 275) the minimum. The old (540, 290)/(500, 275)
+        # pair was below the minimum, so Qt clamped every resize to
+        # 720px wide and the subTest labels lied about the tested width.
+        # TEST_SIZES == (DEFAULT_SIZE, MINIMUM_SIZE) == this pair.
+        test_sizes = self.TEST_SIZES
         for w, h in test_sizes:
-            self.hud.resize(w, h)
-            if hasattr(self.hud, "card"):
-                self.hud.card.resize(w, h)
-            self.hud.show()
-            self._app.processEvents()
+            self._resize_hud(w, h)
 
             for btn in buttons:
                 with self.subTest(size=(w, h), button=btn.text()):
@@ -161,14 +230,10 @@ class OverlayHudLayoutTests(unittest.TestCase):
 
     def test_stats_values_and_logs_layout_geometry(self) -> None:
         """Verifies stats container values height and non-overlapping log lines."""
-        test_sizes = [(540, 290), (500, 275)]
+        test_sizes = self.TEST_SIZES
         for w, h in test_sizes:
             with self.subTest(size=(w, h)):
-                self.hud.resize(w, h)
-                if hasattr(self.hud, "card"):
-                    self.hud.card.resize(w, h)
-                self.hud.show()
-                self._app.processEvents()
+                self._resize_hud(w, h)
 
                 # Stats values height check
                 for stat_lbl in (self.hud.stat1_value, self.hud.stat2_value, self.hud.stat3_value):
@@ -190,11 +255,25 @@ class OverlayHudLayoutTests(unittest.TestCase):
                     )
 
     def test_harvest_badge_no_clipping_with_long_state_and_mode(self) -> None:
-        """Verifies harvest_badge_label has zero text clipping under long state and mode."""
-        test_sizes = [(540, 290), (500, 275)]
+        """Verifies harvest_badge_label has zero text clipping under long state and mode.
+
+        NOTE: comparing the badge's own width against its text width cannot
+        detect clipping here — update_state() sets the badge's minimumWidth
+        from the text itself (advance + 14), so widget_w >= text_w is true
+        by construction. The falsifiable checks are geometric: the badge
+        (and its full text, starting at the badge's x) must stay inside the
+        card, and it must not overlap any sibling in the header row.
+        """
+        siblings = [
+            self.hud.badge_label,
+            self.hud.mode_label,
+            self.hud.elapsed_label,
+            self.hud.btn_hud_minimize,
+        ]
+        test_sizes = self.TEST_SIZES
         for w, h in test_sizes:
             with self.subTest(size=(w, h)):
-                self.hud.resize(w, h)
+                self._resize_hud(w, h)
                 self.hud.update_state({
                     "state": "DURAKLATILDI",
                     "mode": "MANUEL KAYIT",
@@ -204,14 +283,28 @@ class OverlayHudLayoutTests(unittest.TestCase):
                 self.hud.show()
                 self._app.processEvents()
 
-                fm = self.hud.harvest_badge_label.fontMetrics()
-                text_w = fm.horizontalAdvance(self.hud.harvest_badge_label.text())
-                widget_w = self.hud.harvest_badge_label.width()
-                self.assertGreaterEqual(
-                    widget_w,
-                    text_w,
-                    f"harvest_badge_label clipped at ({w}, {h}): widget_w={widget_w} < text_w={text_w}",
+                badge = self.hud.harvest_badge_label
+                fm = badge.fontMetrics()
+                text_w = fm.horizontalAdvance(badge.text())
+                card_w = self.hud.card.width()
+
+                self.assertLessEqual(
+                    badge.geometry().right(),
+                    card_w,
+                    f"harvest_badge_label overflows card at ({w}, {h}): "
+                    f"right={badge.geometry().right()} > card_w={card_w}",
                 )
+                self.assertLessEqual(
+                    badge.x() + text_w,
+                    card_w,
+                    f"harvest_badge_label text overflows card at ({w}, {h}): "
+                    f"x + text_w={badge.x() + text_w} > card_w={card_w}",
+                )
+                for other in siblings:
+                    self.assertFalse(
+                        badge.geometry().intersects(other.geometry()),
+                        f"harvest_badge_label overlaps {other} at ({w}, {h})",
+                    )
 
     def test_stat2_value_dynamic_font_scaling_no_clipping(self) -> None:
         """Verifies stat2_value dynamically scales down font and never clips on long/large counters."""
@@ -219,10 +312,9 @@ class OverlayHudLayoutTests(unittest.TestCase):
             ("150 aktif · 240 dinlenen", 14),
             ("999,999 aktif · 999,999 dinlenen", 13),
         ]
-        test_sizes = [(540, 290), (500, 275)]
+        test_sizes = self.TEST_SIZES
         for w, h in test_sizes:
-            self.hud.resize(w, h)
-            self.hud.show()
+            self._resize_hud(w, h)
             for text_val, max_expected_font_px in test_cases:
                 with self.subTest(size=(w, h), text=text_val):
                     self.hud.update_state({"stat2_val": text_val})

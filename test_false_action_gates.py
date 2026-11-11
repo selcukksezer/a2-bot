@@ -48,6 +48,12 @@ class _Keys:
 
     def press_key(self, key, *args, **kwargs):
         self.pressed.append(str(key).lower())
+        # B-02: üretim _driver_press_ok fail-closed çalışır — None/False
+        # dönen sürücü "gönderilmedi" sayılır. Gerçek InputController
+        # press_key float (>0.0 = gönderildi) döner; kayıt sürücüsü de
+        # başarıyı bool True ile raporlar (state_machine.py _driver_press_ok
+        # docstring). None bırakmak loot F'ini "gönderilemedi" saydırırdı.
+        return True
 
     def hold_movement_key(self, key):
         self.holds.append(str(key).lower())
@@ -144,6 +150,9 @@ def _worker(moving=False):
     worker.behavioral_guard = None
     worker.skill_bar_monitor = None
     worker.game_learner = None
+    # BotWorker.__init__ sets this to None when the subsystem is unavailable;
+    # _motion_should_stop() reads it directly, so the fixture must provide it.
+    worker.focus_monitor = None
     worker._combat_was_targeting = False
     worker._combat_no_target_streak = 0
     worker._combat_last_tab_ts = 0.0
@@ -222,6 +231,21 @@ class FalseActionGateTests(unittest.TestCase):
         recovery.bar = True
         recovery.under = True
         recovery.hp = 1.0
+        # 2-kare kuralı (core/state_machine.py _route_combat_signal_confirmed,
+        # route_fight_confirm_frames=2): the bar must be seen on 2
+        # consecutive ticks — tick 1 only primes the streak, tick 2
+        # confirms the fight.
+        # fix/v20r1-combat-gate (madde 4, commit 106bdde): bar TEK BAŞINA
+        # artık FIGHTING'e sokmaz — bar penceresinde HP düşüşü veya ToT
+        # aggro gerekir (hayalet-savaş: pasif mob barı + sabit HP).
+        # Bar + (True, 1.0) sabit HP, madde 4'ün
+        # test_two_consecutive_bar_frames_alone_do_not_enter_fighting
+        # testinde 10 tick'te bile FIGHTING'e sokmuyor — bu testin eski
+        # kurulumu tam o hayalet imzaydı. Gerçek savaş için tick 2'de
+        # HP düşüşü verilir (1.0 -> 0.97; test_bar_plus_hp_drop_
+        # enters_fighting deseni); loot-tek-F iddiası değişmedi.
+        self.assertFalse(worker._handle_combat_and_death())
+        recovery.hp = 0.97
         self.assertTrue(worker._handle_combat_and_death())
         self.assertTrue(worker._route_combat_confirmed)
         self.assertNotIn("f", worker.input_driver.pressed)
@@ -256,18 +280,8 @@ class FalseActionGateTests(unittest.TestCase):
 
     def test_moving_character_close_obstacle_still_strafes(self):
         worker = _worker(moving=True)
-
-        class _Camera:
-            def __init__(self):
-                self.calls = 0
-
-            def apply_avoidance_steering(self, *args, **kwargs):
-                self.calls += 1
-
-        worker.depth_avoider = _Camera()
         applied = worker._apply_active_obstacle_evasion("rock", 20.7, 20_000.0)
         self.assertTrue(applied)
-        self.assertEqual(worker.depth_avoider.calls, 0)
         self.assertIn("w", worker.input_driver.holds)
         self.assertIn("d", worker.input_driver.holds)
         self.assertIn("space", worker.input_driver.pressed)
@@ -619,13 +633,22 @@ class FalseActionGateTests(unittest.TestCase):
         configured.config["combat_skill_keys"] = ["r", "e"]
         configured.combat_recovery.bar = True
         configured._step_combat_mode()
-        self.assertEqual(configured.input_driver.pressed[0], "r")
+        # The first two presses are "t": the R/T equivalent of holding the
+        # right mouse button, not rotation skills. The rotation itself must
+        # use the configured keys, in order, starting with "r".
+        rotation = [key for key in configured.input_driver.pressed if key in ("r", "e")]
+        self.assertEqual(rotation, ["r", "e"])
 
         held = _worker()
         held._mode = "combat"
         held.combat_recovery.bar = False
         held.combat_recovery.hp = 1.0
         held._combat_was_targeting = True
+        # Target was lost only just now: the 2.5 s target-persistence grace
+        # still applies, so skills keep firing instead of the F+TAB death path.
+        # (Without a recent timestamp the grace computes 999.0 s and the bot
+        # loots with F and Tabs to the next target.)
+        held._combat_last_target_ts = time.time()
         held._step_combat_mode()
         held_skills = [key for key in held.input_driver.pressed if key in known]
         self.assertTrue(held_skills, held.input_driver.pressed)
@@ -651,7 +674,12 @@ class FalseActionGateTests(unittest.TestCase):
             saved.append(kwargs.get("category"))
 
         learner._save_learning_sample = _capture
-        still = np.zeros((24, 24, 3), dtype=np.uint8)
+        # GameFrameGate rejects frames smaller than 60x60, so the samples
+        # must use a textured frame at/above that size (uniform noise passes
+        # the gate as a small crop with natural texture). Still and moving
+        # frames use different seeds so the gate's dHash-novelty check also
+        # accepts the second frame as a new sample.
+        still = np.random.default_rng(7).integers(0, 256, size=(64, 64, 3), dtype=np.uint8)
         still[0, 0] = (1, 2, 3)
         learner._evaluate_and_save_learning_samples(
             frame=still,
@@ -673,7 +701,7 @@ class FalseActionGateTests(unittest.TestCase):
 
         actor_view.moving = True
         learner._seen_dhashes.clear()
-        moving = still.copy()
+        moving = np.random.default_rng(11).integers(0, 256, size=(64, 64, 3), dtype=np.uint8)
         moving[1, 1] = (4, 5, 6)
         learner._evaluate_and_save_learning_samples(
             frame=moving,

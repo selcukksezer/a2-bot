@@ -10,9 +10,11 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -51,7 +53,59 @@ class SlotEconomy:
         self._session_start = time.time()
         self._current_slot: Optional[str] = None
         self._slot_entered_ts = time.time()
+        # I2 (dev/D006): one shared connection instead of a new
+        # sqlite3.connect() per call. Every call used to open the file,
+        # run 1-2 statements and commit (fsync) — ~170 ms/commit under
+        # load on this VM. The shared connection is created with WAL +
+        # synchronous=NORMAL (commits no longer fsync the journal on
+        # every write; a process crash still loses nothing, only an
+        # OS crash / power loss can lose the last transaction — the
+        # documented SQLite trade-off, acceptable for farm stats).
+        # All DB access runs under self._lock (sqlite3 connection with
+        # check_same_thread=False); see _connect().
+        self._conn: Optional[sqlite3.Connection] = None
         self._ensure_schema()
+
+    def set_explore_ratio(self, ratio: float) -> None:
+        """F-23-11: ucb_explore_ratio'yu canlı değiştirir (yeniden başlatmasız).
+
+        main._on_settings_saved -> BotWorker.refresh_consumable_settings
+        yolundan çağrılır. Aralık kurucu ile aynıdır (0.05–0.5); kilit
+        altında yazılır çünkü seçim (UCB) başka thread'den okunabilir.
+        """
+        with self._lock:
+            self.explore_ratio = max(0.05, min(0.5, float(ratio)))
+
+    def close(self) -> None:
+        """Commit pending work and close the shared connection.
+
+        Safe to call repeatedly; instances that are never closed are
+        still reclaimed at process exit (the OS closes the fd and
+        SQLite recovers the WAL on the next open).
+        """
+        with self._lock:
+            conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:  # best effort; never raise at shutdown
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "SlotEconomy":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
     def _emit(self, msg: str) -> None:
         logger.info(msg)
@@ -62,9 +116,25 @@ class SlotEconomy:
                 pass
 
     def _connect(self) -> sqlite3.Connection:
+        """Return the shared connection, creating it on first use.
+
+        Must be called with self._lock held (or during __init__ before
+        the instance escapes). One connection per instance; concurrent
+        use from several threads is serialised by the RLock, and
+        check_same_thread=False allows that sharing.
+        """
+        if self._conn is not None:
+            return self._conn
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        try:
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if mode and str(mode[0]).lower() == "wal":
+                conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception as exc:
+            logger.debug("slot_economy WAL pragma: %s", exc)
+        self._conn = conn
         return conn
 
     def _ensure_schema(self) -> None:
@@ -123,20 +193,20 @@ class SlotEconomy:
             self._flush_slot_time_locked()
             self._current_slot = str(slot_id)
             self._slot_entered_ts = time.time()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO slots(slot_id, region, cx, cy, visits)
-                VALUES(?,?,?,?,1)
-                ON CONFLICT(slot_id) DO UPDATE SET
-                    visits = visits + 1,
-                    cx = COALESCE(excluded.cx, cx),
-                    cy = COALESCE(excluded.cy, cy),
-                    region = COALESCE(NULLIF(excluded.region,''), region)
-                """,
-                (slot_id, region, float(cx), float(cy)),
-            )
-            conn.commit()
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO slots(slot_id, region, cx, cy, visits)
+                    VALUES(?,?,?,?,1)
+                    ON CONFLICT(slot_id) DO UPDATE SET
+                        visits = visits + 1,
+                        cx = COALESCE(excluded.cx, cx),
+                        cy = COALESCE(excluded.cy, cy),
+                        region = COALESCE(NULLIF(excluded.region,''), region)
+                    """,
+                    (slot_id, region, float(cx), float(cy)),
+                )
+                conn.commit()
 
     def _flush_slot_time_locked(self) -> None:
         if not self._current_slot:
@@ -165,25 +235,27 @@ class SlotEconomy:
         name: str = "",
     ) -> None:
         key = str(mob_key or "unknown")
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT avg_ttk, samples, avg_damage_taken FROM monsters WHERE mob_key=?",
-                (key,),
-            ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO monsters(mob_key, name, avg_ttk, samples, avg_damage_taken) VALUES(?,?,?,?,?)",
-                    (key, name or key, float(ttk_sec), 1, float(damage_taken)),
-                )
-            else:
-                n = int(row["samples"] or 0) + 1
-                avg_ttk = ((float(row["avg_ttk"] or 0) * (n - 1)) + float(ttk_sec)) / n
-                avg_dmg = ((float(row["avg_damage_taken"] or 0) * (n - 1)) + float(damage_taken)) / n
-                conn.execute(
-                    "UPDATE monsters SET name=?, avg_ttk=?, samples=?, avg_damage_taken=? WHERE mob_key=?",
-                    (name or key, avg_ttk, n, avg_dmg, key),
-                )
-            conn.commit()
+        # I2: DB work under the lock — the connection is now shared.
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT avg_ttk, samples, avg_damage_taken FROM monsters WHERE mob_key=?",
+                    (key,),
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO monsters(mob_key, name, avg_ttk, samples, avg_damage_taken) VALUES(?,?,?,?,?)",
+                        (key, name or key, float(ttk_sec), 1, float(damage_taken)),
+                    )
+                else:
+                    n = int(row["samples"] or 0) + 1
+                    avg_ttk = ((float(row["avg_ttk"] or 0) * (n - 1)) + float(ttk_sec)) / n
+                    avg_dmg = ((float(row["avg_damage_taken"] or 0) * (n - 1)) + float(damage_taken)) / n
+                    conn.execute(
+                        "UPDATE monsters SET name=?, avg_ttk=?, samples=?, avg_damage_taken=? WHERE mob_key=?",
+                        (name or key, avg_ttk, n, avg_dmg, key),
+                    )
+                conn.commit()
         try:
             from core.lifetime_stats import get_lifetime_stats
 
@@ -207,7 +279,11 @@ class SlotEconomy:
             except Exception:
                 item_val = 0.0
         elif item_name:
-            item_val = 1000.0  # conservative default estimate
+            # F-1922: no price lookup -> unknown value is 0, never a fabricated
+            # 1000 Kina that inflates KPH. Unknown items contribute no value
+            # until a real price is known.
+            item_val = 0.0
+            logger.debug("bilinmeyen eşya fiyatı yok, değer 0 sayıldı: %s", item_name)
         try:
             kina_i = int(float(kina) or 0)
         except (TypeError, ValueError):
@@ -219,31 +295,37 @@ class SlotEconomy:
                 raw = str(mob_key or item_name or "drop")[:64]
                 get_lifetime_stats().record_gold(
                     kina_i,
-                    fingerprint=f"kina:{kina_i}:{raw}:{int(time.time() // 5)}",
+                    fingerprint=f"kina:{kina_i}:{raw}:{time.time_ns()}:{uuid.uuid4().hex[:12]}",
                 )
             except Exception as exc:
                 logger.debug("lifetime gold from slot_economy skipped: %s", exc)
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO drops(ts, mob_key, kina, item_name, item_value, slot_id)
-                VALUES(?,?,?,?,?,?)
-                """,
-                (time.time(), mob_key, float(kina), item_name, item_val, sid),
-            )
-            conn.execute(
-                """
-                INSERT INTO slots(slot_id, total_kina, total_item_value, total_cost, visits)
-                VALUES(?,?,?,?,1)
-                ON CONFLICT(slot_id) DO UPDATE SET
-                    total_kina = total_kina + excluded.total_kina,
-                    total_item_value = total_item_value + excluded.total_item_value,
-                    total_cost = total_cost + excluded.total_cost
-                """,
-                (sid, float(kina), float(item_val), float(pot_scroll_cost)),
-            )
-            self._recompute_kph(conn, sid)
-            conn.commit()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO drops(ts, mob_key, kina, item_name, item_value, slot_id)
+                    VALUES(?,?,?,?,?,?)
+                    """,
+                    (time.time(), mob_key, float(kina), item_name, item_val, sid),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO slots(slot_id, total_kina, total_item_value, total_cost, visits)
+                    VALUES(?,?,?,?,0)
+                    ON CONFLICT(slot_id) DO UPDATE SET
+                        total_kina = total_kina + excluded.total_kina,
+                        total_item_value = total_item_value + excluded.total_item_value,
+                        total_cost = total_cost + excluded.total_cost
+                    """,
+                    (sid, float(kina), float(item_val), float(pot_scroll_cost)),
+                )
+                # S265 (v19/P3-8): drop kaydı eskiden visits'i de +1
+                # artırıyordu — visits giriş+drop toplamı oluyor, UCB
+                # n_i'si "çekiş sayısı" değil "kanıt miktarı" oluyordu.
+                # visits yalnızca slot girişinde artar (yukarıdaki
+                # INSERT); drop yalnızca ekonomik toplamları yazar.
+                self._recompute_kph(conn, sid)
+                conn.commit()
 
     def _recompute_kph(self, conn: sqlite3.Connection, slot_id: str) -> None:
         row = conn.execute(
@@ -268,11 +350,12 @@ class SlotEconomy:
         return (float(sum_kina) + float(sum_item_value) - float(pot_scroll_cost)) / h
 
     def list_slots(self) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT slot_id, region, cx, cy, density, kph, visits, total_hours FROM slots"
-            ).fetchall()
-            return [dict(r) for r in rows]
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT slot_id, region, cx, cy, density, kph, visits, total_hours FROM slots"
+                ).fetchall()
+                return [dict(r) for r in rows]
 
     def pick_slot_ucb(self, total_pulls: Optional[int] = None) -> Optional[SlotPick]:
         """
@@ -284,7 +367,6 @@ class SlotEconomy:
             return None
         n_total = int(total_pulls) if total_pulls is not None else sum(int(s.get("visits") or 0) for s in slots)
         n_total = max(1, n_total)
-        import random
 
         # Exploration branch: least visits.
         if random.random() < self.explore_ratio:
@@ -303,10 +385,13 @@ class SlotEconomy:
 
         best: Optional[SlotPick] = None
         best_score = -1e18
+        # F-1936: scale the UCB exploration bonus into KPH units; a raw bonus
+        # of ~1-2 is invisible next to KPH values in the thousands.
+        kph_scale = max(1.0, max(float(s.get("kph") or 0.0) for s in slots))
         for s in slots:
             n_i = max(1, int(s.get("visits") or 0))
             kph = float(s.get("kph") or 0)
-            bonus = self.ucb_c * math.sqrt(math.log(n_total + 1.0) / n_i)
+            bonus = self.ucb_c * math.sqrt(math.log(n_total + 1.0) / n_i) * kph_scale
             score = kph + bonus
             if score > best_score:
                 best_score = score
@@ -323,35 +408,37 @@ class SlotEconomy:
         return best
 
     def record_obstacle(self, cx: float, cy: float, reason: str = "stuck") -> None:
-        with self._connect() as conn:
-            # Merge nearby obstacles within ~15 units.
-            row = conn.execute(
-                """
-                SELECT obstacle_id, hits FROM obstacles
-                WHERE ABS(cx-?)<15 AND ABS(cy-?)<15
-                ORDER BY hits DESC LIMIT 1
-                """,
-                (float(cx), float(cy)),
-            ).fetchone()
-            if row:
-                conn.execute(
-                    "UPDATE obstacles SET hits = hits + 1, ts=?, reason=? WHERE obstacle_id=?",
-                    (time.time(), reason, int(row["obstacle_id"])),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO obstacles(ts, cx, cy, reason, hits) VALUES(?,?,?,?,1)",
-                    (time.time(), float(cx), float(cy), reason),
-                )
-            conn.commit()
+        with self._lock:
+            with self._connect() as conn:
+                # Merge nearby obstacles within ~15 units.
+                row = conn.execute(
+                    """
+                    SELECT obstacle_id, hits FROM obstacles
+                    WHERE ABS(cx-?)<15 AND ABS(cy-?)<15
+                    ORDER BY hits DESC LIMIT 1
+                    """,
+                    (float(cx), float(cy)),
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE obstacles SET hits = hits + 1, ts=?, reason=? WHERE obstacle_id=?",
+                        (time.time(), reason, int(row["obstacle_id"])),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO obstacles(ts, cx, cy, reason, hits) VALUES(?,?,?,?,1)",
+                        (time.time(), float(cx), float(cy), reason),
+                    )
+                conn.commit()
 
     def obstacles_near(self, cx: float, cy: float, radius: float = 40.0) -> List[Dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM obstacles WHERE ABS(cx-?)<=? AND ABS(cy-?)<=?",
-                (float(cx), float(radius), float(cy), float(radius)),
-            ).fetchall()
-            return [dict(r) for r in rows]
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM obstacles WHERE ABS(cx-?)<=? AND ABS(cy-?)<=?",
+                    (float(cx), float(radius), float(cy), float(radius)),
+                ).fetchall()
+                return [dict(r) for r in rows]
 
     def suggested_hint(self) -> Optional[Dict[str, Any]]:
         pick = self.pick_slot_ucb()
@@ -386,12 +473,14 @@ def estimate_consumable_depletion(
     mp_pots_used: int,
     scrolls_used: int,
     elapsed_minutes: float,
-    hp_pots_initial_stock: int = 100,
-    mp_pots_initial_stock: int = 100,
-    scrolls_initial_stock: int = 50,
+    hp_pots_initial_stock: Optional[int] = None,
+    mp_pots_initial_stock: Optional[int] = None,
+    scrolls_initial_stock: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     İksir (HP/MP) ve parşömen kullanım hızına göre stok tükenme tahmini yapar.
+    F-1941: başlangıç stokları bilinmiyorsa (None) uydurma 100/100/50
+    varsayılmaz; kalan/ETA o kalem için None döner.
     """
     hp_used = max(0, int(hp_pots_used or 0))
     mp_used = max(0, int(mp_pots_used or 0))
@@ -402,11 +491,18 @@ def estimate_consumable_depletion(
     mp_rate_per_min = mp_used / mins
     sc_rate_per_min = sc_used / mins
 
-    hp_remaining = max(0, int(hp_pots_initial_stock) - hp_used)
-    mp_remaining = max(0, int(mp_pots_initial_stock) - mp_used)
-    sc_remaining = max(0, int(scrolls_initial_stock) - sc_used)
+    def _remaining(stock: Optional[int], used: int) -> Optional[int]:
+        if stock is None:
+            return None
+        return max(0, int(stock) - used)
 
-    def _eta_minutes(remaining: int, rate_per_min: float) -> Optional[float]:
+    hp_remaining = _remaining(hp_pots_initial_stock, hp_used)
+    mp_remaining = _remaining(mp_pots_initial_stock, mp_used)
+    sc_remaining = _remaining(scrolls_initial_stock, sc_used)
+
+    def _eta_minutes(remaining: Optional[int], rate_per_min: float) -> Optional[float]:
+        if remaining is None:
+            return None
         if remaining <= 0:
             return 0.0
         if rate_per_min <= 1e-9:
@@ -426,6 +522,9 @@ def estimate_consumable_depletion(
     if finite_etas:
         limiting_item = min(finite_etas, key=lambda k: finite_etas[k])
         min_eta_min: Optional[float] = finite_etas[limiting_item]
+    elif any(v is None for v in (hp_pots_initial_stock, mp_pots_initial_stock, scrolls_initial_stock)):
+        limiting_item = "unknown"
+        min_eta_min = None
     else:
         limiting_item = "none"
         min_eta_min = None
@@ -433,6 +532,11 @@ def estimate_consumable_depletion(
     needs_restock = bool(min_eta_min is not None and min_eta_min <= 10.0)
 
     return {
+        "initial_stock_known": {
+            "hp_pots": hp_pots_initial_stock is not None,
+            "mp_pots": mp_pots_initial_stock is not None,
+            "scrolls": scrolls_initial_stock is not None,
+        },
         "elapsed_minutes": round(mins, 3),
         "used": {
             "hp_pots": hp_used,

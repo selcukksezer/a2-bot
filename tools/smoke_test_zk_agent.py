@@ -26,6 +26,24 @@ if PROJECT_ROOT not in sys.path:
 LOGS_DIR = Path(PROJECT_ROOT) / "logs"
 REPORT_PATH = LOGS_DIR / "smoke_zk_agent.json"
 
+# All test IDs in run order; used to validate --only filters.
+ZK_TEST_IDS = tuple(f"ZK-{i:02d}" for i in range(1, 13))
+
+
+def _smoke_tempdir() -> tempfile.TemporaryDirectory:
+    """Scratch dir for the sqlite/lexicon files ZK-04/05/06/12 create.
+
+    Default is the system temp dir. Set A2_SMOKE_TMPDIR to redirect it
+    (e.g. when /tmp is a small tmpfs): the directory is created if needed
+    and the TemporaryDirectory inside it is still cleaned up on exit.
+    """
+    override = os.environ.get("A2_SMOKE_TMPDIR", "").strip()
+    if override:
+        base = Path(override)
+        base.mkdir(parents=True, exist_ok=True)
+        return tempfile.TemporaryDirectory(dir=str(base))
+    return tempfile.TemporaryDirectory()
+
 
 class _FakeHUD:
     def read_player_hp_mp_bars(self, frame):
@@ -99,10 +117,24 @@ class _FakeDriver:
         self.btns.append(("up", b))
 
 
-def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]]:
+def run_zk_agent_smoke_tests(
+    verbose: bool = True,
+    only: Any = None,
+) -> Tuple[int, int, List[dict]]:
+    """Run the ZK smoke suite.
+
+    `only`: optional iterable of test IDs (e.g. {"ZK-05"}) — only those
+    tests run, and the returned counts cover only the executed tests
+    (skipped tests are not reported as passed or failed). `None` runs all.
+    """
     results: List[dict] = []
+    only_set = None if only is None else {str(t).strip().upper() for t in only}
 
     def _run(test_id: str, category: str, title: str, fn: Callable[[], str]) -> None:
+        if only_set is not None and test_id not in only_set:
+            if verbose:
+                print(f"[SKIP] {test_id} {title} (--only filter)")
+            return
         t0 = time.perf_counter()
         try:
             detail = fn()
@@ -200,7 +232,7 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
     def zk04() -> str:
         from core.skill_discovery import SkillDiscovery
 
-        tmp = tempfile.TemporaryDirectory()
+        tmp = _smoke_tempdir()
         try:
             disc = SkillDiscovery(
                 lexicon_path=os.path.join(tmp.name, "lex.json"),
@@ -225,7 +257,7 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
     def zk05() -> str:
         from core.slot_economy import SlotEconomy
 
-        tmp = tempfile.TemporaryDirectory()
+        tmp = _smoke_tempdir()
         try:
             db = os.path.join(tmp.name, "economy.sqlite")
             eco = SlotEconomy(db_path=db, explore_ratio=0.0)
@@ -253,7 +285,7 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
 
         r = compute_reward(kina=100, damage_dealt=50, damage_taken=10, wasted_mana=1, stuck_time=1)
         assert r > 0
-        tmp = tempfile.TemporaryDirectory()
+        tmp = _smoke_tempdir()
         try:
             db = os.path.join(tmp.name, "eco.sqlite")
             jl = os.path.join(tmp.name, "r.jsonl")
@@ -273,10 +305,15 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
         from core.rl_reward_log import ObstacleMemory
 
         mem = ObstacleMemory(slot_economy=None)
-        mem.stuck_threshold_sec = 0.0
+        # A real, positive threshold: stuck must NOT fire immediately and
+        # MUST fire once the same position persists past the threshold.
+        # (0.0 made the second call pass trivially — stuck_for >= 0 always.)
+        mem.stuck_threshold_sec = 0.05
         assert mem.note_position(1.0, 2.0, moving_cmd=True) is None
+        assert mem.note_position(1.0, 2.0, moving_cmd=True) is None
+        time.sleep(0.06)
         stuck = mem.note_position(1.0, 2.0, moving_cmd=True)
-        assert stuck is not None and stuck >= 0.0
+        assert stuck is not None and stuck >= 0.05
         return f"stuck_for={stuck:.3f}s"
 
     _run("ZK-07", "Navigation", "ObstacleMemory stuck threshold", zk07)
@@ -295,7 +332,12 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
         assert port.mouse_button("left", True)
         assert port.mouse_button("left", False)
         assert d.keys == ["1"]
-        hid = SerialHidAdapter(port_name="")
+        # An empty port_name never even attempts to open, so it proves
+        # nothing — use a bogus but well-formed port so the adapter really
+        # tries (and fails) to open it.
+        bogus_port = "COM999" if os.name == "nt" else "/dev/nonexistent_zk08"
+        hid = SerialHidAdapter(port_name=bogus_port)
+        assert hid.port_name == bogus_port
         assert not hid.available
         assert isinstance(build_default_input_port(d), SoftInputAdapter)
         return "soft_ok hid_unavailable"
@@ -308,6 +350,21 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
         from core.skill_bar_reader import SkillBarReader
 
         d = _FakeDriver()
+        # [O10] R/T sözleşmesi (fix-rt + D26/D70, merged): sol tık saldırısı
+        # fare tuşu değil R tuşudur — hold_left_attack key_down/key_up("r")
+        # kullanır. Sahte sürücüye bu iki metot eklenir (yalnızca bu testin
+        # nesnesine; _FakeDriver sınıfına dokunulmaz, ZK-08 press_key yolunu
+        # kullanmaya devam eder).
+        def _key_down(key: str) -> bool:
+            d.held.append(("down", str(key).lower(), False))
+            return True
+
+        def _key_up(key: str) -> bool:
+            d.held.append(("up", str(key).lower(), False))
+            return True
+
+        d.key_down = _key_down  # type: ignore[attr-defined]
+        d.key_up = _key_up  # type: ignore[attr-defined]
         released: List[str] = []
         restored: List[str] = []
         bus = GameActionBus(
@@ -323,8 +380,13 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
         assert released == [] and restored == []
         bus.hold_left_attack(True)
         bus.hold_left_attack(False)
-        assert ("down", "left") in d.btns and ("up", "left") in d.btns
-        return f"cast={out['method']} left_hold_ok"
+        held_keys = [(a, b) for a, b, _ in d.held]
+        assert ("down", "r") in held_keys, f"sol saldırı R down bekleniyordu: {d.held}"
+        assert ("up", "r") in held_keys, f"sol saldırı bırakma R up bekleniyordu: {d.held}"
+        assert ("down", "left") not in d.btns and ("up", "left") not in d.btns, (
+            f"sol saldırı fare tuşu kullanmamalı (R/T kuralı): {d.btns}"
+        )
+        return f"cast={out['method']} left_hold_ok (R down/up)"
 
     _run("ZK-09", "Input", "GameActionBus cast + left-hold", zk09)
 
@@ -356,6 +418,19 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
         worker._frame_cognition = None
 
         mouse = _FakeDriver()
+        # [O10] R/T sözleşmesi: sol saldırı R, sağ saldırı T tuşudur; fare
+        # tuşu basılmaz. Sahte sürücüye key_down/key_up eklenir (yalnızca bu
+        # testin nesnesine; _FakeDriver sınıfına dokunulmaz).
+        def _m_key_down(key: str) -> bool:
+            mouse.held.append(("down", str(key).lower(), False))
+            return True
+
+        def _m_key_up(key: str) -> bool:
+            mouse.held.append(("up", str(key).lower(), False))
+            return True
+
+        mouse.key_down = _m_key_down  # type: ignore[attr-defined]
+        mouse.key_up = _m_key_up  # type: ignore[attr-defined]
         worker.input_driver = mouse
         worker.action_bus = None
         worker._mode = "combat"
@@ -363,18 +438,26 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
         worker.combat_recovery.bar = True
         worker.combat_recovery.under = True
         worker.combat_recovery.hp = 1.0
-        # Force burst path (mp defaults 100% from empty cognition)
+        # Burst path (mp defaults 100% from empty cognition): burst holds
+        # RIGHT (T) and releases left — "burst holds left" beklentisi yanlıştı;
+        # sol tutuş regen yoluna aittir (aşağıda).
         worker._step_combat_mode()
-        left_attack_ok = "left" in mouse._mouse_buttons_down or ("down", "left") in mouse.btns
+        burst_held = [(a, b) for a, b, _ in mouse.held]
+        right_burst_ok = ("down", "t") in burst_held
+        left_released_in_burst = ("down", "r") not in burst_held
 
         # Regen path: low mp decision + left hold via sync
         d2 = brain.decide(player_mp=0.2, player_hp=1.0, ready_skills=["1"])
         worker._sync_combat_left_button(bool(d2.hold_left))
-        left_regen_ok = "left" in mouse._mouse_buttons_down or ("down", "left") in mouse.btns
-        assert left_attack_ok, "combat tick must hold left in burst"
+        regen_held = [(a, b) for a, b, _ in mouse.held]
+        left_attack_ok = right_burst_ok and left_released_in_burst
+        left_regen_ok = ("down", "r") in regen_held
+        assert left_attack_ok, (
+            f"burst tick sağ (T) tutmalı, solu bırakmalıydı: {mouse.held}"
+        )
         assert left_regen_ok, "regen decide must drive left hold"
         assert any("MANA_PHASE" in m for m in logs)
-        return f"left_attack={left_attack_ok} left_regen={left_regen_ok} logs={logs[:2]}"
+        return f"burst_right={right_burst_ok} left_regen={left_regen_ok} logs={logs[:2]}"
 
     _run("ZK-10", "Integration", "BotWorker combat wiring + left regen", zk10)
 
@@ -418,7 +501,7 @@ def run_zk_agent_smoke_tests(verbose: bool = True) -> Tuple[int, int, List[dict]
         brain.decide(player_mp=0.1)
         assert any("MANA_PHASE" in x for x in logs)
 
-        tmp = tempfile.TemporaryDirectory()
+        tmp = _smoke_tempdir()
         try:
             disc = SkillDiscovery(
                 lexicon_path=os.path.join(tmp.name, "lex.json"),
@@ -468,7 +551,32 @@ def write_zk_smoke_report(
 
 
 def main() -> int:
-    passed, failed, results = run_zk_agent_smoke_tests(verbose=True)
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Gatherion ZK Vision Agent smoke test (ZK-01..ZK-12)")
+    ap.add_argument(
+        "--only",
+        default="",
+        help="run only these test IDs, comma-separated (e.g. --only ZK-05,ZK-07)",
+    )
+    ap.add_argument(
+        "--list",
+        action="store_true",
+        help="list test IDs and exit",
+    )
+    args = ap.parse_args()
+    if args.list:
+        for tid in ZK_TEST_IDS:
+            print(tid)
+        return 0
+    only = None
+    if args.only.strip():
+        only = [t.strip().upper() for t in args.only.split(",") if t.strip()]
+        unknown = sorted(set(only) - set(ZK_TEST_IDS))
+        if unknown:
+            print(f"unknown test ID(s): {', '.join(unknown)} (valid: {', '.join(ZK_TEST_IDS)})", file=sys.stderr)
+            return 2
+    passed, failed, results = run_zk_agent_smoke_tests(verbose=True, only=only)
     path = write_zk_smoke_report(passed, failed, results)
     print(f"\nZK smoke: {passed}/{passed + failed} PASS → {path}")
     return 0 if failed == 0 and passed > 0 else 1

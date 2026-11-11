@@ -26,7 +26,56 @@ from core.corridor_navigator import (
     compute_angle_diff,
     apply_turn_damping,
 )
-from dataset_factory.exemplar_memory import get_exemplar_memory
+from dataset_factory.exemplar_memory import (
+    DEFAULT_EXEMPLAR_PATH,
+    get_exemplar_memory,
+)
+import dataset_factory.exemplar_memory as exemplar_memory_module
+
+
+@pytest.fixture(autouse=True)
+def _isolated_exemplar_memory(tmp_path):
+    """F-1291: exemplar writes go to a temp file, never to dataset/learned_exemplars.json.
+
+    get_exemplar_memory(json_path=...) swaps the process-wide singleton, so
+    CorridorNavigator.evaluate_corridor_path() (which calls it with no args)
+    sees the isolated memory too. Teardown restores the singleton so later
+    tests recreate the production one, and proves the production file is untouched.
+    """
+    prod_path = DEFAULT_EXEMPLAR_PATH
+    prod_before = (
+        (prod_path.stat().st_mtime_ns, prod_path.stat().st_size)
+        if prod_path.is_file()
+        else None
+    )
+    mem = get_exemplar_memory(json_path=tmp_path / "learned_exemplars.json")
+    assert mem.json_path == tmp_path / "learned_exemplars.json"
+    yield mem
+    exemplar_memory_module._GLOBAL_EXEMPLAR_MEMORY = None
+    prod_after = (
+        (prod_path.stat().st_mtime_ns, prod_path.stat().st_size)
+        if prod_path.is_file()
+        else None
+    )
+    assert prod_after == prod_before, "exemplar test wrote to the production memory file"
+
+
+def _textured_patch(seed, base_bgr, shape=(216, 153), noise_amp=25):
+    """Deterministic non-uniform patch: base colour + per-pixel noise + veins.
+
+    F-1404: a flat colour self-matches trivially (zero texture, single-bin
+    histogram). A textured patch forces real HSV-histogram + texture
+    feature matching, and a differently coloured/textured patch must not match.
+    """
+    rng = np.random.default_rng(seed)
+    arr = np.full(shape + (3,), base_bgr, dtype=np.int16)
+    arr += rng.integers(-noise_amp, noise_amp + 1, size=shape + (3,), dtype=np.int16)
+    patch = np.clip(arr, 0, 255).astype(np.uint8)
+    dark = tuple(max(0, c - 40) for c in base_bgr)
+    light = tuple(min(255, c + 40) for c in base_bgr)
+    cv2.line(patch, (0, 0), (shape[1] - 1, shape[0] - 1), dark, 2)
+    cv2.line(patch, (shape[1] - 1, 0), (0, shape[0] - 1), light, 2)
+    return patch
 
 
 class MockInputController:
@@ -73,16 +122,17 @@ class TestCorridorObstacleAndPathAvoidance:
         nav = CorridorNavigator()
         mem = get_exemplar_memory()
 
-        # Learn obstacle patch (class 14)
-        obs_patch = np.zeros((60, 60, 3), dtype=np.uint8)
-        obs_patch[:, :] = (30, 35, 45)  # dark rock color
-        mem.add_positive_exemplar(obs_patch, class_id=14, class_name="obstacle")
+        # Learn a textured obstacle patch (class 14): deterministic noise +
+        # veins over a dark-rock base, so matching must use real features
+        # (F-1404: a flat colour self-matches trivially).
+        obs_region = _textured_patch(seed=7, base_bgr=(30, 35, 45))
+        assert mem.add_positive_exemplar(obs_region[60:120, 40:100].copy(), class_id=14, class_name="obstacle")
 
         # Base frame is outdoor green ground
         frame = np.full((720, 1280, 3), (45, 120, 60), dtype=np.uint8)
         y1, y2 = int(720 * 0.52), int(720 * 0.82)
         cx1, cx2 = int(1280 * 0.44), int(1280 * 0.56)
-        frame[y1:y2, cx1:cx2] = (30, 35, 45)
+        frame[y1:y2, cx1:cx2] = obs_region
 
         eval_res = nav.evaluate_corridor_path(frame)
         assert eval_res["obstacle_detected"] is True
@@ -90,21 +140,38 @@ class TestCorridorObstacleAndPathAvoidance:
         assert eval_res["recommended_turn_offset_deg"] != 0.0
         assert eval_res["lane_scores"]["center"] < eval_res["lane_scores"]["left"]
 
+    def test_unrelated_texture_does_not_match_obstacle(self):
+        """F-1404 negative control: a differently coloured/textured patch must NOT match the obstacle exemplar."""
+        nav = CorridorNavigator()
+        mem = get_exemplar_memory()
+
+        obs_region = _textured_patch(seed=7, base_bgr=(30, 35, 45))
+        assert mem.add_positive_exemplar(obs_region[60:120, 40:100].copy(), class_id=14, class_name="obstacle")
+
+        # Base frame is outdoor green ground; center lane holds an unrelated texture.
+        frame = np.full((720, 1280, 3), (45, 120, 60), dtype=np.uint8)
+        y1, y2 = int(720 * 0.52), int(720 * 0.82)
+        cx1, cx2 = int(1280 * 0.44), int(1280 * 0.56)
+        frame[y1:y2, cx1:cx2] = _textured_patch(seed=99, base_bgr=(200, 90, 30))
+
+        eval_res = nav.evaluate_corridor_path(frame)
+        assert eval_res["obstacle_detected"] is False
+        assert eval_res["steering_bias"] == "clear"
+
     def test_monster_in_corridor_steers_away(self):
         """Monster (class 10) in travel corridor triggers monster_detected and steers to clear side."""
         nav = CorridorNavigator()
         mem = get_exemplar_memory()
 
-        # Learn monster patch (class 10)
-        mob_patch = np.zeros((60, 60, 3), dtype=np.uint8)
-        mob_patch[:, :] = (15, 20, 180)  # red hostile mob
-        mem.add_positive_exemplar(mob_patch, class_id=10, class_name="monster_3d")
+        # Learn a textured monster patch (class 10) — see F-1404 note above.
+        mob_region = _textured_patch(seed=11, base_bgr=(15, 20, 180))
+        assert mem.add_positive_exemplar(mob_region[60:120, 40:100].copy(), class_id=10, class_name="monster_3d")
 
         # Base frame is outdoor green ground
         frame = np.full((720, 1280, 3), (45, 120, 60), dtype=np.uint8)
         y1, y2 = int(720 * 0.52), int(720 * 0.82)
         cx1, cx2 = int(1280 * 0.44), int(1280 * 0.56)
-        frame[y1:y2, cx1:cx2] = (15, 20, 180)
+        frame[y1:y2, cx1:cx2] = mob_region
 
         eval_res = nav.evaluate_corridor_path(frame)
         assert eval_res["monster_detected"] is True
@@ -116,16 +183,15 @@ class TestCorridorObstacleAndPathAvoidance:
         nav = CorridorNavigator()
         mem = get_exemplar_memory()
 
-        path_patch = np.zeros((60, 60, 3), dtype=np.uint8)
-        path_patch[:, :] = (90, 140, 120)  # dirt path
-        mem.add_positive_exemplar(path_patch, class_id=15, class_name="path_ground")
+        path_region = _textured_patch(seed=13, base_bgr=(90, 140, 120), shape=(216, 205))
+        assert mem.add_positive_exemplar(path_region[60:120, 40:100].copy(), class_id=15, class_name="path_ground")
 
         # Base frame is outdoor green ground
         frame = np.full((720, 1280, 3), (45, 120, 60), dtype=np.uint8)
         y1, y2 = int(720 * 0.52), int(720 * 0.82)
         # Place path in right lane
         rx1, rx2 = int(1280 * 0.56), int(1280 * 0.72)
-        frame[y1:y2, rx1:rx2] = (90, 140, 120)
+        frame[y1:y2, rx1:rx2] = path_region
 
         eval_res = nav.evaluate_corridor_path(frame)
         assert eval_res["path_detected"] is True
@@ -219,7 +285,13 @@ class TestStuckDetectionAndOpticalFlow:
         assert res["is_stuck"] is False
 
     def test_optical_flow_measurement_on_viewport(self):
-        """Optical flow calculation measures movement across viewport frames."""
+        """Optical flow calculation measures movement across viewport frames.
+
+        Merge-fix (O8): D13/F-0428 — the first frame only establishes the
+        reference, so it honestly reports 0.0 (no measurement yet) instead
+        of the old fabricated 1.0 sentinel; a static pair must measure
+        ~no motion, proving the shifted pair really measures movement.
+        """
         detector = PhaseCorrelateUnstuckManeuver()
         frame1 = np.zeros((300, 400, 3), dtype=np.uint8)
         frame2 = np.zeros((300, 400, 3), dtype=np.uint8)
@@ -229,8 +301,16 @@ class TestStuckDetectionAndOpticalFlow:
         cv2.rectangle(frame2, (150, 185), (230, 255), (200, 200, 200), -1)
 
         flow1 = detector.compute_viewport_optical_flow(frame1)
+        assert flow1 == pytest.approx(0.0), "first frame is the reference, no measurement yet"
         flow2 = detector.compute_viewport_optical_flow(frame2)
         assert flow2 > 0.0
+
+        # Control: identical frames on a fresh detector measure ~no motion.
+        static_detector = PhaseCorrelateUnstuckManeuver()
+        static_detector.compute_viewport_optical_flow(frame1)
+        flow_static = static_detector.compute_viewport_optical_flow(frame1.copy())
+        assert flow_static == pytest.approx(0.0)
+        assert flow2 > flow_static
 
 
 class TestPhysicalUnstickManeuvers:

@@ -113,20 +113,54 @@ def test_add_player_character_box_to_frame(tmp_path: Path) -> None:
     # User clicks 'Karakterimi Etiketle'
     dlg._add_player_character_box_to_current_frame()
 
-    # Verify box was added in memory
-    trusted = dlg._review_items[0]["trusted"]
-    assert len(trusted) == 1
-    player_box = trusted[0]
+    # F-0695 [O3]: the character box is only a guessed position (never
+    # image-verified), so it lands in `weak` with conf 0.0 — never in
+    # `trusted` — and must not reach the training label file until the
+    # user confirms its position with the handles.
+    weak = dlg._review_items[0]["weak"]
+    assert len(dlg._review_items[0]["trusted"]) == 0
+    assert len(weak) == 1
+    player_box = weak[0]
     assert player_box["class_id"] == 26
     assert player_box["class_name"] == "player_character"
     assert player_box["cx"] == pytest.approx(0.50, abs=1e-2)
     assert player_box["cy"] == pytest.approx(0.62, abs=1e-2)
-    assert player_box["trusted"] is True
-    assert player_box["human_approved"] is True
+    assert player_box["trusted"] is False
+    assert player_box["human_approved"] is False
+    assert float(player_box["confidence"]) == 0.0
 
-    # Verify persisted to label txt
+    # Verify the unverified guess is NOT persisted to the label txt.
     lbl_content = (labels_dir / f"{stem}.txt").read_text(encoding="utf-8").strip()
-    assert lbl_content.startswith("26 0.500000 0.620000")
+    assert lbl_content == ""
+
+    # Phase 2 (F-C): explicitly re-run the real persistence path and
+    # verify the weak guess still does not leak into the label txt.
+    # `_add_player_character_box_to_current_frame` already calls
+    # `_persist_review_item` internally, but that alone does not pin the
+    # persist path: this phase invokes the dialog's persistence entry
+    # point directly. The leak mechanism it guards against:
+    # `_persist_review_item` -> `AtomicReviewTxtSynchronizer.
+    # write_synchronized_pair` -> `_normalize_box_dict` promotes a weak
+    # box with `hand_label=True` to trusted and `_extract_emitted_boxes_
+    # from_json_data` then emits it into the TXT. The F-C fix sets
+    # `hand_label=False` on the guessed box (ui/yolo_factory_dialog.py),
+    # so the box must stay weak and the TXT must stay empty even after
+    # an explicit persist. If `hand_label` regressed to True, this
+    # phase fails (TXT gains a `26 ...` line).
+    # `_persist_review_item(it)` needs only the review item itself
+    # (stem/split/trusted/weak/done); the test's existing setup
+    # (`_review_items`, `_dataset_dir`, `_models_dir`) already covers it.
+    item = dlg._review_items[0]
+    assert item["weak"][0]["hand_label"] is False
+    saved = dlg._persist_review_item(item)
+    assert saved is True
+
+    assert len(dlg._review_items[0]["trusted"]) == 0
+    assert len(dlg._review_items[0]["weak"]) == 1
+    assert dlg._review_items[0]["weak"][0]["class_id"] == 26
+    assert dlg._review_items[0]["weak"][0]["hand_label"] is False
+    lbl_content_after_persist = (labels_dir / f"{stem}.txt").read_text(encoding="utf-8").strip()
+    assert lbl_content_after_persist == ""
 
 
 def test_data_yaml_has_player_character() -> None:

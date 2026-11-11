@@ -6,14 +6,19 @@ DXGI_ERROR_DEVICE_REMOVED üretti. Batch 4, BELOW_NORMAL ve EcoQoS
 oyunu kurtarmadı. RTXTrainerEngine oyun açıkken eğitimi reddeder.
 Oyun kapandıysa eğitim normal batch ile F: üzerinde çalışabilir.
 
-Bu dosyadaki öncelik ve EcoQoS yardımcıları artık eğitimle GPU paylaşmak
-için kullanılmaz. FPS sınırı ve nvidia-smi saat kilidi yazılmaz.
+Politika (F-0100): Bu dosyadaki öncelik ve EcoQoS yardımcıları artık
+eğitimle GPU paylaşmak için kullanılmaz. GameGpuThrottle oyunu ASLA
+kısmaz; yalnızca oyun sürecini tespit eder. Oyun açıkken eğitim
+reddedilir (kısılıp batch 4 ile sürdürülmez); FPS sınırı ve nvidia-smi
+saat kilidi yazılmaz.
 """
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
+from ctypes import wintypes
 from typing import Callable, List, Optional, Sequence
 
 logger = logging.getLogger("Gatherion.GameGpuThrottle")
@@ -25,7 +30,28 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_POWER_THROTTLING = 4
 PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
 PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
-TRAIN_BATCH_WHEN_GAME_PRESENT = 4
+TRAIN_BATCH_WHEN_GAME_PRESENT = 4  # Miras sabit (F-0100): oyun açıkken
+# eğitim batch düşürüp sürdürülmez, reddedilir; capped_train_batch artık
+# bu sabiti kullanmaz.
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    """Shared Toolhelp32 process-entry struct (D25: was defined identically
+    in _snapshot_pid_to_exe_map and _pids_from_process_names). Windows-only
+    use; defining the layout at import is pure ctypes and safe on Linux."""
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
 
 # core/watchdog.py pencere başlıkları + core/dpi_focus_guard.py "aion" / "ncsoft".
 # Exe adı repoda yok. Aion2 ve NCSOFT altındaki Aion süreçleri eşleşir.
@@ -135,9 +161,16 @@ _SKIP_TITLE_SUBSTRINGS = frozenset(
 )
 
 
+def _basename_windows(path: str) -> str:
+    """Dosya adını Windows ayraçlarıyla da böler (F-0273: Linux'ta
+    os.path.basename ters bölü içeren Windows yolunu bölemez; exe adı
+    yanlış çıkar ve hariç tutulan exe'ler oyun sanılır)."""
+    return (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def is_excluded_exe(image_name: str) -> bool:
     """True if image_name belongs to an excluded browser, IDE, shell, explorer, or python."""
-    base = os.path.basename(image_name or "").casefold()
+    base = _basename_windows(image_name).casefold()
     if not base:
         return True
     if base in _SKIP_EXE:
@@ -152,22 +185,53 @@ def is_excluded_exe(image_name: str) -> bool:
 
 
 def training_image_retention_decision(project_root: os.PathLike) -> dict:
-    """Sonraki eğitim yolov8n.pt ile data.yaml'ı baştan okur. Kareler silinmez."""
+    """Sonraki eğitim yolov8n.pt ile data.yaml'ı baştan okur. Kareler silinmez.
+
+    Gerekçe, dosya sistemine bakılarak kurulur (F-0441): data.yaml'ın
+    varlığı ile images/labels/game_learning dizinlerindeki dosya
+    sayıları gerçekten ölçülür; doğrulanmamış iddialar yazılmaz.
+    """
     root = os.fspath(project_root)
     images = os.path.join(root, "dataset", "images")
     labels = os.path.join(root, "dataset", "labels")
     learning = os.path.join(root, "dataset", "game_learning")
+    data_yaml = os.path.join(root, "dataset", "data.yaml")
+
+    def _file_count(path: str) -> int:
+        try:
+            if not os.path.isdir(path):
+                return 0
+            return sum(
+                1
+                for name in os.listdir(path)
+                if os.path.isfile(os.path.join(path, name))
+            )
+        except OSError:
+            return 0
+
+    yaml_exists = os.path.isfile(data_yaml)
+    images_n = _file_count(images)
+    labels_n = _file_count(labels)
+    learning_n = _file_count(learning)
+    observed = (
+        f"data.yaml {'bulundu' if yaml_exists else 'bulunamadı'}; "
+        f"dataset/images: {images_n} dosya; dataset/labels: {labels_n} dosya; "
+        f"dataset/game_learning: {learning_n} dosya"
+    )
     return {
         "action": "keep",
         "delete": False,
-        "data_yaml": os.path.join(root, "dataset", "data.yaml"),
+        "data_yaml": data_yaml,
         "keep_paths": [images, labels, learning],
+        "data_yaml_exists": yaml_exists,
+        "observed": observed,
         "reason": (
-            "Her eğitim resume=False ve pretrained yolov8n.pt ile dataset/images "
-            "ve dataset/labels üzerinden tam eğitimdir. Export bitmeden canlı bot "
-            "models/yolov8n_gatherion.onnx dosyasını açılışta yükler. Sonraki eğitim "
-            "aynı kareleri tekrar ister. game_learning data.yaml içinde yoktur; "
-            "learner oraya yazmaya devam eder, o yüzden o da durur."
+            "Kareler silinmez. "
+            + observed
+            + ". Sonraki eğitim resume=False ve pretrained yolov8n.pt ile "
+            "dataset/images ve dataset/labels üzerinden tam eğitimdir; "
+            "game_learning data.yaml içinde yoktur, learner oraya yazmaya "
+            "devam eder, o yüzden o da durur."
         ),
     }
 
@@ -190,7 +254,7 @@ def title_is_aion_game(title: str) -> bool:
 
 
 def exe_is_aion_game(image_name: str) -> bool:
-    base = os.path.basename(image_name or "").casefold()
+    base = _basename_windows(image_name).casefold()
     if not base or is_excluded_exe(base):
         return False
     compact = _compact_name(os.path.splitext(base)[0])
@@ -202,17 +266,39 @@ def exe_is_aion_game(image_name: str) -> bool:
         return True
     if compact in ("aion", "aionbin", "aion2bin", "aionclient", "aionclassic"):
         return True
-    full = (image_name or "").casefold()
-    return "ncsoft" in full and "aion" in full and "gatherion" not in full
+    # F-0273: yol-alt-dize eşleşmesi ("ncsoft" ve "aion" yolun herhangi
+    # bir yerinde) yanlış pozitif üretir (örn. yedek/rehber klasörü).
+    # Artık dizin bileşeni bazında bakılır: bir dizin tam olarak
+    # "ncsoft" VE bir dizin tam olarak "aion"/"aion2" (veya exe adı
+    # "aion" içeriyor) olmalı.
+    full = (image_name or "").replace("\\", "/").casefold()
+    parts = [p for p in full.split("/") if p]
+    dirs = parts[:-1]
+    has_ncsoft_dir = any(p == "ncsoft" for p in dirs)
+    has_aion_dir = any(p in ("aion", "aion2") for p in dirs)
+    return bool(has_ncsoft_dir and (has_aion_dir or "aion" in compact))
 
 
 def is_game_running() -> bool:
-    """True only when a verified AION 2 game process is currently active."""
-    return bool(find_aion_game_processes())
+    """True only when a verified AION 2 game process is currently active.
+
+    Tarama patlarsa fail-closed: oyun açık varsayılır (F-0101), eğitim
+    başlamaz.
+    """
+    try:
+        return bool(find_aion_game_processes())
+    except Exception as exc:
+        logger.warning("AION süreç araması başarısız; oyun açık varsayılıyor: %s", exc)
+        return True
 
 
 def find_aion_game_processes() -> List[int]:
-    """AION penceresi veya Aion2 exe pid listesi. Oyun yoksa boş liste."""
+    """AION penceresi veya Aion2 exe pid listesi. Oyun yoksa boş liste.
+
+    Tarama adımlarından biri patlarsa hata yutulmaz (F-0101): çağıran
+    oyunu "yok" sanıp eğitimi başlatmasın diye RuntimeError yükselir;
+    is_game_running() bunu fail-closed (True) yorumlar.
+    """
     if os.name != "nt":
         return []
     found: List[int] = []
@@ -220,11 +306,13 @@ def find_aion_game_processes() -> List[int]:
     try:
         found.extend(_pids_from_window_titles())
     except Exception as exc:
-        logger.debug("AION pencere taraması atlandı: %s", exc)
+        logger.error("AION pencere taraması başarısız: %s", exc)
+        raise RuntimeError(f"AION window scan failed: {exc}") from exc
     try:
         found.extend(_pids_from_process_names())
     except Exception as exc:
-        logger.debug("AION süreç taraması atlandı: %s", exc)
+        logger.error("AION süreç taraması başarısız: %s", exc)
+        raise RuntimeError(f"AION process scan failed: {exc}") from exc
     unique: List[int] = []
     seen = set()
     for pid in found:
@@ -232,7 +320,7 @@ def find_aion_game_processes() -> List[int]:
         if pid_i <= 0 or pid_i == own or pid_i in seen:
             continue
         exe_name = _get_exe_for_pid(pid_i)
-        base = os.path.basename(exe_name or "").casefold()
+        base = _basename_windows(exe_name).casefold()
         if base and (is_excluded_exe(base) or not exe_is_aion_game(exe_name)):
             continue
         seen.add(pid_i)
@@ -253,7 +341,14 @@ class _ProcSnap:
 
 
 class GameGpuThrottle:
-    """Oyun sürecine BELOW_NORMAL + EcoQoS uygular. finally içinde geri alır."""
+    """Oyun sürecini tespit eder; oyunu ASLA kısmaz (F-0100).
+
+    Politika: oyun açıkken eğitim reddedilir, oyun BELOW_NORMAL /
+    EcoQoS ile kısılıp batch 4 ile sürdürülmez. apply() yalnızca
+    tespit yapar; restore() durumu sıfırlar. _apply_to_pid /
+    _restore_snap yalnızca geriye dönük uyumluluk için durur ve
+    apply() tarafından çağrılmaz.
+    """
 
     def __init__(
         self,
@@ -274,27 +369,32 @@ class GameGpuThrottle:
         return False
 
     def apply(self) -> None:
+        # F-0442: önceki çalışmadan kalan snap/pid durumu temizlenir.
+        self._snaps = []
+        self.game_found = False
+        self.applied = False
+        self.pids = []
         try:
             pids = [int(p) for p in self._finder()]
         except Exception as exc:
-            logger.warning("AION süreç araması başarısız, eğitim yine başlar: %s", exc)
-            pids = []
+            # F-0101: arama patlarsa oyun "yok" sayılıp eğitim
+            # başlamasın — oyun açık varsayılır.
+            logger.warning("AION süreç araması başarısız; oyun açık varsayılıyor, eğitim başlamamalı: %s", exc)
+            self.game_found = True
+            self.pids = []
+            return
         self.pids = pids
         self.game_found = bool(pids)
         if not pids:
-            logger.info("AION süreci yok. Eğitim batch aynı, GPU eğitimi sürer.")
+            logger.info("AION süreci yok. Eğitim normal batch ile sürer.")
             return
-        for pid in pids:
-            snap = _apply_to_pid(pid)
-            self._snaps.append(snap)
-            if snap.priority_changed or snap.throttle_changed:
-                self.applied = True
-        logger.info(
-            "AION pid=%s: öncelik BELOW_NORMAL, EcoQoS açık. "
-            "FPS sınırı yok (çalışan oyuna güvenli kare sınırı yok). "
-            "Eğitim GPU'da kalır, batch %d.",
+        # F-0100/F-0274: kısma uygulanmaz; log yalnızca gerçeği söyler.
+        # "öncelik BELOW_NORMAL, EcoQoS açık / eğitim GPU'da kalır,
+        # batch 4" iddiası artık yazılmaz.
+        logger.warning(
+            "AION pid=%s açık: öncelik/EcoQoS kısması uygulanmaz; "
+            "eğitim reddedilmelidir.",
             ",".join(str(p) for p in pids),
-            TRAIN_BATCH_WHEN_GAME_PRESENT,
         )
 
     def restore(self) -> None:
@@ -302,12 +402,22 @@ class GameGpuThrottle:
             snap = self._snaps.pop()
             _restore_snap(snap)
         self.applied = False
+        # F-0442: restore sonrası bayat game_found/pids kalmaz.
+        self.game_found = False
+        self.pids = []
 
 
 def capped_train_batch(requested_batch: int, game_found: bool) -> int:
+    """Oyun kapalıyken istenen batch döner.
+
+    Oyun açıkken batch 4'e düşürüp eğitimi sürdürmek politika dışıdır
+    (F-0100): eğitim reddedilir, bu yüzden RuntimeError yükselir.
+    """
     requested = max(1, int(requested_batch))
     if game_found:
-        return min(requested, TRAIN_BATCH_WHEN_GAME_PRESENT)
+        raise RuntimeError(
+            "AION 2 açıkken eğitim reddedilir; batch düşürüp GPU paylaşılmaz"
+        )
     return requested
 
 
@@ -325,25 +435,11 @@ def _snapshot_pid_to_exe_map() -> dict[int, str]:
     kernel32 = ctypes.windll.kernel32
     TH32CS_SNAPPROCESS = 0x00000002
 
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.c_size_t),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", wintypes.WCHAR * 260),
-        ]
-
     kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
     kernel32.Process32FirstW.restype = wintypes.BOOL
-    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
     kernel32.Process32NextW.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
@@ -354,8 +450,8 @@ def _snapshot_pid_to_exe_map() -> dict[int, str]:
         return {}
     pid_map: dict[int, str] = {}
     try:
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
         ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while ok:
             pid_map[int(entry.th32ProcessID)] = entry.szExeFile
@@ -426,8 +522,8 @@ def _pids_from_window_titles() -> List[int]:
     def _callback(hwnd, _lparam):
         if not user32.IsWindowVisible(hwnd):
             return True
-        if hasattr(user32, "IsIconic") and user32.IsIconic(hwnd):
-            return True
+        # F-0275: simge durumuna düşürülmüş (minimized) oyun penceresi
+        # atlanmaz; başlığı okunabilir ve süreç taramasıyla doğrulanır.
 
         length = int(user32.GetWindowTextLengthW(hwnd) or 0)
         if length <= 0:
@@ -442,7 +538,7 @@ def _pids_from_window_titles() -> List[int]:
             pid_val = int(pid.value)
             if pid_val and pid_val != own_pid:
                 exe_name = _get_exe_for_pid(pid_val, snapshot_map)
-                base = os.path.basename(exe_name or "").casefold()
+                base = _basename_windows(exe_name).casefold()
                 if base and not is_excluded_exe(base) and exe_is_aion_game(exe_name):
                     found.append(pid_val)
         return True
@@ -472,29 +568,19 @@ def _pids_from_window_titles() -> List[int]:
 
 
 def _pids_from_process_names() -> List[int]:
+    # F-0443: kardeş fonksiyonlardaki os.name != "nt" koruması burada
+    # da var; Windows dışı platformda ctypes.windll'e dokunulmaz.
+    if os.name != "nt":
+        return []
     ctypes, wintypes = _win32()
     kernel32 = ctypes.windll.kernel32
     TH32CS_SNAPPROCESS = 0x00000002
 
-    class PROCESSENTRY32W(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.c_size_t),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", wintypes.WCHAR * 260),
-        ]
-
     kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
     kernel32.Process32FirstW.restype = wintypes.BOOL
-    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
     kernel32.Process32NextW.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
@@ -505,8 +591,8 @@ def _pids_from_process_names() -> List[int]:
         return []
     found: List[int] = []
     try:
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
         ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while ok:
             exe_name = entry.szExeFile
@@ -616,7 +702,7 @@ def _apply_to_pid(pid: int) -> _ProcSnap:
         handle = kernel32.OpenProcess(access, False, int(pid))
         snap.close_handle = True
     if not handle:
-        logger.warning("AION pid=%s açılamadı. Öncelik değişmedi, batch yine düşer.", pid)
+        logger.warning("AION pid=%s açılamadı. Öncelik değişmedi.", pid)
         snap.close_handle = False
         return snap
     snap.handle = handle

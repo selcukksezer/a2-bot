@@ -66,9 +66,9 @@ def test_skip_unchanged_files_when_stat_and_revision_match(tmp_path: Path) -> No
 
 def test_relabel_only_modified_or_new_files_in_batch(tmp_path: Path) -> None:
     """
-    Test 2: When one cached file is modified on disk (size/mtime change) and a new file
-    is introduced, unchanged files are skipped while only modified and uncached files
-    are scheduled for processing.
+    Test 2a: A file whose mtime changes -- with identical bytes and size --
+    is scheduled for relabeling while unchanged files are skipped.
+    (mtime signal isolated: content and size are untouched.)
     """
     cache_file = tmp_path / ".label_cache.json"
     cache = LabelCache(cache_path=cache_file, dataset_dir=tmp_path)
@@ -85,10 +85,11 @@ def test_relabel_only_modified_or_new_files_in_batch(tmp_path: Path) -> None:
     cache.record_label(img_unchanged, exemplar_revision=rev, box_count=3)
     cache.record_label(img_modified, exemplar_revision=rev, box_count=2)
 
-    # Modify img_modified on disk (different size & mtime_ns)
-    _create_dummy_image(img_modified, color=(200, 40, 90), size=96)
+    # Touch mtime only: same bytes, same size, only the timestamp moves.
+    size_before = img_modified.stat().st_size
     st = img_modified.stat()
     os.utime(img_modified, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000))
+    assert img_modified.stat().st_size == size_before
 
     assert cache.should_relabel(img_unchanged, exemplar_revision=rev) is False
     assert cache.should_relabel(img_modified, exemplar_revision=rev) is True
@@ -101,6 +102,46 @@ def test_relabel_only_modified_or_new_files_in_batch(tmp_path: Path) -> None:
     )
     assert plan["skip"] == [img_unchanged]
     assert plan["full"] == [img_modified, img_new]
+    assert plan["delta"] == []
+
+
+def test_relabel_when_only_file_size_changes(tmp_path: Path) -> None:
+    """
+    Test 2b: A file whose size changes -- with the mtime restored to the
+    cached value -- is scheduled for relabeling while unchanged files are skipped.
+    (size signal isolated: the timestamp is pinned back to the recorded one.)
+    """
+    cache_file = tmp_path / ".label_cache.json"
+    cache = LabelCache(cache_path=cache_file, dataset_dir=tmp_path)
+
+    img_unchanged = tmp_path / "unchanged.png"
+    img_modified = tmp_path / "modified.png"
+
+    _create_dummy_image(img_unchanged, color=(50, 100, 150), size=64)
+    _create_dummy_image(img_modified, color=(50, 100, 150), size=64)
+
+    rev = 2003
+    cache.record_label(img_unchanged, exemplar_revision=rev, box_count=3)
+    cache.record_label(img_modified, exemplar_revision=rev, box_count=2)
+
+    # Rewrite with different bytes/size, then restore the original mtime so
+    # only the size signal differs from the cache entry.
+    st_before = img_modified.stat()
+    _create_dummy_image(img_modified, color=(200, 40, 90), size=96)
+    assert img_modified.stat().st_size != st_before.st_size
+    os.utime(img_modified, ns=(st_before.st_atime_ns, st_before.st_mtime_ns))
+    assert img_modified.stat().st_mtime_ns == st_before.st_mtime_ns
+
+    assert cache.should_relabel(img_unchanged, exemplar_revision=rev) is False
+    assert cache.should_relabel(img_modified, exemplar_revision=rev) is True
+
+    plan = plan_batch_relabel(
+        [img_unchanged, img_modified],
+        exemplar_revision=rev,
+        label_cache=cache,
+    )
+    assert plan["skip"] == [img_unchanged]
+    assert plan["full"] == [img_modified]
     assert plan["delta"] == []
 
 
@@ -135,15 +176,23 @@ def test_new_exemplar_memory_revision_triggers_delta_and_full_relabel(tmp_path: 
     )
     cache.record_label(img_no_crops, exemplar_revision=rev_1, box_count=1)
 
-    # At rev_1, both files are skipped
+    # At rev_1, only the really labelled file is skipped. P2-9 (K-06):
+    # cache_candidate_crops starts a fresh entry at box_count=0
+    # (candidate crops are proposals, not labelled boxes), so the
+    # 0-box guarantee keeps img_with_crops out of "skip" — it routes
+    # to "full" (same revision, so no delta applies).
+    assert cache.should_relabel(img_with_crops, exemplar_revision=rev_1) is True
+    assert cache.should_relabel(img_no_crops, exemplar_revision=rev_1) is False
     plan_initial = plan_batch_relabel([img_with_crops, img_no_crops], exemplar_revision=rev_1, label_cache=cache)
-    assert plan_initial["skip"] == [img_with_crops, img_no_crops]
+    assert plan_initial["skip"] == [img_no_crops]
+    assert plan_initial["delta"] == []
+    assert plan_initial["full"] == [img_with_crops]
 
-    # Advance ExemplarMemory revision by adding a new exemplar and bumping mtime_ns
+    # Advance ExemplarMemory revision by adding a new exemplar. The revision is
+    # the exemplar file's mtime_ns, so a real save must advance it on its own --
+    # no hand-forged timestamp is applied.
     crop_new = _create_dummy_image(tmp_path / "crop_new.png", color=(200, 50, 200), size=32)
     assert memory.add_positive_exemplar(crop_new, class_id=1, class_name="ore", source="ui_approval")
-    st = exemplar_json.stat()
-    os.utime(exemplar_json, ns=(st.st_atime_ns, rev_1 + 10_000_000))
     rev_2 = get_current_exemplar_revision(exemplar_path=exemplar_json)
     assert rev_2 > rev_1
 
@@ -255,13 +304,18 @@ def test_incremental_delta_re_evaluation_with_updated_exemplar_memory(tmp_path: 
         exemplar_revision=rev_updated,
     )
 
-    # Negative candidate (class_id=2) must be suppressed; positive (0) and hand_label (5) survive
+    # Negative candidate (class_id=2) must be suppressed; positive (0) and hand_label (5) survive.
+    # The positive candidate is stored as (0, "wood") but the exemplar was
+    # canonicalized to (5, "tree_log") when added, so re_evaluate corrects
+    # the candidate cid 0 -> 5 (exemplar_corrected=True, sim 1.0 >= 0.78
+    # reassign threshold) instead of reinforcing it in place.
     surviving_cids = [c["class_id"] for c in surviving]
-    assert surviving_cids == [0, 5]
+    assert surviving_cids == [5, 5]
 
-    pos_out = next(c for c in surviving if c["class_id"] == 0)
-    hand_out = next(c for c in surviving if c["class_id"] == 5)
-    assert pos_out.get("exemplar_reinforced") is True
+    pos_out = next(c for c in surviving if c.get("exemplar_corrected") is True)
+    hand_out = next(c for c in surviving if c["class_id"] == 5 and c.get("hand_label") is True)
+    assert pos_out["class_name"] == "tree_log"
+    assert pos_out.get("exemplar_corrected") is True
     assert pos_out["confidence"] > 0.72
     assert hand_out["trusted"] is True
     assert hand_out["confidence"] >= 0.95

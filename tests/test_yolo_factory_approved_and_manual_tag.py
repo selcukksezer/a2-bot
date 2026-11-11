@@ -60,6 +60,12 @@ def factory_dialog(tmp_path: Path) -> YOLOFactoryDialog:
     (tmp_path / "approved" / "train" / "images").mkdir(parents=True, exist_ok=True)
     (tmp_path / "approved" / "train" / "labels").mkdir(parents=True, exist_ok=True)
     dlg._go_step(2)
+    # [YOLO-ASYNC] Adım 2 kuyruğu worker'da dolar; test gövdesi kuyruğu
+    # senkron okumadan önce yüklemenin bitmesini bekle, sonra tmp_path
+    # taramasını senkron tazele (başlangıç yüklemesi üretim dizinini
+    # taramış olabilir — _go_step isteği düşmüşse kuyruk üretim verisi kalır).
+    assert dlg.wait_for_yolo_load(), "async kuyruk yüklemesi 10 sn'de bitmedi"
+    dlg._reload_review_queue()
     yield dlg
     ap_mod._GLOBAL_POOL = prev_pool
 
@@ -219,10 +225,47 @@ def test_only_approved_checkbox_and_training_wiring(factory_dialog: YOLOFactoryD
     assert hasattr(dlg, "btn_train_only_approved")
     assert "Sadece Onaylananlarla Eğit" in dlg.btn_train_only_approved.text()
 
-    # Freeze dataset with only_approved calls prepare_approved_training_dataset
-    with patch.object(ApprovedDatasetPool, "prepare_approved_training_dataset", return_value={"train_samples": 5, "val_samples": 1}) as mock_prep:
-        dlg._freeze_dataset()
-        mock_prep.assert_called_once()
+    # Freeze dataset with only_approved — REAL ApprovedDatasetPool.prepare
+    # (no mock): 5 genuinely approved samples are placed under
+    # tmp/dataset/review + images, freeze must prepare the real approved
+    # training set and write data_approved.yaml for exactly those 5.
+    import cv2
+    import numpy as np
+
+    src_ds = tmp_path / "dataset"
+    (src_ds / "review" / "train").mkdir(parents=True, exist_ok=True)
+    (src_ds / "images" / "train").mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(3)
+    for i in range(5):
+        stem = f"freeze_appr_{i}"
+        cv2.imwrite(
+            str(src_ds / "images" / "train" / f"{stem}.png"),
+            rng.integers(0, 255, (80, 80, 3), dtype=np.uint8),
+        )
+        (src_ds / "review" / "train" / f"{stem}.json").write_text(
+            json.dumps(
+                {
+                    "stem": stem,
+                    "split": "train",
+                    "done": "ok",
+                    "human_approved": True,
+                    # P1-10 / K-21: admitted frames need per-box provenance.
+                    "trusted": [{"class_id": 3, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2, "human_approved": True}],
+                    "image_path": str(src_ds / "images" / "train" / f"{stem}.png"),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    assert dlg.toggle_approved_only.isChecked() is True
+    dlg._freeze_dataset()
+    pool_stats = get_approved_pool(tmp_path).get_approved_stats()
+    assert pool_stats["total_approved_images"] == 5
+    assert pool_stats["train_count"] == 5
+    yaml_path = tmp_path / "approved" / "data_approved.yaml"
+    assert yaml_path.is_file()
+    assert "train:" in yaml_path.read_text(encoding="utf-8")
+    assert (tmp_path / "frozen_manifest.json").is_file()
 
     # Verify worker creation passes only_approved=True
     with patch.object(RTXTrainingWorker, "start"):
@@ -348,41 +391,71 @@ def test_canvas_drag_suppresses_lightbox(factory_dialog: YOLOFactoryDialog):
 
 
 def test_manual_box_addition_and_exemplar_learning(factory_dialog: YOLOFactoryDialog, tmp_path: Path):
-    """Verifies that newly drawn box is assigned confidence=1.0, learned into ExemplarMemory, and persisted."""
+    """Verifies that newly drawn box is assigned confidence=1.0, learned into ExemplarMemory, and persisted.
+
+    Exemplar learning is exercised for REAL (no mock of _learn_box_exemplar):
+    the box uses canonical class 3 (ore_orichalcum) — class 24 buff_scroll
+    is rejected by ExemplarMemory as non-canonical, so asserting learning
+    for it would be false — on a textured image crop, and the exemplar
+    store is redirected to tmp_path so the repo's learned_exemplars.json
+    is untouched. The test then asserts a positive exemplar for class 3
+    with source "manual_draw" is actually persisted.
+    """
+    import cv2
+    import numpy as np
+
+    import dataset_factory.exemplar_memory as ex_mod
+
     dlg = factory_dialog
     item0 = _create_dummy_image_and_review(tmp_path, "draw_test_frame")
+    # Textured image: a uniform black crop yields no extractable features,
+    # so the real learner would (correctly) record nothing.
+    rng = np.random.default_rng(7)
+    cv2.imwrite(
+        str(tmp_path / "images" / "train" / "draw_test_frame.png"),
+        rng.integers(0, 255, (100, 100, 3), dtype=np.uint8),
+    )
     dlg._review_items = [item0]
     dlg._review_index = 0
     dlg._render_queue_list()
 
-    dlg.active_drawing_class_id = 24
-    dlg.active_drawing_class_name = "buff_scroll"
+    dlg.active_drawing_class_id = 3
+    dlg.active_drawing_class_name = "ore_orichalcum"
 
     box_data = {
         "cx": 0.45,
         "cy": 0.55,
         "w": 0.12,
         "h": 0.18,
-        "class_id": 24,
-        "class_name": "buff_scroll",
+        "class_id": 3,
+        "class_name": "ore_orichalcum",
     }
 
-    with patch.object(dlg, "_learn_box_exemplar") as mock_learn:
+    prev_exemplar_memory = ex_mod._GLOBAL_EXEMPLAR_MEMORY
+    ex_path = tmp_path / "learned_exemplars.json"
+    ex_mod.get_exemplar_memory(ex_path)
+    try:
         dlg._on_manual_box_added(box_data)
-        mock_learn.assert_called_once()
-        args, kwargs = mock_learn.call_args
-        assert kwargs.get("positive") is True
-        assert kwargs.get("source") == "manual_draw"
+    finally:
+        ex_mod._GLOBAL_EXEMPLAR_MEMORY = prev_exemplar_memory
 
     # Box must be added to trusted list of current item
     assert len(item0["trusted"]) == 1
     added_box = item0["trusted"][0]
-    assert added_box["class_id"] == 24
-    assert added_box["class_name"] == "buff_scroll"
+    assert added_box["class_id"] == 3
+    assert added_box["class_name"] == "ore_orichalcum"
     assert added_box["confidence"] == 1.0
     assert added_box["hand_label"] is True
     assert added_box["human_approved"] is True
     assert added_box["trusted"] is True
+
+    # Real exemplar learning: a positive exemplar for class 3 from the
+    # manual draw must be persisted to the tmp exemplar store.
+    assert ex_path.is_file(), "Exemplar store was never written — learning did not run"
+    stored = json.loads(ex_path.read_text(encoding="utf-8"))
+    positives = [e for e in stored.get("positive", []) if int(e.get("class_id", -1)) == 3]
+    assert len(positives) >= 1, "No positive exemplar for class 3 was learned"
+    assert any(e.get("source") == "manual_draw" for e in positives)
 
 
 def test_detail_row_cls_combo_has_completer(factory_dialog: YOLOFactoryDialog):
@@ -492,7 +565,12 @@ def test_class_select_dialog_coverage_and_filtering():
 
     # Search return selects first match
     dlg._on_search_return()
-    assert dlg.selected_class_id() in (22, 23)
+    # "potion" matches exactly hp_potion (22) and mp_potion (23), in that
+    # order; the return key must select the FIRST match (22) — accepting
+    # either (22, 23) would hide a wrong-order / wrong-selection bug.
+    visible_ids = [int(dlg.list_widget.item(i).data(Qt.ItemDataRole.UserRole)) for i in range(dlg.list_widget.count()) if not dlg.list_widget.item(i).isHidden()]
+    assert visible_ids == [22, 23]
+    assert dlg.selected_class_id() == 22
 
 
 def test_delete_box_auto_persists_to_disk_and_clears_yolo_txt(factory_dialog: YOLOFactoryDialog, tmp_path: Path):
@@ -683,8 +761,11 @@ def test_yolo_preview_dialog_canvas_click_does_not_close_dialog():
         Qt.KeyboardModifier.NoModifier,
     )
     dlg.canvas.mousePressEvent(ev)
-    # The dialog should NOT have accepted or closed
-    assert dlg.result() != 1
+    # The dialog must still be open with result 0 (Rejected, i.e. not
+    # accepted): `result() != 1` alone also passes for a dialog that was
+    # never shown or was already closed.
+    assert dlg.result() == 0
+    assert dlg.isVisible(), "Preview dialog closed after canvas click"
     dlg.close()
 
 
@@ -730,21 +811,29 @@ def test_on_refresh_clicked_refreshes_queue_and_dashboard(factory_dialog: YOLOFa
     _create_dummy_image_and_review(tmp_path, "refresh_test_frame")
 
     dlg.on_refresh_clicked()
+    # [YOLO-ASYNC] Yenile kuyruğu worker'da doldurur; okumadan önce bekle.
+    assert dlg.wait_for_yolo_load(), "async kuyruk yüklemesi 10 sn'de bitmedi"
     assert len(dlg._review_items) >= 1
     assert any(it["stem"] == "refresh_test_frame" for it in dlg._review_items)
 
 
-def test_class_8_is_combo_skill_prompt():
-    """Verifies Class 8 is configured as combo_skill_prompt and aliases work."""
+def test_class_8_is_ore_obsidian():
+    """Verifies Class 8 is canonical ore_obsidian and aliases work.
+
+    F-1946 remap (Decision 1): the dialog spec table follows CANONICAL_NAMES,
+    so 8 = ore_obsidian. The legacy combo/skill-prompt names remain only as
+    aliases resolving to canonical 13 (skill_ui_prompt), not 8.
+    """
     from ui.yolo_factory_dialog import CLASS_ID_TO_SPEC, CLASS_KEY_ALIASES
 
     spec = CLASS_ID_TO_SPEC[8]
-    assert spec["key"] == "combo_skill_prompt"
-    assert "Kombo" in spec["label_tr"]
-    assert CLASS_KEY_ALIASES["e_gather_icon"] == 8
-    assert CLASS_KEY_ALIASES["combo_skill_prompt"] == 8
-    assert CLASS_KEY_ALIASES["combo_icon"] == 8
-    assert CLASS_KEY_ALIASES["q_combo_icon"] == 8
+    assert spec["key"] == "ore_obsidian"
+    assert "Obsidyen" in spec["label_tr"]
+    assert CLASS_KEY_ALIASES["ore_obsidian"] == 8
+    assert CLASS_KEY_ALIASES["e_gather_icon"] == 13
+    assert CLASS_KEY_ALIASES["combo_skill_prompt"] == 13
+    assert CLASS_KEY_ALIASES["combo_icon"] == 13
+    assert CLASS_KEY_ALIASES["q_combo_icon"] == 13
 
 
 def test_class_10_is_monster_3d_and_aliases_work():
@@ -805,7 +894,13 @@ def test_class_25_is_kinah_and_aliases_work():
 
 
 def test_kinah_earnings_display_and_tracking(factory_dialog: YOLOFactoryDialog, tmp_path: Path):
-    """Verifies that Kinah earnings badge calculates frame value and tracks approved session Kinah."""
+    """Kinah bu ekranda GÖSTERİLMEZ (görev kuralı) ama backend'de izlenir.
+
+    Eski davranış (rozette "Bu Kare: ~43.5K Kinah") kaldırıldı:
+    lbl_review_kinah yok, review_sub'da para değeri yok. Buna karşılık
+    _estimate_box_kinah backend tahmini ve _session_approved_kinah
+    sayacı aynen durur; onaylanan karenin değeri sayaca yazılır.
+    """
     dlg = factory_dialog
 
     # Frame with 1x ore_orichalcum (cid 3 -> 3x hasat ~ 43.500 Kinah) and 1x kinah tag (cid 25)
@@ -822,23 +917,25 @@ def test_kinah_earnings_display_and_tracking(factory_dialog: YOLOFactoryDialog, 
     dlg._render_queue_list()
     dlg._on_queue_row_changed(0)
 
-    # Check that badge exists and contains Kinah info
-    assert hasattr(dlg, "lbl_review_kinah")
-    badge_text = dlg.lbl_review_kinah.text()
-    assert "Kinah" in badge_text
-    assert "43.5K" in badge_text or "43" in badge_text
+    # Ekranda Kinah rozeti YOK — para değeri gösterilmez.
+    assert not hasattr(dlg, "lbl_review_kinah")
+    assert "Kinah" not in dlg.review_sub.text()
+    assert "43.5K" not in dlg.review_sub.text()
 
-    # Check review_sub contains Kinah value
-    assert "Kinah" in dlg.review_sub.text()
+    # Backend tahmini hâlâ doğru: ore_orichalcum 43.500, kinah etiketi 0.
+    assert dlg._estimate_box_kinah({"class_id": 3}) == 43500
+    assert dlg._estimate_box_kinah({"class_id": 25}) == 0
 
-    # Detail row contains Kinah badge
+    # Detail rows still exist.
     row_count = dlg.det_layout.count()
     assert row_count > 0
 
     # Test approving frame updates session earnings
     initial_earned = getattr(dlg, "_session_approved_kinah", 0)
     dlg._on_step2_approve()
-    assert getattr(dlg, "_session_approved_kinah", 0) >= initial_earned + 40000
+    # Exact earnings for this frame: 43.500 Kinah (backend),
+    # not just "at least 40.000".
+    assert getattr(dlg, "_session_approved_kinah", 0) == initial_earned + 43500
 
 
 

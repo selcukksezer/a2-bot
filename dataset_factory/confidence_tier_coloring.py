@@ -71,23 +71,134 @@ class ConfidenceTier(str, Enum):
 
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-    """Convert a ``#RRGGBB`` hex string to an ``(R, G, B)`` tuple."""
+    """Convert a ``#RRGGBB`` hex string to an ``(R, G, B)`` tuple.
+
+    Raises ``ValueError`` on invalid input. Previously any invalid code
+    silently became confident-green ``(34, 197, 94)``, so a typo'd colour
+    rendered a box as trusted/confident.
+    """
     s = str(hex_color or "").strip().lstrip("#")
     if len(s) != 6:
-        return (34, 197, 94)
+        raise ValueError(f"Invalid hex colour (expected #RRGGBB): {hex_color!r}")
     try:
         r = int(s[0:2], 16)
         g = int(s[2:4], 16)
         b = int(s[4:6], 16)
-        return (r, g, b)
     except ValueError:
-        return (34, 197, 94)
+        raise ValueError(f"Invalid hex colour (expected #RRGGBB): {hex_color!r}") from None
+    return (r, g, b)
 
 
 def hex_to_bgr(hex_color: str) -> Tuple[int, int, int]:
     """Convert a ``#RRGGBB`` hex string to an OpenCV ``(B, G, R)`` tuple."""
     r, g, b = hex_to_rgb(hex_color)
     return (b, g, r)
+
+
+def _tier_template(
+    line_color: str,
+    text_color: str,
+    status_color: str,
+    line_style: str,
+    pen_style: str,
+    line_width: float,
+    fill_alpha: int,
+    conf_style: str,
+) -> Dict[str, Any]:
+    """Precompute the per-tier constant fields of a box style dict.
+
+    The three tier colours are fixed module constants, so their RGB/BGR
+    tuples and the long ``conf_style`` CSS strings are parsed/built once at
+    import time instead of on every :func:`get_box_visual_style` call (the
+    hot path of the review/live-preview canvases, called once per box).
+    Only the per-annotation fields (tier flags, badge/status text, class
+    name, confidence, pct) are filled in per call.
+    """
+    rgb = hex_to_rgb(line_color)
+    return {
+        "line_color": line_color,
+        "box_color": line_color,
+        "border_color": line_color,
+        "color": line_color,
+        "color_hex": line_color,
+        "color_rgb": rgb,
+        "color_bgr": (rgb[2], rgb[1], rgb[0]),
+        "badge_bg_color": line_color,
+        "badge_bg": line_color,
+        "badge_background_color": line_color,
+        "text_color": text_color,
+        "badge_text_color": text_color,
+        "font_color": text_color,
+        "line_style": line_style,
+        "pen_style": pen_style,
+        "border_style": line_style,
+        "line_width": line_width,
+        "pen_width": line_width,
+        "border_width": line_width,
+        "fill_alpha": fill_alpha,
+        "status_color": status_color,
+        "conf_style": conf_style,
+    }
+
+
+_TIER_STYLES: Dict[str, Dict[str, Any]] = {
+    TIER_CONFIDENT: _tier_template(
+        CONFIDENT_COLOR_HEX,
+        CONFIDENT_TEXT_COLOR_HEX,
+        CONFIDENT_STATUS_COLOR_HEX,
+        "solid",
+        "SolidLine",
+        2.2,
+        40,
+        "background:#0d2818;color:#4ade80;font-family:Consolas;font-size:11px;font-weight:700;"
+        "border:1px solid #16a34a;border-radius:6px;padding:2px 6px;",
+    ),
+    TIER_SUSPICIOUS: _tier_template(
+        SUSPICIOUS_COLOR_HEX,
+        SUSPICIOUS_TEXT_COLOR_HEX,
+        SUSPICIOUS_STATUS_COLOR_HEX,
+        "dashed",
+        "DashLine",
+        1.8,
+        30,
+        "background:#291804;color:#fb923c;font-family:Consolas;font-size:11px;font-weight:700;"
+        "border:1px solid #d97706;border-radius:6px;padding:2px 6px;",
+    ),
+    TIER_LOW_CONFIDENCE: _tier_template(
+        LOW_CONFIDENCE_COLOR_HEX,
+        LOW_CONFIDENCE_TEXT_COLOR_HEX,
+        LOW_CONFIDENCE_STATUS_COLOR_HEX,
+        "dashed",
+        "DashLine",
+        1.8,
+        30,
+        "background:#3b1010;color:#f87171;font-family:Consolas;font-size:11px;font-weight:700;"
+        "border:1px solid #ef4444;border-radius:6px;padding:2px 6px;",
+    ),
+}
+
+
+_CANONICAL_NAMES: Optional[Dict[int, str]] = None
+
+
+def _get_canonical_names() -> Dict[int, str]:
+    """Lazily load (once) the canonical class-id -> name map.
+
+    Previously :func:`extract_class_name` re-ran the
+    ``from dataset_factory.class_taxonomy import CANONICAL_NAMES`` import on
+    every ``class_id``-only annotation; the import itself is cached by
+    Python but the lookup ran per call. The map is a module constant, so
+    one load is enough.
+    """
+    global _CANONICAL_NAMES
+    if _CANONICAL_NAMES is None:
+        try:
+            from dataset_factory.class_taxonomy import CANONICAL_NAMES
+
+            _CANONICAL_NAMES = dict(CANONICAL_NAMES)
+        except Exception:
+            _CANONICAL_NAMES = {}
+    return _CANONICAL_NAMES
 
 
 def _truthy_flag(value: Any) -> bool:
@@ -103,8 +214,12 @@ def _truthy_flag(value: Any) -> bool:
     return bool(value)
 
 
-def normalize_confidence(raw_conf: Any, default: float = 0.97) -> float:
-    """Normalize a raw confidence value (``0..1`` or ``0..100``) into ``[0.0, 1.0]``."""
+def normalize_confidence(raw_conf: Any, default: float = 0.0) -> float:
+    """Normalize a raw confidence value (``0..1`` or ``0..100``) into ``[0.0, 1.0]``.
+
+    Missing/unparseable confidence defaults to ``0.0`` (unknown), never to
+    0.97: an empty annotation used to be displayed as 97% confident.
+    """
     if raw_conf is None:
         val = float(default)
     else:
@@ -122,7 +237,7 @@ def normalize_confidence(raw_conf: Any, default: float = 0.97) -> float:
     return max(0.0, min(1.0, val))
 
 
-def extract_box_confidence(ann: Mapping[str, Any], default: float = 0.97) -> float:
+def extract_box_confidence(ann: Mapping[str, Any], default: float = 0.0) -> float:
     """Extract and normalize confidence from an annotation dictionary."""
     if not isinstance(ann, Mapping):
         return normalize_confidence(None, default=default)
@@ -134,7 +249,7 @@ def extract_box_confidence(ann: Mapping[str, Any], default: float = 0.97) -> flo
     return normalize_confidence(None, default=default)
 
 
-def extract_class_name(ann: Mapping[str, Any], default: str = "herb_aria") -> str:
+def extract_class_name(ann: Mapping[str, Any], default: str = "unknown") -> str:
     """Extract display class name from an annotation dictionary."""
     if not isinstance(ann, Mapping):
         return default
@@ -146,11 +261,10 @@ def extract_class_name(ann: Mapping[str, Any], default: str = "herb_aria") -> st
 
     if "class_id" in ann and ann["class_id"] is not None:
         try:
-            from dataset_factory.class_taxonomy import CANONICAL_NAMES
-
+            names = _get_canonical_names()
             cid = int(ann["class_id"])
-            if cid in CANONICAL_NAMES:
-                return str(CANONICAL_NAMES[cid])
+            if cid in names:
+                return str(names[cid])
         except Exception:
             pass
         return str(ann["class_id"])
@@ -176,16 +290,15 @@ def is_box_confident(ann: Mapping[str, Any], norm_conf: Optional[float] = None) 
     hand_label = _truthy_flag(ann.get("hand_label"))
     human_approved = _truthy_flag(ann.get("human_approved"))
     source_str = str(ann.get("source", "") or "").strip().lower()
-    tier_hint = str(ann.get("tier", "") or "").strip().lower()
 
     if hand_label or human_approved or source_str in {"hand_label", "human_approved"}:
         return True
 
-    is_trusted = (
-        _truthy_flag(ann.get("trusted"))
-        or source_str in TRUSTED_SOURCES
-        or tier_hint == TIER_CONFIDENT
-    )
+    # NOTE: an incoming "tier": "confident" hint is NOT trust evidence -- a
+    # box used to promote itself to green just by claiming the confident
+    # tier. Only an explicit trusted flag / trusted source counts, plus the
+    # >= 0.85 confidence threshold.
+    is_trusted = _truthy_flag(ann.get("trusted")) or source_str in TRUSTED_SOURCES
     return bool(is_trusted and norm_conf >= CONFIDENT_THRESHOLD)
 
 
@@ -228,102 +341,47 @@ def get_box_visual_style(ann: dict) -> dict:
         badge text color, line style, line width, fill alpha, and formatted badge text.
     """
     safe_ann: Mapping[str, Any] = ann if isinstance(ann, Mapping) else {}
-    cname = extract_class_name(safe_ann, default="herb_aria")
-    norm_conf = extract_box_confidence(safe_ann, default=0.97)
+    cname = extract_class_name(safe_ann, default="unknown")
+    norm_conf = extract_box_confidence(safe_ann, default=0.0)
     pct = max(0, min(100, int(round(norm_conf * 100))))
 
     confident = is_box_confident(safe_ann, norm_conf=norm_conf)
 
     if confident:
         tier = TIER_CONFIDENT
-        line_color = CONFIDENT_COLOR_HEX
-        badge_bg_color = CONFIDENT_COLOR_HEX
-        text_color = CONFIDENT_TEXT_COLOR_HEX
-        line_style = "solid"
-        pen_style = "SolidLine"
-        line_width = 2.2
-        fill_alpha = 40
         badge_text = f"✓ {cname} %{pct}"
         status_text = f"Emin · %{pct} güven"
-        status_color = CONFIDENT_STATUS_COLOR_HEX
-        conf_style = (
-            "background:#0d2818;color:#4ade80;font-family:Consolas;font-size:11px;font-weight:700;"
-            "border:1px solid #16a34a;border-radius:6px;padding:2px 6px;"
-        )
     elif norm_conf >= SUSPICIOUS_THRESHOLD:
         tier = TIER_SUSPICIOUS
-        line_color = SUSPICIOUS_COLOR_HEX
-        badge_bg_color = SUSPICIOUS_COLOR_HEX
-        text_color = SUSPICIOUS_TEXT_COLOR_HEX
-        line_style = "dashed"
-        pen_style = "DashLine"
-        line_width = 1.8
-        fill_alpha = 30
         badge_text = f"🟠 şüpheli {cname} %{pct}"
         status_text = f"Şüpheli · %{pct} güven"
-        status_color = SUSPICIOUS_STATUS_COLOR_HEX
-        conf_style = (
-            "background:#291804;color:#fb923c;font-family:Consolas;font-size:11px;font-weight:700;"
-            "border:1px solid #d97706;border-radius:6px;padding:2px 6px;"
-        )
     else:
         tier = TIER_LOW_CONFIDENCE
-        line_color = LOW_CONFIDENCE_COLOR_HEX
-        badge_bg_color = LOW_CONFIDENCE_COLOR_HEX
-        text_color = LOW_CONFIDENCE_TEXT_COLOR_HEX
-        line_style = "dashed"
-        pen_style = "DashLine"
-        line_width = 1.8
-        fill_alpha = 30
         badge_text = f"şüpheli {cname} %{pct}"
         status_text = f"Düşük Güven (Şüpheli) · %{pct} güven"
-        status_color = LOW_CONFIDENCE_STATUS_COLOR_HEX
-        conf_style = (
-            "background:#3b1010;color:#f87171;font-family:Consolas;font-size:11px;font-weight:700;"
-            "border:1px solid #ef4444;border-radius:6px;padding:2px 6px;"
-        )
 
-    rgb = hex_to_rgb(line_color)
-    bgr = hex_to_bgr(line_color)
-
-    return {
-        "tier": tier,
-        "is_confident": tier == TIER_CONFIDENT,
-        "is_suspicious": tier == TIER_SUSPICIOUS,
-        "is_low_confidence": tier == TIER_LOW_CONFIDENCE,
-        "line_color": line_color,
-        "box_color": line_color,
-        "border_color": line_color,
-        "color": line_color,
-        "color_hex": line_color,
-        "color_rgb": rgb,
-        "color_bgr": bgr,
-        "badge_bg_color": badge_bg_color,
-        "badge_bg": badge_bg_color,
-        "badge_background_color": badge_bg_color,
-        "text_color": text_color,
-        "badge_text_color": text_color,
-        "font_color": text_color,
-        "line_style": line_style,
-        "pen_style": pen_style,
-        "border_style": line_style,
-        "line_width": line_width,
-        "pen_width": line_width,
-        "border_width": line_width,
-        "fill_alpha": fill_alpha,
-        "badge_text": badge_text,
-        "label_text": badge_text,
-        "label_str": badge_text,
-        "label": badge_text,
-        "status_text": status_text,
-        "status_color": status_color,
-        "conf_style": conf_style,
-        "class_name": cname,
-        "conf": norm_conf,
-        "confidence": norm_conf,
-        "pct": pct,
-        "confidence_pct": pct,
-    }
+    # Constant per-tier fields come from the precomputed template (parsed
+    # once at import); only per-annotation fields are filled in here.
+    style = dict(_TIER_STYLES[tier])
+    style.update(
+        {
+            "tier": tier,
+            "is_confident": tier == TIER_CONFIDENT,
+            "is_suspicious": tier == TIER_SUSPICIOUS,
+            "is_low_confidence": tier == TIER_LOW_CONFIDENCE,
+            "badge_text": badge_text,
+            "label_text": badge_text,
+            "label_str": badge_text,
+            "label": badge_text,
+            "status_text": status_text,
+            "class_name": cname,
+            "conf": norm_conf,
+            "confidence": norm_conf,
+            "pct": pct,
+            "confidence_pct": pct,
+        }
+    )
+    return style
 
 
 class ConfidenceTierColoring:

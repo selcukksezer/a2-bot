@@ -48,19 +48,31 @@ def test_excluded_executables_never_match_as_aion_game() -> None:
 
 
 def test_find_aion_game_processes_filters_out_non_game_pids_when_game_closed() -> None:
-    """Pencere veya süreç taramasından sahte/tarayıcı PID'leri gelse bile exe doğrulaması bunları eler."""
+    """Pencere veya süreç taramasından sahte/tarayıcı PID'leri gelse bile exe doğrulaması bunları eler.
+
+    F-1518: find_aion_game_processes() Linux'ta (os.name != "nt") en başta
+    boş liste döner, yani yamalanan _pids_from_* yardımcıları hiç çağrılmaz
+    ve test boşuna geçerdi. os.name "nt" yapılarak Windows dalı zorlanır,
+    böylece exe filtresi gerçekten çalıştırılır ve yama çağrıları doğrulanır.
+    """
     fake_pid_exes = {
         1010: r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         2020: r"C:\Users\user\AppData\Local\Programs\cursor\Cursor.exe",
         3030: r"C:\Windows\System32\cmd.exe",
     }
     with (
-        patch.object(ggt, "_pids_from_window_titles", return_value=[1010, 2020]),
-        patch.object(ggt, "_pids_from_process_names", return_value=[3030]),
-        patch.object(ggt, "_get_exe_for_pid", side_effect=lambda pid, *_a: fake_pid_exes.get(pid, "")),
+        patch.object(os, "name", "nt"),
+        patch.object(ggt, "_pids_from_window_titles", return_value=[1010, 2020]) as mock_titles,
+        patch.object(ggt, "_pids_from_process_names", return_value=[3030]) as mock_procs,
+        patch.object(ggt, "_get_exe_for_pid", side_effect=lambda pid, *_a: fake_pid_exes.get(pid, "")) as mock_exe,
     ):
         assert ggt.find_aion_game_processes() == []
         assert ggt.is_game_running() is False
+        # The filter helpers must actually have run — otherwise this test
+        # would pass vacuously on the early-return path.
+        mock_titles.assert_called()
+        mock_procs.assert_called()
+        assert mock_exe.call_count >= 3
 
 
 def test_game_gpu_throttle_does_not_apply_when_game_is_closed() -> None:

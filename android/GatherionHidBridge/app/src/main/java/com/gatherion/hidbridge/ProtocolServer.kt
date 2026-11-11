@@ -10,10 +10,22 @@ import kotlin.concurrent.thread
 
 /**
  * Line protocol twin of Gatherion SerialHidAdapter / NetworkHidAdapter.
+ *
+ * SECURITY (F-1601): this socket drives HID input (KEYDOWN/KEYUP/KEY), so it
+ * must not accept unauthenticated commands from any LAN client. The bridge
+ * is intentionally reachable over Wi-Fi (the PC client connects to the
+ * phone's LAN IP, see README / GATHERION_HID_TCP), so loopback-only binding
+ * would break the feature; authentication is the fix instead.
+ * Pass [authToken]: the first line of every connection must then be
+ * `AUTH <token>` or the connection is dropped before any command runs.
+ * With no token the server still listens unauthenticated and logs a
+ * warning — wiring the token in requires HidBridgeService (caller) and the
+ * PC NetworkHidAdapter (client) to agree on it, which is outside this file.
  */
 class ProtocolServer(
     private val port: Int = 8765,
     private val onLine: (String) -> String?,
+    private val authToken: String? = null,
 ) {
     companion object {
         private const val TAG = "GatherionHidTcp"
@@ -28,7 +40,11 @@ class ProtocolServer(
             try {
                 val ss = ServerSocket(port)
                 server = ss
-                Log.i(TAG, "listening on $port")
+                if (authToken == null) {
+                    Log.w(TAG, "listening on $port WITHOUT auth token — any LAN client can send HID input")
+                } else {
+                    Log.i(TAG, "listening on $port (AUTH required)")
+                }
                 while (running.get()) {
                     val client = try {
                         ss.accept()
@@ -62,6 +78,13 @@ class ProtocolServer(
             socket.soTimeout = 0
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
             val out = socket.getOutputStream()
+            if (authToken != null) {
+                val first = reader.readLine()?.trim()
+                if (first != "AUTH $authToken") {
+                    Log.w(TAG, "client ${socket.inetAddress.hostAddress} rejected: missing/wrong AUTH")
+                    return
+                }
+            }
             while (running.get()) {
                 val line = reader.readLine() ?: break
                 val trimmed = line.trim()

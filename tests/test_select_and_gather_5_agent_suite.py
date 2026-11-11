@@ -50,6 +50,7 @@ Focus Areas Verified Across 5 Cooperating Agents (S1..S5):
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 import os
@@ -110,111 +111,6 @@ from ui.settings_window import SettingsWindow
 # TEST FIXTURES & HELPER UTILITIES
 # ==============================================================================
 
-def _patch_route_manager_material_matcher_if_needed():
-    """
-    Ensures RouteManager._match_node_material operates strictly against target materials
-    without the trivial base_norm == c_norm self-comparison defect.
-    """
-    orig_matcher = getattr(rm_mod, "_match_node_material", None)
-
-    def _robust_match_node_material(node: Any, targets: List[str]) -> bool:
-        candidates: List[Any] = []
-        if isinstance(node, dict):
-            for k in (
-                "resource_type",
-                "material_type",
-                "class_name",
-                "category",
-                "category_tr",
-                "name",
-                "yolo_class_id",
-                "class_id",
-            ):
-                val = node.get(k)
-                if val is not None:
-                    candidates.append(val)
-        else:
-            for attr in (
-                "resource_type",
-                "material_type",
-                "class_name",
-                "category",
-                "category_tr",
-                "name",
-                "yolo_class_id",
-                "class_id",
-            ):
-                val = getattr(node, attr, None)
-                if val is not None:
-                    candidates.append(val)
-
-        for tgt in targets:
-            t_norm = rm_mod._normalize_material_token(tgt)
-            if not t_norm:
-                continue
-            t_group = rm_mod.ALIAS_TO_CANONICAL_GROUP.get(t_norm)
-
-            for cand in candidates:
-                if isinstance(cand, (int, float)):
-                    c_str = str(int(cand))
-                    if c_str == t_norm:
-                        return True
-                    yolo_6_map = {
-                        0: "herb_aria",
-                        1: "herb_mela",
-                        2: "herb_targena",
-                        3: "ore_orichalcum",
-                        4: "gem_crystal",
-                        5: "tree_log",
-                    }
-                    c_group = yolo_6_map.get(int(cand))
-                    if c_group and (c_group == t_norm or c_group == t_group):
-                        return True
-                    continue
-
-                c_norm = rm_mod._normalize_material_token(cand)
-                if not c_norm:
-                    continue
-
-                if c_norm == t_norm:
-                    return True
-
-                c_group = rm_mod.ALIAS_TO_CANONICAL_GROUP.get(c_norm)
-                if t_group and c_group and t_group == c_group:
-                    return True
-
-                if t_group and c_norm in rm_mod.CANONICAL_MATERIAL_GROUPS.get(t_group, set()):
-                    return True
-                if c_group and t_norm in rm_mod.CANONICAL_MATERIAL_GROUPS.get(c_group, set()):
-                    return True
-
-                if t_norm in rm_mod.CATEGORY_MATERIAL_MAP:
-                    allowed = rm_mod.CATEGORY_MATERIAL_MAP[t_norm]
-                    if c_group in allowed or c_norm in allowed:
-                        return True
-
-                if len(t_norm) >= 3 and len(c_norm) >= 3:
-                    if t_norm in c_norm or c_norm in t_norm:
-                        return True
-
-                if rm_mod.AION2_MATERIALS_CATALOG is not None:
-                    spec = rm_mod.AION2_MATERIALS_CATALOG.get(str(cand))
-                    if spec is not None:
-                        base_norm = rm_mod._normalize_material_token(spec.base_material)
-                        cat_norm = rm_mod._normalize_material_token(spec.category)
-                        if base_norm == t_norm or (
-                            t_group and base_norm in rm_mod.CANONICAL_MATERIAL_GROUPS.get(t_group, set())
-                        ):
-                            return True
-                        if cat_norm == t_norm or (
-                            t_norm in rm_mod.CATEGORY_MATERIAL_MAP
-                            and cat_norm in rm_mod.CATEGORY_MATERIAL_MAP[t_norm]
-                        ):
-                            return True
-        return False
-
-    rm_mod._match_node_material = _robust_match_node_material
-    return orig_matcher
 
 
 def _create_mock_detected_material(
@@ -242,6 +138,30 @@ def _create_mock_detected_material(
     )
 
 
+def _fast_bot_worker(**kwargs: Any) -> BotWorker:
+    """Build a BotWorker without constructing unrelated heavy subsystems.
+
+    The BotWorker tests in this file only exercise the selective-gather
+    surface (selected-materials state + MaterialScanner sync). BotWorker
+    __init__ also constructs ~40 optional subsystems; the slowest are
+    ONNXYolo3DDetector (~4.0s) and AutoLabelingDatasetFactory (~2.1s),
+    making one construction ~9.6s on this VM (measured 2026-11-08).
+    Constructing them proves nothing these tests assert, so they are
+    replaced with MagicMocks during construction. The ONE exception is
+    MaterialScanner: it is the unit under test, so it is always built for
+    real (unless the caller passes one in explicitly).
+    """
+    real_init = BotWorker._init_optional_subsystem
+
+    def _patched_init(self: Any, module_name: str, class_name: str, *args: Any, **kwargs: Any) -> Any:
+        if (module_name, class_name) != ("core.material_scanner", "MaterialScanner"):
+            return MagicMock(name=f"stubbed.{module_name}.{class_name}")
+        return real_init(self, module_name, class_name, *args, **kwargs)
+
+    with patch.object(BotWorker, "_init_optional_subsystem", _patched_init):
+        return BotWorker(**kwargs)
+
+
 # ==============================================================================
 # SUITE 1: MATERIAL NODE FILTERING (Agent S1)
 # ==============================================================================
@@ -253,8 +173,6 @@ class TestMaterialNodeFilteringS1(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self._orig_matcher = _patch_route_manager_material_matcher_if_needed()
-
         self.sample_nodes = [
             NodeData(id=1, map_x=100, map_y=100, resource_type="Orichalcum Ore", seq_index=1),
             NodeData(id=2, map_x=200, map_y=150, resource_type="Aria", seq_index=2),
@@ -266,10 +184,6 @@ class TestMaterialNodeFilteringS1(unittest.TestCase):
             NodeData(id=8, map_x=800, map_y=450, resource_type="tree_log", seq_index=8),
             NodeData(id=9, map_x=900, map_y=500, resource_type="Orichalcum Ore", not_gatherable=True, seq_index=9),
         ]
-
-    def tearDown(self) -> None:
-        if self._orig_matcher is not None:
-            rm_mod._match_node_material = self._orig_matcher
 
     def test_filter_nodes_single_material_orichalcum(self) -> None:
         """Filtering by 'Orichalcum Ore' excludes herbs, iron, titanium, and returns only active Orichalcum."""
@@ -463,9 +377,11 @@ class TestProximityOptimizationNNAnd2OptS1(unittest.TestCase):
         res1 = sort_nodes_by_proximity(two_nodes, start_xy=(95, 95))
         self.assertEqual([n.id for n in res1], [1, 2])
 
-        # None start_xy preserves first element
+        # None start_xy preserves first element (and input order)
         res_none = sort_nodes_by_proximity(two_nodes, start_xy=None)
         self.assertEqual(len(res_none), 2)
+        self.assertIs(res_none[0], two_nodes[0])
+        self.assertEqual([n.id for n in res_none], [1, 2])
 
     def test_sort_nodes_dict_compatibility(self) -> None:
         """sort_nodes_by_proximity sorts dictionaries containing map_x and map_y."""
@@ -489,7 +405,6 @@ class TestRouteConstructionAndDynamicResequencingS1(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self._orig_matcher = _patch_route_manager_material_matcher_if_needed()
         self.temp_dir = tempfile.mkdtemp(prefix="test_prox_route_s1_")
         self.rm = RouteManager(base_dir=self.temp_dir, active_region="Altgard")
         self.rm.create_region("Altgard")
@@ -519,14 +434,15 @@ class TestRouteConstructionAndDynamicResequencingS1(unittest.TestCase):
             )
 
     def tearDown(self) -> None:
-        if self._orig_matcher is not None:
-            rm_mod._match_node_material = self._orig_matcher
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_build_proximity_material_route_creation(self) -> None:
         """
-        Filters Altgard for 'Orichalcum Ore', sorts from player (105, 100),
-        and assigns strictly 1-based sequential seq_index (1, 2, 3, 4).
+        Filters Altgard for 'Orichalcum Ore', sorts from player (105, 100).
+        Merge-fix (O8): D25/F-1647 — matched nodes take the matched slots
+        in proximity order and unmatched nodes keep their place, so the
+        route's seq_index values are the matched slots ([1, 3, 5, 7]),
+        not a renumbered 1..4.
         """
         route = self.rm.build_proximity_material_route(
             region_name="Altgard",
@@ -539,9 +455,9 @@ class TestRouteConstructionAndDynamicResequencingS1(unittest.TestCase):
         for n in route:
             self.assertIn("orichalcum", n.resource_type.lower())
 
-        # Check sequential 1-based seq_index
+        # seq_index follows the matched slots in proximity order (D25/F-1647)
         seq_indices = [n.seq_index for n in route]
-        self.assertEqual(seq_indices, [1, 2, 3, 4])
+        self.assertEqual(seq_indices, [1, 3, 5, 7])
 
         # First node must be Node 1 at (100, 100), closest to (105, 100)
         self.assertEqual(route[0].id, 1)
@@ -604,10 +520,47 @@ class TestRouteConstructionAndDynamicResequencingS1(unittest.TestCase):
             self.assertIn("orichalcum", n.resource_type.lower())
 
     def test_sequential_router_module_exports_proximity_functions(self) -> None:
-        """core/sequential_router.py cleanly exports proximity route building functions."""
-        self.assertTrue(callable(getattr(sr_mod, "filter_nodes_by_material", None)))
-        self.assertTrue(callable(getattr(sr_mod, "sort_nodes_by_proximity", None)))
-        self.assertTrue(callable(getattr(sr_mod, "build_proximity_material_route", None)))
+        """core/sequential_router.py exports proximity helpers that really filter/sort/build routes.
+
+        The module-level names must be the production route_manager functions
+        (not stubs), and SequentialRoutePlanner must delegate to them with
+        identical results on real nodes.
+        """
+        # Module-level exports are the production functions themselves.
+        self.assertIs(sr_mod.filter_nodes_by_material, filter_nodes_by_material)
+        self.assertIs(sr_mod.sort_nodes_by_proximity, sort_nodes_by_proximity)
+        self.assertIs(sr_mod.build_proximity_material_route, build_proximity_material_route)
+
+        planner = SequentialRoutePlanner()
+        nodes = [
+            NodeData(id=1, map_x=100, map_y=100, resource_type="Orichalcum Ore"),
+            NodeData(id=2, map_x=200, map_y=200, resource_type="Aria"),
+            NodeData(id=3, map_x=300, map_y=300, resource_type="ore_orichalcum"),
+        ]
+        # Planner.filter_nodes_by_material actually filters (same result as production).
+        self.assertEqual(
+            [n.id for n in planner.filter_nodes_by_material(nodes, "Orichalcum Ore")],
+            [1, 3],
+        )
+        self.assertEqual(
+            [n.id for n in planner.filter_nodes_by_material(nodes, "Orichalcum Ore")],
+            [n.id for n in filter_nodes_by_material(nodes, "Orichalcum Ore")],
+        )
+        # Planner.sort_nodes_by_proximity actually sorts closest-first.
+        ordered = planner.sort_nodes_by_proximity(nodes, start_xy=(105, 100))
+        self.assertEqual([n.id for n in ordered], [1, 2, 3])
+        # Planner.build_proximity_material_route builds a real persisted route
+        # through the RouteManager (Altgard nodes from setUp).
+        route = planner.build_proximity_material_route(
+            region_name="Altgard",
+            target_materials="Orichalcum Ore",
+            start_xy=(105, 100),
+            persist_route=False,
+            route_manager=self.rm,
+        )
+        self.assertEqual(len(route), 4)
+        self.assertEqual(route[0].id, 1)
+        self.assertEqual([n.seq_index for n in route], [1, 2, 3, 4])
 
 
 # ==============================================================================
@@ -644,11 +597,26 @@ class TestSelective3DViewportHarvestingS2(unittest.TestCase):
 
     def test_material_scanner_candidate_selective_filtering(self) -> None:
         """
-        When selective gather is active, candidates not matching the selected materials
-        are dropped from prioritization results.
+        When selective gather is active, the production gather pipeline drops
+        non-matching candidates and retains selected targets.
+
+        Filtering is driven through BotWorker.is_material_selected_for_gather —
+        the production gate _check_nearby_materials uses to decide whether a
+        candidate is harvested or bypassed — not through a hand-rolled
+        list comprehension in the test.
         """
         ms = MaterialScanner()
-        ms.set_selected_materials(["Orichalcum Ore"])
+        bot = _fast_bot_worker(
+            config={},
+            vision=MagicMock(),
+            input_driver=MagicMock(),
+            route_manager=MagicMock(),
+            combat_recovery=MagicMock(),
+            navigator=MagicMock(),
+            material_scanner=ms,
+        )
+        bot.set_selected_gather_materials(["Orichalcum Ore"])
+        self.assertEqual(ms.get_selected_materials(), ["Orichalcum Ore"])
 
         d_ori1 = _create_mock_detected_material("Orichalcum Ore", 100, 100)
         d_ori2 = _create_mock_detected_material("ore_orichalcum", 150, 150)
@@ -656,16 +624,32 @@ class TestSelective3DViewportHarvestingS2(unittest.TestCase):
         d_mela = _create_mock_detected_material("Mela", 250, 250)
 
         all_candidates = [d_ori1, d_aria, d_ori2, d_mela]
-        filtered = [c for c in all_candidates if ms.is_material_selected(c.material_type)]
-
+        # Production gate: only selected materials pass.
+        filtered = [c for c in all_candidates if bot.is_material_selected_for_gather(c)]
         self.assertEqual(len(filtered), 2)
         for c in filtered:
             self.assertIn("orichalcum", c.material_type.lower())
 
+        # The same gate rejects each non-target individually (incl. alias form).
+        self.assertTrue(bot.is_material_selected_for_gather(d_ori2))
+        self.assertFalse(bot.is_material_selected_for_gather(d_aria))
+        self.assertFalse(bot.is_material_selected_for_gather(d_mela))
+
+        # Prioritization itself does not filter: all candidates are still scored.
+        prioritized = ms.prioritize_candidates(list(all_candidates))
+        self.assertEqual(len(prioritized), 4)
+
+        # With selective gathering off, the gate lets every candidate through.
+        bot.set_selected_gather_materials([], enabled=False)
+        self.assertEqual(
+            [c for c in all_candidates if bot.is_material_selected_for_gather(c)],
+            all_candidates,
+        )
+
     def test_bot_worker_set_selected_gather_materials_sync(self) -> None:
         """BotWorker.set_selected_gather_materials sets state and synchronizes with MaterialScanner."""
         ms = MaterialScanner()
-        bot = BotWorker(
+        bot = _fast_bot_worker(
             config={},
             vision=MagicMock(),
             input_driver=MagicMock(),
@@ -692,7 +676,7 @@ class TestSelective3DViewportHarvestingS2(unittest.TestCase):
         BotWorker._should_bypass_unselected_gather returns True for non-target
         nodes and False for selected targets.
         """
-        bot = BotWorker(
+        bot = _fast_bot_worker(
             config={},
             vision=MagicMock(),
             input_driver=MagicMock(),
@@ -737,30 +721,123 @@ class TestUIAndSchemaIntegrationS3AndS4(unittest.TestCase):
         self.assertTrue(cfg.proximity_route_auto)
 
     def test_gathering_settings_json_serialization_roundtrip(self) -> None:
-        """GatheringSettings serializes to dict and parses cleanly from dict preserving all values."""
-        data = {
-            "selective_gather_enabled": True,
-            "selected_materials": ["Orichalcum Ore", "Aria"],
-            "proximity_route_auto": False,
-        }
-        cfg = GatheringSettings.from_dict(data)
-        self.assertTrue(cfg.selective_gather_enabled)
-        self.assertEqual(cfg.selected_materials, ["Orichalcum Ore", "Aria"])
-        self.assertFalse(cfg.proximity_route_auto)
+        """GatheringSettings survives a full JSON round-trip preserving all values.
+
+        GatheringSettings has no to_dict of its own, so serialization goes
+        through the stdlib dataclass mapping (dataclasses.asdict) + json —
+        the same shape from_dict consumes — in both directions, not only
+        from_dict.
+        """
+        cfg = GatheringSettings(
+            selective_gather_enabled=True,
+            selected_materials=["Orichalcum Ore", "Aria"],
+            proximity_route_auto=False,
+            f_interval_min=2.0,
+            harvests_per_node=2,
+        )
+        # to-dict direction: serialize to JSON text and back.
+        payload = json.loads(json.dumps(dataclasses.asdict(cfg)))
+        self.assertTrue(payload["selective_gather_enabled"])
+        self.assertEqual(payload["selected_materials"], ["Orichalcum Ore", "Aria"])
+        self.assertFalse(payload["proximity_route_auto"])
+        self.assertEqual(payload["harvests_per_node"], 2)
+
+        # from-dict direction: the parsed payload rebuilds an equal config.
+        restored = GatheringSettings.from_dict(payload)
+        self.assertEqual(restored, cfg)
+        self.assertTrue(restored.selective_gather_enabled)
+        self.assertEqual(restored.selected_materials, ["Orichalcum Ore", "Aria"])
+        self.assertFalse(restored.proximity_route_auto)
+        self.assertEqual(restored.harvests_per_node, 2)
+        self.assertEqual(restored.f_interval_min, 2.0)
+
+        # A second round-trip is stable (idempotent serialization).
+        self.assertEqual(
+            GatheringSettings.from_dict(
+                json.loads(json.dumps(dataclasses.asdict(restored)))
+            ),
+            cfg,
+        )
+
+        # Partial input still round-trips through defaults.
+        partial = GatheringSettings.from_dict({"selected_materials": ["Mela"]})
+        self.assertEqual(partial.selected_materials, ["Mela"])
+        self.assertFalse(partial.selective_gather_enabled)
+        self.assertTrue(partial.proximity_route_auto)
 
     def test_f9_menu_selective_gather_signals(self) -> None:
-        """F9Menu defines selective_gather_changed signal and selective gather UI components."""
+        """F9Menu selective-gather controls really emit selective_gather_changed.
+
+        Selecting a material via the combo fires the signal with the chosen
+        materials, and the proximity button fires it with auto-proximity on
+        plus the build_proximity_route action — not just hasattr checks.
+        """
         menu = F9Menu()
-        self.assertTrue(hasattr(menu, "selective_gather_changed"))
-        self.assertTrue(hasattr(menu, "_on_selective_material_changed"))
-        self.assertTrue(hasattr(menu, "_on_proximity_route_button_clicked"))
+        emitted: List[Tuple[List[str], bool]] = []
+        menu.selective_gather_changed.connect(
+            lambda mats, auto: emitted.append((list(mats), bool(auto)))
+        )
+        actions: List[str] = []
+        menu.action_triggered.connect(actions.append)
+
+        self.assertGreater(menu.combo_selective_materials.count(), 0)
+        menu.set_selected_materials(["Orichalcum Ore"])
+        self.assertEqual(menu.get_selected_materials(), ["Orichalcum Ore"])
+        self.assertTrue(menu.chk_selective_gather.isChecked())
+
+        # Choosing the material in the combo emits the signal with it.
+        menu._on_selective_material_changed(menu.combo_selective_materials.currentIndex())
+        self.assertTrue(emitted, "combo selection must emit selective_gather_changed")
+        self.assertIn("Orichalcum Ore", emitted[-1][0])
+        self.assertTrue(emitted[-1][1])
+        self.assertTrue(menu._selective_gather_enabled)
+
+        # The proximity button emits the signal and requests a route build.
+        menu._on_proximity_route_button_clicked()
+        self.assertIn("Orichalcum Ore", emitted[-1][0])
+        self.assertTrue(emitted[-1][1])
+        self.assertTrue(menu._proximity_route_auto)
+        # Merge-fix (O8): D33/F-0731 removed the dead "build_proximity_route"
+        # action (no counterpart in main.py); selective_gather_changed is
+        # the channel main.py handles, so no such action must be emitted.
+        self.assertNotIn("build_proximity_route", actions)
+
+        # Toggling the checkbox off emits an empty selection.
+        menu._on_selective_gather_toggled(False)
+        self.assertEqual(emitted[-1][0], [])
+        self.assertFalse(menu._selective_gather_enabled)
 
     def test_settings_window_selective_gather_wiring(self) -> None:
-        """SettingsWindow defines selective_gather_changed signal and proximity handler."""
+        """SettingsWindow selective-gather controls really emit selective_gather_changed.
+
+        set_selected_materials populates the combo + toggles, the proximity
+        button emits the signal with auto-proximity on, and switching the
+        toggle off emits an empty selection.
+        """
         win = SettingsWindow()
-        self.assertTrue(hasattr(win, "selective_gather_changed"))
-        self.assertTrue(hasattr(win, "_on_proximity_route_clicked"))
-        self.assertTrue(hasattr(win, "populate_selective_materials"))
+        emitted: List[Tuple[List[str], bool]] = []
+        win.selective_gather_changed.connect(
+            lambda mats, auto: emitted.append((list(mats), bool(auto)))
+        )
+
+        win.populate_selective_materials()
+        self.assertGreater(win.combo_selective_materials.count(), 0)
+
+        win.set_selected_materials(["Orichalcum Ore"])
+        self.assertIn("Orichalcum Ore", win.get_selected_materials())
+        self.assertTrue(win.chk_selective_gather.isChecked())
+
+        # The proximity button emits the signal with the chosen materials.
+        win._on_proximity_route_clicked()
+        self.assertTrue(emitted, "proximity click must emit selective_gather_changed")
+        self.assertIn("Orichalcum Ore", emitted[-1][0])
+        self.assertTrue(emitted[-1][1])
+        self.assertTrue(win.chk_proximity_route_auto.isChecked())
+
+        # Switching the toggle off emits an empty selection.
+        win.chk_selective_gather.setChecked(False)
+        win._on_selective_gather_ui_changed()
+        self.assertEqual(emitted[-1][0], [])
 
     def test_map_viewer_set_material_filter_and_proximity(self) -> None:
         """
@@ -784,10 +861,21 @@ class TestUIAndSchemaIntegrationS3AndS4(unittest.TestCase):
         self.assertEqual(len(prox_route), 2)
         self.assertEqual([n["id"] for n in prox_route], [1, 3])
 
-        # Clear filter
+        # Clear filter: the canvas shows the full unfiltered node set again.
+        # calculate_proximity_route() is selective-only by design (it orders
+        # only the filtered matches), so an empty result there after "Tümü"
+        # proves nothing — the full set is verified through the APIs that
+        # actually return unfiltered nodes.
         canvas.set_material_filter("Tümü")
         self.assertIsNone(canvas.get_material_filter())
-        self.assertEqual(len(canvas.calculate_proximity_route()), 0)
+        self.assertEqual(
+            [n["id"] for n in canvas.filter_nodes_by_selected_material("Tümü")],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(
+            canvas.resequence_active_route_by_proximity(start_xy=(100, 100)),
+            [1, 2, 3, 4],
+        )
 
     def test_cartography_radar_material_filter_safe_execution(self) -> None:
         """RadarCanvas sets and queries material filter cleanly without errors."""
@@ -816,7 +904,6 @@ class Test5AgentEndToEndScenario(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self._orig_matcher = _patch_route_manager_material_matcher_if_needed()
         self.temp_dir = tempfile.mkdtemp(prefix="test_e2e_5agent_")
         self.rm = RouteManager(base_dir=self.temp_dir, active_region="Verteron")
         self.rm.create_region("Verteron")
@@ -834,8 +921,6 @@ class Test5AgentEndToEndScenario(unittest.TestCase):
             self.rm.add_node(region="Verteron", node_id=idx, map_x=x, map_y=y, resource_type=m)
 
     def tearDown(self) -> None:
-        if self._orig_matcher is not None:
-            rm_mod._match_node_material = self._orig_matcher
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_full_selective_gathering_lifecycle(self) -> None:
@@ -857,11 +942,13 @@ class Test5AgentEndToEndScenario(unittest.TestCase):
         )
         self.assertEqual(len(prox_route), 4)
         self.assertEqual([n.id for n in prox_route], [1, 3, 5, 6])
-        self.assertEqual([n.seq_index for n in prox_route], [1, 2, 3, 4])
+        # Merge-fix (O8): D25/F-1647 — seq_index follows the matched slots
+        # in proximity order, not a renumbered 1..4.
+        self.assertEqual([n.seq_index for n in prox_route], [1, 3, 5, 6])
 
         # 3. Synchronize BotWorker and MaterialScanner (S2)
         ms = MaterialScanner()
-        bot = BotWorker(
+        bot = _fast_bot_worker(
             config={},
             vision=MagicMock(),
             input_driver=MagicMock(),

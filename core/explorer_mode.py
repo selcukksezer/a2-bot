@@ -46,6 +46,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
+from version import __version__
 
 try:
     import winsound
@@ -62,6 +63,8 @@ from core.depth_glide_navigator import (
 )
 from core.input_driver import InputController
 from core.material_scanner import DetectedMaterial, MaterialScanner
+# P1-7 (K-20): minimap metre/piksel ölçeğinin tek kaynağı.
+from core.corridor_navigator import MINIMAP_METERS_PER_PX
 from core.route_manager import (
     DEFAULT_REGION,
     DEFAULT_RESOURCE_TYPE,
@@ -73,6 +76,29 @@ from core.sequential_router import SequentialRoutePlanner
 from core.vision import VisionEngine
 
 logger = logging.getLogger(__name__)
+
+# H-sweep deseni (dilim 13 K3, auto_cartographer'daki UNKNOWN_RESOURCE_TYPE
+# ile aynı): türü bilinmeyen materyalin dürüst işareti. "Gatherable
+# Material" kod tabanında zaten jenerik sınıf etiketidir; spesifik bir
+# cevher adı ("Orichalcum Ore" — route_manager.DEFAULT_RESOURCE_TYPE)
+# asla varsayılan tür olarak yazılmaz. Bu sabite H dalındaki
+# auto_cartographer tanımından bağımsızdır (o dal entegre değilken de çalışır).
+UNKNOWN_RESOURCE_TYPE: str = "Gatherable Material"
+
+# YZ kutu isimlerinde geçen değerli taş adları — bare "diamond"/"sapphire" gibi
+# isimler de toplama tespiti sayılsın diye (_GATHER_NAMES'te "gem" var ama taş adı yok).
+_GEMSTONE_NAMES = (
+    "sapphire",
+    "ruby",
+    "diamond",
+    "emerald",
+    "topaz",
+    "amethyst",
+    "aquamarine",
+    "garnet",
+    "opal",
+    "blood crystal",
+)
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _formatter = logging.Formatter(
@@ -85,6 +111,135 @@ if not logger.handlers:
 
 
 DEFAULT_HARVESTS_PER_NODE: int = 3
+
+# 3x3 morfolojik kapatma çekirdeği: minimap taraması her karede iki kez
+# `np.ones((3, 3), np.uint8)` ayırmasın diye modül düzeyinde tek örnek
+# paylaşılır (salt-okunur kullanım — hiçbir yerde değiştirilmez).
+_MORPH_CLOSE_KERNEL_3X3 = np.ones((3, 3), np.uint8)
+
+# F17 (mr6 adım yolu): içsel minimap filiz tarayıcısının ÖLÇÜLMÜŞ güveni.
+# MaterialScanner ile AYNI kalibre ölçüm: kanonik 3-yapraklı filiz şablonuna
+# karşı TM_CCOEFF_NORMED eşleşme skoru (eşik 0.68) ve aynı güven formülü
+# (0.78 + 0.18*skor, üst sınır 0.96; core/material_scanner.py:
+# scan_minimap_materials). Sabit güven YOK (P1-4/F-0264): skor eşiğin
+# altındaysa (örn. düz beyaz canavar noktası ~0.50) güven 0.0 kalır ve aday
+# kapılarda elenir. Şablon yüklenemezse de 0.0 döner (fail-closed).
+_SPROUT_TPL_MATCH_MIN: float = 0.68
+_SPROUT_TEMPLATES: Optional[List[np.ndarray]] = None
+
+
+def _sprout_template_confidence(mm_v: np.ndarray, x: int, y: int, cw: int, ch: int) -> float:
+    """Kontur kutusu (x, y, cw, ch) çevresindeki filiz adayının kanonik filiz
+    şablonuna eşleşme skorundan ölçülmüş güveni döndürür.
+
+    16 px kanonik şablon ve 12 px küçültülmüşü (gerçek oyun ikonu ~12 px)
+    ile, adayın ±8 px penceresinde kayan eşleşme yapılır; en yüksek skor
+    alınır. Skor eşiğin (0.68) altındaysa 0.0 döner — güven uydurulmaz.
+    """
+    global _SPROUT_TEMPLATES
+    try:
+        if _SPROUT_TEMPLATES is None:
+            from core.minimap_scanner import MinimapScanner
+
+            tpl16 = np.asarray(MinimapScanner._CANONICAL_SPROUT_TPL, dtype=np.uint8)
+            tpl12 = cv2.resize(tpl16, (12, 12), interpolation=cv2.INTER_AREA)
+            _SPROUT_TEMPLATES = [tpl16, tpl12]
+        h, w = mm_v.shape[:2]
+        x1 = max(0, x - 8)
+        y1 = max(0, y - 8)
+        x2 = min(w, x + cw + 8)
+        y2 = min(h, y + ch + 8)
+        window = mm_v[y1:y2, x1:x2]
+        if window.shape[0] < 16 or window.shape[1] < 16:
+            return 0.0
+        best = 0.0
+        for tpl in _SPROUT_TEMPLATES:
+            res = cv2.matchTemplate(window, tpl, cv2.TM_CCOEFF_NORMED)
+            best = max(best, float(res.max()))
+        if best < _SPROUT_TPL_MATCH_MIN:
+            return 0.0
+        return round(min(0.96, 0.78 + 0.18 * best), 3)
+    except Exception as exc:
+        logger.debug("filiz şablon güveni ölçülemedi: %s", exc)
+        return 0.0
+
+
+
+def _dedupe_detections_by_proximity(
+    detections: List[Dict[str, Any]],
+    radius_px: float,
+    on_duplicate: Optional[Callable[[Dict[str, Any], Dict[str, Any]], None]] = None,
+    base: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Tespitleri `screen_x`/`screen_y` yakınlığına göre tekilleştirir.
+
+    Eskiden her tarama noktasında korunan listedeki TÜM öğeler
+    `math.hypot` ile taranıyordu (O(n²)); yoğun karelerde (ör. YOLO'dan
+    yüzlerce kutu) adım başına yüzlerce ms tutuyordu. Burada tespitler
+    yarıçap büyüklüğünde hücrelere bölünür ve her yeni tespit yalnızca
+    3x3 komşu hücredeki korunan öğelerle karşılaştırılır (ortalama O(n)).
+
+    Anlamsal eşdeğerlik: adaylar eklenme sırasına göre dizilir ve yarıçap
+    içindeki İLK eşleşme kullanılır — tıpkı eski doğrusal tarama gibi.
+    `base` verilirse taban öğeler kendi aralarında tekilleştirilmez (eski
+    kod da tabanı kendi içinde elemiyordu); yalnızca yeni öğeler tabana +
+    daha önce eklenen yeni öğelere karşı kontrol edilir. `on_duplicate`
+    birleştirme geri çağrısı korunan öğenin koordinatını değiştirirse
+    (ör. `existing.update(det)`) öğe yeni hücresine taşınır.
+    """
+    radius = max(0.0, float(radius_px))
+    cell = max(1.0, radius)
+
+    def _cell_of(x: int, y: int) -> Tuple[int, int]:
+        return (int(math.floor(x / cell)), int(math.floor(y / cell)))
+
+    kept: List[Dict[str, Any]] = list(base) if base else []
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    cells: List[Tuple[int, int]] = []
+    for idx, item in enumerate(kept):
+        c = _cell_of(int(item.get("screen_x", 0)), int(item.get("screen_y", 0)))
+        cells.append(c)
+        grid.setdefault(c, []).append(idx)
+
+    for det in detections:
+        x = int(det.get("screen_x", 0))
+        y = int(det.get("screen_y", 0))
+        gx, gy = _cell_of(x, y)
+        cand_idx: List[int] = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                cand_idx.extend(grid.get((gx + dx, gy + dy), ()))
+        cand_idx.sort()
+        dup_idx: Optional[int] = None
+        for idx in cand_idx:
+            ex = kept[idx]
+            if (
+                math.hypot(
+                    x - int(ex.get("screen_x", 0)),
+                    y - int(ex.get("screen_y", 0)),
+                )
+                <= radius
+            ):
+                dup_idx = idx
+                break
+        if dup_idx is not None:
+            if on_duplicate is not None:
+                old_cell = cells[dup_idx]
+                on_duplicate(kept[dup_idx], det)
+                new_cell = _cell_of(
+                    int(kept[dup_idx].get("screen_x", 0)),
+                    int(kept[dup_idx].get("screen_y", 0)),
+                )
+                if new_cell != old_cell:
+                    grid[old_cell].remove(dup_idx)
+                    grid.setdefault(new_cell, []).append(dup_idx)
+                    cells[dup_idx] = new_cell
+            continue
+        kept.append(det)
+        cells.append((gx, gy))
+        grid.setdefault((gx, gy), []).append(len(kept) - 1)
+    return kept
 
 
 def _play_discovery_chime(frequency_hz: int = 1046, duration_ms: int = 45) -> None:
@@ -102,34 +257,67 @@ class ExplorerMode:
 
     def __init__(self, *args, **kwargs) -> None:
         self._controller: Optional[ExplorerModeController] = None
+        # F-0261: Enjekte bağımlılıklar saklanır — controller oluşturma hatası
+        # yutulmaz, loglanır ve _ensure_controller orijinal argümanlarla tekrar dener.
+        self._init_args = args
+        self._init_kwargs = kwargs
+        self._controller_init_error: Optional[BaseException] = None
         if args or kwargs:
             try:
                 self._controller = ExplorerModeController(*args, **kwargs)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._controller_init_error = exc
+                logger.exception(
+                    "ExplorerMode controller oluşturulamadı; enjekte bağımlılıklar "
+                    "saklandı, _ensure_controller orijinal argümanlarla tekrar deneyecek: %s",
+                    exc,
+                )
 
     def _ensure_controller(self) -> ExplorerModeController:
         if self._controller is None:
+            if self._init_args or self._init_kwargs:
+                try:
+                    self._controller = ExplorerModeController(*self._init_args, **self._init_kwargs)
+                    self._controller_init_error = None
+                    return self._controller
+                except Exception as exc:
+                    self._controller_init_error = exc
+                    logger.exception(
+                        "ExplorerMode controller orijinal argümanlarla tekrar "
+                        "oluşturulamadı, parametresiz controller kullanılıyor: %s",
+                        exc,
+                    )
             self._controller = ExplorerModeController()
         return self._controller
 
     def get_explorer_health_summary(self) -> dict:
+        # S-0402: "explorer_ready" artık koşulsuz True değil — aynı sınıftaki
+        # ready/version/diagnostic metotları gibi gerçek prob zincirine
+        # (validate_explorer_mode_contract) delege edilir.
         try:
-            return {"explorer_ready": True, "walking_state": self.get_walking_state()}
+            return {
+                "explorer_ready": validate_explorer_mode_contract(),
+                "walking_state": self.get_walking_state(),
+            }
         except Exception:
             return {"explorer_ready": False}
 
     def get_explorer_mode_ready_flag(self) -> dict:
-        return {"module": "explorer_mode", "ready": True}
+        # S-0603 / Karar 3: Sahte-hazır yok — modül düzeyi gerçek prob
+        # zincirine (validate_explorer_mode_contract) delege edilir.
+        return {"module": "explorer_mode", "ready": validate_explorer_mode_contract()}
 
     def get_explorer_mode_version_info(self) -> dict:
-        return {"module": "explorer_mode", "version": "2.1.0", "ready": True}
+        # S-0603: "ready" artık sabit True değil, gerçek prob sonucudur.
+        return {"module": "explorer_mode", "version": __version__, "ready": validate_explorer_mode_contract()}
 
     def get_explorer_mode_diagnostic_snapshot(self) -> dict:
+        # S-0603: "status"/"ready" artık sabit değil, gerçek prob sonucudur.
+        ready = validate_explorer_mode_contract()
         return {
             "module": "explorer_mode",
-            "status": "ok",
-            "ready": True,
+            "status": "ok" if ready else "not_ready",
+            "ready": ready,
             "walking_state": self.get_walking_state(),
             "movement_coords": self.get_player_movement_coords(),
             "anti_beklemede_lock": True,
@@ -262,6 +450,15 @@ class ExplorerModeController:
         self.hud_notifications: List[str] = []
         self._sector_waypoints: List[Tuple[int, int]] = []
         self._current_waypoint_idx: int = 0
+        # F-0271: Ulaşılamayan sektör waypoint'inde takılmayı önleyen zaman aşımı.
+        self._sector_waypoint_started_ts: float = 0.0
+        self._sector_waypoint_timeout_sec: float = 90.0
+        # F-0262: Kapalı döngü rota tamamlanma sayacı (döngü sürer ama bitiş izlenir).
+        self._route_loop_count: int = 0
+        self._route_completed_once: bool = False
+        # F-0268: Cast bar okuyucu (GameHUDReader) tembel yüklenir ve önbelleğe alınır.
+        self._hud_reader: Optional[Any] = None
+        self._hud_reader_unavailable: bool = False
 
         # Radar and UI event callbacks
         self._node_discovered_callbacks: List[Callable[[Dict[str, Any]], None]] = []
@@ -281,12 +478,24 @@ class ExplorerModeController:
         # Real-time Movement & Odometry tracking (prevents false 3s obstacle alerts & BEKLEMEDE locks)
         self._odometry_pos_x: float = float(getattr(self.auto_cartographer, "map_x", 960.0) or 960.0)
         self._odometry_pos_y: float = float(getattr(self.auto_cartographer, "map_y", 540.0) or 540.0)
+        # F-0017: Son ölçülen (kartograf) konum — ölü hesap (dead reckoning)
+        # yalnızca bu tabandan sapar, ölçümü ezmez.
+        self._odometry_base_x: float = self._odometry_pos_x
+        self._odometry_base_y: float = self._odometry_pos_y
         self._odometry_last_ts: float = time.time()
         self._odometry_vx: float = 0.0
         self._odometry_vy: float = 0.0
         self._odometry_heading_deg: float = 0.0
         self._walking_speed_px_sec: float = 85.0
+        # F-0018/F-0440: Hareket bayrakları __init__'te tanımlı ve zaman damgalı;
+        # bayat iddia (stale) hareket sayılmaz.
+        self._movement_active_override_ts: float = 0.0
+        self._movement_active_override_value: Optional[bool] = None
         self._movement_active_override: Optional[bool] = None
+        self._is_walking_active: bool = False
+        self._is_walking_active_ts: float = 0.0
+        self.exemplar_memory: Optional[Any] = None
+        self._last_glide_check: Dict[str, Any] = {}
 
         # Walking State Machine (guarantees YÜRÜYOR / ROTA TAKİBİ / KEŞİFTE accuracy)
         self._current_walking_state: str = "KEŞİFTE"
@@ -306,6 +515,18 @@ class ExplorerModeController:
         self._continuous_travel_enabled: bool = True
 
         self._sync_ordered_nodes_from_route_manager()
+
+    # F-0018: `_movement_active_override` atamaları zaman damgalıdır — doğrudan
+    # atama (testler dahil) bile tazelik sayacını yeniler; bayat "hareket
+    # ediyor" iddiası is_movement_active() içinde geçersiz sayılır.
+    @property
+    def _movement_active_override(self) -> Optional[bool]:
+        return self._movement_active_override_value
+
+    @_movement_active_override.setter
+    def _movement_active_override(self, value: Optional[bool]) -> None:
+        self._movement_active_override_value = value
+        self._movement_active_override_ts = time.time()
 
     def add_node_discovered_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
         """Yeni bir düğüm haritalandırıldığında anında tetiklenecek geri çağırma işlevini ekler."""
@@ -452,6 +673,7 @@ class ExplorerModeController:
         is_gather = (
             cid in _gather_ids()
             or any(t in name for t in _GATHER_NAMES)
+            or any(t in name for t in _GEMSTONE_NAMES)
             or "odyle" in name
             or name.startswith("essence_")
             or name.startswith("herb_")
@@ -485,9 +707,10 @@ class ExplorerModeController:
         bw = max(1, int(round(abs(x2 - x1))))
         bh = max(1, int(round(abs(y2 - y1))))
         conf = float(
-            box.get("confidence", box.get("conf", box.get("score", box.get("prob", 0.75))))
-            or 0.75
+            box.get("confidence", box.get("conf", box.get("score", box.get("prob", 0.0))))
+            or 0.0
         )
+        # F-0264: Güven bilinmiyorsa 0.75 uydurulmaz; aşağıda 0.0'a sıkıştırılır.
         if conf > 1.0:
             conf = conf / 100.0
 
@@ -502,8 +725,33 @@ class ExplorerModeController:
             mat = "Orichalcum Ore"
         elif "odyle" in name:
             mat = "Odyle"
-        elif "gem" in name:
-            mat = "Gem"
+        elif "gem" in name or "crystal" in name or any(t in name for t in _GEMSTONE_NAMES):
+            # Specific gemstone when the box name says which stone it is;
+            # generic "Gem" only when the stone type is truly unknown.
+            # (Generic "Gem" is treated as upgradable by a later specific 3D
+            # observation in AutoCartographer._refine_existing_node_kalman_ema.)
+            if "sapphire" in name:
+                mat = "Sapphire Gemstone"
+            elif "ruby" in name:
+                mat = "Ruby Gemstone"
+            elif "diamond" in name:
+                mat = "Diamond Gemstone"
+            elif "emerald" in name:
+                mat = "Emerald Gemstone"
+            elif "topaz" in name:
+                mat = "Topaz Gemstone"
+            elif "amethyst" in name:
+                mat = "Amethyst Gemstone"
+            elif "aquamarine" in name:
+                mat = "Aquamarine Gemstone"
+            elif "garnet" in name:
+                mat = "Garnet Gemstone"
+            elif "opal" in name:
+                mat = "Opal Gemstone"
+            elif "blood" in name:
+                mat = "Blood Crystal"
+            else:
+                mat = "Gem"
         elif "sprout" in name or "filiz" in name:
             mat = "Gatherable Material"
 
@@ -545,9 +793,11 @@ class ExplorerModeController:
                         cx, cy, frame_w, frame_h
                     )
                 except Exception:
+                    # F-0264: Başarısız projeksiyonda mesafe 8.0 uydurulmaz —
+                    # göreli sapmadan türetilen gerçek değer kullanılır.
                     rel_dx = float(cx - frame_w // 2) * 0.15
                     rel_dy = float(cy - frame_h // 2) * 0.15
-                    dist_m = 8.0
+                    dist_m = math.hypot(rel_dx, rel_dy)
 
         return {
             "material_type": mat,
@@ -559,7 +809,8 @@ class ExplorerModeController:
             "rel_map_dx": float(rel_dx),
             "rel_map_dy": float(rel_dy),
             "estimated_distance_m": float(dist_m),
-            "confidence": round(max(0.15, min(0.99, conf)), 3),
+            # F-0264: Bilinmeyen güven en az 0.15 diye şişirilmez.
+            "confidence": round(max(0.0, min(0.99, conf)), 3),
             "in_air": bool(cy < frame_h * 0.45),
             "stack_count": 1,
             "max_harvests": self.harvests_per_node,
@@ -583,9 +834,22 @@ class ExplorerModeController:
                     reflex.submit_frame(bgr)
                 if hasattr(reflex, "latest"):
                     snap = reflex.latest() or {}
+                    # S062 (v19/P3-8): reflex asenkron çalışır — latest()
+                    # az önce gönderilen kareyi henüz işlememiş olabilir;
+                    # 2 sn'den eski anlık görüntü bayattır, kutuları düşer.
+                    # Damga yoksa (eski/mock reflex) eski davranış korunur.
+                    _snap_ts = snap.get("snapshot_ts") if isinstance(snap, dict) else None
+                    _stale = (
+                        isinstance(_snap_ts, (int, float))
+                        and _snap_ts > 0.0
+                        and (time.monotonic() - float(_snap_ts)) > 2.0
+                    )
                     raw = snap.get("boxes") if isinstance(snap, dict) else None
-                    if isinstance(raw, list):
+                    if isinstance(raw, list) and not _stale:
                         boxes.extend([b for b in raw if isinstance(b, dict)])
+                    elif _stale:
+                        logger.debug("YZ reflex snapshot bayat (%.1fs), kutular atıldı.",
+                                     time.monotonic() - float(_snap_ts))
             except Exception as exc:
                 logger.debug("YZ reflex scan skipped: %s", exc)
 
@@ -643,23 +907,40 @@ class ExplorerModeController:
             except Exception as exc:
                 logger.debug("YZ perception hub skipped: %s", exc)
 
+        candidates: List[Dict[str, Any]] = []
         for box in boxes:
-            det = self._yz_box_to_detection(box, w, h)
-            if det is None:
-                continue
-            duplicate = False
-            for existing in out:
-                if math.hypot(
-                    int(det["screen_x"]) - int(existing["screen_x"]),
-                    int(det["screen_y"]) - int(existing["screen_y"]),
-                ) <= 28.0:
-                    duplicate = True
-                    if float(det["confidence"]) > float(existing.get("confidence", 0)):
-                        existing.update(det)
+            # S062 (v19/P3-8): güven eşiği yoktu — 0.0 güvenli kutu da
+            # düğüm oluyordu. Güven alanı taşıyan kutuda en düşük işletim
+            # kademesi (Hassas ≈ 0.10) uygulanır; güven alanı taşımayan
+            # kutu (sentetik/test) eski davranışla korunur.
+            _conf_val: Optional[float] = None
+            for _ck in ("confidence", "conf", "score", "prob"):
+                if isinstance(box, dict) and box.get(_ck) is not None:
+                    try:
+                        _conf_val = float(box[_ck])
+                    except (TypeError, ValueError):
+                        _conf_val = None
                     break
-            if not duplicate:
-                out.append(det)
-        return out
+            if _conf_val is not None:
+                if _conf_val > 1.0:
+                    _conf_val = _conf_val / 100.0
+                if _conf_val < 0.10:
+                    continue
+            det = self._yz_box_to_detection(box, w, h)
+            if det is not None:
+                candidates.append(det)
+
+        def _keep_higher_confidence(
+            existing: Dict[str, Any], det: Dict[str, Any]
+        ) -> None:
+            if float(det["confidence"]) > float(existing.get("confidence", 0)):
+                existing.update(det)
+
+        # Grid tabanlı tekilleştirme (28 px): eski O(n²) doğrusal taramayla
+        # aynı anlamsal sonuç (ilk eşleşme + yüksek güven kazanır).
+        return _dedupe_detections_by_proximity(
+            candidates, 28.0, _keep_higher_confidence
+        )
 
     @property
     def depth_obstacle_avoidance(self) -> MonocularDepthObstacleAvoidance:
@@ -683,56 +964,90 @@ class ExplorerModeController:
     def glide_controller(self, value: Optional[GlideWaypointController]) -> None:
         self._glide_controller = value
 
+    def _movement_signal_active(self) -> bool:
+        """
+        Canlı hareket sinyali: girdi denetleyicisinin `movement_active()` raporu
+        veya taze (<3 sn) açık hareket bildirimi. Yürüme *durum etiketi*
+        (`_is_walking_active`) tek başına hareket kanıtı değildir (F-0017/F-0018).
+        """
+        ov = self._movement_active_override
+        if ov is True:
+            if time.time() - self._movement_active_override_ts < 3.0:
+                return True
+        if self.input_controller is not None:
+            active_fn = getattr(self.input_controller, "movement_active", None)
+            if callable(active_fn):
+                try:
+                    if bool(active_fn()):
+                        return True
+                except Exception:
+                    pass
+        return False
+
     def get_player_movement_coords(self) -> Tuple[float, float]:
         """
-        Returns real-time player map coordinates combining AutoCartographer position
-        with continuous dead-reckoning odometry when walking.
-        Guarantees that moving players/bots never report frozen or zero coordinates,
-        preventing false 3.0s stuck alerts in RadarStuckDetector and 5m BEKLEMEDE locks.
+        Oyuncunun gerçek zamanlı harita konumunu döndürür.
+
+        F-0017: Önceki sürüm, hareket varsayılınca oyuncuyu waypoint'e doğru
+        85 px/sn ilerletip uydurulan konumu paylaşılan gerçek konuma
+        (`auto_cartographer.map_x/map_y`) yazıyordu. Artık:
+        - Taban her zaman kartografın ölçtüğü konumdur; ölçüm değişirse ölü
+          hesap (odometri) o konuma sıfırlanır.
+        - Ölü hesap yalnızca canlı hareket sinyali varken (girdi denetleyicisi
+          veya taze açık bildirim) ilerler ve SADECE iç odometri durumunu
+          günceller — kartografın ölçtüğü konum asla üzerine yazılmaz.
+        - Hareket sinyali yoksa hız sıfırlanır; konum ölçülen değerde kalır.
         """
         now = time.time()
         base_x = float(getattr(self.auto_cartographer, "map_x", self._odometry_pos_x) or self._odometry_pos_x)
         base_y = float(getattr(self.auto_cartographer, "map_y", self._odometry_pos_y) or self._odometry_pos_y)
 
-        moving = self.is_movement_active()
+        # Gerçek ölçüm değiştiyse odometriyi ölçüme sıfırla.
+        if (base_x, base_y) != (self._odometry_base_x, self._odometry_base_y):
+            self._odometry_base_x = base_x
+            self._odometry_base_y = base_y
+            self._odometry_pos_x = round(base_x, 2)
+            self._odometry_pos_y = round(base_y, 2)
+            self._odometry_vx = 0.0
+            self._odometry_vy = 0.0
+            self._odometry_last_ts = now
+            return self._odometry_pos_x, self._odometry_pos_y
+
+        moving = self._movement_signal_active()
         dt = now - self._odometry_last_ts
         if moving and dt >= 0.02:
             dt = min(0.5, dt)
             target_pt = self.get_active_waypoint_coords()
             if target_pt is not None:
                 tx, ty = float(target_pt[0]), float(target_pt[1])
-                dx = tx - base_x
-                dy = ty - base_y
+                dx = tx - self._odometry_pos_x
+                dy = ty - self._odometry_pos_y
                 dist = math.hypot(dx, dy)
                 if dist > 1.0:
                     speed = self._walking_speed_px_sec
                     step = min(dist, speed * dt)
-                    base_x += (dx / dist) * step
-                    base_y += (dy / dist) * step
+                    self._odometry_pos_x = round(self._odometry_pos_x + (dx / dist) * step, 2)
+                    self._odometry_pos_y = round(self._odometry_pos_y + (dy / dist) * step, 2)
                     self._odometry_vx = (dx / dist) * speed
                     self._odometry_vy = (dy / dist) * speed
                     self._odometry_heading_deg = (math.degrees(math.atan2(dx, -dy)) + 360.0) % 360.0
+                else:
+                    # Hedefe varıldı: hız sıfır (bayat hız hareket sayılmasın).
+                    self._odometry_vx = 0.0
+                    self._odometry_vy = 0.0
             else:
                 rad = math.radians(self._odometry_heading_deg)
                 speed = self._walking_speed_px_sec
                 step = speed * dt
-                base_x += math.sin(rad) * step
-                base_y += -math.cos(rad) * step
+                self._odometry_pos_x = round(self._odometry_pos_x + math.sin(rad) * step, 2)
+                self._odometry_pos_y = round(self._odometry_pos_y + -math.cos(rad) * step, 2)
                 self._odometry_vx = math.sin(rad) * speed
                 self._odometry_vy = -math.cos(rad) * speed
-
-            try:
-                self.auto_cartographer.map_x = round(base_x, 2)
-                self.auto_cartographer.map_y = round(base_y, 2)
-            except Exception:
-                pass
-
-            self._odometry_pos_x = round(base_x, 2)
-            self._odometry_pos_y = round(base_y, 2)
             self._odometry_last_ts = now
-        else:
-            self._odometry_pos_x = round(base_x, 2)
-            self._odometry_pos_y = round(base_y, 2)
+        elif not moving:
+            # Hareket yok: bayat hızı sıfırla, konum ölçülen değerde kalsın.
+            self._odometry_vx = 0.0
+            self._odometry_vy = 0.0
 
         return self._odometry_pos_x, self._odometry_pos_y
 
@@ -747,12 +1062,22 @@ class ExplorerModeController:
     def is_movement_active(self) -> bool:
         """
         Determines whether the player or bot is actively walking.
-        In explorer/auto-cartography mode, the player walks freely without bot holding W.
-        Guarantees that active motion is correctly recognized so state machine never
-        falsely downgrades to BEKLEMEDE.
+
+        F-0018: Önceki sürümde bir kez YÜRÜYOR/ROTA/KEŞİFTE olunca
+        `_is_walking_active` asla sıfırlanamıyor, bayat odometri hızı da
+        süresiz hareket sayılıyordu — bot dursa/ölse bile hep `True` dönüyordu.
+        Artık her sinyal zaman damgalıdır: açık bildirim 3 sn, yürüme bayrağı
+        3 sn, odometri hızı 1 sn içinde tazelenmezse hareket sayılmaz.
         """
-        if self._movement_active_override is not None:
-            return bool(self._movement_active_override)
+        now = time.time()
+
+        ov = self._movement_active_override
+        if ov is not None:
+            if ov is False:
+                return False
+            if now - self._movement_active_override_ts < 3.0:
+                return True
+            # Bayat "hareket ediyor" iddiası geçersiz — canlı sinyallere düş.
 
         if self.input_controller is not None:
             active_fn = getattr(self.input_controller, "movement_active", None)
@@ -764,9 +1089,12 @@ class ExplorerModeController:
                     pass
 
         if getattr(self, "_is_walking_active", False):
-            return True
+            if now - getattr(self, "_is_walking_active_ts", 0.0) < 3.0:
+                return True
 
-        if abs(self._odometry_vx) > 5.0 or abs(self._odometry_vy) > 5.0:
+        if now - self._odometry_last_ts < 1.0 and (
+            abs(self._odometry_vx) > 5.0 or abs(self._odometry_vy) > 5.0
+        ):
             return True
 
         return False
@@ -791,11 +1119,15 @@ class ExplorerModeController:
         if is_walking:
             self._movement_active_override = True
             self._is_walking_active = True
+            self._is_walking_active_ts = now
         try:
             self.auto_cartographer.map_x = round(self._odometry_pos_x, 2)
             self.auto_cartographer.map_y = round(self._odometry_pos_y, 2)
         except Exception:
             pass
+        # Kartograf konumu açık delta ile güncellendi — ölçüm tabanını da ilerlet.
+        self._odometry_base_x = round(self._odometry_pos_x, 2)
+        self._odometry_base_y = round(self._odometry_pos_y, 2)
         return round(self._odometry_pos_x, 2), round(self._odometry_pos_y, 2)
 
     def get_walking_state(self) -> str:
@@ -836,8 +1168,11 @@ class ExplorerModeController:
         self._last_state_change_reason = reason
         if norm in ("YÜRÜYOR", "ROTA TAKİBİ", "KEŞİFTE"):
             self._is_walking_active = True
+            self._is_walking_active_ts = time.time()
         elif norm in ("BEKLEMEDE", "IDLE", "PAUSED"):
+            # F-0018: Durma durumu yürüme bayrağını sıfırlar (kalıcı kilit yok).
             self._is_walking_active = False
+            self._is_walking_active_ts = 0.0
         return self._current_walking_state
 
     def update_walking_state(
@@ -916,8 +1251,9 @@ class ExplorerModeController:
             if nid is not None:
                 seen_ids.add(nid)
             if getattr(node, "state", "") == "resting":
+                # F-0272: Yalnızca kilit açılır — kısmi hasat ilerlemesi
+                # (current_harvests, örn. 2/3) korunur, sıfırlanmaz.
                 node.state = "active"
-                node.current_harvests = 0
                 node.consecutive_failures = 0
                 unlocked += 1
         if unlocked > 0:
@@ -999,7 +1335,10 @@ class ExplorerModeController:
         else:
             if raw_depth_obs:
                 self._consecutive_obstacle_hits += 1
-                center_clr = float(res.get("clearance_center", 1.0) or 1.0)
+                # F-0091: `or 1.0` tamamen kapalı koridoru (clearance 0.0)
+                # "açık" (1.0) sayıyordu — yalnızca None varsayılan 1.0 alır.
+                _clr_raw = res.get("clearance_center")
+                center_clr = float(_clr_raw) if _clr_raw is not None else 1.0
                 # Suppress transient 1-frame depth shadows if player is actively moving
                 # and corridor clearance is not critically blocked (< 0.18).
                 if suppress_transient_depth and self._consecutive_obstacle_hits < 2 and center_clr > 0.18:
@@ -1030,14 +1369,25 @@ class ExplorerModeController:
         return self._ordered_nodes[self._active_route_index]
 
     def get_active_waypoint_coords(self) -> Optional[Tuple[float, float]]:
-        """Returns (x, y) coordinates of the active route or sector waypoint."""
+        """Returns (x, y) coordinates of the active route or sector waypoint.
+
+        P1-10 (K-14): sektör waypoint ilerlemesi yalnızca ölü
+        `get_next_sector_waypoint`'te yaşıyordu — bu canlı yol indeksi
+        hiç ilerletmiyor, bot ilk sektör waypoint'inde takılıyordu.
+        Rota düğümü yokken ilerleme (varış + F-0271 90 sn zaman aşımı
+        atlaması) artık buradan akar; tarama bitince None döner.
+        """
         if self._ordered_nodes:
             node = self.get_active_waypoint()
             if node is not None:
                 return float(node.map_x), float(node.map_y)
-        if self._sector_waypoints and self._current_waypoint_idx < len(self._sector_waypoints):
-            pt = self._sector_waypoints[self._current_waypoint_idx]
-            return float(pt[0]), float(pt[1])
+        if self._sector_waypoints:
+            nxt = self.get_next_sector_waypoint(
+                arrival_radius_px=self._waypoint_arrival_radius_px,
+            )
+            if nxt is not None:
+                return float(nxt[0]), float(nxt[1])
+            return None
         return None
 
     def advance_route_waypoint(
@@ -1059,6 +1409,11 @@ class ExplorerModeController:
         n_nodes = len(self._ordered_nodes)
 
         if curr_idx >= n_nodes:
+            # F-0262: Kapalı döngüde başa dönüş rota bitişidir — sayacı işlet.
+            if closed_loop:
+                self._route_loop_count += 1
+                self._route_completed_once = True
+                logger.info("Rota döngüsü tamamlandı (kapalı döngü #%d).", self._route_loop_count)
             curr_idx = 0 if closed_loop else n_nodes - 1
             self._active_route_index = curr_idx
 
@@ -1069,14 +1424,23 @@ class ExplorerModeController:
         if dist <= float(arrival_radius_px):
             next_idx = curr_idx + 1
             if next_idx >= n_nodes:
+                # F-0262: Son düğümde başa dönüş rota bitişidir — sayacı işlet.
+                if closed_loop:
+                    self._route_loop_count += 1
+                    self._route_completed_once = True
+                    logger.info("Rota döngüsü tamamlandı (kapalı döngü #%d).", self._route_loop_count)
                 next_idx = 0 if closed_loop else n_nodes - 1
             self._active_route_index = next_idx
             self._waypoint_last_advanced_ts = time.time()
             target_node = self._ordered_nodes[next_idx]
             self.set_walking_state("ROTA TAKİBİ", reason=f"advanced to waypoint #{target_node.id}")
             if getattr(target_node, "state", "") == "resting":
+                # S-0601 / F-0272: Yalnızca kilit açılır — kısmi hasat
+                # ilerlemesi (current_harvests, örn. 2/3) korunur, sıfırlanmaz.
+                # Meşru 3/3 tamamlanmış düğümde sayaç zaten 0'dır
+                # (RouteManager.record_harvest_stage 3/3'te sıfırlar), o
+                # yüzden sıfırlamayı kaldırmak o yolu değiştirmez.
                 target_node.state = "active"
-                target_node.current_harvests = 0
 
         return target_node
 
@@ -1120,6 +1484,39 @@ class ExplorerModeController:
             steer_key = "a"  # Turn left
 
         reached = dist <= self._waypoint_arrival_radius_px
+        # F-0439: Glide kontrolcüsü üretim akışında okunuyordu (yalnızca
+        # lazy property olarak duruyordu) — mevcut bacak için süzülme
+        # önerisi hesaplanır ve çağrıcıya (state machine) sunulur.
+        glide_check: Dict[str, Any] = {"glide_recommended": False}
+        try:
+            current_node = self.get_active_waypoint()
+            next_node = None
+            if self._ordered_nodes:
+                nxt_idx = (self._active_route_index + 1) % len(self._ordered_nodes)
+                next_node = self._ordered_nodes[nxt_idx]
+            if current_node is not None and next_node is not None:
+                cur_d = {
+                    "x": float(current_node.map_x),
+                    "y": float(current_node.map_y),
+                    "z": getattr(current_node, "elevation", getattr(current_node, "z", None)),
+                    "is_glide_waypoint": getattr(current_node, "is_glide_waypoint", False),
+                }
+                nxt_d = {
+                    "x": float(next_node.map_x),
+                    "y": float(next_node.map_y),
+                    "z": getattr(next_node, "elevation", getattr(next_node, "z", None)),
+                    "is_glide_target": getattr(next_node, "is_glide_target", False),
+                }
+                recommended = bool(self.glide_controller.should_use_glide(cur_d, nxt_d))
+                glide_check = {
+                    "glide_recommended": recommended,
+                    "glide_params": self.glide_controller.estimate_glide_parameters(cur_d, nxt_d)
+                    if recommended
+                    else None,
+                }
+        except Exception as exc:
+            logger.debug("Glide bacak kontrolü atlandı: %s", exc)
+        self._last_glide_check = glide_check
         return {
             "has_target": True,
             "target_coords": (tx, ty),
@@ -1129,6 +1526,8 @@ class ExplorerModeController:
             "distance_px": round(dist, 1),
             "steer_key": steer_key,
             "reached": reached,
+            "glide_recommended": bool(glide_check.get("glide_recommended", False)),
+            "glide_params": glide_check.get("glide_params"),
             "walking_state": self.get_walking_state(),
         }
 
@@ -1153,12 +1552,14 @@ class ExplorerModeController:
                 region_name=self.active_region,
                 route_name=self.active_route,
             )
-            self._ordered_nodes = list(nodes) if nodes else []
-            for idx, node in enumerate(self._ordered_nodes, start=1):
-                setattr(node, "seq_index", idx)
         except Exception as exc:
-            logger.error("Rota düğümleri senkronize edilirken hata: %s", exc)
-            self._ordered_nodes = []
+            # F-0263: Geçici bir getirme hatası bellek içi rotayı yok etmesin —
+            # eski liste korunur.
+            logger.error("Rota düğümleri senkronize edilirken hata (mevcut liste korunuyor): %s", exc)
+            return
+        self._ordered_nodes = list(nodes) if nodes else []
+        for idx, node in enumerate(self._ordered_nodes, start=1):
+            setattr(node, "seq_index", idx)
 
     def _persist_ordered_nodes_to_route_manager(self) -> None:
         """`_ordered_nodes` içindeki sıralı dizilimi `RouteManager` belleğine ve diske yazar."""
@@ -1177,11 +1578,13 @@ class ExplorerModeController:
                     regions_store[target_region]["nodes"] = list(self._ordered_nodes)
                 else:
                     ordered_ids = {n.id for n in self._ordered_nodes}
-                    ordered_iter = iter(self._ordered_nodes)
+                    # F-0092: Sıralı düğüm, id eşleşmesine göre yerleştirilir —
+                    # sıradaki düğümü körü körüne almak yanlış düğümü yanlış sıraya yazar.
+                    ordered_by_id = {n.id: n for n in self._ordered_nodes}
                     merged: List[NodeData] = []
                     for existing in all_region_nodes:
                         if existing.id in ordered_ids:
-                            merged.append(next(ordered_iter))
+                            merged.append(ordered_by_id[existing.id])
                         else:
                             merged.append(existing)
                     regions_store[target_region]["nodes"] = merged
@@ -1209,7 +1612,7 @@ class ExplorerModeController:
         """`DetectedMaterial` veya sözlük nesnesini JSON uyumlu sözlüğe çevirir."""
         if isinstance(item, dict):
             result = dict(item)
-            result.setdefault("material_type", DEFAULT_RESOURCE_TYPE)
+            result.setdefault("material_type", UNKNOWN_RESOURCE_TYPE)
             result.setdefault("source", "unknown")
             result.setdefault("screen_x", 0)
             result.setdefault("screen_y", 0)
@@ -1217,7 +1620,8 @@ class ExplorerModeController:
             result.setdefault("rel_map_dx", 0.0)
             result.setdefault("rel_map_dy", 0.0)
             result.setdefault("estimated_distance_m", 0.0)
-            result.setdefault("confidence", 0.85)
+            # F-0264: Bilinmeyen güven 0.85 diye kayda girmez — bilinmiyorsa 0.0.
+            result.setdefault("confidence", 0.0)
             result.setdefault("in_air", False)
             stack_cnt = max(1, int(result.get("stack_count", 1) or 1))
             max_h = max(int(result.get("max_harvests", 3 * stack_cnt) or 3), 3 * stack_cnt)
@@ -1243,7 +1647,7 @@ class ExplorerModeController:
         )
         gather_k = str(getattr(item, "gather_key", "f") or "f").strip().lower()
         return {
-            "material_type": str(getattr(item, "material_type", DEFAULT_RESOURCE_TYPE)),
+            "material_type": str(getattr(item, "material_type", UNKNOWN_RESOURCE_TYPE)),
             "source": src,
             "source_type": src_type,
             "screen_x": int(getattr(item, "screen_x", 0)),
@@ -1301,23 +1705,24 @@ class ExplorerModeController:
 
             # 2. Dahili yüksek hassasiyetli minimap ikon + stack rozeti tarayıcısı
             internal_items = self._scan_minimap_icons_internal(bgr)
-            for cand in internal_items:
-                cx, cy = int(cand["screen_x"]), int(cand["screen_y"])
-                duplicate = False
-                for existing in merged:
-                    if math.hypot(cx - int(existing["screen_x"]), cy - int(existing["screen_y"])) <= 9.0:
-                        duplicate = True
-                        if int(cand.get("max_harvests", 3)) > int(existing.get("max_harvests", 3)):
-                            existing["max_harvests"] = int(cand["max_harvests"])
-                            existing["stack_count"] = int(cand.get("stack_count", 1))
-                        if (
-                            existing.get("material_type") in ("Gatherable Material", "")
-                            and cand.get("material_type") not in ("Gatherable Material", "")
-                        ):
-                            existing["material_type"] = cand["material_type"]
-                        break
-                if not duplicate:
-                    merged.append(cand)
+
+            def _merge_minimap_candidate(
+                existing: Dict[str, Any], cand: Dict[str, Any]
+            ) -> None:
+                if int(cand.get("max_harvests", 3)) > int(existing.get("max_harvests", 3)):
+                    existing["max_harvests"] = int(cand["max_harvests"])
+                    existing["stack_count"] = int(cand.get("stack_count", 1))
+                if (
+                    existing.get("material_type") in ("Gatherable Material", "")
+                    and cand.get("material_type") not in ("Gatherable Material", "")
+                ):
+                    existing["material_type"] = cand["material_type"]
+
+            # Grid tabanlı tekilleştirme (9 px): eski O(n²) döngüyle aynı
+            # anlamsal sonuç (ilk eşleşme + max_harvests/tür yükseltme).
+            merged = _dedupe_detections_by_proximity(
+                internal_items, 9.0, _merge_minimap_candidate, base=merged
+            )
 
             return merged
         except Exception as exc:
@@ -1327,10 +1732,11 @@ class ExplorerModeController:
     def _get_minimap_inner_bounds(self, w: int, h: int) -> Tuple[int, int, int, int]:
         """Ekran çözünürlüğüne göre minimap iç radar sınırlarını `(mx1, my1, mx2, my2)` döndürür."""
         if w >= 900 and h >= 550:
-            mx1 = int(round(w * 0.865))
-            my1 = int(round(h * 0.095))
-            mx2 = int(round(w * 0.978))
-            my2 = int(round(h * 0.265))
+            # F-0435: MaterialScanner ile aynı oranlar (0.855–0.992 / 0.065–0.255).
+            mx1 = int(round(w * 0.855))
+            my1 = int(round(h * 0.065))
+            mx2 = int(round(w * 0.992))
+            my2 = int(round(h * 0.255))
         elif w >= 550 and h <= 450:
             # minimap_filter_closeup.jpg (718x362)
             mx1 = int(round(w * 0.50))
@@ -1439,18 +1845,56 @@ class ExplorerModeController:
             hsv = cv2.cvtColor(mm, cv2.COLOR_BGR2HSV)
             mean_v = float(np.mean(hsv[:, :, 2]))
             mean_s = float(np.mean(hsv[:, :, 1]))
+            # F-0265: Ortalama parlaklık/doygunluk gece bölgelerinde düşük olur
+            # diye tüm tarama kör bırakılmaz — yalnızca en parlak pikseller
+            # bile sönükse (parlak ikon yoksa) atlanır.
             if mean_v < 58.0 or mean_s < 14.0:
-                return detections
+                if float(np.percentile(hsv[:, :, 2], 99.5)) < 90.0:
+                    return detections
 
             # Unified minimap player anchor (same default as AutoCartographer arrow).
-            cx, cy = mw * 0.50, mh * 0.545
+            # B-05: _locate_minimap_player_arrow ok bulamayınca da istisna
+            # atmadan AYNI sabit merkezi döner — "ok tam merkezde" hali ile
+            # "ok bulunamadı" hali dönüş değerinden ayırt edilemez. Bu
+            # yüzden dönen nokta tam varsayılan merkezse ankraj
+            # ÖLÇÜLMEMİŞ sayılır: player_anchor_fallback=True ile
+            # işaretlenir (mesafe/yön bu varsayılan ankrajdan hesaplanır).
+            default_cx, default_cy = mw * 0.50, mh * 0.545
+            cx, cy = default_cx, default_cy
+            anchor_fallback = True
             try:
-                from core.auto_cartographer import AutoCartographer
-
+                # AutoCartographer modül düzeyinde import edilmiş durumda;
+                # her karede içe import yapılmaz.
                 cx, cy = AutoCartographer._locate_minimap_player_arrow(mm)
-            except Exception:
-                pass
-            meters_per_px = float(getattr(self.material_scanner, "meters_per_map_pixel", 0.65))
+                anchor_fallback = (float(cx) == float(default_cx) and float(cy) == float(default_cy))
+            except Exception as exc:
+                anchor_fallback = True
+                now_ts = time.time()
+                last_warn = float(getattr(self, "_minimap_anchor_warn_ts", 0.0) or 0.0)
+                if now_ts - last_warn >= 60.0:
+                    self._minimap_anchor_warn_ts = now_ts
+                    logger.warning(
+                        "Minimap oyuncu oku tespiti başarısız (%s); sabit merkez "
+                        "(%.2f, %.2f) varsayılan ankraj olarak kullanılıyor — "
+                        "ikon mesafe/yön hesapları bu ankraja göredir "
+                        "(player_anchor_fallback=True).",
+                        exc, cx, cy,
+                    )
+                logger.debug("Minimap oyuncu oku tespiti başarısız: %s", exc)
+            if anchor_fallback:
+                now_ts = time.time()
+                last_warn = float(getattr(self, "_minimap_anchor_fallback_warn_ts", 0.0) or 0.0)
+                if now_ts - last_warn >= 60.0:
+                    self._minimap_anchor_fallback_warn_ts = now_ts
+                    logger.warning(
+                        "Minimap oyuncu oku ölçülemedi; sabit merkez (%.2f, %.2f) "
+                        "varsayılan ankraj olarak kullanılıyor — ikon mesafe/yön "
+                        "hesapları bu ankraja göredir (player_anchor_fallback=True).",
+                        cx, cy,
+                    )
+            # P1-7 (K-20): minimap ölçeği tek kaynaktan
+            # (MINIMAP_METERS_PER_PX, 0.55); eski 0.65 yedeği kaldırıldı.
+            meters_per_px = float(getattr(self.material_scanner, "meters_per_map_pixel", MINIMAP_METERS_PER_PX))
 
             valid = np.full((mh, mw), 255, dtype=np.uint8)
             valid[: int(mh * 0.20), int(mw * 0.78) :] = 0
@@ -1471,7 +1915,7 @@ class ExplorerModeController:
             )
             badge_centers: List[Tuple[float, float, int]] = []
             cnts_g, _ = cv2.findContours(
-                cv2.morphologyEx(green_badge, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)),
+                cv2.morphologyEx(green_badge, cv2.MORPH_CLOSE, _MORPH_CLOSE_KERNEL_3X3),
                 cv2.RETR_EXTERNAL,
                 cv2.CHAIN_APPROX_SIMPLE,
             )
@@ -1484,7 +1928,13 @@ class ExplorerModeController:
                         2,
                     ]
                     if patch_v.size > 0 and float(patch_v.max()) >= 175.0:
-                        stack_cnt = 3 if (gh >= 11 or gw >= 10) else 2
+                        # F-0436: Rozet boyutu çözünürlüğe göre değişir — eşik
+                        # mutlak piksel değil, minimap boyutuna oranlıdır.
+                        stack_cnt = (
+                            3
+                            if (gh >= max(11.0, mh * 0.085) or gw >= max(10.0, mw * 0.05))
+                            else 2
+                        )
                         badge_centers.append((gx + gw / 2.0, gy + gh / 2.0, stack_cnt))
 
             # 2. Cyan/Mavi Kanat (Wing Feather / Gemstone) ikonları
@@ -1493,7 +1943,7 @@ class ExplorerModeController:
                 valid,
             )
             cnts_c, _ = cv2.findContours(
-                cv2.morphologyEx(cyan_wing, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)),
+                cv2.morphologyEx(cyan_wing, cv2.MORPH_CLOSE, _MORPH_CLOSE_KERNEL_3X3),
                 cv2.RETR_EXTERNAL,
                 cv2.CHAIN_APPROX_SIMPLE,
             )
@@ -1520,7 +1970,13 @@ class ExplorerModeController:
                             "rel_map_dx": rel_dx,
                             "rel_map_dy": rel_dy,
                             "estimated_distance_m": dist_m,
-                            "confidence": 0.91 if stack_cnt >= 2 else 0.86,
+                            # P1-4 (K-07): uydurma sabit güven yok — bu CV
+                            # yolu gerçek bir skor üretmez; bilinmiyorsa
+                            # 0.0 (F-0264 kuralı). Eskiden 0.91/0.86 idi ve
+                            # dedup'ta YZ güvenini ezip YOLO tespitini
+                            # bastırıyordu.
+                            "confidence": 0.0,
+                            "player_anchor_fallback": bool(anchor_fallback),
                             "in_air": False,
                             "stack_count": stack_cnt,
                             "max_harvests": 3 * stack_cnt,
@@ -1575,8 +2031,13 @@ class ExplorerModeController:
 
                 if stack_cnt >= 2 or (aspect >= 1.32 and max(cw, ch) >= 7):
                     mat_type = "Odyle"
+                    sprout_conf = 0.0
                 else:
                     mat_type = "Gatherable Material"
+                    # F17: filizde güven ÖLÇÜLÜR — kanonik şablon eşleşmesi
+                    # (MaterialScanner kalibrasyonu); eşik altı 0.0 kalır.
+                    # Odyle/kanatta şablon yok, güven 0.0'dır.
+                    sprout_conf = _sprout_template_confidence(hsv[:, :, 2], x, y, cw, ch)
 
                 rel_dx = round(float(ncx - cx), 2)
                 rel_dy = round(float(ncy - cy), 2)
@@ -1592,7 +2053,12 @@ class ExplorerModeController:
                         "rel_map_dx": rel_dx,
                         "rel_map_dy": rel_dy,
                         "estimated_distance_m": dist_m,
-                        "confidence": 0.90 if stack_cnt >= 2 else 0.84,
+                        # P1-4 (K-07): uydurma sabit güven yok — filizde
+                        # güven şablon eşleşmesinden ölçülür (F17), eşik
+                        # altı 0.0 kalır (F-0264 kuralı). Eskiden 0.90/0.84
+                        # sabitiydi.
+                        "confidence": sprout_conf,
+                        "player_anchor_fallback": bool(anchor_fallback),
                         "in_air": False,
                         "stack_count": stack_cnt,
                         "max_harvests": 3 * stack_cnt,
@@ -1628,6 +2094,21 @@ class ExplorerModeController:
 
             # 1. MaterialScanner üzerinden 3D isim etiketleri ve gather prompt
             scanner_world = self.material_scanner.scan_3d_world_nameplates(bgr, hsv)
+            # v20 (MADDE 8): canlı oto-haritalama yolu scan_frame_for_materials'i
+            # çağırmaz — exemplar kapısı (öğrenilmiş negatif örnek:
+            # monster_3d_negative / player_character, sim >= 0.82) burada
+            # hiç çalışmazdı; canavar "Targena" diye haritalanıyordu.
+            # Toplama yolunun kullandığı aynı kapı burada da çalışır:
+            # negatif eşleşen aday kartografa girmeden elenir.
+            if self.material_scanner is not None and hasattr(
+                self.material_scanner, "_refine_candidates_with_exemplars"
+            ):
+                try:
+                    scanner_world = self.material_scanner._refine_candidates_with_exemplars(
+                        bgr, scanner_world
+                    )
+                except Exception as exc:
+                    logger.debug("3D dünya exemplar kapısı atlandı: %s", exc)
             for item in scanner_world:
                 d = self._serialize_detected_material(item)
                 d["source"] = "3d_world"
@@ -1636,20 +2117,22 @@ class ExplorerModeController:
 
             # 2. Dahili 3D Aria / Mela Beyaz Kanatlı Toplama Arması ve [E]/[F] Yüzen İkon Tarayıcı
             internal_3d = self._scan_3d_crests_and_floating_icons_internal(bgr, hsv)
-            for cand in internal_3d:
-                cx, cy = int(cand["screen_x"]), int(cand["screen_y"])
-                duplicate = False
-                for existing in world_and_prompt:
-                    if math.hypot(cx - int(existing["screen_x"]), cy - int(existing["screen_y"])) <= 36.0:
-                        duplicate = True
-                        if (
-                            existing.get("material_type") in ("Orichalcum Ore", "Gatherable Material", "")
-                            and cand.get("material_type") in ("Aria", "Mela", "Odyle")
-                        ):
-                            existing["material_type"] = cand["material_type"]
-                        break
-                if not duplicate:
-                    world_and_prompt.append(cand)
+
+            def _upgrade_3d_material(
+                existing: Dict[str, Any], cand: Dict[str, Any]
+            ) -> None:
+                if (
+                    existing.get("material_type")
+                    in ("Orichalcum Ore", "Gatherable Material", "")
+                    and cand.get("material_type") in ("Aria", "Mela", "Odyle")
+                ):
+                    existing["material_type"] = cand["material_type"]
+
+            # Grid tabanlı tekilleştirme (36 px): eski O(n²) döngüyle aynı
+            # anlamsal sonuç (ilk eşleşme + spesifik tür yükseltme).
+            world_and_prompt = _dedupe_detections_by_proximity(
+                internal_3d, 36.0, _upgrade_3d_material, base=world_and_prompt
+            )
 
             # 3. 'F Gather' etkileşim istemi (MaterialScanner + VisionEngine)
             only_3d_objs = [
@@ -1669,6 +2152,7 @@ class ExplorerModeController:
                 if d.get("source") == "3d_world"
             ]
             scanner_prompts = self.material_scanner.scan_gather_prompt(bgr, hsv, only_3d_objs)
+            prompt_dets: List[Dict[str, Any]] = []
             for p_item in scanner_prompts:
                 pd = self._serialize_detected_material(p_item)
                 pd["source"] = "gather_prompt"
@@ -1683,7 +2167,24 @@ class ExplorerModeController:
                     )
                     if nearest_3d.material_type and nearest_3d.material_type != "Gatherable Material":
                         pd["material_type"] = nearest_3d.material_type
-                world_and_prompt.append(pd)
+                prompt_dets.append(pd)
+
+            def _upgrade_prompt_material(
+                existing: Dict[str, Any], pd: Dict[str, Any]
+            ) -> None:
+                # F-0266: Yüzen [E]/[F] ikonu zaten gather_prompt olarak ekliyse
+                # aynı istem iki kez sayılmaz — 36 px içindekiler tekilleştirilir.
+                if (
+                    existing.get("material_type") in ("Gatherable Material", "Odyle", "")
+                    and pd.get("material_type") not in ("Gatherable Material", "Odyle", "")
+                ):
+                    existing["material_type"] = pd["material_type"]
+
+            # Grid tabanlı tekilleştirme (36 px): eski O(n²) döngüyle aynı
+            # anlamsal sonuç (ilk eşleşme + spesifik tür yükseltme).
+            world_and_prompt = _dedupe_detections_by_proximity(
+                prompt_dets, 36.0, _upgrade_prompt_material, base=world_and_prompt
+            )
 
             has_f_prompt = any(
                 d.get("source") == "gather_prompt" and d.get("gather_key", "f") == "f"
@@ -1826,6 +2327,12 @@ class ExplorerModeController:
                         bgr, hsv, tx1, ty1, tx2 - tx1, ty2 - ty1
                     )
 
+                # v20 (MADDE 8): boş ad = mesh learned-negative reddi
+                # (canavar/oyuncu) — boş ad kartografta UNKNOWN_RESOURCE_TYPE
+                # düğüme dönerdi, bu yüzden tespit hiç üretilmez.
+                if not mat_name:
+                    continue
+
                 target_sx = int(ax + cw // 2)
                 target_sy = int(min(h - 1, ty2 + int(round(24 * sy))))
                 rel_dx, rel_dy, dist_m = self.material_scanner._project_3d_to_map_offset(
@@ -1843,7 +2350,9 @@ class ExplorerModeController:
                         "rel_map_dx": float(rel_dx),
                         "rel_map_dy": float(rel_dy),
                         "estimated_distance_m": float(dist_m),
-                        "confidence": 0.92,
+                        # P1-4 (K-07): arma sınıflandırması skor üretmez;
+                        # sabit 0.92 uydurmaydı — bilinmiyorsa 0.0.
+                        "confidence": 0.0,
                         "in_air": False,
                         "stack_count": 1,
                         "max_harvests": self.harvests_per_node,
@@ -1914,7 +2423,9 @@ class ExplorerModeController:
                         "rel_map_dx": float(rel_dx),
                         "rel_map_dy": float(rel_dy),
                         "estimated_distance_m": float(dist_m),
-                        "confidence": 0.91,
+                        # P1-4 (K-07): yüzen [E]/[F] ikonu skor üretmez;
+                        # sabit 0.91 uydurmaydı — bilinmiyorsa 0.0.
+                        "confidence": 0.0,
                         "in_air": False,
                         "stack_count": 1,
                         "max_harvests": self.harvests_per_node,
@@ -1986,11 +2497,47 @@ class ExplorerModeController:
                 self.input_controller.tap_key(clean_key)
             elif callable(self.input_controller):
                 self.input_controller(clean_key)
+            else:
+                # F-0267: Hiçbir tuş yöntemi yoksa sessizce geçilmez — uyarı loglanır.
+                logger.warning(
+                    "[ExplorerMode] Toplama tuşu '%s' gönderilemedi: input_controller'da "
+                    "press_key/tap_key/callable yok.",
+                    clean_key.upper(),
+                )
         elif not self.test_mode:
             self.input_controller = InputController(test_mode=self.test_mode)
             self.input_controller.press_key(clean_key)
         else:
             logger.info("[ExplorerMode] Test modunda '%s' toplama tuşu simüle edildi.", clean_key.upper())
+
+    def _get_cast_bar_reader(self) -> Optional[Any]:
+        """Cast bar okuyucuyu (GameHUDReader.read_cast_bar_progress) tembel yükler."""
+        if self._hud_reader is not None:
+            return self._hud_reader
+        if self._hud_reader_unavailable:
+            return None
+        try:
+            from core.ocr_distance import GameHUDReader
+
+            self._hud_reader = GameHUDReader()
+            return self._hud_reader
+        except Exception as exc:
+            self._hud_reader_unavailable = True
+            logger.debug("Cast bar okuyucu yüklenemedi, kör bekleme kullanılacak: %s", exc)
+            return None
+
+    def _read_cast_bar_progress(self, frame: Optional[np.ndarray]) -> Optional[float]:
+        """Verilen karede toplama barı ilerlemesini (0.0..1.0) okur; okunamazsa None."""
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+            return None
+        reader = self._get_cast_bar_reader()
+        if reader is None:
+            return None
+        try:
+            return float(reader.read_cast_bar_progress(frame))
+        except Exception as exc:
+            logger.debug("Cast bar okuma hatası: %s", exc)
+            return None
 
     def _wait_for_harvest_cast(
         self,
@@ -2001,6 +2548,12 @@ class ExplorerModeController:
         Her bir hasat aşaması (`1/3`, `2/3`, `3/3`) sırasında toplama barının (cast bar)
         tamamlanmasını bekler ve en güncel kareyi döndürür.
         `test_mode=True` iken birim testlerini yavaşlatmamak için anında tamamlanır.
+
+        F-0268: Önceki sürüm barı hiç okumadan kör bekliyordu. Artık her
+        karede cast bar ilerlemesi okunur: bar görüldükten sonra dolması
+        (>=0.99) veya kaybolması (0.0) hasat aşamasının bittiğini gösterir ve
+        bekleme erken sonlanır; bar hiç görülmezse bütçe (cast_wait_sec)
+        dolana kadar beklenir (eski davranış, üst sınır olarak korunur).
         """
         latest_frame = frame_bgr
         if self.test_mode:
@@ -2015,6 +2568,12 @@ class ExplorerModeController:
 
         wait_budget = max(0.15, float(self.cast_wait_sec))
         deadline = time.time() + wait_budget
+        cast_bar_seen = False
+        initial_progress = self._read_cast_bar_progress(latest_frame)
+        # Girişte dolu (0.99) görünen bar önceki aşamadan kalma olabilir —
+        # yalnızca 0..0.99 arası ilerleme "görüldü" sayılır.
+        if initial_progress is not None and 0.0 < initial_progress < 0.99:
+            cast_bar_seen = True
         while time.time() < deadline:
             if self.heartbeat_callback is not None and callable(self.heartbeat_callback):
                 try:
@@ -2029,6 +2588,16 @@ class ExplorerModeController:
                         latest_frame = provided
                 except Exception as exc:
                     logger.debug("Canlı frame_provider hatası: %s", exc)
+            progress = self._read_cast_bar_progress(latest_frame)
+            if progress is None:
+                continue
+            if progress > 0.0:
+                cast_bar_seen = True
+                if progress >= 0.99:
+                    break
+            elif cast_bar_seen:
+                # Bar dolup kayboldu: hasat aşaması tamamlandı.
+                break
         return latest_frame
 
     def _handle_opportunistic_gather(
@@ -2084,10 +2653,12 @@ class ExplorerModeController:
         retries_count = 0
         stages_log: List[str] = []
         current_frame = frame_bgr
+        stage_failed = False
 
         try:
             for stage_idx in range(1, target_harvests + 1):
                 stage_attempts = 0
+                extraction_failed = False
                 while True:
                     stage_attempts += 1
                     self._press_gather_key_once(used_key)
@@ -2114,6 +2685,18 @@ class ExplorerModeController:
                         if frame_provider is None:
                             current_frame = None
                         continue
+                    break
+
+                # F-0094: Son denemede de 'Essence Extraction failed' varsa aşama
+                # BAŞARISIZDIR — sayaca eklenmez, sonraki aşamalara geçilmez.
+                if extraction_failed:
+                    stage_failed = True
+                    logger.warning(
+                        "[ExplorerMode] Hasat aşaması %d/%d son denemede de başarısız "
+                        "('Essence Extraction failed'); hasat durduruldu.",
+                        stage_idx,
+                        target_harvests,
+                    )
                     break
 
                 completed_stages += 1
@@ -2158,8 +2741,12 @@ class ExplorerModeController:
                 "harvests_target": target_harvests,
                 "stages_log": stages_log,
                 "extraction_failed_retries": retries_count,
+                "stage_failed": stage_failed,
+                "extraction_failed": stage_failed,
                 "node_id": int(nearest_node.id) if nearest_node is not None else None,
-                "node_depleted": completed_stages >= target_harvests,
+                # F-0093: Yakında düğüm yokken hasat kaydı da yok — 'tükendi'
+                # yalnızca bir düğüm gerçekten tüketildiyse doğrudur.
+                "node_depleted": bool(nearest_node is not None and completed_stages >= target_harvests),
             }
             self._last_opportunistic_gather_info = info
             return info
@@ -2172,8 +2759,10 @@ class ExplorerModeController:
                 "harvests_target": target_harvests,
                 "stages_log": stages_log,
                 "extraction_failed_retries": retries_count,
+                "stage_failed": stage_failed,
+                "extraction_failed": stage_failed,
                 "node_id": int(nearest_node.id) if nearest_node is not None else None,
-                "node_depleted": completed_stages >= target_harvests,
+                "node_depleted": bool(nearest_node is not None and completed_stages >= target_harvests),
                 "error": str(exc),
             }
             self._last_opportunistic_gather_info = info
@@ -2219,16 +2808,37 @@ class ExplorerModeController:
         dist_m = float(target_det.get("estimated_distance_m", 0.0))
 
         steered = False
+        steer_reason = "not_attempted"
         if execute_steer:
-            if not self.test_mode and self.input_controller is not None:
+            if self.test_mode:
+                # F-0096: Test modunda fare hiç oynatılmadan yönelme 'başarılı'
+                # sayılmaz — girdi gönderilmedi.
+                steered = False
+                steer_reason = "test_mode_no_input_sent"
+            elif self.input_controller is not None:
                 try:
-                    if hasattr(self.input_controller, "move_mouse"):
-                        self.input_controller.move_mouse(tx, ty)
+                    # F-0095: InputController'da move_mouse yok; var olan
+                    # smooth_move_to (piksel hedef) kullanılır. move_mouse_abs
+                    # normalize (0..65535) koordinat alır — piksel verilmez.
+                    if hasattr(self.input_controller, "smooth_move_to"):
+                        if hasattr(self.input_controller, "get_cursor_position"):
+                            cx, cy = self.input_controller.get_cursor_position()
+                            self.input_controller.smooth_move_to(cx + dx, cy + dy, duration=0.08)
+                        else:
+                            self.input_controller.smooth_move_to(tx, ty, duration=0.08)
                         steered = True
+                        steer_reason = "smooth_move_to"
+                    else:
+                        steer_reason = "no_mouse_method_on_input_controller"
+                        logger.warning(
+                            "3D hedefe yönelme yapılamadı: input_controller'da "
+                            "smooth_move_to yok."
+                        )
                 except Exception as exc:
+                    steer_reason = f"mouse_move_failed: {exc}"
                     logger.debug("3D hedefe yönelme fare hareketi atlandı: %s", exc)
             else:
-                steered = True
+                steer_reason = "no_input_controller"
 
         steer_info = {
             "material_type": str(target_det.get("material_type", DEFAULT_RESOURCE_TYPE)),
@@ -2241,6 +2851,7 @@ class ExplorerModeController:
             "estimated_distance_m": dist_m,
             "gather_key": str(target_det.get("gather_key", "f")),
             "steered": steered,
+            "steer_reason": steer_reason,
         }
         self._last_steer_target = steer_info
         return steer_info
@@ -2277,7 +2888,10 @@ class ExplorerModeController:
     def step_passive_cartography(
         self,
         frame_bgr: np.ndarray,
-        gather_while_exploring: bool = False,
+        # F-0269: explore_step varsayılanı True iken bu metodun varsayılanı
+        # False idi — aynı işi yapan iki giriş noktası çağrı yerine göre
+        # toplar ya da toplamazdı. Varsayılanlar hizalandı (True).
+        gather_while_exploring: bool = True,
         steer_to_3d_targets: bool = True,
         frame_provider: Optional[Callable[[], Optional[np.ndarray]]] = None,
     ) -> dict:
@@ -2320,7 +2934,10 @@ class ExplorerModeController:
                         "norm_x": norm_x,
                         "norm_y": norm_y,
                     },
-                    "is_map_open": False,
+                    # Sweep G: geçersiz karede harita durumu bilinmiyor —
+                    # açık sayılır (fail-closed), bilinmezlik bayrağı eklenir.
+                    "is_map_open": True,
+                    "is_map_open_unknown": True,
                     "is_window_blocking": False,
                     "detected_materials": [],
                     "detected_count": 0,
@@ -2351,7 +2968,11 @@ class ExplorerModeController:
             h, w = bgr.shape[:2]
 
             # Dünya haritası ('M') veya engelleyici oyun penceresi kontrolü
-            is_map_open = bool(self.vision_engine.is_map_open(bgr))
+            # Sweep G: is_map_open üç durumlu (True/False/None=bilinmiyor) —
+            # bilinmiyor açık sayılır (fail-closed): tarama/toplama durur.
+            _map_open_raw = self.vision_engine.is_map_open(bgr)
+            is_map_open = _map_open_raw is not False
+            is_map_open_unknown = _map_open_raw is None
             is_blocking = False if is_map_open else bool(self.vision_engine.is_game_window_blocking(bgr))
 
             # Adım 1: Hibrit Sağ-Üst Minimap + 3D Dünya + YZ (reflex/YOLO) tarama
@@ -2366,24 +2987,21 @@ class ExplorerModeController:
             serialized_detections: List[Dict[str, Any]] = (
                 list(world_3d_detections) + list(minimap_detections) + list(yz_detections)
             )
-            # Dedup CV vs YZ overlaps (keep higher confidence).
-            merged: List[Dict[str, Any]] = []
-            for det in serialized_detections:
-                dup = False
-                for existing in merged:
-                    if math.hypot(
-                        int(det.get("screen_x", 0)) - int(existing.get("screen_x", 0)),
-                        int(det.get("screen_y", 0)) - int(existing.get("screen_y", 0)),
-                    ) <= 32.0:
-                        dup = True
-                        if float(det.get("confidence", 0)) > float(existing.get("confidence", 0)):
-                            existing.update(det)
-                        elif det.get("yz") and not existing.get("material_type"):
-                            existing["material_type"] = det.get("material_type", existing.get("material_type"))
-                        break
-                if not dup:
-                    merged.append(det)
-            serialized_detections = merged
+
+            def _merge_step_detection(
+                existing: Dict[str, Any], det: Dict[str, Any]
+            ) -> None:
+                # Dedup CV vs YZ overlaps (keep higher confidence).
+                if float(det.get("confidence", 0)) > float(existing.get("confidence", 0)):
+                    existing.update(det)
+                elif det.get("yz") and not existing.get("material_type"):
+                    existing["material_type"] = det.get("material_type", existing.get("material_type"))
+
+            # Grid tabanlı tekilleştirme (32 px): eski O(n²) döngüyle aynı
+            # anlamsal sonuç (ilk eşleşme + yüksek güven kazanır).
+            serialized_detections = _dedupe_detections_by_proximity(
+                serialized_detections, 32.0, _merge_step_detection
+            )
 
             gather_prompts = [
                 d for d in world_3d_detections if d.get("source") == "gather_prompt"
@@ -2427,7 +3045,9 @@ class ExplorerModeController:
                 det_source_type = str(det.get("source_type", det_source or "minimap_material"))
                 if det_source_type in ("yz_3d", "3d_world", "3d_auto"):
                     det_source_type = "3d_auto"
-                elif det_source_type in ("yz_minimap", "minimap", "minimap_auto"):
+                elif det_source_type in ("yz_minimap", "minimap", "minimap_auto", "minimap_material"):
+                    # F17: içsel minimap tarayıcısının etiketi de minimap_auto'dur
+                    # (parse ile tutarlı; kartograf düğümü minimap_auto yazar).
                     det_source_type = "minimap_auto"
                 det_type = str(det.get("material_type", ""))
                 det_max_h = max(3, int(det.get("max_harvests", 3) or 3))
@@ -2441,8 +3061,11 @@ class ExplorerModeController:
                 )
                 if tracked_node is not None:
                     rm_node = self.route_manager.get_node(tracked_node.node_id, region=self.active_region)
+                    # F-0270: Yüzen [E] ikonunun sabit 'Odyle' etiketi jenerik
+                    # düğümü ezemez — tür değişimi yalnızca gerçek 3D arma
+                    # sınıflandırmasından (source 3d_world) gelir.
                     if (
-                        det_source in ("3d_world", "gather_prompt")
+                        det_source == "3d_world"
                         and det_type
                         and det_type != "Gatherable Material"
                     ):
@@ -2589,6 +3212,7 @@ class ExplorerModeController:
                 "anti_beklemede_active": True,
                 "active_waypoint_idx": self._active_route_index,
                 "is_map_open": is_map_open,
+                "is_map_open_unknown": is_map_open_unknown,
                 "is_window_blocking": is_blocking,
                 "needs_map_calibrate": bool(
                     getattr(self.auto_cartographer, "needs_map_calibrate", False)
@@ -2613,11 +3237,9 @@ class ExplorerModeController:
                 "total_mapped_nodes": len(self._ordered_nodes),
                 "sequential_route_ids": [n.id for n in self._ordered_nodes],
                 "hud_notifications": step_notifications,
-                "latest_hud_message": (
-                    step_notifications[-1]
-                    if step_notifications
-                    else (self.hud_notifications[-1] if self.hud_notifications else "")
-                ),
+                # F-0437: Bu adımda bildirim yoksa önceki adımın mesajı 'son
+                # mesaj' gibi sunulmaz — boş döner.
+                "latest_hud_message": step_notifications[-1] if step_notifications else "",
             }
 
         except Exception as exc:
@@ -2635,7 +3257,10 @@ class ExplorerModeController:
                 "movement_coords": (self._odometry_pos_x, self._odometry_pos_y),
                 "walking_state": self.get_walking_state(),
                 "anti_beklemede_active": True,
-                "is_map_open": False,
+                # Sweep G: hata yolunda harita durumu bilinmiyor — açık
+                # sayılır (fail-closed), bilinmezlik bayrağı eklenir.
+                "is_map_open": True,
+                "is_map_open_unknown": True,
                 "is_window_blocking": False,
                 "detected_materials": [],
                 "detected_count": 0,
@@ -2717,6 +3342,23 @@ class ExplorerModeController:
                     walk_trajectory=walk_traj_2d,
                     mode=clean_mode,
                 )
+            # F-0097: Sıralama boş dönerse rota listesi sessizce silinmez —
+            # önce sıralanmamış güncel liste, o da yoksa önceki liste korunur.
+            if not ordered_nodes:
+                if current_nodes:
+                    logger.warning(
+                        "finalize_and_sort_route: sıralama boş döndü; sıralanmamış "
+                        "%d düğümlük liste korunuyor.",
+                        len(current_nodes),
+                    )
+                    ordered_nodes = list(current_nodes)
+                elif self._ordered_nodes:
+                    logger.warning(
+                        "finalize_and_sort_route: sıralama boş döndü; önceki "
+                        "%d düğümlük liste korunuyor.",
+                        len(self._ordered_nodes),
+                    )
+                    ordered_nodes = list(self._ordered_nodes)
 
             self._ordered_nodes = list(ordered_nodes)
             after_quality = self.route_planner.evaluate_sequence_quality(
@@ -2743,9 +3385,13 @@ class ExplorerModeController:
                 allow_wrap=True,
             )
 
+            # F-0438: Kalite hesabı skor üretemezse rota '100/100 pürüzsüz'
+            # raporlanmaz — bilinmeyen skor 0.0'dır.
+            _smooth_raw = after_quality.get("smoothness_score")
+            smoothness_val = float(_smooth_raw) if _smooth_raw is not None else 0.0
             summary_msg = (
                 f"Route finalized ({clean_mode}): {len(self._ordered_nodes)} nodes sorted "
-                f"(smoothness={after_quality.get('smoothness_score', 100.0):.1f}/100, "
+                f"(smoothness={smoothness_val:.1f}/100, "
                 f"distance={after_quality.get('total_distance_px', 0.0):.1f}px)"
             )
             self._emit_hud_notification(summary_msg)
@@ -2782,7 +3428,7 @@ class ExplorerModeController:
                 "max_jump_px": float(after_quality.get("max_jump_px", 0.0)),
                 "sharp_turns_count": int(after_quality.get("sharp_turns_count", 0)),
                 "crossings_count": int(after_quality.get("crossings_count", 0)),
-                "smoothness_score": float(after_quality.get("smoothness_score", 100.0)),
+                "smoothness_score": smoothness_val,
                 "walk_trajectory_points": len(walk_traj_2d),
                 "total_gathered_while_exploring": self._total_gathered_in_explorer,
                 "anti_ping_pong_enabled": True,
@@ -2793,6 +3439,19 @@ class ExplorerModeController:
 
         except Exception as exc:
             logger.error("finalize_and_sort_route sırasında hata: %s", exc, exc_info=True)
+            # S064 (v19/P3-8): hata yolundaki walk_trajectory_points ham
+            # öznitelik sayıyordu; başarı yolu filtreli
+            # (len>=2) sayıyordu — aynı alan iki farklı sayı üretiyordu.
+            # Hata yolunda da aynı filtre uygulanır.
+            try:
+                _raw_traj = self.auto_cartographer.walk_trajectory
+                _traj_points = sum(
+                    1
+                    for _pt in _raw_traj
+                    if isinstance(_pt, (list, tuple)) and len(_pt) >= 2
+                )
+            except Exception:
+                _traj_points = 0
             return {
                 "region": self.active_region,
                 "route": self.active_route,
@@ -2811,7 +3470,7 @@ class ExplorerModeController:
                 "sharp_turns_count": 0,
                 "crossings_count": 0,
                 "smoothness_score": 0.0,
-                "walk_trajectory_points": len(self.auto_cartographer.walk_trajectory),
+                "walk_trajectory_points": _traj_points,
                 "total_gathered_while_exploring": self._total_gathered_in_explorer,
                 "anti_ping_pong_enabled": True,
                 "next_target_node_id": None,
@@ -2911,6 +3570,8 @@ class ExplorerModeController:
 
             self._sector_waypoints = list(waypoints)
             self._current_waypoint_idx = 0
+            # F-0271: Yeni taramada waypoint zaman aşımı sayacı sıfırlanır.
+            self._sector_waypoint_started_ts = 0.0
 
             logger.info(
                 "Boustrophedon sektör tarama rotası üretildi: bounds=(%d, %d, %d, %d), "
@@ -2932,10 +3593,14 @@ class ExplorerModeController:
         self,
         arrival_radius_px: float = 18.0,
         loop_sweep: bool = False,
+        waypoint_timeout_sec: float = 90.0,
     ) -> Optional[Tuple[int, int]]:
         """
         Otonom sektör taraması sırasında oyuncunun anlık odometri konumuna göre
         sıradaki Boustrophedon waypoint hedefini döndürür.
+
+        F-0271: Ulaşılamayan waypoint'te tarama kilitlenmez — waypoint
+        `waypoint_timeout_sec` içinde varılamazsa atlanır ve sonrakine geçilir.
         """
         try:
             if not self._sector_waypoints:
@@ -2943,17 +3608,35 @@ class ExplorerModeController:
 
             px, py, _, _ = self.auto_cartographer.get_position()
             n = len(self._sector_waypoints)
+            now = time.time()
+            if self._sector_waypoint_started_ts <= 0.0:
+                self._sector_waypoint_started_ts = now
 
             while self._current_waypoint_idx < n:
                 wx, wy = self._sector_waypoints[self._current_waypoint_idx]
                 if math.hypot(float(wx) - px, float(wy) - py) <= float(arrival_radius_px):
                     self._current_waypoint_idx += 1
+                    self._sector_waypoint_started_ts = time.time()
+                elif (
+                    waypoint_timeout_sec > 0
+                    and time.time() - self._sector_waypoint_started_ts > float(waypoint_timeout_sec)
+                ):
+                    logger.warning(
+                        "Sektör waypoint #%d (%.0f, %.0f) %.0fs içinde ulaşılamadı; atlanıyor.",
+                        self._current_waypoint_idx,
+                        wx,
+                        wy,
+                        float(waypoint_timeout_sec),
+                    )
+                    self._current_waypoint_idx += 1
+                    self._sector_waypoint_started_ts = time.time()
                 else:
                     break
 
             if self._current_waypoint_idx >= n:
                 if loop_sweep:
                     self._current_waypoint_idx = 0
+                    self._sector_waypoint_started_ts = time.time()
                 else:
                     return None
 
@@ -2963,16 +3646,51 @@ class ExplorerModeController:
             return None
 
 
+def _run_explorer_mode_contract_checks() -> Dict[str, Any]:
+    """
+    F-0098: 'hazır/audit/certified' zinciri artık gerçek ölçüm yapar — test
+    modunda bir controller kurulup yürüme durumu, rota listesi ve ana
+    giriş noktalarının varlığı doğrulanır.
+    """
+    checks: Dict[str, Any] = {}
+    try:
+        ctrl = ExplorerModeController(test_mode=True)
+        state = ctrl.get_walking_state()
+        checks["controller_constructs"] = True
+        checks["walking_state_known"] = state in (
+            "YÜRÜYOR",
+            "ROTA TAKİBİ",
+            "KEŞİFTE",
+            "TOPLANIYOR",
+            "BEKLEMEDE",
+        )
+        checks["walking_state"] = state
+        checks["ordered_nodes_is_list"] = isinstance(ctrl._ordered_nodes, list)
+        checks["explore_step_callable"] = callable(getattr(ctrl, "explore_step", None))
+        checks["movement_query_callable"] = callable(getattr(ctrl, "is_movement_active", None))
+        checks["depth_avoidance_available"] = ctrl.depth_obstacle_avoidance is not None
+        checks["glide_controller_available"] = ctrl.glide_controller is not None
+    except Exception as exc:
+        checks["controller_constructs"] = False
+        checks["error"] = str(exc)
+    passed = bool(checks.get("controller_constructs")) and all(
+        bool(v) for k, v in checks.items() if k not in ("walking_state", "error")
+    )
+    checks["passed"] = passed
+    return checks
+
+
 def get_explorer_mode_capabilities() -> list:
     return ["explorer_mode", "autonomous_exploration", "diagnostic_snapshot"]
 
 
 def validate_explorer_mode_contract() -> bool:
-    return bool(get_explorer_mode_capabilities())
+    return bool(_run_explorer_mode_contract_checks().get("passed", False))
 
 
 def get_explorer_mode_baseline_metrics() -> dict:
-    return {"module": "explorer_mode", "contract_valid": validate_explorer_mode_contract(), "capability_count": len(get_explorer_mode_capabilities())}
+    checks = _run_explorer_mode_contract_checks()
+    return {"module": "explorer_mode", "contract_valid": bool(checks.get("passed", False)), "capability_count": len(get_explorer_mode_capabilities()), "checks": checks}
 
 
 def get_explorer_mode_readiness_status() -> dict:
@@ -2980,7 +3698,13 @@ def get_explorer_mode_readiness_status() -> dict:
 
 
 def get_explorer_mode_audit_record() -> dict:
-    return {"module": "explorer_mode", "audit_passed": validate_explorer_mode_contract(), "readiness": get_explorer_mode_readiness_status()}
+    checks = _run_explorer_mode_contract_checks()
+    return {
+        "module": "explorer_mode",
+        "audit_passed": bool(checks.get("passed", False)),
+        "checks": checks,
+        "readiness": get_explorer_mode_readiness_status(),
+    }
 
 
 def get_explorer_mode_operational_digest() -> dict:

@@ -49,14 +49,12 @@ Focus Areas Verified Across 5 Cooperating Agents (E1..E5):
 from __future__ import annotations
 
 import json
-import math
 import os
 import shutil
 import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
@@ -71,13 +69,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from core.auto_cartographer import (
     DEFAULT_DEDUP_RADIUS_PX,
+    DEDUP_RADIUS_MAX_PX,
+    DEDUP_RADIUS_MIN_PX,
     AutoCartographer,
     TrackedResourceNode,
     VisualOdometryTracker,
 )
 from core.material_scanner import DetectedMaterial, MaterialScanner
 from config.materials_db import (
-    AION2_MATERIALS_CATALOG,
     MATERIAL_CATEGORIES,
     classify_3d_material_patch,
     get_material_spec,
@@ -87,7 +86,6 @@ from config.materials_db import (
 from core.minimap_scanner import MinimapScanner
 from ui.cartography_radar import (
     _GATHER_PLAYER_CLEARANCE,
-    CANONICAL_REGION_ALIASES,
     SequentialRoutePlanner,
     apply_hd_fit,
     inv_hd_fit,
@@ -96,10 +94,6 @@ from ui.cartography_radar import (
     resolve_canonical_region,
 )
 from core.node_quality_gate import (
-    HARD_WRONG_CLASS_IDS,
-    KEEP_CLASS_IDS,
-    GateVerdict,
-    conf_min_for_tier,
     evaluate_node_candidate,
     is_fake_gray_rock_or_ground,
     is_hard_wrong_class,
@@ -107,13 +101,12 @@ from core.node_quality_gate import (
     patch_is_feather,
     patch_is_monster_dot,
 )
-from core.route_manager import DEFAULT_MAX_HARVESTS, NodeData, RouteManager
+from core.route_manager import RouteManager
 from core.wrong_node_scan import (
     WrongNode,
     classify_wrong_nodes,
     purge_wrong_nodes,
     save_wrong_nodes_as_negative_exemplars,
-    scan_would_exceed_half,
 )
 from dataset_factory.exemplar_memory import ExemplarMemory, get_exemplar_memory
 
@@ -121,6 +114,21 @@ from dataset_factory.exemplar_memory import ExemplarMemory, get_exemplar_memory
 # =============================================================================
 # Helper Utilities & Synthetic Patches
 # =============================================================================
+
+def _textured_patch(base_bgr, shape, seed=0, amp=12):
+    """Deterministic textured patch: base colour + seeded luminance noise.
+
+    K-3 (dataset_factory/exemplar_memory.py) rejects flat single-colour
+    crops as degenerate ("flat crop, no texture"), so exemplar fixtures
+    must carry real texture. The noise is luminance-only (the same offset
+    on all three channels), so hue is preserved and a grey patch stays
+    grey through any BGR->grey conversion on the way to the matcher.
+    """
+    rng = np.random.default_rng(seed)
+    base = np.full(shape, base_bgr, dtype=np.int16)
+    noise = rng.integers(-amp, amp + 1, size=(shape[0], shape[1], 1), dtype=np.int16)
+    return np.clip(base + noise, 0, 255).astype(np.uint8)
+
 
 def _create_synthetic_aria_patch(size: int = 80) -> np.ndarray:
     """Create a synthetic purple/violet Aria flower patch."""
@@ -164,6 +172,60 @@ def _create_synthetic_flat_ground_patch(size: int = 80) -> np.ndarray:
     return np.clip(ground, 0, 255).astype(np.uint8)
 
 
+_TEXTURED_MINIMAP_FRAME: np.ndarray | None = None
+
+
+def _frame_with_textured_minimap() -> np.ndarray:
+    """1280x720 frame whose minimap ROI carries a textured Aria patch.
+
+    The real quality gate crops its 80x80 candidate patch out of the minimap
+    ROI, so a blank/black frame is rejected by the gate as a negative
+    exemplar. Tiling the deterministic textured Aria patch over the minimap
+    ROI makes the extracted patch pass the real gate without mocking it.
+
+    The frame is fully deterministic, so it is built once and cached; each
+    call returns an owned ``.copy()`` so a test that draws on its frame can
+    never leak markings into another test.
+    """
+    global _TEXTURED_MINIMAP_FRAME
+    if _TEXTURED_MINIMAP_FRAME is None:
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        aria = _create_synthetic_aria_patch(80)
+        x1, y1, x2, y2 = AutoCartographer()._get_minimap_pixel_rect(1280, 720)
+        for y in range(y1, y2, 80):
+            for x in range(x1, x2, 80):
+                h = min(80, y2 - y)
+                w = min(80, x2 - x)
+                frame[y:y + h, x:x + w] = aria[:h, :w]
+        _TEXTURED_MINIMAP_FRAME = frame
+    return _TEXTURED_MINIMAP_FRAME.copy()
+
+
+def _make_cartographer_env(
+    prefix: str,
+    region: str = "Altgard",
+    initial_map_x: float = 600.0,
+    initial_map_y: float = 400.0,
+    **cartographer_kwargs,
+):
+    """Shared tmp-dir + RouteManager + AutoCartographer setup for the suites.
+
+    Returns ``(tmp_dir, route_mgr, cartographer)`` with the region created.
+    Extra keyword arguments are forwarded to ``AutoCartographer`` so each
+    suite keeps its own position / radius / EMA settings.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix=prefix)
+    route_mgr = RouteManager(base_dir=tmp_dir, active_region=region)
+    route_mgr.create_region(region)
+    cartographer = AutoCartographer(
+        route_manager=route_mgr,
+        initial_map_x=initial_map_x,
+        initial_map_y=initial_map_y,
+        **cartographer_kwargs,
+    )
+    return tmp_dir, route_mgr, cartographer
+
+
 # =============================================================================
 # Suite 1: Autonomous Exploration Route Generation & Breadcrumb Graph (E1)
 # =============================================================================
@@ -172,11 +234,8 @@ class TestAutonomousRouteGeneration(unittest.TestCase):
     """Verifies autonomous route builder, odometry tracking, and node graph persistence."""
 
     def setUp(self) -> None:
-        self.tmp_dir = tempfile.mkdtemp(prefix="test_auto_explore_e1_")
-        self.route_mgr = RouteManager(base_dir=self.tmp_dir, active_region="Altgard")
-        self.route_mgr.create_region("Altgard")
-        self.cartographer = AutoCartographer(
-            route_manager=self.route_mgr,
+        self.tmp_dir, self.route_mgr, self.cartographer = _make_cartographer_env(
+            "test_auto_explore_e1_",
             initial_map_x=600.0,
             initial_map_y=400.0,
             map_width=1920,
@@ -237,7 +296,7 @@ class TestAutonomousRouteGeneration(unittest.TestCase):
 
     def test_autonomous_route_mapping_and_node_graph_creation(self) -> None:
         """AutoCartographer maps discovered nodes into route with coordinates and metadata."""
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame = _frame_with_textured_minimap()
         det_aria = {
             "rel_map_dx": 15.0,
             "rel_map_dy": 25.0,
@@ -246,13 +305,12 @@ class TestAutonomousRouteGeneration(unittest.TestCase):
             "source_type": "3d_auto",
         }
 
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            discovered = self.cartographer.record_from_3d_world(
-                frame,
-                detections=[det_aria],
-                route_manager=self.route_mgr,
-                region="Altgard",
-            )
+        discovered = self.cartographer.record_from_3d_world(
+            frame,
+            detections=[det_aria],
+            route_manager=self.route_mgr,
+            region="Altgard",
+        )
 
         self.assertEqual(len(discovered), 1)
         node_info = discovered[0]
@@ -270,7 +328,7 @@ class TestAutonomousRouteGeneration(unittest.TestCase):
 
     def test_route_persistence_live_region_data_json(self) -> None:
         """Discovered nodes and routes are immediately persisted to region_data.json."""
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame = _frame_with_textured_minimap()
         det = {
             "rel_map_dx": 50.0,
             "rel_map_dy": 60.0,
@@ -279,13 +337,12 @@ class TestAutonomousRouteGeneration(unittest.TestCase):
             "source_type": "3d_auto",
         }
 
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            self.cartographer.record_from_3d_world(
-                frame,
-                detections=[det],
-                route_manager=self.route_mgr,
-                region="Altgard",
-            )
+        self.cartographer.record_from_3d_world(
+            frame,
+            detections=[det],
+            route_manager=self.route_mgr,
+            region="Altgard",
+        )
 
         region_file = os.path.join(self.tmp_dir, "Altgard", "region_data.json")
         self.assertTrue(os.path.exists(region_file))
@@ -299,29 +356,55 @@ class TestAutonomousRouteGeneration(unittest.TestCase):
         self.assertAlmostEqual(data["nodes"][0]["map_x"], 650.0)
 
     def test_auto_cartographer_harvest_capacity_and_depletion(self) -> None:
-        """Nodes follow 3x harvest capacity per stack and enter depletion after max harvests."""
-        node = TrackedResourceNode(
-            node_id=10,
-            region="Altgard",
-            map_x=700.0,
-            map_y=450.0,
-            resource_type="Orichalcum Ore",
-            stack_count=2,
-            max_harvests=6,  # 3x * 2 stacks = 6 harvests
+        """Nodes follow 3x harvest capacity per stack and enter depletion after max harvests.
+
+        The 3x-per-stack rule and the harvest events run through the real
+        pipeline: a 2-stack sprout is recorded via record_from_minimap (the
+        real quality gate must accept it) and each harvest goes through
+        record_node_harvest -- no counter is hand-written here.
+        """
+        frame = _frame_with_textured_minimap()
+        det = {
+            "rel_map_dx": 60.0,
+            "rel_map_dy": 50.0,
+            "resource_type": "Gatherable Material",
+            "confidence": 0.88,
+            "source_type": "minimap_auto",
+            "stack_count": 2,  # Multi-stack sprout -> 3x * 2 stacks = 6 harvests
+        }
+        discovered = self.cartographer.record_from_minimap(
+            frame, detections=[det], route_manager=self.route_mgr, region="Altgard", update_odometry=False
         )
-        self.assertEqual(node.max_harvests, 6)
-        self.assertEqual(node.remaining_harvests, 6)
-        self.assertFalse(node.is_depleted)
+        self.assertEqual(len(discovered), 1)
+        node_id = discovered[0]["id"]
+        # 3x rule applied by the real recording pipeline, not hand-set.
+        self.assertEqual(discovered[0]["stack_count"], 2)
+        self.assertEqual(discovered[0]["max_harvests"], 6)
+        self.assertEqual(discovered[0]["current_harvests"], 0)
+        self.assertEqual(discovered[0]["remaining_harvests"], 6)
+        self.assertFalse(discovered[0]["is_depleted"])
 
-        # Simulate 4 harvest events
-        node.current_harvests = 4
-        self.assertEqual(node.remaining_harvests, 2)
-        self.assertFalse(node.is_depleted)
+        # 4 real harvest events through record_node_harvest.
+        for _ in range(4):
+            harvested = self.cartographer.record_node_harvest(node_id=node_id, region="Altgard")
+            self.assertIsNotNone(harvested)
+        tracked = self.cartographer.get_tracked_nodes("Altgard")[0]
+        self.assertEqual(tracked["current_harvests"], 4)
+        self.assertEqual(tracked["remaining_harvests"], 2)
+        self.assertFalse(tracked["is_depleted"])
+        # RouteManager mirrors the harvest counter.
+        rm_node = self.route_mgr.get_node(node_id, region="Altgard")
+        self.assertIsNotNone(rm_node)
+        self.assertEqual(rm_node.current_harvests, 4)
 
-        # Deplete the node at 6 harvests
-        node.current_harvests = 6
-        self.assertEqual(node.remaining_harvests, 0)
-        self.assertTrue(node.is_depleted)
+        # 2 more harvest events deplete the node at 6 harvests.
+        for _ in range(2):
+            harvested = self.cartographer.record_node_harvest(node_id=node_id, region="Altgard")
+            self.assertIsNotNone(harvested)
+        tracked = self.cartographer.get_tracked_nodes("Altgard")[0]
+        self.assertEqual(tracked["current_harvests"], 6)
+        self.assertEqual(tracked["remaining_harvests"], 0)
+        self.assertTrue(tracked["is_depleted"])
 
     def test_auto_cartographer_event_callbacks_and_ui_listeners(self) -> None:
         """AutoCartographer notifies external subscribers via discovery and radar callbacks."""
@@ -331,7 +414,7 @@ class TestAutonomousRouteGeneration(unittest.TestCase):
         self.cartographer.add_node_discovered_callback(lambda d: discovered_events.append(d))
         self.cartographer.add_radar_event_callback(lambda ev, data: radar_events.append((ev, data)))
 
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame = _frame_with_textured_minimap()
         det = {
             "rel_map_dx": 30.0,
             "rel_map_dy": 30.0,
@@ -340,13 +423,12 @@ class TestAutonomousRouteGeneration(unittest.TestCase):
             "source_type": "3d_auto",
         }
 
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            self.cartographer.record_from_3d_world(
-                frame,
-                detections=[det],
-                route_manager=self.route_mgr,
-                region="Altgard",
-            )
+        self.cartographer.record_from_3d_world(
+            frame,
+            detections=[det],
+            route_manager=self.route_mgr,
+            region="Altgard",
+        )
 
         self.assertEqual(len(discovered_events), 1)
         self.assertEqual(discovered_events[0]["resource_type"], "Gem")
@@ -356,10 +438,39 @@ class TestAutonomousRouteGeneration(unittest.TestCase):
 
     def test_cartographer_metrics_and_health_summary(self) -> None:
         """get_cartography_stats and health diagnostics provide operational metrics."""
+        # Fresh cartographer: exact zero state, not just present keys.
         stats = self.cartographer.get_cartography_stats("Altgard")
-        self.assertIn("total_nodes", stats)
-        self.assertIn("player_map_x", stats)
-        self.assertIn("walk_trajectory_points", stats)
+        self.assertEqual(stats["total_nodes"], 0)
+        self.assertEqual(stats["total_max_harvests"], 0)
+        self.assertEqual(stats["total_current_harvests"], 0)
+        self.assertEqual(stats["total_available_harvests"], 0)
+        self.assertEqual(stats["total_3d_recorded"], 0)
+        self.assertEqual(stats["total_minimap_recorded"], 0)
+        self.assertAlmostEqual(stats["player_map_x"], 600.0)
+        self.assertAlmostEqual(stats["player_map_y"], 400.0)
+        self.assertEqual(stats["walk_trajectory_points"], 0)
+
+        # One real discovery through the quality gate moves every counter.
+        frame = _frame_with_textured_minimap()
+        det = {
+            "rel_map_dx": 15.0,
+            "rel_map_dy": 25.0,
+            "resource_type": "Aria",
+            "confidence": 0.92,
+            "source_type": "3d_auto",
+        }
+        discovered = self.cartographer.record_from_3d_world(
+            frame, detections=[det], route_manager=self.route_mgr, region="Altgard"
+        )
+        self.assertEqual(len(discovered), 1)
+
+        stats = self.cartographer.get_cartography_stats("Altgard")
+        self.assertEqual(stats["total_nodes"], 1)
+        self.assertEqual(stats["graph_nodes_count"], 1)
+        self.assertEqual(stats["total_3d_recorded"], 1)
+        self.assertEqual(stats["total_max_harvests"], 3)
+        self.assertEqual(stats["total_current_harvests"], 0)
+        self.assertEqual(stats["total_available_harvests"], 3)
 
         health = self.cartographer.get_cartographer_health_summary()
         self.assertTrue(health.get("cartographer_ready"))
@@ -377,11 +488,8 @@ class TestSpatialClusteringAndDeduplication(unittest.TestCase):
     """Verifies 15-25px spatial clustering, EMA Kalman refinement, and anti-duplication."""
 
     def setUp(self) -> None:
-        self.tmp_dir = tempfile.mkdtemp(prefix="test_auto_explore_e2_")
-        self.route_mgr = RouteManager(base_dir=self.tmp_dir, active_region="Altgard")
-        self.route_mgr.create_region("Altgard")
-        self.cartographer = AutoCartographer(
-            route_manager=self.route_mgr,
+        self.tmp_dir, self.route_mgr, self.cartographer = _make_cartographer_env(
+            "test_auto_explore_e2_",
             initial_map_x=500.0,
             initial_map_y=300.0,
             dedup_radius_px=22.0,  # Explicitly within 15-25px range
@@ -402,9 +510,27 @@ class TestSpatialClusteringAndDeduplication(unittest.TestCase):
         self.assertEqual(self.cartographer.cluster_radius, 18.5)
         self.assertEqual(self.cartographer.dedup_radius_px, 18.5)
 
+        # Out-of-band inputs clamp to the 15-25px band instead of echoing.
+        self.cartographer.cluster_radius = 5.0
+        self.assertEqual(self.cartographer.cluster_radius, DEDUP_RADIUS_MIN_PX)
+        self.assertEqual(self.cartographer.dedup_radius_px, DEDUP_RADIUS_MIN_PX)
+        self.cartographer.cluster_radius = 50.0
+        self.assertEqual(self.cartographer.cluster_radius, DEDUP_RADIUS_MAX_PX)
+        self.assertEqual(self.cartographer.dedup_radius_px, DEDUP_RADIUS_MAX_PX)
+        self.cartographer.cluster_radius = -10.0
+        self.assertEqual(self.cartographer.cluster_radius, DEDUP_RADIUS_MIN_PX)
+
+        # Band edges are accepted; constructor input clamps the same way.
+        self.cartographer.cluster_radius = 15.0
+        self.assertEqual(self.cartographer.cluster_radius, 15.0)
+        self.cartographer.cluster_radius = 25.0
+        self.assertEqual(self.cartographer.cluster_radius, 25.0)
+        self.assertEqual(AutoCartographer(dedup_radius_px=100.0).cluster_radius, DEDUP_RADIUS_MAX_PX)
+        self.assertEqual(AutoCartographer(dedup_radius_px=1.0).cluster_radius, DEDUP_RADIUS_MIN_PX)
+
     def test_spatial_deduplication_within_radius_merges_node(self) -> None:
         """Candidate sightings within 15-25px merge into existing node without duplicating."""
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame = _frame_with_textured_minimap()
 
         # Initial sighting at (510, 315) -> creates Node #1
         det1 = {
@@ -414,10 +540,9 @@ class TestSpatialClusteringAndDeduplication(unittest.TestCase):
             "confidence": 0.85,
             "source_type": "3d_auto",
         }
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            res1 = self.cartographer.record_from_3d_world(
-                frame, detections=[det1], route_manager=self.route_mgr, region="Altgard"
-            )
+        res1 = self.cartographer.record_from_3d_world(
+            frame, detections=[det1], route_manager=self.route_mgr, region="Altgard"
+        )
 
         self.assertEqual(len(res1), 1)
         self.assertEqual(res1[0]["id"], 1)
@@ -430,10 +555,9 @@ class TestSpatialClusteringAndDeduplication(unittest.TestCase):
             "confidence": 0.89,
             "source_type": "3d_auto",
         }
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            res2 = self.cartographer.record_from_3d_world(
-                frame, detections=[det2], route_manager=self.route_mgr, region="Altgard"
-            )
+        res2 = self.cartographer.record_from_3d_world(
+            frame, detections=[det2], route_manager=self.route_mgr, region="Altgard"
+        )
 
         # res2 must be empty (merged, not newly discovered)
         self.assertEqual(len(res2), 0)
@@ -475,16 +599,15 @@ class TestSpatialClusteringAndDeduplication(unittest.TestCase):
 
     def test_new_node_created_when_distance_exceeds_radius(self) -> None:
         """Candidate sighting with distance > 25px creates a distinct, separate node."""
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame = _frame_with_textured_minimap()
 
         # Node 1 at (510, 315)
         det1 = {"rel_map_dx": 10.0, "rel_map_dy": 15.0, "resource_type": "Aria", "confidence": 0.85, "source_type": "3d_auto"}
         # Node 2 at (550, 360) -> distance = hypot(40, 45) ≈ 60.2 px > 25.0 px
         det2 = {"rel_map_dx": 50.0, "rel_map_dy": 60.0, "resource_type": "Orichalcum", "confidence": 0.88, "source_type": "3d_auto"}
 
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            res1 = self.cartographer.record_from_3d_world(frame, detections=[det1], route_manager=self.route_mgr, region="Altgard")
-            res2 = self.cartographer.record_from_3d_world(frame, detections=[det2], route_manager=self.route_mgr, region="Altgard")
+        res1 = self.cartographer.record_from_3d_world(frame, detections=[det1], route_manager=self.route_mgr, region="Altgard")
+        res2 = self.cartographer.record_from_3d_world(frame, detections=[det2], route_manager=self.route_mgr, region="Altgard")
 
         self.assertEqual(len(res1), 1)
         self.assertEqual(len(res2), 1)
@@ -630,20 +753,82 @@ class TestMaterialTaxonomyAnd3DIdentification(unittest.TestCase):
         self.assertEqual(classification["category"], "Odyle & Aether")
         self.assertGreaterEqual(classification["confidence"], 0.70)
 
+    def test_classify_3d_material_patch_non_uniform_textured_inputs(self) -> None:
+        """Classification uses real texture, not just uniform synthetic HSV flats.
+
+        Two-tone + gradient + noise patches must still classify correctly,
+        and a green foliage patch must not be mistaken for Aria.
+        """
+        rng = np.random.default_rng(7)
+        hsv = np.zeros((80, 80, 3), dtype=np.uint8)
+        hsv[:40, :] = (135, 170, 200)  # Violet top
+        hsv[40:, :] = (150, 150, 170)  # Deeper purple bottom
+        for i in range(80):
+            hsv[i, :, 2] = np.clip(hsv[i, :, 2].astype(int) + (i - 40) // 2, 0, 255)
+        noise = rng.integers(-20, 20, (80, 80, 3), dtype=np.int16)
+        textured_aria = np.clip(
+            cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR).astype(np.int16) + noise, 0, 255
+        ).astype(np.uint8)
+        aria_class = classify_3d_material_patch(textured_aria)
+        self.assertEqual(aria_class["name"], "Aria")
+        self.assertEqual(aria_class["category"], "Herbs")
+        self.assertGreaterEqual(aria_class["confidence"], 0.70)
+
+        def _noisy(patch: np.ndarray, seed: int) -> np.ndarray:
+            r = np.random.default_rng(seed)
+            nz = r.integers(-18, 18, patch.shape, dtype=np.int16)
+            return np.clip(patch.astype(np.int16) + nz, 0, 255).astype(np.uint8)
+
+        # Noisy two-tone ore / mela patches keep their classes.
+        self.assertEqual(
+            classify_3d_material_patch(_noisy(_create_synthetic_ore_patch(40), 3))["name"],
+            "Orichalcum Ore",
+        )
+        self.assertEqual(
+            classify_3d_material_patch(_noisy(_create_synthetic_mela_patch(40), 4))["name"],
+            "Mela",
+        )
+
+        # Green foliage control is not Aria.
+        green = np.zeros((40, 40, 3), dtype=np.uint8)
+        green[:, :] = (60, 120, 120)
+        self.assertNotEqual(
+            classify_3d_material_patch(cv2.cvtColor(green, cv2.COLOR_HSV2BGR))["name"],
+            "Aria",
+        )
+
     def test_material_scanner_refines_material_via_exemplar_memory(self) -> None:
-        """ExemplarMemory positive exemplars refine candidate classes and elevate confidence."""
+        """ExemplarMemory positive exemplars refine candidate classes and elevate confidence.
+
+        The candidate is a *different* capture of the same gem, so the test
+        proves generalisation instead of self-matching the planted exemplar.
+        """
         tmp = tempfile.mkdtemp(prefix="test_scanner_exemplar_")
         try:
             ex_path = os.path.join(tmp, "exemplars.json")
-            mem = get_exemplar_memory(json_path=ex_path)
+            # Fresh instance, not the process singleton: no exemplar leaks
+            # into other tests (or the cartographer's default memory).
+            mem = ExemplarMemory(json_path=ex_path)
 
-            # Register positive exemplar for Gem (class_id=4)
-            gem_crop = np.zeros((40, 40, 3), dtype=np.uint8)
-            gem_crop[:, :] = (200, 150, 40)
+            # Register positive exemplar for Gem (class_id=4; textured —
+            # a flat patch is rejected by the K-3 degenerate-crop gate)
+            gem_crop = _textured_patch((200, 150, 40), (40, 40, 3), seed=12)
             mem.add_positive_exemplar(gem_crop, class_id=4, class_name="gem_sapphire")
 
+            # A different capture of the same gem (shifted shade + noise),
+            # never the planted exemplar itself: this proves generalisation,
+            # not self-matching.
+            rng = np.random.default_rng(11)
+            gem_capture = np.zeros((40, 40, 3), dtype=np.uint8)
+            gem_capture[:, :] = (185, 140, 55)
+            gem_capture = np.clip(
+                gem_capture.astype(np.int16) + rng.integers(-12, 12, (40, 40, 3)),
+                0, 255,
+            ).astype(np.uint8)
+            self.assertFalse(np.array_equal(gem_capture, gem_crop))
+
             frame = np.full((720, 1280, 3), 60, dtype=np.uint8)
-            frame[300:340, 500:540] = gem_crop
+            frame[300:340, 500:540] = gem_capture
 
             candidate = DetectedMaterial(
                 material_type="Raw_Node",
@@ -804,12 +989,11 @@ class TestWrongNodePurgeAndNegativeExemplarMemory(unittest.TestCase):
     def test_evaluate_node_candidate_accepts_valid_gatherable(self) -> None:
         """Genuine textured resource patch passes candidate evaluation."""
         aria_patch = _create_synthetic_aria_patch(80)
+        # Full gate: exemplar + terrain checks stay ON (defaults).
         verdict = evaluate_node_candidate(
             aria_patch,
             source_type="3d_auto",
             resource_type="Aria",
-            check_exemplars=False,
-            check_terrain=False,
         )
         self.assertTrue(verdict.accept)
         self.assertFalse(verdict.reject)
@@ -841,38 +1025,67 @@ class TestWrongNodePurgeAndNegativeExemplarMemory(unittest.TestCase):
         self.assertEqual(verdict.class_id, 10)
 
     def test_evaluate_node_candidate_rejects_feather_and_monster_filters(self) -> None:
-        """Feather icons and monster circularities trigger rejection in evaluate_node_candidate."""
-        img_patch = np.zeros((80, 80, 3), dtype=np.uint8)
+        """Feather icons and monster circularities trigger rejection in evaluate_node_candidate.
 
-        # 1. When feather filter triggers
-        with patch("core.node_quality_gate.patch_is_feather", return_value=True):
-            v_feather = evaluate_node_candidate(
-                img_patch,
-                source_type="minimap_auto",
-                resource_type="Gatherable Material",
-                check_feather=True,
-                check_monster=False,
-                check_exemplars=False,
-                check_terrain=False,
-            )
+        Both filters run on real pixels, nothing is mocked: the feather case
+        pastes the repo's own minimap feather template into the patch, and
+        the monster case uses a compact bright blob that the production
+        MonsterCircularityFilter itself classifies as a monster dot
+        (compact-blob branch: circularity 0.79, area 64 px2).
+        """
+        # 1. Real feather icon: the minimap feather template.
+        feather_path = os.path.join(REPO_ROOT, "templates", "minimap_feather_odyle.png")
+        self.assertTrue(os.path.isfile(feather_path))
+        feather_template = cv2.imread(feather_path, cv2.IMREAD_COLOR)
+        self.assertIsNotNone(feather_template)
+        feather_patch = np.zeros((80, 80, 3), dtype=np.uint8)
+        th, tw = feather_template.shape[:2]
+        y0, x0 = (80 - th) // 2, (80 - tw) // 2
+        feather_patch[y0:y0 + th, x0:x0 + tw] = feather_template
+        self.assertTrue(patch_is_feather(feather_patch))
+        v_feather = evaluate_node_candidate(
+            feather_patch,
+            source_type="minimap_auto",
+            resource_type="Gatherable Material",
+            check_feather=True,
+            check_monster=False,
+            check_exemplars=False,
+            check_terrain=False,
+        )
         self.assertFalse(v_feather.accept)
         self.assertTrue(v_feather.reject)
         self.assertIn("feather", v_feather.reasons)
 
-        # 2. When monster dot filter triggers
-        with patch("core.node_quality_gate.patch_is_monster_dot", return_value=True):
-            v_monster = evaluate_node_candidate(
-                img_patch,
-                source_type="minimap_auto",
-                resource_type="Gatherable Material",
-                check_feather=False,
-                check_monster=True,
-                check_exemplars=False,
-                check_terrain=False,
-            )
+        # 2. Real monster dot: compact bright blob on a dark patch.
+        monster_patch = np.zeros((80, 80, 3), dtype=np.uint8)
+        monster_patch[36:45, 36:45] = 255  # 9x9 bright blob, area 64 px2
+        self.assertTrue(patch_is_monster_dot(monster_patch))
+        v_monster = evaluate_node_candidate(
+            monster_patch,
+            source_type="minimap_auto",
+            resource_type="Gatherable Material",
+            check_feather=False,
+            check_monster=True,
+            check_exemplars=False,
+            check_terrain=False,
+        )
         self.assertFalse(v_monster.accept)
         self.assertTrue(v_monster.reject)
         self.assertIn("monster", v_monster.reasons)
+
+        # 3. Control: a genuine textured gatherable patch passes both filters.
+        aria_patch = _create_synthetic_aria_patch(80)
+        v_ok = evaluate_node_candidate(
+            aria_patch,
+            source_type="minimap_auto",
+            resource_type="Aria",
+            check_feather=True,
+            check_monster=True,
+            check_exemplars=False,
+            check_terrain=False,
+        )
+        self.assertTrue(v_ok.accept)
+        self.assertFalse(v_ok.reject)
 
     def test_is_fake_gray_rock_or_ground_detection(self) -> None:
         """Flat barren ground texture triggers fake terrain detection."""
@@ -883,8 +1096,8 @@ class TestWrongNodePurgeAndNegativeExemplarMemory(unittest.TestCase):
         self.assertGreater(conf_def, 0.50)
 
         # 2. Custom exemplar memory check with learned negative
-        rock_patch = np.zeros((80, 80, 3), dtype=np.uint8)
-        rock_patch[:, :] = (100, 105, 110)
+        # (textured — a flat patch is rejected by the K-3 degenerate gate)
+        rock_patch = _textured_patch((100, 105, 110), (80, 80, 3), seed=13)
         self.mem.add_negative_exemplar(rock_patch, class_id=14, class_name="gray_rock_candidate")
 
         is_fake_mem, conf_mem, reason_mem = is_fake_gray_rock_or_ground(rock_patch, exemplar_memory=self.mem)
@@ -893,8 +1106,7 @@ class TestWrongNodePurgeAndNegativeExemplarMemory(unittest.TestCase):
 
     def test_learned_negative_exemplar_rejection(self) -> None:
         """Purged negative exemplar instantly suppresses matching future candidates."""
-        erroneous_patch = np.zeros((80, 80, 3), dtype=np.uint8)
-        erroneous_patch[:, :] = (80, 85, 90)
+        erroneous_patch = _textured_patch((80, 85, 90), (80, 80, 3), seed=14)
 
         # Register as negative exemplar
         self.mem.add_negative_exemplar(erroneous_patch, class_id=15, class_name="false_dirt_patch")
@@ -941,7 +1153,7 @@ class TestWrongNodePurgeAndNegativeExemplarMemory(unittest.TestCase):
 
     def test_save_wrong_nodes_as_negative_exemplars_active_learning(self) -> None:
         """save_wrong_nodes_as_negative_exemplars records purged thumbnails into ExemplarMemory."""
-        fake_patch = np.full((80, 80, 3), 115, dtype=np.uint8)
+        fake_patch = _textured_patch(115, (80, 80, 3), seed=15)
         wrong = [
             WrongNode(node_id=5, reasons=["model:10"], class_id=10, confidence=0.88),
         ]
@@ -1014,18 +1226,15 @@ class Test5AgentAutoExploreEndToEndIntegration(unittest.TestCase):
     """End-to-end integration test validating the cooperation of all 5 exploration agents."""
 
     def setUp(self) -> None:
-        self.tmp_dir = tempfile.mkdtemp(prefix="test_auto_explore_e5_e2e_")
-        self.route_mgr = RouteManager(base_dir=self.tmp_dir, active_region="Altgard")
-        self.route_mgr.create_region("Altgard")
-        self.ex_path = os.path.join(self.tmp_dir, "learned_exemplars.json")
-        self.mem = get_exemplar_memory(json_path=self.ex_path)
-
-        self.cartographer = AutoCartographer(
-            route_manager=self.route_mgr,
+        self.tmp_dir, self.route_mgr, self.cartographer = _make_cartographer_env(
+            "test_auto_explore_e5_e2e_",
             initial_map_x=500.0,
             initial_map_y=300.0,
             dedup_radius_px=22.0,
         )
+        self.ex_path = os.path.join(self.tmp_dir, "learned_exemplars.json")
+        self.mem = get_exemplar_memory(json_path=self.ex_path)
+
         self.scanner = MaterialScanner()
         self.planner = SequentialRoutePlanner()
 
@@ -1052,7 +1261,7 @@ class Test5AgentAutoExploreEndToEndIntegration(unittest.TestCase):
         aria_class = classify_3d_material_patch(aria_patch)
         self.assertEqual(aria_class["name"], "Aria")
 
-        frame1 = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame1 = _frame_with_textured_minimap()
         det_aria = {
             "rel_map_dx": 10.0,
             "rel_map_dy": 10.0,
@@ -1060,10 +1269,9 @@ class Test5AgentAutoExploreEndToEndIntegration(unittest.TestCase):
             "confidence": aria_class["confidence"],
             "source_type": "3d_auto",
         }
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            res_aria = self.cartographer.record_from_3d_world(
-                frame1, detections=[det_aria], route_manager=self.route_mgr, region="Altgard"
-            )
+        res_aria = self.cartographer.record_from_3d_world(
+            frame1, detections=[det_aria], route_manager=self.route_mgr, region="Altgard"
+        )
         self.assertEqual(len(res_aria), 1)
         self.assertEqual(res_aria[0]["id"], 1)
         self.assertEqual(res_aria[0]["resource_type"], "Aria")
@@ -1079,10 +1287,9 @@ class Test5AgentAutoExploreEndToEndIntegration(unittest.TestCase):
             "confidence": 0.95,
             "source_type": "3d_auto",
         }
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            res_repeat = self.cartographer.record_from_3d_world(
-                frame1, detections=[det_aria_repeat], route_manager=self.route_mgr, region="Altgard"
-            )
+        res_repeat = self.cartographer.record_from_3d_world(
+            frame1, detections=[det_aria_repeat], route_manager=self.route_mgr, region="Altgard"
+        )
         self.assertEqual(len(res_repeat), 0)  # Deduplicated!
         tracked_aria = self.cartographer.get_tracked_nodes("Altgard")[0]
         self.assertEqual(tracked_aria["sightings_count"], 2)
@@ -1098,10 +1305,9 @@ class Test5AgentAutoExploreEndToEndIntegration(unittest.TestCase):
             "source_type": "minimap_auto",
             "stack_count": 2,  # Multi-stack sprout!
         }
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            res_sprout = self.cartographer.record_from_minimap(
-                frame1, detections=[sprout_det], route_manager=self.route_mgr, region="Altgard", update_odometry=False
-            )
+        res_sprout = self.cartographer.record_from_minimap(
+            frame1, detections=[sprout_det], route_manager=self.route_mgr, region="Altgard", update_odometry=False
+        )
         self.assertEqual(len(res_sprout), 1)
         self.assertEqual(res_sprout[0]["id"], 2)
         self.assertEqual(res_sprout[0]["stack_count"], 2)
@@ -1114,16 +1320,18 @@ class Test5AgentAutoExploreEndToEndIntegration(unittest.TestCase):
         self.assertTrue(is_hard_wrong_class(11))  # Monster text/dot
         self.assertTrue(is_rejected_non_material("feather"))
         self.assertTrue(is_rejected_non_material("monster"))
-        with patch("core.node_quality_gate.patch_is_monster_dot", return_value=True):
-            v_monster = evaluate_node_candidate(
-                np.zeros((80, 80, 3), dtype=np.uint8),
-                source_type="minimap_auto",
-                resource_type="Monster_Dot",
-                check_monster=True,
-                check_feather=False,
-                check_exemplars=False,
-                check_terrain=False,
-            )
+        monster_patch = np.zeros((80, 80, 3), dtype=np.uint8)
+        monster_patch[36:45, 36:45] = 255  # Real compact blob: the production filter flags it as a monster dot.
+        self.assertTrue(patch_is_monster_dot(monster_patch))
+        v_monster = evaluate_node_candidate(
+            monster_patch,
+            source_type="minimap_auto",
+            resource_type="Monster_Dot",
+            check_monster=True,
+            check_feather=False,
+            check_exemplars=False,
+            check_terrain=False,
+        )
         self.assertTrue(v_monster.reject)
         self.assertIn("monster", v_monster.reasons)
 
@@ -1141,10 +1349,9 @@ class Test5AgentAutoExploreEndToEndIntegration(unittest.TestCase):
             "confidence": ore_class["confidence"],
             "source_type": "3d_auto",
         }
-        with patch("core.auto_cartographer.evaluate_node_candidate", return_value=GateVerdict(accept=True)):
-            res_ore = self.cartographer.record_from_3d_world(
-                frame1, detections=[det_ore], route_manager=self.route_mgr, region="Altgard"
-            )
+        res_ore = self.cartographer.record_from_3d_world(
+            frame1, detections=[det_ore], route_manager=self.route_mgr, region="Altgard"
+        )
         self.assertEqual(len(res_ore), 1)
         self.assertEqual(res_ore[0]["id"], 3)
         self.assertEqual(res_ore[0]["resource_type"], "Orichalcum Ore")

@@ -28,8 +28,39 @@ from ui.cartography_radar import (
     CartographyRadarWindow,
     RadarCanvas,
     SequentialMapCanvas,
+    get_cartography_radar_baseline_metrics,
     get_cartography_radar_capabilities,
+    validate_cartography_radar_contract,
 )
+
+
+def _count_exact_color_pixels(image: QImage, hex_color: str) -> int:
+    """QImage içindeki `hex_color` rengine tam uyan piksel sayısı.
+
+    QImage.Format_ARGB32 bellekte little-endian BGRA düzenindedir, bu yüzden
+    hedef renk BGR sırasıyla karşılaştırılır. Tam eşleşme sayımı antialiasing
+    kenarlarını saymaz; işaretçi renkleri düz dolguyla çizildiği için
+    işaretçi varlığını kanıtlamaya yeter.
+    """
+    r = int(hex_color[1:3], 16)
+    g = int(hex_color[3:5], 16)
+    b = int(hex_color[5:7], 16)
+    ptr = image.bits()
+    ptr.setsize(image.sizeInBytes())
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(image.height(), image.width(), 4)[:, :, :3]
+    target = np.array([b, g, r], dtype=np.uint8)
+    return int(np.count_nonzero((arr == target).all(axis=2)))
+
+
+def _render_to_image(canvas: RadarCanvas, width: int = 640, height: int = 480) -> QImage:
+    image = QImage(width, height, QImage.Format.Format_ARGB32)
+    image.fill(0)
+    painter = QPainter(image)
+    try:
+        canvas.render(painter)
+    finally:
+        painter.end()
+    return image
 
 
 class TestRadarCanvas3DProjection:
@@ -73,9 +104,13 @@ class TestRadarCanvas3DProjection:
         assert p_herb["shape"] == "circle_dot"
         # Merkezde olduğu için açısı ~0° olmalı
         assert abs(p_herb["bearing_deg"] - 0.0) < 3.0
-        assert 5.0 < p_herb["distance_m"] < 45.0
+        # Perspektif hesabı deterministiktir: merkez kutu ~7.9 m'dedir.
+        # ±1.0 m bandı, 5..45 m'lik eski gevşek aralığın yerini alır.
+        assert p_herb["distance_m"] == pytest.approx(7.9, abs=1.0)
         # Kuzeye baktığı için map_y oyuncudan daha küçük (harita koordinatında yukarı)
         assert p_herb["map_y"] < 500.0
+        assert p_herb["map_x"] == pytest.approx(500.0, abs=1.0)
+        assert p_herb["map_y"] == pytest.approx(471.8, abs=2.0)
 
         # 2. Sağ kutu (ore_orichalcum)
         p_ore = projections[1]
@@ -85,6 +120,8 @@ class TestRadarCanvas3DProjection:
         # Sağda olduğu için bearing pozitif açı (doğu yönüne doğru ~15°..30°)
         assert 10.0 < p_ore["bearing_deg"] < 40.0
         assert p_ore["map_x"] > 500.0
+        # Ayak hizasına yakın sağ kutu ~4.8 m'dedir.
+        assert p_ore["distance_m"] == pytest.approx(4.8, abs=1.0)
 
         # 3. Sol kutu (monster)
         p_mob = projections[2]
@@ -94,6 +131,8 @@ class TestRadarCanvas3DProjection:
         # Solda olduğu için bearing batıya doğru (~330°..350°)
         assert 320.0 < p_mob["bearing_deg"] < 355.0
         assert p_mob["map_x"] < 500.0
+        # Uzakta, ufka yakın sol kutu ~16.8 m'dedir.
+        assert p_mob["distance_m"] == pytest.approx(16.8, abs=1.5)
 
     def test_minimap_sprout_and_monster_projection(self) -> None:
         """Minimap'ten gelen toplanabilir filiz ve canavar tespitleri doğru sınıflarla yansıtılır."""
@@ -236,8 +275,19 @@ class TestUIControlsAndFilters:
 
         canvas.center_on_player()
         pan_x, pan_y = canvas.get_pan()
-        # Oyuncu ekran merkezine (400, 300) yakın olmalı
-        assert isinstance(pan_x, float) and isinstance(pan_y, float)
+        # Oyuncu (350, 250) ekran merkezine (400, 300) gelmeli:
+        # pan = merkez - oyuncu * zoom, zoom burada 1.0'dır.
+        zoom = canvas.get_zoom()
+        assert zoom == pytest.approx(1.0, abs=0.01)
+        assert pan_x == pytest.approx(400.0 - 350.0 * zoom, abs=0.01)
+        assert pan_y == pytest.approx(300.0 - 250.0 * zoom, abs=0.01)
+        # Geometrik karşılığı: oyuncunun widget koordinatı tam merkezdir.
+        widget_x = pan_x + 350.0 * zoom
+        widget_y = pan_y + 250.0 * zoom
+        assert widget_x == pytest.approx(400.0, abs=0.5)
+        assert widget_y == pytest.approx(300.0, abs=0.5)
+        # Yanlış pan değeri merkezi kaydırır: pan +10px olsaydı oyuncu
+        # merkezden 10px sapardı; bu eşitlik onu yakalar.
 
 
 class TestCartographyRadarDialogIntegration:
@@ -273,21 +323,68 @@ class TestCartographyRadarDialogIntegration:
         assert dialog.btn_toggle_enemies.isChecked() is True
 
     def test_alias_and_capabilities(self) -> None:
-        """CartographyRadarWindow takma adı ve kabiliyetler eksiksiz tanımlıdır."""
+        """CartographyRadarWindow takma adı ve kabiliyetler eksiksiz tanımlıdır.
+
+        Kabiliyet listesi yalnızca sabit bir listeyle karşılaştırılmaz: listedeki
+        her kabiliyet, üretim kodundaki sözleşme yardımcılarıyla ve gerçek
+        davranışla çapraz doğrulanır.
+        """
         assert CartographyRadarWindow is CartographyRadarDialog
         caps = get_cartography_radar_capabilities()
-        assert "radar_canvas" in caps
-        assert "3d_ai_projection" in caps
-        assert "live_minimap_fusion" in caps
-        assert "offline_simulation" in caps
-        assert "filter_controls" in caps
+        # Tam liste, sırasız karşılaştırma + tekrar yok + hepsi dolu metin.
+        expected_caps = {
+            "cartography_radar",
+            "live_radar_overlay",
+            "diagnostic_snapshot",
+            "radar_canvas",
+            "3d_ai_projection",
+            "live_minimap_fusion",
+            "offline_simulation",
+            "filter_controls",
+        }
+        assert set(caps) == expected_caps
+        assert len(caps) == len(set(caps))
+        assert all(isinstance(c, str) and c for c in caps)
+        # Üretim sözleşmesi yardımcıları aynı listeyle tutarlı olmalı.
+        assert validate_cartography_radar_contract() is True
+        metrics = get_cartography_radar_baseline_metrics()
+        assert metrics["capability_count"] == len(caps)
+        assert metrics["contract_valid"] is True
+
+        # Kabiliyet -> gerçek davranış eşleşmesi (sabit liste tekrarı değil):
+        dialog = CartographyRadarDialog()
+        canvas = dialog.canvas
+        assert isinstance(canvas, RadarCanvas)  # radar_canvas
+        projections = canvas.project_3d_yolo_boxes(
+            [{"bbox": [600, 320, 680, 400], "class_name": "herb_aria"}],
+            frame_w=1280,
+            frame_h=720,
+            heading_deg=0.0,
+        )
+        assert len(projections) == 1  # 3d_ai_projection
+        assert canvas.is_idle() is True
+        canvas.update_live_frame(
+            frame_bgr=np.zeros((720, 1280, 3), dtype=np.uint8),
+            yolo_boxes=[{"bbox": [600, 320, 680, 400], "class_name": "herb_aria"}],
+            player_pos=(500.0, 500.0, 0.0),
+        )
+        assert canvas.is_idle() is False  # live_minimap_fusion
+        canvas.update_live_frame(frame_bgr=None)
+        assert canvas.is_idle() is True  # offline_simulation
+        canvas.set_filter("enemies", False)
+        assert canvas.get_filter("enemies") is False  # filter_controls
 
 
 class TestRadarCanvasPaintEventRendering:
     """Offscreen tuval boyama (paintEvent) çökme/performans testi."""
 
     def test_offscreen_paint_live_and_idle(self) -> None:
-        """Tuval hem canlı tespitlerle hem de çevrimdışı ızgarayla hatasız boyanır."""
+        """Tuval hem canlı tespitlerle hem de çevrimdışı ızgarayla hatasız boyanır.
+
+        Eski test hiç assert içermiyordu: boş çizim de geçerdi. Şimdi boyanan
+        görüntüdeki işaretçi renkleri sayılır — işaretçiler çizilmezse sayı 0
+        olur ve test düşer.
+        """
         canvas = RadarCanvas()
         canvas.resize(640, 480)
         canvas.set_player_position(300.0, 200.0, angle_deg=35.0)
@@ -302,21 +399,40 @@ class TestRadarCanvasPaintEventRendering:
             player_pos=(300.0, 200.0, 35.0),
         )
 
-        image = QImage(640, 480, QImage.Format.Format_ARGB32)
-        image.fill(0)
-        painter = QPainter(image)
-        try:
-            # Doğrudan tuvalin render motorunu test et
-            canvas.render(painter)
-        finally:
-            painter.end()
+        live_image = _render_to_image(canvas)
+        # Herb (#10b981) ve canavar (#ef4444) işaretçileri gerçekten çizilmeli.
+        assert _count_exact_color_pixels(live_image, "#10b981") >= 10
+        assert _count_exact_color_pixels(live_image, "#ef4444") >= 10
 
-        # Çevrimdışı moda geç ve tekrar boya
+        # Çevrimdışı moda geç ve tekrar boya: son tespitler korunduğu için
+        # işaretçiler hâlâ görünür olmalı.
         canvas.update_live_frame(frame_bgr=None)
-        image_idle = QImage(640, 480, QImage.Format.Format_ARGB32)
-        image_idle.fill(0)
-        painter_idle = QPainter(image_idle)
-        try:
-            canvas.render(painter_idle)
-        finally:
-            painter_idle.end()
+        idle_image = _render_to_image(canvas)
+        assert _count_exact_color_pixels(idle_image, "#10b981") >= 10
+        assert _count_exact_color_pixels(idle_image, "#ef4444") >= 10
+
+    def test_offscreen_paint_projections_filter_hides_markers(self) -> None:
+        """3B izdüşüm filtresi kapalıyken işaretçi renkleri çizilmez (kontrol)."""
+        canvas = RadarCanvas()
+        canvas.resize(640, 480)
+        canvas.set_player_position(300.0, 200.0, angle_deg=35.0)
+        canvas.set_filter("projections", False)
+        canvas.update_live_frame(
+            frame_bgr=np.zeros((720, 1280, 3), dtype=np.uint8),
+            yolo_boxes=[
+                {"bbox": [640, 360, 700, 420], "class_name": "herb_aria"},
+                {"bbox": [300, 200, 350, 250], "class_name": "monster"},
+            ],
+            player_pos=(300.0, 200.0, 35.0),
+        )
+        image = _render_to_image(canvas)
+        assert _count_exact_color_pixels(image, "#10b981") == 0
+        assert _count_exact_color_pixels(image, "#ef4444") == 0
+
+    def test_offscreen_paint_empty_canvas_has_no_markers(self) -> None:
+        """Tespitsiz boş tuvalde işaretçi rengi olmaz (sayacın sıfır noktası)."""
+        canvas = RadarCanvas()
+        canvas.resize(640, 480)
+        image = _render_to_image(canvas)
+        assert _count_exact_color_pixels(image, "#10b981") == 0
+        assert _count_exact_color_pixels(image, "#ef4444") == 0

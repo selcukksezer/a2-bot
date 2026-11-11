@@ -16,17 +16,16 @@
     "epochs": 100,
     "epoch": 33,
     "mode": "ultralytics_cuda_fp16",
-    "status": "completed",
+    "status": "interrupted",
     "artifacts": {
-      "onnx_model": "F:\\a2\\models\\yolov8n_gatherion.onnx",
-      "custom_detector_json": "F:\\a2\\models\\gatherion_custom_detector.json",
-      "train_bat_script": "F:\\a2\\train_rtx_yolo.bat",
-      "ultralytics_best_pt": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16\\weights\\best.pt",
-      "run_dir": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16",
-      "results_csv": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16\\results.csv"
+      "onnx_model": "models/yolov8n_gatherion.onnx",
+      "custom_detector_json": "models/gatherion_custom_detector.json",
+      "train_bat_script": "train_rtx_yolo.bat",
+      "ultralytics_best_pt": "models/rtx_runs/gatherion_rtx_fp16/weights/best.pt",
+      "run_dir": "models/rtx_runs/gatherion_rtx_fp16",
+      "results_csv": "models/rtx_runs/gatherion_rtx_fp16/results.csv"
     }
   },
-  "train_completed_at": "2026-11-08T11:33:17",
   "model_stale": true,
   "stale_reason": "Etiketler güncellendi: gather_t2s_aria_s1_9743714_0001_aug06_night_fog_hflip (train)",
   "stale_at": "2026-11-08T12:22:24.850215"

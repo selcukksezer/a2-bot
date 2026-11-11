@@ -34,6 +34,6 @@
     "25": 0,
     "26": 0
   },
-  "split_train_pct": 84,
+  "split_train_pct": 96,
   "run_id": 2
 }

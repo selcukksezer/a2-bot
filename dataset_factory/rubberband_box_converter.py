@@ -112,7 +112,31 @@ class RubberBandConversionResult:
         confidence: float = 1.0,
         color: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Build a canonical manual annotation dictionary suitable for preview & export."""
+        """Build a canonical manual annotation dictionary suitable for preview & export.
+
+        An invalid conversion result must never masquerade as a trusted
+        hand label: it yields an explicitly untrusted dict (``trusted`` /
+        ``hand_label`` / ``human_approved`` all False, zero box) instead of
+        a trusted annotation with a ``(0, 0, 0, 0)`` box.
+        """
+        if not self.valid:
+            return {
+                "valid": False,
+                "reason": self.reason,
+                "class_id": int(class_id),
+                "class_name": str(class_name),
+                "cx": 0.0,
+                "cy": 0.0,
+                "w": 0.0,
+                "h": 0.0,
+                "bbox": [0.0, 0.0, 0.0, 0.0],
+                "conf": 0.0,
+                "confidence": 0.0,
+                "trusted": False,
+                "hand_label": False,
+                "human_approved": False,
+                "source": "manual_rubberband",
+            }
         ann: Dict[str, Any] = {
             "class_id": int(class_id),
             "class_name": str(class_name),
@@ -245,6 +269,69 @@ def _parse_target_rect(target_rect: Any) -> Optional[Tuple[float, float, float, 
     return None
 
 
+def _clamp_unchecked(value: float, lo: float, hi: float) -> float:
+    """min(max(value, lo), hi) for inputs already proven finite (D42)."""
+    return min(max(float(value), lo), hi)
+
+
+def _drag_span_unchecked(
+    x1: float, y1: float, x2: float, y2: float
+) -> Tuple[float, float, float]:
+    """(dx, dy, euclidean distance) for inputs already proven finite (D42)."""
+    dx = abs(float(x2) - float(x1))
+    dy = abs(float(y2) - float(y1))
+    return (dx, dy, math.hypot(dx, dy))
+
+
+def _validate_drag_unchecked(
+    dx: float,
+    dy: float,
+    dist: float,
+    threshold: float,
+    both_axes: bool,
+) -> Tuple[bool, str]:
+    """Threshold logic shared by validate_drag_distance and convert_result (D42).
+
+    Single home of the drag rule so the two call sites cannot drift apart:
+    distance must reach `threshold`, and with `both_axes` each axis must
+    reach it too (a 1px-tall horizontal line is not a box); without it, a
+    zero-extent axis is rejected.
+    """
+    if dist < threshold:
+        return False, "drag_too_short"
+    if both_axes and (dx < threshold or dy < threshold):
+        return False, "drag_too_short"
+    if not both_axes and (dx <= 0.0 or dy <= 0.0):
+        return False, "drag_too_short"
+    return True, "ok"
+
+
+def _clip_to_parsed_rect(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    parsed_rect: Tuple[float, float, float, float],
+) -> Tuple[float, float, float, float]:
+    """Order + clip coordinates to an already-parsed, already-validated rect (D42).
+
+    Callers must have proven all inputs finite and width/height > 0
+    (convert_result does; the public clip_to_target_rect validates first).
+    """
+    left, top, width, height = parsed_rect
+    right = left + width
+    bottom = top + height
+    px_min_x = min(float(x1), float(x2))
+    px_max_x = max(float(x1), float(x2))
+    px_min_y = min(float(y1), float(y2))
+    px_max_y = max(float(y1), float(y2))
+    cx1 = min(max(px_min_x, left), right)
+    cy1 = min(max(px_min_y, top), bottom)
+    cx2 = min(max(px_max_x, left), right)
+    cy2 = min(max(px_max_y, top), bottom)
+    return (cx1, cy1, cx2, cy2)
+
+
 class RubberBandBoxConverter:
     """
     Converts mouse-dragged rubber-band pixel coordinates ``(x1, y1) -> (x2, y2)``
@@ -286,7 +373,7 @@ class RubberBandBoxConverter:
         """Clamp a normalized value into ``[0.0, 1.0]``."""
         if not math.isfinite(value):
             return min_coord
-        return min(max(float(value), min_coord), max_coord)
+        return _clamp_unchecked(value, min_coord, max_coord)
 
     def clamp_yolo_box(
         self,
@@ -295,11 +382,19 @@ class RubberBandBoxConverter:
         w: float,
         h: float,
     ) -> Tuple[float, float, float, float]:
-        """Clip a normalized YOLO ``(cx, cy, w, h)`` box to ``[0.0, 1.0]`` boundaries."""
+        """Clip a normalized YOLO ``(cx, cy, w, h)`` box to ``[0.0, 1.0]`` boundaries.
+
+        Raises ``ValueError`` on non-finite input: silently collapsing it to
+        ``(0, 0, 0, 0)`` made downstream code mistake an invalid box for a
+        successful (zero-size) projection.
+        """
         lo = self.config.min_coord
         hi = self.config.max_coord
         if not all(math.isfinite(v) for v in (cx, cy, w, h)):
-            return (0.0, 0.0, 0.0, 0.0)
+            raise ValueError(
+                "clamp_yolo_box received non-finite input: "
+                f"(cx={cx!r}, cy={cy!r}, w={w!r}, h={h!r})"
+            )
 
         nx1 = min(max(cx - w * 0.5, lo), hi)
         ny1 = min(max(cy - h * 0.5, lo), hi)
@@ -322,10 +417,7 @@ class RubberBandBoxConverter:
         """Return ``(dx_px, dy_px, euclidean_distance_px)`` for a drag vector."""
         if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
             return (0.0, 0.0, 0.0)
-        dx = abs(float(x2) - float(x1))
-        dy = abs(float(y2) - float(y1))
-        dist = math.hypot(dx, dy)
-        return (dx, dy, dist)
+        return _drag_span_unchecked(x1, y1, x2, y2)
 
     def validate_drag_distance(
         self,
@@ -345,16 +437,8 @@ class RubberBandBoxConverter:
 
         threshold = float(self.config.min_drag_px if min_drag_px is None else min_drag_px)
         both_axes = self.config.require_both_axes if require_both_axes is None else bool(require_both_axes)
-        dx, dy, dist = self.compute_drag_span(x1, y1, x2, y2)
-
-        if dist < threshold:
-            return False, "drag_too_short"
-        if both_axes and (dx < threshold or dy < threshold):
-            return False, "drag_too_short"
-        if not both_axes and (dx <= 0.0 or dy <= 0.0):
-            return False, "drag_too_short"
-
-        return True, "ok"
+        dx, dy, dist = _drag_span_unchecked(x1, y1, x2, y2)
+        return _validate_drag_unchecked(dx, dy, dist, threshold, both_axes)
 
     def is_valid_drag_distance(
         self,
@@ -397,19 +481,7 @@ class RubberBandBoxConverter:
         if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
             return None
 
-        right = left + width
-        bottom = top + height
-
-        px_min_x = min(float(x1), float(x2))
-        px_max_x = max(float(x1), float(x2))
-        px_min_y = min(float(y1), float(y2))
-        px_max_y = max(float(y1), float(y2))
-
-        cx1 = min(max(px_min_x, left), right)
-        cy1 = min(max(px_min_y, top), bottom)
-        cx2 = min(max(px_max_x, left), right)
-        cy2 = min(max(px_max_y, top), bottom)
-        return (cx1, cy1, cx2, cy2)
+        return _clip_to_parsed_rect(x1, y1, x2, y2, parsed_rect)
 
     def _unpack_call_arguments(
         self,
@@ -525,8 +597,19 @@ class RubberBandBoxConverter:
         if not all(math.isfinite(v) for v in (left, top, width, height)) or width <= 0.0 or height <= 0.0:
             return RubberBandConversionResult(valid=False, reason="invalid_target_rect")
 
-        raw_dx, raw_dy, raw_dist = self.compute_drag_span(px1, py1, px2, py2)
-        drag_ok, drag_reason = self.validate_drag_distance(px1, py1, px2, py2)
+        # D42 fast path: coordinates and rect are already proven finite with
+        # width/height > 0 above, so the unchecked helpers below skip the
+        # redundant finiteness re-checks (6x per call) and the second rect
+        # parse that clip_to_target_rect used to repeat. Behaviour and
+        # rejection reasons are identical to the public helpers.
+        raw_dx, raw_dy, raw_dist = _drag_span_unchecked(px1, py1, px2, py2)
+        drag_ok, drag_reason = _validate_drag_unchecked(
+            raw_dx,
+            raw_dy,
+            raw_dist,
+            self.config.min_drag_px,
+            self.config.require_both_axes,
+        )
         if not drag_ok:
             return RubberBandConversionResult(
                 valid=False,
@@ -536,17 +619,7 @@ class RubberBandBoxConverter:
                 raw_distance_px=raw_dist,
             )
 
-        clipped = self.clip_to_target_rect(px1, py1, px2, py2, parsed_rect)
-        if clipped is None:
-            return RubberBandConversionResult(
-                valid=False,
-                reason="invalid_target_rect",
-                raw_dx_px=raw_dx,
-                raw_dy_px=raw_dy,
-                raw_distance_px=raw_dist,
-            )
-
-        cx1, cy1, cx2, cy2 = clipped
+        cx1, cy1, cx2, cy2 = _clip_to_parsed_rect(px1, py1, px2, py2, parsed_rect)
         clipped_w = cx2 - cx1
         clipped_h = cy2 - cy1
 
@@ -566,7 +639,14 @@ class RubberBandBoxConverter:
             )
 
         if self.config.require_clipped_min_drag:
-            clipped_ok, _ = self.validate_drag_distance(cx1, cy1, cx2, cy2)
+            c_dx, c_dy, c_dist = _drag_span_unchecked(cx1, cy1, cx2, cy2)
+            clipped_ok, _ = _validate_drag_unchecked(
+                c_dx,
+                c_dy,
+                c_dist,
+                self.config.min_drag_px,
+                self.config.require_both_axes,
+            )
             if not clipped_ok:
                 return RubberBandConversionResult(
                     valid=False,
@@ -585,8 +665,10 @@ class RubberBandBoxConverter:
         lo = self.config.min_coord
         hi = self.config.max_coord
 
-        norm_w = self.clamp_normalized_coord(clipped_w / width, lo, hi - lo)
-        norm_h = self.clamp_normalized_coord(clipped_h / height, lo, hi - lo)
+        # Ratios are finite by construction here: clipped sizes are within
+        # the (finite, positive) rect, so every ratio lands in [0, 1].
+        norm_w = _clamp_unchecked(clipped_w / width, lo, hi - lo)
+        norm_h = _clamp_unchecked(clipped_h / height, lo, hi - lo)
         if norm_w <= 0.0 or norm_h <= 0.0:
             return RubberBandConversionResult(
                 valid=False,
@@ -602,8 +684,8 @@ class RubberBandBoxConverter:
                 clipped_h_px=clipped_h,
             )
 
-        norm_cx = self.clamp_normalized_coord(((cx1 + cx2) * 0.5 - left) / width, lo, hi)
-        norm_cy = self.clamp_normalized_coord(((cy1 + cy2) * 0.5 - top) / height, lo, hi)
+        norm_cx = _clamp_unchecked(((cx1 + cx2) * 0.5 - left) / width, lo, hi)
+        norm_cy = _clamp_unchecked(((cy1 + cy2) * 0.5 - top) / height, lo, hi)
 
         return RubberBandConversionResult(
             valid=True,
@@ -741,6 +823,8 @@ class RubberBandBoxConverter:
         """
         Return the clipped ``(left, top, width, height)`` pixel rectangle inside
         ``target_rect`` for rendering the live rubber-band selection overlay.
+        Returns ``None`` when the drag is below the minimum drag threshold
+        (a click / micro-drag must not draw a selection rectangle).
         """
         unpacked = self._unpack_call_arguments(
             a0,
@@ -763,6 +847,9 @@ class RubberBandBoxConverter:
         if clipped is None:
             return None
         cx1, cy1, cx2, cy2 = clipped
+        drag_ok, _ = self.validate_drag_distance(cx1, cy1, cx2, cy2)
+        if not drag_ok:
+            return None
         return (cx1, cy1, max(0.0, cx2 - cx1), max(0.0, cy2 - cy1))
 
     def yolo_to_pixel_rect(
@@ -776,12 +863,16 @@ class RubberBandBoxConverter:
         """
         Project normalized YOLO ``(cx, cy, w, h)`` coordinates onto ``target_rect``,
         returning ``(bx, by, bw_px, bh_px)`` in canvas pixel space.
+        Returns ``None`` for an unparseable rect or non-finite input (an
+        invalid box is not a successful zero-size projection).
         """
         parsed_rect = _parse_target_rect(target_rect)
         if parsed_rect is None:
             return None
         left, top, width, height = parsed_rect
         if width <= 0.0 or height <= 0.0:
+            return None
+        if not all(math.isfinite(v) for v in (cx, cy, w, h)):
             return None
 
         ncx, ncy, nw, nh = self.clamp_yolo_box(cx, cy, w, h)

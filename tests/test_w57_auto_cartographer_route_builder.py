@@ -29,20 +29,50 @@ from core.auto_cartographer import (
 from core.node_quality_gate import (
     HARD_WRONG_CLASS_IDS,
     SPROUT_CLASS_ID,
-    GateVerdict,
     evaluate_node_candidate,
     is_hard_wrong_class,
 )
 from core.route_manager import RouteManager
 
 
+_GAME_FRAME_BASE: np.ndarray | None = None
+
+
 def _make_game_frame_with_minimap(width: int = 1280, height: int = 720) -> np.ndarray:
-    """Create a synthetic 1280x720 game frame with a valid non-occluded minimap ROI."""
-    rng = np.random.default_rng(57)
-    frame = np.full((height, width, 3), (68, 78, 72), dtype=np.uint8)
-    noise = rng.integers(-22, 22, (height, width, 3), dtype=np.int16)
-    frame = np.clip(frame.astype(np.int16) + noise, 25, 220).astype(np.uint8)
-    return frame
+    """Create a synthetic 1280x720 game frame with a valid non-occluded minimap ROI.
+
+    The noisy backdrop is deterministic (seed 57) and identical for every
+    caller, so it is built once and cached; each call returns an owned
+    ``.copy()`` because callers draw on the minimap ROI (test 4) and must
+    never see another test's markings. A copy is ~0.1 ms (median, warmed)
+    vs ~140-290 ms to regenerate the 2.7 Mpx noise field.
+    """
+    global _GAME_FRAME_BASE
+    if _GAME_FRAME_BASE is None or _GAME_FRAME_BASE.shape[:2] != (height, width):
+        rng = np.random.default_rng(57)
+        frame = np.full((height, width, 3), (68, 78, 72), dtype=np.uint8)
+        noise = rng.integers(-22, 22, (height, width, 3), dtype=np.int16)
+        _GAME_FRAME_BASE = np.clip(frame.astype(np.int16) + noise, 25, 220).astype(np.uint8)
+    return _GAME_FRAME_BASE.copy()
+
+
+def _make_route_env(tmp_path: Path, region: str, map_x: float, map_y: float):
+    """Shared RouteManager + AutoCartographer setup for the W57 route tests.
+
+    Returns ``(route_manager, cartographer)`` with auto-cartography enabled
+    and the player positioned at ``(map_x, map_y)``.
+    """
+    rm = RouteManager(base_dir=str(tmp_path), active_region=region)
+    rm.create_region(region)
+    cart = AutoCartographer(
+        route_manager=rm,
+        dedup_radius_px=DEFAULT_DEDUP_RADIUS_PX,
+        initial_map_x=map_x,
+        initial_map_y=map_y,
+    )
+    cart.enable_auto_cartography(True)
+    cart.set_position(map_x, map_y)
+    return rm, cart
 
 
 def _make_clean_sprout_patch_80() -> np.ndarray:
@@ -122,18 +152,8 @@ def test_minimap_sprout_class_9_recorded_and_connected_to_autonomous_route_graph
     assert SPROUT_CLASS_ID == 9
     assert not is_hard_wrong_class(SPROUT_CLASS_ID)
 
-    rm = RouteManager(base_dir=str(tmp_path), active_region="Verteron")
-    rm.create_region("Verteron")
-    cart = AutoCartographer(
-        route_manager=rm,
-        dedup_radius_px=DEFAULT_DEDUP_RADIUS_PX,
-        initial_map_x=500.0,
-        initial_map_y=400.0,
-    )
+    rm, cart = _make_route_env(tmp_path, "Verteron", 500.0, 400.0)
     assert cart.dedup_radius_px == pytest.approx(22.0)
-
-    cart.enable_auto_cartography(True)
-    cart.set_position(500.0, 400.0)
 
     patch_80 = _make_clean_sprout_patch_80()
     # Evaluate with model verdict returning class 9 (minimap sprout)
@@ -159,9 +179,11 @@ def test_minimap_sprout_class_9_recorded_and_connected_to_autonomous_route_graph
         "class_id": 9,
     }
 
-    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80), patch(
-        "core.auto_cartographer.evaluate_node_candidate", return_value=verdict
-    ):
+    # The gate itself is NOT mocked here: process_frame_discoveries runs the
+    # real evaluate_node_candidate on the extracted patch (only the minimap
+    # crop is stubbed, as a fixture). The direct call above already proved
+    # the real gate accepts this sprout patch.
+    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80):
         discovered = cart.process_frame_discoveries(
             frame,
             detected_materials=[sprout_det],
@@ -190,24 +212,17 @@ def test_minimap_sprouts_deduplicated_within_22px_radius_across_roaming_frames(t
     into a single node with Kalman/EMA coordinate refinement, while a sprout > 22px away
     creates a second distinct node.
     """
-    rm = RouteManager(base_dir=str(tmp_path), active_region="Verteron")
-    rm.create_region("Verteron")
-    cart = AutoCartographer(
-        route_manager=rm,
-        dedup_radius_px=22.0,
-        initial_map_x=600.0,
-        initial_map_y=500.0,
-    )
-    cart.enable_auto_cartography(True)
-    cart.set_position(600.0, 500.0)
+    rm, cart = _make_route_env(tmp_path, "Verteron", 600.0, 500.0)
 
     patch_80 = _make_clean_sprout_patch_80()
-    accept_gate = GateVerdict(accept=True, raw_class_id=9, confidence=0.90)
     frame = _make_game_frame_with_minimap()
 
-    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80), patch(
-        "core.auto_cartographer.evaluate_node_candidate", return_value=accept_gate
-    ):
+    # The gate itself is NOT mocked here: the real evaluate_node_candidate
+    # decides on the extracted patch (only the minimap crop is stubbed).
+    # The dedup assertions below therefore prove real Kalman/EMA refinement:
+    # after the second sighting the tracked node must have moved TOWARD the
+    # new observation (620,510) -> (634,519) and sightings_count must be 2.
+    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80):
         # Frame 1: Two simultaneous sprout (9) detections 12px apart -> clustered into 1 node near (620, 510)
         batch_1 = [
             {
@@ -249,6 +264,10 @@ def test_minimap_sprouts_deduplicated_within_22px_radius_across_roaming_frames(t
         tracked_after_f2 = cart.get_tracked_nodes(region="Verteron")
         assert len(tracked_after_f2) == 1
         assert tracked_after_f2[0]["sightings_count"] == 2
+        # Kalman/EMA refinement: the tracked position moved from the first
+        # observation (620, 510) toward the second (634, 519).
+        assert 620.0 < float(tracked_after_f2[0]["map_x"]) < 634.0
+        assert 510.0 < float(tracked_after_f2[0]["map_y"]) < 519.0
 
         # Frame 3: Player walks further to (650, 505) and discovers a new sprout at (710, 560),
         # > 22.0px away in map coords and > 36px in relative offset -> must be recorded as node #2!
@@ -280,16 +299,7 @@ def test_minimap_monster_dot_class_11_rejected_by_quality_gate_and_never_added_t
     assert 11 in HARD_WRONG_CLASS_IDS
     assert is_hard_wrong_class(11) is True
 
-    rm = RouteManager(base_dir=str(tmp_path), active_region="Altgard")
-    rm.create_region("Altgard")
-    cart = AutoCartographer(
-        route_manager=rm,
-        dedup_radius_px=22.0,
-        initial_map_x=400.0,
-        initial_map_y=300.0,
-    )
-    cart.enable_auto_cartography(True)
-    cart.set_position(400.0, 300.0)
+    rm, cart = _make_route_env(tmp_path, "Altgard", 400.0, 300.0)
 
     patch_80 = _make_clean_sprout_patch_80()
     # Evaluate candidate when detector classifies it as class 11 (Minimap Monster)
@@ -315,15 +325,26 @@ def test_minimap_monster_dot_class_11_rejected_by_quality_gate_and_never_added_t
         "class_id": 11,
     }
 
-    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80), patch(
-        "core.auto_cartographer.evaluate_node_candidate", return_value=monster_verdict
-    ):
+    # F-1389 FIXED (R11): the gate is NOT stubbed here any more. Production
+    # now forwards the detection's class_id to the gate as model_verdict
+    # (core/auto_cartographer.py: _parse_material_detection preserves
+    # class_id, _register_parsed_detections passes model_verdict, and
+    # record_node accepts class_id) — so the real gate rejects class 11
+    # with reason "model" on both legs below. Only the minimap crop is
+    # stubbed, as a fixture.
+    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80):
         discovered = cart.process_frame_discoveries(
             frame,
             detected_materials=[monster_det],
             route_manager=rm,
             region="Altgard",
         )
+        # NOTE: confidence=0.88 is REQUIRED here, not incidental. Without a
+        # measured confidence, record_node takes the H-sweep K3 early return
+        # ("güven verilmediyse kayıt yok") BEFORE the quality gate runs, so
+        # the class-11 rejection is never counted in total_gate_rejected
+        # and the `>= 2` assertion below fails with 1. With confidence the
+        # real gate runs with model_verdict=(11, 0.88) and rejects it.
         recorded_direct = cart.record_node(
             patch=patch_80,
             map_x=425.0,
@@ -331,6 +352,8 @@ def test_minimap_monster_dot_class_11_rejected_by_quality_gate_and_never_added_t
             source_type="minimap_auto",
             route_manager=rm,
             region="Altgard",
+            class_id=11,
+            confidence=0.88,
         )
 
     assert discovered == []
@@ -347,16 +370,7 @@ def test_minimap_cv_detector_accepts_3_leaf_sprout_and_filters_out_circular_mons
     detect only the 3-leaf white sprout icon (class 9 geometry) while ignoring circular
     white and red monster dots (class 11 geometry).
     """
-    rm = RouteManager(base_dir=str(tmp_path), active_region="PilgrimsRidge")
-    rm.create_region("PilgrimsRidge")
-    cart = AutoCartographer(
-        route_manager=rm,
-        dedup_radius_px=22.0,
-        initial_map_x=800.0,
-        initial_map_y=600.0,
-    )
-    cart.enable_auto_cartography(True)
-    cart.set_position(800.0, 600.0)
+    rm, cart = _make_route_env(tmp_path, "PilgrimsRidge", 800.0, 600.0)
 
     frame = _make_game_frame_with_minimap(1280, 720)
     x1, y1, x2, y2 = cart._get_minimap_pixel_rect(1280, 720)
@@ -376,10 +390,10 @@ def test_minimap_cv_detector_accepts_3_leaf_sprout_and_filters_out_circular_mons
     assert math.hypot(det["minimap_x"] - sprout_icx, det["minimap_y"] - sprout_icy) <= 2.0
 
     patch_80 = _make_clean_sprout_patch_80()
-    accept_gate = GateVerdict(accept=True, raw_class_id=9, confidence=0.89)
-    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80), patch(
-        "core.auto_cartographer.evaluate_node_candidate", return_value=accept_gate
-    ):
+    # The gate itself is NOT mocked here: record_from_minimap runs the real
+    # evaluate_node_candidate on the extracted patch (only the minimap crop
+    # is stubbed, as a fixture).
+    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80):
         recorded = cart.record_from_minimap(
             frame,
             route_manager=rm,
@@ -400,28 +414,18 @@ def test_autonomous_roaming_mixed_sprout_9_and_monster_11_stream_builds_clean_de
     a second stacked sprout (9) further along the route. Verify that the final route graph
     and persisted region_data.json contain only the 2 deduplicated sprout nodes and 0 monsters.
     """
-    rm = RouteManager(base_dir=str(tmp_path), active_region="Heiron")
-    rm.create_region("Heiron")
-    cart = AutoCartographer(
-        route_manager=rm,
-        dedup_radius_px=22.0,
-        initial_map_x=300.0,
-        initial_map_y=300.0,
-    )
-    cart.enable_auto_cartography(True)
+    rm, cart = _make_route_env(tmp_path, "Heiron", 300.0, 300.0)
 
     patch_80 = _make_clean_sprout_patch_80()
     frame = _make_game_frame_with_minimap()
 
-    def _mock_gate(patch_img, **kwargs):
-        res_type = str(kwargs.get("resource_type", ""))
-        if "monster" in res_type.lower():
-            return GateVerdict(accept=False, reasons=["model", "monster"], class_id=11, raw_class_id=11, confidence=0.92)
-        return GateVerdict(accept=True, raw_class_id=9, confidence=0.91)
-
-    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80), patch(
-        "core.auto_cartographer.evaluate_node_candidate", side_effect=_mock_gate
-    ):
+    # F-1390 FIXED (R11): the gate is NOT stubbed here any more — the real
+    # evaluate_node_candidate runs on every leg. Production now forwards
+    # each detection's class_id as model_verdict, so the monster leg
+    # (class_id 11) is genuinely rejected with reason "model" while the
+    # sprout legs (class_id 9) are accepted. Only the minimap crop is
+    # stubbed, as a fixture.
+    with patch.object(cart, "extract_clean_minimap_patch", return_value=patch_80):
         # Step 1: Start at (300, 300) -> Waypoint #1 created; see Sprout #1 at (305, 310) and a Monster (11) at (340, 290)
         cart.set_position(300.0, 300.0)
         cart.process_frame_discoveries(

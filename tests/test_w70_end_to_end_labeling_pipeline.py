@@ -27,19 +27,27 @@ import numpy as np
 import pytest
 import yaml
 from PyQt6.QtCore import QEvent, QPointF, Qt
-from PyQt6.QtGui import QImage, QKeyEvent, QMouseEvent
+from PyQt6.QtGui import QImage, QKeyEvent, QMouseEvent, QColor
 from PyQt6.QtWidgets import QApplication
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-_app = QApplication.instance()
-if _app is None:
-    _app = QApplication(sys.argv)
+
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_qapplication():
+    """Create the QApplication lazily (once per session), not at import time."""
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    yield app
+
+
+from dataset_factory.exemplar_memory import get_exemplar_memory
 
 import dataset_factory.approved_pool as approved_pool_mod
-from dataset_factory.approved_pool import ApprovedDatasetPool, CORE_22_CANONICAL_NAMES
+from dataset_factory.approved_pool import ApprovedDatasetPool, CANONICAL_NAMES
 from dataset_factory.manual_tag_search import (
     create_manual_annotation_box,
     get_tag_registry,
@@ -91,6 +99,48 @@ def _create_synthetic_game_frame(
     return frame
 
 
+def _drag_manual_box_on_canvas(canvas, x1_frac, y1_frac, x2_frac, y2_frac):
+    """Simulate a real mouse drag on the review canvas (press/move/release).
+
+    Fractions are relative to the canvas target rect; the resulting box is
+    (cx=(x1+x2)/2, cy=(y1+y2)/2, w=x2-x1, h=y2-y1) in the same fractions.
+    """
+    trect = canvas._compute_target_rect()
+    canvas._last_target_rect = trect
+    start_pt = QPointF(trect.left() + trect.width() * x1_frac, trect.top() + trect.height() * y1_frac)
+    end_pt = QPointF(trect.left() + trect.width() * x2_frac, trect.top() + trect.height() * y2_frac)
+
+    press_evt = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        start_pt,
+        start_pt,
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    move_evt = QMouseEvent(
+        QEvent.Type.MouseMove,
+        end_pt,
+        end_pt,
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    release_evt = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        end_pt,
+        end_pt,
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+    canvas.mousePressEvent(press_evt)
+    canvas.mouseMoveEvent(move_evt)
+    canvas.mouseReleaseEvent(release_evt)
+    QApplication.processEvents()
+
+
 @pytest.fixture
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Provide an isolated dataset directory, ApprovedDatasetPool, and YOLOFactoryDialog."""
@@ -109,8 +159,17 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     dlg = YOLOFactoryDialog()
     dlg._auto_confirm_dialogs = True
     dlg._dataset_dir = lambda: dataset_dir  # type: ignore[assignment]
-    dlg._learn_box_exemplar = lambda *args, **kwargs: None  # type: ignore[assignment]
+    # NOTE: _learn_box_exemplar is intentionally NOT stubbed here: the real
+    # exemplar learning must run so approve/manual flows are actually tested
+    # (F-1521). It writes to the global learned_exemplars.json; the scratch
+    # clone reverts that file before commit.
     dlg._go_step(2)
+    # [YOLO-ASYNC] Adım 2 kuyruğu worker'da dolar; test gövdesi kuyruğu
+    # senkron okumadan önce yüklemenin bitmesini bekle, sonra tmp_path
+    # taramasını senkron tazele (başlangıç yüklemesi üretim dizinini
+    # taramış olabilir — _go_step isteği düşmüşse kuyruk üretim verisi kalır).
+    assert dlg.wait_for_yolo_load(), "async kuyruk yüklemesi 10 sn'de bitmedi"
+    dlg._reload_review_queue()
     return dlg, dataset_dir, pool
 
 
@@ -152,51 +211,50 @@ def test_1_auto_labeling_to_review_queue_integration(isolated_env) -> None:
     item = dlg._review_items[0]
     assert item["stem"] == stem
 
-    # Inject a deterministic auto-label return to verify dialog categorization (Emin vs Şüpheli)
-    simulated_auto_anns = [
-        {
-            "class_id": 6,
-            "class_name": "world_gather_crest",
-            "cx": 0.45,
-            "cy": 0.45,
-            "w": 0.08,
-            "h": 0.10,
-            "confidence": 0.94,
-            "source": "gather_crest_template",
-        },
-        {
-            "class_id": 3,
-            "class_name": "ore_orichalcum",
-            "cx": 0.41,
-            "cy": 0.50,
-            "w": 0.10,
-            "h": 0.12,
-            "confidence": 0.62,
-            "source": "salient_3d_resource",
-            "trusted": False,
-            "weak": True,
-        },
-    ]
-    orig_auto_label = YOLOAutoLabeler.auto_label_frame
-    try:
-        YOLOAutoLabeler.auto_label_frame = lambda self, *a, **kw: simulated_auto_anns  # type: ignore[assignment]
-        n_boxes = dlg._relabel_single_item(item)
-    finally:
-        YOLOAutoLabeler.auto_label_frame = orig_auto_label  # type: ignore[assignment]
+    # 2. Load into dialog review queue and run _relabel_single_item with the
+    # REAL auto-labeler (no monkeypatched return): the dialog must categorize
+    # exactly what the real labeler produced on this frame. The reference
+    # call mirrors _relabel_single_item exactly (disk image, fast_mode=True,
+    # source_path) — a different call can legitimately return different anns.
+    # The same labeler instance is reused: auto_label_frame is stateless
+    # across calls (no per-call instance state), so a second construction
+    # would only re-pay the VisionEngine/MaterialScanner/MinimapScanner init.
+    disk_img = dlg._imread_cached(img_path)
+    assert disk_img is not None and getattr(disk_img, "size", 0) > 0
+    real_anns = labeler.auto_label_frame(disk_img, fast_mode=True, source_path=img_path)
+    assert len(real_anns) >= 1, "Real auto-labeler found nothing on the synthetic frame"
+    # Expected split uses the dialog's own Emin rule (conf >= threshold, or
+    # hand/approved/exemplar/crest evidence) applied to the real anns.
+    emin_th = dlg._bulk_threshold() if hasattr(dlg, "bulk_range") else 0.85
 
-    assert n_boxes == 2
-    assert len(item["trusted"]) == 1
-    assert len(item["weak"]) == 1
-    assert item["trusted"][0]["class_id"] == 6
-    assert item["weak"][0]["class_id"] == 3
+    def _is_emin(a):
+        return (
+            a.get("hand_label") is True
+            or a.get("human_approved") is True
+            or a.get("approved") is True
+            or a.get("exemplar_match") is True
+            or float(a.get("confidence", a.get("conf", 0.0)) or 0.0) >= emin_th
+            or str(a.get("source", "")).startswith("gather_crest")
+        )
+
+    exp_trusted = [a for a in real_anns if _is_emin(a)]
+    exp_weak = [a for a in real_anns if not _is_emin(a)]
+
+    n_boxes = dlg._relabel_single_item(item)
+
+    assert n_boxes == len(real_anns)
+    assert len(item["trusted"]) == len(exp_trusted)
+    assert len(item["weak"]) == len(exp_weak)
+    assert [b["class_id"] for b in item["trusted"]] == [a["class_id"] for a in exp_trusted]
+    assert [b["class_id"] for b in item["weak"]] == [a["class_id"] for a in exp_weak]
     assert item["done"] is None
 
     # Verify review JSON was persisted to disk
     rev_json = dataset_dir / "review" / "train" / f"{stem}.json"
     assert rev_json.is_file()
     saved = json.loads(rev_json.read_text(encoding="utf-8"))
-    assert len(saved["trusted"]) == 1
-    assert len(saved["weak"]) == 1
+    assert len(saved["trusted"]) == len(exp_trusted)
+    assert len(saved["weak"]) == len(exp_weak)
 
 
 # ============================================================================
@@ -265,25 +323,58 @@ def test_2_three_tier_color_coding_green_orange_red_integration(isolated_env) ->
     dlg._reload_review_queue()
     dlg._render_review_frame()
 
+    def _conf_label_text_color_px(row, expected_rgb, min_px=10):
+        """Render a review row offscreen and count pixels near `expected_rgb`
+        inside the confidence label: the tier colour must actually be PAINTED,
+        not merely present in a stylesheet string."""
+        row.resize(500, 60)
+        row.layout().activate()
+        QApplication.processEvents()
+        conf_lbl = row.findChild(object, "PipeDetConf")
+        assert conf_lbl is not None
+        image = QImage(row.size(), QImage.Format.Format_ARGB32)
+        image.fill(QColor(0, 0, 0, 255))
+        row.render(image)
+        ptr = image.bits()
+        ptr.setsize(image.sizeInBytes())
+        px = np.frombuffer(ptr, dtype=np.uint8).reshape(
+            image.height(), image.width(), 4
+        ).copy()
+        geom = conf_lbl.geometry()
+        sub = px[geom.top() : geom.bottom() + 1, geom.left() : geom.right() + 1]
+        # ARGB32 little-endian bytes are (B, G, R, A).
+        dist = (
+            np.abs(sub[:, :, 2].astype(int) - expected_rgb[0])
+            + np.abs(sub[:, :, 1].astype(int) - expected_rgb[1])
+            + np.abs(sub[:, :, 0].astype(int) - expected_rgb[2])
+        )
+        return int(np.count_nonzero(dist < 90)), min_px
+
     # Check detail rows for each tier
     row_green = dlg._create_review_det_row(tier1_green_box, is_trusted=True)
     conf_green = row_green.findChild(object, "PipeDetConf")
     assert conf_green is not None
-    assert "#4ade80" in conf_green.styleSheet()
+    assert conf_green.text() == "%93"
+    n_green, _ = _conf_label_text_color_px(row_green, (74, 222, 128))  # #4ade80
+    assert n_green >= 10, f"Tier-1 green text not painted (near-green px: {n_green})"
     texts_green = [w.text() for w in row_green.findChildren(object) if hasattr(w, "text")]
     assert any("Emin · %93 güven" in t for t in texts_green)
 
     row_orange = dlg._create_review_det_row(tier2_orange_box, is_trusted=False)
     conf_orange = row_orange.findChild(object, "PipeDetConf")
     assert conf_orange is not None
-    assert "#fb923c" in conf_orange.styleSheet()
+    assert conf_orange.text() == "%76"
+    n_orange, _ = _conf_label_text_color_px(row_orange, (251, 146, 60))  # #fb923c
+    assert n_orange >= 10, f"Tier-2 orange text not painted (near-orange px: {n_orange})"
     texts_orange = [w.text() for w in row_orange.findChildren(object) if hasattr(w, "text")]
     assert any("Şüpheli · %76 güven" in t for t in texts_orange)
 
     row_red = dlg._create_review_det_row(tier3_red_box, is_trusted=False)
     conf_red = row_red.findChild(object, "PipeDetConf")
     assert conf_red is not None
-    assert "#ef4444" in conf_red.styleSheet()
+    assert conf_red.text() == "%48"
+    n_red, _ = _conf_label_text_color_px(row_red, (248, 113, 113))  # #f87171 (tier-3 text)
+    assert n_red >= 10, f"Tier-3 red text not painted (near-red px: {n_red})"
     texts_red = [w.text() for w in row_red.findChildren(object) if hasattr(w, "text")]
     assert any("Düşük Güven (Şüpheli) · %48 güven" in t for t in texts_red)
 
@@ -353,47 +444,32 @@ def test_3_manual_tag_search_and_box_drawing_integration(isolated_env) -> None:
     # Clear focus from search input so canvas / shortcuts behave normally
     dlg.manual_tag_search.clearFocus()
 
-    # 3. Simulate mouse drag on review_preview canvas to draw a manual bounding box
+    # 3. Simulate mouse drag on review_preview canvas to draw a manual bounding box.
+    # The real _learn_box_exemplar must run (not stubbed). Learning is verified
+    # with a recording wrapper around the REAL add_positive_exemplar (the real
+    # method still runs and persists): the dialog must invoke it for class 3
+    # with source "manual_draw". A plain before/after count is NOT used —
+    # add_positive_exemplar dedupes an identical crop learned in an earlier
+    # run, so the count need not grow on re-runs.
+    exemplar_mem = get_exemplar_memory()
+    learn_calls = []
+    _real_add_positive = exemplar_mem.add_positive_exemplar
+
+    def _recording_add_positive(crop, class_id, class_name, source="ui_approval", **kw):
+        learn_calls.append((int(class_id), str(class_name), str(source)))
+        return _real_add_positive(crop, class_id, class_name, source=source, **kw)
+
     canvas = dlg.review_preview
     canvas.resize(800, 500)
     canvas.set_live_frame(frame, badge="manual_test", annotations=[])
     canvas.active_drawing_class_id = 3
     canvas.active_drawing_class_name = "ore_orichalcum"
 
-    trect = canvas._compute_target_rect()
-    canvas._last_target_rect = trect
-    start_pt = QPointF(trect.left() + trect.width() * 0.30, trect.top() + trect.height() * 0.30)
-    end_pt = QPointF(trect.left() + trect.width() * 0.50, trect.top() + trect.height() * 0.55)
-
-    press_evt = QMouseEvent(
-        QEvent.Type.MouseButtonPress,
-        start_pt,
-        start_pt,
-        Qt.MouseButton.LeftButton,
-        Qt.MouseButton.LeftButton,
-        Qt.KeyboardModifier.NoModifier,
-    )
-    move_evt = QMouseEvent(
-        QEvent.Type.MouseMove,
-        end_pt,
-        end_pt,
-        Qt.MouseButton.NoButton,
-        Qt.MouseButton.LeftButton,
-        Qt.KeyboardModifier.NoModifier,
-    )
-    release_evt = QMouseEvent(
-        QEvent.Type.MouseButtonRelease,
-        end_pt,
-        end_pt,
-        Qt.MouseButton.LeftButton,
-        Qt.MouseButton.NoButton,
-        Qt.KeyboardModifier.NoModifier,
-    )
-
-    canvas.mousePressEvent(press_evt)
-    canvas.mouseMoveEvent(move_evt)
-    canvas.mouseReleaseEvent(release_evt)
-    QApplication.processEvents()
+    exemplar_mem.add_positive_exemplar = _recording_add_positive  # type: ignore[method-assign]
+    try:
+        _drag_manual_box_on_canvas(canvas, 0.30, 0.30, 0.50, 0.55)
+    finally:
+        exemplar_mem.add_positive_exemplar = _real_add_positive  # type: ignore[method-assign]
 
     # Verify manual box was added to current review item's trusted list and saved to disk
     current_item = dlg._review_items[dlg._review_index]
@@ -415,6 +491,12 @@ def test_3_manual_tag_search_and_box_drawing_integration(isolated_env) -> None:
     assert len(saved_payload["trusted"]) == 1
     assert saved_payload["trusted"][0]["class_id"] == 3
     assert saved_payload["trusted"][0]["hand_label"] is True
+
+    # Exemplar learning really happened for the manual box: the dialog invoked
+    # the real add_positive_exemplar for class 3 with source "manual_draw".
+    assert (3, "ore_orichalcum", "manual_draw") in learn_calls, (
+        f"Manual box was not learned as a class-3 positive exemplar; learn calls: {learn_calls}"
+    )
 
 
 # ============================================================================
@@ -464,7 +546,20 @@ def test_4_approve_and_queue_deduction_persistence_integration(isolated_env) -> 
     assert dlg._pending_count() == 3
     assert dlg.queue_list.count() == 3
 
+    # Approve flows must really learn exemplars (real _learn_box_exemplar,
+    # not stubbed): record the real add_positive_exemplar invocations.
+    exemplar_mem = get_exemplar_memory()
+    learn_calls = []
+    _real_add_positive = exemplar_mem.add_positive_exemplar
+
+    def _recording_add_positive(crop, class_id, class_name, source="ui_approval", **kw):
+        learn_calls.append((int(class_id), str(source)))
+        return _real_add_positive(crop, class_id, class_name, source=source, **kw)
+
+    exemplar_mem.add_positive_exemplar = _recording_add_positive  # type: ignore[method-assign]
+
     first_stem = dlg._review_items[0]["stem"]
+    first_cid = int(dlg._review_items[0]["weak"][0]["class_id"])
 
     # Approve first item via 'A' keyPressEvent
     key_a = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_A, Qt.KeyboardModifier.NoModifier, "A")
@@ -480,8 +575,18 @@ def test_4_approve_and_queue_deduction_persistence_integration(isolated_env) -> 
 
     # Approve second item via _on_step2_approve()
     second_stem = dlg._review_items[0]["stem"]
+    second_cid = int(dlg._review_items[0]["weak"][0]["class_id"])
     dlg._on_step2_approve()
     QApplication.processEvents()
+    exemplar_mem.add_positive_exemplar = _real_add_positive  # type: ignore[method-assign]
+
+    # Both approvals learned their weak boxes as positives.
+    assert (first_cid, "user_frame_approve") in learn_calls, (
+        f"Approve did not learn class {first_cid}: {learn_calls}"
+    )
+    assert (second_cid, "user_frame_approve") in learn_calls, (
+        f"Approve did not learn class {second_cid}: {learn_calls}"
+    )
 
     assert len(dlg._review_items) == 1
     assert dlg._pending_count() == 1
@@ -618,17 +723,30 @@ def test_5_end_to_end_pipeline_to_approved_dataset_pool_and_yaml(isolated_env) -
     assert int(dlg.manual_tag_combo.currentData()) == 10
     dlg.manual_tag_search.clearFocus()
 
-    dlg._on_manual_box_added(
-        {
-            "class_id": 10,
-            "class_name": "monster_3d",
-            "cx": 0.60,
-            "cy": 0.55,
-            "w": 0.18,
-            "h": 0.22,
-        }
+    # Draw the manual box with a real mouse drag on the canvas (same path a
+    # user takes), instead of calling _on_manual_box_added directly. The drag
+    # spans target-rect fractions x 0.51->0.69, y 0.44->0.66, i.e. the box
+    # (cx 0.60, cy 0.55, w 0.18, h 0.22) for class 10 (monster_3d).
+    frame_manual = cv2.imread(
+        str(dataset_dir / "images" / "train" / "e2e_frame_manual_approved.jpg")
     )
+    assert frame_manual is not None
+    canvas = dlg.review_preview
+    canvas.resize(800, 500)
+    canvas.set_live_frame(frame_manual, badge="manual_test", annotations=[])
+    canvas.active_drawing_class_id = 10
+    canvas.active_drawing_class_name = "monster_3d"
+
+    _drag_manual_box_on_canvas(canvas, 0.51, 0.44, 0.69, 0.66)
+
     assert len(dlg._review_items[dlg._review_index]["trusted"]) == 1
+    manual_box = dlg._review_items[dlg._review_index]["trusted"][0]
+    assert manual_box["class_id"] == 10
+    assert manual_box["class_name"] == "monster_3d"
+    assert abs(float(manual_box["cx"]) - 0.60) < 0.03
+    assert abs(float(manual_box["cy"]) - 0.55) < 0.03
+    assert abs(float(manual_box["w"]) - 0.18) < 0.03
+    assert abs(float(manual_box["h"]) - 0.22) < 0.03
     dlg._on_step2_approve()
 
     # Queue must now only have the 1 unapproved suspect frame left
@@ -650,24 +768,33 @@ def test_5_end_to_end_pipeline_to_approved_dataset_pool_and_yaml(isolated_env) -
     assert not (pool.images_train_dir / "e2e_frame_unapproved_suspect.jpg").exists()
     assert not (pool.labels_train_dir / "e2e_frame_unapproved_suspect.txt").exists()
 
-    # Verify YOLO label files in approved pool
+    # Verify YOLO label files in approved pool (line order is not specified;
+    # compare as sets).
     lbl_auto = (pool.labels_train_dir / "e2e_frame_auto_approved.txt").read_text(encoding="utf-8").strip().splitlines()
     assert len(lbl_auto) == 2
-    assert lbl_auto[0].startswith("0 0.400000 0.450000 0.140000 0.180000")
-    assert lbl_auto[1].startswith("9 0.880000 0.150000 0.040000 0.040000")
+    assert set(lbl_auto) == {
+        "0 0.400000 0.450000 0.140000 0.180000",
+        "9 0.880000 0.150000 0.040000 0.040000",
+    }
 
     lbl_manual = (pool.labels_train_dir / "e2e_frame_manual_approved.txt").read_text(encoding="utf-8").strip().splitlines()
     assert len(lbl_manual) == 1
     assert lbl_manual[0].startswith("10 0.600000 0.550000 0.180000 0.220000")
 
-    # Verify data_approved.yaml structure and canonical 22 training classes
+    # Verify data_approved.yaml structure and canonical 27 classes (D38:
+    # the approved pool emits CANONICAL_NAMES; the stale nc==22 pinned the
+    # pre-D38 22-class set).
     yaml_path = Path(summary["data_yaml_path"])
     assert yaml_path.is_file()
     assert yaml_path.name == "data_approved.yaml"
     parsed_yaml = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    assert parsed_yaml["path"] == pool.pool_root.as_posix()
+    # B-09 DÜZELTME (2026-11-10, canlı kanıt): Ultralytics path'i
+    # yaml'ın dizinine göre DEĞİL, CWD'ye göre çözer; bu yüzden `path`
+    # yaml'ın klasörünün MUTLAK yoludur (forward-slash).
+    assert Path(parsed_yaml["path"]).is_absolute()
+    assert parsed_yaml["path"] == yaml_path.parent.resolve().as_posix()
     assert parsed_yaml["train"] == "images/train"
     assert parsed_yaml["val"] == "images/val"
-    assert parsed_yaml["nc"] == 22
-    for cid, cname in CORE_22_CANONICAL_NAMES.items():
+    assert parsed_yaml["nc"] == 27
+    for cid, cname in CANONICAL_NAMES.items():
         assert parsed_yaml["names"][cid] == cname

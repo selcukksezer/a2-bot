@@ -4,12 +4,15 @@ Agent G3 Verification Test Suite.
 Tests Route Creation, F8 Hotkey Recording, Snap-to-Path, Deduplication, Sequence Indexing, and Atomic Persistence.
 """
 
+import glob
 import json
 import math
 import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
+
 import numpy as np
 
 from core.route_manager import (
@@ -21,6 +24,30 @@ from core.route_manager import (
     SnapResult,
     get_route_manager_capabilities,
 )
+
+
+def _region_dir(base_dir: str, region: str) -> str:
+    """Herhangi bir özel yardımcıya dayanmadan bölgenin disk dizini.
+
+    Düzen, `RouteManager.save_region` belgesindeki herkese açık düzendir:
+    `<base_dir>/<region>/region_data.json`.
+    """
+    return os.path.join(base_dir, region)
+
+
+def _region_json_path(base_dir: str, region: str) -> str:
+    return os.path.join(_region_dir(base_dir, region), "region_data.json")
+
+
+def _patch_disk_path(base_dir: str, node) -> str:
+    """Node'un herkese açık `patch_path` alanından disk yolunu türetir.
+
+    `patch_path` (`routes/<region>/patches/node_<id>.png`) kalıcı, serileşen
+    bir alandır; diskteki karşılığı `<base_dir>/<region>/patches/` altındadır.
+    """
+    return os.path.join(
+        _region_dir(base_dir, node.region), "patches", os.path.basename(node.patch_path)
+    )
 
 
 class MockOdometryTracker:
@@ -37,6 +64,18 @@ class MockOdometryTracker:
 
 
 class MockVisionEngine:
+    """Gerçek minimap tespit yolunu kullanan sahte görüş motoru.
+
+    Bilinçli olarak `find_player_on_map` TANIMLANMAZ: üretim kodu
+    (`RouteManager.record_current_node`) bu yöntem varsa onu öncelikli
+    kullanır ve karedeki gerçek minimap tespitini atlar. Bu mock'ta yöntem
+    olmadığı için kayıt akışı kareyi tarayan gerçek
+    `_locate_minimap_player_center` + odometri yolundan geçer; oyuncu
+    dünya koordinatı odometri izleyiciden gelir. `grab_frame` minimap
+    merkezine parlak oyuncu oku çizer ki tespit edilecek gerçek bir
+    sinyal olsun.
+    """
+
     def __init__(self, w: int = 1920, h: int = 1080, player_pos=(500, 500)):
         self.screen_w = w
         self.screen_h = h
@@ -52,9 +91,6 @@ class MockVisionEngine:
 
     def is_map_open(self, frame=None):
         return False
-
-    def find_player_on_map(self, frame=None):
-        return self.player_pos
 
 
 class TestRouteManagerG3(unittest.TestCase):
@@ -78,6 +114,10 @@ class TestRouteManagerG3(unittest.TestCase):
     def test_f8_waypoint_recording_basic(self):
         """F8 records a node, saves 80x80 patch, sets max_harvests=3 and seq_index=1."""
         vision = MockVisionEngine(player_pos=(400, 300))
+        # Kısayol koruması: mock gerçek minimap tespitini atlayan
+        # find_player_on_map yöntemini sağlamamalı; kayıt, kare taraması +
+        # odometri yolundan geçmeli.
+        self.assertFalse(hasattr(vision, "find_player_on_map"))
         node = self.rm.record_current_node(
             input_ctrl=None,
             vision_engine=vision,
@@ -96,17 +136,40 @@ class TestRouteManagerG3(unittest.TestCase):
         self.assertEqual(node.map_x, 400)
         self.assertEqual(node.map_y, 300)
 
-        # Check patch file existence on disk
-        disk_patch = self.rm._resolve_patch_disk_path(node)
+        # Check patch file existence on disk (herkese açık patch_path'ten türetilir)
+        self.assertTrue(node.patch_path.endswith(f"patches/node_{node.id}.png"))
+        disk_patch = _patch_disk_path(self.temp_dir, node)
         self.assertTrue(os.path.isfile(disk_patch))
 
         # Check region_data.json existence and content
-        json_path = self.rm._get_region_json_path("Verteron")
+        json_path = _region_json_path(self.temp_dir, "Verteron")
         self.assertTrue(os.path.isfile(json_path))
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         self.assertEqual(len(data["nodes"]), 1)
         self.assertEqual(data["nodes"][0]["seq_index"], 1)
+
+    def test_minimap_player_arrow_detected_from_frame(self):
+        """Gerçek minimap tespiti karedeki parlak oku bulur, varsayılanı dönmez.
+
+        Mock artık `find_player_on_map` kısayolunu sağlamadığı için bu test,
+        üretim tespitçisinin (`_locate_minimap_player_center`) pikselleri
+        gerçekten taradığını kanıtlar: ok varsayılan merkezden kaydırılınca
+        tespit de kayar.
+        """
+        vision = MockVisionEngine(player_pos=(400, 300))
+        frame = vision.grab_frame()
+        cx, cy = self.rm._locate_minimap_player_center(frame)
+        self.assertAlmostEqual(cx, round(1920 * 0.923), delta=5)
+        self.assertAlmostEqual(cy, round(1080 * 0.165), delta=5)
+
+        # Oku arama penceresi içinde kaydır (±24 px pencere): tespit kaymalı.
+        shifted = np.full((1080, 1920, 3), 120, dtype=np.uint8)
+        shifted[165 - 5 : 165 + 5, 1760 - 5 : 1760 + 5] = [255, 255, 255]
+        sx, sy = self.rm._locate_minimap_player_center(shifted)
+        self.assertAlmostEqual(sx, 1760, delta=5)
+        self.assertAlmostEqual(sy, 165, delta=5)
+        self.assertNotEqual((sx, sy), (cx, cy))
 
     def test_f8_waypoint_recording_rapid_duplicate_prevention(self):
         """Rapid duplicate F8 clicks while stationary return existing node without spamming duplicates."""
@@ -239,7 +302,7 @@ class TestRouteManagerG3(unittest.TestCase):
         self.assertEqual(all_nodes[3].seq_index, 4)
 
         # Verify disk persistence of seq_index
-        json_path = self.rm._get_region_json_path("Altgard")
+        json_path = _region_json_path(self.temp_dir, "Altgard")
         with open(json_path, "r", encoding="utf-8") as f:
             disk_data = json.load(f)
         indices = [n["seq_index"] for n in disk_data["nodes"]]
@@ -266,15 +329,26 @@ class TestRouteManagerG3(unittest.TestCase):
         self.assertEqual(remaining[1].seq_index, 2)
 
     def test_atomic_persistence_and_backup(self):
-        """Atomic save guarantees .tmp clean replace and creates region_data.backup.json."""
+        """Atomic save guarantees .tmp clean replace and creates region_data.backup.json.
+
+        Atomiklik yalnızca "yedek dosyası var" diye değil, üç özellikle
+        kanıtlanır: (1) başarılı kayıttan sonra ortada `.tmp` artığı kalmaz,
+        (2) yedek, bir önceki kaydın birebir içeriğidir (sadece dosya varlığı
+        değil), (3) ana dosya her adımda geçerli JSON'dur.
+        """
         self.rm.add_node(region="Verteron", route="Loop", map_x=150, map_y=250)
-        json_path = self.rm._get_region_json_path("Verteron")
-        backup_path = os.path.join(self.rm._get_region_dir("Verteron"), "region_data.backup.json")
+        json_path = _region_json_path(self.temp_dir, "Verteron")
+        backup_path = os.path.join(_region_dir(self.temp_dir, "Verteron"), "region_data.backup.json")
+        region_dir = _region_dir(self.temp_dir, "Verteron")
 
         self.assertTrue(os.path.isfile(json_path))
+        self.assertEqual(glob.glob(os.path.join(region_dir, "*.tmp")), [])
+        with open(json_path, "r", encoding="utf-8") as f:
+            first_payload = json.load(f)
+        self.assertEqual(len(first_payload["nodes"]), 1)
 
         # Add second node to trigger save with backup
-        self.rm.add_node(region="Verteron", route="Loop", map_x=350, map_y=450)
+        node2 = self.rm.add_node(region="Verteron", route="Loop", map_x=350, map_y=450)
         self.assertTrue(os.path.isfile(backup_path))
 
         # Check backup content has 1 node, main has 2 nodes
@@ -285,6 +359,48 @@ class TestRouteManagerG3(unittest.TestCase):
 
         self.assertEqual(len(backup_data["nodes"]), 1)
         self.assertEqual(len(main_data["nodes"]), 2)
+        # Yedek, ilk kaydın birebir içeriğidir: aynı düğüm kimliği/koordinat.
+        self.assertEqual(backup_data["nodes"], first_payload["nodes"])
+        self.assertEqual(main_data["nodes"][1]["map_x"], 350)
+        self.assertEqual(main_data["nodes"][1]["map_y"], 450)
+        self.assertEqual(main_data["nodes"][1]["seq_index"], 2)
+        # Başarılı kayıttan sonra .tmp artığı kalmamalı.
+        self.assertEqual(glob.glob(os.path.join(region_dir, "*.tmp")), [])
+        self.assertEqual(glob.glob(os.path.join(region_dir, "*.tmp*")), [])
+
+    def test_atomic_save_failure_leaves_committed_file_intact(self):
+        """`os.replace` başarısız olursa kayıt False döner, eski dosya bozulmaz.
+
+        Bu, atomik yazmanın özüdür: tmp dosyasına yazma bitse bile commit
+        adımı (replace) çökerse diskteki son iyi `region_data.json` aynen
+        kalır; ardından gelen normal kayıt kurtarma yapar.
+        """
+        self.rm.add_node(region="Verteron", route="Loop", map_x=150, map_y=250)
+        self.rm.add_node(region="Verteron", route="Loop", map_x=350, map_y=450)
+        json_path = _region_json_path(self.temp_dir, "Verteron")
+        with open(json_path, "rb") as f:
+            committed_bytes = f.read()
+        with open(json_path, "r", encoding="utf-8") as f:
+            committed_data = json.load(f)
+        self.assertEqual(len(committed_data["nodes"]), 2)
+
+        with mock.patch("os.replace", side_effect=OSError("simulated replace failure")):
+            saved = self.rm.save_region("Verteron")
+
+        self.assertFalse(saved)
+        self.assertIsNotNone(self.rm.last_save_error)
+        with open(json_path, "rb") as f:
+            self.assertEqual(f.read(), committed_bytes)
+        with open(json_path, "r", encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["nodes"]), 2)
+
+        # Kurtarma: sonraki normal kayıt başarır ve dosya geçerli kalır.
+        self.assertTrue(self.rm.save_region("Verteron"))
+        with open(json_path, "r", encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["nodes"]), 2)
+        self.assertEqual(
+            glob.glob(os.path.join(_region_dir(self.temp_dir, "Verteron"), "*.tmp")), []
+        )
 
     def test_sequence_index_ordering_and_movement(self):
         """resequence_nodes, move_node_in_sequence and delete_node maintain strict 1..N order."""

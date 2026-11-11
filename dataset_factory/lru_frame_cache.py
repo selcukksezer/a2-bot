@@ -19,6 +19,20 @@ Key Capabilities:
 4. Windows Unicode Path Support:
    Decodes paths containing Turkish / non-ASCII characters (e.g. `selçuk`) via
    `np.fromfile` + `cv2.imdecode` with an ASCII fast-path.
+
+Public API & Wiring (F-2000 / R65 — DO NOT delete as "dead code"):
+    This module is the canonical frame-decode cache for Step 2 review
+    scrubbing (`ui/yolo_factory_dialog.py`) and part of the public
+    `dataset_factory` API: `LRUFrameDecodeCache`, `get_lru_frame_cache`
+    (process-wide shared instance), `imread_unicode`, `FrameCacheEntry` and
+    `DEFAULT_CACHE_CAPACITY`. It is wired through two points outside this
+    file, not by direct imports from every consumer:
+      * package-level export in `dataset_factory/__init__.py` (slice R46);
+      * Step 2 consumer wiring in `ui/yolo_factory_dialog.py` (slice R44).
+    Candidate in-package call sites that decode the same frame paths
+    repeatedly and could use the shared cache:
+    `dataset_factory/factory_controller.py` and
+    `dataset_factory/label_cache.py` (their `imread_unicode` call sites).
 """
 
 from __future__ import annotations
@@ -26,6 +40,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
 import threading
 import time
@@ -48,6 +63,10 @@ logger = logging.getLogger("DatasetFactory.LRUFrameDecodeCache")
 
 DEFAULT_CACHE_CAPACITY: int = 32
 
+# Sentinel for _decode_and_store(disk_stat=...): distinguishes "no stat was
+# passed, compute one" from an explicitly passed None (file missing).
+_STAT_NOT_PROVIDED: Any = object()
+
 
 def imread_unicode(
     path: Union[str, Path],
@@ -68,7 +87,7 @@ def imread_unicode(
             img = cv2.imread(path_str, flags)
             if img is not None and getattr(img, "size", 0) > 0:
                 return img
-        except (UnicodeEncodeError, Exception):
+        except UnicodeEncodeError:
             pass
 
         raw_bytes = np.fromfile(path_str, dtype=np.uint8)
@@ -142,7 +161,7 @@ class LRUFrameDecodeCache:
         max_items: Optional[int] = None,
         decoder: Optional[Callable[[Union[str, Path]], Optional[np.ndarray]]] = None,
         flags: int = cv2.IMREAD_COLOR,
-        copy_on_read: bool = False,
+        copy_on_read: bool = True,
     ) -> None:
         resolved_cap = (
             max_capacity
@@ -156,6 +175,11 @@ class LRUFrameDecodeCache:
 
         self._lock = threading.RLock()
         self._cache: "OrderedDict[str, FrameCacheEntry]" = OrderedDict()
+        # Keys currently being decoded by another thread (in-flight dedup:
+        # concurrent misses for the same path share one decode instead of
+        # decoding twice). Guarded by `_inflight_cond` (same RLock).
+        self._inflight: set = set()
+        self._inflight_cond = threading.Condition(self._lock)
 
         # Telemetry counters
         self._hits: int = 0
@@ -211,18 +235,19 @@ class LRUFrameDecodeCache:
     # ==========================================================================
     @staticmethod
     def _normalize_key(path: Union[str, Path]) -> str:
-        """Normalize a file path into a canonical cache key."""
+        """Normalize a file path into a canonical cache key.
+
+        Uses the memoized lexical abspath (see _abspath_cached): resolve()
+        is ~400-740us per call on this filesystem, and every cache operation
+        normalizes its key.
+        """
         if isinstance(path, Path):
-            p = path
+            text = str(path)
         else:
             text = str(path).strip()
             if not text:
                 return ""
-            p = Path(text)
-        try:
-            return str(p.resolve())
-        except OSError:
-            return str(p)
+        return _abspath_cached(text)
 
     @staticmethod
     def _stat_file(path: Union[str, Path]) -> Optional[Tuple[float, int, int]]:
@@ -261,8 +286,9 @@ class LRUFrameDecodeCache:
         if entry.file_size > 0 and disk_size > 0 and entry.file_size != disk_size:
             return False
         if entry.mtime_ns > 0 and disk_mtime_ns > 0:
-            if entry.mtime_ns == disk_mtime_ns:
-                return True
+            # Nanosecond stamps are exact: a differing ns value means the file
+            # changed, even when the float-second mtimes look equal within 1e-6.
+            return entry.mtime_ns == disk_mtime_ns
         return abs(entry.mtime - disk_mtime) <= 1e-6
 
     def _evict_overflow_locked(self) -> int:
@@ -370,11 +396,32 @@ class LRUFrameDecodeCache:
         if not isinstance(image, np.ndarray) or getattr(image, "size", 0) == 0:
             return None
 
+        return self._put_with_stat(path, image, self._stat_file(path), mtime=mtime)
+
+    def _put_with_stat(
+        self,
+        path: Union[str, Path],
+        image: np.ndarray,
+        disk_stat: Optional[Tuple[float, int, int]],
+        *,
+        mtime: Optional[float] = None,
+    ) -> Optional[np.ndarray]:
+        """Insert/update a frame using an already-computed stat result (D42).
+
+        `put()` stats the file itself; `_decode_and_store()` passes the stat
+        it already took, so a decode miss costs ONE stat instead of three
+        (`get_or_decode` + `_decode_and_store` + `put` each stat'd the same
+        file — 3.00 stats/miss measured before this change).
+        """
+        # Defensive copy: the caller keeps owning its array, so later mutation
+        # of the caller's buffer (e.g. a reused VideoCapture/scratch array)
+        # cannot silently corrupt the cached frame. The stored entry holds
+        # the copy; the caller's original array is returned unchanged.
+        stored_image = image.copy()
         key = self._normalize_key(path)
         if not key:
             return None
 
-        disk_stat = self._stat_file(path)
         existed = disk_stat is not None
 
         if mtime is not None:
@@ -398,7 +445,7 @@ class LRUFrameDecodeCache:
             mtime=resolved_mtime,
             mtime_ns=resolved_mtime_ns,
             file_size=resolved_size,
-            image=image,
+            image=stored_image,
             existed_on_disk=existed,
             cached_at=time.time(),
         )
@@ -430,34 +477,72 @@ class LRUFrameDecodeCache:
         flags: Optional[int] = None,
         mtime: Optional[float] = None,
         copy: Optional[bool] = None,
+        disk_stat: Any = _STAT_NOT_PROVIDED,
+        cache_key: Optional[str] = None,
     ) -> Optional[np.ndarray]:
-        """Decode image from disk outside the lock and store it in the cache."""
+        """Decode image from disk outside the lock and store it in the cache.
+
+        Concurrent misses for the same path share a single decode: a thread
+        that finds the key already in flight waits for the decoding thread
+        and then reuses the stored entry instead of decoding a second copy
+        (avoids double decode + TOCTOU window between check and store).
+
+        `disk_stat` (D42): pass the stat result the caller already took
+        (e.g. `get_or_decode`) so the miss path stats the file once instead
+        of three times; omitted it is computed here. The sentinel default
+        distinguishes "no stat was passed" from an explicit None (stat
+        failed / file missing). `cache_key` lets `get_or_decode` (which
+        already stat'd the file and resolved the key for its hit check)
+        reuse them instead of paying a second `stat` + `Path.resolve()`
+        on the miss path.
+        """
         file_path = Path(path)
-        disk_stat = self._stat_file(file_path)
+        if disk_stat is _STAT_NOT_PROVIDED:
+            disk_stat = self._stat_file(file_path)
         if disk_stat is None and mtime is None:
             return None
 
-        decode_fn = decoder or self._decoder
+        key = cache_key if cache_key is not None else self._normalize_key(file_path)
+        with self._inflight_cond:
+            while key in self._inflight:
+                self._inflight_cond.wait()
+            entry = self._cache.get(key)
+            if entry is not None and self._is_mtime_valid(
+                entry, disk_stat, explicit_mtime=mtime
+            ):
+                # Another thread stored it while we waited (or between the
+                # caller's check and ours). Reuse it; the caller already
+                # counted this lookup as a miss, so do NOT count a hit here.
+                self._cache.move_to_end(key, last=True)
+                return self._prepare_output_image(entry.image, copy=copy)
+            self._inflight.add(key)
+
         try:
-            if decode_fn is not None:
-                img = decode_fn(file_path)
-            else:
-                read_flags = self._flags if flags is None else int(flags)
-                img = imread_unicode(file_path, flags=read_flags)
-        except Exception as exc:
-            logger.debug("Frame decode failed for %s: %s", file_path, exc)
-            with self._lock:
-                self._decode_errors += 1
-            return None
+            decode_fn = decoder or self._decoder
+            try:
+                if decode_fn is not None:
+                    img = decode_fn(file_path)
+                else:
+                    read_flags = self._flags if flags is None else int(flags)
+                    img = imread_unicode(file_path, flags=read_flags)
+            except Exception as exc:
+                logger.debug("Frame decode failed for %s: %s", file_path, exc)
+                with self._lock:
+                    self._decode_errors += 1
+                return None
 
-        if img is None or not isinstance(img, np.ndarray) or getattr(img, "size", 0) == 0:
-            with self._lock:
-                self._decode_errors += 1
-            return None
+            if img is None or not isinstance(img, np.ndarray) or getattr(img, "size", 0) == 0:
+                with self._lock:
+                    self._decode_errors += 1
+                return None
 
-        effective_mtime = float(mtime) if mtime is not None else (disk_stat[0] if disk_stat else 0.0)
-        self.put(file_path, img, mtime=effective_mtime)
-        return self._prepare_output_image(img, copy=copy)
+            effective_mtime = float(mtime) if mtime is not None else (disk_stat[0] if disk_stat else 0.0)
+            self._put_with_stat(file_path, img, disk_stat, mtime=effective_mtime)
+            return self._prepare_output_image(img, copy=copy)
+        finally:
+            with self._inflight_cond:
+                self._inflight.discard(key)
+                self._inflight_cond.notify_all()
 
     def get_or_decode(
         self,
@@ -478,7 +563,16 @@ class LRUFrameDecodeCache:
         if disk_stat is None:
             key = self._normalize_key(file_path)
             with self._lock:
-                if key in self._cache:
+                entry = self._cache.get(key)
+                if entry is not None and not entry.existed_on_disk:
+                    # Synthetic in-memory entry that never existed on disk:
+                    # keep it, exactly like get()/__contains__ do. Only an
+                    # entry that used to exist on disk is stale when the
+                    # file disappears.
+                    self._cache.move_to_end(key, last=True)
+                    self._hits += 1
+                    return self._prepare_output_image(entry.image, copy=copy)
+                if entry is not None:
                     del self._cache[key]
                     self._stale_invalidations += 1
                 self._misses += 1
@@ -503,6 +597,8 @@ class LRUFrameDecodeCache:
             flags=flags,
             mtime=disk_stat[0],
             copy=copy,
+            disk_stat=disk_stat,
+            cache_key=key,
         )
 
     def decode(
@@ -621,16 +717,11 @@ class LRUFrameDecodeCache:
     def invalidate(self, path: Union[str, Path]) -> bool:
         """Remove a specific file path from the cache. Returns True if removed."""
         key = self._normalize_key(path)
-        raw_key = str(path)
         with self._lock:
-            removed = False
             if key in self._cache:
                 del self._cache[key]
-                removed = True
-            if raw_key in self._cache:
-                del self._cache[raw_key]
-                removed = True
-            return removed
+                return True
+            return False
 
     def remove(self, path: Union[str, Path]) -> bool:
         """Alias for `invalidate`."""
@@ -646,15 +737,18 @@ class LRUFrameDecodeCache:
         with self._lock:
             entry = self._cache.pop(key, None)
             if entry is None:
-                entry = self._cache.pop(str(path), None)
-            if entry is None:
                 return default
             return entry.image
 
     def clear(self) -> None:
-        """Remove all cached frames from memory."""
+        """Remove all cached frames from memory and reset telemetry counters."""
         with self._lock:
             self._cache.clear()
+            self._hits = 0
+            self._misses = 0
+            self._evictions = 0
+            self._stale_invalidations = 0
+            self._decode_errors = 0
 
     def resize(self, new_capacity: int) -> None:
         """Update cache capacity and immediately evict oldest entries if shrunk."""
@@ -709,7 +803,9 @@ class LRUFrameDecodeCache:
             return True
 
     def __getitem__(self, path: Union[str, Path]) -> np.ndarray:
-        img = self.get(path)
+        # Decode from disk on miss (like get(decode_on_miss=True)); only raise
+        # KeyError when the frame cannot be obtained at all.
+        img = self.get(path, decode_on_miss=True)
         if img is None:
             raise KeyError(path)
         return img
@@ -726,17 +822,39 @@ class LRUFrameDecodeCache:
         if not self.invalidate(path):
             raise KeyError(path)
 
+    def _validated_entries_locked(self) -> List[Tuple[str, FrameCacheEntry]]:
+        """Return [(key, entry)] for mtime-valid entries only. Assumes `_lock`.
+
+        Stale entries (file changed or deleted on disk) are purged first, so
+        keys()/values()/items() never serve entries that get()/__contains__
+        would reject. Synthetic in-memory entries (never on disk) stay valid.
+        """
+        valid: List[Tuple[str, FrameCacheEntry]] = []
+        for key, entry in list(self._cache.items()):
+            if self._is_mtime_valid(entry, self._stat_file(entry.path)):
+                valid.append((key, entry))
+            else:
+                del self._cache[key]
+                self._stale_invalidations += 1
+        return valid
+
     def keys(self) -> List[str]:
         with self._lock:
-            return list(self._cache.keys())
+            return [key for key, _ in self._validated_entries_locked()]
 
     def values(self) -> List[np.ndarray]:
         with self._lock:
-            return [entry.image for entry in self._cache.values()]
+            return [
+                self._prepare_output_image(entry.image)
+                for _, entry in self._validated_entries_locked()
+            ]
 
     def items(self) -> List[Tuple[str, np.ndarray]]:
         with self._lock:
-            return [(k, entry.image) for k, entry in self._cache.items()]
+            return [
+                (key, self._prepare_output_image(entry.image))
+                for key, entry in self._validated_entries_locked()
+            ]
 
     def __repr__(self) -> str:
         with self._lock:
@@ -751,14 +869,66 @@ _GLOBAL_FRAME_CACHE: Optional[LRUFrameDecodeCache] = None
 _GLOBAL_FRAME_CACHE_LOCK = threading.RLock()
 
 
+# --- D42: absolute-path memo ---------------------------------------------
+# _normalize_key() used to call Path.resolve() on EVERY cache lookup, and
+# resolve() costs ~400-740us per call on this filesystem (symlink walk +
+# stat syscalls) — more than the mtime stat itself (~150us). The key only
+# needs a canonical spelling of the path, so normalize with the purely
+# lexical os.path.abspath() (~4us) and memoize that per input string
+# (~0.5us on a hit). Only ABSOLUTE paths are memoized: abspath() of a
+# relative path depends on the process cwd, so caching it would go stale
+# after a chdir; relative paths are recomputed fresh (still ~100x cheaper
+# than resolve()). Symlink spellings are NOT canonicalized, unlike
+# resolve(): two spellings of the same file (symlink vs target) now get
+# separate entries (one extra decode at most); they can never serve each
+# other's content, because every read still validates against the
+# caller-supplied path's live mtime/size (see _is_mtime_valid).
+_ABSPATH_CACHE_MAX_ENTRIES: int = 8192
+_abspath_cache: Dict[str, str] = {}
+_abspath_cache_lock = threading.Lock()
+
+
+def _abspath_cached(path_str: str) -> str:
+    """Return os.path.abspath(path_str), memoized for absolute inputs only.
+
+    Relative inputs are resolved fresh on every call: their abspath depends
+    on the process working directory, so a memoized value could silently
+    point at the wrong directory after a chdir.
+    """
+    if not os.path.isabs(path_str):
+        return os.path.abspath(path_str)
+    with _abspath_cache_lock:
+        cached = _abspath_cache.get(path_str)
+        if cached is not None:
+            return cached
+    resolved = os.path.abspath(path_str)
+    with _abspath_cache_lock:
+        if len(_abspath_cache) >= _ABSPATH_CACHE_MAX_ENTRIES:
+            _abspath_cache.clear()
+        _abspath_cache[path_str] = resolved
+    return resolved
+
+
 def get_lru_frame_cache(capacity: int = DEFAULT_CACHE_CAPACITY) -> LRUFrameDecodeCache:
-    """Return or initialize the shared process-wide `LRUFrameDecodeCache` instance."""
+    """Return or initialize the shared process-wide `LRUFrameDecodeCache` instance.
+
+    `capacity` only applies when the shared instance is first created. A later
+    call with a different capacity does NOT resize the shared cache (silently
+    resizing it would evict frames another caller is relying on); the mismatch
+    is logged and the existing capacity is kept. Use ``.resize()`` explicitly
+    on the returned instance if a resize is really intended.
+    """
     global _GLOBAL_FRAME_CACHE
     with _GLOBAL_FRAME_CACHE_LOCK:
         if _GLOBAL_FRAME_CACHE is None:
             _GLOBAL_FRAME_CACHE = LRUFrameDecodeCache(capacity=capacity)
         elif int(capacity) != _GLOBAL_FRAME_CACHE.capacity:
-            _GLOBAL_FRAME_CACHE.resize(capacity)
+            logger.warning(
+                "get_lru_frame_cache(capacity=%d) ignored: shared cache already "
+                "exists with capacity=%d; call .resize() explicitly to change it.",
+                int(capacity),
+                _GLOBAL_FRAME_CACHE.capacity,
+            )
         return _GLOBAL_FRAME_CACHE
 
 

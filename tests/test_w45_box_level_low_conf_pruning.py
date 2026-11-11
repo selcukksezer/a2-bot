@@ -87,8 +87,15 @@ def _setup_frame(
     rev_dir.mkdir(parents=True, exist_ok=True)
     lbl_dir.mkdir(parents=True, exist_ok=True)
 
+    # F-1587: a REAL decodable PNG (not dummy bytes that no decoder ever
+    # reads). Pruning must preserve a genuine image, and the negative-
+    # exemplar path can actually load it via cv2.imread.
+    import cv2
+
     img_path = img_dir / f"{stem}.png"
-    img_path.write_bytes(b"\x89PNG\r\n\x1a\nDUMMY_IMAGE_CONTENT")
+    assert cv2.imwrite(str(img_path), np.full((200, 200, 3), (60, 120, 180), dtype=np.uint8))
+    decoded = cv2.imread(str(img_path))
+    assert decoded is not None and decoded.shape == (200, 200, 3)
 
     rev_path = rev_dir / f"{stem}.json"
     payload = {
@@ -127,6 +134,13 @@ def test_prune_one_low_conf_box_preserves_image_and_three_high_conf_boxes(tmp_pa
     assert res["promoted_boxes"] == 3
     assert img_path.is_file(), "Image file must never be deleted during box-level pruning"
 
+    # F-1587: "image preserved" must mean a still-decodable image, not just
+    # an existing file with dummy bytes.
+    import cv2
+
+    preserved = cv2.imread(str(img_path))
+    assert preserved is not None and preserved.shape == (200, 200, 3)
+
     updated = json.loads(rev_path.read_text(encoding="utf-8"))
     assert len(updated["trusted"]) == 3
     assert len(updated["weak"]) == 0
@@ -157,39 +171,60 @@ def test_prune_updates_yolo_train_txt_to_keep_exact_three_boxes(tmp_path: Path) 
 
 
 def test_prune_records_negative_exemplar_only_for_deleted_low_conf_box(tmp_path: Path) -> None:
-    """3. Only the 1 pruned low-confidence box is recorded as a negative exemplar in ExemplarMemory."""
+    """3. Only the 1 pruned low-confidence box is recorded as a negative exemplar in ExemplarMemory.
+
+    F-1509: the old test used a fake in-memory spy, so it only proved the
+    prune function *called* something. This test passes a REAL
+    ExemplarMemory (tmp JSON path) and verifies the exemplar is actually
+    persisted and retrievable through the public match path.
+    """
+    from dataset_factory.exemplar_memory import ExemplarMemory
+
     trusted, weak = _make_four_boxes(low_conf=0.25, high_confs=(0.96, 0.92, 0.88))
     img_path, _, _ = _setup_frame(tmp_path, "frame_4box_03", trusted, weak)
 
-    class _SpyExemplarMemory:
-        def __init__(self) -> None:
-            self.calls: List[Tuple[ Tuple[int, ...], int, str, str ]] = []
-
-        def add_negative_exemplar(
-            self, crop: np.ndarray, class_id: int, class_name: str = "", source: str = ""
-        ) -> None:
-            self.calls.append((crop.shape, int(class_id), str(class_name), str(source)))
-
-    spy_mem = _SpyExemplarMemory()
-    dummy_frame = np.full((200, 200, 3), 128, dtype=np.uint8)
+    mem_path = tmp_path / "learned_exemplars.json"
+    real_mem = ExemplarMemory(json_path=mem_path)
+    # K-3 (v12 daraltma): dejenere kapısı artık yalnızca POZİTİF tarafta
+    # uygulanır — düz gri çerçeveden çıkan içeriksiz crop negatif olarak
+    # kabul edilir ("bu gri yama kaynak değil" bastırma sinyali).
+    # Brightness-only noise (A-set K-3 method): the same delta on all
+    # channels keeps hue/saturation gray while V varies, so the crop
+    # carries real texture (and would pass the gate even on the
+    # positive side); the negative is accepted either way under v12.
+    rng = np.random.default_rng(7)
+    noise = rng.integers(-30, 31, size=(200, 200, 1), dtype=np.int16)
+    dummy_frame = np.clip(
+        np.full((200, 200, 3), 128, dtype=np.int16) + noise, 0, 255
+    ).astype(np.uint8)
 
     res = prune_low_confidence_boxes_in_dataset(
         dataset_dir=tmp_path,
         threshold=0.85,
         record_negative_exemplars=True,
-        exemplar_memory=spy_mem,
+        exemplar_memory=real_mem,
         frame_map={"frame_4box_03": dummy_frame},
     )
 
     assert img_path.is_file()
     assert res["pruned_boxes"] == 1
     assert res["promoted_boxes"] == 3
-    assert len(spy_mem.calls) == 1
-    crop_shape, neg_cid, neg_cname, neg_src = spy_mem.calls[0]
-    assert crop_shape[0] > 0 and crop_shape[1] > 0
-    assert neg_cid == 14
-    assert neg_cname == "obstacle"
-    assert neg_src == "bulk_prune_low_conf"
+
+    # Persisted: exactly one negative exemplar, for the pruned box only.
+    persisted = json.loads(mem_path.read_text(encoding="utf-8"))
+    assert len(persisted["negative"]) == 1
+    assert persisted["negative"][0]["class_id"] == 14
+    assert persisted["negative"][0]["class_name"] == "obstacle"
+    assert persisted["negative"][0]["source"] == "bulk_prune_low_conf"
+    assert persisted["positive"] == []
+
+    # Retrievable through the public match path: the pruned box's crop
+    # (20x20 gray crop of the dummy frame at cx=0.40, cy=0.80) matches it.
+    reloaded = ExemplarMemory(json_path=mem_path)
+    probe_crop = dummy_frame[150:170, 70:90]
+    neg_sim, neg_ex = reloaded.match_negative(probe_crop, class_id=14)
+    assert neg_sim >= 0.99
+    assert neg_ex is not None and neg_ex["class_id"] == 14
 
 
 def test_prune_protects_hand_label_among_three_kept_boxes_while_pruning_fourth_low_conf(
@@ -219,27 +254,48 @@ def test_prune_protects_hand_label_among_three_kept_boxes_while_pruning_fourth_l
 
 
 def test_prune_with_stem_filter_and_min_confidence_alias_on_four_box_frame(tmp_path: Path) -> None:
-    """5. `indices_or_stems` + `min_confidence` prunes only the targeted 4-box frame."""
+    """5. `indices_or_stems` + `min_confidence` prunes only the targeted 4-box frame.
+
+    F-1510: the old test used min_confidence=0.85 — identical to the default
+    threshold — so it could not tell the alias from the default, and
+    teach_negative=False had no observable effect. Here min_confidence=0.92
+    is deliberately DIFFERENT from the default: with the default 0.85 only
+    the 0.38 box would be pruned (1 pruned / 3 promoted), while 0.92 prunes
+    the 0.91 and 0.86 boxes too (3 pruned / 1 promoted). teach_negative=False
+    is observed through a real ExemplarMemory that must stay empty.
+    """
+    from dataset_factory.exemplar_memory import ExemplarMemory
+
     t1, w1 = _make_four_boxes(low_conf=0.38, high_confs=(0.94, 0.91, 0.86))
     t2, w2 = _make_four_boxes(low_conf=0.20, high_confs=(0.95, 0.90, 0.88))
     img1, rev1, _ = _setup_frame(tmp_path, "target_4box", t1, w1)
     img2, rev2, _ = _setup_frame(tmp_path, "untouched_4box", t2, w2)
 
+    mem_path = tmp_path / "learned_exemplars.json"
+    real_mem = ExemplarMemory(json_path=mem_path)
+
     res = prune_low_confidence_boxes_in_dataset(
         dataset_dir=tmp_path,
-        min_confidence=0.85,
+        min_confidence=0.92,
         indices_or_stems=["target_4box"],
         teach_negative=False,
+        exemplar_memory=real_mem,
     )
 
     assert res["scanned"] == 1
-    assert res["pruned_boxes"] == 1
-    assert res["promoted_boxes"] == 3
+    # 0.92 alias honored (default 0.85 would give pruned=1, promoted=3):
+    assert res["pruned_boxes"] == 3
+    assert res["promoted_boxes"] == 1
     assert res["preserved_frames"] == 1
     assert img1.is_file() and img2.is_file()
 
     up1 = json.loads(rev1.read_text(encoding="utf-8"))
-    assert len(up1["trusted"]) == 3 and len(up1["weak"]) == 0
+    assert len(up1["trusted"]) == 1 and len(up1["weak"]) == 0
+    assert [b["class_id"] for b in up1["trusted"]] == [0]
 
     up2 = json.loads(rev2.read_text(encoding="utf-8"))
     assert len(up2["trusted"]) == 2 and len(up2["weak"]) == 2
+
+    # teach_negative=False observed: no negative exemplar was recorded even
+    # though 3 boxes were pruned and a real memory was supplied.
+    assert not mem_path.is_file() or json.loads(mem_path.read_text(encoding="utf-8"))["negative"] == []

@@ -1,0 +1,82 @@
+{
+ "gradient": {
+  "recommended_steer_deg": 0.0,
+  "obstacle_detected": false,
+  "obstacle_type": "none",
+  "clearance_left": 0.3907,
+  "clearance_center": 0.4047,
+  "clearance_right": 0.393,
+  "cliff_drop_detected": false,
+  "lower_ground_depth": 0.3115,
+  "inference_ms": 280.848,
+  "depth_map_shape": [
+   90,
+   160
+  ],
+  "backend": "geometric_perspective_sobel_realtime"
+ },
+ "noise": {
+  "recommended_steer_deg": 28.56,
+  "obstacle_detected": true,
+  "obstacle_type": "wall",
+  "clearance_left": 0.0797,
+  "clearance_center": 0.0831,
+  "clearance_right": 0.0817,
+  "cliff_drop_detected": false,
+  "lower_ground_depth": 0.0445,
+  "inference_ms": 37.145,
+  "depth_map_shape": [
+   90,
+   160
+  ],
+  "backend": "geometric_perspective_sobel_realtime"
+ },
+ "dark": {
+  "recommended_steer_deg": 32.33,
+  "obstacle_detected": true,
+  "obstacle_type": "wall",
+  "clearance_left": 0.1324,
+  "clearance_center": 0.1372,
+  "clearance_right": 0.1325,
+  "cliff_drop_detected": false,
+  "lower_ground_depth": 0.0895,
+  "inference_ms": 1.14,
+  "depth_map_shape": [
+   90,
+   160
+  ],
+  "backend": "geometric_perspective_sobel_realtime"
+ },
+ "bright": {
+  "recommended_steer_deg": 10.35,
+  "obstacle_detected": false,
+  "obstacle_type": "none",
+  "clearance_left": 0.5844,
+  "clearance_center": 0.6054,
+  "clearance_right": 0.5848,
+  "cliff_drop_detected": false,
+  "lower_ground_depth": 0.5577,
+  "inference_ms": 91.138,
+  "depth_map_shape": [
+   90,
+   160
+  ],
+  "backend": "geometric_perspective_sobel_realtime"
+ },
+ "gray2d": {
+  "recommended_steer_deg": 3.31,
+  "obstacle_detected": false,
+  "obstacle_type": "none",
+  "clearance_left": 0.3913,
+  "clearance_center": 0.4053,
+  "clearance_right": 0.3916,
+  "cliff_drop_detected": false,
+  "lower_ground_depth": 0.4328,
+  "inference_ms": 93.301,
+  "depth_map_shape": [
+   90,
+   160
+  ],
+  "backend": "geometric_perspective_sobel_realtime"
+ }
+}

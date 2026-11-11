@@ -3,12 +3,14 @@
 Donanım Seviyesi Girdi ve Kısayol Sürücüsü (Hardware-Level Input & Hotkey Driver)
 AION 2 Gatherion Pixel Bot - Ajan 2 Modülü
 
-Mimari Katmanlar (klavye; soft fare soft-aim/LMB ayrı kalır):
+Mimari Katmanlar (klavye + fare; yumuşak yedek YOK — P0-5/K-04):
 1. Serial/Network HID (Leonardo COM veya Android BT-HID köprüsü —
    GATHERION_HID_COM / GATHERION_HID_TCP / input.serial_port / input.hid_tcp)
 2. Interception (interception.dll + kernel driver; yoksa INTERCEPTION_MISSING)
 3. FakerInput (Sanal HID Sürücü Köprüsü / Pipe veya DLL mevcutsa)
-4. pydirectinput (DirectInput ScanCode) + ctypes SendInput / keybd_event (son çare)
+4. pydirectinput (DirectInput ScanCode) + ctypes SendInput / keybd_event —
+   YALNIZCA test_mode simülasyonu; canlı yolda yumuşak yedek yoktur
+   (klavye v17'de, fare P0-5'te kapatıldı; backend reddi False döner).
 
 Özellikler:
 - Çözünürlükten bağımsız (1920x1080, 2560x1440 vb.) normalize ve piksel koordinat desteği
@@ -29,6 +31,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from version import __version__
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -179,9 +182,25 @@ HARDWARE_SCANCODES: Dict[str, int] = {
     "left": 0xCB,
     "right": 0xCD,
     "down": 0xD0,
+    "pageup": 0xC9,
+    "pagedown": 0xD1,
+    "insert": 0xD2,
+    "delete": 0xD3,
+    "home": 0xC7,
+    "end": 0xCF,
+    "left alt": 0x38,
+    "right alt": 0x38,
+    "left ctrl": 0x1D,
+    "right ctrl": 0x1D,
+    "left shift": 0x2A,
+    "right shift": 0x36,
+    "win": 0x5B,
+    "windows": 0x5B,
+    "left win": 0x5B,
+    "right win": 0x5C,
 }
 
-EXTENDED_KEYS: Set[str] = {"up", "down", "left", "right", "insert", "delete", "home", "end", "pageup", "pagedown"}
+EXTENDED_KEYS: Set[str] = {"up", "down", "left", "right", "insert", "delete", "home", "end", "pageup", "pagedown", "win", "windows", "left win", "right win", "right alt", "right ctrl"}
 
 # Windows Virtual-Key (VK) Tablosu (SendInput + MapVirtualKeyW donanım ScanCode dönüşümü için)
 VIRTUAL_KEY_CODES: Dict[str, int] = {
@@ -247,6 +266,22 @@ VIRTUAL_KEY_CODES: Dict[str, int] = {
     "left": 0x25,
     "right": 0x27,
     "down": 0x28,
+    "pageup": 0x21,
+    "pagedown": 0x22,
+    "insert": 0x2D,
+    "delete": 0x2E,
+    "home": 0x24,
+    "end": 0x23,
+    "left alt": 0x12,
+    "right alt": 0x12,
+    "left ctrl": 0x11,
+    "right ctrl": 0x11,
+    "left shift": 0x10,
+    "right shift": 0x10,
+    "win": 0x5B,
+    "windows": 0x5B,
+    "left win": 0x5B,
+    "right win": 0x5C,
 }
 
 # Oyun içi normal hareket ve etkileşim tuşları beyaz listesi (Asla otomatik PAUSE tetiklemez)
@@ -265,6 +300,36 @@ HOTKEY_DEBOUNCE_SEC: float = 0.45
 SETTINGS_RELOAD_DEBOUNCE_SEC: float = 0.250
 # Avoid EnumWindows on every keypress; title seldom changes while the bot runs.
 _GAME_HWND_CACHE_TTL_SEC: float = 3.0
+
+# EnumWindows callback type (same guard as core/watchdog.py).
+# wintypes has HWND/HANDLE but NOT WNDENUMPROC. Using ctypes.c_bool as the
+# return type is an ABI mismatch (BOOL is 4 bytes, c_bool is 1) and can make
+# EnumWindows visit 0 windows or truncate HWND on Win64. Prefer
+# WINFUNCTYPE(BOOL, HWND, LPARAM); None off Windows where WINFUNCTYPE is absent.
+try:
+    _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+except AttributeError:  # pragma: no cover - Windows-only
+    _WNDENUMPROC = None
+
+# Ekran çözünürlüğü önbellek TTL'si: normalize/denormalize/jitter her çağrıda
+# Win32 sorgusu yapıyordu; çözünürlük saniyeler içinde değişmez.
+_SCREEN_RES_CACHE_TTL_SEC: float = 5.0
+
+# Görüş maskesi morfolojik çekirdekleri: find_* her karede np.ones() ile
+# çekirdeği yeniden üretiyordu; bir kez üret, önbellekte tut.
+_MORPH_KERNEL_CACHE: Dict[Tuple[int, int], Any] = {}
+
+
+def _morph_kernel(rows: int, cols: int) -> Any:
+    """Paylaşılan morfolojik çekirdek (np.ones); ilk kullanımda üretilir."""
+    key = (int(rows), int(cols))
+    kernel = _MORPH_KERNEL_CACHE.get(key)
+    if kernel is None:
+        import numpy as np
+
+        kernel = np.ones(key, np.uint8)
+        _MORPH_KERNEL_CACHE[key] = kernel
+    return kernel
 
 # Oyun penceresinin kendi iletisi. SendInput ön plan penceresine gider;
 # Aion bu klavye/sol tık paketini yok sayabiliyor. WM_* doğrudan istemciye yazılır.
@@ -388,7 +453,11 @@ class FakerInputBridge:
     def _detect_fakerinput(self) -> None:
         """Sistemde FakerInput DLL veya cihaz yolunu arar."""
         try:
+            # Project root first: os.getcwd() depends on where the bot was
+            # launched from and misses the DLL shipped with the repo.
             candidate_paths = [
+                str(PROJECT_ROOT / "FakerInputWrapper.dll"),
+                str(PROJECT_ROOT / "drivers" / "FakerInputWrapper.dll"),
                 os.path.join(os.getcwd(), "FakerInputWrapper.dll"),
                 os.path.join(os.getcwd(), "drivers", "FakerInputWrapper.dll"),
                 r"C:\Program Files\FakerInput\FakerInputWrapper.dll",
@@ -396,6 +465,7 @@ class FakerInputBridge:
             for dll_path in candidate_paths:
                 if os.path.exists(dll_path):
                     self._dll = ctypes.WinDLL(dll_path)
+                    self._bind_prototypes()
                     if hasattr(self._dll, "fakerinput_alloc"):
                         self._handle = self._dll.fakerinput_alloc()
                         if self._handle:
@@ -405,6 +475,45 @@ class FakerInputBridge:
         except Exception as exc:
             logger.debug("FakerInput algılama sırasında bilgi: %s", exc)
             self.available = False
+
+    def _bind_prototypes(self) -> None:
+        """ctypes prototypes: without restype=c_void_p a 64-bit handle is
+        truncated to c_int (32-bit) by ctypes' default."""
+        try:
+            if hasattr(self._dll, "fakerinput_alloc"):
+                self._dll.fakerinput_alloc.restype = ctypes.c_void_p
+                self._dll.fakerinput_alloc.argtypes = []
+            if hasattr(self._dll, "fakerinput_key_down"):
+                self._dll.fakerinput_key_down.argtypes = [ctypes.c_void_p, ctypes.c_ubyte]
+                self._dll.fakerinput_key_down.restype = ctypes.c_int
+            if hasattr(self._dll, "fakerinput_key_up"):
+                self._dll.fakerinput_key_up.argtypes = [ctypes.c_void_p, ctypes.c_ubyte]
+                self._dll.fakerinput_key_up.restype = ctypes.c_int
+            if hasattr(self._dll, "fakerinput_update_absolute_mouse"):
+                self._dll.fakerinput_update_absolute_mouse.argtypes = [
+                    ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_ushort,
+                    ctypes.c_ushort, ctypes.c_ubyte, ctypes.c_ubyte,
+                ]
+                self._dll.fakerinput_update_absolute_mouse.restype = ctypes.c_int
+            if hasattr(self._dll, "fakerinput_update_relative_mouse"):
+                self._dll.fakerinput_update_relative_mouse.argtypes = [
+                    ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_short,
+                    ctypes.c_short, ctypes.c_ubyte, ctypes.c_ubyte,
+                ]
+                self._dll.fakerinput_update_relative_mouse.restype = ctypes.c_int
+        except Exception as exc:
+            logger.debug("FakerInput prototype binding failed: %s", exc)
+
+    def close(self) -> None:
+        """Release the FakerInput handle so hot-reload can rebuild the bridge."""
+        try:
+            if self._dll is not None and self._handle is not None and hasattr(self._dll, "fakerinput_free"):
+                self._dll.fakerinput_free(self._handle)
+        except Exception:
+            pass
+        self._handle = None
+        self._dll = None
+        self.available = False
 
     def send_key(self, scancode: int, is_down: bool) -> bool:
         """FakerInput üzerinden tuş basımı/bırakımı gönderir."""
@@ -474,11 +583,43 @@ _INTERCEPTION_KEY_DOWN = 0x00
 _INTERCEPTION_KEY_UP = 0x01
 _INTERCEPTION_KEY_E0 = 0x02
 
+# Interception mouse flags (oblitum/Interception interception.h:
+# enum InterceptionMouseFlag — MOVE_RELATIVE 0x000, MOVE_ABSOLUTE 0x001).
+# Fare cihaz ID'leri 11..20'dir (klavye 1..10).
+_INTERCEPTION_MOUSE_MOVE_RELATIVE = 0x000
+_INTERCEPTION_MOUSE_MOVE_ABSOLUTE = 0x001
+# Interception mouse button states (interception.h enum InterceptionMouseState).
+_INTERCEPTION_MOUSE_LEFT_BUTTON_DOWN = 0x001
+_INTERCEPTION_MOUSE_LEFT_BUTTON_UP = 0x002
+_INTERCEPTION_MOUSE_RIGHT_BUTTON_DOWN = 0x004
+_INTERCEPTION_MOUSE_RIGHT_BUTTON_UP = 0x008
+_INTERCEPTION_MOUSE_MIDDLE_BUTTON_DOWN = 0x010
+_INTERCEPTION_MOUSE_MIDDLE_BUTTON_UP = 0x020
+_INTERCEPTION_MOUSE_BUTTON_4_DOWN = 0x040
+_INTERCEPTION_MOUSE_BUTTON_4_UP = 0x080
+_INTERCEPTION_MOUSE_BUTTON_5_DOWN = 0x100
+_INTERCEPTION_MOUSE_BUTTON_5_UP = 0x200
+
 
 class InterceptionKeyStroke(ctypes.Structure):
     _fields_ = [
         ("code", ctypes.c_ushort),
         ("state", ctypes.c_ushort),
+        ("information", ctypes.c_uint),
+    ]
+
+
+class InterceptionMouseStroke(ctypes.Structure):
+    """oblitum/Interception interception.h: state (u16), flags (u16),
+    rolling (i16), x (i32), y (i32), information (u32). Göreli harekette
+    state=0 (tuş değişimi yok), flags=MOVE_RELATIVE (0x000), x/y = delta."""
+
+    _fields_ = [
+        ("state", ctypes.c_ushort),
+        ("flags", ctypes.c_ushort),
+        ("rolling", ctypes.c_short),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
         ("information", ctypes.c_uint),
     ]
 
@@ -503,6 +644,13 @@ class InterceptionBridge:
         self._dll = None
         self._ctx = None
         self._keyboard_device: int = 1
+        # Fare cihaz ID'leri 11..20 (oblitum/Interception: klavye 1..10, fare 11..20).
+        self._mouse_device: int = 11
+        # Son tespit denemesinin hata nedeni (başarısızsa neden başarısız olduğu).
+        # AION2 yumuşak girdiyi görmezden geldiği için bu bilgi, "Interception yok"
+        # hatasının neyin eksik olduğunu söylemesi için saklanır.
+        self.last_error: str = ""
+        self.dll_found: bool = False
         self._detect_interception()
 
     def _candidate_dll_paths(self) -> List[str]:
@@ -544,16 +692,22 @@ class InterceptionBridge:
         assert self._dll is not None
         self._dll.interception_create_context.restype = ctypes.c_void_p
         self._dll.interception_destroy_context.argtypes = [ctypes.c_void_p]
+        # Stroke pointer c_void_p'dir: interception_send hem klavye
+        # (InterceptionKeyStroke) hem fare (InterceptionMouseStroke) alır;
+        # POINTER(KeyStroke) fare stroke'unu reddederdi.
         self._dll.interception_send.argtypes = [
             ctypes.c_void_p,
             ctypes.c_int,
-            ctypes.POINTER(InterceptionKeyStroke),
+            ctypes.c_void_p,
             ctypes.c_uint,
         ]
         self._dll.interception_send.restype = ctypes.c_int
         if hasattr(self._dll, "interception_is_keyboard"):
             self._dll.interception_is_keyboard.argtypes = [ctypes.c_int]
             self._dll.interception_is_keyboard.restype = ctypes.c_int
+        if hasattr(self._dll, "interception_is_mouse"):
+            self._dll.interception_is_mouse.argtypes = [ctypes.c_int]
+            self._dll.interception_is_mouse.restype = ctypes.c_int
 
     def _detect_interception(self) -> None:
         """Load interception.dll if present; graceful no-op when missing/driver down."""
@@ -563,6 +717,7 @@ class InterceptionBridge:
         for dll_path in self._candidate_dll_paths():
             if not os.path.isfile(dll_path):
                 continue
+            self.dll_found = True
             try:
                 if hasattr(os, "add_dll_directory"):
                     try:
@@ -583,7 +738,9 @@ class InterceptionBridge:
                 self._ctx = ctx
                 self.dll_path = dll_path
                 self.available = True
+                self.last_error = ""
                 self._pick_keyboard_device()
+                self._pick_mouse_device()
                 logger.info(
                     "INTERCEPTION_OK: kernel keyboard bridge ready (%s, device=%d)",
                     dll_path,
@@ -607,7 +764,10 @@ class InterceptionBridge:
                         self._ctx = ctx
                         self.dll_path = "interception.dll"
                         self.available = True
+                        self.last_error = ""
+                        self.dll_found = True
                         self._pick_keyboard_device()
+                        self._pick_mouse_device()
                         logger.info(
                             "INTERCEPTION_OK: kernel keyboard bridge ready (PATH, device=%d)",
                             self._keyboard_device,
@@ -619,6 +779,7 @@ class InterceptionBridge:
                 last_err = str(exc)
                 self._dll = None
 
+        self.last_error = last_err or "dll not found"
         logger.warning(
             "INTERCEPTION_MISSING: interception.dll/driver yok — AION2 soft klavye "
             "(SendInput/pydirectinput) filtrelenmeye devam eder. "
@@ -641,6 +802,156 @@ class InterceptionBridge:
             except Exception:
                 continue
         self._keyboard_device = 1
+
+    def _pick_mouse_device(self) -> None:
+        """Prefer first mouse device id (11..20, oblitum/Interception)."""
+        if self._dll is None or not hasattr(self._dll, "interception_is_mouse"):
+            self._mouse_device = 11
+            return
+        for device in range(11, 21):
+            try:
+                if int(self._dll.interception_is_mouse(device)) != 0:
+                    self._mouse_device = device
+                    return
+            except Exception:
+                continue
+        self._mouse_device = 11
+
+    def send_mouse_relative(self, dx: int, dy: int) -> bool:
+        """Send a relative mouse move via Interception. Returns False if
+        unavailable — NEVER falls back to soft SendInput (AION2 ignores it,
+        so faking success is worse than refusing). F-1693 / Karar 4."""
+        if not self.available or self._dll is None or self._ctx is None:
+            return False
+        try:
+            dx_i = int(dx)
+            dy_i = int(dy)
+        except Exception:
+            return False
+        if dx_i == 0 and dy_i == 0:
+            return True
+        # state=0: tuş değişimi yok; flags=MOVE_RELATIVE (0x000); x/y = delta.
+        stroke = InterceptionMouseStroke(0, _INTERCEPTION_MOUSE_MOVE_RELATIVE, 0, dx_i, dy_i, 0)
+        try:
+            sent = int(
+                self._dll.interception_send(
+                    self._ctx,
+                    int(self._mouse_device),
+                    ctypes.byref(stroke),
+                    1,
+                )
+            )
+            if sent > 0:
+                return True
+            # Fallback: broadcast to all mouse slots if preferred device rejected
+            for device in range(11, 21):
+                if device == self._mouse_device:
+                    continue
+                sent = int(
+                    self._dll.interception_send(
+                        self._ctx, device, ctypes.byref(stroke), 1
+                    )
+                )
+                if sent > 0:
+                    self._mouse_device = device
+                    return True
+            return False
+        except Exception as exc:
+            logger.debug("Interception send_mouse_relative failed: %s", exc)
+            return False
+
+    def send_mouse_button(self, button: str, is_down: bool) -> bool:
+        """Send a mouse button press/release via Interception. Returns False
+        if unavailable — NEVER falls back to soft SendInput (Y-4, dilim 20:
+        _hw_mouse_down/up eskiden Interception fare tuşunu hiç denemiyordu).
+        """
+        if not self.available or self._dll is None or self._ctx is None:
+            return False
+        btn = str(button or "left").strip().lower()
+        states = {
+            "left": (_INTERCEPTION_MOUSE_LEFT_BUTTON_DOWN, _INTERCEPTION_MOUSE_LEFT_BUTTON_UP),
+            "right": (_INTERCEPTION_MOUSE_RIGHT_BUTTON_DOWN, _INTERCEPTION_MOUSE_RIGHT_BUTTON_UP),
+            "middle": (_INTERCEPTION_MOUSE_MIDDLE_BUTTON_DOWN, _INTERCEPTION_MOUSE_MIDDLE_BUTTON_UP),
+            "x1": (_INTERCEPTION_MOUSE_BUTTON_4_DOWN, _INTERCEPTION_MOUSE_BUTTON_4_UP),
+            "x2": (_INTERCEPTION_MOUSE_BUTTON_5_DOWN, _INTERCEPTION_MOUSE_BUTTON_5_UP),
+        }
+        pair = states.get(btn)
+        if pair is None:
+            return False
+        state = pair[0] if is_down else pair[1]
+        stroke = InterceptionMouseStroke(state, 0, 0, 0, 0, 0)
+        try:
+            sent = int(
+                self._dll.interception_send(
+                    self._ctx,
+                    int(self._mouse_device),
+                    ctypes.byref(stroke),
+                    1,
+                )
+            )
+            if sent > 0:
+                return True
+            for device in range(11, 21):
+                if device == self._mouse_device:
+                    continue
+                sent = int(
+                    self._dll.interception_send(
+                        self._ctx, device, ctypes.byref(stroke), 1
+                    )
+                )
+                if sent > 0:
+                    self._mouse_device = device
+                    return True
+            return False
+        except Exception as exc:
+            logger.debug("Interception send_mouse_button failed: %s", exc)
+            return False
+
+    def send_mouse_absolute(self, x_px: int, y_px: int) -> bool:
+        """Send an absolute mouse move via Interception (MOVE_ABSOLUTE,
+        0..65535 normalized). Returns False if unavailable."""
+        if not self.available or self._dll is None or self._ctx is None:
+            return False
+        try:
+            width, height = 1920, 1080
+            try:
+                width = int(ctypes.windll.user32.GetSystemMetrics(0) or 1920)
+                height = int(ctypes.windll.user32.GetSystemMetrics(1) or 1080)
+            except Exception:
+                pass
+            norm_x = int(round((float(x_px) * 65535.0) / float(max(1, width - 1))))
+            norm_y = int(round((float(y_px) * 65535.0) / float(max(1, height - 1))))
+            norm_x = max(0, min(65535, norm_x))
+            norm_y = max(0, min(65535, norm_y))
+        except Exception:
+            return False
+        stroke = InterceptionMouseStroke(0, _INTERCEPTION_MOUSE_MOVE_ABSOLUTE, 0, norm_x, norm_y, 0)
+        try:
+            sent = int(
+                self._dll.interception_send(
+                    self._ctx,
+                    int(self._mouse_device),
+                    ctypes.byref(stroke),
+                    1,
+                )
+            )
+            if sent > 0:
+                return True
+            for device in range(11, 21):
+                if device == self._mouse_device:
+                    continue
+                sent = int(
+                    self._dll.interception_send(
+                        self._ctx, device, ctypes.byref(stroke), 1
+                    )
+                )
+                if sent > 0:
+                    self._mouse_device = device
+                    return True
+            return False
+        except Exception as exc:
+            logger.debug("Interception send_mouse_absolute failed: %s", exc)
+            return False
 
     def send_key(self, scancode: int, is_down: bool, extended: bool = False) -> bool:
         """Send a hardware scancode via Interception. Returns False if unavailable."""
@@ -665,6 +976,9 @@ class InterceptionBridge:
             if sent > 0:
                 return True
             # Fallback: broadcast to all keyboard slots if preferred device rejected
+            # D-1 (dilim 20): eskiden sessizdi — hangi cihaza geçildiği
+            # bilinmiyordu. Cihaz değişimi nadir olduğu için warning
+            # loglanır (tuş başına değil, yalnızca geçişte).
             for device in range(1, 11):
                 if device == self._keyboard_device:
                     continue
@@ -674,6 +988,11 @@ class InterceptionBridge:
                     )
                 )
                 if sent > 0:
+                    logger.warning(
+                        "Interception klavye cihazı %s reddetti; %s cihazına geçildi.",
+                        self._keyboard_device,
+                        device,
+                    )
                     self._keyboard_device = device
                     return True
             return False
@@ -799,25 +1118,10 @@ class HotkeyListener:
             0x42: "f8",
             0x43: "f9",
             0x44: "f10",
-            66: "f8",
-            67: "f9",
-            68: "f10",
             -0x77: "f8",
             -0x78: "f9",
             -0x79: "f10",
         }.get(scan, "")
-
-    def _repeat_while_held(self, flag_name: str, event_ts_name: str, now: float) -> bool:
-        """
-        True when this key-down is auto-repeat and must be ignored.
-        A missed key-up cannot latch the flag forever: a later press after a gap is accepted.
-        """
-        if getattr(self, flag_name) and (now - getattr(self, event_ts_name)) < 0.40:
-            setattr(self, event_ts_name, now)
-            return True
-        setattr(self, flag_name, True)
-        setattr(self, event_ts_name, now)
-        return False
 
     def _on_key_release(self, event) -> None:
         """Tuş bırakıldığında fiziksel basılı tutma (auto-repeat) kilidini sıfırlar."""
@@ -909,7 +1213,7 @@ class HotkeyListener:
                     self._last_f9_time,
                     getattr(self.controller, "_last_f9_ts", 0.0),
                 )
-                if now - last < 0.55:
+                if now - last < HOTKEY_DEBOUNCE_SEC:
                     return False
                 self._last_f9_ts = now
                 self._last_f9_time = now
@@ -952,16 +1256,29 @@ class HotkeyListener:
             logger.info("[Hotkey] %s -> mevcut konum yeni Node olarak kaydediliyor.", self._node_spec)
         elif action == "f10":
             try:
-                abort = getattr(self.controller, "abort_motion", None)
-                if callable(abort):
-                    abort()
+                # Stop sonrası sessizlik: giriş mandalı kuruluyken F10 akoru
+                # abort/fare-bırakma göndermez. on_f10 callback'i (pause
+                # toggle) aşağıda yine çalışır; resume() gerekirse
+                # resume_motion() ile yeniden kurar.
+                _stopped_fn = getattr(self.controller, "input_stopped", None)
+                if callable(_stopped_fn):
+                    try:
+                        _stopped = bool(_stopped_fn())
+                    except Exception:
+                        _stopped = False
                 else:
-                    releaser = getattr(self.controller, "release_all_movement_keys", None)
-                    if callable(releaser):
-                        releaser()
-                freer = getattr(self.controller, "free_mouse_cursor", None)
-                if callable(freer):
-                    freer()
+                    _stopped = bool(getattr(self.controller, "_input_stopped", False))
+                if not _stopped:
+                    abort = getattr(self.controller, "abort_motion", None)
+                    if callable(abort):
+                        abort()
+                    else:
+                        releaser = getattr(self.controller, "release_all_movement_keys", None)
+                        if callable(releaser):
+                            releaser()
+                    freer = getattr(self.controller, "free_mouse_cursor", None)
+                    if callable(freer):
+                        freer()
             except Exception as release_exc:
                 logger.error("Duraklat akoru hareket tuşu bırakılamadı (kısayol yine de işlenecek): %s", release_exc)
             logger.info("[Hotkey] %s -> bot duraklat / devam.", self._pause_spec)
@@ -1003,12 +1320,20 @@ class HotkeyListener:
 
             now = time.time()
 
-            # Botun kendi gönderdiği sanal tuş basımı ise kesinlikle müdahale sayma
-            if (
-                self.controller._sending_virtual_key
-                or (now - self.controller._last_virtual_key_ts) < 0.15
-                or self.controller.is_bot_pressing(key_name)
-            ):
+            # ESC closes the F9 menu: keep the flag in sync when the menu is
+            # dismissed by keyboard instead of the resume path.
+            if key_name in ("esc", "escape"):
+                with self._lock:
+                    self._f9_menu_open = False
+
+            # Botun kendi gönderdiği sanal tuş basımı ise kesinlikle müdahale sayma.
+            # Emergency chords (F8/F9/F10) are exempt: a bot keypress landing in
+            # the 150 ms virtual-key window must never swallow the user's stop.
+            # O-3 (dilim 20): eskiden pencere TÜM tuşları bastırıyordu
+            # (skill spamı sürerken pencere hiç kapanmıyor, kullanıcının
+            # durdurma tuşu yutuluyordu). Artık yalnızca botun tuttuğu/son
+            # gönderdiği tuş bastırılır — is_bot_pressing tuş-adına özeldir.
+            if key_name not in ("f8", "f9", "f10") and self.controller.is_bot_pressing(key_name):
                 return
 
             # Yalın F8/F9/F10 botu uyandırmaz ve yutulmaz (suppress=False). Akor şart.
@@ -1041,7 +1366,13 @@ class HotkeyListener:
                     "[Hotkey] Rota çalışırken kullanıcı fiziksel klavye tuşuna bastı ('%s') -> Bot PAUSED durumuna geçiriliyor!",
                     key_name,
                 )
-                self.controller.route_active = False
+                # Go through set_route_active so the anti-stuck guard releases
+                # held keys (direct assignment bypassed it) and free the mouse.
+                self.controller.set_route_active(False)
+                try:
+                    self.controller.free_mouse_cursor()
+                except Exception:
+                    pass
                 with self._lock:
                     self._f9_menu_open = True
                 if self.on_user_key_interrupt is not None:
@@ -1104,6 +1435,10 @@ class InputController:
         # Canlı ayar yeniden yükleme (Hot-Reload) 250ms sinyal debounce & state-diff kilidi (Item 19)
         self._settings_debounce_lock = threading.RLock()
         self._last_test_mode_log_ts: float = 0.0
+        # Güvenilir klavye yolu yokken basılan tuşlar için sert hata logu (60 sn throttle).
+        self._last_hw_key_gate_log_ts: float = 0.0
+        # Göreli fare reddi uyarısı throttle'u (60 sn) — yörünge adımlarında log seli olmasın.
+        self._last_rel_mouse_warn_ts: float = 0.0
         self._last_logged_test_mode: Optional[bool] = self.test_mode
         self._last_settings_apply_ts: float = 0.0
         self._last_applied_settings_snapshot: Dict[str, Any] = {
@@ -1129,7 +1464,19 @@ class InputController:
         self._bot_pressing: bool = False
         self._sending_virtual_key: bool = False
         self._last_virtual_key_ts: float = 0.0
+        # O-3 (dilim 20): 150 ms bastırma penceresi tuş-adına özeldir; son
+        # sanal tuşun adı saklanır ki kullanıcının FARKLI tuşu yutulmasın.
+        self._last_virtual_key_name: str = ""
         self._active_bot_keys: Set[str] = set()
+        # O-5 (dilim 20): Interception orta-oturumda gelirse yeniden yoklama
+        # zaman damgası (throttle'lu; bkz. _maybe_redetect_interception).
+        self._interception_redetect_ts: float = 0.0
+        # K-1 (dilim 20): close() idempotency.
+        self._closed: bool = False
+        # O-6 (dilim 20): HID yazım hatası uyarısı throttle'u (60 sn).
+        self._last_hid_fail_log_ts: float = 0.0
+        # P0-5/K-04: güvenilir fare yolu yok uyarısı throttle'u (60 sn).
+        self._last_hw_mouse_gate_log_ts: float = 0.0
         self._cached_game_hwnd: int = 0
         self._game_hwnd_cache_ts: float = 0.0
         self._logged_game_window_input: bool = False
@@ -1139,13 +1486,20 @@ class InputController:
         self._motion_lock = threading.Lock()
         self._motion_abort = threading.Event()
         self._aim_blocked: bool = False
+        # F-durdur: BotWorker.stop() sonrası giriş mandalı. True iken bu
+        # denetleyiciden hiçbir sentetik girdi çıkmaz (abort/release/F10
+        # yolları no-op olur); yalnızca resume_motion() yeniden kurar.
+        # Kullanıcının fiziksel tuşuna dokunmaz — mandal yalnız botun
+        # gönderimini keser, fiziksel klavyeyi yakalamaz/yutmaz.
+        self._input_stopped: bool = False
         self._held_movement: Set[str] = set()
         self._path_step_active: bool = False
         self._input_refused: bool = False
         self._mouse_buttons_down: Set[str] = set()
         self._emitted_move_points: List[Tuple[int, int]] = []
 
-        # Kernel / serial keyboard backends (optional; soft paths remain fallback)
+        # Kernel / serial keyboard backends (optional; N-3101: soft paths
+        # are NOT a fallback — no trusted path means the input fails).
         self._serial_hid: Any = None
         self._hid_retry_ts: float = 0.0
         self._interception = InterceptionBridge() if self.use_interception else None
@@ -1161,6 +1515,10 @@ class InputController:
 
         # Ekran çözünürlüğünü algıla
         self.screen_width, self.screen_height = self.get_screen_resolution()
+        # Çözünürlük önbelleği: normalize/denormalize/jitter her çağrıda
+        # Win32 sorgusu yapmasın diye; TTL dolunca _cached_screen_resolution yeniler.
+        self._screen_res_cache: Tuple[int, int] = (self.screen_width, self.screen_height)
+        self._screen_res_cache_ts: float = time.monotonic()
         logger.info(
             "InputController başlatıldı | Çözünürlük: %dx%d | Backend: %s | Test Modu: %s",
             self.screen_width,
@@ -1177,7 +1535,8 @@ class InputController:
             logger.warning(
                 "INPUT BLOCK: FakerInputWrapper.dll / Interception / Serial HID yok — AION2 Raw Input "
                 "çoğu zaman SendInput/keybd_event/pydirectinput/PostMessage Tab+skill tuşlarını düşürür. "
-                "Fare (relative/absolute) elevated bot'ta çalışır; soft-aim mouse-only yolu aktif. "
+                "Fare de yalnizca guvenilir yoldan (Interception/FakerInput/HID) "
+                "gonderilir; N-3101 ile yumusak SendInput/PostMessage baypasi kaldirildi. "
                 "Kök neden adayı: Steam/AION2 High integrity iken Medium bot UIPI ile tamamen "
                 "sessiz düşer — botu baslat.bat (Yönetici) ile aç VEYA Steam'i yükseltmesiz başlat. "
                 "Kalıcı HID klavye: Android GatherionHidBridge (GATHERION_HID_TCP) / "
@@ -1272,6 +1631,122 @@ class InputController:
         self._hid_retry_ts = now
         return self.configure_serial_hid(endpoint)
 
+    def _maybe_redetect_interception(self, min_interval_sec: float = 120.0) -> bool:
+        """O-5 (dilim 20): Interception bot başladıktan sonra kurulduysa geç
+        fark et — __init__'teki tek seferlik yoklama yetmiyordu; HID köprüsü
+        için olan late-bind Interception'a uygulanmamıştı. Yalnızca
+        use_interception açıkken ve köprü yok/çalışmıyorken denenir; DLL
+        dosyası diskte görünmüyorsa sessizce atlanır (yoksa
+        INTERCEPTION_MISSING uyarısı logu boğar). True: köprü kuruldu.
+        """
+        if not bool(getattr(self, "use_interception", False)):
+            return False
+        bridge = getattr(self, "_interception", None)
+        if bridge is not None and bool(getattr(bridge, "available", False)):
+            return True
+        now = time.monotonic()
+        if (now - float(getattr(self, "_interception_redetect_ts", 0.0) or 0.0)) < float(min_interval_sec):
+            return False
+        self._interception_redetect_ts = now
+        dll_present = False
+        try:
+            roots = [
+                os.getcwd(),
+                str(PROJECT_ROOT),
+                os.path.join(str(PROJECT_ROOT), "drivers"),
+                os.path.join(str(PROJECT_ROOT), "vendor", "interception"),
+                r"C:\Program Files\Interception",
+                r"C:\Windows\System32",
+            ]
+            for root in roots:
+                if os.path.isfile(os.path.join(root, "interception.dll")):
+                    dll_present = True
+                    break
+            if not dll_present:
+                for part in str(os.environ.get("PATH", "") or "").split(os.pathsep):
+                    if part and os.path.isfile(os.path.join(part, "interception.dll")):
+                        dll_present = True
+                        break
+        except Exception:
+            dll_present = False
+        if not dll_present:
+            return False
+        try:
+            if bridge is not None:
+                try:
+                    bridge.close()
+                except Exception:
+                    pass
+            self._interception = InterceptionBridge()
+            return bool(getattr(self._interception, "available", False))
+        except Exception as exc:
+            logger.debug("Interception yeniden yoklama hatası: %s", exc)
+            return False
+
+    def close(self) -> None:
+        """Release input backends and the hotkey hook.
+
+        InputController previously had no close()/shutdown() even though
+        InterceptionBridge.close() existed and was never called.
+
+        K-1 (dilim 20): köprüler kapanmadan ÖNCE botun tuttuğu tuşlar ve
+        fare tuşları bırakılır — aksi halde tuş oyunda basılı kalır ve onu
+        bırakacak köprü kalmaz. Bırakma, _input_stopped mandalı kuruluyken
+        bile denenir (kapatma terminaldir; bırakma yeni girdi değil,
+        temizliktir): mandal geçici kaldırılır, bırakma yapılır, sonra
+        köprüler kapatılır.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        # 1) Önce bırak (köprüler hâlâ ayakta).
+        _was_stopped = bool(getattr(self, "_input_stopped", False))
+        try:
+            if _was_stopped:
+                self._input_stopped = False
+            try:
+                self.release_all_held_keys(reason="close")
+            except Exception:
+                pass
+            try:
+                self._release_mouse_buttons()
+            except Exception:
+                pass
+        finally:
+            if _was_stopped:
+                self._input_stopped = True
+        try:
+            listener = getattr(self, "hotkey_listener", None)
+            if listener is not None:
+                listener.unregister()
+        except Exception:
+            pass
+        try:
+            bridge = getattr(self, "_interception", None)
+            if bridge is not None:
+                bridge.close()
+        except Exception:
+            pass
+        self._interception = None
+        try:
+            faker = getattr(self, "_faker", None)
+            if faker is not None:
+                faker.close()
+        except Exception:
+            pass
+        self._faker = None
+        try:
+            hid = getattr(self, "_serial_hid", None)
+            if hid is not None:
+                hid.close()
+        except Exception:
+            pass
+        self._serial_hid = None
+
+    def shutdown(self) -> None:
+        """Alias for close()."""
+        self.close()
+
     def _line_hid_available(self) -> bool:
         return bool(self._serial_hid is not None and getattr(self._serial_hid, "available", False))
 
@@ -1290,9 +1765,13 @@ class InputController:
             parts.append("FakerInput")
         if parts:
             return "+".join(parts)
-        if HAS_PYDIRECTINPUT:
-            return "pydirectinput+SendInput"
-        return "ctypes.SendInput"
+        # O-7 (dilim 20): güvenilir yol yokken eski etiket
+        # ("pydirectinput+SendInput") çalışan backend izlenimi veriyordu —
+        # oysa klavye kapısı bu yolu reddeder. Etiket artık yokluğu söyler.
+        # (mobile_server._keyboard_trusted/_mouse_trusted ad içinde
+        # "Interception"/"HID"/"FakerInput" arar; bu etiket hiçbirine
+        # uymaz, yani güven hesabı değişmez.)
+        return "none (soft-only, blocked)"
 
     @property
     def keyboard_inject_trusted(self) -> bool:
@@ -1317,13 +1796,34 @@ class InputController:
         return self.keyboard_inject_trusted
 
     def key_down(self, key: str, post_to_window: bool = False) -> bool:
-        """Send hardware key press via Interception/HID; return True immediately without soft fallthrough."""
+        """Send a hardware key press via Interception/HID (test_mode: simulated).
+        False when no trusted path exists — there is no soft fallthrough.
+
+        K-3 (dilim 20): doğrudan kapı artık press_key ile aynı stop/abort
+        kapılarını uygular — stop mandalı veya abort kuruluyken yeni basış
+        yapılmaz. key_up kasıtlı olarak kapısızdır: bırakma her zaman
+        serbesttir (takılı tuşu engellemek, yeni basışı engellemekten
+        önemlidir); bırakma yolları _hw_key_up'u doğrudan çağırır.
+        Odak/sohbet kapısı burada eklenmedi: press_key o kontrolleri
+        zaten yapar; bu düşük seviye primitive'e pencere-odak yan etkisi
+        eklemek çağıranların (combat/navigator) akışını bozar.
+        """
+        if getattr(self, "_input_stopped", False):
+            logger.debug("key_down('%s') reddedildi: input stopped.", key)
+            return False
+        if self.motion_aborted():
+            logger.debug("key_down('%s') reddedildi: motion aborted.", key)
+            return False
         return self._hw_key_down(key, post_to_window=post_to_window)
 
     def key_up(self, key: str, post_to_window: bool = False) -> bool:
-        """Send hardware key release via Interception/HID; return immediately without soft fallthrough."""
-        self._hw_key_up(key, post_to_window=post_to_window)
-        return True
+        """Send a hardware key release via Interception/HID and return the real
+        release result (previously an unconditional True).
+
+        K-3 notu: bırakma kapısızdır — stop/abort sonrası bile UP
+        gönderilebilir; takılı tuş bırakmak güven yönündedir.
+        """
+        return self._hw_key_up(key, post_to_window=post_to_window)
 
     def _sleep_jitter(
         self,
@@ -1417,13 +1917,47 @@ class InputController:
             self.test_mode = new_mode
             self._last_applied_settings_snapshot["test_mode"] = new_mode
 
+            # The return value reports the state change; the log line is still
+            # debounced (a change inside the 250 ms window must not log again,
+            # but it did change, so returning False would lie about it).
             if (now - self._last_test_mode_log_ts) >= self.SETTINGS_RELOAD_DEBOUNCE_SEC:
                 self._last_test_mode_log_ts = now
                 self._last_logged_test_mode = new_mode
                 logger.info("InputController test_mode durumu güncellendi: %s", self.test_mode)
-                return True
+            return True
 
-            return False
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        """'false'/'0'/'no'/'off' strings are False — bool('false') is True."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("true", "1", "yes", "on", "y"):
+                return True
+            if v in ("false", "0", "no", "off", "n", ""):
+                return False
+            return default
+        return bool(value) if value is not None else default
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return default
+
+    @staticmethod
+    def _coerce_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
     def _extract_settings_snapshot(self, settings: Any) -> Dict[str, Any]:
         """Verilen ayar nesnesi veya sözlüğünden InputController ile ilgili alanları çıkarır."""
@@ -1484,7 +2018,10 @@ class InputController:
             or self._serial_port_cfg
             or ""
         )
-        # Env always wins when set (same rule as resolve_serial_hid_port)
+        # Env always wins when set (same rule as resolve_serial_hid_port).
+        # D-6 (dilim 20): eskiden settings değeri sessizce eziliyordu —
+        # ayar dosyasından TCP'ye geçiş yapılamaması anlaşılmıyordu.
+        settings_serial = str(serial_val or "").strip()
         env_com = str(os.environ.get("GATHERION_HID_COM", "") or "").strip()
         if env_com:
             serial_val = env_com
@@ -1492,16 +2029,27 @@ class InputController:
             env_tcp = str(os.environ.get("GATHERION_HID_TCP", "") or "").strip()
             if env_tcp:
                 serial_val = env_tcp
+        if str(serial_val or "").strip() and str(serial_val or "").strip() != settings_serial:
+            logger.info(
+                "HID endpoint ortam değişkeniyle gölgelendi: settings='%s' -> env='%s' "
+                "(GATHERION_HID_COM/GATHERION_HID_TCP her zaman kazanır).",
+                settings_serial,
+                str(serial_val or "").strip(),
+            )
 
         return {
-            "test_mode": bool(test_mode_val),
-            "pause_on_any_key": bool(pause_any_val),
-            "use_faker_input": bool(faker_val),
-            "use_interception": bool(interception_val),
-            "chat_box_guard_enabled": bool(chat_guard_val),
-            "jitter_px": max(0, int(jitter_val)),
-            "min_hold_sec": max(0.01, float(min_hold_val)),
-            "max_hold_sec": max(0.01, float(max_hold_val)),
+            "test_mode": self._coerce_bool(test_mode_val, self.test_mode),
+            "pause_on_any_key": self._coerce_bool(pause_any_val, self.pause_on_any_key),
+            "use_faker_input": self._coerce_bool(faker_val, self.use_faker_input),
+            "use_interception": self._coerce_bool(interception_val, self.use_interception),
+            "chat_box_guard_enabled": self._coerce_bool(chat_guard_val, self.chat_box_guard_enabled),
+            "jitter_px": max(0, self._coerce_int(jitter_val, self.DEFAULT_JITTER_PX)),
+            # D-6 (dilim 20): hold sürelerinde üst sınır yoktu — yanlış bir
+            # ayar (min_hold_sec: 5) her tuş basışını 5 sn tutardı. Basış
+            # süreleri 1 sn ile sınırlanır (hareket tuşları bu yolu
+            # kullanmaz; onlar hold_movement_key ile tutulur).
+            "min_hold_sec": min(1.0, max(0.01, self._coerce_float(min_hold_val, self.DEFAULT_MIN_HOLD_SEC))),
+            "max_hold_sec": min(1.0, max(0.01, self._coerce_float(max_hold_val, self.DEFAULT_MAX_HOLD_SEC))),
             "serial_port": str(serial_val or "").strip(),
         }
 
@@ -1513,7 +2061,17 @@ class InputController:
         """
         with self._settings_debounce_lock:
             now = time.monotonic()
-            snapshot = self._extract_settings_snapshot(settings)
+            try:
+                snapshot = self._extract_settings_snapshot(settings)
+            except Exception as exc:
+                logger.debug("apply_settings: ayar snapshot çıkarılamadı: %s", exc)
+                return {
+                    "applied": False,
+                    "debounced": False,
+                    "changed_keys": [],
+                    "test_mode": self.test_mode,
+                    "error": str(exc),
+                }
             changed_keys: List[str] = [
                 k for k, v in snapshot.items() if self._last_applied_settings_snapshot.get(k) != v
             ]
@@ -1524,16 +2082,14 @@ class InputController:
             )
 
             if not changed_keys or is_debounced:
-                # Durum değişmemişse veya 250ms debounce penceresi içindeyse log basmadan çık
-                if changed_keys and is_debounced:
-                    self.test_mode = snapshot["test_mode"]
-                    self.pause_on_any_key = snapshot["pause_on_any_key"]
-                    self.chat_box_guard_enabled = snapshot["chat_box_guard_enabled"]
-                    self._last_applied_settings_snapshot.update(snapshot)
+                # Debounce: NOTHING is applied and the snapshot is NOT marked
+                # applied. The old code applied 3 fields but recorded the whole
+                # snapshot, permanently swallowing the other changed settings.
+                # The next call after the 250 ms window applies everything.
                 return {
                     "applied": False,
                     "debounced": is_debounced,
-                    "changed_keys": [],
+                    "changed_keys": list(changed_keys),
                     "test_mode": self.test_mode,
                 }
 
@@ -1563,6 +2119,17 @@ class InputController:
                     except Exception:
                         pass
                     self._interception = None
+            if "use_faker_input" in changed_keys:
+                if self.use_faker_input and (
+                    self._faker is None or not getattr(self._faker, "available", False)
+                ):
+                    self._faker = FakerInputBridge()
+                elif not self.use_faker_input and self._faker is not None:
+                    try:
+                        self._faker.close()
+                    except Exception:
+                        pass
+                    self._faker = None
             self._last_applied_settings_snapshot = dict(snapshot)
 
             non_test_changes = [k for k in changed_keys if k != "test_mode"]
@@ -1613,14 +2180,19 @@ class InputController:
             except Exception as exc:
                 logger.debug("Chat detector callback hatası: %s", exc)
 
+        # No frame was measured here (flag/callback only): confidence is 0.5
+        # (unknown), not a fabricated 1.0, and the ROI is the documented chat
+        # region (x 0.01..0.24, y 0.91..0.96), not (0, 0, 0, 0).
+        width = int(getattr(self, "screen_width", 1920) or 1920)
+        height = int(getattr(self, "screen_height", 1080) or 1080)
         return ChatInputOpenResult(
             is_open=is_open,
             chat_open=is_open,
-            has_border=is_open,
+            has_border=False,
             has_cursor=False,
             has_prompt_tag=False,
-            confidence=1.0 if is_open else 0.0,
-            roi_bbox=(0, 0, 0, 0),
+            confidence=0.5,
+            roi_bbox=(int(width * 0.01), int(height * 0.91), int(width * 0.24), int(height * 0.96)),
             elapsed_ms=0.0,
         )
 
@@ -1655,7 +2227,18 @@ class InputController:
         )
         esc_delay = 0.005 if self.test_mode else self._human_timing.sample_gaussian_jitter(0.025, std_sec=0.003)
         self._sleep_abortable(esc_delay)
-        return True
+        if self.test_mode:
+            # Simulated ESC: test mode never sends physical input.
+            return True
+        down_ok = bool(self._hw_key_down("esc", post_to_window=False))
+        up_ok = bool(self._hw_key_up("esc", post_to_window=False))
+        if not (down_ok and up_ok):
+            logger.warning(
+                "Sohbet ESC gönderilemedi (down=%s, up=%s); sonraki tuş sohbet satırına yazılabilir.",
+                down_ok,
+                up_ok,
+            )
+        return bool(down_ok and up_ok)
 
     def set_pause_on_any_key(self, enabled: bool) -> None:
         """
@@ -1677,12 +2260,21 @@ class InputController:
         logger.debug("InputController route_active durumu güncellendi: %s", self.route_active)
 
     def is_bot_pressing(self, key_name: Optional[str] = None) -> bool:
-        """Botun şu anda sanal bir tuşa basıp basmadığını kontrol eder."""
+        """Botun şu anda sanal bir tuşa basıp basmadığını kontrol eder.
+
+        O-3 (dilim 20): eskiden 150 ms penceresi içinde _active_bot_keys
+        boşken bile her tuş için True dönüyordu — boş küme "basıyor"
+        sayılıyordu. Artık pencere tuş-adına özeldir: yalnızca tutulan
+        kümedeki tuş veya son sanal tuşun adı bastırılır.
+        """
         with self._bot_pressing_lock:
             if self._sending_virtual_key or (time.time() - self._last_virtual_key_ts) < 0.15:
-                if key_name is None or not self._active_bot_keys:
+                if key_name is None:
                     return True
-                return key_name.lower() in self._active_bot_keys or self._sending_virtual_key
+                kl = key_name.lower()
+                if kl in self._active_bot_keys:
+                    return True
+                return kl == (getattr(self, "_last_virtual_key_name", "") or "")
             if not self._bot_pressing:
                 return False
             if key_name is None:
@@ -1710,6 +2302,20 @@ class InputController:
             logger.error("Ekran çözünürlüğü okunamadı, varsayılan 1920x1080 kullanılıyor: %s", exc)
         return 1920, 1080
 
+    def _cached_screen_resolution(self) -> Tuple[int, int]:
+        """TTL'li çözünürlük: sık çağrılan koordinat yardımcıları her seferinde
+        Win32 sorgusu yapmasın. TTL dolunca bir kez yenilenir; kısmen kurulu
+        nesnelerde (getattr varsayılanı) ilk çağrı doğrudan sorguya düşer."""
+        now = time.monotonic()
+        cache = getattr(self, "_screen_res_cache", None)
+        ts = float(getattr(self, "_screen_res_cache_ts", 0.0) or 0.0)
+        if cache and (now - ts) < _SCREEN_RES_CACHE_TTL_SEC:
+            return cache
+        res = self.get_screen_resolution()
+        self._screen_res_cache = res
+        self._screen_res_cache_ts = now
+        return res
+
     @staticmethod
     def get_cursor_position() -> Tuple[int, int]:
         """Mevcut fare imleç koordinatlarını (x, y) döndürür."""
@@ -1722,28 +2328,74 @@ class InputController:
         return 0, 0
 
     def release_all_movement_keys(self) -> None:
-        """Release movement keys the bot may still be holding (W/A/S/D and strafe)."""
+        """Release movement keys the bot is actually holding (W/A/S/D, Q/E, Space).
+
+        Botun tutmadığı bir hareket tuşu için sentetik key-UP gönderilmez:
+        kullanıcının fiziksel olarak basılı tuttuğu W'ya gelen sentetik
+        W-UP, oyunun W'yu bırakılmış görmesine yol açar ve karakter durur.
+        """
         with self._motion_lock:
+            held_mov = set(self._held_movement)
             self._held_movement.clear()
             self._path_step_active = False
         with self._bot_pressing_lock:
+            active_keys = set(self._active_bot_keys)
             for key in ("w", "a", "s", "d", "q", "e", "space"):
                 self._active_bot_keys.discard(key)
             self._sending_virtual_key = False
             if not self._active_bot_keys:
                 self._bot_pressing = False
+        if getattr(self, "_input_stopped", False):
+            # Y-2 (dilim 20): atılan tuşlar sayılır ve uyarı loglanır —
+            # eskiden kümeler sessizce temizleniyor, kaç tuşun gönderilmeden
+            # atıldığı hiç görünmüyordu.
+            skipped = sorted(
+                key
+                for key in ("w", "a", "s", "d", "q", "e", "space")
+                if key in held_mov or key in active_keys
+            )
+            if skipped:
+                logger.warning(
+                    "[ANTI-STUCK GUARD] input stopped iken %d hareket tuşu "
+                    "gönderilmeden atıldı (kalan takılı olabilir): %s",
+                    len(skipped),
+                    skipped,
+                )
+            return
+        to_release = {
+            key
+            for key in ("w", "a", "s", "d", "q", "e", "space")
+            if key in held_mov or key in active_keys
+        }
         if self.test_mode:
             logger.info("[TEST MODE] release_all_movement_keys")
             return
-        for key in ("w", "a", "s", "d", "q", "e", "space"):
+        # K-2 (dilim 20): bırakılamayan hareket tuşu kayıtta kalır.
+        failed_mov: List[str] = []
+        for key in sorted(to_release):
             try:
-                self._hw_key_up(key)
+                if not self._hw_key_up(key):
+                    failed_mov.append(key)
             except Exception as exc:
                 logger.debug("Hareket tuşu bırakılamadı (%s): %s", key, exc)
+                failed_mov.append(key)
+        if failed_mov:
+            with self._motion_lock:
+                self._held_movement.update(failed_mov)
+            with self._bot_pressing_lock:
+                self._active_bot_keys.update(failed_mov)
+                self._bot_pressing = True
+            logger.warning(
+                "[ANTI-STUCK GUARD] %d hareket tuşu bırakılamadı, izlemede tutuldu: %s",
+                len(failed_mov),
+                sorted(failed_mov),
+            )
 
     def motion_aborted(self) -> bool:
         """True while stop/pause has cancelled aim and movement."""
-        return self._motion_abort.is_set() or self._aim_blocked
+        abort = getattr(self, "_motion_abort", None)
+        aborted = abort.is_set() if abort is not None else False
+        return aborted or bool(getattr(self, "_aim_blocked", False))
 
     def movement_active(self) -> bool:
         """WALKING is real only while a movement key is down or a path step is in progress."""
@@ -1752,10 +2404,54 @@ class InputController:
 
     def release_all_held_keys(self, reason: str = "state_transition") -> int:
         """
-        Anti-stuck key release guard:
-        Explicitly releases all currently active bot keys, movement keys, and modifier keys.
-        Prevents stuck keys (e.g. stuck W/A/S/D, stuck Alt, stuck Tab, stuck 1..9) on state transitions.
+        Anti-stuck key release guard — YALNIZCA BOTUN TUTTUĞU TUŞLAR.
+
+        Bırakılan küme _held_movement ∪ _active_bot_keys'tir. Botun
+        basmadığı bir tuş için ASLA sentetik key-UP gönderilmez: kullanıcı
+        fiziksel olarak W basılı tutarken gönderilen sentetik W-UP, oyunun
+        W'yu bırakılmış görmesine yol açar (yeni DOWN ancak kullanıcı
+        tekrar basınca gelir) ve karakter durur. Eski koşulsuz 23 tuşluk
+        salvo (WASD, Q/E, Space, Tab, Alt, Ctrl, Shift, 1-0) bu yüzden
+        kaldırıldı; takılı tuş için periyodik süpürme yoktur. Botun tüm
+        tuş-basışları _hw_key_down üzerinden izlendiği için (_active_bot_keys;
+        repo'da izlenmeyen pydirectinput.keyDown / keyboard.press yoktur)
+        botun tuttuğu tuş kaybolmaz.
+
+        Stop sonrası sessizlik: _input_stopped mandalı kuruluyken hiçbir
+        şey gönderilmez (0 döner); izleme kümeleri gönderimsiz temizlenir.
         """
+        if getattr(self, "_input_stopped", False):
+            # İzleme kümeleri zaten boş olmalı (mark_input_stopped önce son
+            # bırakmayı yapar; mandal kuruluyken yeni basış da olamaz) —
+            # gönderimsiz temizlik yalnızca savunmadır. Y-2 (dilim 20):
+            # boş değilse kaç tuşun atıldığı sayılır ve uyarı loglanır;
+            # eskiden yalnızca masum bir info satırı çıkıyordu.
+            skipped: List[str] = []
+            try:
+                if hasattr(self, "_held_movement"):
+                    skipped.extend(sorted(self._held_movement))
+                    self._held_movement.clear()
+                if hasattr(self, "_active_bot_keys"):
+                    skipped.extend(
+                        k for k in sorted(self._active_bot_keys) if k not in skipped
+                    )
+                    self._active_bot_keys.clear()
+            except Exception:
+                pass
+            if skipped:
+                logger.warning(
+                    "[ANTI-STUCK GUARD] skipped (input stopped, reason='%s'): "
+                    "%d tuş gönderilmeden atıldı (kalan takılı olabilir): %s.",
+                    reason,
+                    len(skipped),
+                    skipped,
+                )
+            else:
+                logger.info(
+                    "[ANTI-STUCK GUARD] skipped (input stopped, reason='%s').",
+                    reason,
+                )
+            return 0
         released_count = 0
         if not hasattr(self, "_motion_lock"):
             self._motion_lock = threading.Lock()
@@ -1777,23 +2473,42 @@ class InputController:
             self._sending_virtual_key = False
             self._bot_pressing = False
 
-        all_keys = held_mov.union(active_keys)
-        critical_suspects = {
-            "w", "a", "s", "d", "q", "e", "space", "tab",
-            "alt", "ctrl", "shift", "left alt", "right alt",
-            "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
-        }
-        all_to_release = all_keys.union(critical_suspects)
+        # SADECE botun tuttuğu tuşlar — koşulsuz "kritik şüpheli" listesi yok.
+        all_to_release = held_mov.union(active_keys)
 
         if not getattr(self, "test_mode", False):
-            for k in all_to_release:
+            # K-2 (dilim 20): başarısız bırakma kayıttan düşmez — _hw_key_up
+            # False dönerse tuş _active_bot_keys'e geri yazılır ki sonraki
+            # süpürme yeniden deneyebilsin; yoksa tuş oyunda basılı kalır.
+            failed: List[str] = []
+            for k in sorted(all_to_release):
                 try:
-                    self._hw_key_up(k)
-                    released_count += 1
+                    # Count only releases a backend actually accepted.
+                    if self._hw_key_up(k):
+                        released_count += 1
+                    else:
+                        failed.append(k)
                 except Exception as exc:
                     logger.debug("release_all_held_keys failed for '%s': %s", k, exc)
+                    failed.append(k)
+            if failed:
+                with self._bot_pressing_lock:
+                    self._active_bot_keys.update(failed)
+                    self._bot_pressing = True
+                logger.warning(
+                    "[ANTI-STUCK GUARD] %d tuş bırakılamadı, izlemede tutuldu "
+                    "(sonraki süpürmede yeniden denenecek): %s",
+                    len(failed),
+                    sorted(failed),
+                )
 
             try:
+                # Modifier'lar yukarıdaki all_to_release döngüsünde zaten
+                # bırakıldı (modifier da _active_bot_keys üyesidir); bu çağrı
+                # _active_bot_keys artık boş olduğu için no-op'tur — Y-2
+                # (dilim 20) notu: eski yorum "burada genelde gönderim
+                # olmaz" diyordu ama nedenini (döngünün kapsaması)
+                # söylemiyordu. Çağrı savunma amaçlı tutulur.
                 self.release_modifier_keys()
             except Exception:
                 pass
@@ -1818,6 +2533,10 @@ class InputController:
 
     def abort_motion(self) -> None:
         """Cancel an in-flight cursor path, drop mouse buttons, and release WASD and all held keys."""
+        # Stop sonrası sessizlik: mandal kuruluyken abort tekrar ateşlenemez
+        # (F10 akoru / periyodik guard'lar stop sonrası gönderim yapamaz).
+        if getattr(self, "_input_stopped", False):
+            return
         self._motion_abort.set()
         self._aim_blocked = True
         self.release_all_held_keys(reason="abort_motion")
@@ -1828,6 +2547,38 @@ class InputController:
         self._input_refused = False
         self._aim_blocked = False
         self._motion_abort.clear()
+        # F-0049 deseni: resume, pause/stop mandallarının tamamını kaldırır —
+        # _motion_abort/_aim_blocked ile birlikte stop sonrası giriş mandalı
+        # da burada, tek yeniden-kurma yolundan temizlenir.
+        self._input_stopped = False
+
+    def mark_input_stopped(self) -> None:
+        """Latch the controller silent after BotWorker.stop().
+
+        Önce botun tuttuğu tuşlar bırakılır (bot-held-only release), sonra
+        mandal kurulur: bu andan itibaren abort/release/F10 yolları hiçbir
+        sentetik girdi gönderemez. Yalnızca resume_motion() kaldırır.
+        Hareket kapısı da kilitlenir (_motion_abort set) ki press_key /
+        hold_movement_key / pulse_key mandal kalkana dek 0.0/False dönsün.
+        """
+        try:
+            self.release_all_held_keys(reason="input_stopped")
+        except Exception:
+            pass
+        if hasattr(self, "_motion_abort"):
+            try:
+                self._motion_abort.set()
+            except Exception:
+                pass
+        try:
+            self._aim_blocked = True
+        except Exception:
+            pass
+        self._input_stopped = True
+
+    def input_stopped(self) -> bool:
+        """True while the post-stop input latch is set."""
+        return bool(getattr(self, "_input_stopped", False))
 
     def hold_movement_key(self, key: str) -> bool:
         """Hold a movement key. False means the game refused the input or motion is aborted."""
@@ -1863,9 +2614,29 @@ class InputController:
         return ok
 
     def release_movement_key(self, key: str) -> None:
-        """Release one held movement key. Other held keys, including W, stay down."""
+        """Release one held movement key. Other held keys, including W, stay down.
+
+        K-2 (dilim 20): bırakma başarısız olursa kayıt korunur — eskiden
+        kümeden önce siliniyor, başarısız UP kayboluyordu.
+        """
         key_clean = str(key or "").strip().lower()
         if not key_clean:
+            return
+        if self.test_mode:
+            with self._motion_lock:
+                self._held_movement.discard(key_clean)
+            with self._bot_pressing_lock:
+                self._active_bot_keys.discard(key_clean)
+                if not self._active_bot_keys:
+                    self._bot_pressing = False
+                    self._sending_virtual_key = False
+            return
+        try:
+            released = bool(self._hw_key_up(key_clean))
+        except Exception as exc:
+            logger.debug("Hareket tuşu bırakılamadı (%s): %s", key_clean, exc)
+            released = False
+        if not released:
             return
         with self._motion_lock:
             self._held_movement.discard(key_clean)
@@ -1874,12 +2645,6 @@ class InputController:
             if not self._active_bot_keys:
                 self._bot_pressing = False
                 self._sending_virtual_key = False
-        if self.test_mode:
-            return
-        try:
-            self._hw_key_up(key_clean)
-        except Exception as exc:
-            logger.debug("Hareket tuşu bırakılamadı (%s): %s", key_clean, exc)
 
     def pulse_key(self, key: str, hold_sec: float = 0.16) -> bool:
         """
@@ -1891,15 +2656,18 @@ class InputController:
         if not key_clean or self.motion_aborted():
             return False
         if self.test_mode:
-            with self._bot_pressing_lock:
-                self._bot_pressing = True
-                self._active_bot_keys.add(key_clean)
+            # O-2 (dilim 20): test modunda izlemeye kayıt eklenmez — eskiden
+            # her pulse kalıcı hayalet kayıt bırakıyor, _bot_pressing bir
+            # daha False olmuyordu. Simülasyon "başarı" döner, iz bırakmaz.
             return True
         with self._bot_pressing_lock:
             self._bot_pressing = True
             self._sending_virtual_key = True
             self._last_virtual_key_ts = time.time()
-            self._active_bot_keys.add(key_clean)
+            self._last_virtual_key_name = key_clean
+            # Y-1 (dilim 20): kayıt _hw_key_down_impl'e aittir (yalnızca
+            # başarılı gönderimde eklenir); buradaki ön-kayıt başarısız
+            # basışı hayalet bırakıyordu.
         ok = bool(self._hw_key_down(key_clean))
         try:
             self._sleep_abortable(max(0.05, float(hold_sec)))
@@ -1912,6 +2680,7 @@ class InputController:
                 self._active_bot_keys.discard(key_clean)
                 self._sending_virtual_key = False
                 self._last_virtual_key_ts = time.time()
+                self._last_virtual_key_name = key_clean
                 if not self._active_bot_keys:
                     self._bot_pressing = False
         return ok
@@ -1926,32 +2695,82 @@ class InputController:
         with self._motion_lock:
             self._path_step_active = False
 
-    def _release_mouse_buttons(self) -> None:
+    def _release_mouse_buttons(self) -> bool:
+        """Release ONLY mouse buttons the bot itself holds (_mouse_buttons_down).
+
+        Kullanıcının fiziksel olarak basılı tuttuğu fare tuşu için sentetik
+        mouse-UP gönderilmez.
+
+        P0-5/K-04: bırakması başarısız olan tuş kayıtta KALIR (K-2: sonraki
+        süpürme yeniden deneyebilsin) ve False döner — eskiden kayıt
+        denemeden önce temizleniyor, başarısız bırakma sessizce başarı
+        sayılıyordu. True = tutulacak tuş kalmadı / hepsi bırakıldı.
+        """
         with self._motion_lock:
+            held_buttons = set(self._mouse_buttons_down)
             self._mouse_buttons_down.clear()
         if self.test_mode:
-            return
-        for button in ("left", "right", "middle"):
+            return True
+        all_released = True
+        for button in sorted(held_buttons):
             try:
-                self._hw_mouse_up(button)
+                if self._hw_mouse_up(button) is False:
+                    # Bırakma reddedildi: tuş fiziksel olarak basılı
+                    # kalmış olabilir — kaydı geri koy ki sonraki süpürme
+                    # yeniden denesin; sessizce başarı sayma.
+                    logger.warning(
+                        "Fare tuşu bırakılamadı (%s): güvenilir fare yolu "
+                        "reddetti, tuş kayıtta tutuldu.",
+                        button,
+                    )
+                    with self._motion_lock:
+                        self._mouse_buttons_down.add(button)
+                    all_released = False
             except Exception as exc:
                 logger.debug("Fare tuşu bırakılamadı (%s): %s", button, exc)
+                with self._motion_lock:
+                    self._mouse_buttons_down.add(button)
+                all_released = False
+        return all_released
 
     def _sleep_abortable(self, seconds: float) -> bool:
-        """Sleep in short slices. False means stop/pause aborted the wait."""
-        end = time.perf_counter() + max(0.0, float(seconds))
+        """Sleep until the deadline or until stop/pause aborts. False = aborted.
+
+        Tek bir Event.wait: eski 10 ms polling döngüsü her dilimde uyanıyordu
+        (0.5 sn uyku ≈ 14-50 uyanış; bu VM'de sleep(0.01) ~35 ms sürdüğü için
+        abort gecikmesi ~50 ms'yi buluyordu). D-5 (dilim 20) düzeltmesi:
+        _aim_blocked'ın yazıcıları abort_motion (True), mark_input_stopped
+        (True) ve resume_motion (False) — "tek yazıcı abort_motion" eski
+        yorumu yanlıştı; davranış (event + son kontrol) yine de doğru
+        çünkü motion_aborted() event VEYA bayrağa bakıyor.
+        """
+        if self.motion_aborted():
+            return False
+        remaining = max(0.0, float(seconds))
+        if remaining <= 0:
+            return not self.motion_aborted()
+        abort_event = getattr(self, "_motion_abort", None)
+        if abort_event is not None and hasattr(abort_event, "wait"):
+            aborted = bool(abort_event.wait(timeout=remaining))
+            return not (aborted or self.motion_aborted())
+        end = time.perf_counter() + remaining
         while True:
             if self.motion_aborted():
                 return False
-            remaining = end - time.perf_counter()
-            if remaining <= 0:
+            left = end - time.perf_counter()
+            if left <= 0:
                 return True
-            time.sleep(min(0.01, remaining))
+            time.sleep(min(0.01, left))
 
     def free_mouse_cursor(self) -> None:
         """
         F9 Menüsü açıldığında oyunun fareyi ekran ortasına kilitlemesini (ClipCursor / SetCapture)
         ve basılı kalan sağ/sol fare tuşlarını serbest bırakır.
+
+        Y-5 (dilim 20): eskiden botun tutmadığı tuşlara bile koşulsuz
+        yumuşak UP gönderiliyordu (kullanıcı sağ tıkla kamera bakarken
+        menü açılırsa kamera bırakılıyordu). Artık yalnızca botun tuttuğu
+        fare tuşları bırakılır (_release_mouse_buttons, bot-held-only).
         """
         try:
             user32 = ctypes.windll.user32
@@ -1961,14 +2780,13 @@ class InputController:
                 if user32.ShowCursor(True) >= 0:
                     break
             if not self.test_mode:
-                self._sendinput_mouse_button("right", False)
-                self._sendinput_mouse_button("left", False)
+                self._release_mouse_buttons()
         except Exception as exc:
             logger.debug("free_mouse_cursor bilgi: %s", exc)
 
     def normalize_coords(self, x: int, y: int) -> Tuple[float, float]:
         """Piksel koordinatlarını [0.0, 1.0] aralığında normalize koordinata dönüştürür."""
-        self.screen_width, self.screen_height = self.get_screen_resolution()
+        self.screen_width, self.screen_height = self._cached_screen_resolution()
         nx = max(0.0, min(1.0, float(x) / float(max(1, self.screen_width))))
         ny = max(0.0, min(1.0, float(y) / float(max(1, self.screen_height))))
         return nx, ny
@@ -1978,7 +2796,7 @@ class InputController:
         [0.0, 1.0] aralığındaki normalize koordinatları güncel ekran çözünürlüğüne
         (1920x1080, 2560x1440 vb.) göre piksel koordinatlarına dönüştürür.
         """
-        self.screen_width, self.screen_height = self.get_screen_resolution()
+        self.screen_width, self.screen_height = self._cached_screen_resolution()
         clamped_nx = max(0.0, min(1.0, float(nx)))
         clamped_ny = max(0.0, min(1.0, float(ny)))
         px = int(round(clamped_nx * (self.screen_width - 1)))
@@ -1990,7 +2808,7 @@ class InputController:
         Koordinatlara rastgele ±jitter_px (varsayılan ±2 piksel) insan sapması uygular
         ve ekran sınırları içinde tutar.
         """
-        self.screen_width, self.screen_height = self.get_screen_resolution()
+        self.screen_width, self.screen_height = self._cached_screen_resolution()
         dx = random.randint(-abs(jitter_px), abs(jitter_px))
         dy = random.randint(-abs(jitter_px), abs(jitter_px))
         jx = max(0, min(self.screen_width - 1, int(x) + dx))
@@ -2005,12 +2823,15 @@ class InputController:
         """
         Dual SendInput: scancode-only (DirectInput/Unreal) then VK path.
         Some AION2 builds drop one flavor while accepting the other.
+        test_mode: never injects physical input.
         """
+        if getattr(self, "test_mode", False):
+            return False
         try:
             key_lower = key.lower().strip()
             vk_code = VIRTUAL_KEY_CODES.get(key_lower, 0)
-            if vk_code == 0 and key_lower:
-                vk_code = ctypes.windll.user32.VkKeyScanW(ord(key_lower[0])) & 0xFF
+            # No first-letter fallback: VkKeyScanW(ord(key[0])) sends the WRONG
+            # key for multi-letter names (pageup->P, win->W, left alt->L).
 
             # Physical WASD positions. MapVirtualKey follows the OS layout and can
             # miss the key the game expects. wVk must stay 0 with KEYEVENTF_SCANCODE:
@@ -2050,18 +2871,62 @@ class InputController:
             return False
 
     def nudge_camera(self, dx: int, dy: int = 0) -> bool:
-        """Relative mouse move for AION2 mouse-look aiming (no absolute teleport)."""
-        if self.test_mode or not sys.platform.startswith("win"):
-            return False
+        """Relative mouse move for AION2 mouse-look aiming (no absolute teleport).
+
+        S-2901: eski govde dogrudan ctypes SendInput cagiriyordu — AION2
+        yumusak girdiyi yok saydigi halde SendInput==1 True doner (sahte
+        basari). Simdi `mouse_move_relative` (Interception donanim HID)
+        uzerinden gider; donanim yoksa False doner ve yumusak SendInput'a
+        ASLA dusmez. test_mode'da fiziksel gonderim yapilmadan True doner
+        (mouse_move_relative ile ayni kural).
+        """
+        return self.mouse_move_relative(dx, dy)
+
+    def mouse_move_relative(self, dx: int, dy: int) -> bool:
+        """Interception (donanım HID) üzerinden göreli fare hareketi.
+
+        F-1693 / Karar 4: windmouse `_resolve_relative_mouse_setter`'ın
+        çözdüğü donanım yoludur. Donanım (Interception sürücüsü) yoksa
+        False döner ve yumuşak SendInput'a ASLA düşmez — AION2 yumuşak
+        girdiyi görmezden gelir, başarıyı taklit etmek reddetmekten kötüdür.
+        test_mode'da fiziksel gönderim yapılmadan True döner (simülasyon;
+        `_hw_move_to` ile aynı kural). (0, 0) no-op'tur, True döner.
+        """
         try:
-            extra = ctypes.c_ulong(0)
-            ii = InnerInputUnion()
-            ii.mi = MouseInput(int(dx), int(dy), 0, MOUSEEVENTF_MOVE, 0, ctypes.pointer(extra))
-            inp = InputStruct(ctypes.c_ulong(INPUT_MOUSE), ii)
-            return ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp)) == 1
-        except Exception as exc:
-            logger.debug("nudge_camera failed: %s", exc)
+            dx_i = int(dx)
+            dy_i = int(dy)
+        except Exception:
             return False
+        if dx_i == 0 and dy_i == 0:
+            return True
+        if self.test_mode:
+            return True
+        bridge = getattr(self, "_interception", None)
+        if bridge is not None and getattr(bridge, "available", False):
+            send = getattr(bridge, "send_mouse_relative", None)
+            if callable(send):
+                try:
+                    return bool(send(dx_i, dy_i))
+                except Exception as exc:
+                    logger.debug("mouse_move_relative Interception hatası: %s", exc)
+                    return False
+        now = time.time()
+        last = float(getattr(self, "_last_rel_mouse_warn_ts", 0.0) or 0.0)
+        if (now - last) >= 60.0:
+            self._last_rel_mouse_warn_ts = now
+            logger.warning(
+                "mouse_move_relative reddedildi (dx=%d, dy=%d): Interception "
+                "fare yolu yok — yumusak SendInput'a dusulmedi (AION2'de calismaz).",
+                dx_i,
+                dy_i,
+            )
+        else:
+            logger.debug(
+                "mouse_move_relative reddedildi (dx=%d, dy=%d): Interception fare yolu yok",
+                dx_i,
+                dy_i,
+            )
+        return False
 
     def find_monster_nameplate_offset(
         self, frame: Optional[Any] = None
@@ -2089,7 +2954,6 @@ class InputController:
             return None
         try:
             import cv2
-            import numpy as np
 
             bgr = frame
             if getattr(bgr, "ndim", 0) != 3:
@@ -2102,25 +2966,16 @@ class InputController:
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             # AION2 hostile/attackable names are often yellow-gold; some zones use red/pink.
             # Keep out of dry-grass orange by requiring high V + enough saturation.
-            mask_red = (
-                ((hsv[:, :, 0] <= 8) | (hsv[:, :, 0] >= 170))
-                & (hsv[:, :, 1] >= 140)
-                & (hsv[:, :, 2] >= 150)
+            # cv2.inRange (C, kapsayıcı sınırlar) numpy boolean zinciriyle birebir
+            # aynı maskeyi üretir ama kare başına ~10 geçici boolean dizi ayırmaz.
+            mask_red = cv2.bitwise_or(
+                cv2.inRange(hsv, (0, 140, 150), (8, 255, 255)),
+                cv2.inRange(hsv, (170, 140, 150), (179, 255, 255)),
             )
-            mask_pink = (
-                (hsv[:, :, 0] >= 140)
-                & (hsv[:, :, 0] <= 175)
-                & (hsv[:, :, 1] >= 70)
-                & (hsv[:, :, 2] >= 120)
-            )
-            mask_yellow = (
-                (hsv[:, :, 0] >= 18)
-                & (hsv[:, :, 0] <= 38)
-                & (hsv[:, :, 1] >= 120)
-                & (hsv[:, :, 2] >= 170)
-            )
-            mask = ((mask_red | mask_pink | mask_yellow).astype(np.uint8) * 255)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((2, 13), np.uint8))
+            mask_pink = cv2.inRange(hsv, (140, 70, 120), (175, 255, 255))
+            mask_yellow = cv2.inRange(hsv, (18, 120, 170), (38, 255, 255))
+            mask = cv2.bitwise_or(cv2.bitwise_or(mask_red, mask_pink), mask_yellow)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _morph_kernel(2, 13))
             num, _, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
             best: Optional[Tuple[int, int, int, int]] = None
             best_dist = 1e18
@@ -2158,7 +3013,6 @@ class InputController:
             return None
         try:
             import cv2
-            import numpy as np
 
             bgr = frame
             if getattr(bgr, "ndim", 0) != 3:
@@ -2169,15 +3023,10 @@ class InputController:
             roi = bgr[y1:y2, x1:x2]
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             # Vibrant greens / teals distinct from dry grass (low S warm yellow).
-            mask = (
-                (hsv[:, :, 0] >= 35)
-                & (hsv[:, :, 0] <= 95)
-                & (hsv[:, :, 1] >= 90)
-                & (hsv[:, :, 2] >= 70)
-                & (hsv[:, :, 2] <= 230)
-            ).astype(np.uint8) * 255
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+            # inRange sınırları eski numpy zinciriyle birebir aynıdır (kapsayıcı).
+            mask = cv2.inRange(hsv, (35, 90, 70), (95, 255, 230))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _morph_kernel(3, 3))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _morph_kernel(5, 5))
             num, _, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
             best: Optional[Tuple[int, int, int, int]] = None
             best_score = 1e18
@@ -2212,25 +3061,31 @@ class InputController:
         restore_lmb: bool = True,
     ) -> bool:
         """
-        Mouse-only acquire under AION2 mouse-look when Tab/keys are filtered.
+        Mouse-look acquire under AION2 mouse-look when Tab/keys are filtered.
 
         Order: clear sticky RMB → Alt+nameplate select (best-effort) → camera nudge to
-        body → brief approach → LMB AA pulses → optional restore LMB hold.
-        Alt may also be dropped by Raw Input; relative LMB still reaches elevated clients.
+        body → brief approach → R-key AA pulses (left-click attack = R) → optional
+        restore R hold. Alt may also be dropped by Raw Input; relative R still reaches
+        elevated clients. Nameplate selection itself still needs one Alt+click (no key
+        equivalent for clicking a nameplate).
         """
         if self.test_mode:
             return True
+        if self._game_focus_refused():
+            logger.warning("soft_aim_click: oyun penceresi odağı alınamadı, tıklama yapılmadı.")
+            return False
         # Keep under ~2.5s so BotWorker heartbeat / watchdog (15s) is not stalled.
         pattern = sweeps if sweeps is not None else [40, -80, 55]
         try:
-            self.focus_game_window()
             self.release_modifier_keys()
             # Always clear RMB first — soft-aim must never leave sticky camera orbit.
             self._hw_mouse_up("right")
             self._hw_mouse_up("left")
             self._sleep_jitter(0.02, std_sec=0.003)
             # Mild look-up only (large pitch pointed camera at sky / stalled worker).
-            self.nudge_camera(0, -28)
+            # S-2901: donus degeri yok sayilmaz — donanim reddi sessizce gecilmez.
+            if not self.nudge_camera(0, -28):
+                logger.debug("soft_aim_click: look-up nudge reddedildi (Interception yok).")
             self._sleep_jitter(0.03, std_sec=0.004)
 
             aimed = False
@@ -2250,7 +3105,15 @@ class InputController:
                 step_x = int(max(-90, min(90, dx * 0.45)))
                 step_y = int(max(-55, min(55, dy * 0.35)))
                 if step_x or step_y:
-                    self.nudge_camera(step_x, step_y)
+                    # S-2901: donus degeri yok sayilmaz — aim duzeltmesi
+                    # reddedildiyse R atisi hedefsiz yapilir, logda belli olur.
+                    if not self.nudge_camera(step_x, step_y):
+                        logger.warning(
+                            "soft_aim_click: body aim nudge reddedildi (dx=%d, dy=%d); "
+                            "Interception fare yolu yok.",
+                            step_x,
+                            step_y,
+                        )
                     self._sleep_jitter(0.05, std_sec=0.006)
                 # Best-effort close gap (W often filtered — harmless if dropped).
                 if abs(dx) > 70 or abs(dy) > 55:
@@ -2274,13 +3137,10 @@ class InputController:
                     except Exception as exc:
                         logger.debug("soft_aim nameplate Alt+click failed: %s", exc)
                 self._hw_mouse_up("right")
-                self._hw_mouse_down("left")
-                self._sleep_jitter(0.12, std_sec=0.010)
-                self._hw_mouse_up("left")
+                # Sol tık saldırı atışları yerine R tuşu (sol tık = R).
+                self.press_key("r", min_hold=0.10, max_hold=0.14)
                 self._sleep_jitter(0.04, std_sec=0.005)
-                self._hw_mouse_down("left")
-                self._sleep_jitter(0.22, std_sec=0.018)
-                self._hw_mouse_up("left")
+                self.press_key("r", min_hold=0.20, max_hold=0.24)
                 aimed = True
                 logger.info(
                     "SOFT AIM relative body dx=%d dy=%d @(%d,%d)", dx, dy, abs_x, abs_y
@@ -2288,14 +3148,16 @@ class InputController:
 
             if not aimed:
                 for step in pattern:
-                    self.nudge_camera(int(step), 0)
+                    # S-2901: donus degeri yok sayilmaz.
+                    if not self.nudge_camera(int(step), 0):
+                        logger.debug(
+                            "soft_aim_click: sweep nudge reddedildi (step=%d); Interception yok.",
+                            int(step),
+                        )
                     self._sleep_jitter(0.035, std_sec=0.004)
-                    self._hw_mouse_up("right")
-                    self._hw_mouse_down("left")
-                    self._sleep_jitter(0.10, std_sec=0.008)
-                    self._hw_mouse_up("left")
+                    self.press_key("r", min_hold=0.08, max_hold=0.12)
                     self._sleep_jitter(0.03, std_sec=0.004)
-                logger.info("SOFT AIM sweep+LMB (no vision hit)")
+                logger.info("SOFT AIM sweep+R (no vision hit)")
 
             # Sticky RMB regression guard + optional AA hold for mouse-look combat.
             self._hw_mouse_up("right")
@@ -2305,8 +3167,10 @@ class InputController:
                 pass
             if restore_lmb:
                 self._sleep_jitter(0.02, std_sec=0.003)
-                self._hw_mouse_down("left")
-            return True
+                # AA hold artık fare değil R tuşu (sol tık = R).
+                self.key_down("r")
+            # Blind sweep+R is not a hit: report whether vision actually aimed.
+            return bool(aimed)
         except Exception as exc:
             logger.debug("soft_aim_click failed: %s", exc)
             try:
@@ -2324,20 +3188,32 @@ class InputController:
         """
         if self.test_mode:
             return True
+        if self._game_focus_refused():
+            logger.warning("cast_skill_alt_click: oyun penceresi odağı alınamadı, tıklama yapılmadı.")
+            return False
         px, py = int(x), int(y)
+        clicked = False
         try:
-            self.focus_game_window()
             # Never leave sticky RMB after leaving mouse-look cursor mode via Alt.
             self._hw_mouse_up("right")
             self._hw_mouse_up("left")
             # Pass 1: Alt + absolute click (cursor mode when Alt is accepted).
             self._hw_key_down("alt", post_to_window=False)
             self._sleep_jitter(0.10, std_sec=0.008)
-            self._hw_move_to(px, py)
-            self._sleep_jitter(0.06, std_sec=0.006)
-            self._hw_mouse_down("left")
-            self._sleep_jitter(0.09, std_sec=0.008)
-            self._hw_mouse_up("left")
+            # P0-5: taşıma reddedildiyse kör tık atılmaz — down eski
+            # konumda isabet edip "tıklandı" sayılırdı.
+            if self._hw_move_to(px, py) is False:
+                logger.warning(
+                    "cast_skill_alt_click: taşıma reddedildi (%d, %d) — "
+                    "Pass 1 atlandı.",
+                    px,
+                    py,
+                )
+            else:
+                self._sleep_jitter(0.06, std_sec=0.006)
+                clicked = bool(self._hw_mouse_down("left")) or clicked
+                self._sleep_jitter(0.09, std_sec=0.008)
+                self._hw_mouse_up("left")
             self._hw_key_up("alt", post_to_window=False)
             self.release_modifier_keys()
             self._hw_mouse_up("right")
@@ -2346,14 +3222,22 @@ class InputController:
             # still sees the cursor even when Alt inject is dropped.
             self._hw_mouse_up("right")
             self._hw_mouse_up("left")
-            self._hw_move_to(px, py)
-            self._sleep_jitter(0.05, std_sec=0.005)
-            self._hw_mouse_down("left")
-            self._sleep_jitter(0.09, std_sec=0.008)
-            self._hw_mouse_up("left")
+            # P0-5: Pass 1 ile aynı kural — taşıma yoksa kör tık yok.
+            if self._hw_move_to(px, py) is False:
+                logger.warning(
+                    "cast_skill_alt_click: taşıma reddedildi (%d, %d) — "
+                    "Pass 2 atlandı.",
+                    px,
+                    py,
+                )
+            else:
+                self._sleep_jitter(0.05, std_sec=0.005)
+                clicked = bool(self._hw_mouse_down("left")) or clicked
+                self._sleep_jitter(0.09, std_sec=0.008)
+                self._hw_mouse_up("left")
             self.release_modifier_keys()
             self._hw_mouse_up("right")
-            return True
+            return bool(clicked)
         except Exception as exc:
             logger.debug("cast_skill_alt_click failed: %s", exc)
             try:
@@ -2364,60 +3248,17 @@ class InputController:
                 pass
             return False
 
-    def _sendinput_mouse_move(self, x: int, y: int) -> bool:
-        """ctypes.windll.user32.SendInput ile mutlak (ABSOLUTE) koordinata fare taşır."""
-        try:
-            width, height = self.get_screen_resolution()
-            abs_x = int(round((float(x) * 65535.0) / float(max(1, width - 1))))
-            abs_y = int(round((float(y) * 65535.0) / float(max(1, height - 1))))
-
-            extra = ctypes.c_ulong(0)
-            ii = InnerInputUnion()
-            ii.mi = MouseInput(
-                abs_x,
-                abs_y,
-                0,
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                0,
-                ctypes.pointer(extra),
-            )
-            inp = InputStruct(ctypes.c_ulong(INPUT_MOUSE), ii)
-            sent = ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
-            return sent == 1
-        except Exception as exc:
-            logger.error("SendInput fare taşıma hatası (%d, %d): %s", x, y, exc)
-            return False
-
-    def _sendinput_mouse_button(self, button: str, is_down: bool) -> bool:
-        """ctypes.windll.user32.SendInput ile fare tuşu basımı/bırakımı gönderir."""
-        try:
-            btn = button.lower().strip()
-            if btn == "right":
-                flag = MOUSEEVENTF_RIGHTDOWN if is_down else MOUSEEVENTF_RIGHTUP
-            elif btn == "middle":
-                flag = MOUSEEVENTF_MIDDLEDOWN if is_down else MOUSEEVENTF_MIDDLEUP
-            else:
-                flag = MOUSEEVENTF_LEFTDOWN if is_down else MOUSEEVENTF_LEFTUP
-
-            extra = ctypes.c_ulong(0)
-            ii = InnerInputUnion()
-            ii.mi = MouseInput(0, 0, 0, flag, 0, ctypes.pointer(extra))
-            inp = InputStruct(ctypes.c_ulong(INPUT_MOUSE), ii)
-            sent = ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
-            return sent == 1
-        except Exception as exc:
-            logger.error("SendInput fare tuşu hatası (%s, down=%s): %s", button, is_down, exc)
-            return False
-
     def _game_message_hwnd(self) -> int:
         """Aion istemcisinin tuş iletisini okuduğu pencere. Varsa UnrealWindow çocuğu."""
         top = int(self._get_cached_aion_hwnd() or 0)
         if not top or not sys.platform.startswith("win"):
             return 0
         try:
-            user32 = ctypes.windll.user32
-            child = int(user32.FindWindowExW(top, 0, "UnrealWindow", None) or 0)
-            if child and int(user32.IsWindow(child)):
+            user32 = self._ensure_user32_hwnd_prototypes()
+            child = self._hwnd_to_int(
+                user32.FindWindowExW(wintypes.HWND(top), None, "UnrealWindow", None)
+            )
+            if child and user32.IsWindow(wintypes.HWND(child)):
                 return child
         except Exception as exc:
             logger.debug("UnrealWindow araması atlandı: %s", exc)
@@ -2431,7 +3272,7 @@ class InputController:
         if not hwnd:
             if not self._missing_game_hwnd_logged:
                 self._missing_game_hwnd_logged = True
-                logger.info("Oyun penceresi bulunamadı; tuş yalnız SendInput ile gidiyor.")
+                logger.info("Oyun penceresi bulunamadı; ileti gönderilmedi (N-3101: yumuşak yedek yok).")
             return False
         try:
             user32 = ctypes.windll.user32
@@ -2453,7 +3294,7 @@ class InputController:
             )
             if ok and not self._logged_game_window_input:
                 self._logged_game_window_input = True
-                logger.info("Tuş ve sol tık oyun penceresine doğrudan iletiliyor.")
+                logger.info("Tuş/ileti oyun penceresinin ileti kuyruğuna yazıldı (teslimat doğrulanmadı).")
             return ok
         except Exception as exc:
             logger.debug("Oyun penceresine ileti yazılamadı: %s", exc)
@@ -2479,39 +3320,24 @@ class InputController:
                     lparam |= (1 << 30) | (1 << 31)
         return self._post_to_game(msg, vk, lparam)
 
-    def _post_mouse_button_to_game(self, button: str, is_down: bool) -> bool:
-        if str(button or "").strip().lower() != "left":
-            return False
-        if self.test_mode or not sys.platform.startswith("win"):
-            return False
-        x, y = 0, 0
-        hwnd = self._game_message_hwnd()
-        if hwnd:
-            x, y = self.get_cursor_position()
-            try:
-                pt = wintypes.POINT(int(x), int(y))
-                ctypes.windll.user32.ScreenToClient(wintypes.HWND(hwnd), ctypes.byref(pt))
-                x, y = int(pt.x), int(pt.y)
-            except Exception as exc:
-                logger.debug("Sol tık istemci koordinatı alınamadı: %s", exc)
-        parts = mouse_button_window_message("left", is_down, x, y)
-        if parts is None:
-            return False
-        return self._post_to_game(*parts)
-
     def _keybd_event_key(self, key: str, is_down: bool) -> bool:
         """
         Legacy user32.keybd_event. Some Unreal clients accept this when
-        SendInput alone is ignored for skill hotkeys.
+        SendInput alone is ignored for skill hotkeys. keybd_event is a void
+        API: True here means "the call was issued without error", NOT that
+        the game received the key (delivery is unverifiable).
+        test_mode: never injects physical input.
         """
+        if getattr(self, "test_mode", False):
+            return False
         if not sys.platform.startswith("win"):
             return False
         try:
             key_lower = str(key).lower().strip()
             vk = int(VIRTUAL_KEY_CODES.get(key_lower, 0))
             scan = int(HARDWARE_SCANCODES.get(key_lower, 0) or 0)
-            if vk <= 0 and key_lower:
-                vk = int(ctypes.windll.user32.VkKeyScanW(ord(key_lower[0])) & 0xFF)
+            # No first-letter fallback (see _sendinput_key): unknown keys fail
+            # closed instead of pressing the wrong key.
             if scan <= 0 and vk > 0:
                 scan = int(ctypes.windll.user32.MapVirtualKeyW(vk, 0) or 0)
             if vk <= 0 and scan <= 0:
@@ -2536,32 +3362,163 @@ class InputController:
     # erken çıkış skill tuşunu öldürüyordu. Sağ tık fare yolu aynı kalır.
     # ------------------------------------------------------------------------
 
+    def _hw_key_trusted_available(self) -> bool:
+        """True when a hardware keyboard path (Serial/Network HID, Interception, FakerInput) is up."""
+        try:
+            if self._line_hid_available():
+                return True
+        except Exception:
+            pass
+        try:
+            if self._interception is not None and getattr(self._interception, "available", False):
+                return True
+        except Exception:
+            pass
+        try:
+            if self._faker is not None and getattr(self._faker, "available", False):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _log_hw_key_untrusted_once(self, key: str, action: str) -> None:
+        """Throttled (60 sn) hard error: no trusted keyboard path, so the key is NOT sent.
+
+        AION2 ignores soft SendInput/keybd_event input, so sending it only fakes
+        success while the game receives nothing. The detailed error below is
+        throttled (60 s); the short OPSEC FALLBACK warning is emitted per call
+        so callers/tests can see every refused key.
+        """
+        logger.warning(
+            "[OPSEC FALLBACK] '%s' tuşu için yumuşak gönderim yapılmadı (%s): "
+            "güvenilir klavye yolu yok (soft SendInput AION2'de çalışmaz).",
+            key,
+            action,
+        )
+        now = time.time()
+        last = float(getattr(self, "_last_hw_key_gate_log_ts", 0.0) or 0.0)
+        if (now - last) < 60.0:
+            return
+        self._last_hw_key_gate_log_ts = now
+        bridge = getattr(self, "_interception", None)
+        dll_found = bool(bridge is not None and getattr(bridge, "dll_found", False))
+        last_err = str(getattr(bridge, "last_error", "") or "")
+        if last_err:
+            detail = last_err
+        elif dll_found:
+            detail = "interception.dll bulundu ama create_context NULL (sürücü kurulu değil?)"
+        else:
+            detail = "interception.dll bulunamadı"
+        admin: Optional[bool] = None
+        try:
+            from core.uac_elevator import is_admin
+
+            admin = bool(is_admin())
+        except Exception:
+            admin = None
+        admin_txt = "yönetici" if admin is True else ("yönetici DEĞİL" if admin is False else "yönetici durumu bilinmiyor")
+        logger.error(
+            "[HARDWARE KEY GEREKLİ] Güvenilir klavye yolu YOK — '%s' %s gönderilmedi "
+            "(yumuşak SendInput AION2'de çalışmaz, o yüzden gönderilmedi). "
+            "Interception: %s | süreç: %s | düzeltme: baslat.bat'i yönetici olarak çalıştır, "
+            "Interception sürücüsünü kur (install-interception.exe /install) ve "
+            "interception.dll'i proje köküne koy.",
+            key,
+            action,
+            detail,
+            admin_txt,
+        )
+
+    def _log_hw_key_hid_failed_once(self, key: str, action: str) -> None:
+        """O-6 (dilim 20): HID hattı yapılandırılmış ama yazım başarısız oldu
+        ve Interception/Faker da reddetti — eskiden yalnızca debug satırıyla
+        False dönülüyordu. 60 sn throttle'lu uyarı."""
+        now = time.time()
+        last = float(getattr(self, "_last_hid_fail_log_ts", 0.0) or 0.0)
+        if (now - last) < 60.0:
+            return
+        self._last_hid_fail_log_ts = now
+        logger.warning(
+            "[HID KEY FAILED] HID hattı yapılandırılmış ama '%s' %s yazılamadı "
+            "(telefon köprüsü koptu / cihaz yanıt vermiyor); Interception/Faker "
+            "da reddetti. Tuş gönderilmedi.",
+            key,
+            action,
+        )
+
+    def _log_hw_mouse_untrusted_once(self, what: str) -> None:
+        """P0-5/K-04 (klavye yolundaki `_log_hw_key_untrusted_once` ile aynı
+        kural): güvenilir fare yolu (Interception/Faker) yok ya da reddetti,
+        o yüzden fare gönderilmedi — AION2 yumuşak SendInput/PostMessage/
+        pydirectinput girdisini görmezden gelir; göndermek yalnızca sahte
+        başarı üretirdi. Kısa uyarı her çağrıda, ayrıntı 60 sn throttle'lu."""
+        logger.warning(
+            "[OPSEC FALLBACK] %s için yumuşak gönderim yapılmadı: "
+            "güvenilir fare yolu yok (soft SendInput/PostMessage/pydirectinput "
+            "AION2'de çalışmaz).",
+            what,
+        )
+        now = time.time()
+        last = float(getattr(self, "_last_hw_mouse_gate_log_ts", 0.0) or 0.0)
+        if (now - last) < 60.0:
+            return
+        self._last_hw_mouse_gate_log_ts = now
+        bridge = getattr(self, "_interception", None)
+        dll_found = bool(bridge is not None and getattr(bridge, "dll_found", False))
+        logger.error(
+            "[HW MOUSE GATE] %s gönderilmedi: Interception %s, Faker %s. "
+            "Çözüm: Interception sürücüsü/DLL ya da FakerInputWrapper.dll, "
+            "veya HID köprüsü (GATHERION_HID_COM / GATHERION_HID_TCP).",
+            what,
+            "kurulu ama reddetti" if dll_found else "yok",
+            "yok/reddetti"
+            if getattr(self, "_faker", None) is None
+            else "kurulu ama reddetti",
+        )
+
     def _hw_key_down(self, key: str, post_to_window: bool = False) -> bool:
-        """post_to_window=False: avoid WM_KEYDOWN chat typing; skill cast needs scan codes."""
+        """Trusted-path key press. The virtual-key flag only suppresses hook
+        echo during the call itself: it is cleared on return (F-0021) — the
+        held key stays tracked via _active_bot_keys + the 150 ms timestamp,
+        so a direct key_down() can no longer latch the flag forever and
+        swallow the user's F9/F10 afterwards."""
+        try:
+            return bool(self._hw_key_down_impl(key, post_to_window=post_to_window))
+        finally:
+            try:
+                self._sending_virtual_key = False
+            except Exception:
+                pass
+
+    def _hw_key_down_impl(self, key: str, post_to_window: bool = False) -> bool:
+        """post_to_window=False: avoid WM_KEYDOWN chat typing; skill cast needs scan codes.
+
+        Y-1 (dilim 20): _active_bot_keys kaydı yalnızca bir backend
+        gönderimi KABUL ETTİKTEN SONRA eklenir — eskiden gönderimden önce
+        ekleniyor, bilinmeyen/reddedilen tuş hayalet kayıt bırakıyordu.
+        """
         key_clean = key.lower().strip()
         self._sending_virtual_key = True
         self._last_virtual_key_ts = time.time()
+        self._last_virtual_key_name = key_clean
         if not hasattr(self, "_active_bot_keys"):
             self._active_bot_keys = set()
         if not hasattr(self, "_bot_pressing_lock"):
             self._bot_pressing_lock = threading.Lock()
-        with self._bot_pressing_lock:
-            self._active_bot_keys.add(key_clean)
-            self._bot_pressing = True
         scancode = HARDWARE_SCANCODES.get(key_clean, 0)
         extended = key_clean in EXTENDED_KEYS or key_clean in {"right alt", "right ctrl"}
         if scancode <= 0:
             vk = int(VIRTUAL_KEY_CODES.get(key_clean, 0))
-            if vk <= 0 and key_clean and sys.platform.startswith("win"):
-                try:
-                    vk = int(ctypes.windll.user32.VkKeyScanW(ord(key_clean[0])) & 0xFF)
-                except Exception:
-                    vk = 0
+            # No first-letter fallback (F-0022): VkKeyScanW(ord(key[0])) sends
+            # the WRONG key for multi-letter names (pageup->P, win->W).
             if vk > 0 and sys.platform.startswith("win"):
                 try:
                     scancode = int(ctypes.windll.user32.MapVirtualKeyW(vk, 0) or 0)
                 except Exception:
                     scancode = 0
+        if scancode <= 0 and int(VIRTUAL_KEY_CODES.get(key_clean, 0)) <= 0:
+            logger.debug("Bilinmeyen tuş (tablo dışı): '%s' gönderilmedi.", key_clean)
+            return False
 
         # Late-bind NetworkHID before combat keys (phone TCP may appear mid-session).
         try:
@@ -2569,83 +3526,94 @@ class InputController:
         except Exception:
             pass
 
+        # O-5 (dilim 20): Interception orta-oturumda kurulduysa geç fark et.
+        try:
+            self._maybe_redetect_interception()
+        except Exception:
+            pass
+
         test_mode_active = bool(getattr(self, "test_mode", False))
+        sent = False
 
         # 1) Serial/Network HID — real keyboard reports (Leonardo COM or Android BT-HID bridge)
         line_hid = self._line_hid_available()
         if line_hid and not test_mode_active:
             try:
-                if bool(self._serial_hid.key_down(key_clean)):
-                    return True
+                sent = bool(self._serial_hid.key_down(key_clean))
             except Exception as exc:
                 logger.debug("HidBridge key_down (%s): %s", key_clean, exc)
 
         # 2) Interception kernel bridge — before soft SendInput
-        if not test_mode_active and self._interception is not None and getattr(self._interception, "available", False) and scancode > 0:
+        if not sent and not test_mode_active and self._interception is not None and getattr(self._interception, "available", False) and scancode > 0:
             try:
-                if bool(self._interception.send_key(scancode, True, extended=extended)):
-                    return True
+                sent = bool(self._interception.send_key(scancode, True, extended=extended))
             except Exception as exc:
                 logger.debug("Interception key_down (%s): %s", key_clean, exc)
 
         # 3) FakerInput virtual HID
-        if not test_mode_active and self._faker is not None and getattr(self._faker, "available", False) and scancode > 0:
+        if not sent and not test_mode_active and self._faker is not None and getattr(self._faker, "available", False) and scancode > 0:
             try:
-                if bool(self._faker.send_key(scancode, True)):
-                    return True
+                sent = bool(self._faker.send_key(scancode, True))
             except Exception as exc:
                 logger.debug("FakerInput key_down (%s): %s", key_clean, exc)
 
+        if sent:
+            with self._bot_pressing_lock:
+                self._active_bot_keys.add(key_clean)
+                self._bot_pressing = True
+            return True
+
         if line_hid and not test_mode_active:
             # HID was configured but write failed — skip soft (untrusted for AION2).
+            # O-6 (dilim 20): eskiden sessiz False; artık throttle'lu uyarı.
+            self._log_hw_key_hid_failed_once(key_clean, "basma")
             return False
 
-        # 4) Soft fallbacks (may be filtered by AION2)
-        if not test_mode_active:
-            logger.warning(
-                "[InputController] [OPSEC FALLBACK] Donanım HID/Interception kullanılamıyor veya başarısız — '%s' tuşu için yumuşak (soft SendInput/keybd_event) fallback devrede!",
-                key_clean,
-            )
-        ok = False
-        ok = bool(self._sendinput_key(key_clean, True)) or ok
-        ok = bool(self._keybd_event_key(key_clean, True)) or ok
-        if post_to_window:
-            ok = bool(self._post_key_to_game(key_clean, True)) or ok
-        if HAS_PYDIRECTINPUT and pydirectinput is not None:
-            try:
-                pydirectinput.keyDown(key_clean)
-                ok = True
-            except Exception as exc:
-                logger.debug("pydirectinput.keyDown geri dönüşü (%s): %s", key_clean, exc)
+        if test_mode_active:
+            # Test-mode dispatch goes through the (mockable) soft methods
+            # only: the low-level senders refuse physical input in test_mode,
+            # and the old direct pydirectinput/keyboard calls (which really
+            # injected keys on Windows, and forced ok=True unconditionally)
+            # are removed. O-2 (dilim 20): başarısız simülasyon kayda
+            # eklenmez — hayalet kayıt yok.
+            ok = False
+            ok = bool(self._sendinput_key(key_clean, True)) or ok
+            ok = bool(self._keybd_event_key(key_clean, True)) or ok
+            if post_to_window:
+                ok = bool(self._post_key_to_game(key_clean, True)) or ok
+            return ok
+
+        # AION2 ignores soft SendInput/keybd_event/pydirectinput: with no
+        # trusted path there is no soft fallback at all.
+        self._log_hw_key_untrusted_once(key_clean, "basma")
+        return False
+
+    def _hw_key_up(self, key: str, post_to_window: bool = False) -> bool:
+        """Trusted-path key release. Returns the real result (F-0019) and
+        clears the virtual-key flag on return (F-0021)."""
         try:
-            import keyboard as _kb  # type: ignore
+            return bool(self._hw_key_up_impl(key, post_to_window=post_to_window))
+        finally:
+            try:
+                self._sending_virtual_key = False
+            except Exception:
+                pass
 
-            _kb.press(key_clean)
-            ok = True
-        except Exception as exc:
-            logger.debug("keyboard.press geri dönüşü (%s): %s", key_clean, exc)
-        return ok
-
-    def _hw_key_up(self, key: str, post_to_window: bool = False) -> None:
+    def _hw_key_up_impl(self, key: str, post_to_window: bool = False) -> bool:
+        """K-2 (dilim 20): izlemeden silme YALNIZCA başarılı gönderimden
+        sonra yapılır — eskiden kayıt önce siliniyor, gönderim başarısız
+        olursa tuş hiçbir kümede kalmıyor, tekrar bırakma imkânsızdı.
+        Başarısızlıkta kayıt korunur ki release_all_held_keys yeniden
+        deneyebilsin; ayrıca throttle'lu uyarı loglanır."""
         key_clean = key.lower().strip()
         self._sending_virtual_key = True
         self._last_virtual_key_ts = time.time()
-        if hasattr(self, "_active_bot_keys"):
-            if not hasattr(self, "_bot_pressing_lock"):
-                self._bot_pressing_lock = threading.Lock()
-            with self._bot_pressing_lock:
-                self._active_bot_keys.discard(key_clean)
-                if not self._active_bot_keys:
-                    self._bot_pressing = False
+        self._last_virtual_key_name = key_clean
         scancode = HARDWARE_SCANCODES.get(key_clean, 0)
         extended = key_clean in EXTENDED_KEYS or key_clean in {"right alt", "right ctrl"}
         if scancode <= 0:
             vk = int(VIRTUAL_KEY_CODES.get(key_clean, 0))
-            if vk <= 0 and key_clean and sys.platform.startswith("win"):
-                try:
-                    vk = int(ctypes.windll.user32.VkKeyScanW(ord(key_clean[0])) & 0xFF)
-                except Exception:
-                    vk = 0
+            # No first-letter fallback (F-0022).
             if vk > 0 and sys.platform.startswith("win"):
                 try:
                     scancode = int(ctypes.windll.user32.MapVirtualKeyW(vk, 0) or 0)
@@ -2653,134 +3621,196 @@ class InputController:
                     scancode = 0
 
         test_mode_active = bool(getattr(self, "test_mode", False))
+        if test_mode_active:
+            # Test-mode dispatch through the mockable soft methods only
+            # (low-level senders refuse physical input in test_mode).
+            ok = False
+            ok = bool(self._sendinput_key(key_clean, False)) or ok
+            ok = bool(self._keybd_event_key(key_clean, False)) or ok
+            if post_to_window:
+                ok = bool(self._post_key_to_game(key_clean, False)) or ok
+            return ok
 
+        sent = False
         line_hid = self._line_hid_available()
-        if line_hid and not test_mode_active:
+        if line_hid:
             try:
-                self._serial_hid.key_up(key_clean)
-                return
+                sent = bool(self._serial_hid.key_up(key_clean))
             except Exception as exc:
+                # F-0112: a HID release failure must fall through to
+                # Interception/Faker — the old code returned here and the
+                # key stayed stuck down.
                 logger.debug("HidBridge key_up (%s): %s", key_clean, exc)
-            return
 
-        if not test_mode_active and self._interception is not None and getattr(self._interception, "available", False) and scancode > 0:
+        if not sent and self._interception is not None and getattr(self._interception, "available", False) and scancode > 0:
             try:
-                if bool(self._interception.send_key(scancode, False, extended=extended)):
-                    return
+                sent = bool(self._interception.send_key(scancode, False, extended=extended))
             except Exception as exc:
                 logger.debug("Interception key_up (%s): %s", key_clean, exc)
 
-        if not test_mode_active and self._faker is not None and getattr(self._faker, "available", False) and scancode > 0:
+        if not sent and self._faker is not None and getattr(self._faker, "available", False) and scancode > 0:
             try:
-                if bool(self._faker.send_key(scancode, False)):
-                    return
+                sent = bool(self._faker.send_key(scancode, False))
             except Exception as exc:
                 logger.debug("FakerInput key_up (%s): %s", key_clean, exc)
 
+        if sent:
+            if hasattr(self, "_active_bot_keys"):
+                if not hasattr(self, "_bot_pressing_lock"):
+                    self._bot_pressing_lock = threading.Lock()
+                with self._bot_pressing_lock:
+                    self._active_bot_keys.discard(key_clean)
+                    if not self._active_bot_keys:
+                        self._bot_pressing = False
+            return True
+
         # Soft cascade only when no Network/Serial HID owns the keyboard path.
-        if line_hid and not test_mode_active:
-            return
+        if line_hid:
+            # O-6 (dilim 20): HID sahipliyken başarısızlık sessizdi.
+            self._log_hw_key_hid_failed_once(key_clean, "bırakma")
+            return False
 
-        if not test_mode_active:
-            logger.warning(
-                "[InputController] [OPSEC FALLBACK] Donanım HID/Interception kullanılamıyor veya başarısız — '%s' tuş bırakma için yumuşak (soft SendInput/keybd_event) fallback devrede!",
-                key_clean,
-            )
-        self._sendinput_key(key_clean, False)
-        self._keybd_event_key(key_clean, False)
-        if post_to_window:
-            self._post_key_to_game(key_clean, False)
-        if HAS_PYDIRECTINPUT and pydirectinput is not None:
-            try:
-                pydirectinput.keyUp(key_clean)
-            except Exception as exc:
-                logger.debug("pydirectinput.keyUp geri dönüşü (%s): %s", key_clean, exc)
-        try:
-            import keyboard as _kb  # type: ignore
-
-            _kb.release(key_clean)
-        except Exception as exc:
-            logger.debug("keyboard.release geri dönüşü (%s): %s", key_clean, exc)
+        # AION2 ignores soft key release too — do not pretend it was sent.
+        self._log_hw_key_untrusted_once(key_clean, "bırakma")
+        return False
 
     def release_modifier_keys(self) -> None:
-        """Drop Alt/Ctrl/Shift/Win — stuck Alt puts AION2 in cursor mode and eats Tab/skills."""
-        for mod in ("alt", "ctrl", "shift", "win", "left alt", "right alt", "left ctrl", "right ctrl", "left shift", "right shift"):
+        """Drop modifiers the BOT holds (Alt/Ctrl/Shift/Win).
+
+        Yalnızca izlenen _active_bot_keys içindeki modifier'lar bırakılır;
+        kullanıcının fiziksel olarak tuttuğu Alt/Ctrl/Shift'e dokunulmaz
+        (sentetik UP, oyunun modifier'ı bırakılmış görmesine yol açar).
+        Yumuşak pydirectinput.keyUp yolu kaldırıldı — oyun girdisi
+        Interception/HID yolunda kalır, sessiz soft fallback yoktur.
+        """
+        if getattr(self, "_input_stopped", False):
+            return
+        if not hasattr(self, "_active_bot_keys") or not hasattr(self, "_bot_pressing_lock"):
+            return
+        with self._bot_pressing_lock:
+            held_mods = [
+                mod
+                for mod in (
+                    "alt", "ctrl", "shift", "win",
+                    "left alt", "right alt", "left ctrl", "right ctrl",
+                    "left shift", "right shift",
+                )
+                if mod in self._active_bot_keys
+            ]
+        for mod in held_mods:
             try:
                 self._hw_key_up(mod, post_to_window=False)
             except Exception:
                 pass
-            try:
-                if HAS_PYDIRECTINPUT and pydirectinput is not None:
-                    pydirectinput.keyUp(mod.split()[-1] if " " in mod else mod)
-            except Exception:
-                pass
 
-    def prepare_game_keyboard(self) -> None:
-        """Focus game, clear modifiers/mouse, then allow skill/Tab."""
+    def prepare_game_keyboard(self) -> bool:
+        """Focus game, clear modifiers/mouse, then allow skill/Tab.
+        False when game focus was refused (do not send into another app)."""
         if self.test_mode:
-            return
-        self.focus_game_window()
+            return True
+        if self._game_focus_refused():
+            return False
         try:
             self.release_modifier_keys()
-            self._hw_mouse_up("right")
-            self._hw_mouse_up("left")
-            self._hw_mouse_up("middle")
+            # Yalnız botun tuttuğu fare tuşları bırakılır; kullanıcının
+            # fiziksel olarak basılı tuttuğu tuşa sentetik mouse-UP gitmez.
+            self._release_mouse_buttons()
         except Exception as exc:
             logger.debug("prepare_game_keyboard release skipped: %s", exc)
         self._sleep_jitter(0.05, std_sec=0.006)
+        return True
 
-    def _hw_move_to(self, x: int, y: int) -> None:
-        width, height = self.get_screen_resolution()
-        if self._faker is not None and self._faker.available:
+    def _hw_move_to(self, x: int, y: int) -> bool:
+        """Absolute mouse move. Returns True only if a trusted backend
+        (Interception/Faker) accepted the move.
+
+        P0-5/K-04: klavye yolundaki v17 kuralı fareye de uygulandı — yumuşak
+        yedek (SendInput/pydirectinput) KALDIRILDI. AION2 yumuşak fareyi
+        görmezden gelir; backend reddi False döner, sessizce başarı
+        sayılmaz. test_mode'da fiziksel gönderim yapılmadan True döner.
+        """
+        if self.test_mode:
+            return True
+        if self._interception is not None and getattr(self._interception, "available", False):
+            try:
+                if bool(self._interception.send_mouse_absolute(int(x), int(y))):
+                    return True
+            except Exception as exc:
+                logger.debug("Interception move_to hatası: %s", exc)
+        if self._faker is not None and getattr(self._faker, "available", False):
+            width, height = self._cached_screen_resolution()
             norm_x = int(round((float(x) * 65535.0) / float(max(1, width - 1))))
             norm_y = int(round((float(y) * 65535.0) / float(max(1, height - 1))))
             if self._faker.move_mouse_abs(norm_x, norm_y):
-                return
-        if self._sendinput_mouse_move(x, y):
-            return
-        if HAS_PYDIRECTINPUT and pydirectinput is not None:
-            try:
-                pydirectinput.moveTo(int(x), int(y))
-            except Exception as exc:
-                logger.error("pydirectinput.moveTo hatası: %s", exc)
+                return True
+        # Güvenilir yol yok/reddetti: yumuşak SendInput'a ASLA düşülmez.
+        self._log_hw_mouse_untrusted_once(f"fare taşıma ({x},{y})")
+        return False
 
-    def _hw_mouse_down(self, button: str = "left") -> None:
+    def _hw_mouse_down(self, button: str = "left") -> bool:
+        """P0-5/K-04: zincir sıralı ve ilk kabulde durur; kayıt yalnızca
+        güvenilir (Interception/Faker) gönderimde eklenir. Yumuşak yedek
+        (SendInput/pydirectinput) KALDIRILDI — backend reddi False döner,
+        sahte başarı yok. test_mode'da True döner.
+
+        N-3101: F11 pencere-ileti dikişi (F-1410) KALDIRILDI — sol tık
+        artık güvenilir yol reddedince PostMessage ile de gönderilmez;
+        Interception/Faker yoksa False + gate logu döner.
+        """
         btn = str(button or "left").strip().lower()
-        with self._motion_lock:
-            self._mouse_buttons_down.add(btn)
         if self.test_mode:
-            return
-        if btn == "left":
-            self._post_mouse_button_to_game(btn, True)
-        if self._faker is not None and self._faker.available:
+            return True
+        if self._interception is not None and getattr(self._interception, "available", False):
+            try:
+                if bool(self._interception.send_mouse_button(btn, True)):
+                    self._mark_mouse_button_down(btn)
+                    return True
+            except Exception as exc:
+                logger.debug("Interception mouse_down hatası (%s): %s", btn, exc)
+        if self._faker is not None and getattr(self._faker, "available", False):
             if self._faker.mouse_button(btn, True):
-                return
-        if self._sendinput_mouse_button(btn, True):
-            return
-        if HAS_PYDIRECTINPUT and pydirectinput is not None:
-            try:
-                pydirectinput.mouseDown(button=btn)
-            except Exception as exc:
-                logger.error("pydirectinput.mouseDown hatası: %s", exc)
+                self._mark_mouse_button_down(btn)
+                return True
+        # Güvenilir yol yok/reddetti: yumuşak yedeğe ASLA düşülmez.
+        self._log_hw_mouse_untrusted_once(f"fare {btn} down")
+        return False
 
-    def _hw_mouse_up(self, button: str = "left") -> None:
+    def _mark_mouse_button_down(self, btn: str) -> None:
+        if hasattr(self, "_motion_lock") and hasattr(self, "_mouse_buttons_down"):
+            with self._motion_lock:
+                self._mouse_buttons_down.add(btn)
+
+    def _mark_mouse_button_up(self, btn: str) -> None:
+        if hasattr(self, "_motion_lock") and hasattr(self, "_mouse_buttons_down"):
+            with self._motion_lock:
+                self._mouse_buttons_down.discard(btn)
+
+    def _hw_mouse_up(self, button: str = "left") -> bool:
+        """P0-5/K-04: down ile aynı sıralı zincir; kayıt yalnızca güvenilir
+        bırakmada silinir (K-2: başarısız UP kaydı korur ki sonraki süpürme
+        yeniden deneyebilsin). Yumuşak yedek (SendInput/pydirectinput)
+        KALDIRILDI — backend reddi False döner.
+
+        N-3101: F11 pencere-ileti dikişi (F-1410) KALDIRILDI — sol tık
+        bırakma da güvenilir yol reddedince PostMessage ile gönderilmez.
+        """
         btn = str(button or "left").strip().lower()
-        with self._motion_lock:
-            self._mouse_buttons_down.discard(btn)
         if self.test_mode:
-            return
-        if btn == "left":
-            self._post_mouse_button_to_game(btn, False)
-        if self._faker is not None and self._faker.available:
-            if self._faker.mouse_button(btn, False):
-                return
-        if self._sendinput_mouse_button(btn, False):
-            return
-        if HAS_PYDIRECTINPUT and pydirectinput is not None:
+            return True
+        if self._interception is not None and getattr(self._interception, "available", False):
             try:
-                pydirectinput.mouseUp(button=btn)
+                if bool(self._interception.send_mouse_button(btn, False)):
+                    self._mark_mouse_button_up(btn)
+                    return True
             except Exception as exc:
-                logger.error("pydirectinput.mouseUp hatası: %s", exc)
+                logger.debug("Interception mouse_up hatası (%s): %s", btn, exc)
+        if self._faker is not None and getattr(self._faker, "available", False):
+            if self._faker.mouse_button(btn, False):
+                self._mark_mouse_button_up(btn)
+                return True
+        # Güvenilir yol yok/reddetti: yumuşak yedeğe ASLA düşülmez.
+        self._log_hw_mouse_untrusted_once(f"fare {btn} up")
+        return False
 
     # ------------------------------------------------------------------------
     # İNSANLAŞTIRILMIŞ FARE VE KLAVYE METODLARI (HUMANIZER)
@@ -2860,13 +3890,14 @@ class InputController:
             if not path:
                 return start_x, start_y
 
+            last_move_ok = True
             for i, (cur_x, cur_y) in enumerate(path, start=1):
                 if self.motion_aborted():
                     self._release_mouse_buttons()
                     return self.get_cursor_position() if not self.test_mode else (start_x, start_y)
                 self._emitted_move_points.append((cur_x, cur_y))
                 if not self.test_mode:
-                    self._hw_move_to(cur_x, cur_y)
+                    last_move_ok = bool(self._hw_move_to(cur_x, cur_y))
                 u = float(i) / float(len(path))
                 # Variable speed: linger at the start and end, quicker in the middle.
                 speed_scale = 0.42 + 0.95 * math.sin(math.pi * u)
@@ -2880,21 +3911,36 @@ class InputController:
             if self.motion_aborted():
                 self._release_mouse_buttons()
                 return start_x, start_y
+            if not last_move_ok:
+                # P0-5: son adım reddedildiyse hedefe varılmış sayılmaz —
+                # gerçek imleç konumu döner (istisna yolundaki kural ile aynı).
+                logger.warning(
+                    "Yumuşak fare geçişi reddedildi: hedef (%d, %d) "
+                    "ulaşılamadı (güvenilir fare yolu yok).",
+                    int(target_x),
+                    int(target_y),
+                )
+                return self.get_cursor_position()
             return int(target_x), int(target_y)
         except Exception as exc:
             logger.error("Yumuşak fare geçişi sırasında hata: %s", exc)
             if not self.test_mode and not self.motion_aborted():
-                self._hw_move_to(target_x, target_y)
-            return target_x, target_y
+                try:
+                    self._hw_move_to(target_x, target_y)
+                except Exception:
+                    pass
+            # Never claim the target was reached: report where the cursor is.
+            return self.get_cursor_position()
 
     def press_key(
         self,
         key: str,
-        min_hold: float = DEFAULT_MIN_HOLD_SEC,
-        max_hold: float = DEFAULT_MAX_HOLD_SEC,
+        min_hold: Optional[float] = None,
+        max_hold: Optional[float] = None,
         frame: Optional[Any] = None,
         release_mouse: bool = False,
         post_to_window: bool = False,
+        hold_sec: Optional[float] = None,
     ) -> float:
         """
         Belirtilen tuşa insanlaştırılmış süreyle (varsayılan 40ms - 90ms) basar ve bırakır.
@@ -2905,6 +3951,10 @@ class InputController:
         """
         key_clean = str(key).strip().lower()
         # Pause/stop calls abort_motion(); finish quickly and do not start new key events.
+        # Stop mandalı ayrıca: _motion_abort temizlense bile stop sonrası
+        # press_key gönderim yapamaz (yalnız resume_motion() kaldırır).
+        if getattr(self, "_input_stopped", False):
+            return 0.0
         if self.motion_aborted():
             return 0.0
 
@@ -2914,13 +3964,24 @@ class InputController:
 
         if not self.test_mode:
             if release_mouse:
-                self.prepare_game_keyboard()
-            else:
-                self.focus_game_window()
+                if not self.prepare_game_keyboard():
+                    logger.warning("press_key('%s'): oyun penceresi odağı alınamadı, tuş gönderilmedi.", key_clean)
+                    return 0.0
+            elif self._game_focus_refused():
+                logger.warning("press_key('%s'): oyun penceresi odağı alınamadı, tuş gönderilmedi.", key_clean)
+                return 0.0
 
         if self.motion_aborted():
             return 0.0
 
+        # Defaults resolve from the LIVE instance values (hot-reload), not
+        # from def-time bindings captured when the class was defined.
+        if hold_sec is not None:
+            min_hold = max_hold = float(hold_sec)
+        if min_hold is None:
+            min_hold = float(getattr(self, "DEFAULT_MIN_HOLD_SEC", 0.04))
+        if max_hold is None:
+            max_hold = float(getattr(self, "DEFAULT_MAX_HOLD_SEC", 0.09))
         low = max(0.01, min(float(min_hold), float(max_hold)))
         high = max(low, float(max_hold))
         timing = getattr(self, "_human_timing", None) or getattr(self, "human_timing", None)
@@ -2936,6 +3997,7 @@ class InputController:
                 self._bot_pressing = True
                 self._sending_virtual_key = True
                 self._last_virtual_key_ts = time.time()
+                self._last_virtual_key_name = key_clean
                 self._active_bot_keys.add(key_clean)
 
             try:
@@ -2951,12 +4013,15 @@ class InputController:
                         return 0.0
                     return hold_time
 
-                self._hw_key_down(key_clean, post_to_window=bool(post_to_window))
+                down_ok = bool(self._hw_key_down(key_clean, post_to_window=bool(post_to_window)))
                 try:
                     if not self._sleep_abortable(hold_time):
                         return 0.0
                 finally:
                     self._hw_key_up(key_clean, post_to_window=bool(post_to_window))
+                if not down_ok:
+                    logger.error("press_key('%s'): tuş gönderilemedi (güvenilir yol yok).", key_clean)
+                    return 0.0
                 logger.debug(
                     "Tuş basıldı: '%s' | Süre: %.1fms | Sürücü: %s",
                     key_clean,
@@ -2966,11 +4031,13 @@ class InputController:
             finally:
                 # Tuş bırakıldıktan sonra OS kancasının olayı işlemesi için kısa koruma
                 self._last_virtual_key_ts = time.time()
+                self._last_virtual_key_name = key_clean
                 if not self.test_mode:
                     release_delay = self._human_timing.get_key_release_guard_sec()
                     _ = self._sleep_abortable(release_delay)
                 with self._bot_pressing_lock:
                     self._last_virtual_key_ts = time.time()
+                    self._last_virtual_key_name = key_clean
                     self._active_bot_keys.discard(key_clean)
                     if not self._active_bot_keys:
                         self._bot_pressing = False
@@ -2979,22 +4046,33 @@ class InputController:
             return hold_time
         except Exception as exc:
             logger.error("press_key('%s') hatası: %s", key_clean, exc)
-            return hold_time
+            # O-1 (dilim 20): istisna dalı eskiden planlanan hold_time
+            # döndürüyordu — çağıran (combat._press_key_sent) bunu
+            # "gönderildi" sayıyordu. Başarısızlık 0.0'dır.
+            return 0.0
 
     def human_click(
         self,
         x: Optional[int] = None,
         y: Optional[int] = None,
         button: str = "left",
-        min_hold: float = DEFAULT_MIN_HOLD_SEC,
-        max_hold: float = DEFAULT_MAX_HOLD_SEC,
+        min_hold: Optional[float] = None,
+        max_hold: Optional[float] = None,
         double: bool = False,
     ) -> Tuple[int, int, float]:
         """
         İmleci hedef koordinata ±2 piksel insan sapması ve yumuşak geçişle taşır,
         ardından 40ms-90ms basılı tutma süresiyle tıklar.
         Dönüş: (uygulanan_x, uygulanan_y, basılı_tutma_süresi)
+        D-3 (dilim 20): abort/istisna dalları 0.0 hold döner — eskiden
+        başarıyla aynı tuple dönüyor, çağıran tıklamanın yapıldığını
+        sanıyordu (game_action_bus._interpret_click_result + mobil
+        click_screen hold<=0'u hata sayar).
         """
+        if min_hold is None:
+            min_hold = float(getattr(self, "DEFAULT_MIN_HOLD_SEC", 0.04))
+        if max_hold is None:
+            max_hold = float(getattr(self, "DEFAULT_MAX_HOLD_SEC", 0.09))
         low = max(0.01, min(float(min_hold), float(max_hold)))
         high = max(low, float(max_hold))
         hold_time = random.uniform(low, high)
@@ -3022,7 +4100,7 @@ class InputController:
                     self.smooth_move_to(target_x, target_y)
                 if self.motion_aborted():
                     self._release_mouse_buttons()
-                    return target_x, target_y, hold_time
+                    return target_x, target_y, 0.0
                 self._sleep_abortable(hold_time)
                 return target_x, target_y, hold_time
 
@@ -3030,26 +4108,47 @@ class InputController:
                 self.smooth_move_to(target_x, target_y)
                 if self.motion_aborted():
                     self._release_mouse_buttons()
-                    return target_x, target_y, hold_time
+                    return target_x, target_y, 0.0
                 if not self._sleep_abortable(random.uniform(0.02, 0.045)):
                     self._release_mouse_buttons()
-                    return target_x, target_y, hold_time
+                    return target_x, target_y, 0.0
 
             clicks = 2 if double else 1
             for click_idx in range(clicks):
                 if self.motion_aborted():
                     self._release_mouse_buttons()
-                    return target_x, target_y, hold_time
+                    return target_x, target_y, 0.0
                 current_hold = hold_time if click_idx == 0 else random.uniform(low, high)
-                self._hw_mouse_down(btn)
+                # P0-5: basış reddedildiyse tık yok — hold 0.0 başarısızlık
+                # sinyalidir (_interpret_click_result bunu eler); yanlış
+                # konumda kör tık atılmaz.
+                if self._hw_mouse_down(btn) is False:
+                    logger.warning(
+                        "human_click: fare %s down reddedildi (%d, %d) — "
+                        "tıklama yapılmadı.",
+                        btn,
+                        target_x,
+                        target_y,
+                    )
+                    return target_x, target_y, 0.0
                 if not self._sleep_abortable(current_hold):
                     self._release_mouse_buttons()
-                    return target_x, target_y, hold_time
-                self._hw_mouse_up(btn)
+                    return target_x, target_y, 0.0
+                # Bırakma reddedildiyse tuş basılı kalmış olabilir (K-2:
+                # kayıtta tutulur, sonraki süpürme dener) — başarı sayılmaz.
+                if self._hw_mouse_up(btn) is False:
+                    logger.error(
+                        "human_click: fare %s up reddedildi (%d, %d) — tuş "
+                        "basılı kalmış olabilir.",
+                        btn,
+                        target_x,
+                        target_y,
+                    )
+                    return target_x, target_y, 0.0
                 if click_idx == 0 and clicks == 2:
                     if not self._sleep_abortable(random.uniform(0.04, 0.075)):
                         self._release_mouse_buttons()
-                        return target_x, target_y, hold_time
+                        return target_x, target_y, 0.0
 
             logger.debug(
                 "Fare tıklandı: (%d, %d) | Buton: %s | Double: %s | Süre: %.1fms",
@@ -3062,7 +4161,12 @@ class InputController:
             return target_x, target_y, hold_time
         except Exception as exc:
             logger.error("human_click hatası ((%s, %s), button=%s): %s", x, y, btn, exc)
-            return (int(x or 0), int(y or 0), hold_time)
+            # Report the actual cursor position, not the requested target.
+            try:
+                cx, cy = self.get_cursor_position()
+            except Exception:
+                cx, cy = int(x or 0), int(y or 0)
+            return (cx, cy, 0.0)
 
     def click_map(
         self,
@@ -3120,13 +4224,61 @@ class InputController:
             self.close_chat_box_if_open(frame=frame)
         return self.press_key("f", self.DEFAULT_MIN_HOLD_SEC, self.DEFAULT_MAX_HOLD_SEC, frame=None)
 
+    def _ensure_user32_hwnd_prototypes(self) -> Any:
+        """Set HWND-safe ctypes restypes once (Win64 truncates without them).
+
+        Default GetForegroundWindow/FindWindowExW restype is c_long (32-bit on
+        Win64). A full 64-bit HWND then fails equality checks against the value
+        stored from an EnumWindows(HWND) callback → false 'NOT focused' while
+        the user is on the game screen. Matches watchdog FindWindowW pattern.
+        """
+        user32 = ctypes.windll.user32
+        if getattr(user32, "_gatherion_hwnd_proto", False):
+            return user32
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.FindWindowExW.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+        ]
+        user32.FindWindowExW.restype = wintypes.HWND
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        if _WNDENUMPROC is not None:
+            user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+            user32.EnumWindows.restype = wintypes.BOOL
+        user32._gatherion_hwnd_proto = True  # type: ignore[attr-defined]
+        return user32
+
+    def _hwnd_to_int(self, hwnd: Any) -> int:
+        """Normalize ctypes HWND / c_void_p / int without 32-bit truncation."""
+        if hwnd is None:
+            return 0
+        try:
+            if isinstance(hwnd, ctypes.c_void_p):
+                return int(hwnd.value or 0)
+            return int(hwnd)
+        except (TypeError, ValueError):
+            return 0
+
     def _get_cached_aion_hwnd(self) -> int:
         """Resolve AION client HWND with a short TTL cache (EnumWindows is relatively expensive)."""
         now = time.time()
         cached = int(self._cached_game_hwnd or 0)
         if cached and (now - self._game_hwnd_cache_ts) < _GAME_HWND_CACHE_TTL_SEC:
             try:
-                if ctypes.windll.user32.IsWindow(wintypes.HWND(cached)):
+                user32 = self._ensure_user32_hwnd_prototypes()
+                if user32.IsWindow(wintypes.HWND(cached)):
                     return cached
             except Exception:
                 pass
@@ -3154,6 +4306,22 @@ class InputController:
             pass
         return False
 
+    def _game_focus_refused(self) -> bool:
+        """True when the game window exists (Windows) but focus could not be
+        taken — e.g. the user Alt-Tabbed to Discord/Chrome. Callers must not
+        send keys into the wrong window. On Linux / with no game window this
+        is False so tests and headless runs are unaffected."""
+        if self.test_mode or not sys.platform.startswith("win"):
+            return False
+        if self.motion_aborted():
+            return True
+        if self.focus_game_window():
+            return False
+        try:
+            return int(self._get_cached_aion_hwnd() or 0) != 0
+        except Exception:
+            return False
+
     def focus_game_window(self) -> bool:
         """
         Bring the AION 2 client to the foreground before M.
@@ -3167,12 +4335,15 @@ class InputController:
         if self.motion_aborted():
             return False
         try:
-            user32 = ctypes.windll.user32
+            user32 = self._ensure_user32_hwnd_prototypes()
             game = self._get_cached_aion_hwnd()
             if not game:
                 return False
-            fg = int(user32.GetForegroundWindow() or 0)
+            fg = self._hwnd_to_int(user32.GetForegroundWindow())
             if fg == game:
+                return True
+            # Same process as the game client counts as focused (child/top mismatch).
+            if fg and self._hwnd_same_process(fg, game):
                 return True
             # Never steal focus from external applications (Discord, Chrome, Explorer, etc.)
             if fg and not self._is_gatherion_hwnd(fg):
@@ -3187,37 +4358,69 @@ class InputController:
             user32.SetForegroundWindow(wintypes.HWND(game))
             if attached:
                 user32.AttachThreadInput(fg_thread, game_thread, False)
-            return int(user32.GetForegroundWindow() or 0) == game
+            fg2 = self._hwnd_to_int(user32.GetForegroundWindow())
+            return fg2 == game or (fg2 != 0 and self._hwnd_same_process(fg2, game))
         except Exception as exc:
             logger.debug("AION focus before map key skipped: %s", exc)
             return False
 
+    def _hwnd_same_process(self, hwnd_a: int, hwnd_b: int) -> bool:
+        """True when both HWNDs belong to the same process (focus detection only)."""
+        if not hwnd_a or not hwnd_b or hwnd_a == hwnd_b:
+            return bool(hwnd_a and hwnd_b and hwnd_a == hwnd_b)
+        try:
+            user32 = self._ensure_user32_hwnd_prototypes()
+            pid_a = wintypes.DWORD(0)
+            pid_b = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(wintypes.HWND(hwnd_a), ctypes.byref(pid_a))
+            user32.GetWindowThreadProcessId(wintypes.HWND(hwnd_b), ctypes.byref(pid_b))
+            return bool(pid_a.value and pid_a.value == pid_b.value)
+        except Exception:
+            return False
+
     def _find_aion_hwnd(self) -> int:
         """Visible AION 2 window. Gatherion titles that mention Aion are ignored."""
-        if not sys.platform.startswith("win"):
+        if not sys.platform.startswith("win") or _WNDENUMPROC is None:
             return 0
-        user32 = ctypes.windll.user32
+        user32 = self._ensure_user32_hwnd_prototypes()
         found: List[int] = []
 
-        enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-
-        def _callback(hwnd: int, _lparam: int) -> bool:
-            if not user32.IsWindowVisible(hwnd):
+        def _callback(hwnd: Any, _lparam: Any) -> bool:
+            hwnd_i = self._hwnd_to_int(hwnd)
+            if not hwnd_i or not user32.IsWindowVisible(wintypes.HWND(hwnd_i)):
                 return True
-            length = int(user32.GetWindowTextLengthW(hwnd) or 0)
+            length = int(user32.GetWindowTextLengthW(wintypes.HWND(hwnd_i)) or 0)
             if length <= 0:
                 return True
             buf = ctypes.create_unicode_buffer(length + 2)
-            user32.GetWindowTextW(hwnd, buf, length + 2)
+            user32.GetWindowTextW(wintypes.HWND(hwnd_i), buf, length + 2)
             title = buf.value.strip().lower()
-            if not title or "gatherion" in title or "cursor" in title:
+            # S037 (v19/P3-8): ilk eşleşen alınıyordu; NCSoft launcher
+            # penceresi ("ncsoft" içerir) istemci yerine seçilebilirdi.
+            # Launcher/patcher pencereleri açıkça dışlanır; oyun penceresi
+            # ("Aion 2") Z-sırasında genelde en üsttedir.
+            if not title or "gatherion" in title or "cursor" in title or "launcher" in title or "patcher" in title:
                 return True
             if "aion" in title or "아이온" in title or "ncsoft" in title:
-                found.append(int(hwnd))
+                found.append(hwnd_i)
+                return False  # stop: first Z-order match
             return True
 
-        user32.EnumWindows(enum_proc(_callback), 0)
-        return found[0] if found else 0
+        # Persistent callback ref (GC of a temporary WINFUNCTYPE wrapper
+        # during EnumWindows crashes the process on some hosts).
+        self._enum_aion_cb_ref = _WNDENUMPROC(_callback)
+        user32.EnumWindows(self._enum_aion_cb_ref, 0)
+        if found:
+            return found[0]
+        # Title miss (borderless / empty title): FindWindowW exact titles.
+        for title in ("AION 2", "Aion 2", "AION", "Aion"):
+            try:
+                hwnd = self._hwnd_to_int(user32.FindWindowW(None, title))
+                if hwnd and user32.IsWindow(wintypes.HWND(hwnd)):
+                    return hwnd
+            except Exception:
+                continue
+        return 0
 
     def toggle_map(self, frame: Optional[Any] = None) -> float:
         """
@@ -3227,7 +4430,9 @@ class InputController:
         """
         if self.chat_box_guard_enabled:
             self.close_chat_box_if_open(frame=frame)
-        self.focus_game_window()
+        if self._game_focus_refused():
+            logger.warning("toggle_map: oyun penceresi odağı alınamadı.")
+            return 0.0
         return self.press_key("m", 0.18, 0.26, frame=None)
 
     def press_esc(self) -> float:
@@ -3279,34 +4484,76 @@ class InputController:
         key: str = "",
     ) -> Dict[str, Any]:
         """Simulates and records a trajectory or keypress via DryRunSimulator when test_mode is active."""
+        if not getattr(self, "test_mode", False):
+            return {"recorded": False, "action_type": action_type, "x": int(x), "y": int(y), "key": str(key), "reason": "test_mode required"}
+        if action_type not in ("click", "key"):
+            return {"recorded": False, "action_type": action_type, "x": int(x), "y": int(y), "key": str(key), "reason": "unknown action_type"}
         try:
             if not hasattr(self, "_dry_run_sim"):
-                from core.dry_run_simulator import DryRunSimulator
-                self._dry_run_sim = DryRunSimulator()
+                from core.dry_run_simulator import DryRunReplaySimulator
+
+                self._dry_run_sim = DryRunReplaySimulator()
             if action_type == "click":
-                self._dry_run_sim.record_click(int(x), int(y), label=key or "left")
-            elif action_type == "key":
-                self._dry_run_sim.record_key_press(str(key), hold_ms=55.0)
-            return {"recorded": True, "action_type": action_type, "x": int(x), "y": int(y), "key": str(key)}
+                ok = bool(self._dry_run_sim.record_click(int(x), int(y), label=key or "left"))
+            else:
+                ok = bool(self._dry_run_sim.record_key_press(str(key), hold_ms=55.0))
+            return {"recorded": ok, "action_type": action_type, "x": int(x), "y": int(y), "key": str(key)}
         except Exception as exc:
             logger.debug("record_dry_run_event warning: %s", exc)
             return {"recorded": False, "action_type": action_type}
 
     def get_input_controller_health_summary(self) -> dict:
+        """Health from the real backend state — never an unconditional True."""
         try:
-            return {"input_controller_ready": True}
-        except Exception as e:
-            logger.debug("get_input_controller_health_summary error: %s", e)
-            return {"input_controller_ready": False}
+            trusted = bool(self.keyboard_inject_trusted)
+        except Exception:
+            trusted = False
+        try:
+            backend = str(self.active_backend_name)
+        except Exception:
+            backend = "unknown"
+        ready = bool(getattr(self, "test_mode", False)) or trusted
+        return {
+            "input_controller_ready": ready,
+            "keyboard_inject_trusted": trusted,
+            "backend": backend,
+            "test_mode": bool(getattr(self, "test_mode", False)),
+        }
 
     def get_input_controller_ready_flag(self) -> dict:
-        return {"module": "input_driver", "ready": True}
+        try:
+            trusted = bool(self.keyboard_inject_trusted)
+        except Exception:
+            trusted = False
+        ready = bool(getattr(self, "test_mode", False)) or trusted
+        return {"module": "input_driver", "ready": ready, "keyboard_inject_trusted": trusted}
 
     def get_input_controller_version_info(self) -> dict:
-        return {"module": "input_driver", "version": "2.0.0", "ready": True}
+        # Teşhis stub'ları notu (dilim 20): eskiden koşulsuz {"ready": True}
+        # dönüyordu. Artık gerçek backend durumu ölçülüyor.
+        try:
+            trusted = bool(self.keyboard_inject_trusted)
+        except Exception:
+            trusted = False
+        ready = bool(getattr(self, "test_mode", False)) or trusted
+        return {"module": "input_driver", "version": __version__, "ready": ready, "keyboard_inject_trusted": trusted}
 
     def get_input_controller_diagnostic_snapshot(self) -> dict:
-        return {"module": "input_driver", "status": "ok", "ready": True}
+        summary = self.get_input_controller_health_summary()
+        return {
+            "module": "input_driver",
+            "status": "ok" if summary["input_controller_ready"] else "no_trusted_backend",
+            "ready": summary["input_controller_ready"],
+            "backend": summary.get("backend"),
+            "keyboard_inject_trusted": summary.get("keyboard_inject_trusted"),
+            "test_mode": summary.get("test_mode"),
+            "active_bot_keys": sorted(getattr(self, "_active_bot_keys", set()) or set()),
+            # F-0452: yalnızca yazılan üç alanın okunduğu prob — silinmedi,
+            # tanılama anlık görüntüsüne bağlandı.
+            "input_refused": bool(getattr(self, "_input_refused", False)),
+            "last_logged_test_mode": getattr(self, "_last_logged_test_mode", None),
+            "emitted_move_points": list(getattr(self, "_emitted_move_points", []) or []),
+        }
 
 
 # Geriye dönük uyumluluk için takma ad (Alias)
@@ -3331,8 +4578,12 @@ def close_chat_box_if_open(
     """
     Modül seviyesi yardımcı fonksiyon: Sohbet kutusu açıksa ESC tuşuna basarak kapatır (Item 17).
     """
-    ctrl = controller if isinstance(controller, InputController) else InputController(test_mode=True)
-    return ctrl.close_chat_box_if_open(frame=frame, chat_open=chat_open)
+    if not isinstance(controller, InputController):
+        # No controller, no ESC to send: do not construct a whole controller
+        # (Interception/Faker probing + screen queries) as a side effect.
+        logger.debug("close_chat_box_if_open: controller verilmedi, ESC gönderilmedi.")
+        return False
+    return controller.close_chat_box_if_open(frame=frame, chat_open=chat_open)
 
 
 if __name__ == "__main__":
@@ -3441,6 +4692,10 @@ if __name__ == "__main__":
 
         fb_logs = [m for m in fallback_records if "OPSEC FALLBACK" in m]
         assert len(fb_logs) >= 2, f"Expected OPSEC FALLBACK warning logs for key_down and key_up, got {fb_logs}"
+        # key_up now returns the real result (F-0019): with no trusted path
+        # both directions must report failure instead of a fake True.
+        assert ctrl_fallback.key_down("1") is False, "key_down must return False with no trusted path"
+        assert ctrl_fallback.key_up("1") is False, "key_up must return False with no trusted path"
     finally:
         logger.removeHandler(fb_handler)
 
@@ -3457,8 +4712,64 @@ if __name__ == "__main__":
     gcd_wait = ctrl.align_to_gcd(burst_duration_sec=0.040, gcd_sec=0.12)
     assert 0.060 <= gcd_wait <= 0.100, f"GCD alignment out of expected range: {gcd_wait}"
 
-    # 6. Verify Trust & Public Contract methods
-    assert ctrl.is_keyboard_trusted() == ctrl.keyboard_inject_trusted
+    # 7. Verify D12: _sleep_abortable Event.wait, resolution cache, vision inRange
+    import threading as _th
+
+    sleep_calls = {"n": 0}
+    _real_sleep = time.sleep
+
+    def _counting_sleep(s):
+        sleep_calls["n"] += 1
+        _real_sleep(s)
+
+    time.sleep = _counting_sleep
+    try:
+        assert ctrl._sleep_abortable(0.2) is True, "_sleep_abortable must complete"
+    finally:
+        time.sleep = _real_sleep
+    assert sleep_calls["n"] == 0, f"_sleep_abortable must not poll time.sleep, got {sleep_calls['n']} calls"
+    _abort_res = {}
+
+    def _d12_sleeper():
+        _abort_res["ok"] = ctrl._sleep_abortable(5.0)
+
+    _t = _th.Thread(target=_d12_sleeper)
+    _t.start()
+    _real_sleep(0.05)
+    ctrl.abort_motion()
+    _t.join(timeout=2.0)
+    assert not _t.is_alive(), "_sleep_abortable must wake promptly on abort"
+    assert _abort_res.get("ok") is False, "aborted _sleep_abortable must return False"
+    ctrl.resume_motion()
+
+    _orig_res = InputController.get_screen_resolution
+    _res_calls = {"n": 0}
+
+    def _counting_res(*a, **k):
+        _res_calls["n"] += 1
+        return _orig_res(*a, **k)
+
+    InputController.get_screen_resolution = staticmethod(_counting_res)
+    try:
+        ctrl._screen_res_cache_ts = 0.0  # force exactly one refresh
+        for _ in range(20):
+            ctrl.normalize_coords(960, 540)
+            ctrl.denormalize_coords(0.5, 0.5)
+        assert _res_calls["n"] == 1, f"resolution must be cached, got {_res_calls['n']} raw queries"
+        assert ctrl.normalize_coords(960, 540) == (0.5, 0.5), "cached normalize must stay correct"
+    finally:
+        InputController.get_screen_resolution = _orig_res
+
+    _plate_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    cv2.rectangle(_plate_frame, (800, 300), (1050, 318), (0, 215, 255), -1)
+    _hit = ctrl.find_monster_nameplate_points(_plate_frame)
+    assert _hit is not None, "inRange nameplate mask must still find the yellow strip"
+    assert 800 <= _hit[0] <= 1050 and 295 <= _hit[1] <= 325, f"plate coords off: {_hit}"
+    _green_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    cv2.rectangle(_green_frame, (900, 400), (1020, 520), (60, 200, 80), -1)
+    _body = ctrl.find_hostile_body_offset(_green_frame)
+    assert _body is not None, "inRange hostile mask must still find the green blob"
+    assert len(_MORPH_KERNEL_CACHE) >= 3, "morph kernels must be cached, not rebuilt per frame"
 
     logger.info("core/input_driver.py all self-checks PASSED (esc_guard, interception single-fire, opsec fallback, human jitter, gcd align).")
 
@@ -3468,7 +4779,15 @@ def get_input_driver_capabilities() -> list:
 
 
 def validate_input_driver_contract() -> bool:
-    return bool(get_input_driver_capabilities())
+    """Teşhis stub'ları notu (dilim 20): bu modül-seviyesi fonksiyonun
+    canlı bir denetleyici örneği yoktur; eskiden yalnızca yetenek
+    listesinin boş olmadığını ölçüp True dönüyor, `audit_passed: True`
+    hiçbir şeyi doğrulamıyordu. Dürüst değer False'dur ("ölçülmedi") —
+    gerçek durum için InputController.get_input_controller_health_summary()
+    / get_input_controller_ready_flag() kullanılır. Bu değişim bilinçlidir:
+    repo genelinde bu fonksiyonun üretim çağıranı yoktur.
+    """
+    return False
 
 
 def get_input_driver_baseline_metrics() -> dict:

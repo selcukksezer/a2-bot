@@ -23,6 +23,11 @@ class _Driver:
 
     def human_click(self, x, y, button="left", **kwargs):
         self.clicks.append((int(x), int(y), str(button)))
+        # F-1868 contract: the real driver (core/input_driver.py human_click)
+        # returns (applied_x, applied_y, hold_sec) on EVERY path; None carries
+        # no success signal, so _interpret_click_result rejects it. The fake
+        # must honour the same contract (cf. tests/test_r15_game_action_bus_click.py).
+        return (int(x), int(y), 0.05)
 
     def press_key(self, key, **kwargs):
         self.keys.append((str(key).lower(), dict(kwargs)))
@@ -37,6 +42,15 @@ class _Driver:
 
     def _hw_key_up(self, key, post_to_window=False):
         self.held.append(("up", str(key).lower(), bool(post_to_window)))
+
+    def key_down(self, key, post_to_window=False):
+        """InputController.key_down arayüzü: hold_left_attack önce bunu dener."""
+        self.held.append(("down", str(key).lower(), bool(post_to_window)))
+        return True
+
+    def key_up(self, key, post_to_window=False):
+        self.held.append(("up", str(key).lower(), bool(post_to_window)))
+        return True
 
     def _hw_move_to(self, x, y):
         self.moves.append((int(x), int(y)))
@@ -58,24 +72,15 @@ class _Vision:
 
 class GameActionBusTests(unittest.TestCase):
     def test_hold_left_attack_toggles(self):
+        """Sol tık saldırı = R tuşu (fare tıklaması değil, R/T kuralı):
+        basılı tutma R down/up üretir, fare olayı üretmez."""
         driver = _Driver()
-        downs = []
-
-        def _down(btn):
-            downs.append(("down", btn))
-            driver._mouse_buttons_down.add(btn)
-
-        def _up(btn):
-            downs.append(("up", btn))
-            driver._mouse_buttons_down.discard(btn)
-
-        driver._hw_mouse_down = _down
-        driver._hw_mouse_up = _up
         bus = GameActionBus(input_driver=driver)
         bus.hold_left_attack(True)
         bus.hold_left_attack(True)  # idempotent
         bus.hold_left_attack(False)
-        self.assertEqual(downs, [("down", "left"), ("up", "left")])
+        self.assertEqual(driver.held, [("down", "r", False), ("up", "r", False)])
+        self.assertEqual(driver.clicks, [])
 
     def test_slot_center_splits_bar_into_eight(self):
         reader = SkillBarReader()
@@ -205,6 +210,48 @@ class GameActionBusTests(unittest.TestCase):
         self.assertTrue(driver.moves)
         self.assertTrue(seen)
         self.assertEqual(driver.clicks, [])  # no cast click
+
+
+    def test_hold_basic_attack_right_click_t_contract(self):
+        """Sağ tık saldırı = T tuşu (R/T kuralının sağ tarafı): hold_basic_attack
+        açarken restore_basic_attack, kapatırken release_basic_attack çağırır.
+        T tuşunun kendisi bu callback'lerin sahibinde tutulur; bus burada
+        fare tıklaması da tuş olayı da üretmez, yalnızca sırayı pinler."""
+        calls = []
+        driver = _Driver()
+        bus = GameActionBus(
+            input_driver=driver,
+            release_basic_attack=lambda: calls.append("release"),
+            restore_basic_attack=lambda: calls.append("restore"),
+        )
+        bus.hold_basic_attack(True)
+        bus.hold_basic_attack(False)
+        self.assertEqual(calls, ["restore", "release"])
+        self.assertEqual(driver.clicks, [])
+        self.assertEqual(driver.keys, [])
+        self.assertEqual(driver.held, [])
+
+    def test_cast_skill_last_resort_reports_failure_not_success(self):
+        """Güvenilir HID yok + Alt+click yoksa cast_skill son çare olarak R
+        nabzı atar ama skill ATILMADIĞINI raporlar (ok=False, method key_basic)
+        ve yapışkan T'yi önce bırakır. Eski kod burada ok=True dönüyordu —
+        sahte skill-cast başarısı; bu test o davranışı kilitler."""
+        driver = _Driver()  # untrusted keyboard: keyboard_inject_trusted() False
+        bus = GameActionBus(
+            input_driver=driver,
+            skill_bar_reader=SkillBarReader(),
+            mouse_look_mode=True,
+        )
+        frame = np.zeros((540, 960, 3), dtype=np.uint8)
+        out = bus.cast_skill("2", frame=frame)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["method"], "key_basic")
+        self.assertEqual(driver.clicks, [])  # no UI click on this path
+        # Sticky T released first, then R down/up pulse.
+        self.assertEqual(
+            driver.held,
+            [("up", "t", False), ("down", "r", False), ("up", "r", False)],
+        )
 
 
 if __name__ == "__main__":

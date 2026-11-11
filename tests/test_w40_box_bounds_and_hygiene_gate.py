@@ -146,7 +146,11 @@ def test_validate_yolo_file_blocks_all_hygiene_violations(tmp_path: Path) -> Non
     )
 
     boxes, issues = validate_yolo_file(yolo_txt, strict_bounds=True)
-    assert len(boxes) == 4
+    # S-3102: üretim tarafı (dataset_validator.py, F-0852) hatalı satırı
+    # boxes'a eklemez — 3 hatalı satır atlanır, yalnızca geçerli satır (4.
+    # satır, class_id 3) döner. Issue'lar yine de 3 hata tipini taşır.
+    assert len(boxes) == 1
+    assert boxes[0]["class_id"] == 3
 
     issue_types = [iss.issue_type for iss in issues if iss.severity == "error"]
     assert "micro_noise" in issue_types
@@ -177,7 +181,9 @@ def test_dataset_hygiene_gate_blocks_training_on_invalid_boxes(tmp_path: Path) -
 
     ready, reason = is_dataset_ready_for_training(tmp_path)
     assert ready is False
-    assert "QA" in reason or "başarısız" in reason
+    # F-1586: pin the exact gate reason instead of a loose `"QA" in reason
+    # or "başarısız" in reason` — the message must carry the QA summary.
+    assert reason == f"Eğitim engellendi: QA doğrulaması başarısız ({report.summary})."
 
     # Replace with clean box and verify gate passes
     bad_file.write_text("0 0.500000 0.500000 0.120000 0.120000\n", encoding="utf-8")
@@ -187,3 +193,48 @@ def test_dataset_hygiene_gate_blocks_training_on_invalid_boxes(tmp_path: Path) -
 
     ready_clean, _ = is_dataset_ready_for_training(tmp_path)
     assert ready_clean is True
+
+
+@pytest.mark.parametrize(
+    "w,h,is_bad,msg_part",
+    [
+        # Micro-noise dimension violations (each dimension independently).
+        (0.0039, 0.10, True, "0.004"),
+        (0.10, 0.001, True, "0.004"),
+        # Exact dimension boundaries are valid (0.004 and 0.65 inclusive).
+        (0.004, 0.004, False, ""),
+        (0.004, 0.10, False, ""),
+        (0.10, 0.004, False, ""),
+        (0.65, 0.65, False, ""),
+        (0.65, 0.20, False, ""),
+        # Massive-box dimension violations.
+        (0.651, 0.20, True, "0.65"),
+        (0.20, 0.85, True, "0.65"),
+        # Clean interior box.
+        (0.10, 0.10, False, ""),
+        # Zero / negative dimensions — previously untested branch.
+        (0.0, 0.10, True, "Sıfır"),
+        (-0.05, 0.10, True, "Sıfır"),
+        (0.10, -0.01, True, "Sıfır"),
+        # Non-finite dimensions — previously untested branch.
+        (float("nan"), 0.10, True, "geçersiz sayı"),
+        (float("inf"), 0.10, True, "geçersiz sayı"),
+        (0.10, float("nan"), True, "geçersiz sayı"),
+    ],
+)
+def test_check_box_size_bounds_parametrized(w: float, h: float, is_bad: bool, msg_part: str) -> None:
+    """check_box_size_bounds directly, one case per test.
+
+    The existing tests exercise this function only through
+    validate_label_box / sanitize_dataset_boxes and only for the
+    micro-noise and massive-box dimensions. The zero/negative and
+    non-finite branches had no coverage; parametrizing also gives each
+    (w, h) pair its own test id instead of masking later cases behind
+    an earlier assertion failure.
+    """
+    bad, msg = check_box_size_bounds(w, h)
+    assert bad is is_bad
+    if is_bad:
+        assert msg_part in msg
+    else:
+        assert msg == ""

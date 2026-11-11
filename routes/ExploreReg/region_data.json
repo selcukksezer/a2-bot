@@ -1,0 +1,114 @@
+{
+  "region": "ExploreReg",
+  "routes": [
+    "All"
+  ],
+  "nodes": [
+    {
+      "id": 1,
+      "node_id": 1,
+      "region": "ExploreReg",
+      "routes": [],
+      "resource_type": "Aria",
+      "map_x": 504,
+      "map_y": 306,
+      "exact_map_x": 504.311,
+      "exact_map_y": 305.949,
+      "norm_x": 0.2627,
+      "norm_y": 0.2833,
+      "in_air": false,
+      "sightings_count": 1,
+      "confidence": 0.88,
+      "kalman_variance": 16.0,
+      "kalman_variance_x": 16.0,
+      "kalman_variance_y": 16.0,
+      "patch_path": "tmp8c13u9jg/ExploreReg/patches/node_1.png",
+      "first_seen_timestamp": 1794201569.57165,
+      "last_seen_timestamp": 1794201569.5716503,
+      "stack_count": 1,
+      "max_harvests": 3,
+      "current_harvests": 0,
+      "remaining_harvests": 3,
+      "is_depleted": false,
+      "state": "active",
+      "rest_started_timestamp": 0.0,
+      "source_type": "3d_auto",
+      "node_type": "resource",
+      "connected_waypoints": []
+    }
+  ],
+  "route_graph": {
+    "region": "ExploreReg",
+    "waypoints": [
+      {
+        "waypoint_id": 1,
+        "map_x": 500.0,
+        "map_y": 300.0,
+        "norm_x": 0.2604,
+        "norm_y": 0.2778,
+        "timestamp": 1794343398.699304,
+        "connected_node_ids": [
+          1
+        ],
+        "seq_index": 1,
+        "is_breadcrumb": true
+      }
+    ],
+    "edges": [
+      {
+        "from_id": 1,
+        "to_id": 1,
+        "from_type": "waypoint",
+        "to_type": "node",
+        "distance_px": 7.35,
+        "heading_deg": 0.0,
+        "bidirectional": true
+      },
+      {
+        "from_id": 1,
+        "to_id": 1,
+        "from_type": "waypoint",
+        "to_type": "node",
+        "distance_px": 7.35,
+        "heading_deg": 0.0,
+        "bidirectional": true
+      }
+    ],
+    "total_distance_px": 14.69,
+    "waypoint_count": 1,
+    "edge_count": 2
+  },
+  "cartography_stats": {
+    "total_nodes": 1,
+    "auto_mapped": 2,
+    "last_mapped": {
+      "type": "waypoint",
+      "waypoint_id": 1,
+      "map_x": 500.0,
+      "map_y": 300.0,
+      "timestamp": 1794343398.699304,
+      "region": "ExploreReg",
+      "calibrated": false
+    },
+    "auto_cartography_mode": true,
+    "graph_nodes_count": 1,
+    "graph_waypoints_count": 1,
+    "graph_edges_count": 2,
+    "graph_total_distance_px": 14.69,
+    "total_minimap_recorded": 0,
+    "total_3d_recorded": 1,
+    "total_harvest_recorded": 0,
+    "total_max_harvests": 3,
+    "total_current_harvests": 0,
+    "total_available_harvests": 3,
+    "player_map_x": 500.0,
+    "player_map_y": 300.0,
+    "player_norm_x": 0.2604,
+    "player_norm_y": 0.2778,
+    "walk_trajectory_points": 2,
+    "is_calibrated_on_world_map": false,
+    "cumulative_drift_px": null,
+    "drift_not_measured": true
+  },
+  "updated_at": 1794343398.7559824
+}

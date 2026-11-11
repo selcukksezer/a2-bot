@@ -23,10 +23,19 @@ echo === after_magisk_hid: adb=%ADB% ===
 "%ADB%" version
 echo === after_magisk_hid: root probe ===
 %PY% tools\setup_android_usb_hid.py --check
+if errorlevel 3 (
+  echo WARN: hidg0 missing, root OK - the --enable-gadget step below will try to enable it.
+  goto :CHECK_DONE
+)
 if errorlevel 2 (
   echo FAIL: su missing — finish Magisk first. See docs\S8_MAGISK_SEQUENCE_SAFE.md
   exit /b 2
 )
+if errorlevel 1 (
+  echo FAIL: no adb device - enable USB debugging and authorize this PC, then retry.
+  exit /b 1
+)
+:CHECK_DONE
 
 echo.
 echo === push + enable-gadget + forward + settings ===
