@@ -8,13 +8,12 @@ YOLO training datasets (`dataset/labels/{train,val}/*.txt`,
 before YOLO training begins.
 
 Enforces 4 strict zero-defect pre-training invariants:
-1. 0 invalid/unknown `class_id` entries (core training classes 0..21, see
-   `dataset_factory/class_taxonomy.py::CORE_22_CLASSES` — the training set.
-   The taxonomy has 27 classes total (0..26); consumables 22..24, kinah 25
-   and player_character 26 are valid taxonomy classes but NOT training
-   classes for this gate, so boxes carrying them are purged, F-1305/D66).
+1. 0 invalid/unknown `class_id` entries. Training ids are the canonical
+   taxonomy 0..28 (`dataset_factory/class_taxonomy.py::ALL_CANONICAL_CLASSES`).
 2. 0 unapproved/unverified boxes in training and validation sets (strictly enforces human approval
-   or high-confidence verified trust).
+   or high-confidence verified trust). A missing review JSON does not make
+   a well-formed exactly-5-field TXT line unverified: that line is a hand
+   label, matching the freeze / approved-pool rule.
 3. 0 zero-area, unnormalized, or corrupted boxes.
 4. 0 empty/corrupted labels with mismatched images (orphaned labels/images).
 
@@ -40,7 +39,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from dataset_factory.class_taxonomy import (
-    CORE_22_CLASSES,
+    ALL_CANONICAL_CLASSES,
     MATERIAL_3D_CLASSES,
     MINIMAP_SYMBOL_CLASSES,
     canonical_names,
@@ -60,17 +59,13 @@ if not logger.handlers:
 # Canonical Taxonomy & Domain Definitions
 # ==============================================================================
 
-# Canonical training-set class IDs: the core 22 classes 0..21.
-# Pinned to dataset_factory/class_taxonomy.py::CORE_22_CLASSES so the set
-# cannot silently drift (D66 test_canonical_classes). The taxonomy has 27
-# classes total (0..26); consumables 22..24, kinah 25 and player_character 26
-# are valid taxonomy classes but NOT training classes for this gate.
-# (D45's F-0795 widened this to 0..26; [O5] narrowed it back: the merged
-# D66 test explicitly pins the core-22 training scope, F-1305.)
-CANONICAL_CLASS_IDS: frozenset[int] = CORE_22_CLASSES
+# Canonical training-set class IDs: the full taxonomy 0..28.
+# Pinned to dataset_factory/class_taxonomy.py::ALL_CANONICAL_CLASSES so the
+# set cannot silently drift. Consumables 22..24, kinah 25, player_character
+# 26, and the F4 generics 27..28 are training classes.
+CANONICAL_CLASS_IDS: frozenset[int] = ALL_CANONICAL_CLASSES
 
-# Human-readable names for all 27 taxonomy classes (kept complete: used for
-# diagnostics/messages even for classes outside the training set).
+# Human-readable names for every taxonomy class (diagnostics/messages).
 # P1-1: read from the authority (dataset/data.yaml via
 # dataset_factory.class_taxonomy.canonical_names) — NOT a second copy of
 # the table. Any data.yaml rename flows here automatically.
@@ -143,18 +138,14 @@ SUPPORTED_IMAGE_EXTS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".bmp
 # ==============================================================================
 
 def is_canonical_class(class_id: Any) -> bool:
-    """Check if class_id is an integer within the core training range 0..21.
+    """Check if class_id is a strict int in the canonical taxonomy 0..28.
 
-    NOTE (P1-1): despite the name, this is the TRAINING-scope check,
-    not taxonomy membership — 22..26 are valid taxonomy classes but NOT
-    training classes for this gate (pinned by D66/F-1305, unchanged).
-    Use :func:`is_taxonomy_class` when the question is "is this a real
-    class at all" (0..26, single source).
-
-    Strict: only real ints count. ``bool`` is rejected (``int(True) == 1``
-    would otherwise smuggle ``True`` in as class 1) and ``float``/``str``
-    values are rejected even when integral (``7.0``/``"7"`` are malformed
-    class ids, not canonical ones) (F-1038).
+    Membership is ``ALL_CANONICAL_CLASSES`` (the exported id set in
+    ``dataset_factory/class_taxonomy.py``). Strict: only real ints count.
+    ``bool`` is rejected (``int(True) == 1`` would otherwise smuggle
+    ``True`` in as class 1) and ``float``/``str`` values are rejected
+    even when integral (``7.0``/``"7"`` are malformed class ids, not
+    canonical ones) (F-1038).
     """
     if isinstance(class_id, bool) or not isinstance(class_id, int):
         return False
@@ -162,29 +153,23 @@ def is_canonical_class(class_id: Any) -> bool:
 
 
 def is_taxonomy_class(class_id: Any) -> bool:
-    """Check if class_id is a real taxonomy class (0..26, single source).
+    """Check if class_id is a real taxonomy class (authority, today 0..28).
 
     P1-1: the range comes from the authority (``dataset/data.yaml`` via
-    ``dataset_factory.class_taxonomy.is_valid_canonical_class_id``).
-    Unlike :func:`is_canonical_class`, 22..26 (consumables, kinah,
-    player_character) pass here — they are valid classes, just not
-    training classes for this gate.
+    ``dataset_factory.class_taxonomy.is_valid_canonical_class_id``), which
+    also accepts digit-only strings. :func:`is_canonical_class` is the
+    stricter int-only check over the same id set.
     """
     return is_valid_canonical_class_id(class_id)
 
 
 def _non_training_class_reason(cid: Any) -> str:
-    """Message fragment for a box purged by the training-scope check.
-
-    P1-1: a 22..26 box is a VALID taxonomy class, just not a training
-    class — calling it "non-canonical" in the report hid that
-    distinction (K-01). Truly unknown ids keep the old wording.
-    """
-    if is_taxonomy_class(cid):
+    """Message fragment for a box purged by the canonical-id check."""
+    hi = max(CANONICAL_CLASS_IDS) if CANONICAL_CLASS_IDS else -1
+    if is_taxonomy_class(cid) and not is_canonical_class(cid):
         return (
-            f"Valid taxonomy class {cid} "
-            f"({CANONICAL_CLASS_NAMES.get(cid, '?')}) but not a training "
-            f"class (0..21)"
+            f"Class id {cid!r} is not a strict canonical integer "
+            f"(training ids are 0..{hi})"
         )
     return f"Non-canonical class_id {cid}"
 
@@ -410,24 +395,47 @@ def is_training_box_verified(
     box: Dict[str, Any],
     stem: str = "",
     emin_threshold: float = DEFAULT_EMIN_THRESHOLD,
+    *,
+    jsonless_hand_label: bool = False,
 ) -> Tuple[bool, str]:
     """
     Evaluates whether a box is authorized to appear in training labels:
     - 0 unapproved/unverified boxes in training set (strictly enforces human
       approval or high-confidence verified trust).
+
+    ``jsonless_hand_label`` is set by the label walker only when the review
+    JSON is missing and the TXT line is an exactly-5-field box. That is a
+    hand label (freeze / approved_pool). It must be kept when the class id
+    is canonical and the geometry is valid, and must not be purged as
+    ``unverified_txt``.
     """
     if not isinstance(box, dict):
         return False, "Box is not a dictionary"
 
     # 1. Canonical class FIRST (S-2304): human approval must never admit a
     # non-canonical class. Previously the approval check came first, so a
-    # box with class_id=99 (or 26, a valid taxonomy class but not a core
-    # training class 0..21) and human_approved=True was admitted as
+    # box with class_id=99 and human_approved=True was admitted as
     # "human_approved" even though it can never belong in training labels.
     cid = box.get("class_id")
     if not is_canonical_class(cid):
         return False, _non_training_class_reason(cid)
     cid = int(cid)
+
+    # 1b. JSON-less exactly-5-field TXT line: hand label, not unverified_txt.
+    # Geometry is re-checked here so a direct caller cannot use the flag to
+    # admit NaN, zero-area, or out-of-bounds boxes.
+    if jsonless_hand_label:
+        try:
+            cx = float(box["cx"])
+            cy = float(box["cy"])
+            w = float(box["w"])
+            h = float(box["h"])
+        except (KeyError, TypeError, ValueError):
+            return False, "JSON-less TXT line is not a well-formed box"
+        valid_geom, _, geom_reason = validate_and_clamp_box(cx, cy, w, h)
+        if not valid_geom:
+            return False, geom_reason
+        return True, "hand_label_txt"
 
     # 2. Human approval or hand label always approved (canonical classes only)
     if is_hand_or_human_approved(box, emin_threshold=emin_threshold):
@@ -931,9 +939,12 @@ def _process_single_label_file(
             modified = True
             continue
 
-        # Check 1: Canonical class_id (0..21)
+        # Check 1: Canonical class_id (taxonomy 0..28)
         if not is_canonical_class(cid):
-            details.append(f"[{split}:{stem}] Invalid {_non_training_class_reason(cid)} (allowed: 0..21)")
+            hi = max(CANONICAL_CLASS_IDS) if CANONICAL_CLASS_IDS else -1
+            details.append(
+                f"[{split}:{stem}] Invalid {_non_training_class_reason(cid)} (allowed: 0..{hi})"
+            )
             purged_boxes += 1
             invalid_cids += 1
             modified = True
@@ -955,25 +966,46 @@ def _process_single_label_file(
         # Check 2: Unapproved / unverified box — enforced on EVERY split
         # (train and val alike, F-0845), not only train.
         if enforce_approval:
-            # Match on class + centre AND size: centre-only matching pairs
-            # a txt line with a different-sized review box (F-0932).
-            # Indexed lookup: same rule as the old linear scan (tolerance
-            # strictly below _LABEL_MATCH_TOLERANCE on all four axes,
-            # first match in review order wins).
-            matched_trusted = _find_matching_trusted_box(trusted_index, cid, cx, cy, w, h) if rev_data else None
+            # Freeze / approved_pool: no review JSON + an exactly-5-field
+            # line is a hand label. A 6+ field line is model output and
+            # stays unverified. A present review JSON decides the frame;
+            # a non-matching line is not promoted to a hand label.
+            jsonless_hand_label = rev_data is None and len(parts) == 5
+            if jsonless_hand_label:
+                box_rep = {
+                    "class_id": cid,
+                    "cx": cx_c,
+                    "cy": cy_c,
+                    "w": w_c,
+                    "h": h_c,
+                    "hand_label": True,
+                    "source": "hand_label_txt",
+                }
+            else:
+                # Match on class + centre AND size: centre-only matching pairs
+                # a txt line with a different-sized review box (F-0932).
+                # Indexed lookup: same rule as the old linear scan (tolerance
+                # strictly below _LABEL_MATCH_TOLERANCE on all four axes,
+                # first match in review order wins).
+                matched_trusted = _find_matching_trusted_box(trusted_index, cid, cx, cy, w, h) if rev_data else None
 
-            box_rep = matched_trusted if matched_trusted else {
-                "class_id": cid,
-                "cx": cx_c,
-                "cy": cy_c,
-                "w": w_c,
-                "h": h_c,
-                "trusted": True if matched_trusted else False,
-                "confidence": 0.50 if not matched_trusted else float(matched_trusted.get("confidence", 0.50)),
-                "source": "unverified_txt" if not matched_trusted else matched_trusted.get("source", ""),
-            }
+                box_rep = matched_trusted if matched_trusted else {
+                    "class_id": cid,
+                    "cx": cx_c,
+                    "cy": cy_c,
+                    "w": w_c,
+                    "h": h_c,
+                    "trusted": True if matched_trusted else False,
+                    "confidence": 0.50 if not matched_trusted else float(matched_trusted.get("confidence", 0.50)),
+                    "source": "unverified_txt" if not matched_trusted else matched_trusted.get("source", ""),
+                }
 
-            verified, reason = is_training_box_verified(box_rep, stem=stem, emin_threshold=emin_threshold)
+            verified, reason = is_training_box_verified(
+                box_rep,
+                stem=stem,
+                emin_threshold=emin_threshold,
+                jsonless_hand_label=jsonless_hand_label,
+            )
             if not verified:
                 details.append(f"[{split}:{stem}] Purged unverified/unapproved box (cid={cid}): {reason}")
                 purged_boxes += 1
@@ -1035,7 +1067,7 @@ def pre_training_dataset_hygiene_gate(
       - `dataset/images/{train,val}/*`
 
     Enforces 4 strict zero-defect pre-training invariants:
-      1. 0 invalid/unknown `class_id` entries (strictly canonical 0..21).
+      1. 0 invalid/unknown `class_id` entries (canonical taxonomy 0..28).
       2. 0 unapproved/unverified boxes in training and validation sets.
       3. 0 zero-area, unnormalized, or corrupted boxes.
       4. 0 empty labels with mismatched/missing images.

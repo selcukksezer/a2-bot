@@ -12,12 +12,13 @@ import tempfile
 import time
 import unittest
 
-from dataset_factory.class_taxonomy import CORE_22_CLASSES
+from dataset_factory.class_taxonomy import ALL_CANONICAL_CLASSES
 from dataset_factory.dataset_hygiene_gate import (
     CANONICAL_CLASS_IDS,
     CANONICAL_CLASS_NAMES,
     audit_dataset_hygiene,
     is_canonical_class,
+    is_training_box_verified,
     pre_training_dataset_hygiene_gate,
     validate_and_clamp_box,
 )
@@ -89,27 +90,20 @@ class TestDatasetHygieneGate(unittest.TestCase):
         return rev_p
 
     def test_canonical_classes(self):
-        """Verify the training gate accepts exactly the core 22 classes 0..21.
+        """Training ids are the exported canonical taxonomy, 0..28.
 
-        The gate's canonical set is the *training* set (core 22). Classes
-        22..26 (consumables 22-24, currency 25, player_character 26) exist in
-        `dataset_factory.class_taxonomy.ALL_CANONICAL_CLASSES` (27 total) but
-        are NOT training classes, so this gate must reject them. The two
-        names describe different scopes; pin the gate to the taxonomy's
-        CORE_22_CLASSES so the sets cannot silently drift apart.
+        Pin the gate to ALL_CANONICAL_CLASSES so 22..28 cannot be purged
+        as invalid while a second, narrower list drifts in.
         """
-        self.assertEqual(CANONICAL_CLASS_IDS, CORE_22_CLASSES)
-        self.assertEqual(len(CANONICAL_CLASS_IDS), 22)
-        for cid in range(22):
-            self.assertTrue(is_canonical_class(cid))
+        self.assertEqual(CANONICAL_CLASS_IDS, ALL_CANONICAL_CLASSES)
+        self.assertEqual(len(CANONICAL_CLASS_IDS), 29)
+        for cid in range(29):
+            self.assertTrue(is_canonical_class(cid), cid)
             self.assertIn(cid, CANONICAL_CLASS_NAMES)
         self.assertFalse(is_canonical_class(-1))
-        self.assertFalse(is_canonical_class(22))
-        self.assertFalse(is_canonical_class(23))
-        self.assertFalse(is_canonical_class(24))
-        self.assertFalse(is_canonical_class(25))
-        self.assertFalse(is_canonical_class(26))
+        self.assertFalse(is_canonical_class(29))
         self.assertFalse(is_canonical_class(98))
+        self.assertFalse(is_canonical_class(True))
         self.assertFalse(is_canonical_class("invalid"))
 
     def test_geometry_validation_and_clamping(self):
@@ -140,7 +134,7 @@ class TestDatasetHygieneGate(unittest.TestCase):
         self.assertAlmostEqual(cy, 0.0001)
 
     def test_check_1_purges_invalid_class_ids(self):
-        """Check 1: Non-canonical class IDs (e.g. 98, 70, 22) are purged from .txt and .json."""
+        """Check 1: Non-canonical class IDs (e.g. 98, 70) are purged from .txt and .json."""
         stem = "test_invalid_cid"
         self._create_image("train", stem)
         self._create_label(
@@ -416,6 +410,111 @@ class TestDatasetHygieneGate(unittest.TestCase):
         # File should NOT be modified in dry-run audit mode
         raw = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip()
         self.assertTrue(raw.startswith("99 "))
+
+    def test_regression_canonical_ids_and_jsonless_hand_labels(self):
+        """22/24/26 stay; a JSON-less 5-field line is a hand label.
+
+        Bad geometry and a truly invalid class id are still purged.
+        A 6-field line without review JSON is model output, not a hand label.
+        A review JSON that does not approve the line still purges it, and
+        the reason is unverified rather than an invalid class id.
+        """
+        kept_box = {
+            "class_id": 22,
+            "cx": 0.5,
+            "cy": 0.5,
+            "w": 0.1,
+            "h": 0.1,
+            "source": "unverified_txt",
+            "trusted": False,
+        }
+        ok, reason = is_training_box_verified(kept_box, jsonless_hand_label=True)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "hand_label_txt")
+
+        bad_geom, geom_reason = is_training_box_verified(
+            {"class_id": 24, "cx": 0.5, "cy": 0.5, "w": 0.0, "h": 0.1},
+            jsonless_hand_label=True,
+        )
+        self.assertFalse(bad_geom)
+        self.assertIn("Zero or sub-minimal", geom_reason)
+
+        bad_cid, cid_reason = is_training_box_verified(
+            {"class_id": 99, "cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1},
+            jsonless_hand_label=True,
+        )
+        self.assertFalse(bad_cid)
+        self.assertIn("Non-canonical", cid_reason)
+
+        still_unverified, unverified_reason = is_training_box_verified(kept_box)
+        self.assertFalse(still_unverified)
+        self.assertIn("untrusted", unverified_reason)
+
+        stem = "jsonless_hand"
+        self._create_image("train", stem)
+        self._create_label(
+            "train",
+            stem,
+            [
+                "22 0.500000 0.500000 0.100000 0.100000",
+                "24 0.400000 0.400000 0.100000 0.100000",
+                "26 0.300000 0.300000 0.100000 0.100000",
+                "27 0.200000 0.250000 0.100000 0.100000",
+                "28 0.150000 0.150000 0.100000 0.100000",
+                "99 0.500000 0.200000 0.100000 0.100000",
+                "29 0.500000 0.250000 0.100000 0.100000",
+                "22 nan 0.500000 0.100000 0.100000",
+                "24 0.500000 0.500000 0.000000 0.100000",
+                "26 1.500000 0.500000 0.100000 0.100000",
+                "22 0.550000 0.550000 0.100000 0.100000 0.990000",
+            ],
+        )
+
+        report = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
+        self.assertTrue(report["clean"], report["details"])
+        self.assertEqual(report["invalid_class_ids_purged"], 2)
+        self.assertEqual(report["corrupted_boxes_purged"], 3)
+        self.assertEqual(report["unapproved_boxes_purged"], 1)
+        self.assertEqual(report["purged_boxes"], 6)
+
+        lbl_content = (self.labels_train / f"{stem}.txt").read_text(encoding="utf-8").strip().splitlines()
+        cids = [int(line.split()[0]) for line in lbl_content]
+        self.assertEqual(cids, [22, 24, 26, 27, 28])
+        for cid in (22, 24, 26):
+            self.assertNotIn(f"Invalid Non-canonical class_id {cid}", "\n".join(report["details"]))
+
+        reviewed = "reviewed_unmatched_22"
+        self._create_image("train", reviewed)
+        self._create_label(
+            "train",
+            reviewed,
+            ["22 0.500000 0.500000 0.100000 0.100000"],
+        )
+        self._create_review(
+            "train",
+            reviewed,
+            trusted=[
+                {
+                    "class_id": 0,
+                    "cx": 0.2,
+                    "cy": 0.2,
+                    "w": 0.1,
+                    "h": 0.1,
+                    "confidence": 0.95,
+                    "source": "hand_label",
+                }
+            ],
+        )
+        report2 = pre_training_dataset_hygiene_gate(self.root, auto_clean=True)
+        self.assertTrue(report2["clean"], report2["details"])
+        reviewed_lines = (self.labels_train / f"{reviewed}.txt").read_text(encoding="utf-8").strip()
+        self.assertEqual(reviewed_lines, "")
+        self.assertTrue(
+            any("unverified" in line and "cid=22" in line for line in report2["details"])
+        )
+        self.assertFalse(
+            any(f"Invalid Non-canonical class_id 22" in line for line in report2["details"])
+        )
 
     def test_nonexistent_dataset_directory(self):
         """Verify non-existent directory returns clean=False with error message."""
