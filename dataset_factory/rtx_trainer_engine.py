@@ -546,6 +546,82 @@ class _BatchStepCounter:
         return (self._count, total, int(epoch0) + 1)
 
 
+def total_system_ram_mb() -> Optional[float]:
+    """Toplam sistem RAM'i (MB). psutil yoksa/okunamazsa None döner."""
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.virtual_memory().total) / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+def default_rss_abort_mb(total_ram_mb: Optional[float] = None) -> float:
+    """RSS abort eşiği varsayılanı (MB): toplam RAM'in %75'i, en az 10240 MB.
+
+    fix/v20-rss-panik: sabit 10240 MB eşiği 32 GB'lık PC'de sağlıklı
+    eğitimi öldürüyordu — canlı kanıt: 11 Kasım gecesi yolo11m/960
+    koşusu 19-21 GB bandında plato yapıp mAP50 0.685'e ulaştı (güvenli);
+    12 Kasım yolo11s koşusu ise 10315 MB'ta abort ile durduruldu.
+    Eşik makinenin RAM'ine göre ölçeklenir; RAM okunamazsa eski
+    10240 MB varsayılanı korunur.
+    """
+    if total_ram_mb is None:
+        total_ram_mb = total_system_ram_mb()
+    if total_ram_mb is None or float(total_ram_mb) <= 0:
+        return 10240.0
+    return max(10240.0, 0.75 * float(total_ram_mb))
+
+
+class _RssAbortDecider:
+    """RSS abort kararı: eşik aşımı ardışık kontrollerle teyit edilir.
+
+    Tek anlık sıçrama (model yükleme, cache dolumu) eğitimi öldürmesin
+    diye eşik üstü okuma ``confirmations`` kez üst üste görülmeden
+    abort ateşlenmez (kontrol aralığı 30 sn → 2 teyit ≈ 60 sn).
+    Acil durum: RSS toplam RAM'in ``emergency_fraction``'ına ulaşırsa
+    teyit beklenmez — OOM'dan önce durulur. ``abort_mb <= 0`` abort'u
+    kapatır (açık ayar).
+    """
+
+    def __init__(
+        self,
+        abort_mb: float,
+        *,
+        confirmations: int = 2,
+        emergency_fraction: float = 0.90,
+        total_ram_mb: Optional[float] = None,
+    ) -> None:
+        self.abort_mb = float(abort_mb)
+        self.confirmations = max(1, int(confirmations))
+        self.emergency_fraction = float(emergency_fraction)
+        self.total_ram_mb = total_ram_mb
+        self._over_streak = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.abort_mb > 0
+
+    def observe(self, rss_mb: Optional[float]) -> bool:
+        """Bir RSS okumasını işle; abort ateşlenecekse True döner."""
+        if not self.enabled or rss_mb is None:
+            return False
+        if (
+            self.total_ram_mb
+            and float(self.total_ram_mb) > 0
+            and float(rss_mb) >= self.emergency_fraction * float(self.total_ram_mb)
+        ):
+            return True
+        if float(rss_mb) >= self.abort_mb:
+            self._over_streak += 1
+        else:
+            self._over_streak = 0
+        return self._over_streak >= self.confirmations
+
+    def reset(self) -> None:
+        self._over_streak = 0
+
+
 class RTXTrainerEngine:
     """
     1-Click RTX 3070 CUDA FP16 YOLO Trainer & ONNX Exporter.
@@ -868,6 +944,10 @@ class RTXTrainerEngine:
             # disk: onay havuzu (~1.4k kare) ile cache=ram süreçte +10–12 GB RSS
             # biriktiriyordu; Gatherion botu ile aynı süreçte segfault riski.
             "cache": "disk",
+            # None = RAM-orantılı varsayılan (default_rss_abort_mb: toplam
+            # RAM'in %75'i, en az 10240 MB). Sayı verilirse o eşik (MB)
+            # kullanılır; 0 abort'u kapatır. fix/v20-rss-panik.
+            "rss_abort_mb": None,
             "device": 0,
             "deterministic": True,
             "seed": 42,
@@ -1760,7 +1840,23 @@ class RTXTrainerEngine:
         _last_rss_check = 0.0
         _stopped_for_rss = False
         _batch_counter = _BatchStepCounter()
-        _rss_abort_mb = float(train_cfg.get("rss_abort_mb", 10240.0))
+        # fix/v20-rss-panik: eşik açıkça verilmediyse RAM-orantılı
+        # varsayılan (toplam RAM'in %75'i, en az 10240 MB). Açık 0
+        # abort'u kapatır. Eşik + toplam RAM loga yazılır — bir sonraki
+        # koşuda hangi eşikle çalışıldığı logdan okunur.
+        _cfg_abort = train_cfg.get("rss_abort_mb")
+        _total_ram_mb = total_system_ram_mb()
+        if _cfg_abort is None:
+            _rss_abort_mb = default_rss_abort_mb(_total_ram_mb)
+        else:
+            _rss_abort_mb = float(_cfg_abort)
+        _rss_decider = _RssAbortDecider(_rss_abort_mb, total_ram_mb=_total_ram_mb)
+        logger.info(
+            "RTX eğitimi RSS abort eşiği: %.0f MB (toplam RAM: %s; %d ardışık kontrolle teyit).",
+            _rss_abort_mb,
+            ("%.0f MB" % _total_ram_mb) if _total_ram_mb else "bilinmiyor",
+            _rss_decider.confirmations,
+        )
 
         def _on_train_batch_end(trainer: Any) -> None:
             nonlocal _last_batch_ui_update, _last_rss_check, _stopped_for_rss
@@ -1772,7 +1868,7 @@ class RTXTrainerEngine:
                     pass
                 return
             now_rss = time.monotonic()
-            if _rss_abort_mb > 0 and now_rss - _last_rss_check >= 30.0:
+            if _rss_decider.enabled and now_rss - _last_rss_check >= 30.0:
                 _last_rss_check = now_rss
                 try:
                     from core.crash_evidence import _read_rss_mb
@@ -1780,12 +1876,13 @@ class RTXTrainerEngine:
                     rss = _read_rss_mb()
                 except Exception:
                     rss = None
-                if rss is not None and rss >= _rss_abort_mb:
+                if rss is not None and _rss_decider.observe(rss):
                     _stopped_for_rss = True
                     logger.warning(
-                        "RTX eğitimi RSS eşiği aşıldı (%.1f MB >= %.1f MB) — güvenli durdurma.",
+                        "RTX eğitimi RSS eşiği aşıldı (%.1f MB >= %.1f MB, %d ardışık kontrol) — güvenli durdurma.",
                         rss,
                         _rss_abort_mb,
+                        _rss_decider.confirmations,
                     )
                     self._stop_event.set()
                     setattr(trainer, "stop", True)

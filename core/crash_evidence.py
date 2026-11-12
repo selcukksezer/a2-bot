@@ -64,6 +64,7 @@ import sys
 import threading
 import time
 import traceback
+import tracemalloc
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -81,6 +82,17 @@ _LOG = logging.getLogger("Gatherion.CrashEvidence")
 RSS_INTERVAL_SEC = 60.0
 RSS_WARN_GROWTH_MB = 512.0
 RSS_WARN_TOTAL_MB = 6144.0
+# fix/v20-rss-panik: bellek dokumu TEK SEFERLIK degil — esik asili
+# kalirken her 5 dk'da bir tekrarlanir (tur sayimi + tracemalloc
+# farki). 12 Kasim kaniti: egitim durduktan SONRA da RSS ~300 MB/dk
+# artmaya devam etti; tek dokum hangi turun buyudugunu gostermez,
+# tekrarli dokum + fark gosterir. tracemalloc yalnizca ilk uyarida
+# baslatilir (normal calismada ek yuk yok); fark ikinci dokumden
+# itibaren loglanir.
+MEM_DUMP_REPEAT_SEC = 300.0
+MEM_DUMP_TOP_TYPES = 15
+MEM_DUMP_TOP_TRACES = 5
+TRACEMALLOC_FRAMES = 5
 
 _state: Dict[str, Any] = {
     "installed": False,
@@ -95,6 +107,9 @@ _state: Dict[str, Any] = {
     "monitor_stop": None,
     "monitor_thread": None,
     "rss_reader": None,
+    "last_mem_dump_mono": None,
+    "tracemalloc_snapshot": None,
+    "tracemalloc_started_here": False,
 }
 
 
@@ -321,13 +336,103 @@ def log_imminent_process_exit(action: str, delay_sec: float = 0.0) -> None:
     _flush_logger_handlers()
 
 
+def _top_object_types(limit: int = MEM_DUMP_TOP_TYPES) -> str:
+    """En cok nesne turleri sayimi (gc.get_objects). Hata durumunda kisa mesaj."""
+    try:
+        counter: Dict[str, int] = collections.Counter()
+        for obj in gc.get_objects():
+            try:
+                counter[type(obj).__name__] += 1
+            except Exception:
+                pass
+        return ", ".join("%s=%d" % item for item in counter.most_common(limit))
+    except Exception as exc:
+        return "sayim hatasi: %r" % (exc,)
+
+
+def _tracemalloc_diff_lines(limit: int = MEM_DUMP_TOP_TRACES) -> str:
+    """tracemalloc farki: onceki anlik goruntuyle karsilastirir.
+
+    Ilk cagrida izleme baslatilir + taban anlik goruntu alinir, fark
+    henuz yoktur ("taban alindi" doner). Sonraki cagrilar en cok
+    buyuyen tahsis satirlarini dondurur. Izleme disaridan zaten
+    aciksa ona dokunulmaz, yalnizca fark alinir.
+    """
+    try:
+        tracing = tracemalloc.is_tracing()
+        if not tracing:
+            tracemalloc.start(TRACEMALLOC_FRAMES)
+            _state["tracemalloc_started_here"] = True
+            tracing = True
+        current = tracemalloc.take_snapshot()
+        previous = _state.get("tracemalloc_snapshot")
+        _state["tracemalloc_snapshot"] = current
+        if previous is None:
+            return "tracemalloc taban anlik goruntusu alindi; fark bir sonraki dokumde"
+        try:
+            stats = current.compare_to(previous, "traceback")
+        except Exception as exc:
+            return "tracemalloc farki alinamadi: %r" % (exc,)
+        lines = []
+        for stat in stats[:limit]:
+            frame = stat.traceback[0] if stat.traceback else None
+            where = (
+                "%s:%s" % (frame.filename, frame.lineno)
+                if frame is not None
+                else "bilinmiyor"
+            )
+            lines.append(
+                "%s +%0.1f MB (%+d tahsis)" % (where, stat.size_diff / (1024.0 * 1024.0), stat.count_diff)
+            )
+        return "; ".join(lines) if lines else "tracemalloc farki bos"
+    except Exception as exc:
+        return "tracemalloc hatasi: %r" % (exc,)
+
+
+def _maybe_memory_dump(
+    logger: Any,
+    rss: float,
+    growth: float,
+    now_mono: float,
+    warn_growth: float,
+    warn_total: float,
+) -> bool:
+    """Esik asili kalirken periyodik bellek dokumu yapar; doktu ise True.
+
+    Tek seferlik degil: esik asildiktan sonra her MEM_DUMP_REPEAT_SEC
+    saniyede bir tekrarlar. Esik altina inilirse sayac sifirlanmaz —
+    bir sonraki asimda aninda dokulur (last_mem_dump yalnizca dokumde
+    guncellenir).
+    """
+    if growth < warn_growth and rss < warn_total:
+        return False
+    last = _state.get("last_mem_dump_mono")
+    if last is not None and (now_mono - float(last)) < MEM_DUMP_REPEAT_SEC:
+        return False
+    _state["last_mem_dump_mono"] = now_mono
+    top_types = _top_object_types()
+    trace_diff = _tracemalloc_diff_lines()
+    try:
+        logger.warning(
+            "[CRASH-EVIDENCE] BELLEK UYARISI: RSS=%.1f MB "
+            "(baslangictan %+.1f MB) -- en cok nesne turleri: %s | "
+            "tracemalloc farki: %s",
+            rss,
+            growth,
+            top_types,
+            trace_diff,
+        )
+    except Exception:
+        pass
+    return True
+
+
 def _rss_monitor_loop() -> None:
     stop = _state.get("monitor_stop")
     interval = float(_state.get("rss_interval_sec") or RSS_INTERVAL_SEC)
     warn_growth = float(_state.get("rss_warn_growth_mb") or RSS_WARN_GROWTH_MB)
     warn_total = float(_state.get("rss_warn_total_mb") or RSS_WARN_TOTAL_MB)
     logger = _state.get("logger") or _LOG
-    warned = False
     while stop is None or not stop.wait(timeout=interval):
         try:
             rss = _read_rss_mb()
@@ -359,31 +464,15 @@ def _rss_monitor_loop() -> None:
             )
         except Exception:
             pass
-        if (growth >= warn_growth or rss >= warn_total) and not warned:
-            warned = True
-            top_types = "alinamadi"
-            try:
-                counter: Dict[str, int] = collections.Counter()
-                for obj in gc.get_objects():
-                    try:
-                        counter[type(obj).__name__] += 1
-                    except Exception:
-                        pass
-                top_types = ", ".join(
-                    "%s=%d" % item for item in counter.most_common(15)
-                )
-            except Exception as exc:
-                top_types = "sayim hatasi: %r" % (exc,)
-            try:
-                logger.warning(
-                    "[CRASH-EVIDENCE] BELLEK UYARISI: RSS=%.1f MB "
-                    "(baslangictan %+.1f MB) -- en cok nesne turleri: %s",
-                    rss,
-                    growth,
-                    top_types,
-                )
-            except Exception:
-                pass
+        # fix/v20-rss-panik: tekrarli dokum — esik asili kalirken her
+        # 5 dk'da bir tur sayimi + tracemalloc farki (tek dokum hangi
+        # turun buyudugunu gostermez).
+        try:
+            _maybe_memory_dump(
+                logger, rss, growth, time.monotonic(), warn_growth, warn_total
+            )
+        except Exception:
+            pass
 
 
 def install_crash_evidence(
@@ -522,6 +611,11 @@ def _reset_state_for_tests() -> None:
         atexit.unregister(_record_exit)
     except Exception:
         pass
+    try:
+        if _state.get("tracemalloc_started_here") and tracemalloc.is_tracing():
+            tracemalloc.stop()
+    except Exception:
+        pass
     _state.update(
         {
             "installed": False,
@@ -536,5 +630,8 @@ def _reset_state_for_tests() -> None:
             "monitor_stop": None,
             "monitor_thread": None,
             "rss_reader": None,
+            "last_mem_dump_mono": None,
+            "tracemalloc_snapshot": None,
+            "tracemalloc_started_here": False,
         }
     )

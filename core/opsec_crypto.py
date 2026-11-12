@@ -1243,9 +1243,17 @@ class PanicAlertSystem:
         # True = açık, False = kapalı, None = bilinmiyor. Yokken (False)
         # idle sayacı durur; bilinmiyorsa eski davranış korunur.
         self._game_window_present_detector: Optional[Callable[[], Optional[bool]]] = None
+        # fix/v20-rss-panik: oyun penceresi simge-durumu detektörü —
+        # True = simge durumunda (toplanamaz/savaşılamaz), False/None =
+        # değil/bilinmiyor. Simge durumundayken idle + savaş sayacı
+        # donar (oyun-yokluğu ile aynı kural).
+        self._game_window_minimized_detector: Optional[Callable[[], Optional[bool]]] = None
         # fix/panik-kilit-oyun-yok: idle sayacının oyun-yokluğu yüzünden
         # duraklatıldığının son durumu — geçişte tek debug satırı için.
         self._idle_paused_for_game_window: bool = False
+        # fix/v20-rss-panik: idle sayacının simge-durumu yüzünden
+        # duraklatıldığının son durumu (aynı geçiş logu deseni).
+        self._idle_paused_for_minimized: bool = False
         # fix/v20-panic-combat: bot duraklatıldı mı (BotWorker.pause() /
         # resume() set_paused ile bildirir). Duraklatılıyken savaş sayacı
         # donar — poll bayat in_combat okusa bile COMBAT_TIMEOUT_2M
@@ -1255,6 +1263,9 @@ class PanicAlertSystem:
         # son durumu — geçişte tek debug satırı için (idle deseni).
         self._combat_frozen_for_pause: bool = False
         self._combat_frozen_for_game_window: bool = False
+        # fix/v20-rss-panik: savaş sayacının simge-durumu yüzünden
+        # dondurulduğunun son durumu (aynı geçiş logu deseni).
+        self._combat_frozen_for_minimized: bool = False
         # fix/v20-panic-combat: poll'un savaş detektörünü ardışık kaç
         # turdur True gördüğü — tek poll'lük True (tek karelik
         # vignette/HP-okuma parlaması) sayacı kuramaz; bkz.
@@ -2130,6 +2141,7 @@ class PanicAlertSystem:
         gm_whisper_detected: bool = False,
         play_siren: bool = True,
         game_window_present: Optional[bool] = None,
+        game_window_minimized: Optional[bool] = None,
         paused: Optional[bool] = None,
     ) -> Optional[Dict[str, Any]]:
         """
@@ -2161,6 +2173,13 @@ class PanicAlertSystem:
         (paused=True veya set_paused(True)): duraklatılmış bot savaşmaz,
         savaş sayacı işlemez. Ölüm/GM/istem yolları aynen çalışır
         (oyun yokken de, duraklatılıyken de).
+        fix/v20-rss-panik: oyun penceresi simge durumundayken de
+        (game_window_minimized=True) idle VE savaş sayacı donar —
+        simge durumundaki oyunun ekranı okunamaz, toplanamaz,
+        savaşılamaz. Watchdog pencereyi "var" sayar
+        (is_game_window_present True döner), o yüzden simge durumu
+        ayrı sinyalle gelir; oyun-yokluğu ile aynı donma uygulanır.
+        Ölüm/GM/istem yolları simge durumundayken de aynen çalışır.
         None (bilinmiyor / verilmedi) = eski davranış.
         """
         now = time.monotonic()
@@ -2176,12 +2195,18 @@ class PanicAlertSystem:
             # _last_gather_ts "şimdi"ye çekilirse idle_elapsed 0 olur ve
             # aşağıdaki idle koşulu tutmaz; oyun geri gelince sayaç
             # sıfırdan başlar. Diğer zamanlayıcılara dokunulmaz.
-            idle_paused = game_window_present is False
+            # fix/v20-rss-panik: simge durumu da aynı donmayı uygular.
+            window_absent = game_window_present is False
+            window_minimized = game_window_minimized is True
+            idle_paused = window_absent or window_minimized
             if idle_paused:
                 self._last_gather_ts = now
                 idle_elapsed = 0.0
-            was_idle_paused = self._idle_paused_for_game_window
-            self._idle_paused_for_game_window = idle_paused
+            was_idle_paused = (
+                self._idle_paused_for_game_window or self._idle_paused_for_minimized
+            )
+            self._idle_paused_for_game_window = window_absent
+            self._idle_paused_for_minimized = window_minimized
             # fix/v20-panic-combat: savaş sayacı donar — oyun yokken
             # VEYA bot duraklatılıyken. _combat_start_ts temizlenir
             # (sıfırlanır); oyun geri gelince / devam edilince sayaç
@@ -2192,15 +2217,17 @@ class PanicAlertSystem:
             # sayacı yeniden kuramaz. paused argümanı verilmezse
             # set_paused() ile bildirilen durum kullanılır.
             paused_effective = self._paused if paused is None else bool(paused)
-            combat_frozen = paused_effective or game_window_present is False
+            combat_frozen = paused_effective or window_absent or window_minimized
             if combat_frozen:
                 self._combat_start_ts = None
                 self._combat_poll_streak = 0
                 combat_elapsed = 0.0
             was_combat_frozen_pause = self._combat_frozen_for_pause
             was_combat_frozen_window = self._combat_frozen_for_game_window
+            was_combat_frozen_minimized = self._combat_frozen_for_minimized
             self._combat_frozen_for_pause = paused_effective
-            self._combat_frozen_for_game_window = game_window_present is False
+            self._combat_frozen_for_game_window = window_absent
+            self._combat_frozen_for_minimized = window_minimized
             # fix/v20-kalan-eksikler: duraklatılıyken istem sayacı donar
             # (canlı 19:26:11 — Ctrl+Alt+F10 sonrası PROMPT_STUCK yanlış pozitif).
             if paused_effective:
@@ -2209,17 +2236,23 @@ class PanicAlertSystem:
 
         if idle_paused and not was_idle_paused:
             logger.debug(
-                "[PANIC] Oyun penceresi yok — boşta sayacı duraklatıldı "
-                "(IDLE_TIMEOUT_15M tetiklenmez)."
+                "[PANIC] Oyun penceresi %s — boşta sayacı duraklatıldı "
+                "(IDLE_TIMEOUT_15M tetiklenmez).",
+                "simge durumunda" if window_minimized else "yok",
             )
         elif not idle_paused and was_idle_paused:
             logger.debug("[PANIC] Oyun penceresi geri geldi — boşta sayacı yeniden çalışıyor.")
-        if combat_frozen and not (was_combat_frozen_pause or was_combat_frozen_window):
+        _was_combat_frozen = (
+            was_combat_frozen_pause or was_combat_frozen_window or was_combat_frozen_minimized
+        )
+        if combat_frozen and not _was_combat_frozen:
             logger.debug(
                 "[PANIC] Savaş sayacı donduruldu (%s) — COMBAT_TIMEOUT_2M tetiklenmez.",
-                "bot duraklatıldı" if paused_effective else "oyun penceresi yok",
+                "bot duraklatıldı"
+                if paused_effective
+                else ("oyun penceresi simge durumunda" if window_minimized else "oyun penceresi yok"),
             )
-        elif not combat_frozen and (was_combat_frozen_pause or was_combat_frozen_window):
+        elif not combat_frozen and _was_combat_frozen:
             logger.debug("[PANIC] Savaş sayacı yeniden çalışıyor (sıfırdan).")
 
         # Öncelik sırası korunur: ölüm → GM → istem → savaş → idle.
@@ -2334,6 +2367,7 @@ class PanicAlertSystem:
         combat_state_detector: Optional[Callable[[], bool]] = None,
         prompt_visible_detector: Optional[Callable[[], bool]] = None,
         game_window_present_detector: Optional[Callable[[], Optional[bool]]] = None,
+        game_window_minimized_detector: Optional[Callable[[], Optional[bool]]] = None,
     ) -> None:
         """
         F-0163: _poll_loop'un her turda danışacağı dış sinyal detektörlerini
@@ -2352,6 +2386,10 @@ class PanicAlertSystem:
           False, belirlenemiyorsa None döner — poll bunu
           check_watchdog_conditions'a geçirir; False iken idle sayacı
           VE savaş sayacı durur, diğer tetikleyiciler aynen çalışır.
+        - game_window_minimized_detector (fix/v20-rss-panik): oyun
+          penceresi simge durumundaysa True döner — poll bunu
+          check_watchdog_conditions'a geçirir; True iken idle sayacı
+          VE savaş sayacı durur (oyun-yokluğu ile aynı kural).
         """
         with self._lock:
             if character_dead_detector is not None:
@@ -2368,6 +2406,8 @@ class PanicAlertSystem:
                 self._prompt_visible_detector = prompt_visible_detector
             if game_window_present_detector is not None:
                 self._game_window_present_detector = game_window_present_detector
+            if game_window_minimized_detector is not None:
+                self._game_window_minimized_detector = game_window_minimized_detector
 
     def bind_production_watchdog_sources(
         self,
@@ -2409,6 +2449,9 @@ class PanicAlertSystem:
           belirlenemediği için yoksa fully_wired asla True olamaz ve
           "degraded" kalıcı alarm yorgunluğuna dönerdi (gm_whisper ile
           aynı gerekçe).
+        - game_window_minimized (fix/v20-rss-panik): worker.watchdog
+          .is_game_window_minimized — simge durumundaysa True döner.
+          "Zorunlu" sayılmaz (aynı gerekçe).
 
         Döner: {"wired": {sinyal: bool, ...}, "missing": [sinyal, ...]}.
         Eksik sinyal varsa warning loglanır — sessiz eksik bağlama yok.
@@ -2425,6 +2468,7 @@ class PanicAlertSystem:
             "prompt_visible": False,
             "prompt_stuck": False,
             "game_window_present": False,
+            "game_window_minimized": False,
         }
 
         if cr is not None and hasattr(cr, "is_dead"):
@@ -2560,6 +2604,31 @@ class PanicAlertSystem:
                 )
                 wired["game_window_present"] = True
 
+            # fix/v20-rss-panik: simge durumu — worker.watchdog
+            # (BotWatchdog).is_game_window_minimized. Yoksa (eski/test
+            # worker'ı) kayıtsız kalır; poll o durumda idle'ı eskisi
+            # gibi denetler.
+            _is_minimized_fn = (
+                getattr(_bot_watchdog, "is_game_window_minimized", None)
+                if _bot_watchdog is not None
+                else None
+            )
+            if callable(_is_minimized_fn):
+
+                def _game_window_minimized() -> Optional[bool]:
+                    try:
+                        result = _is_minimized_fn()
+                    except Exception:
+                        return None
+                    if result is None:
+                        return None
+                    return bool(result)
+
+                self.register_watchdog_detectors(
+                    game_window_minimized_detector=_game_window_minimized
+                )
+                wired["game_window_minimized"] = True
+
         missing = [name for name, ok in wired.items() if not ok]
         if missing:
             logger.warning(
@@ -2583,6 +2652,7 @@ class PanicAlertSystem:
                 "combat_state": self._combat_state_detector is not None,
                 "prompt_visible": self._prompt_visible_detector is not None,
                 "game_window_present": self._game_window_present_detector is not None,
+                "game_window_minimized": self._game_window_minimized_detector is not None,
             }
             polling = self._watchdog_thread is not None and self._watchdog_thread.is_alive()
             failures = dict(self._detector_failures)
@@ -2593,10 +2663,12 @@ class PanicAlertSystem:
         # fix/panik-kilit-oyun-yok: game_window_present de "zorunlu"
         # sayılmaz — Windows dışı platformda (Linux/VM) belirlenemez;
         # aynı gerekçeyle missing_required'a girmez.
+        # fix/v20-rss-panik: game_window_minimized de aynı gerekçeyle
+        # "zorunlu" sayılmaz.
         required = [
             name
             for name in detectors
-            if name not in ("gm_whisper", "game_window_present")
+            if name not in ("gm_whisper", "game_window_present", "game_window_minimized")
         ]
         missing_required = [name for name in required if not detectors[name]]
         faulted = [name for name, count in failures.items() if count >= 3]
@@ -2685,6 +2757,7 @@ class PanicAlertSystem:
         combat_state_detector: Optional[Callable[[], bool]] = None,
         prompt_visible_detector: Optional[Callable[[], bool]] = None,
         game_window_present_detector: Optional[Callable[[], Optional[bool]]] = None,
+        game_window_minimized_detector: Optional[Callable[[], Optional[bool]]] = None,
     ) -> bool:
         """
         F-0163 (dilim-içi kısım): check_watchdog_conditions'ı periyodik
@@ -2706,6 +2779,7 @@ class PanicAlertSystem:
             or combat_state_detector is not None
             or prompt_visible_detector is not None
             or game_window_present_detector is not None
+            or game_window_minimized_detector is not None
         ):
             self.register_watchdog_detectors(
                 character_dead_detector=character_dead_detector,
@@ -2715,6 +2789,7 @@ class PanicAlertSystem:
                 combat_state_detector=combat_state_detector,
                 prompt_visible_detector=prompt_visible_detector,
                 game_window_present_detector=game_window_present_detector,
+                game_window_minimized_detector=game_window_minimized_detector,
             )
         with self._lock:
             if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
@@ -2766,6 +2841,11 @@ class PanicAlertSystem:
                     game_window_present = self._call_detector(
                         self._game_window_present_detector, "game_window_present"
                     )
+                    # fix/v20-rss-panik: simge durumu da idle/savaş
+                    # sayacını dondurur (oyun-yokluğu ile aynı kural).
+                    game_window_minimized = self._call_detector(
+                        self._game_window_minimized_detector, "game_window_minimized"
+                    )
                     self.check_watchdog_conditions(
                         input_ctrl=input_ctrl,
                         character_dead=bool(
@@ -2784,6 +2864,11 @@ class PanicAlertSystem:
                             None
                             if game_window_present is None
                             else bool(game_window_present)
+                        ),
+                        game_window_minimized=(
+                            None
+                            if game_window_minimized is None
+                            else bool(game_window_minimized)
                         ),
                     )
                 except Exception as exc:

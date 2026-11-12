@@ -1035,6 +1035,23 @@ class BotWatchdog:
         hwnd, _title = self._find_game_window()
         return hwnd is not None
 
+    def is_game_window_minimized(self) -> bool:
+        """Oyun penceresi simge durumunda mı?
+
+        fix/v20-rss-panik: panik poll'unun simge-durumu detektörü.
+        Simge durumundaki oyun toplanamaz/savaşılamaz — pencere
+        "var" sayılsa bile (is_game_window_present True döner) idle ve
+        savaş sayaçları donmalıdır; yoksa eğitim sırasında / oyun
+        simge durumundayken IDLE_TIMEOUT_15M haksız yere tetiklenir
+        (canlı 12 Kasım 21:12:40). Windows dışı / hedef yok / hata
+        durumunda False döner (eski davranış).
+        """
+        try:
+            minimized, _title = self._is_game_window_minimized()
+            return bool(minimized)
+        except Exception:
+            return False
+
     def _is_game_window_minimized(self) -> Tuple[bool, str]:
         """
         Checks if a matching game window is minimized (iconic) on Windows.
