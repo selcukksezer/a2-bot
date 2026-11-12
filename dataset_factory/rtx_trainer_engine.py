@@ -14,6 +14,7 @@ Exclusive Owner: Sub-Agent 6 (`dataset_factory/rtx_trainer_engine.py`)
 
 from __future__ import annotations
 
+import datetime
 import gc
 import importlib.util
 import json
@@ -21,11 +22,13 @@ import logging
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -79,6 +82,188 @@ def rtx_runs_dir_for() -> Path:
 def _project_root() -> Path:
     """Repo root (fallback train root when no F: offload drive exists)."""
     return Path(__file__).resolve().parent.parent
+
+
+# fix/v20-egitim-devam: koşu klasörü adları. Taze koşular artık sabit
+# `gatherion_rtx_fp16` klasörüne yazılmaz — her koşu benzersiz zaman
+# damgalı klasör alır, eski best.pt/last.pt korunur. Eski sabit isimli
+# klasör geriye dönük tanınır (devam + en-son-koşu bulucusu).
+_RUN_DIR_BASE = "gatherion_rtx_fp16"
+_RUN_DIR_NAME_RE = re.compile(r"^gatherion_rtx_fp16(?:_\d{8}_\d{6}(?:_\d+)?)?$")
+
+
+def is_rtx_run_dir_name(name: str) -> bool:
+    """Eski sabit isim + zaman damgalı koşu klasörü isimlerini tanır."""
+    return bool(_RUN_DIR_NAME_RE.match(str(name or "")))
+
+
+def generate_unique_run_name(
+    runs_dir: Union[str, Path],
+    now: Optional[datetime.datetime] = None,
+    base: str = _RUN_DIR_BASE,
+) -> str:
+    """Taze koşu için benzersiz klasör adı: ``base_YYYYMMDD_HHMMSS`` (yerel saat).
+
+    Aynı saniyede çakışırsa ``_2``, ``_3`` ... sayacı artar. Sabit isim
+    asla dönülmez — yeni koşu eski ağırlıkların üstüne yazılmaz.
+    """
+    stamp = (now or datetime.datetime.now()).strftime("%Y%m%d_%H%M%S")
+    runs = Path(runs_dir)
+    candidate = "%s_%s" % (base, stamp)
+    if not (runs / candidate).exists():
+        return candidate
+    for counter in range(2, 10000):
+        candidate = "%s_%s_%d" % (base, stamp, counter)
+        if not (runs / candidate).exists():
+            return candidate
+    raise RuntimeError(
+        "Benzersiz koşu klasörü adı üretilemedi (%s altında %s saniyesi dolu)."
+        % (runs, stamp)
+    )
+
+
+def validate_resume_checkpoint(
+    checkpoint: Union[str, Path, None], *, deep: bool = False
+) -> Tuple[bool, str]:
+    """Devam checkpoint'ini okunabilirlik açısından denetler (eğitim başlatmaz).
+
+    Sığ denetim (her zaman): dosya var, boş değil, torch zip kapsayıcısı
+    (``archive/data.pkl`` girdisi var). Derin denetim (``deep=True`` ve
+    torch import edilebiliyorsa): ``torch.load`` ile açılır, eğitim
+    checkpoint'i anahtarları (``epoch`` + ``model``) aranır. torch yoksa
+    sığ karar geçerlidir. Döner: ``(geçerli_mi, hata_mesajı)``.
+    """
+    if checkpoint is None or str(checkpoint or "").strip() == "":
+        return False, "Devam checkpoint'i verilmedi."
+    path = Path(str(checkpoint))
+    if not path.is_file():
+        return False, "Devam edilecek checkpoint bulunamadı: %s" % path
+    try:
+        if path.stat().st_size <= 0:
+            return False, "Checkpoint boş (0 bayt): %s" % path
+    except OSError as exc:
+        return False, "Checkpoint okunamadı (%s): %s" % (exc, path)
+    try:
+        if not zipfile.is_zipfile(path):
+            return (
+                False,
+                "Checkpoint geçerli bir eğitim dosyası değil (zip kapsayıcısı değil): %s"
+                % path,
+            )
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+        if not any(n.endswith("data.pkl") for n in names):
+            return (
+                False,
+                "Checkpoint geçerli bir eğitim dosyası değil (data.pkl yok): %s" % path,
+            )
+    except Exception as exc:
+        return False, "Checkpoint okunamadı (%s): %s" % (exc, path)
+    if deep:
+        try:
+            import torch  # type: ignore
+        except Exception:
+            return True, ""
+        try:
+            # weights_only=False şart: Ultralytics checkpoint'inde 'model'
+            # bir nn.Module nesnesidir, salt tensör değildir. Dosya bu
+            # reponun kendi eğitimlerinin yazdığı checkpoint'tir.
+            ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+        except Exception as exc:
+            return False, "Checkpoint bozuk, açılamadı (%s): %s" % (exc, path)
+        if not isinstance(ckpt, dict) or "epoch" not in ckpt or "model" not in ckpt:
+            return (
+                False,
+                "Checkpoint eğitim durumu taşımıyor (epoch/model anahtarı yok): %s" % path,
+            )
+    return True, ""
+
+
+def resolve_resume_checkpoint(checkpoint: Union[str, Path]) -> Path:
+    """Geçerli checkpoint'in mutlak yolunu döner; geçersizse Türkçe RuntimeError."""
+    ok, reason = validate_resume_checkpoint(checkpoint, deep=True)
+    if not ok:
+        raise RuntimeError(reason)
+    return Path(str(checkpoint)).resolve()
+
+
+def run_dir_for_resume_checkpoint(checkpoint: Union[str, Path]) -> Path:
+    """Checkpoint'in koşu klasörünü döner (``weights/last.pt`` düzenini şart koşar)."""
+    path = Path(str(checkpoint))
+    if path.parent.name != "weights":
+        raise RuntimeError(
+            "Checkpoint eğitim klasörü düzeninde değil (weights/last.pt beklenir): %s"
+            % path
+        )
+    return path.parent.parent
+
+
+def _run_dir_artifact_mtime(run_dir: Path) -> float:
+    """Koşu klasörünün en yeni yazım zamanı (ağırlık/csv/klasör mtime'larının max'ı)."""
+    newest = 0.0
+    try:
+        newest = max(newest, run_dir.stat().st_mtime)
+    except OSError:
+        return 0.0
+    for rel in ("weights/last.pt", "weights/best.pt", "results.csv"):
+        try:
+            cand = run_dir / rel
+            if cand.is_file():
+                newest = max(newest, cand.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def find_latest_run_dir(runs_dir: Optional[Union[str, Path]] = None) -> Optional[Path]:
+    """En son yazılmış koşu klasörü (zaman damgalı + eski sabit isim tanınır)."""
+    runs = Path(runs_dir) if runs_dir is not None else rtx_runs_dir_for()
+    try:
+        if not runs.is_dir():
+            return None
+        candidates = [
+            d for d in runs.iterdir() if d.is_dir() and is_rtx_run_dir_name(d.name)
+        ]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda d: (_run_dir_artifact_mtime(d), d.name), reverse=True)
+    return candidates[0]
+
+
+def find_resumable_checkpoint(
+    runs_dir: Optional[Union[str, Path]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Devam edilebilir en yeni koşuyu bulur (sığ denetim — kilit zamanlayıcısında da ucuz).
+
+    Döner: ``{"checkpoint", "run_dir", "run_name", "epochs_completed"}`` ya da
+    ``None``. Derin (torch) doğrulama eğitim başlangıcında yapılır; burada
+    yalnızca okunabilir bir ``weights/last.pt`` aranır, en yeniden eskiye
+    ilk geçerli olan alınır.
+    """
+    runs = Path(runs_dir) if runs_dir is not None else rtx_runs_dir_for()
+    try:
+        if not runs.is_dir():
+            return None
+        candidates = [
+            d for d in runs.iterdir() if d.is_dir() and is_rtx_run_dir_name(d.name)
+        ]
+    except OSError:
+        return None
+    candidates.sort(key=lambda d: (_run_dir_artifact_mtime(d), d.name), reverse=True)
+    for run_dir in candidates:
+        ckpt = run_dir / "weights" / "last.pt"
+        ok, _reason = validate_resume_checkpoint(ckpt)
+        if not ok:
+            continue
+        return {
+            "checkpoint": ckpt,
+            "run_dir": run_dir,
+            "run_name": run_dir.name,
+            "epochs_completed": int(RTXTrainerEngine._count_results_csv_epochs(run_dir)),
+        }
+    return None
 
 
 def _pin_train_env() -> Path:
@@ -265,7 +450,7 @@ _TRAIN_SLOT_HELD = False
 
 
 def _acquire_train_slot() -> bool:
-    """One Ultralytics run for models/rtx_runs/gatherion_rtx_fp16. Second call loses."""
+    """One Ultralytics run per process. Second call loses."""
     global _TRAIN_SLOT_HELD
     with _TRAIN_SLOT_LOCK:
         if _TRAIN_SLOT_HELD:
@@ -948,6 +1133,10 @@ class RTXTrainerEngine:
             # RAM'in %75'i, en az 10240 MB). Sayı verilirse o eşik (MB)
             # kullanılır; 0 abort'u kapatır. fix/v20-rss-panik.
             "rss_abort_mb": None,
+            # None = taze koşu. last.pt yolu verilirse eğitim kaldığı
+            # yerden devam eder (train(resume=True), aynı koşu klasörü).
+            # fix/v20-egitim-devam.
+            "resume_from": None,
             "device": 0,
             "deterministic": True,
             "seed": 42,
@@ -1294,6 +1483,7 @@ class RTXTrainerEngine:
         model: str = "yolo11n.pt",
         allow_opencv_fallback: bool = False,
         use_approved_only: bool = False,
+        resume_from: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """
         Starts 1-Click training asynchronously on a background daemon thread.
@@ -1358,6 +1548,7 @@ class RTXTrainerEngine:
                 model=model,
                 use_approved_only=effective_approved,
             )
+            train_cfg["resume_from"] = str(resume_from) if resume_from else None
 
             def _worker() -> None:
                 try:
@@ -1372,6 +1563,7 @@ class RTXTrainerEngine:
                         model=model,
                         allow_opencv_fallback=allow_opencv_fallback,
                         use_approved_only=effective_approved,
+                        resume_from=resume_from,
                     )
                 except Exception as exc:
                     logger.exception("Asynchronous training encountered an error: %s", exc)
@@ -1458,10 +1650,20 @@ class RTXTrainerEngine:
         model: str = "yolo11n.pt",
         allow_opencv_fallback: bool = False,
         use_approved_only: bool = False,
+        resume_from: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """Run one training job. A second caller gets started=False until this one finishes."""
         runs_dir = _pin_train_env()
-        save_dir = runs_dir / "gatherion_rtx_fp16"
+        # fix/v20-egitim-devam: devam checkpoint'i eğitim başlamadan
+        # doğrulanır (geçersizse burada yükselir, slot/disk işine
+        # girilmez); taze koşu benzersiz zaman damgalı klasöre planlanır
+        # — eski best.pt/last.pt'nin üstüne bir daha yazılmaz.
+        resume_ckpt: Optional[Path] = None
+        if resume_from is not None and str(resume_from).strip() != "":
+            resume_ckpt = resolve_resume_checkpoint(resume_from)
+            save_dir = run_dir_for_resume_checkpoint(resume_ckpt)
+        else:
+            save_dir = runs_dir / generate_unique_run_name(runs_dir)
         # P0-5 tur 2: yaml doğrulaması disk/oyun reddinden SONRA çalışır.
         # `validate=False` ile çözümlenir; gerçek body ilk adımda
         # doğrulamalı çözümleme yapar, yani geçersiz yaml eğitimden önce
@@ -1518,6 +1720,8 @@ class RTXTrainerEngine:
                 model=model,
                 allow_opencv_fallback=allow_opencv_fallback,
                 use_approved_only=effective_approved,
+                resume_from=resume_ckpt,
+                run_dir=save_dir,
             )
         finally:
             self._end_training_session(session)
@@ -1533,6 +1737,8 @@ class RTXTrainerEngine:
         model: str = "yolo11n.pt",
         allow_opencv_fallback: bool = False,
         use_approved_only: bool = False,
+        resume_from: Optional[Union[str, Path]] = None,
+        run_dir: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """
         Executes the full training & export pipeline synchronously:
@@ -1652,6 +1858,10 @@ class RTXTrainerEngine:
             model=model,
             use_approved_only=effective_approved,
         )
+        # fix/v20-egitim-devam: devam isteği + planlanan koşu klasörü
+        # config üzerinden Mode A'ya taşınır (sonuç payload'unda da görünür).
+        train_cfg["resume_from"] = str(resume_from) if resume_from else None
+        train_cfg["run_dir"] = str(run_dir) if run_dir else None
 
         # Always generate the 1-click batch launcher script for full RTX GPU training
         bat_path = self._generate_rtx_batch_script(
@@ -1675,12 +1885,17 @@ class RTXTrainerEngine:
                     progress_callback=progress_callback,
                     model=model,
                     use_approved_only=effective_approved,
+                    resume_from=resume_from,
+                    run_dir=run_dir,
                 )
                 res_a["use_approved_only"] = effective_approved
                 res_a["data_yaml_path"] = str(yaml_path)
                 return res_a
             except Exception as exc:
-                if not allow_opencv_fallback:
+                # fix/v20-egitim-devam: devam isteği varken Mode B
+                # prototipine düşülmez — prototip kaldığı yerden devam
+                # edemez, sessizce taze eğitim sayılırdı.
+                if not allow_opencv_fallback or resume_from is not None:
                     logger.error(
                         "Mode A (Ultralytics) failed; OpenCV fallback disabled: %s",
                         exc,
@@ -1705,12 +1920,17 @@ class RTXTrainerEngine:
                     "Mode A (Ultralytics) failed (%s); seamlessly falling back to Mode B OpenCV Prototype trainer.",
                     exc,
                 )
-        elif not allow_opencv_fallback:
+        elif not allow_opencv_fallback or resume_from is not None:
             reason = (
                 "ultralytics yüklü değil — YOLO fabrikası OpenCV prototipini kabul etmez."
                 if not env_info.get("ultralytics_installed")
                 else "force_fallback=True reddedildi (OpenCV fallback kapalı)."
             )
+            if resume_from is not None and env_info.get("ultralytics_installed"):
+                reason = (
+                    "Devam eğitimi yalnızca Ultralytics ile yapılır — "
+                    "OpenCV prototipi kaldığı yerden devam edemez."
+                )
             payload = {
                 "started": False,
                 "state": "failed",
@@ -1757,23 +1977,62 @@ class RTXTrainerEngine:
         progress_callback: Optional[Callable[[Dict[str, Any]], None]],
         model: str = "yolo11n.pt",
         use_approved_only: bool = False,
+        resume_from: Optional[Union[str, Path]] = None,
+        run_dir: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
+        # fix/v20-egitim-devam: devam isteği ultralytics import'undan
+        # ÖNCE doğrulanır — geçersiz checkpoint eğitim hiç başlamadan
+        # Türkçe hatayla reddedilir. Koşu klasörü de burada kesinleşir:
+        # devamda checkpoint'in klasörü, taze koşuda benzersiz zaman
+        # damgalı klasör (çağıranın planladığı klasör varsa o kullanılır).
+        resume_arg = resume_from if resume_from is not None else train_cfg.get("resume_from")
+        resume_ckpt: Optional[Path] = None
+        if resume_arg is not None and str(resume_arg).strip() != "":
+            resume_ckpt = resolve_resume_checkpoint(resume_arg)
+        run_dir_arg = run_dir if run_dir is not None else train_cfg.get("run_dir")
+        runs_dir = rtx_runs_dir_for()
+        if resume_ckpt is not None:
+            run_dir = (
+                Path(run_dir_arg)
+                if run_dir_arg
+                else run_dir_for_resume_checkpoint(resume_ckpt)
+            )
+        elif run_dir_arg:
+            run_dir = Path(run_dir_arg)
+        else:
+            run_dir = runs_dir / generate_unique_run_name(runs_dir)
+        run_name = Path(run_dir).name
+
         from ultralytics import YOLO  # type: ignore
 
         start_time = time.perf_counter()
         device_arg: Union[int, str] = 0 if env_info.get("cuda_available") else "cpu"
 
-        base_model_str = self._resolve_base_weights(
-            str(model or train_cfg.get("model") or "yolo11n.pt")
-        )
-        logger.info(
-            "Mode A Ultralytics start: model=%s epochs=%s imgsz=%s batch=%s device=%s",
-            base_model_str,
-            epochs,
-            imgsz,
-            batch,
-            device_arg,
-        )
+        if resume_ckpt is not None:
+            # Devam: model = checkpoint'in kendisi; Ultralytics
+            # resume=True ile epoch/optimizer/zamanlayıcıyı geri yükler.
+            base_model_str = str(resume_ckpt)
+            logger.info(
+                "Mode A Ultralytics resume: checkpoint=%s run_dir=%s epochs=%s imgsz=%s batch=%s device=%s",
+                base_model_str,
+                run_dir,
+                epochs,
+                imgsz,
+                batch,
+                device_arg,
+            )
+        else:
+            base_model_str = self._resolve_base_weights(
+                str(model or train_cfg.get("model") or "yolo11n.pt")
+            )
+            logger.info(
+                "Mode A Ultralytics start: model=%s epochs=%s imgsz=%s batch=%s device=%s",
+                base_model_str,
+                epochs,
+                imgsz,
+                batch,
+                device_arg,
+            )
         model = YOLO(base_model_str)
 
         def _on_fit_epoch_end(trainer: Any) -> None:
@@ -1916,10 +2175,8 @@ class RTXTrainerEngine:
         except Exception:
             pass
 
-        runs_dir = rtx_runs_dir_for()
         _point_ultralytics_runs(runs_dir)
         use_cuda_device = bool(env_info.get("cuda_available", False))
-        run_dir = runs_dir / "gatherion_rtx_fp16"
         # F-0891: pass the hyperparameters build_rtx_training_config computed
         # instead of silently dropping most of them.
         model.train(
@@ -1962,9 +2219,9 @@ class RTXTrainerEngine:
             rect=bool(train_cfg.get("rect", False)),
             pretrained=bool(train_cfg.get("pretrained", True)),
             project=str(runs_dir),
-            name="gatherion_rtx_fp16",
+            name=run_name,
             exist_ok=True,
-            resume=False,
+            resume=resume_ckpt is not None,
             verbose=bool(train_cfg.get("verbose", False)),
         )
 
@@ -3135,6 +3392,9 @@ class RTXTrainerEngine:
         # F-0993: the launcher must train the configured base model.
         base_model = str(train_cfg.get("model") or "yolo11n.pt")
         runs_posix = str(rtx_runs_dir_for()).replace("\\", "/")
+        # fix/v20-egitim-devam: üretilen .bat da sabit klasöre yazmaz —
+        # her üretimde benzersiz zaman damgalı koşu adı alır.
+        run_name = generate_unique_run_name(rtx_runs_dir_for())
         onnx_out = str((home / "models" / "yolov8n_gatherion.onnx")).replace("\\", "/")
         yaml_on_f = _yaml_on_offload(data_yaml_path)
         yaml_str = str(yaml_on_f).replace("\\", "/")
@@ -3200,7 +3460,7 @@ if errorlevel 1 (
 
 :START_TRAIN
 echo [INFO] Starting RTX FP16 Mixed-Precision Training...
-"%PYTHON_EXE%" -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; cpu='CPU'; print(f'[INFO] Active Training Device: {{dev}} (CUDA={{use_cuda}}, GPU={{torch.cuda.get_device_name(0) if use_cuda else cpu}})'); m = YOLO('{base_model}'); m.train(data=r'{yaml_str}', epochs={epochs}, imgsz={imgsz}, batch={batch}, amp=use_cuda, cos_lr=True, mosaic={mosaic}, mixup={mixup}, optimizer='AdamW', lr0={lr0}, patience={patience}, device=dev, workers=0, project=r'{runs_posix}', name='gatherion_rtx_fp16', exist_ok=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz={imgsz}); out_p = Path(r'{onnx_out}'); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
+"%PYTHON_EXE%" -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; cpu='CPU'; print(f'[INFO] Active Training Device: {{dev}} (CUDA={{use_cuda}}, GPU={{torch.cuda.get_device_name(0) if use_cuda else cpu}})'); m = YOLO('{base_model}'); m.train(data=r'{yaml_str}', epochs={epochs}, imgsz={imgsz}, batch={batch}, amp=use_cuda, cos_lr=True, mosaic={mosaic}, mixup={mixup}, optimizer='AdamW', lr0={lr0}, patience={patience}, device=dev, workers=0, project=r'{runs_posix}', name='{run_name}', exist_ok=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz={imgsz}); out_p = Path(r'{onnx_out}'); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
 if not errorlevel 1 goto :TRAIN_DONE
 
 echo [HATA] Ultralytics egitimi basarisiz oldu; model uretilmedi.

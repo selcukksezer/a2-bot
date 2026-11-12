@@ -175,7 +175,12 @@ def test_disk_dolu_does_not_train() -> None:
             assert runs_dir == engine_mod._project_root() / "models" / "rtx_runs"
         else:
             assert runs_dir == root / "models" / "rtx_runs"
-        assert Path(str(result.get("save_dir"))) == runs_dir / "gatherion_rtx_fp16"
+        # fix/v20-egitim-devam: planlanan koşu klasörü artık benzersiz
+        # zaman damgalı isim alır (sabit isim üstüne yazma yok); sözleşme
+        # klasörün runs_dir altında + damgalı isimde olmasıdır.
+        save_dir = Path(str(result.get("save_dir")))
+        assert save_dir.parent == runs_dir
+        assert save_dir.name.startswith("gatherion_rtx_fp16_")
     finally:
         engine_mod.target_volume_free_bytes = original
         _release_train_slot()

@@ -10,9 +10,14 @@ if errorlevel 1 (
     echo [HATA] Calisma dizinine gecilemedi: "%GATHERION_HOME%"
     exit /b 1
 )
-set "LAST_PT=F:\a2\models\rtx_runs\gatherion_rtx_fp16\weights\last.pt"
-if not exist "%LAST_PT%" (
-    echo [HATA] Devam icin checkpoint yok: "%LAST_PT%"
+REM fix/v20-egitim-devam: sabit checkpoint yolu yok. En son yazilmis
+REM weights\last.pt bulunur (zaman damgali kosu klasorleri + eski sabit
+REM isimli klasor taninir); yoksa acik hata ile cikilir.
+set "RUNS_DIR=%GATHERION_HOME%\models\rtx_runs"
+set "LAST_PT="
+for /f "delims=" %%P in ('powershell -NoProfile -Command "Get-ChildItem -Path '%RUNS_DIR%' -Directory -Filter 'gatherion_rtx_fp16*' -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'weights\last.pt' } | Where-Object { Test-Path $_ } | Sort-Object { (Get-Item $_).LastWriteTime } -Descending | Select-Object -First 1"') do set "LAST_PT=%%P"
+if not defined LAST_PT (
+    echo [HATA] Devam icin checkpoint yok: "%RUNS_DIR%\gatherion_rtx_fp16*\weights\last.pt" bulunamadi.
     echo [INFO] Ilk egitim icin train_rtx_yolo.bat kullanin.
     exit /b 1
 )
@@ -31,10 +36,10 @@ if not exist "%TEMP%" mkdir "%TEMP%"
 if not exist "%YOLO_CONFIG_DIR%" mkdir "%YOLO_CONFIG_DIR%"
 if not exist "%TORCH_HOME%" mkdir "%TORCH_HOME%"
 if not exist "%PIP_CACHE_DIR%" mkdir "%PIP_CACHE_DIR%"
-title Gatherion RTX 3070 - Resume gatherion_rtx_fp16 ^& ONNX Exporter
+title Gatherion RTX 3070 - Resume latest run ^& ONNX Exporter
 echo ============================================================================
 echo   GATHERION AI - RESUME RTX CUDA FP16 TRAINING
-echo   Checkpoint   : F:/a2/models/rtx_runs/gatherion_rtx_fp16/weights/last.pt
+echo   Checkpoint   : %LAST_PT%
 echo   Target ONNX  : F:/a2/models/yolov8n_gatherion.onnx (egitim tamamlaninca)
 echo   Config       : Ultralytics resume=True (args run klasorunden)
 echo ============================================================================
@@ -61,7 +66,7 @@ if errorlevel 1 (
 
 :START_RESUME
 echo [INFO] Resuming RTX FP16 training from last.pt...
-"%PYTHON_EXE%" -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; last_p = Path(r'F:/a2/models/rtx_runs/gatherion_rtx_fp16/weights/last.pt'); use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; cpu='CPU'; print(f'[INFO] Active Training Device: {dev} (CUDA={use_cuda}, GPU={torch.cuda.get_device_name(0) if use_cuda else cpu})'); print('[INFO] Resume checkpoint:', last_p); m = YOLO(str(last_p)); m.train(resume=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz=960); out_p = Path(r'F:/a2/models/yolov8n_gatherion.onnx'); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
+"%PYTHON_EXE%" -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; last_p = Path(r'%LAST_PT%'); use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; cpu='CPU'; print(f'[INFO] Active Training Device: {dev} (CUDA={use_cuda}, GPU={torch.cuda.get_device_name(0) if use_cuda else cpu})'); print('[INFO] Resume checkpoint:', last_p); m = YOLO(str(last_p)); m.train(resume=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz=960); out_p = Path(r'F:/a2/models/yolov8n_gatherion.onnx'); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
 if not errorlevel 1 goto :TRAIN_DONE
 
 echo [HATA] Ultralytics egitimi (resume) basarisiz oldu; model uretilmedi.

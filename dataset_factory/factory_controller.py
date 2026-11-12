@@ -1492,6 +1492,7 @@ class AutoLabelingDatasetFactory:
         # vaadi "Sadece Onaylananlarla Eğit"tir.
         only_approved: bool = True,
         data_yaml_path: Optional[Union[str, Path]] = None,
+        resume_from: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """
         Launches `RTXTrainerEngine` on the approved dataset
@@ -1516,6 +1517,9 @@ class AutoLabelingDatasetFactory:
             data_yaml_path: Explicit training yaml; honoured as-is. When omitted
                             and `only_approved=True`, the engine resolves the
                             approved yaml; otherwise the raw dataset yaml.
+            resume_from: `last.pt` checkpoint path to resume from
+                         (`fix/v20-egitim-devam`). None = fresh run. When set,
+                         training continues in the checkpoint's run dir.
 
         Returns:
             Dictionary containing final training metrics (`mAP50`, `mAP50_95`, `box_loss`,
@@ -1533,6 +1537,7 @@ class AutoLabelingDatasetFactory:
                 allow_opencv_fallback=bool(allow_opencv_fallback),
                 only_approved=bool(only_approved),
                 data_yaml_path=data_yaml_path,
+                resume_from=resume_from,
             )
 
         prepared = self.prepare_one_click_dataset()
@@ -1558,6 +1563,7 @@ class AutoLabelingDatasetFactory:
             model=str(model),
             allow_opencv_fallback=bool(allow_opencv_fallback),
             use_approved_only=bool(only_approved),
+            resume_from=resume_from,
         )
 
     def stop_training(self) -> None:
@@ -1600,6 +1606,7 @@ class AutoLabelingDatasetFactory:
         allow_opencv_fallback: bool = False,
         only_approved: bool = True,
         data_yaml_path: Optional[Union[str, Path]] = None,
+        resume_from: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """Return immediately. Dataset bootstrap and the CUDA launch run on a side thread."""
         existing = getattr(self, "_one_click_thread", None)
@@ -1639,6 +1646,7 @@ class AutoLabelingDatasetFactory:
                     model=str(model),
                     allow_opencv_fallback=bool(allow_opencv_fallback),
                     use_approved_only=bool(only_approved),
+                    resume_from=resume_from,
                 )
             except Exception as exc:
                 logger.exception("One-click dataset bootstrap failed: %s", exc)

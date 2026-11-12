@@ -180,7 +180,9 @@ from dataset_factory.lru_frame_cache import get_lru_frame_cache  # F-2000 / R44
 from dataset_factory.quality_dedup_gate import DatasetQualityGate
 from dataset_factory.rtx_trainer_engine import (
     RTXTrainerEngine,
+    find_resumable_checkpoint,
     probe_gpu_environment,
+    resolve_resume_checkpoint,
     rtx_runs_dir_for,
 )
 from dataset_factory.synthetic_augmentor import SyntheticYOLOAugmentor
@@ -964,6 +966,7 @@ class _BuiltinAutoLabelingDatasetFactory:
         batch: int = 16,
         model: str = "yolo11n.pt",
         allow_opencv_fallback: bool = False,
+        resume_from: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """Tek tıkla RTX CUDA FP16 YOLO eğitimini çalıştırır ve sonuç metriklerini döndürür."""
         self._ensure_data_yaml()
@@ -975,6 +978,7 @@ class _BuiltinAutoLabelingDatasetFactory:
             batch=batch,
             model=model,
             allow_opencv_fallback=allow_opencv_fallback,
+            resume_from=resume_from,
         )
 
     # P2-20: GPU probe (nvidia-smi + import denemeleri) önbellek süresi.
@@ -3190,6 +3194,7 @@ class RTXTrainingWorker(QThread):
         batch: int = 16,
         model: str = "yolo11n.pt",
         only_approved: bool = False,
+        resume_from: Optional[Union[str, Path]] = None,
     ) -> None:
         super().__init__(parent)
         self.controller = controller
@@ -3198,6 +3203,9 @@ class RTXTrainingWorker(QThread):
         self.batch = max(1, int(batch))
         self.model = str(model or "yolo11n.pt").strip() or "yolo11n.pt"
         self.only_approved = bool(only_approved)
+        # fix/v20-egitim-devam: None = taze koşu; last.pt yolu = kaldığı
+        # yerden devam (motor resume=True ile aynı klasörde sürdürür).
+        self.resume_from = resume_from
         self._stop_requested: bool = False
 
     def is_stop_requested(self) -> bool:
@@ -3362,6 +3370,7 @@ class RTXTrainingWorker(QThread):
                 batch=self.batch,
                 model=self.model,
                 only_approved=self.only_approved,
+                resume_from=self.resume_from,
             )
             if isinstance(result, dict) and (
                 result.get("waiting_for_game_exit") or result.get("reason") == "aion2_running"
@@ -3404,6 +3413,7 @@ def _invoke_controller_rtx_training(
     batch: int = 16,
     model: str = "yolo11n.pt",
     only_approved: bool = False,
+    resume_from: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """
     `controller.run_one_click_rtx_training` metodunu esnek imza uyumluluğuyla çağırır.
@@ -3432,6 +3442,8 @@ def _invoke_controller_rtx_training(
             kwargs["async_mode"] = False
         if "only_approved" in sig.parameters:
             kwargs["only_approved"] = bool(only_approved)
+        if "resume_from" in sig.parameters:
+            kwargs["resume_from"] = resume_from
         if only_approved:
             dataset_dir = getattr(controller, "dataset_dir", Path("dataset"))
             app_yaml = Path(dataset_dir) / "approved" / "data_approved.yaml"
@@ -3475,6 +3487,7 @@ def _invoke_controller_rtx_training(
                 batch=batch,
                 model=model,
                 allow_opencv_fallback=False,
+                resume_from=resume_from,
             )
     return fallback.run_one_click_rtx_training(
         epochs=epochs,
@@ -3483,6 +3496,7 @@ def _invoke_controller_rtx_training(
         batch=batch,
         model=model,
         allow_opencv_fallback=False,
+        resume_from=resume_from,
     )
 
 
@@ -6770,6 +6784,24 @@ class YOLOFactoryDialog(QDialog):
         btn_row.addWidget(self.btn_stop_train)
         lay.addLayout(btn_row)
 
+        # fix/v20-egitim-devam: yarım kalan koşuya devam. Düğme yalnızca
+        # okunabilir weights/last.pt varsa etkinleşir; bilgi etiketi
+        # hangi koşunun devam edeceğini yazar.
+        resume_row = QHBoxLayout()
+        resume_row.setContentsMargins(14, 4, 14, 8)
+        resume_row.setSpacing(8)
+        self.btn_resume_training = QPushButton("▶ Kaldığı Yerden Devam Et", self)
+        self.btn_resume_training.setObjectName("PipeBtn")
+        self.btn_resume_training.setMinimumHeight(48)
+        self.btn_resume_training.setEnabled(False)
+        self.btn_resume_training.clicked.connect(self._on_resume_training_clicked)
+        self.lbl_resume_info = QLabel("Devam edilebilir koşu aranıyor…", self)
+        self.lbl_resume_info.setWordWrap(True)
+        self.lbl_resume_info.setStyleSheet("font-size:12px; color:#D7DEE8;")
+        resume_row.addWidget(self.btn_resume_training)
+        resume_row.addWidget(self.lbl_resume_info, stretch=1)
+        lay.addLayout(resume_row)
+
         epoch_box = QVBoxLayout()
         epoch_box.setContentsMargins(14, 4, 14, 8)
         head = QHBoxLayout()
@@ -7523,6 +7555,10 @@ class YOLOFactoryDialog(QDialog):
             self._refresh_train_rtx_label()
         except Exception:
             pass
+        try:
+            self._refresh_resume_button(can_train)
+        except Exception:
+            pass
         if refresh_summary:
             try:
                 self._refresh_train_summary()
@@ -7552,6 +7588,75 @@ class YOLOFactoryDialog(QDialog):
                 "Tüm veriyle eğitir (dataset/train + val, onaylanmamış "
                 "kareler dahil) — 'Sadece Onaylananlarla Eğit' anahtarı KAPALI."
             )
+
+    def _refresh_resume_button(self, can_train: bool) -> None:
+        """fix/v20-egitim-devam: devam düğmesi + bilgi etiketi tazeleme.
+
+        Karar mantığı motordaki `find_resumable_checkpoint` yardımcısındadır
+        (Qt'suz test edilir); burada yalnızca görünüm güncellenir. Düğme
+        ancak eğitim kapıları açıkken VE okunabilir last.pt varken etkindir.
+        """
+        btn = getattr(self, "btn_resume_training", None)
+        lbl = getattr(self, "lbl_resume_info", None)
+        if btn is None and lbl is None:
+            return
+        try:
+            found = find_resumable_checkpoint()
+        except Exception as exc:
+            logger.debug("Devam edilebilir koşu taraması başarısız: %s", exc)
+            found = None
+        if found is not None:
+            epochs_done = int(found.get("epochs_completed", 0) or 0)
+            info = (
+                f"Son koşu: {found.get('run_name', '')} · "
+                f"{epochs_done} epoch tamamlandı — kaldığı yerden devam eder."
+            )
+        else:
+            info = "Devam edilebilir koşu yok — weights/last.pt bulunamadı."
+        if lbl is not None:
+            lbl.setText(info)
+        if btn is not None:
+            btn.setEnabled(bool(can_train and found is not None))
+            btn.setToolTip(
+                info
+                if found is not None
+                else "Yarım kalmış bir eğitim koşusu yok (weights/last.pt bulunamadı)."
+            )
+
+    def _on_resume_training_clicked(self) -> None:
+        """fix/v20-egitim-devam: en yeni koşuyu kaldığı yerden devam ettir."""
+        try:
+            found = find_resumable_checkpoint()
+        except Exception as exc:
+            logger.warning("Devam edilebilir koşu taraması başarısız: %s", exc)
+            found = None
+        if found is None:
+            self._append_log(
+                "[EĞİTİM] Devam edilebilir koşu yok — weights/last.pt bulunamadı."
+            )
+            try:
+                self._update_train_lock()
+            except Exception:
+                pass
+            return
+        checkpoint = Path(str(found["checkpoint"]))
+        try:
+            # Tık anında derin doğrulama: bozuk checkpoint eğitim hiç
+            # başlamadan reddedilir, kullanıcıya nedeni söylenir.
+            checkpoint = resolve_resume_checkpoint(checkpoint)
+        except Exception as exc:
+            self._append_log(f"[EĞİTİM] RED: devam checkpoint'i geçersiz ({exc})")
+            try:
+                self._update_train_lock()
+            except Exception:
+                pass
+            return
+        epochs_done = int(found.get("epochs_completed", 0) or 0)
+        self._append_log(
+            f"[EĞİTİM] Devam ediliyor: {found.get('run_name', '')} "
+            f"({epochs_done} epoch tamamlandı) — kaldığı yerden sürer."
+        )
+        self.on_train_rtx_clicked(resume_from=checkpoint)
 
     def _refresh_training_locks(self, refresh_summary: bool = True) -> None:
         """P2-22 (bölüm 6.2, F048-O1): kilitleri sinyal beklemeden tazele.
@@ -15839,6 +15944,7 @@ class YOLOFactoryDialog(QDialog):
         imgsz: Optional[int] = None,
         batch: Optional[int] = None,
         only_approved: Optional[bool] = None,
+        resume_from: Optional[Union[str, Path]] = None,
     ) -> RTXTrainingWorker:
         """
         Starts or creates RTXTrainingWorker with explicit hyperparameters or current UI selections.
@@ -15871,6 +15977,7 @@ class YOLOFactoryDialog(QDialog):
                 batch=batch,
                 model=model,
                 only_approved=bool(only_approved),
+                resume_from=resume_from,
             )
         except RuntimeError:
             worker = RTXTrainingWorker(
@@ -15881,6 +15988,7 @@ class YOLOFactoryDialog(QDialog):
                 batch=batch,
                 model=model,
                 only_approved=bool(only_approved),
+                resume_from=resume_from,
             )
         worker.setObjectName("GatherionDatasetBootstrap")
         worker.status_text.connect(self._on_training_status)
@@ -15904,7 +16012,11 @@ class YOLOFactoryDialog(QDialog):
         # (bayat senkron bayrak temizlenir, Durdur kapatılır).
         self._refresh_training_locks()
 
-    def on_train_rtx_clicked(self, only_approved: Optional[bool] = None) -> None:
+    def on_train_rtx_clicked(
+        self,
+        only_approved: Optional[bool] = None,
+        resume_from: Optional[Union[str, Path]] = None,
+    ) -> None:
         if only_approved is None:
             only_approved = self._only_approved_enabled()
         is_only_approved = bool(only_approved)
@@ -15923,6 +16035,8 @@ class YOLOFactoryDialog(QDialog):
         self.btn_train_rtx.setEnabled(False)
         if hasattr(self, "btn_train_only_approved"):
             self.btn_train_only_approved.setEnabled(False)
+        if hasattr(self, "btn_resume_training"):
+            self.btn_resume_training.setEnabled(False)
 
         if is_only_approved:
             # B-10: havuz hazırlık hatası eskiden yalnızca loglanıp yola
@@ -16029,13 +16143,16 @@ class YOLOFactoryDialog(QDialog):
         self.btn_train_rtx.setEnabled(False)
         if hasattr(self, "btn_train_only_approved"):
             self.btn_train_only_approved.setEnabled(False)
+        if hasattr(self, "btn_resume_training"):
+            self.btn_resume_training.setEnabled(False)
         self.btn_stop_train.setEnabled(True)
         self.train_progress_bar.setValue(0)
         self.epoch_label.setText(f"Epoch 0 / {epochs}")
         self.lbl_train_status.setText(SCAN_RUNNING_STATUS)
         approved_suffix = " (Sadece Onaylananlar)" if is_only_approved else ""
+        resume_suffix = " (Kaldığı Yerden Devam)" if resume_from is not None else ""
         self._append_log(
-            f"[EĞİTİM] Başlatılıyor: {model} · {epochs} epoch · imgsz={imgsz} · batch={batch}{approved_suffix}"
+            f"[EĞİTİM] Başlatılıyor: {model} · {epochs} epoch · imgsz={imgsz} · batch={batch}{approved_suffix}{resume_suffix}"
         )
         self._append_log("Veri seti taraması sürüyor")
 
@@ -16045,7 +16162,7 @@ class YOLOFactoryDialog(QDialog):
         # (yedeği: 1 sn kilit zamanlayıcısı).
         self._pause_bot_for_training()
         try:
-            self._start_training_worker(epochs=epochs, model=model, imgsz=imgsz, batch=batch, only_approved=is_only_approved)
+            self._start_training_worker(epochs=epochs, model=model, imgsz=imgsz, batch=batch, only_approved=is_only_approved, resume_from=resume_from)
         except Exception:
             self._training_starting = False
             self._resume_bot_after_training()
