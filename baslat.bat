@@ -1,6 +1,8 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
+echo [YOLO UI] Tasarim dali: F:\a2 (fix/v20-birlesik) — onayla-r4 filmstrip.
+echo          freeze-cumulative eski fabrika UI gosterir; yeni tasarim icin BU bat.
 set "PROJECT_DIR=%~dp0"
 set "PYTHONPATH=%PROJECT_DIR%"
 set "PYTHONUTF8=1"

@@ -69,6 +69,7 @@ from PyQt6.QtGui import (
     QShortcut,
     QTextCursor,
     QTextDocument,
+    QWheelEvent,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -103,7 +104,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ui.shell_theme import SHELL_COLORS, SHELL_PAGE_FRAME_QSS
+from ui.shell_theme import SHELL_COLORS
+from ui.yolo_factory_theme import (
+    BTN_HEIGHT_MAX as _YF_BTN_HEIGHT_MAX,
+    BTN_HEIGHT_MIN as _YF_BTN_HEIGHT_MIN,
+    FILMSTRIP_HEIGHT as _YF_FILMSTRIP_HEIGHT,
+    PIPELINE_COLORS as _YF_PIPELINE_COLORS,
+    SIDEBAR_WIDTH as _YF_SIDEBAR_WIDTH,
+    UI_BUILD_STAMP as _YF_UI_BUILD_STAMP,
+    apply_yolo_factory_theme,
+)
 
 from dataset_factory.approval_state import is_frame_closed
 from dataset_factory.approved_pool import ApprovedDatasetPool, get_approved_pool, is_approved
@@ -1562,6 +1572,11 @@ class YOLOPreviewCanvas(QWidget):
     boxDrawn = pyqtSignal(float, float, float, float)
     boxAdded = pyqtSignal(dict)
     boxEdited = pyqtSignal(dict)
+    zoomChanged = pyqtSignal(float)
+
+    MIN_USER_ZOOM: float = 0.25
+    MAX_USER_ZOOM: float = 8.0
+    ZOOM_STEP: float = 1.25
 
     REQUIRED_PREVIEW_TAGS: List[Tuple[str, str]] = [
         ("herb_aria", "#22c55e"),
@@ -1578,6 +1593,7 @@ class YOLOPreviewCanvas(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName("YOLO etiket önizleme tuvali")
         self._pixmap: Optional[QPixmap] = None
         self._preview_path: str = ""
         self._live_badge: str = ""
@@ -1588,6 +1604,8 @@ class YOLOPreviewCanvas(QWidget):
         # Önizleme görünüm modu: live (görüntü + kutular), boxes (yalnız kutular),
         # clean (yalnız görüntü). _set_preview_view ile değiştirilir (F-0605).
         self._view_mode: str = "live"
+        self._user_zoom: float = 1.0
+        self._pan_offset: QPointF = QPointF(0.0, 0.0)
         self._close_hit_rects: List[Tuple[QRectF, Dict[str, Any], int]] = []
         self._box_hit_rects: List[Tuple[QRectF, Dict[str, Any], int]] = []
         self._box_draw_info: List[Dict[str, Any]] = []
@@ -1634,7 +1652,59 @@ class YOLOPreviewCanvas(QWidget):
         self._drag_start_box_rect = QRectF()
         self._drag_start_ann = {}
 
-    def _compute_target_rect(self) -> QRectF:
+    def user_zoom(self) -> float:
+        """Kullanıcı yakınlaştırma çarpanı (1.0 = sığdır)."""
+        return float(self._user_zoom)
+
+    def set_user_zoom(self, zoom: float, *, anchor: Optional[QPointF] = None) -> None:
+        """Yakınlaştırmayı [MIN, MAX] aralığına kıstırır; isteğe bağlı imleç merkezli."""
+        try:
+            z = float(zoom)
+        except (TypeError, ValueError):
+            return
+        z = max(self.MIN_USER_ZOOM, min(self.MAX_USER_ZOOM, z))
+        old_z = float(self._user_zoom)
+        if abs(z - old_z) < 1e-9 and anchor is None:
+            if abs(z - 1.0) < 1e-9 and (
+                abs(self._pan_offset.x()) > 1e-6 or abs(self._pan_offset.y()) > 1e-6
+            ):
+                self._pan_offset = QPointF(0.0, 0.0)
+                self.update()
+                self.zoomChanged.emit(self._user_zoom)
+            return
+        if abs(z - 1.0) < 1e-9:
+            self._user_zoom = 1.0
+            self._pan_offset = QPointF(0.0, 0.0)
+        elif anchor is not None and old_z > 1e-9:
+            old_rect = self._compute_target_rect()
+            rel_x = 0.5
+            rel_y = 0.5
+            if old_rect.width() > 1e-6 and old_rect.height() > 1e-6:
+                rel_x = (float(anchor.x()) - old_rect.left()) / old_rect.width()
+                rel_y = (float(anchor.y()) - old_rect.top()) / old_rect.height()
+            self._user_zoom = z
+            base = self._fit_rect()
+            new_w = base.width() * z
+            new_h = base.height() * z
+            desired_left = float(anchor.x()) - rel_x * new_w
+            desired_top = float(anchor.y()) - rel_y * new_h
+            self._pan_offset = QPointF(
+                desired_left + new_w * 0.5 - base.center().x(),
+                desired_top + new_h * 0.5 - base.center().y(),
+            )
+        else:
+            self._user_zoom = z
+        self.update()
+        self.zoomChanged.emit(self._user_zoom)
+
+    def zoom_in(self) -> None:
+        self.set_user_zoom(self._user_zoom * self.ZOOM_STEP)
+
+    def zoom_out(self) -> None:
+        self.set_user_zoom(self._user_zoom / self.ZOOM_STEP)
+
+    def _fit_rect(self) -> QRectF:
+        """Zoom/pan uygulanmamış sığdırılmış görüntü dikdörtgeni."""
         rect = self.rect()
         header_h = 32.0
         footer_h = 28.0
@@ -1656,6 +1726,28 @@ class YOLOPreviewCanvas(QWidget):
                 dy = view_rect.top() + (view_rect.height() - sh) * 0.5
                 target_rect = QRectF(dx, dy, sw, sh)
         return target_rect
+
+    def _reset_view_transform(self, *, emit: bool = True) -> None:
+        changed = abs(self._user_zoom - 1.0) > 1e-9 or abs(self._pan_offset.x()) > 1e-6 or abs(
+            self._pan_offset.y()
+        ) > 1e-6
+        self._user_zoom = 1.0
+        self._pan_offset = QPointF(0.0, 0.0)
+        if changed and emit:
+            self.zoomChanged.emit(self._user_zoom)
+
+    def _compute_target_rect(self) -> QRectF:
+        base = self._fit_rect()
+        z = float(self._user_zoom)
+        if abs(z - 1.0) < 1e-9 and abs(self._pan_offset.x()) < 1e-6 and abs(
+            self._pan_offset.y()
+        ) < 1e-6:
+            return base
+        sw = base.width() * z
+        sh = base.height() * z
+        cx = base.center().x() + float(self._pan_offset.x())
+        cy = base.center().y() + float(self._pan_offset.y())
+        return QRectF(cx - sw * 0.5, cy - sh * 0.5, sw, sh)
 
     def hit_test_close_button(self, pos: Union[QPoint, QPointF]) -> Optional[Dict[str, Any]]:
         """Verilen fare koordinatı bir etiketin `✕` silme düğmesi üzerindeyse ilgili kutu sözlüğünü döndürür."""
@@ -2040,6 +2132,23 @@ class YOLOPreviewCanvas(QWidget):
             self.update()
         super().mouseReleaseEvent(event)
 
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
+        """Ctrl+tekerlek: imleç merkezli yakınlaştır / uzaklaştır."""
+        try:
+            if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                super().wheelEvent(event)
+                return
+            delta = int(event.angleDelta().y())
+            if delta == 0:
+                event.accept()
+                return
+            factor = self.ZOOM_STEP if delta > 0 else (1.0 / self.ZOOM_STEP)
+            anchor = event.position() if hasattr(event, "position") else QPointF(event.pos())
+            self.set_user_zoom(self._user_zoom * factor, anchor=QPointF(anchor))
+            event.accept()
+        except Exception:
+            super().wheelEvent(event)
+
     def leaveEvent(self, event: Any) -> None:  # noqa: N802
         if not (self._is_dragging_box and self._drag_start_pos is not None):
             self.clear_drag_state()
@@ -2106,12 +2215,15 @@ class YOLOPreviewCanvas(QWidget):
         qimg = QImage(
             img_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888
         ).copy()
+        prev_key = self._source_key
         self._pixmap = QPixmap.fromImage(qimg)
         self._preview_path = str(p)
         self._source_key = key
         self._empty = False
         self._live_badge = p.name
         self._last_decode_error = ""
+        if key != prev_key:
+            self._reset_view_transform(emit=True)
         self.update()
         return True
 
@@ -2123,6 +2235,7 @@ class YOLOPreviewCanvas(QWidget):
         self._empty = True
         self._live_badge = message
         self._source_key = ""
+        self._reset_view_transform(emit=True)
         self.update()
 
     def set_live_frame(
@@ -2148,6 +2261,7 @@ class YOLOPreviewCanvas(QWidget):
             self._live_badge = badge
             return True
 
+        same_source = bool(key) and key == self._source_key and not self._empty
         display = self._downscale_bgr(frame_bgr)
         img_rgb = np.ascontiguousarray(cv2.cvtColor(display, cv2.COLOR_BGR2RGB))
         height, width, channels = img_rgb.shape
@@ -2159,8 +2273,12 @@ class YOLOPreviewCanvas(QWidget):
         self._source_key = key
         self._empty = False
         self._live_badge = badge
+        # Aynı kaynak + annotations=None erken dönüşte kalır; buraya geldiysek
+        # ya yeni kaynak ya da etiket yenilemesi — None ise kutuları temizle.
         self._annotations = list(annotations) if annotations is not None else []
         self._last_decode_error = ""
+        if not same_source:
+            self._reset_view_transform(emit=True)
         self.update()
         return True
 
@@ -2202,23 +2320,27 @@ class YOLOPreviewCanvas(QWidget):
                 f"🎯 CANLI OTOMATİK ETİKET ÖNİZLEME (t - 2.0 sn): {file_badge}",
             )
 
-            # Görüntüyü çiz ("boxes" modunda görüntü çizilmez, yalnız kutular)
-            target_rect = view_rect
+            # Görüntüyü çiz ("boxes" modunda görüntü çizilmez, yalnız kutular).
+            # Zoom/pan _compute_target_rect üzerinden uygulanır.
+            target_rect = self._compute_target_rect()
             if getattr(self, "_view_mode", "live") == "boxes":
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QBrush(QColor("#0f141c")))
                 painter.drawRoundedRect(view_rect, 6.0, 6.0)
             elif self._pixmap is not None and not self._pixmap.isNull():
                 scaled = self._pixmap.scaled(
-                    int(view_rect.width()),
-                    int(view_rect.height()),
-                    Qt.AspectRatioMode.KeepAspectRatio,
+                    max(1, int(round(target_rect.width()))),
+                    max(1, int(round(target_rect.height()))),
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                dx = view_rect.left() + (view_rect.width() - scaled.width()) * 0.5
-                dy = view_rect.top() + (view_rect.height() - scaled.height()) * 0.5
-                target_rect = QRectF(dx, dy, float(scaled.width()), float(scaled.height()))
-                painter.drawPixmap(int(dx), int(dy), scaled)
+                painter.drawPixmap(int(round(target_rect.left())), int(round(target_rect.top())), scaled)
+                target_rect = QRectF(
+                    float(int(round(target_rect.left()))),
+                    float(int(round(target_rect.top()))),
+                    float(scaled.width()),
+                    float(scaled.height()),
+                )
             else:
                 grad = QLinearGradient(view_rect.topLeft(), view_rect.bottomLeft())
                 grad.setColorAt(0.0, QColor("#111827"))
@@ -2475,26 +2597,26 @@ class SearchableTagListPanel(QFrame):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
             "QFrame#SearchableTagListPanel {"
-            " background-color: #0b0e14; border: 1px solid #1e293b; border-radius: 8px; padding: 6px;"
+            " background-color: #171B22; border: 1px solid #262D3A; border-radius: 8px; padding: 4px;"
             "}"
-            "QFrame#SearchableTagListPanel QLabel { background: transparent; color: #f1f5f9; }"
-            "QLineEdit#TagSearchEdit { background: #111827; color: #ffffff; border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; font-size: 12px; }"
-            "QLineEdit#TagSearchEdit:focus { border: 1px solid #38bdf8; }"
-            "QListWidget#TagListWidget { background: #07090e; color: #f1f5f9; border: 1px solid #1e293b; border-radius: 6px; font-size: 12px; }"
-            "QListWidget#TagListWidget::item { padding: 5px 8px; border-radius: 4px; }"
-            "QListWidget#TagListWidget::item:hover { background: #1e293b; }"
-            "QListWidget#TagListWidget::item:selected { background: #166534; color: #ffffff; font-weight: 700; }"
+            "QFrame#SearchableTagListPanel QLabel { background: transparent; color: #F2F3F5; }"
+            "QLineEdit#TagSearchEdit { background: #0B0E12; color: #F2F3F5; border: 1px solid #262D3A; border-radius: 6px; padding: 5px 8px; font-size: 11px; }"
+            "QLineEdit#TagSearchEdit:focus { border: 1px solid #F6B81E; }"
+            "QListWidget#TagListWidget { background: #0B0E12; color: #F2F3F5; border: 1px solid #262D3A; border-radius: 6px; font-size: 11px; }"
+            "QListWidget#TagListWidget::item { padding: 4px 6px; border-radius: 4px; }"
+            "QListWidget#TagListWidget::item:hover { background: #1C212B; }"
+            "QListWidget#TagListWidget::item:selected { background: #2A220E; color: #F6B81E; font-weight: 700; }"
         )
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(5)
 
         # Header with active class indicator
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(2, 0, 2, 0)
         self.lbl_title = QLabel(f"🏷️ {len(CLASS_ID_TO_SPEC)} Sınıflı Etiket Listesi")
-        self.lbl_title.setStyleSheet("font-weight: 700; font-size: 12px; color: #38bdf8;")
+        self.lbl_title.setStyleSheet("font-weight: 700; font-size: 11px; color: #9AA3B2;")
         self.lbl_active_pill = QLabel("🎯 0: herb_aria")
         self.lbl_active_pill.setStyleSheet(
             "background: #0d2818; color: #4ade80; border: 1px solid #16a34a; border-radius: 5px; padding: 3px 8px; font-weight: 700; font-size: 11px;"
@@ -4511,7 +4633,10 @@ class YOLOFactoryDialog(QDialog):
     Yakala → Onayla → Hazırla → Eğit → Doğrula → Yayınla
     """
 
-    WINDOW_TITLE_TR: str = "YOLO Fabrikası — İş Akışı"
+    # Header stamp — kullanıcı yeni Onayla düzeninin yüklendiğini görsün.
+    # Kaynak: ui/yolo_factory_theme.py (tek yer).
+    UI_BUILD_STAMP: str = _YF_UI_BUILD_STAMP
+    WINDOW_TITLE_TR: str = "YOLO Fabrikası"
     STEP_NAMES: Dict[int, str] = {
         1: "Yakala",
         2: "Onayla",
@@ -4520,24 +4645,7 @@ class YOLOFactoryDialog(QDialog):
         5: "Doğrula",
         6: "Yayınla",
     }
-    PIPELINE_COLORS = {
-        "bg": "#0E1013",
-        "panel": "#171B22",
-        "panel2": "#1C212B",
-        "panel3": "#202633",
-        "line": "#262D3A",
-        "line2": "#2E3647",
-        "text": "#F2F3F5",
-        "muted": "#9AA3B2",
-        "muted2": "#6B7688",
-        "amber": "#F6B81E",
-        "amber_soft": "#2A220E",
-        "green": "#2ED573",
-        "green_soft": "#0F2A1D",
-        "red": "#FF5A5F",
-        "red_soft": "#24151A",
-        "radius": "14px",
-    }
+    PIPELINE_COLORS = dict(_YF_PIPELINE_COLORS)
 
     def __init__(
         self,
@@ -5407,283 +5515,55 @@ class YOLOFactoryDialog(QDialog):
         self._last_train_result = merged
 
     def _apply_dark_studio_theme(self) -> None:
-        C = self.PIPELINE_COLORS
-        self.setStyleSheet(
-            SHELL_PAGE_FRAME_QSS
-            + f"""
-            QDialog {{
-                background-color: {C["bg"]};
-                color: {C["text"]};
-                font-family: "Plus Jakarta Sans", "Segoe UI", sans-serif;
-                font-size: 13px;
-            }}
-            QLabel {{ color: {C["text"]}; }}
-            QFrame#PipeCard, QFrame#PipeFlow, QFrame#PipeStat,
-            QFrame#PipeNext, QFrame#PipeBlockerHost, QFrame#PipeRailCard {{
-                background-color: {C["panel"]};
-                border: 1px solid {C["line"]};
-                border-radius: {C["radius"]};
-            }}
-            QFrame#PipeStatWarn {{
-                background-color: {C["panel"]};
-                border: 1px solid #4A2028;
-                border-radius: 12px;
-            }}
-            QFrame#PipeStatGood {{
-                background-color: {C["panel"]};
-                border: 1px solid #1E4D33;
-                border-radius: 12px;
-            }}
-            QPushButton#PipeBtn {{
-                background: {C["panel"]};
-                color: {C["text"]};
-                border: 1px solid {C["line"]};
-                border-radius: 10px;
-                padding: 10px 16px;
-                font-size: 13px;
-                font-weight: 700;
-            }}
-            QPushButton#PipeBtn:hover {{ background: {C["panel2"]}; border-color: {C["line2"]}; }}
-            QPushButton#PipeBtn:disabled {{ opacity: 0.45; }}
-            QPushButton#PipePrimary {{
-                background: {C["amber"]};
-                color: #111;
-                border: 1px solid #FFD84D;
-                border-radius: 10px;
-                padding: 10px 16px;
-                font-size: 13px;
-                font-weight: 700;
-            }}
-            QPushButton#PipePrimary:hover {{ background: #FFC933; }}
-            QPushButton#PipePrimary:disabled {{ background: #3a3f48; color: #c2c8d2; border-color: #3a3f48; }}
-            QPushButton#PipeGreen {{
-                background: {C["green"]};
-                color: #08130C;
-                border: 1px solid #35E585;
-                border-radius: 10px;
-                padding: 10px 16px;
-                font-size: 13px;
-                font-weight: 700;
-            }}
-            QPushButton#PipeDanger {{
-                background: transparent;
-                color: #FF8A94;
-                border: 1px solid #4A2028;
-                border-radius: 10px;
-                padding: 10px 16px;
-                font-size: 13px;
-                font-weight: 700;
-            }}
-            QPushButton#PipeStep {{
-                background: #0B0E12;
-                color: {C["text"]};
-                border: 1px solid {C["line"]};
-                border-radius: 12px;
-                text-align: left;
-                padding: 10px;
-            }}
-            QPushButton#PipeStep:hover {{ border-color: {C["line2"]}; }}
-            QPushButton#PipeStepCurrent {{
-                background: {C["amber_soft"]};
-                color: {C["text"]};
-                border: 1px solid {C["amber"]};
-                border-radius: 12px;
-                text-align: left;
-                padding: 10px;
-            }}
-            QPushButton#PipeStepDone {{
-                background: #0E1712;
-                color: {C["text"]};
-                border: 1px solid #1E4D33;
-                border-radius: 12px;
-                text-align: left;
-                padding: 10px;
-            }}
-            QPushButton#PipeStepBlocked {{
-                background: #0B0E12;
-                color: {C["muted"]};
-                border: 1px solid {C["line"]};
-                border-radius: 12px;
-                text-align: left;
-                padding: 10px;
-                opacity: 0.62;
-            }}
-            QFrame#PipePreset, QFrame#PipeFormat {{
-                background: #0B0E12;
-                color: {C["text"]};
-                border: 1px solid {C["line"]};
-                border-radius: 11px;
-            }}
-            QFrame#PipePreset:hover, QFrame#PipeFormat:hover {{
-                border-color: {C["line2"]};
-            }}
-            QFrame#PipePresetSel, QFrame#PipeFormatSel {{
-                background: {C["amber_soft"]};
-                color: {C["text"]};
-                border: 1px solid {C["amber"]};
-                border-radius: 11px;
-            }}
-            QListWidget#PipeQueue {{
-                background: #0B0E12;
-                border: none;
-                outline: none;
-                color: {C["text"]};
-            }}
-            QListWidget#PipeQueue::item {{
-                background: #0B0E12;
-                border: 1px solid {C["line"]};
-                border-radius: 10px;
-                padding: 8px;
-                margin-bottom: 6px;
-                color: {C["text"]};
-            }}
-            QListWidget#PipeQueue::item:selected {{
-                border-color: {C["amber"]};
-                background: {C["amber_soft"]};
-            }}
-            QScrollArea#PipeDetScroll {{
-                background: #0B0E12;
-                border: none;
-                border-top: 1px solid {C["line"]};
-            }}
-            QScrollArea#PipeDetScroll > QWidget > QWidget {{
-                background: #0B0E12;
-            }}
-            QScrollArea#ClassDistScroll {{
-                background: #0B0E12;
-                border: none;
-                border-top: 1px solid {C["line"]};
-            }}
-            QScrollArea#ClassDistScroll QWidget {{
-                background: #0B0E12;
-            }}
-            QWidget#ClassDistHost, QWidget#ClassBarRow {{
-                background-color: #0B0E12;
-                color: {C["text"]};
-            }}
-            QWidget#PipeDetHost, QWidget#PipeDetRow {{
-                background-color: #0B0E12;
-                color: {C["text"]};
-            }}
-            QWidget#PipeDetHost QLabel {{
-                background: transparent;
-                color: {C["text"]};
-            }}
-            QLabel#PipeDetMuted {{
-                background: transparent;
-                color: {C["muted"]};
-                font-size: 11px;
-            }}
-            QLabel#PipeDetConf {{
-                background: #171B22;
-                color: {C["text"]};
-                font-family: Consolas, "JetBrains Mono", monospace;
-                border: 1px solid {C["line"]};
-                border-radius: 999px;
-                padding: 2px 6px;
-            }}
-            QPlainTextEdit#PipeLog, QPlainTextEdit#training_log_box {{
-                background: #0B0E12;
-                color: #d5dae3;
-                border: 1px solid {C["line"]};
-                border-radius: 10px;
-                font-family: Consolas, "JetBrains Mono", monospace;
-                font-size: 11px;
-                padding: 8px;
-            }}
-            QProgressBar#ShellProgress, QProgressBar#PipeProgress {{
-                background-color: #0B0E12;
-                border: 1px solid {C["line"]};
-                border-radius: 999px;
-                color: #ffffff;
-                font-weight: 700;
-                font-size: 12px;
-                text-align: center;
-                min-height: 10px;
-                max-height: 14px;
-            }}
-            QProgressBar#ShellProgress::chunk, QProgressBar#PipeProgress::chunk {{
-                background-color: {C["amber"]};
-                border-radius: 999px;
-            }}
-            QComboBox, QSpinBox, QLineEdit {{
-                background: #0B0E12;
-                color: {C["text"]};
-                border: 1px solid {C["line"]};
-                border-radius: 8px;
-                padding: 6px 8px;
-            }}
-            QSlider::groove:horizontal {{
-                height: 6px;
-                background: #0B0E12;
-                border: 1px solid {C["line"]};
-                border-radius: 999px;
-            }}
-            QSlider::handle:horizontal {{
-                width: 14px;
-                margin: -5px 0;
-                background: {C["amber"]};
-                border-radius: 7px;
-            }}
-            """
-        )
+        """Load olive-steel operator QSS from ``ui/yolo_factory_theme`` + ``.qss``."""
+        apply_yolo_factory_theme(self, self.PIPELINE_COLORS)
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         root = wrap_shell_tab_root_layout(self, "yolo")
-        root.setSpacing(14)
+        root.setSpacing(6)
 
+        # Compact chrome: brand + stamp + actions (no hero subtitle block).
         head = QHBoxLayout()
-        head.setSpacing(16)
-        head_left = QVBoxLayout()
-        head_left.setSpacing(8)
-        title = QLabel("YOLO fabrikası  —  iş akışı")
+        head.setSpacing(10)
+        title = QLabel("YOLO fabrikası")
         title.setObjectName("PipeMainTitle")
-        title.setStyleSheet(
-            "font-size:28px;font-weight:800;letter-spacing:-0.02em;color:#F2F3F5;"
-            "font-family:'Plus Jakarta Sans','Segoe UI',sans-serif;"
+        stamp = QLabel(self.UI_BUILD_STAMP, self)
+        stamp.setObjectName("PipeUiBuildStamp")
+        stamp.setToolTip(
+            "Onayla r4 — full-bleed tuval · üst toolstrip · yatay filmstrip · yan ray yok."
         )
-        sub = QLabel(
-            "Ekran artık vitrin değil tezgâh: her adım bir sonrakini besliyor. "
-            "Nerede takıldığını, sıradaki işin ne olduğunu ve eğitimi neyin engellediğini tek yerden görürsün."
-        )
-        sub.setWordWrap(True)
-        sub.setStyleSheet(
-            "color:#B7BFCB;font-size:14px;max-width:620px;line-height:1.55;"
-            "font-family:'Plus Jakarta Sans','Segoe UI',sans-serif;"
-        )
-        head_left.addWidget(title)
-        head_left.addWidget(sub)
-        head.addLayout(head_left, stretch=1)
-
-        head_actions = QHBoxLayout()
-        self.btn_open_dataset = QPushButton("📁 dataset/ klasörünü aç", self)
+        head.addWidget(title)
+        head.addWidget(stamp)
+        head.addStretch(1)
+        self.btn_status_toggle = QPushButton("Durum ▾", self)
+        self.btn_status_toggle.setObjectName("PipeBtn")
+        self.btn_status_toggle.setFixedHeight(int(_YF_BTN_HEIGHT_MAX))
+        self.btn_status_toggle.setToolTip("Sıradaki / engeller / canlı log (yan sütun değil)")
+        self.btn_status_toggle.clicked.connect(self._toggle_status_drawer)
+        self.btn_open_dataset = QPushButton("📁 dataset/", self)
         self.btn_open_dataset.setObjectName("PipeBtn")
+        self.btn_open_dataset.setFixedHeight(int(_YF_BTN_HEIGHT_MAX))
         self.btn_open_dataset.clicked.connect(self.on_open_dataset_folder_clicked)
         self.btn_refresh = QPushButton("↻ Yenile", self)
         self.btn_refresh.setObjectName("PipeBtn")
+        self.btn_refresh.setFixedHeight(int(_YF_BTN_HEIGHT_MAX))
         self.btn_refresh.clicked.connect(self.on_refresh_clicked)
-        head_actions.addWidget(self.btn_open_dataset)
-        head_actions.addWidget(self.btn_refresh)
-        head.addLayout(head_actions)
+        head.addWidget(self.btn_status_toggle)
+        head.addWidget(self.btn_open_dataset)
+        head.addWidget(self.btn_refresh)
         root.addLayout(head)
 
         root.addWidget(self._build_flow_section())
+        # KPI labels still created (tooltips / Yenile) — big dual metric cards gone.
         root.addWidget(self._build_strip_section())
 
-        body = QHBoxLayout()
-        body.setSpacing(16)
-        left_col = QVBoxLayout()
+        # Full-bleed step pages — NO left/right sandwich around the stack.
         self.step_stack = QStackedWidget(self)
+        self.step_stack.setObjectName("PipeStepStack")
         self.step_stack.addWidget(self._build_step_capture())
-        # W3 (dikey tasma): Onayla adimi dikey kaydirmali alana alinir.
-        # 1560x960'da govde ~384 px; canvas (min 620) + lejant + aksiyon
-        # cubugu ~800 px sigmadigi icin lejant ve aksiyon cubugu
-        # erisilemez kaliyordu. Kaydirma alani her boyutta alt satira
-        # inmeyi saglar; yatay kaydirma yalnizca pencere cok
-        # daraltilirsa devreye girer.
         review_page = self._build_step_review()
         review_scroll = QScrollArea(self)
         review_scroll.setObjectName("PipeReviewScroll")
@@ -5691,24 +5571,43 @@ class YOLOFactoryDialog(QDialog):
         review_scroll.setFrameShape(QFrame.Shape.NoFrame)
         review_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         review_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        review_scroll.setStyleSheet(
-            "QScrollArea#PipeReviewScroll { background: transparent; border: none; }"
-        )
         review_scroll.setWidget(review_page)
         self._review_scroll = review_scroll
         self.step_stack.addWidget(review_scroll)
-        self.step_stack.addWidget(self._build_step_prepare())
+        prepare_page = self._build_step_prepare()
+        prepare_scroll = QScrollArea(self)
+        prepare_scroll.setObjectName("PipePrepareScroll")
+        prepare_scroll.setWidgetResizable(True)
+        prepare_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        prepare_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        prepare_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        prepare_scroll.setWidget(prepare_page)
+        self._prepare_scroll = prepare_scroll
+        self.step_stack.addWidget(prepare_scroll)
         self.step_stack.addWidget(self._build_step_train())
         self.step_stack.addWidget(self._build_step_validate())
         self.step_stack.addWidget(self._build_step_publish())
-        left_col.addWidget(self.step_stack)
-        body.addLayout(left_col, stretch=1)
-        body.addWidget(self._build_right_rail(), stretch=0)
-        root.addLayout(body, stretch=1)
+        root.addWidget(self.step_stack, stretch=1)
 
-        # Alttaki filtreli Canlı Günlük şeridi (prototip): Tümü / INFO /
-        # Önizleme + Temizle. Sağdaki Canlı log ile aynı akışı gösterir.
+        # Former right rail → collapsible bottom status drawer (not a 280–330px column).
+        self._status_drawer = self._build_right_rail()
+        self._status_drawer.setObjectName("PipeStatusDrawer")
+        self._status_drawer.setVisible(False)
+        root.addWidget(self._status_drawer)
+
+        status_line = QFrame(self)
+        status_line.setObjectName("PipeStatusLine")
+        sl = QHBoxLayout(status_line)
+        sl.setContentsMargins(8, 2, 8, 2)
+        sl.setSpacing(8)
+        self.status_line_summary = QLabel("Durum hazır", status_line)
+        self.status_line_summary.setObjectName("PipeStatusSummary")
+        sl.addWidget(self.status_line_summary, stretch=1)
+        root.addWidget(status_line)
+
+        # Kabuk CANLI GÜNLÜK tek kaynak — şerit API'si durur, sayfada gizlenir.
         self.live_journal_strip = self._build_live_journal_strip()
+        self.live_journal_strip.hide()
         root.addWidget(self.live_journal_strip)
 
         # Compatibility aliases used by older handlers / tests
@@ -5722,92 +5621,90 @@ class YOLOFactoryDialog(QDialog):
         self.btn_close.hide()
         self.btn_close.clicked.connect(self.close)
 
-        # [YOLO-ASYNC] Yükleme katmanı + görünür satır küçük resim tetikleyicisi.
+        # [YOLO-ASYNC] Yükleme katmanı + görünür filmstrip küçük resim tetikleyicisi.
         self._build_yolo_loading_overlay()
         self._wire_queue_thumb_requests()
 
+    def _toggle_status_drawer(self) -> None:
+        drawer = getattr(self, "_status_drawer", None)
+        btn = getattr(self, "btn_status_toggle", None)
+        if drawer is None:
+            return
+        show = not drawer.isVisible()
+        drawer.setVisible(show)
+        if btn is not None:
+            btn.setText("Durum ▴" if show else "Durum ▾")
+
     def _build_flow_section(self) -> QFrame:
+        """Thin single-line stepper: numbers + short names only (no six big cards)."""
         C = self.PIPELINE_COLORS
         frame = QFrame(self)
         frame.setObjectName("PipeFlow")
-        lay = QVBoxLayout(frame)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(12)
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(6)
 
-        head = QHBoxLayout()
-        title = QLabel("Üretim hattı — dataset v4")
-        title.setStyleSheet("font-size:14px;font-weight:800;")
-        self.flow_summary = QLabel("Adım 1/6 · Yakala")
-        self.flow_summary.setStyleSheet(f"color:{C['muted']};font-size:13px;")
-        head.addWidget(title)
-        head.addStretch()
-        head.addWidget(self.flow_summary)
-        lay.addLayout(head)
+        self.flow_summary = QLabel("1/6 · Yakala")
+        self.flow_summary.setObjectName("PipeFlowSummary")
+        self.flow_summary.setStyleSheet(f"color:{C['muted']};font-size:11px;")
+        lay.addWidget(self.flow_summary)
 
-        track = QHBoxLayout()
-        track.setSpacing(8)
         specs = [
-            (1, "1 · Yakala", "Canlı kare + zaman makinesi ile toplama"),
-            (2, "2 · Onayla", "Otomatik etiketleri tek tek gözden geçir"),
-            (3, "3 · Hazırla", "Sağlık kontrolü, bölme, çoğaltma, dondur"),
-            (4, "4 · Eğit", "RTX üzerinde eğitim çalıştır"),
-            (5, "5 · Doğrula", "mAP, sınıf bazlı AP, hata kareleri"),
-            (6, "6 · Yayınla", "Format seç, modele yaz, botu güncelle"),
+            (1, "Yakala"),
+            (2, "Onayla"),
+            (3, "Hazırla"),
+            (4, "Eğit"),
+            (5, "Doğrula"),
+            (6, "Yayınla"),
         ]
-        for step, title_txt, desc in specs:
-            btn = QPushButton(self)
+        for step, short in specs:
+            btn = QPushButton(f"{step} {short}", self)
             btn.setObjectName("PipeStep")
-            btn.setMinimumHeight(112)
+            btn.setFixedHeight(26)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setProperty("pipe_step", step)
-            inner = QVBoxLayout(btn)
-            inner.setContentsMargins(4, 2, 4, 2)
-            inner.setSpacing(4)
-            num = QLabel(str(step))
+            # Keep num/status attrs for existing stepper refresh / pending updates.
+            num = QLabel(str(step), btn)
             num.setObjectName("PipeStepNum")
-            num.setFixedSize(26, 26)
-            num.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            num.setStyleSheet(
-                f"background:{C['panel3']};border:1px solid {C['line2']};"
-                "border-radius:13px;font-family:Consolas;font-weight:700;font-size:13px;color:#B7BFCB;"
-            )
-            title_lbl = QLabel(title_txt)
-            title_lbl.setStyleSheet("font-size:15px;font-weight:800;background:transparent;border:none;")
-            desc_lbl = QLabel(desc)
-            desc_lbl.setWordWrap(True)
-            desc_lbl.setStyleSheet(f"font-size:12px;color:{C['muted']};background:transparent;border:none;")
-            st_lbl = QLabel("—")
+            num.hide()
+            st_lbl = QLabel("—", btn)
             st_lbl.setObjectName("PipeStepStatus")
-            st_lbl.setStyleSheet(
-                f"font-size:10px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;"
-                f"color:{C['muted']};background:transparent;border:none;"
-            )
-            inner.addWidget(num)
-            inner.addWidget(title_lbl)
-            inner.addWidget(desc_lbl)
-            inner.addStretch()
-            inner.addWidget(st_lbl)
+            st_lbl.hide()
             btn._num_lbl = num  # type: ignore[attr-defined]
             btn._st_lbl = st_lbl  # type: ignore[attr-defined]
+            btn._title_txt = short  # type: ignore[attr-defined]
             btn.clicked.connect(lambda _=False, s=step: self._go_step(s))
             self._step_buttons[step] = btn
-            track.addWidget(btn, stretch=1)
-        lay.addLayout(track)
+            lay.addWidget(btn)
+
+        self.chip_pending = QLabel("0 bekleyen", self)
+        self.chip_pending.setObjectName("PipePendingChip")
+        self.chip_pending.setToolTip("Onay bekleyen kare sayısı")
+        lay.addWidget(self.chip_pending)
 
         self.flow_bar = QProgressBar(self)
         self.flow_bar.setObjectName("PipeProgress")
         self.flow_bar.setRange(0, 100)
         self.flow_bar.setValue(8)
         self.flow_bar.setTextVisible(False)
-        self.flow_bar.setFixedHeight(8)
+        self.flow_bar.setFixedHeight(4)
+        self.flow_bar.setFixedWidth(72)
         lay.addWidget(self.flow_bar)
+        lay.addStretch(1)
         return frame
 
     def _build_strip_section(self) -> QWidget:
+        """KPI label host only — big VERİ SETİ / ONAY BEKLEYEN cards removed from chrome.
+
+        Values stay reachable via Yenile tooltip + pending chip on the stepper.
+        """
         host = QWidget(self)
+        host.setObjectName("PipeStatHost")
+        host.setFixedHeight(0)
+        host.hide()
         row = QHBoxLayout(host)
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(10)
+        row.setSpacing(0)
 
         self.stat_frames_value, self.stat_frames_sub, c1 = self._make_stat(
             "Veri seti", "0 / 100.000", "Train 0 · Val 0 · 0 kutu", "PipeStat"
@@ -5821,9 +5718,35 @@ class YOLOFactoryDialog(QDialog):
         self.stat_model_value, self.stat_model_sub, c4 = self._make_stat(
             "Son model", "best.pt", "models/ altında", "PipeStatGood"
         )
+        self._stat_cards = {
+            "frames": c1,
+            "pending": c2,
+            "empty": c3,
+            "model": c4,
+        }
         for card in (c1, c2, c3, c4):
-            row.addWidget(card, stretch=1)
+            card.hide()
+            row.addWidget(card)
+        self.btn_refresh.setToolTip(
+            "Yenile — veri seti / bekleyen / boş sınıf / model özeti güncellenir"
+        )
+        self._refresh_stat_strip_visibility()
         return host
+
+    def _refresh_stat_strip_visibility(self) -> None:
+        """r4: big metric cards stay hidden; only pending chip near stepper is chrome."""
+        cards = getattr(self, "_stat_cards", None)
+        if cards:
+            for card in cards.values():
+                card.hide()
+        chip = getattr(self, "chip_pending", None)
+        if chip is not None:
+            step = int((getattr(self, "_pipeline", {}) or {}).get("step", 1) or 1)
+            # Always-available tiny chip; strongest on Onayla.
+            chip.setVisible(True)
+            chip.setProperty("pipe_active", step == 2)
+            chip.style().unpolish(chip)
+            chip.style().polish(chip)
 
     def _make_stat(
         self, caption: str, value: str, sub: str, object_name: str
@@ -5832,22 +5755,22 @@ class YOLOFactoryDialog(QDialog):
         card = QFrame(self)
         card.setObjectName(object_name)
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(14, 12, 14, 12)
-        lay.setSpacing(3)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(0)
         cap = QLabel(caption.upper())
         cap.setStyleSheet(
-            f"font-size:10px;letter-spacing:0.1em;font-weight:800;color:{C['muted']};"
+            f"font-size:9px;letter-spacing:0.08em;font-weight:800;color:{C['muted']};"
             "background:transparent;border:none;"
         )
         val = QLabel(value)
         val.setStyleSheet(
-            "font-family:Consolas,'JetBrains Mono',monospace;font-size:20px;font-weight:700;"
+            "font-family:Consolas,'Cascadia Mono',monospace;font-size:12px;font-weight:700;"
             "background:transparent;border:none;"
         )
         sub_lbl = QLabel(sub)
         sub_lbl.setWordWrap(True)
         sub_lbl.setStyleSheet(
-            f"font-size:11px;color:{C['muted']};background:transparent;border:none;"
+            f"font-size:10px;color:{C['muted']};background:transparent;border:none;"
         )
         lay.addWidget(cap)
         lay.addWidget(val)
@@ -6021,102 +5944,64 @@ class YOLOFactoryDialog(QDialog):
         return card
 
     def _build_step_review(self) -> QFrame:
+        """Onayla r4 — full-bleed preview, top toolstrip, horizontal filmstrip.
+
+        No left/right sandwich. Filters + bulk live in a compact top strip;
+        queue is a filmstrip under the canvas; CTAs dock under the preview.
+        Single güven slider (``queue_conf_slider`` / ``bulk_range`` alias).
+        """
         C = self.PIPELINE_COLORS
         card = QFrame(self)
-        card.setObjectName("PipeCard")
+        card.setObjectName("PipeReviewPage")
         lay = QVBoxLayout(card)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
+        lay.setSpacing(4)
 
-        # -------------------------------------------------------------
-        # 1. SOL PANEL: Kaydırılabilir Seçenekler, Filtreler & Kuyruk
-        # -------------------------------------------------------------
-        sidebar_scroll = QScrollArea(self)
-        sidebar_scroll.setObjectName("PipeSidebarScroll")
-        sidebar_scroll.setWidgetResizable(True)
-        sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        # R05: sabit 420 px (v1 sözleşmesi 340 px'ti). 340 px'te kuyruk
-        # kartlarındaki metin (stem + güven + sınıf özeti) sığmıyor ve
-        # sınıf filtresi combo'sunun en uzun öğesi (~485 px) paneli yatay
-        # kaydırmaya zorluyordu. 420 px'te kuyruk metni okunur; 2560
-        # hedef ekranda merkez canvas hâlâ açık ara en geniş alan.
-        # W3'ün gerçek taşma düzeltmeleri (dikey kaydırma, kısaltılmış
-        # çubuk, esnek sağ ray) aynen duruyor.
-        sidebar_scroll.setFixedWidth(420)
-        sidebar_scroll.setStyleSheet(
-            "QScrollArea#PipeSidebarScroll { background:#070a0e; border:none; border-right:1px solid #1e293b; }"
-            "QScrollArea#PipeSidebarScroll > QWidget { background:#070a0e; }"
-            "QScrollArea#PipeSidebarScroll QWidget { background-color:#070a0e; color:#F2F3F5; }"
-        )
+        def _compact(btn: QPushButton) -> QPushButton:
+            btn.setFixedHeight(int(_YF_BTN_HEIGHT_MAX))
+            return btn
 
-        side_widget = QWidget(self)
-        side_l = QVBoxLayout(side_widget)
-        side_l.setContentsMargins(10, 10, 10, 14)
-        side_l.setSpacing(10)
+        # ---- TOP TOOLSTRIP: progress + filters + conf + clear ----
+        tool = QFrame(self)
+        tool.setObjectName("PipeReviewToolstrip")
+        tool_l = QHBoxLayout(tool)
+        tool_l.setContentsMargins(6, 4, 6, 4)
+        tool_l.setSpacing(6)
 
-        # A) İlerleme & Başlık
-        intro_box = QFrame(self)
-        intro_box.setStyleSheet("background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:8px;")
-        intro_l = QVBoxLayout(intro_box)
-        intro_l.setContentsMargins(4, 4, 4, 4)
-        intro_l.setSpacing(6)
-
-        hdr_row = QHBoxLayout()
-        step_title = QLabel("Adım 2 — Onayla")
-        step_title.setStyleSheet("font-size:13px; font-weight:800; color:#38bdf8; background:transparent;")
-        hdr_row.addWidget(step_title)
-        hdr_row.addStretch()
         self.review_prog_txt = QLabel("0 / 0")
-        self.review_prog_txt.setStyleSheet("font-family:Consolas; font-weight:700; color:#cbd5e1; background:transparent;")
-        hdr_row.addWidget(self.review_prog_txt)
-        intro_l.addLayout(hdr_row)
-
-        pool = get_approved_pool(self._dataset_dir())
-        self.lbl_approved_count = QLabel(f"✓ {pool.get_approved_count()} Onaylandı", self)
-        self.lbl_approved_count.setObjectName("LblApprovedCount")
-        self.lbl_approved_count.setStyleSheet(
-            "background:#0d2818; color:#4ade80; font-family:Consolas; font-size:11px; font-weight:700;"
-            "border:1px solid #16a34a; border-radius:6px; padding:3px 8px;"
+        self.review_prog_txt.setStyleSheet(
+            f"font-family:Consolas; font-weight:700; font-size:11px; "
+            f"color:{C['text']}; background:transparent;"
         )
-        intro_l.addWidget(self.lbl_approved_count)
-
+        tool_l.addWidget(self.review_prog_txt)
         self.review_prog = QProgressBar(self)
         self.review_prog.setObjectName("PipeProgress")
         self.review_prog.setRange(0, 100)
         self.review_prog.setValue(0)
         self.review_prog.setTextVisible(False)
-        self.review_prog.setFixedHeight(7)
-        intro_l.addWidget(self.review_prog)
-
-        step_hint = QLabel("Kısayol: A onayla · R reddet · S atla · K karakterimi etiketle")
-        step_hint.setStyleSheet("font-size:10px; color:#64748b; background:transparent;")
-        intro_l.addWidget(step_hint)
-        side_l.addWidget(intro_box)
-
-        # B) Arama ve Kuyruk Filtreleri
-        filter_box = QFrame(self)
-        filter_box.setStyleSheet("background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:8px;")
-        filter_l = QVBoxLayout(filter_box)
-        filter_l.setContentsMargins(4, 4, 4, 4)
-        filter_l.setSpacing(6)
-
-        flt_hdr = QLabel("🔍 Filtre & Arama")
-        flt_hdr.setStyleSheet("font-size:11px; font-weight:700; color:#94a3b8; background:transparent;")
-        filter_l.addWidget(flt_hdr)
+        self.review_prog.setFixedHeight(5)
+        self.review_prog.setFixedWidth(80)
+        tool_l.addWidget(self.review_prog)
+        pool = get_approved_pool(self._dataset_dir())
+        self.lbl_approved_count = QLabel(f"✓ {pool.get_approved_count()} Onaylandı", self)
+        self.lbl_approved_count.setObjectName("LblApprovedCount")
+        self.lbl_approved_count.setStyleSheet(
+            f"background:{C['green_soft']}; color:{C['green']}; font-family:Consolas; "
+            f"font-size:10px; font-weight:700; border:1px solid #1E4D33; "
+            f"border-radius:4px; padding:1px 5px;"
+        )
+        tool_l.addWidget(self.lbl_approved_count)
 
         self.review_search_edit = QLineEdit(self)
         self.review_search_edit.setObjectName("PipeSearch")
         self.review_search_edit.setPlaceholderText("🔍 Dosya / stem ara...")
+        self.review_search_edit.setMaximumWidth(180)
         self.review_search_edit.textChanged.connect(self._on_search_text_changed)
         self.edit_search = self.review_search_edit
-        filter_l.addWidget(self.review_search_edit)
+        tool_l.addWidget(self.review_search_edit)
 
         self.queue_filter = QComboBox(self)
         self.queue_filter.setObjectName("PipeCombo")
-        # Prototip (panel-2) durum filtresi: Tümü / Bekleyen / Onaylanan /
-        # Reddedilen / Yüksek güvenli / Düşük güvenli. Eski modlar
-        # (suspicious/confident/...) _filtered_review_indices'te programatik
-        # olarak desteklenmeye devam eder, combo'da gösterilmez.
         self.queue_filter.addItem("Tümü (Tüm Kareler)", "all")
         self.queue_filter.addItem("Bekleyenler", "pending")
         self.queue_filter.addItem("Onaylananlar", "ok")
@@ -6124,137 +6009,109 @@ class YOLOFactoryDialog(QDialog):
         self.queue_filter.addItem("Yüksek güvenli (≥ kaydırıcı eşiği)", "high")
         self.queue_filter.addItem("Düşük güvenli (< kaydırıcı eşiği)", "low")
         self.queue_filter.currentIndexChanged.connect(self._on_queue_filter_changed)
-        filter_l.addWidget(self.queue_filter)
+        self.queue_filter.setMaximumWidth(160)
+        tool_l.addWidget(self.queue_filter)
 
         self.review_class_filter = QComboBox(self)
         self.review_class_filter.setObjectName("PipeClassFilter")
-        # Sınıf filtresi en uzun öğeye göre ~485 px minimum genişlik
-        # ister; bu, sol paneli yatay kaydırmaya zorlayıp kuyruk
-        # kartlarını kırpıyordu. İçerik uzunluğuna göre ayarı kapatıp
-        # panel genişliğine uyması sağlanır (seçili metin elide edilir,
-        # tam metin açılır listede görünür).
         self.review_class_filter.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self.review_class_filter.setMinimumContentsLength(10)
+        self.review_class_filter.setMinimumContentsLength(8)
+        self.review_class_filter.setMaximumWidth(150)
         self.review_class_filter.addItem("Sınıf: Tümü", -1)
         for cid_opt, spec_opt in sorted(CLASS_ID_TO_SPEC.items()):
             cname_opt = spec_opt.get("key", f"class_{cid_opt}")
             lbl_tr = spec_opt.get("label_tr", cname_opt)
-            self.review_class_filter.addItem(f"Sınıf {cid_opt:02d}: {cname_opt} ({lbl_tr})", cid_opt)
+            self.review_class_filter.addItem(
+                f"Sınıf {cid_opt:02d}: {cname_opt} ({lbl_tr})", cid_opt
+            )
         self.review_class_filter.currentIndexChanged.connect(self._on_class_filter_changed)
-        filter_l.addWidget(self.review_class_filter)
+        tool_l.addWidget(self.review_class_filter)
 
-        # Kuyruk güven kaydırıcısı (prototip qConf): 0..95, adım 5 — kuyruğu
-        # minimum güvene göre süzer. Toplu-onay eşiği (bulk_range) ayrıdır.
-        conf_row = QHBoxLayout()
-        conf_row.addWidget(QLabel("Güven:"))
+        conf_lbl = QLabel("Güven ≥")
+        conf_lbl.setStyleSheet(f"font-size:11px; color:{C['muted']}; background:transparent;")
+        tool_l.addWidget(conf_lbl)
         self.queue_conf_slider = QSlider(Qt.Orientation.Horizontal, self)
         self.queue_conf_slider.setObjectName("PipeQueueConf")
-        self.queue_conf_slider.setRange(0, 95)
+        self.queue_conf_slider.setRange(0, 100)
         self.queue_conf_slider.setSingleStep(5)
         self.queue_conf_slider.setPageStep(5)
         self.queue_conf_slider.setValue(0)
+        self.queue_conf_slider.setMinimumWidth(90)
+        self.queue_conf_slider.setMaximumWidth(140)
+        self.queue_conf_slider.setToolTip(
+            "Tek eşik: kuyruk min güven filtresi + toplu onay + Emin rozeti + "
+            "yüksek/düşük durum filtresi. Temizlik floor'u ayrıdır (TRAIN_CONF_FLOOR)."
+        )
         self.queue_conf_val = QLabel("≥ 0,00")
-        self.queue_conf_val.setStyleSheet(
-            "font-family:Consolas; background:#0B0E12; border:1px solid #262D3A; border-radius:5px; padding:2px 6px;"
-        )
-        self.queue_conf_slider.valueChanged.connect(self._on_queue_conf_changed)
-        conf_row.addWidget(self.queue_conf_slider)
-        conf_row.addWidget(self.queue_conf_val)
-        filter_l.addLayout(conf_row)
+        self.queue_conf_val.setObjectName("PipeConfVal")
+        self.bulk_range = self.queue_conf_slider
+        self.bulk_val = self.queue_conf_val
+        self.queue_conf_slider.valueChanged.connect(self._on_unified_conf_changed)
+        self.queue_conf_slider.sliderReleased.connect(self._on_bulk_threshold_released)
+        tool_l.addWidget(self.queue_conf_slider, stretch=1)
+        tool_l.addWidget(self.queue_conf_val)
 
-        self.btn_clear_filters = QPushButton("Filtreleri temizle", self)
+        self.btn_clear_filters = _compact(QPushButton("Filtreleri temizle", self))
         self.btn_clear_filters.setObjectName("PipeBtn")
-        self.btn_clear_filters.setToolTip("Arama, durum, sınıf ve güven filtresini sıfırlar; kuyruğu hepsine döndürür.")
+        self.btn_clear_filters.setToolTip(
+            "Arama, durum, sınıf ve güven filtresini sıfırlar; kuyruğu hepsine döndürür."
+        )
         self.btn_clear_filters.clicked.connect(self._on_clear_filters)
-        filter_l.addWidget(self.btn_clear_filters)
-
-        slider_row = QHBoxLayout()
-        slider_row.addWidget(QLabel("Güven:"))
-        self.bulk_range = QSlider(Qt.Orientation.Horizontal, self)
-        self.bulk_range.setRange(0, 100)
-        self.bulk_range.setValue(int(round(CONF_BULK_DEFAULT * 100)))
-        self.bulk_val = QLabel(str(int(round(CONF_BULK_DEFAULT * 100))))
-        self.bulk_val.setStyleSheet(
-            "font-family:Consolas; background:#0B0E12; border:1px solid #262D3A; border-radius:5px; padding:2px 6px;"
-        )
-        # P1-12 (K-31): bu kaydırıcı TEK eşiktir — toplu onay, "Emin"
-        # rozeti, yüksek/düşük filtreleri ve sayaçlar aynı değeri okur.
-        self.bulk_range.setToolTip(
-            "Toplu onay + Emin rozeti eşiği: bu değer ve üstü toplu onaylanır, "
-            "rozet Emin sayılır; altı şüpheli kalır. Temizlik floor'u bu değer "
-            "DEĞİLDİR (temizlik her zaman TRAIN_CONF_FLOOR 0.45 kullanır)."
-        )
-        self.bulk_range.valueChanged.connect(self._on_bulk_threshold_changed)
-        self.bulk_range.sliderReleased.connect(self._on_bulk_threshold_released)
-        slider_row.addWidget(self.bulk_range)
-        slider_row.addWidget(self.bulk_val)
-        filter_l.addLayout(slider_row)
+        tool_l.addWidget(self.btn_clear_filters)
 
         self.chk_only_approved = QCheckBox("Sadece Onaylananlarla Eğit", self)
         self.chk_only_approved.setChecked(True)
-        self.chk_only_approved.setToolTip("Eğitim sadece onay havuzundaki (dataset/approved) doğrulanmış kareleri kullansın.")
+        self.chk_only_approved.setToolTip(
+            "Eğitim sadece onay havuzundaki (dataset/approved) doğrulanmış kareleri kullansın."
+        )
         self.chk_only_approved.toggled.connect(self._on_only_approved_toggled)
         self.toggle_approved_only = self.chk_only_approved
-        filter_l.addWidget(self.chk_only_approved)
-        side_l.addWidget(filter_box)
+        tool_l.addWidget(self.chk_only_approved)
 
-        # C) Kuyruk Listesi
-        queue_box = QFrame(self)
-        queue_box.setStyleSheet("background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:6px;")
-        queue_l = QVBoxLayout(queue_box)
-        queue_l.setContentsMargins(4, 4, 4, 4)
-        queue_l.setSpacing(4)
-        self.queue_filter_lbl = QLabel("Kuyruk")
-        self.queue_filter_lbl.setStyleSheet("color:#94a3b8; font-size:11px; font-weight:700; background:transparent;")
-        queue_l.addWidget(self.queue_filter_lbl)
+        hint = QLabel("A·R·S·K · tekerlek zoom")
+        hint.setStyleSheet(f"font-size:10px; color:{C['muted2']}; background:transparent;")
+        hint.setAccessibleName("Adım 2 klavye ve fare kısayolları")
+        tool_l.addWidget(hint)
+        lay.addWidget(tool)
 
-        self.queue_list = QListWidget(self)
-        self.queue_list.setObjectName("PipeQueue")
-        # Okunur kuyruk: özel satır widget'ları değişken yükseklikli olduğu için
-        # uniform item sizes kapalı; liste 180px'e sıkıştırılmaz.
-        self.queue_list.setMinimumHeight(240)
-        self.queue_list.setUniformItemSizes(False)
-        self.queue_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.queue_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.queue_list.currentRowChanged.connect(self._on_queue_row_changed)
-        self.queue_list.installEventFilter(self)
-        queue_l.addWidget(self.queue_list)
-        side_l.addWidget(queue_box)
+        # ---- SECOND TOOLSTRIP: bulk + relabel (compact, always reachable) ----
+        bulk = QFrame(self)
+        bulk.setObjectName("PipeReviewBulkstrip")
+        bulk_l = QHBoxLayout(bulk)
+        bulk_l.setContentsMargins(6, 2, 6, 2)
+        bulk_l.setSpacing(4)
 
-        # D) Toplu İşlemler
-        bulk_box = QFrame(self)
-        bulk_box.setStyleSheet("background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:6px;")
-        bulk_l = QVBoxLayout(bulk_box)
-        bulk_l.setContentsMargins(4, 4, 4, 4)
-        bulk_l.setSpacing(6)
-        bulk_hdr = QLabel("⚡ Toplu İşlemler")
-        bulk_hdr.setStyleSheet("font-size:11px; font-weight:700; color:#94a3b8; background:transparent;")
-        bulk_l.addWidget(bulk_hdr)
-
-        self.btn_bulk = QPushButton("Eşik üstünü onayla", self)
-        self.btn_bulk.setObjectName("PipeGreen")
+        self.btn_bulk = _compact(QPushButton("Eşik üstünü onayla", self))
+        self.btn_bulk.setObjectName("PipeBtn")
+        self.btn_bulk.setToolTip(
+            "Filtredeki karelerde toplu eşik üstü kutuları onaylar "
+            "(Filtredekileri Onayla ile aynı işlem)."
+        )
         self.btn_bulk.clicked.connect(self._bulk_approve)
         self.btn_bulk_approve = self.btn_bulk
         bulk_l.addWidget(self.btn_bulk)
 
-        # Prototip "Filtredekileri Onayla (n)": o anki filtredeki karelerin
-        # tamamını onaylar — _bulk_approve zaten filtrelenen indekste çalışır.
-        self.btn_approve_filtered = QPushButton("✓ Filtredekileri Onayla (0)", self)
-        self.btn_approve_filtered.setObjectName("PipeGreen")
-        self.btn_approve_filtered.setToolTip("O anki arama/durum/sınıf/güven filtresine uyan karelerin tamamını onaylar.")
+        self.btn_approve_filtered = _compact(QPushButton("✓ Filtredekileri Onayla (0)", self))
+        self.btn_approve_filtered.setObjectName("PipePrimary")
+        self.btn_approve_filtered.setToolTip(
+            "O anki arama/durum/sınıf/güven filtresine uyan karelerin tamamını onaylar "
+            "(birincil toplu onay)."
+        )
+        self.btn_approve_filtered.setAccessibleName("Filtredekileri toplu onayla")
         self.btn_approve_filtered.clicked.connect(self._bulk_approve)
         bulk_l.addWidget(self.btn_approve_filtered)
 
-        self.btn_bulk_reject = QPushButton("Eşik altını reddet", self)
+        self.btn_bulk_reject = _compact(QPushButton("Eşik altını reddet", self))
         self.btn_bulk_reject.setObjectName("PipeDanger")
-        self.btn_bulk_reject.setToolTip("Seçili filtredeki tüm kareleri diskten siler (train’e girmez).")
+        self.btn_bulk_reject.setToolTip(
+            "Seçili filtredeki tüm kareleri diskten siler (train’e girmez)."
+        )
         self.btn_bulk_reject.clicked.connect(self._bulk_reject_filtered)
         bulk_l.addWidget(self.btn_bulk_reject)
 
-        self.btn_purge_omni = QPushButton("Zehirli otomatik temizle", self)
+        self.btn_purge_omni = _compact(QPushButton("Zehirli otomatik temizle", self))
         self.btn_purge_omni.setObjectName("PipeDanger")
         self.btn_purge_omni.setToolTip(
             "omni_* sahte kutuları + HUD/minimap yanlış sınıfları + eşik altı weak’i siler. "
@@ -6263,7 +6120,7 @@ class YOLOFactoryDialog(QDialog):
         self.btn_purge_omni.clicked.connect(self._purge_poisoned_labels)
         bulk_l.addWidget(self.btn_purge_omni)
 
-        self.btn_requeue_dataset = QPushButton("Mevcut seti onaya geri al", self)
+        self.btn_requeue_dataset = _compact(QPushButton("Seti onaya geri al", self))
         self.btn_requeue_dataset.setObjectName("PipeBtn")
         self.btn_requeue_dataset.setToolTip(
             "Train/val görüntü + etiketlerini Adım 2 onay kuyruğuna yeniden yükler. "
@@ -6272,153 +6129,114 @@ class YOLOFactoryDialog(QDialog):
         )
         self.btn_requeue_dataset.clicked.connect(self._requeue_existing_dataset)
         bulk_l.addWidget(self.btn_requeue_dataset)
-        side_l.addWidget(bulk_box)
 
-        # E) Yeniden Etiketleme Araçları
-        relabel_box = QFrame(self)
-        relabel_box.setStyleSheet("background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:6px;")
-        relabel_l = QVBoxLayout(relabel_box)
-        relabel_l.setContentsMargins(4, 4, 4, 4)
-        relabel_l.setSpacing(6)
-        relabel_hdr = QLabel("🤖 Yeniden Etiketleme")
-        relabel_hdr.setStyleSheet("font-size:11px; font-weight:700; color:#94a3b8; background:transparent;")
-        relabel_l.addWidget(relabel_hdr)
-
-        self.btn_auto_label_unlabeled_suspicious = QPushButton("⚡ Etiketsiz & Şüphelileri Etiketle", self)
+        self.btn_auto_label_unlabeled_suspicious = _compact(
+            QPushButton("⚡ Etiketsiz & Şüphelileri Etiketle", self)
+        )
         self.btn_auto_label_unlabeled_suspicious.setObjectName("PipeGreen")
         self.btn_auto_label_unlabeled_suspicious.setToolTip(
             "Etiketsiz (0 kutu) ve şüpheli kareleri tespit edip otomatik olarak YZ ve görsel hafıza ile etiketler. "
             "El etiketli kareler hedefe girmez."
         )
-        self.btn_auto_label_unlabeled_suspicious.clicked.connect(self._auto_label_unlabeled_suspicious)
-        relabel_l.addWidget(self.btn_auto_label_unlabeled_suspicious)
+        self.btn_auto_label_unlabeled_suspicious.clicked.connect(
+            self._auto_label_unlabeled_suspicious
+        )
+        bulk_l.addWidget(self.btn_auto_label_unlabeled_suspicious)
 
-        self.btn_live_relabel_filtered = QPushButton("🎯 Filtredekileri Canlı Etiketle (0 kare)", self)
+        self.btn_live_relabel_filtered = _compact(
+            QPushButton("🎯 Filtredekileri Canlı Etiketle (0)", self)
+        )
         self.btn_live_relabel_filtered.setObjectName("PipeBtn")
         self.btn_live_relabel_filtered.clicked.connect(self._toggle_live_relabel_filtered)
-        relabel_l.addWidget(self.btn_live_relabel_filtered)
+        bulk_l.addWidget(self.btn_live_relabel_filtered)
 
-        self.btn_live_relabel_all = QPushButton("🤖 Tümünü Canlı Yeniden Etiketle", self)
+        self.btn_live_relabel_all = _compact(QPushButton("🤖 Tümünü Canlı Yeniden Etiketle", self))
         self.btn_live_relabel_all.setObjectName("PipeBtn")
         self.btn_live_relabel_all.clicked.connect(self._toggle_live_relabel_all)
-        relabel_l.addWidget(self.btn_live_relabel_all)
+        bulk_l.addWidget(self.btn_live_relabel_all)
 
-        self.btn_prune_low_confidence = QPushButton("✂️ Düşük Güvenlileri Sil", self)
+        self.btn_prune_low_confidence = _compact(QPushButton("✂️ Düşük Güvenlileri Sil", self))
         self.btn_prune_low_confidence.setObjectName("PipeDanger")
         self.btn_prune_low_confidence.clicked.connect(self._bulk_prune_low_confidence_boxes)
         self.btn_bulk_prune_boxes = self.btn_prune_low_confidence
-        relabel_l.addWidget(self.btn_prune_low_confidence)
+        bulk_l.addWidget(self.btn_prune_low_confidence)
 
-        self.btn_relabel_current_frame = QPushButton("⚡ Bu Kareyi Yeniden Etiketle", self)
+        self.btn_relabel_current_frame = _compact(QPushButton("⚡ Bu Kareyi Yeniden Etiketle", self))
         self.btn_relabel_current_frame.setObjectName("PipeBtn")
         self.btn_relabel_current_frame.clicked.connect(self._relabel_current_frame_clicked)
-        relabel_l.addWidget(self.btn_relabel_current_frame)
+        bulk_l.addWidget(self.btn_relabel_current_frame)
 
-        self.btn_relabel_selected_frames = QPushButton("Seçilenleri Yeniden Etiketle", self)
+        self.btn_relabel_selected_frames = _compact(QPushButton("Seçilenleri Yeniden Etiketle", self))
         self.btn_relabel_selected_frames.setObjectName("PipeBtn")
         self.btn_relabel_selected_frames.clicked.connect(self._relabel_selected_frames_clicked)
-        relabel_l.addWidget(self.btn_relabel_selected_frames)
-        side_l.addWidget(relabel_box)
+        bulk_l.addWidget(self.btn_relabel_selected_frames)
+        bulk_l.addStretch(1)
+        lay.addWidget(bulk)
 
-        # F) Çizim Sınıfı Seçim Paneli (25 Sınıf Paleti)
-        self.tag_panel = SearchableTagListPanel(self)
-        self.manual_tag_search = self.tag_panel.search_edit
-        self.manual_tag_combo = self.tag_panel.combo
-        self.manual_tag_list = self.tag_panel.list_widget
-        self.tag_panel.classSelected.connect(self._on_drawing_class_selected)
-        side_l.addWidget(self.tag_panel)
-
-        # G) Mevcut Karedeki Etiket Listesi
-        self.det_host = QWidget(self)
-        self.det_host.setObjectName("PipeDetHost")
-        self.det_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.det_host.setAutoFillBackground(True)
-        det_pal = self.det_host.palette()
-        det_pal.setColor(QPalette.ColorRole.Window, QColor("#0B0E12"))
-        det_pal.setColor(QPalette.ColorRole.Base, QColor("#0B0E12"))
-        det_pal.setColor(QPalette.ColorRole.Text, QColor(C["text"]))
-        self.det_host.setPalette(det_pal)
-        self.det_host.setStyleSheet(
-            "QWidget#PipeDetHost { background-color:#0B0E12; color:#F2F3F5; }"
-            "QWidget#PipeDetHost QLabel { background:transparent; color:#F2F3F5; }"
-        )
-        self.det_layout = QVBoxLayout(self.det_host)
-        self.det_layout.setContentsMargins(8, 4, 8, 4)
-        self.det_layout.setSpacing(4)
-        det_scroll = QScrollArea(self)
-        det_scroll.setObjectName("PipeDetScroll")
-        det_scroll.setWidgetResizable(True)
-        det_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        det_scroll.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        det_scroll.setStyleSheet(
-            "QScrollArea#PipeDetScroll { background:#0B0E12; border:1px solid #1e293b; border-radius:6px; }"
-            "QScrollArea#PipeDetScroll > QWidget { background:#0B0E12; }"
-            "QScrollArea#PipeDetScroll QWidget { background-color:#0B0E12; color:#F2F3F5; }"
-        )
-        det_scroll.setWidget(self.det_host)
-        det_scroll.setMinimumHeight(150)
-        self._det_scroll = det_scroll
-        side_l.addWidget(det_scroll)
-
-        sidebar_scroll.setWidget(side_widget)
-
-        # -------------------------------------------------------------
-        # 2. SAĞ PANEL: DEV ETİKETLEME CANVAS'I VE AKSİYONLAR
-        # -------------------------------------------------------------
-        right = QVBoxLayout()
-        right.setContentsMargins(6, 4, 6, 6)
-        right.setSpacing(6)
-
-        # Üst Başlık & Durum Çubuğu
-        title_row = QHBoxLayout()
-        title_row.setContentsMargins(4, 2, 4, 2)
-        title_row.setSpacing(10)
+        # ---- META + ZOOM over full-bleed canvas ----
+        meta = QHBoxLayout()
+        meta.setContentsMargins(6, 0, 6, 0)
+        meta.setSpacing(6)
         self.review_title = QLabel("Kare —")
         self.review_title.setStyleSheet(
-            f"font-size:14px; font-weight:800; color:{C['text']}; background:transparent;"
+            f"font-size:13px; font-weight:800; color:{C['text']}; background:transparent;"
         )
         self.review_sub = QLabel("")
-        self.review_sub.setStyleSheet(f"color:{C['muted']}; font-size:12px; background:transparent;")
-        title_row.addWidget(self.review_title)
-        title_row.addWidget(self.review_sub)
-        title_row.addStretch()
-        right.addLayout(title_row)
-
-        # Fotoğraf üstü şerit (prototip scene-head): Hız/Kalan göstergesi +
-        # Tam Ekran (Lightbox). Canlı önizleme satırı TEK: canvas'ın kendi
-        # paintEvent başlığı çizer (lbl_preview_live çift satırdı, kaldırıldı).
-        # Bu ekranda Kinah tutarı gösterilmez.
-        preview_head = QHBoxLayout()
-        preview_head.setContentsMargins(4, 2, 4, 2)
-        preview_head.setSpacing(10)
-        preview_head.addStretch(1)
-
+        self.review_sub.setStyleSheet(
+            f"color:{C['muted']}; font-size:11px; background:transparent;"
+        )
+        meta.addWidget(self.review_title)
+        meta.addWidget(self.review_sub)
+        meta.addStretch(1)
         self.lbl_speed_meter = QLabel("⚡ Hız: — · Kalan: — · 0 / 0", self)
         self.lbl_speed_meter.setObjectName("PipeSpeedMeter")
         self.lbl_speed_meter.setStyleSheet(
-            "font-family:Consolas; font-size:11px; color:#38bdf8; background:#0B0E12; "
-            "border:1px solid #1e293b; border-radius:6px; padding:4px 8px;"
+            f"font-family:Consolas; font-size:11px; color:{C['muted']}; background:{C['bg']}; "
+            f"border:1px solid {C['line']}; border-radius:4px; padding:2px 6px;"
         )
-        preview_head.addWidget(self.lbl_speed_meter)
-
-        self.btn_open_lightbox = QPushButton("⛶ Tam Ekran (Lightbox)", self)
+        meta.addWidget(self.lbl_speed_meter)
+        self.btn_zoom_out = _compact(QPushButton("−", self))
+        self.btn_zoom_out.setObjectName("PipeBtn")
+        self.btn_zoom_out.setFixedWidth(28)
+        self.btn_zoom_out.setToolTip("Uzaklaştır (tekerlek aşağı · −)")
+        self.btn_zoom_out.setAccessibleName("Uzaklaştır")
+        self.btn_zoom_reset = _compact(QPushButton("100%", self))
+        self.btn_zoom_reset.setObjectName("PipeBtn")
+        self.btn_zoom_reset.setMinimumWidth(44)
+        self.btn_zoom_reset.setToolTip(
+            "Görünümü sığdır (Ctrl+0) — kare değişince de sıfırlanır"
+        )
+        self.btn_zoom_reset.setAccessibleName("Yakınlaştırmayı sıfırla yüzde yüz")
+        self.btn_zoom_in = _compact(QPushButton("+", self))
+        self.btn_zoom_in.setObjectName("PipeBtn")
+        self.btn_zoom_in.setFixedWidth(28)
+        self.btn_zoom_in.setToolTip("Yakınlaştır (tekerlek yukarı · +)")
+        self.btn_zoom_in.setAccessibleName("Yakınlaştır")
+        for zb in (self.btn_zoom_out, self.btn_zoom_reset, self.btn_zoom_in):
+            zb.setCursor(Qt.CursorShape.PointingHandCursor)
+            meta.addWidget(zb)
+        self.btn_open_lightbox = _compact(QPushButton("⛶ Tam Ekran (Lightbox)", self))
         self.btn_open_lightbox.setObjectName("PipeBtn")
-        self.btn_open_lightbox.setStyleSheet("font-size:11px; padding:4px 12px;")
-        self.btn_open_lightbox.setToolTip("Görseli büyük ekranda incele (Çift tıklayarak da açabilirsiniz)")
+        self.btn_open_lightbox.setToolTip(
+            "Görseli büyük ekranda incele (Çift tıklayarak da açabilirsiniz)"
+        )
+        self.btn_open_lightbox.setAccessibleName("Tam ekran lightbox aç")
         self.btn_open_lightbox.clicked.connect(self._open_review_lightbox)
-        preview_head.addWidget(self.btn_open_lightbox)
-        right.addLayout(preview_head)
+        meta.addWidget(self.btn_open_lightbox)
+        lay.addLayout(meta)
 
-        # DEVASA YOLO ÖNİZLEME VE ETİKETLEME CANVAS'I
+        # ---- FULL-BLEED PREVIEW (primary plane) ----
         self.review_preview = YOLOPreviewCanvas(self)
         self.review_preview.setObjectName("PipeReviewPreview")
+        self.review_preview.setAccessibleName("YOLO etiket önizleme tuvali")
         self.review_preview.setMinimumHeight(620)
         self.review_preview.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self.review_preview.setCursor(Qt.CursorShape.CrossCursor)
         self.review_preview.setToolTip(
-            "Sol tık sürükle: Yeni kutu çiz · Kutuya tıkla: Seç · İçinden sürükle: Taşı · Kenar/Köşe tutamaçları: Büyüt/Küçült · Çift tık: Büyüt · Del: Sil"
+            "Sol tık sürükle: Yeni kutu çiz · Kutuya tıkla: Seç · İçinden sürükle: Taşı · "
+            "Kenar/Köşe tutamaçları: Büyüt/Küçült · Çift tık: Büyüt · Del: Sil"
         )
         self.review_preview.installEventFilter(self)
         self.review_preview.boxRemoveRequested.connect(
@@ -6427,58 +6245,51 @@ class YOLOFactoryDialog(QDialog):
         self.review_preview.boxChangeClassRequested.connect(self._prompt_change_class_for_box)
         self.review_preview.boxAdded.connect(self._on_manual_box_added)
         self.review_preview.boxEdited.connect(self._on_box_edited)
+        self.btn_zoom_in.clicked.connect(self.review_preview.zoom_in)
+        self.btn_zoom_out.clicked.connect(self.review_preview.zoom_out)
+        self.btn_zoom_reset.clicked.connect(lambda: self.review_preview.set_user_zoom(1.0))
+        self.review_preview.zoomChanged.connect(self._sync_review_zoom_label)
+        self._sync_review_zoom_label(self.review_preview.user_zoom())
         self._review_lightbox_pixmap: Optional[QPixmap] = None
-        right.addWidget(self.review_preview, stretch=10)
+        lay.addWidget(self.review_preview, stretch=10)
 
-        # Fotoğraf altı renk lejantı (prototip classLegend): tıklayınca kuyruğu
-        # o sınıfa süzer; aynı sınıfa tekrar tıklayınca filtre sıfırlanır.
-        self._build_class_legend()
-        right.addWidget(self.class_legend_scroll)
-
-        # Alt Büyük Aksiyon Çubuğu
-        # W3 (yatay tasma): buton yatay padding'leri kisildi (metinler ayni);
-        # cubuk minimumu ~930 px'ten ~838 px'e indi, 1560 px pencerede
-        # butonlar artik minimum genisliklerinin altinda sikismiyor.
+        # ---- CTA dock under canvas ----
         actions = QHBoxLayout()
-        actions.setContentsMargins(4, 6, 4, 4)
-        actions.setSpacing(10)
-
-        self.btn_approve = QPushButton("✓ ONAYLA VE SONRAKİ  (A)", self)
-        self.btn_approve.setObjectName("PipeGreen")
-        self.btn_approve.setStyleSheet("font-size:13px; font-weight:800; padding:10px 12px;")
+        actions.setContentsMargins(6, 2, 6, 2)
+        actions.setSpacing(6)
+        self.btn_approve = _compact(QPushButton("ONAYLA  (A)", self))
+        self.btn_approve.setObjectName("PipePrimary")
+        self.btn_approve.setMinimumWidth(110)
+        self.btn_approve.setAccessibleName("Onayla ve sonraki kareye geç")
+        self.btn_approve.setToolTip("Bu kareyi onayla ve sonrakine geç (A)")
         self.btn_approve.clicked.connect(self._on_step2_approve)
-
-        self.btn_reject = QPushButton("✕ REDDET  (R)", self)
+        self.btn_reject = _compact(QPushButton("REDDET  (R)", self))
         self.btn_reject.setObjectName("PipeDanger")
-        self.btn_reject.setStyleSheet("font-size:12px; font-weight:700; padding:10px 10px;")
+        self.btn_reject.setMinimumWidth(96)
+        self.btn_reject.setAccessibleName("Kareyi reddet ve sil")
+        self.btn_reject.setToolTip("Kareyi reddet / sil (R)")
         self.btn_reject.clicked.connect(self._on_step2_reject)
-
-        self.btn_skip = QPushButton("Atla  (S)", self)
+        self.btn_skip = _compact(QPushButton("Atla  (S)", self))
         self.btn_skip.setObjectName("PipeBtn")
-        self.btn_skip.setStyleSheet("font-size:12px; padding:10px 10px;")
+        self.btn_skip.setAccessibleName("Kareyi atla")
+        self.btn_skip.setToolTip("Kareyi atla (S)")
         self.btn_skip.clicked.connect(self._review_skip)
-
-        self.btn_add_player_char = QPushButton("🎯 Karakterimi Etiketle  (K)", self)
+        self.btn_add_player_char = _compact(QPushButton("Karakterimi Etiketle  (K)", self))
         self.btn_add_player_char.setObjectName("PipeBtn")
-        self.btn_add_player_char.setStyleSheet(
-            "font-size:12px; font-weight:700; padding:10px 10px; border:1px solid #00d2ff; color:#00d2ff; background:#082f49;"
-        )
         self.btn_add_player_char.setToolTip(
-            "Karakter kutusunu ekranın ortasına otomatik yerleştirir. Tutamaçları çekerek tam boyuta getirebilirsiniz. Kısayol: 'K'"
+            "Karakter kutusunu ekranın ortasına otomatik yerleştirir. "
+            "Tutamaçları çekerek tam boyuta getirebilirsiniz. Kısayol: 'K'"
         )
         self.btn_add_player_char.clicked.connect(self._add_player_character_box_to_current_frame)
-
-        self.btn_back_capture = QPushButton("← Yakala'ya dön", self)
+        self.btn_back_capture = _compact(QPushButton("← Yakala'ya dön", self))
         self.btn_back_capture.setObjectName("PipeBtn")
-        self.btn_back_capture.setStyleSheet("font-size:11px; padding:8px 8px;")
         self.btn_back_capture.clicked.connect(lambda: self._go_step(1))
-
-        self.btn_goto_train = QPushButton("Eğit adımına git →", self)
+        self.btn_goto_train = _compact(QPushButton("Eğit adımına git →", self))
         self.btn_goto_train.setObjectName("PipeBtn")
-        self.btn_goto_train.setStyleSheet("font-size:11px; font-weight:700; padding:8px 8px;")
-        self.btn_goto_train.setToolTip("Adım 4 — Eğit'e gider (veri seti dondurulmadan eğitim kilitlidir).")
+        self.btn_goto_train.setToolTip(
+            "Adım 4 — Eğit'e gider (veri seti dondurulmadan eğitim kilitlidir)."
+        )
         self.btn_goto_train.clicked.connect(lambda: self._go_step(4))
-
         actions.addWidget(self.btn_approve)
         actions.addWidget(self.btn_reject)
         actions.addWidget(self.btn_skip)
@@ -6486,23 +6297,80 @@ class YOLOFactoryDialog(QDialog):
         actions.addStretch()
         actions.addWidget(self.btn_back_capture)
         actions.addWidget(self.btn_goto_train)
-        right.addLayout(actions)
+        lay.addLayout(actions)
 
-        # Grid yerleşimi: Sol Scrollable Sidebar + Sağ Devasa Canvas
-        grid = QHBoxLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(0)
-        grid.addWidget(sidebar_scroll)
-        grid.addLayout(right, stretch=1)
-        lay.addLayout(grid, stretch=1)
+        # ---- HORIZONTAL FILMSTRIP (was tall left queue list) ----
+        film = QFrame(self)
+        film.setObjectName("PipeFilmstripHost")
+        film_l = QVBoxLayout(film)
+        film_l.setContentsMargins(4, 2, 4, 2)
+        film_l.setSpacing(2)
+        self.queue_filter_lbl = QLabel("Kuyruk", self)
+        self.queue_filter_lbl.setObjectName("PipeRailHdr")
+        film_l.addWidget(self.queue_filter_lbl)
+        self.queue_list = QListWidget(self)
+        self.queue_list.setObjectName("PipeQueue")
+        self.queue_list.setFlow(QListWidget.Flow.LeftToRight)
+        self.queue_list.setWrapping(False)
+        self.queue_list.setMovement(QListWidget.Movement.Static)
+        self.queue_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.queue_list.setViewMode(QListWidget.ViewMode.ListMode)
+        self.queue_list.setUniformItemSizes(True)
+        self.queue_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.queue_list.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.queue_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.queue_list.setFixedHeight(int(_YF_FILMSTRIP_HEIGHT))
+        self.queue_list.currentRowChanged.connect(self._on_queue_row_changed)
+        self.queue_list.installEventFilter(self)
+        film_l.addWidget(self.queue_list)
+        lay.addWidget(film)
 
-        # Kısayollar
-        # [P2-19/F044-03] Basılı tutulan A/R/S/K art arda kare
-        # onaylamasın/silmesin: QShortcut otomatik tekrarı kapalıdır
-        # (fiziksel tek basış = tek tetik). eventFilter/keyPressEvent
-        # yolunda aynı koruma `event.isAutoRepeat()` ile yapılır
-        # (`_review_shortcuts_allowed`).
-        self._shortcut_approve_a = QShortcut(QKeySequence(Qt.Key.Key_A), self, context=Qt.ShortcutContext.WindowShortcut)
+        # ---- Class legend under filmstrip ----
+        self._build_class_legend()
+        lay.addWidget(self.class_legend_scroll)
+
+        # ---- Bottom drawer: tag panel + detections (relocated, not deleted) ----
+        drawer = QFrame(self)
+        drawer.setObjectName("PipeReviewDrawer")
+        drawer_l = QHBoxLayout(drawer)
+        drawer_l.setContentsMargins(4, 2, 4, 4)
+        drawer_l.setSpacing(6)
+        self.tag_panel = SearchableTagListPanel(self)
+        self.tag_panel.setMaximumHeight(140)
+        self.manual_tag_search = self.tag_panel.search_edit
+        self.manual_tag_combo = self.tag_panel.combo
+        self.manual_tag_list = self.tag_panel.list_widget
+        self.tag_panel.classSelected.connect(self._on_drawing_class_selected)
+        drawer_l.addWidget(self.tag_panel, stretch=1)
+
+        self.det_host = QWidget(self)
+        self.det_host.setObjectName("PipeDetHost")
+        self.det_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.det_host.setAutoFillBackground(True)
+        det_pal = self.det_host.palette()
+        det_pal.setColor(QPalette.ColorRole.Window, QColor(C["bg"]))
+        det_pal.setColor(QPalette.ColorRole.Base, QColor(C["bg"]))
+        det_pal.setColor(QPalette.ColorRole.Text, QColor(C["text"]))
+        self.det_host.setPalette(det_pal)
+        self.det_layout = QVBoxLayout(self.det_host)
+        self.det_layout.setContentsMargins(6, 3, 6, 3)
+        self.det_layout.setSpacing(3)
+        det_scroll = QScrollArea(self)
+        det_scroll.setObjectName("PipeDetScroll")
+        det_scroll.setWidgetResizable(True)
+        det_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        det_scroll.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        det_scroll.setWidget(self.det_host)
+        det_scroll.setMaximumHeight(140)
+        self._det_scroll = det_scroll
+        drawer_l.addWidget(det_scroll, stretch=1)
+        lay.addWidget(drawer)
+
+        # Kısayollar — auto-repeat kapalı (P2-19/F044-03).
+        self._shortcut_approve_a = QShortcut(
+            QKeySequence(Qt.Key.Key_A), self, context=Qt.ShortcutContext.WindowShortcut
+        )
         self._shortcut_approve_a.activated.connect(self._handle_shortcut_approve)
         self._shortcut_approve_a.activatedAmbiguously.connect(self._handle_shortcut_approve)
         self._shortcut_approve_lower = self._shortcut_approve_a
@@ -6512,7 +6380,9 @@ class YOLOFactoryDialog(QDialog):
         except Exception:
             pass
 
-        self._shortcut_reject_r = QShortcut(QKeySequence(Qt.Key.Key_R), self, context=Qt.ShortcutContext.WindowShortcut)
+        self._shortcut_reject_r = QShortcut(
+            QKeySequence(Qt.Key.Key_R), self, context=Qt.ShortcutContext.WindowShortcut
+        )
         self._shortcut_reject_r.activated.connect(self._handle_shortcut_reject)
         self._shortcut_reject_r.activatedAmbiguously.connect(self._handle_shortcut_reject)
         self._shortcut_reject_lower = self._shortcut_reject_r
@@ -6522,7 +6392,9 @@ class YOLOFactoryDialog(QDialog):
         except Exception:
             pass
 
-        self._shortcut_skip_s = QShortcut(QKeySequence(Qt.Key.Key_S), self, context=Qt.ShortcutContext.WindowShortcut)
+        self._shortcut_skip_s = QShortcut(
+            QKeySequence(Qt.Key.Key_S), self, context=Qt.ShortcutContext.WindowShortcut
+        )
         self._shortcut_skip_s.activated.connect(self._handle_shortcut_skip)
         self._shortcut_skip_s.activatedAmbiguously.connect(self._handle_shortcut_skip)
         self._shortcut_skip_lower = self._shortcut_skip_s
@@ -6532,7 +6404,9 @@ class YOLOFactoryDialog(QDialog):
         except Exception:
             pass
 
-        self._shortcut_player_k = QShortcut(QKeySequence(Qt.Key.Key_K), self, context=Qt.ShortcutContext.WindowShortcut)
+        self._shortcut_player_k = QShortcut(
+            QKeySequence(Qt.Key.Key_K), self, context=Qt.ShortcutContext.WindowShortcut
+        )
         self._shortcut_player_k.activated.connect(self._handle_shortcut_player_char)
         self._shortcut_player_k.activatedAmbiguously.connect(self._handle_shortcut_player_char)
         try:
@@ -7138,16 +7012,17 @@ class YOLOFactoryDialog(QDialog):
         self._render_journal()
 
     def _build_right_rail(self) -> QWidget:
+        """Status drawer content (Sıradaki / Engeller / Log) — NOT a permanent side column.
+
+        Hosted under the step stack and toggled via Durum ▾ (see ``_toggle_status_drawer``).
+        """
         C = self.PIPELINE_COLORS
         rail = QWidget(self)
-        # W3 (yatay tasma): sabit 330 px yerine esnek genislik (280-330);
-        # dar pencerede kuculup Onayla adimina yer acar. Varsayilan
-        # boyutta 330 px'te kalir.
-        rail.setMinimumWidth(280)
-        rail.setMaximumWidth(330)
-        lay = QVBoxLayout(rail)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(12)
+        rail.setMinimumHeight(0)
+        rail.setMaximumHeight(220)
+        lay = QHBoxLayout(rail)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(8)
 
         next_card = QFrame(self)
         next_card.setObjectName("PipeNext")
@@ -7181,42 +7056,42 @@ class YOLOFactoryDialog(QDialog):
         nl = QVBoxLayout(next_card)
         nl.setContentsMargins(14, 14, 14, 14)
         nl.setSpacing(8)
-        nk = QLabel("SIRADAKİ İŞİN", next_card)
+        nk = QLabel("SIRADAKİ", next_card)
         nk.setStyleSheet(
             f"color:{C['amber']};font-size:10px;font-weight:800;letter-spacing:0.12em;"
         )
         nk.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.next_title = QLabel("Hazırlanıyor…", next_card)
         self.next_title.setWordWrap(True)
-        self.next_title.setStyleSheet("font-size:16px;font-weight:800;")
+        self.next_title.setStyleSheet("font-size:14px;font-weight:800;")
         self.next_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.next_text = QLabel("", next_card)
         self.next_text.setWordWrap(True)
-        self.next_text.setStyleSheet(f"color:{C['muted']};font-size:12px;")
+        self.next_text.setStyleSheet(f"color:{C['muted']};font-size:11px;")
         self.next_text.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.btn_next = QPushButton("Onay kuyruğuna git →", next_card)
         self.btn_next.setObjectName("PipePrimary")
         self.btn_next.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_next.setMinimumHeight(40)
+        self.btn_next.setMinimumHeight(36)
         self.btn_next.clicked.connect(self._on_next_clicked)
         self._next_action = "goto"
         nl.addWidget(nk)
         nl.addWidget(self.next_title)
         nl.addWidget(self.next_text)
         nl.addWidget(self.btn_next)
-        lay.addWidget(next_card)
+        lay.addWidget(next_card, stretch=1)
 
         blockers = QFrame(self)
         blockers.setObjectName("PipeRailCard")
         bl = QVBoxLayout(blockers)
-        bl.setContentsMargins(0, 0, 0, 8)
+        bl.setContentsMargins(0, 0, 0, 4)
         head = QHBoxLayout()
-        head.setContentsMargins(14, 12, 14, 8)
+        head.setContentsMargins(8, 6, 8, 4)
         h = QLabel("<b>Engeller</b>")
         self.block_count = QLabel("0 engel")
         self.block_count.setStyleSheet(
             "color:#FF8A94;background:#24151A;border:1px solid #4A2028;"
-            "border-radius:999px;padding:4px 8px;font-size:11px;font-weight:700;"
+            "border-radius:999px;padding:2px 6px;font-size:10px;font-weight:700;"
         )
         head.addWidget(h)
         head.addStretch()
@@ -7236,42 +7111,55 @@ class YOLOFactoryDialog(QDialog):
         )
         for key, w in self._blocker_widgets.items():
             bl.addWidget(w)
-        lay.addWidget(blockers)
+        lay.addWidget(blockers, stretch=1)
 
         runs = QFrame(self)
         runs.setObjectName("PipeRailCard")
+        self._runs_card = runs
         rl = QVBoxLayout(runs)
-        rl.setContentsMargins(14, 12, 14, 12)
-        rl.addWidget(QLabel("<b>Çalıştırmalar</b>"))
-        sub = QLabel("Son eğitimler — karşılaştır, en iyiyi seç.")
-        sub.setStyleSheet(f"color:{C['muted']};font-size:12px;")
+        rl.setContentsMargins(6, 4, 6, 4)
+        runs_title = QLabel("<b>Çalıştırmalar</b>")
+        runs_title.setStyleSheet(f"font-size:11px;color:{C['muted']};")
+        self._runs_title = runs_title
+        rl.addWidget(runs_title)
+        sub = QLabel("Son eğitimler")
+        sub.setStyleSheet(f"color:{C['muted2']};font-size:10px;")
+        self._runs_sub = sub
         rl.addWidget(sub)
         self.run_list_host = QVBoxLayout()
+        self.run_list_host.setSpacing(2)
         rl.addLayout(self.run_list_host)
-        lay.addWidget(runs)
+        lay.addWidget(runs, stretch=1)
 
         log_card = QFrame(self)
         log_card.setObjectName("PipeRailCard")
         ll = QVBoxLayout(log_card)
-        ll.setContentsMargins(10, 10, 10, 10)
+        ll.setContentsMargins(6, 4, 6, 4)
         log_head = QHBoxLayout()
-        log_head.addWidget(QLabel("<b>Canlı log</b>"))
+        log_lbl = QLabel("<b>Canlı log</b>")
+        log_lbl.setStyleSheet(f"font-size:11px;color:{C['muted']};")
+        log_head.addWidget(log_lbl)
         log_head.addStretch()
         clear = QPushButton("Temizle", self)
         clear.setObjectName("PipeBtn")
+        clear.setStyleSheet("font-size:10px; padding:2px 6px;")
         clear.clicked.connect(self._clear_log)
         log_head.addWidget(clear)
         ll.addLayout(log_head)
         self.training_log_box = QPlainTextEdit(self)
         self.training_log_box.setObjectName("training_log_box")
         self.training_log_box.setReadOnly(True)
-        self.training_log_box.setMinimumHeight(160)
+        self.training_log_box.setMinimumHeight(64)
+        self.training_log_box.setMaximumHeight(160)
+        self.training_log_box.setStyleSheet(
+            f"QPlainTextEdit#training_log_box {{ color:{C['muted2']}; font-size:11px; }}"
+        )
         self.training_log_box.setPlainText(
             "[HAZIR] YOLO fabrikası açıldı.\n"
             "[BİLGİ] Hat: Yakala → Onayla → Hazırla → Eğit → Doğrula → Yayınla.\n"
         )
         ll.addWidget(self.training_log_box)
-        lay.addWidget(log_card, stretch=1)
+        lay.addWidget(log_card, stretch=2)
         return rail
 
     def _make_blocker(
@@ -7339,11 +7227,13 @@ class YOLOFactoryDialog(QDialog):
             self._append_log(f"[HATA] Adım {step} yığını bozuk (index dışı).")
             return
         self.step_stack.setCurrentIndex(step - 1)
-        self.flow_summary.setText(f"Adım {step}/6 · {self.STEP_NAMES[step]}")
+        self.flow_summary.setText(f"{step}/6 · {self.STEP_NAMES[step]}")
         self._refresh_stepper_visuals()
+        self._refresh_stat_strip_visibility()
         self._update_next_card()
         self._update_blockers()
         self._update_train_lock()
+        self._update_pending_labels()
         self._save_pipeline_disk_state()
         if step == 2:
             # Ağır kuyruk taraması worker thread'de (UI donmasın); zaten
@@ -7412,51 +7302,36 @@ class YOLOFactoryDialog(QDialog):
         pct = int(round(((done_count + (0.5 if current > 1 else 0)) / 6.0) * 100))
         self.flow_bar.setValue(max(8, min(100, pct)))
 
+        short_names = {
+            1: "Yakala",
+            2: "Onayla",
+            3: "Hazırla",
+            4: "Eğit",
+            5: "Doğrula",
+            6: "Yayınla",
+        }
         for step, btn in self._step_buttons.items():
             st = btn._st_lbl  # type: ignore[attr-defined]
             num = btn._num_lbl  # type: ignore[attr-defined]
             st.setText(str(status_texts.get(step, "—")).upper())
+            title = short_names.get(step, str(step))
             if done_flags.get(step) and step != current:
                 btn.setObjectName("PipeStepDone")
+                btn.setText(f"✓ {title}")
                 num.setText("✓")
-                num.setStyleSheet(
-                    "background:#2ED573;border:1px solid #2ED573;border-radius:13px;"
-                    "font-family:Consolas;font-weight:700;font-size:12px;color:#08130C;"
-                )
-                st.setStyleSheet(
-                    f"font-size:10px;font-weight:800;color:{C['green']};background:transparent;border:none;"
-                )
             elif step == current:
                 btn.setObjectName("PipeStepCurrent")
+                btn.setText(f"{step} {title}")
                 if not done_flags.get(step):
                     num.setText(str(step))
-                    num.setStyleSheet(
-                        f"background:{C['amber']};border:1px solid {C['amber']};border-radius:13px;"
-                        "font-family:Consolas;font-weight:700;font-size:12px;color:#111;"
-                    )
-                st.setStyleSheet(
-                    f"font-size:10px;font-weight:800;color:{C['amber']};background:transparent;border:none;"
-                )
             elif blocked.get(step):
                 btn.setObjectName("PipeStepBlocked")
+                btn.setText(f"{step} {title}")
                 num.setText(str(step))
-                num.setStyleSheet(
-                    f"background:{C['panel3']};border:1px solid {C['line2']};border-radius:13px;"
-                    "font-family:Consolas;font-weight:700;font-size:12px;color:#9AA3B2;"
-                )
-                st.setStyleSheet(
-                    "font-size:10px;font-weight:800;color:#FF8A94;background:transparent;border:none;"
-                )
             else:
                 btn.setObjectName("PipeStep")
+                btn.setText(f"{step} {title}")
                 num.setText(str(step))
-                num.setStyleSheet(
-                    f"background:{C['panel3']};border:1px solid {C['line2']};border-radius:13px;"
-                    "font-family:Consolas;font-weight:700;font-size:12px;color:#9AA3B2;"
-                )
-                st.setStyleSheet(
-                    f"font-size:10px;font-weight:800;color:{C['muted']};background:transparent;border:none;"
-                )
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
@@ -7706,6 +7581,8 @@ class YOLOFactoryDialog(QDialog):
             btn_stop = getattr(self, "btn_stop_train", None)
             if btn_stop is not None and not running:
                 btn_stop.setEnabled(False)
+            if not running:
+                self._resume_bot_after_training()
         except Exception as exc:
             logger.debug("training lock refresh error: %s", exc)
 
@@ -8900,6 +8777,56 @@ class YOLOFactoryDialog(QDialog):
         except Exception:
             pass
 
+    def _pause_bot_for_training(self) -> None:
+        """Eğitim süresince ekran yakalama + CUDA çakışmasını önlemek için botu duraklat."""
+        if getattr(self, "_bot_paused_for_training", False):
+            return
+        pause_fn = getattr(self, "_bot_pause_fn", None)
+        if not callable(pause_fn):
+            return
+        is_paused_fn = getattr(self, "_bot_is_paused_fn", None)
+        try:
+            if callable(is_paused_fn) and bool(is_paused_fn()):
+                return
+        except Exception:
+            pass
+        try:
+            pause_fn()
+        except Exception as exc:
+            logger.debug("Eğitim bot-pause kancası çalışmadı: %s", exc)
+            return
+        self._bot_paused_for_training = True
+        try:
+            self._append_log(
+                "[BOT] RTX eğitimi başladı — bot duraklatıldı (eğitim bitince devam eder)."
+            )
+        except Exception:
+            pass
+
+    def _resume_bot_after_training(self) -> None:
+        """Eğitim bitti/durduruldu: yalnızca eğitim için duraklattığımız botu devam ettir."""
+        if not getattr(self, "_bot_paused_for_training", False):
+            return
+        self._bot_paused_for_training = False
+        resume_fn = getattr(self, "_bot_resume_fn", None)
+        if not callable(resume_fn):
+            return
+        is_paused_fn = getattr(self, "_bot_is_paused_fn", None)
+        try:
+            if callable(is_paused_fn) and not bool(is_paused_fn()):
+                return
+        except Exception:
+            pass
+        try:
+            resume_fn()
+        except Exception as exc:
+            logger.debug("Eğitim bot-resume kancası çalışmadı: %s", exc)
+            return
+        try:
+            self._append_log("[BOT] Eğitim bitti — bot devam ettirildi.")
+        except Exception:
+            pass
+
     def _resume_bot_if_paused_by_factory(self) -> None:
         """Dialog gizlendi/kapandı: yalnızca bizim duraklattığımız botu devam ettir."""
         if not getattr(self, "_bot_paused_by_factory", False):
@@ -8944,6 +8871,12 @@ class YOLOFactoryDialog(QDialog):
     # ------------------------------------------------------------------
     def _wire_queue_thumb_requests(self) -> None:
         try:
+            # r4 filmstrip is horizontal — prefer h-scrollbar, fall back to v.
+            bar = self.queue_list.horizontalScrollBar()
+            if bar is None or bar.maximum() == 0:
+                # Still wire both so first paint / later overflow work.
+                bar = self.queue_list.horizontalScrollBar()
+            bar.valueChanged.connect(lambda _v: self._schedule_visible_thumbs())
             self.queue_list.verticalScrollBar().valueChanged.connect(
                 lambda _v: self._schedule_visible_thumbs()
             )
@@ -8969,10 +8902,11 @@ class YOLOFactoryDialog(QDialog):
         if count == 0:
             return (0, -1)
         vp = qlist.viewport()
-        top = qlist.indexAt(QPoint(0, 0))
-        bottom = qlist.indexAt(QPoint(0, max(0, vp.height() - 1)))
-        first = top.row() if top.isValid() else 0
-        last = bottom.row() if bottom.isValid() else min(count - 1, first + 15)
+        # Horizontal filmstrip: probe left/right edges.
+        left = qlist.indexAt(QPoint(0, max(0, vp.height() // 2)))
+        right = qlist.indexAt(QPoint(max(0, vp.width() - 1), max(0, vp.height() // 2)))
+        first = left.row() if left.isValid() else 0
+        last = right.row() if right.isValid() else min(count - 1, first + 15)
         if last < first:
             last = min(count - 1, first + 15)
         return (first, last)
@@ -9031,7 +8965,7 @@ class YOLOFactoryDialog(QDialog):
         lbl = labels.get(f"{split}|{stem}")
         if lbl is not None:
             lbl.setPixmap(
-                pix.scaled(72, 54, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                pix.scaled(64, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             )
             lbl.setText("")
 
@@ -9048,11 +8982,25 @@ class YOLOFactoryDialog(QDialog):
         """
         return self._bulk_threshold() if self.__dict__.get("bulk_range") else CONF_BULK_DEFAULT
 
-    def _on_bulk_threshold_changed(self, value: int) -> None:
-        self.bulk_val.setText(str(int(value)))
-        if getattr(self, "_queue_filter_mode", "all") in ("below", "above"):
-            self._render_queue_list()
+    def _format_conf_val_label(self, value: int) -> str:
+        return f"≥ {max(0.0, min(1.0, float(value) / 100.0)):.2f}".replace(".", ",")
+
+    def _on_unified_conf_changed(self, value: int) -> None:
+        """Tek güven kaydırıcısı: kuyruk min filtresi + toplu/Emin eşiği."""
+        v = int(value)
+        self._queue_min_conf = max(0.0, min(1.0, float(v) / 100.0))
+        label = self._format_conf_val_label(v)
+        if hasattr(self, "queue_conf_val"):
+            self.queue_conf_val.setText(label)
+        # Alias / eski API: bulk_val aynı veya ayrı etiket olabilir.
+        if hasattr(self, "bulk_val") and self.bulk_val is not getattr(self, "queue_conf_val", None):
+            self.bulk_val.setText(str(v))
+        self._render_queue_list()
         self._update_filter_action_buttons()
+
+    def _on_bulk_threshold_changed(self, value: int) -> None:
+        """Eski ad — unified kaydırıcıya yönlendir (API uyumu)."""
+        self._on_unified_conf_changed(value)
 
     def _on_bulk_threshold_released(self) -> None:
         """Kaydırıcı bırakılınca rozet eşiği değiştiği için mevcut kare
@@ -9085,15 +9033,11 @@ class YOLOFactoryDialog(QDialog):
         self._on_search_text_changed(_text)
 
     def _on_queue_conf_changed(self, value: int) -> None:
-        """Kuyruk güven kaydırıcısı (prototip qConf): minimum güven filtresi."""
-        self._queue_min_conf = max(0.0, min(0.95, float(value) / 100.0))
-        if hasattr(self, "queue_conf_val"):
-            self.queue_conf_val.setText(f"≥ {self._queue_min_conf:.2f}".replace(".", ","))
-        self._render_queue_list()
-        self._update_filter_action_buttons()
+        """Eski ad — unified kaydırıcıya yönlendir (API uyumu)."""
+        self._on_unified_conf_changed(value)
 
     def _on_clear_filters(self) -> None:
-        """Prototip 'Filtreleri temizle': arama + durum + sınıf + güven sıfırlanır."""
+        """Filtreleri temizle: arama + durum + sınıf + güven sıfırlanır."""
         if hasattr(self, "review_search_edit"):
             self.review_search_edit.clear()
         if hasattr(self, "queue_filter"):
@@ -9121,6 +9065,17 @@ class YOLOFactoryDialog(QDialog):
             self._update_train_lock()
         except Exception:
             pass
+
+    def _sync_review_zoom_label(self, zoom: float = 1.0) -> None:
+        """Zoom araç çubuğundaki yüzde etiketini tuval yakınlaştırmasıyla eşitler."""
+        btn = getattr(self, "btn_zoom_reset", None)
+        if btn is None:
+            return
+        try:
+            z = float(zoom)
+        except (TypeError, ValueError):
+            z = 1.0
+        btn.setText(f"{int(round(z * 100))}%")
 
     def _build_class_legend(self) -> None:
         """Fotoğraf altı renk lejantı (prototip classLegend): her sınıf bir
@@ -9214,7 +9169,8 @@ class YOLOFactoryDialog(QDialog):
             if cid == current:
                 btn.setStyleSheet(
                     f"font-size:11px; font-weight:800; color:{color}; padding:3px 8px; "
-                    "border:2px solid #38bdf8; border-radius:6px; background:#0f172a;"
+                    f"border:2px solid {self.PIPELINE_COLORS.get('amber', '#F6B81E')}; "
+                    f"border-radius:6px; background:{self.PIPELINE_COLORS.get('amber_soft', '#2A220E')};"
                 )
             else:
                 btn.setStyleSheet(
@@ -9224,8 +9180,7 @@ class YOLOFactoryDialog(QDialog):
 
 
     def _create_queue_item_widget(self, it: Dict[str, Any]) -> QWidget:
-        """Okunur kuyruk satırı: küçük resim + kare no + güven + kutu sayısı +
-        saat/sınıf/kutu satırı — kesilmeden (uzun stem iki satıra sarılır)."""
+        """Yatay filmstrip hücresi: küçük resim + kısa güven/kutu özeti."""
         conf = self._frame_conf(it)
         it["conf"] = conf
         weak = list(it.get("weak") or [])
@@ -9235,30 +9190,18 @@ class YOLOFactoryDialog(QDialog):
         n_total = n_weak + n_trusted
         stem = str(it.get("stem", ""))
         done = it.get("done")
-        status = ""
+        mark = ""
         if done == "ok":
-            status = " · ✓ onaylandı"
+            mark = "✓"
         elif done == "no":
-            status = " · ✕ reddedildi"
+            mark = "✕"
 
         if n_total == 0:
-            conf_str = "0 Kutu (Boş)"
+            conf_str = "boş"
         else:
-            confs: List[float] = []
-            for b in weak + trusted:
-                try:
-                    c = float(b.get("confidence", b.get("conf", 0.0)) or 0.0)
-                    confs.append(c if c <= 1.0 else c / 100.0)
-                except (TypeError, ValueError):
-                    pass
-            if confs:
-                mn = int(round(min(confs) * 100))
-                mx = int(round(max(confs) * 100))
-                conf_str = f"%{mn}" if mn == mx else f"%{mn}-%{mx}"
-            else:
-                conf_str = f"%{int(round(conf * 100))}"
+            conf_str = f"%{int(round(conf * 100))}·{n_total}"
 
-        # Saat (dosya mtime) + sınıf/kutu özeti
+        # Saat + sınıf özeti tooltip'te (hücre dar).
         mtime = float(it.get("mtime", 0.0) or 0.0)
         time_str = datetime.fromtimestamp(mtime).strftime("%H:%M") if mtime > 0 else "—"
         if n_total == 0:
@@ -9274,18 +9217,14 @@ class YOLOFactoryDialog(QDialog):
                 counts[str(cname)] = counts.get(str(cname), 0) + 1
             class_str = " · ".join(f"{k}×{v}" for k, v in sorted(counts.items()))
 
-        row = QWidget(self)
-        lay = QHBoxLayout(row)
-        lay.setContentsMargins(6, 4, 6, 4)
-        lay.setSpacing(8)
-        thumb = QLabel(row)
+        cell = QWidget(self)
+        lay = QVBoxLayout(cell)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(1)
+        thumb = QLabel(cell)
         thumb.setObjectName("queue_thumb")
-        thumb.setFixedSize(72, 54)
-        thumb.setStyleSheet("background:#0B0E12; border:1px solid #1e293b; border-radius:4px;")
-        # [YOLO-ASYNC] Küçük resim artık satır kurulumunda decode edilmez
-        # (417 kare x tam çözünürlük decode = 30+ sn UI donması). Önbellek
-        # isabeti varsa anında basılır, yoksa yer tutucu kalır; görünür
-        # satırların küçük resmi worker thread'de üretilir (QImage).
+        thumb.setFixedSize(64, 48)
+        thumb.setStyleSheet("background:#0B0E12; border:1px solid #1e293b; border-radius:3px;")
         split = str(it.get("split", "train"))
         thumb_key = f"{split}|{stem}"
         thumb.setProperty("thumb_key", thumb_key)
@@ -9295,32 +9234,22 @@ class YOLOFactoryDialog(QDialog):
         pix = self._queue_thumb_cache.get((split, stem))
         if pix is not None and not pix.isNull():
             thumb.setPixmap(
-                pix.scaled(72, 54, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                pix.scaled(64, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             )
         else:
             thumb.setText("…")
             thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb.setStyleSheet("background:#0B0E12; border:1px solid #1e293b; border-radius:4px; color:#64748b;")
-        lay.addWidget(thumb)
-
-        text_col = QVBoxLayout()
-        text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(1)
-        l1 = QLabel(f"#{stem}", row)
-        l1.setWordWrap(True)
-        l1.setStyleSheet("font-size:11.5px; font-weight:700; color:#F2F3F5; background:transparent;")
-        text_col.addWidget(l1)
-        l2 = QLabel(f"{conf_str} · {n_total} kutu ({n_trusted} Emin, {n_weak} Şüpheli){status}", row)
-        l2.setWordWrap(True)
-        l2.setStyleSheet("font-size:11px; color:#cbd5e1; background:transparent;")
-        text_col.addWidget(l2)
-        l3 = QLabel(f"{time_str} · {class_str}", row)
-        l3.setWordWrap(True)
-        l3.setStyleSheet("font-size:10.5px; color:#94a3b8; background:transparent;")
-        text_col.addWidget(l3)
-        lay.addLayout(text_col, stretch=1)
-        row.setToolTip(stem)
-        return row
+            thumb.setStyleSheet(
+                "background:#0B0E12; border:1px solid #1e293b; border-radius:3px; color:#64748b;"
+            )
+        lay.addWidget(thumb, alignment=Qt.AlignmentFlag.AlignHCenter)
+        cap = QLabel(f"{mark}{conf_str}".strip() or "—", cell)
+        cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cap.setStyleSheet("font-size:9px; color:#cbd5e1; background:transparent;")
+        lay.addWidget(cap)
+        tip_extra = f"{n_trusted} Emin, {n_weak} Şüpheli" if n_total else "0 kutu"
+        cell.setToolTip(f"{stem}\n{time_str} · {class_str}\n{tip_extra}")
+        return cell
 
     def set_queue_filter_mode(self, mode: str) -> None:
         """Kuyruk filtre modunu ayarlar ve butonları günceller."""
@@ -9372,10 +9301,10 @@ class YOLOFactoryDialog(QDialog):
             conf = self._frame_conf(it)
             it["conf"] = conf
 
-            # Kuyruk güven kaydırıcısı (qConf): minimum güvenin altındaki kareler
-            # durum modundan bağımsız olarak elenir.
+            # Tek güven kaydırıcısı: min filtre (all/pending/…) + high/bulk eşiği.
+            # "low" modunda min uygulanmaz — aksi halde eşik altı kuyruk boşalır.
             min_conf = float(getattr(self, "_queue_min_conf", 0.0) or 0.0)
-            if min_conf > 0.0 and conf < min_conf:
+            if mode != "low" and min_conf > 0.0 and conf < min_conf:
                 continue
 
             # Prototip durum modları: Bekleyen / Onaylanan / Reddedilen /
@@ -9657,14 +9586,15 @@ class YOLOFactoryDialog(QDialog):
         self._render_review_frame()
         self._queue_render_frame_index = self._review_index
         self._update_filter_action_buttons()
-        # İlk parçadan sonra liste tıklanabilir olsun (kalan parçalar
-        # aşağıya eklenir; seçim finalize'da güncel indekse göre kurulur).
+        # İlk parçadan sonra filmstrip tıklanabilir olsun (kalan hücreler
+        # sağa eklenir; seçim finalize'da güncel indekse göre kurulur).
         self.queue_list.blockSignals(False)
         QTimer.singleShot(0, lambda: self._render_queue_list_chunk(gen))
 
     def _render_queue_rows(self, start: int, end: int) -> None:
-        """_queue_render_indices[start:end] satırlarını listeye ekler."""
+        """_queue_render_indices[start:end] filmstrip hücrelerini ekler."""
         indices = getattr(self, "_queue_render_indices", []) or []
+        cell_w, cell_h = 78, max(64, int(_YF_FILMSTRIP_HEIGHT) - 10)
         for list_row in range(start, min(end, len(indices))):
             real_i = indices[list_row]
             it = self._review_items[real_i]
@@ -9672,17 +9602,8 @@ class YOLOFactoryDialog(QDialog):
             item.setData(int(Qt.ItemDataRole.UserRole), int(real_i))
             if it.get("done"):
                 item.setForeground(QColor("#6B7688"))
-            # Okunur satır: küçük resim + kare no + güven + kutu sayısı +
-            # saat/sınıf/kutu satırı. Uzun stem iki satıra sarılır.
             widget = self._create_queue_item_widget(it)
-            stem_len = len(str(it.get("stem", "")))
-            row_h = 112 if stem_len > 28 else 92
-            # [YOLO-ASYNC] Satır yüksekliği burada ölçülmez: 456 satırda
-            # resize+activate+sizeHint ~3 sn UI bloğu yapıyordu (açılışta
-            # UI-WATCHDOG uyarısı). Sezgisel yükseklikle kurulur; gerçek
-            # yükseklikler `_refresh_queue_row_heights` ile olay
-            # döngüsüne bölünmüş parçalar halinde düzeltilir.
-            item.setSizeHint(QSize(200, row_h))
+            item.setSizeHint(QSize(cell_w, cell_h))
             self.queue_list.addItem(item)
             self.queue_list.setItemWidget(item, widget)
             if real_i == self._review_index:
@@ -9740,55 +9661,10 @@ class YOLOFactoryDialog(QDialog):
         QTimer.singleShot(120, self._request_visible_thumbs)
 
     def _refresh_queue_row_heights(self, _start: int = 0, _gen: Optional[int] = None) -> None:
-        """Kuyruk satır yüksekliklerini liste genişliğine göre düzelt.
-
-        Sarılan satırlar (uzun stem / sınıf özeti) sabit 92/112 px'e
-        sığmazsa satır dikeyde sıkışır ve metin kesilir. Satır widget'ı
-        liste genişliğinde yatırılıp sizeHint yüksekliği okunur; yetersiz
-        kalan satırlar büyütülür (küçültme yapılmaz — titreme olmasın).
-
-        [YOLO-ASYNC] 456 satırı tek seferde ölçmek ~3 sn UI bloğu
-        yapıyordu; o yüzden 25 satırlık parçalar halinde, olay döngüsüne
-        dönerek çalışır. Yeni bir render başlarsa eski geçiş nesil
-        numarasıyla iptal olur.
-        """
-        if _gen is not None and _gen != getattr(self, "_queue_heights_gen", 0):
-            return
-        qlist = getattr(self, "queue_list", None)
-        if qlist is None:
-            self._queue_heights_pending = False
-            return
-        avail_w = qlist.viewport().width()
-        if avail_w < 200:
-            self._queue_heights_pending = False
-            return
-        if _start == 0:
-            measured_w = getattr(self, "_queue_heights_measured_w", -1)
-            if not getattr(self, "_queue_heights_dirty", True) and abs(avail_w - measured_w) < 4:
-                self._queue_heights_pending = False
-                return
-        self._queue_heights_pending = True
-        end = min(qlist.count(), _start + 25)
-        for r in range(_start, end):
-            item = qlist.item(r)
-            wdg = qlist.itemWidget(item) if item is not None else None
-            if item is None or wdg is None:
-                continue
-            meas_w = wdg.width() if wdg.width() >= 200 else max(200, avail_w - 18)
-            wdg.resize(meas_w, wdg.sizeHint().height())
-            row_layout = wdg.layout()
-            if row_layout is not None:
-                row_layout.activate()
-            need_h = min(wdg.sizeHint().height() + 24, 240)
-            if need_h > item.sizeHint().height():
-                item.setSizeHint(QSize(200, need_h))
-        if end < qlist.count():
-            _gen2 = _gen if _gen is not None else getattr(self, "_queue_heights_gen", 0)
-            QTimer.singleShot(0, lambda: self._refresh_queue_row_heights(end, _gen2))
-        else:
-            self._queue_heights_pending = False
-            self._queue_heights_dirty = False
-            self._queue_heights_measured_w = avail_w
+        """Filmstrip hücreleri sabit boyutta — eski dikey satır yeniden ölçümü yok."""
+        self._queue_heights_pending = False
+        self._queue_heights_dirty = False
+        return
 
     def _on_queue_row_changed(self, row: int) -> None:
         if row < 0 or row >= self.queue_list.count():
@@ -14872,6 +14748,14 @@ class YOLOFactoryDialog(QDialog):
         val_lbl = self.__dict__.get("stat_pending_value")
         if val_lbl is not None:
             val_lbl.setText(f"{pending} kare")
+        chip = self.__dict__.get("chip_pending")
+        if chip is not None:
+            chip.setText(f"{pending} bekleyen" if pending else "0 bekleyen")
+            tip_frames = ""
+            frames_lbl = self.__dict__.get("stat_frames_value")
+            if frames_lbl is not None:
+                tip_frames = f"Veri seti: {frames_lbl.text()}"
+            chip.setToolTip(tip_frames or "Onay bekleyen kare sayısı")
         # P1-12 (K-31/F014-02): sayaç kaydırıcıyı okur — sabit 0.90 yok.
         th = self._bulk_threshold() if self.__dict__.get("bulk_range") else CONF_BULK_DEFAULT
         hi = sum(
@@ -14891,6 +14775,15 @@ class YOLOFactoryDialog(QDialog):
                 btn._st_lbl.setText(  # type: ignore[attr-defined]
                     f"{pending} kare bekliyor".upper() if pending else "KUYRUK BOŞ"
                 )
+        summary = self.__dict__.get("status_line_summary")
+        if summary is not None:
+            next_t = ""
+            if hasattr(self, "next_title") and self.next_title is not None:
+                next_t = self.next_title.text()
+            blk = ""
+            if hasattr(self, "block_count") and self.block_count is not None:
+                blk = self.block_count.text()
+            summary.setText(f"{next_t}  ·  {blk}  ·  {pending} bekleyen".strip(" ·"))
 
     def _clear_log(self) -> None:
         self.training_log_box.clear()
@@ -16150,10 +16043,12 @@ class YOLOFactoryDialog(QDialog):
         # başlatma denemesi `_training_starting` + `isRunning()` ile düşer.
         # Başlatma istisnayla yarıda kalırsa bayrak hemen temizlenir
         # (yedeği: 1 sn kilit zamanlayıcısı).
+        self._pause_bot_for_training()
         try:
             self._start_training_worker(epochs=epochs, model=model, imgsz=imgsz, batch=batch, only_approved=is_only_approved)
         except Exception:
             self._training_starting = False
+            self._resume_bot_after_training()
             self._update_train_lock()
             raise
 

@@ -1035,7 +1035,7 @@ class AutoLabelingDatasetFactory:
         if not annotations:
             annotations = self.curator.auto_label_frame(target_frame, full_scan=True)
 
-        # P1-14 (K-36): both labelers emit the CANONICAL scheme (0..26);
+        # P1-14 (K-36): both labelers emit the CANONICAL scheme (0..28);
         # _canonicalize_annotations only validates, never translates (F-0802
         # legacy claim was contradicted by the labeler's own docstring).
         annotations = _canonicalize_annotations(annotations)

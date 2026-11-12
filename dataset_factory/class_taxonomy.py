@@ -3,9 +3,10 @@
 ===================================
 Canonical YOLO Class Taxonomy, Validation & Sanitization for Aion 2.
 
-Defines and strictly enforces the canonical 27 classes (0..26): core 22
+Defines and strictly enforces the canonical 29 classes (0..28): core 22
 (0..21), consumable classes (22..24: hp_potion, mp_potion, buff_scroll),
-currency (25: kinah) and player character (26: player_character).
+currency (25: kinah), player character (26: player_character), and F4
+generics (27: other_ore, 28: other_odyle).
 
 Strictly blocks non-canonical classes (such as class_id: 98, essence_*, or legacy
 omni IDs) from entering YOLO training `.txt` files or review `.json` files.
@@ -246,8 +247,8 @@ ALL_CANONICAL_CLASSES: FrozenSet[int] = frozenset(range(29))
 # Canonical taxonomy — single source (P0-3, v18; extended P1-1, v18)
 # =============================================================================
 # AUTHORITY: ``dataset/data.yaml`` is the authority for the canonical
-# taxonomy (``nc`` -> ids 0..nc-1, ``names`` -> id -> name; today nc=27 ->
-# 0..26). Every resolver in the codebase reads the taxonomy through
+# taxonomy (``nc`` -> ids 0..nc-1, ``names`` -> id -> name; today nc=29 ->
+# 0..28). Every resolver in the codebase reads the taxonomy through
 # :func:`load_canonical_taxonomy` / :func:`canonical_names` /
 # :func:`resolve_canonical_max_class_id` in this module — no other file
 # may keep its own copy of the id/name table (K-01). The in-code
@@ -427,7 +428,7 @@ def resolve_canonical_max_class_id(
 
     Thin wrapper over :func:`load_canonical_taxonomy` — the ceiling and
     the names can never disagree because they come from the same parse.
-    Falls back to ``max(ALL_CANONICAL_CLASSES)`` (26) with a warning log
+    Falls back to ``max(ALL_CANONICAL_CLASSES)`` (28) with a warning log
     when data.yaml cannot be read (see :func:`load_canonical_taxonomy`).
     Cached via the loader: call ``resolve_canonical_max_class_id.cache_clear()``
     in tests that rewrite data.yaml mid-process.
@@ -1028,7 +1029,7 @@ def is_valid_canonical_class_id(class_id: Any) -> bool:
     (:func:`load_canonical_taxonomy` — ``dataset/data.yaml`` ``nc``),
     not from the hardcoded ``range(27)`` — so a dataset whose ``nc``
     changes cannot silently disagree with the gate/augmentor ceiling.
-    Today nc=27, so this is exactly 0..26.
+    Today nc=29, so this is exactly 0..28.
     """
     cid = _parse_class_id(class_id)
     if cid is None:
@@ -1477,7 +1478,7 @@ def sanitize_yolo_box(
 ) -> Optional[Dict[str, Any]]:
     """Sanitize a bounding box dict in-place or via copy.
 
-    Enforces that 'class_id' is in 0..26 and 'class_name' matches canonical name.
+    Enforces that 'class_id' is in 0..28 and 'class_name' matches canonical name.
     If the box has an unresolvable non-canonical class (e.g. 98 or unresolvable essence):
       - Returns None if strict_drop_non_canonical is True (dropping the poisoned box).
       - Returns unmodified box if strict_drop_non_canonical is False.
@@ -1609,7 +1610,7 @@ def parse_and_sanitize_yolo_txt_line(
 # =============================================================================
 
 def dataset_class_names() -> Dict[int, str]:
-    """Return dictionary of all canonical class IDs and names (0..26).
+    """Return dictionary of all canonical class IDs and names (0..28).
 
     P1-1: read from the authority (:func:`canonical_names` —
     ``dataset/data.yaml``), not from the alias-built table.
@@ -1691,7 +1692,7 @@ def ui_class_specs() -> List[dict]:
 
 
 def all_ui_class_specs() -> List[dict]:
-    """UI specs for all canonical classes (0..26)."""
+    """UI specs for all canonical classes (0..28)."""
     _build_taxonomy()
     rows: List[dict] = []
     for cid in sorted(class_id for class_id in _NAMES if class_id in ALL_CANONICAL_CLASSES):

@@ -29,10 +29,10 @@ title Gatherion 1-Click RTX 3070 CUDA FP16 YOLO Trainer ^& ONNX Exporter
 echo ============================================================================
 echo   GATHERION AI - 1-CLICK RTX CUDA FP16 CUSTOM MODEL TRAINER
 echo   Detected GPU : NVIDIA GeForce RTX 3070
-echo   Dataset YAML : %GATHERION_HOME%\dataset\data.yaml
-echo   Target ONNX  : %GATHERION_HOME%\models\yolov8n_gatherion.onnx
-echo   Runs         : %GATHERION_HOME%\models\rtx_runs
-echo   Config       : epochs=100, imgsz=640, batch=16, amp=True (FP16)
+echo   Dataset YAML : F:/a2/dataset/approved/data_approved.yaml
+echo   Target ONNX  : F:/a2/models/yolov8n_gatherion.onnx
+echo   Runs         : F:/a2/models/rtx_runs
+echo   Config       : epochs=50, imgsz=640, batch=16, amp=True (FP16)
 echo ============================================================================
 echo.
 
@@ -57,7 +57,7 @@ if errorlevel 1 (
 
 :START_TRAIN
 echo [INFO] Starting RTX FP16 Mixed-Precision Training...
-"%PYTHON_EXE%" -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; cpu='CPU'; print(f'[INFO] Active Training Device: {dev} (CUDA={use_cuda}, GPU={torch.cuda.get_device_name(0) if use_cuda else cpu})'); m = YOLO('yolov8n.pt'); m.train(data='dataset/data.yaml', epochs=100, imgsz=640, batch=16, amp=use_cuda, cos_lr=True, mosaic=1.0, mixup=0.15, optimizer='AdamW', lr0=0.0015, patience=15, device=dev, workers=0, project='models/rtx_runs', name='gatherion_rtx_fp16', exist_ok=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz=640); out_p = Path('models/yolov8n_gatherion.onnx'); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
+"%PYTHON_EXE%" -c "from pathlib import Path; import shutil, torch; from ultralytics import YOLO; use_cuda = torch.cuda.is_available(); dev = 0 if use_cuda else 'cpu'; cpu='CPU'; print(f'[INFO] Active Training Device: {dev} (CUDA={use_cuda}, GPU={torch.cuda.get_device_name(0) if use_cuda else cpu})'); m = YOLO('yolo11s.pt'); m.train(data=r'F:/a2/dataset/approved/data_approved.yaml', epochs=50, imgsz=640, batch=16, amp=use_cuda, cos_lr=True, mosaic=1.0, mixup=0.15, optimizer='AdamW', lr0=0.0015, patience=15, device=dev, workers=0, project=r'F:/a2/models/rtx_runs', name='gatherion_rtx_fp16', exist_ok=True); exp = m.export(format='onnx', half=use_cuda, dynamic=False, imgsz=640); out_p = Path(r'F:/a2/models/yolov8n_gatherion.onnx'); out_p.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(str(exp), str(out_p)); print('[SUCCESS] Exported ONNX model to:', str(out_p))"
 if not errorlevel 1 goto :TRAIN_DONE
 
 echo [HATA] Ultralytics egitimi basarisiz oldu; model uretilmedi.
@@ -65,8 +65,8 @@ echo [HATA] OpenCV prototip yedegi fabrika tarafindan kapalidir (sahte-tamamlama
 exit /b 1
 
 :TRAIN_DONE
-if not exist "%GATHERION_HOME%\models\yolov8n_gatherion.onnx" (
-    echo [HATA] Egitim bitti gorunuyor ama ONNX dosyasi yok: %GATHERION_HOME%\models\yolov8n_gatherion.onnx
+if not exist "F:\a2\models\yolov8n_gatherion.onnx" (
+    echo [HATA] Egitim bitti gorunuyor ama ONNX dosyasi yok: F:\a2\models\yolov8n_gatherion.onnx
     echo [HATA] Model uretilmedi; bot eski modelle calismaya devam eder.
     exit /b 1
 )

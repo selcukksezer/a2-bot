@@ -348,6 +348,10 @@ SHELL_MAIN_QSS = f"""
         border-bottom: 1px solid {SHELL_COLORS["line"]};
         border-top-left-radius: 9px;
         border-top-right-radius: 9px;
+        min-height: 64px;
+    }}
+    QWidget#ShellLogWrap {{
+        background: transparent;
     }}
     QLabel#ShellLogTitle {{
         color: {SHELL_COLORS["muted"]};

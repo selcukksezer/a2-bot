@@ -1,0 +1,353 @@
+/* YOLO Fabrikası — operator console QSS
+ * Tokens: {{name}} substituted by ui/yolo_factory_theme.py
+ * Compact controls: ~24–28px height, tight padding.
+ */
+
+QDialog {
+    background-color: {{bg}};
+    color: {{text}};
+    font-family: {{font}};
+    font-size: 12px;
+}
+QLabel {
+    color: {{text}};
+}
+
+QFrame#PipeCard,
+QFrame#PipeReviewPage,
+QFrame#PipeFlow,
+QFrame#PipeStat,
+QFrame#PipeNext,
+QFrame#PipeBlockerHost,
+QFrame#PipeRailCard,
+QFrame#PipeRailSection,
+QFrame#PipeReviewToolstrip,
+QFrame#PipeReviewBulkstrip,
+QFrame#PipeFilmstripHost,
+QFrame#PipeReviewDrawer,
+QFrame#PipeStatusLine {
+    background-color: {{panel}};
+    border: 1px solid {{line}};
+    border-radius: {{radius}};
+}
+QFrame#PipeReviewToolstrip,
+QFrame#PipeReviewBulkstrip,
+QFrame#PipeFilmstripHost,
+QFrame#PipeStatusLine {
+    border-radius: 4px;
+}
+QFrame#PipeStatWarn {
+    background-color: {{panel}};
+    border: 1px solid #4A2028;
+    border-radius: {{radius}};
+}
+QFrame#PipeStatGood {
+    background-color: {{panel}};
+    border: 1px solid #1E4D33;
+    border-radius: {{radius}};
+}
+
+/* Compact chrome buttons */
+QPushButton#PipeBtn {
+    background: {{panel2}};
+    color: {{text}};
+    border: 1px solid {{line}};
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#PipeBtn:hover {
+    background: {{panel3}};
+    border-color: {{line2}};
+}
+QPushButton#PipeBtn:focus {
+    border: 1px solid {{amber}};
+}
+QPushButton#PipeBtn:disabled {
+    opacity: 0.45;
+}
+
+QPushButton#PipePrimary {
+    background: {{amber}};
+    color: #111411;
+    border: 1px solid {{amber}};
+    border-radius: 4px;
+    padding: 1px 10px;
+    font-size: 11px;
+    font-weight: 800;
+}
+QPushButton#PipePrimary:hover {
+    background: #F0B82A;
+}
+QPushButton#PipePrimary:focus {
+    border: 1px solid #ffffff;
+}
+QPushButton#PipePrimary:disabled {
+    background: #3a3f38;
+    color: #c2c8c2;
+    border-color: #3a3f38;
+}
+
+QPushButton#PipeGreen {
+    background: {{green}};
+    color: #08130C;
+    border: 1px solid {{green}};
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QPushButton#PipeGreen:focus {
+    border: 1px solid {{amber}};
+}
+
+QPushButton#PipeDanger {
+    background: transparent;
+    color: #E88890;
+    border: 1px solid #4A2028;
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QPushButton#PipeDanger:focus {
+    border: 1px solid {{amber}};
+}
+
+QPushButton#PipeStep {
+    background: {{bg}};
+    color: {{text}};
+    border: 1px solid {{line}};
+    border-radius: {{radius}};
+    text-align: left;
+    padding: 4px 6px;
+}
+QPushButton#PipeStep:hover {
+    border-color: {{line2}};
+}
+QPushButton#PipeStepCurrent {
+    background: {{amber_soft}};
+    color: {{text}};
+    border: 1px solid {{amber}};
+    border-radius: {{radius}};
+    text-align: left;
+    padding: 4px 6px;
+}
+QPushButton#PipeStepDone {
+    background: #0E1712;
+    color: {{text}};
+    border: 1px solid #1E4D33;
+    border-radius: {{radius}};
+    text-align: left;
+    padding: 4px 6px;
+}
+QPushButton#PipeStepBlocked {
+    background: {{bg}};
+    color: {{muted}};
+    border: 1px solid {{line}};
+    border-radius: {{radius}};
+    text-align: left;
+    padding: 4px 6px;
+    opacity: 0.62;
+}
+
+QFrame#PipePreset,
+QFrame#PipeFormat {
+    background: {{bg}};
+    color: {{text}};
+    border: 1px solid {{line}};
+    border-radius: {{radius}};
+}
+QFrame#PipePreset:hover,
+QFrame#PipeFormat:hover {
+    border-color: {{line2}};
+}
+QFrame#PipePresetSel,
+QFrame#PipeFormatSel {
+    background: {{amber_soft}};
+    color: {{text}};
+    border: 1px solid {{amber}};
+    border-radius: {{radius}};
+}
+
+QListWidget#PipeQueue {
+    background: {{bg}};
+    border: none;
+    outline: none;
+    color: {{text}};
+}
+QListWidget#PipeQueue::item {
+    background: {{bg}};
+    border: 1px solid {{line}};
+    border-radius: 4px;
+    padding: 4px;
+    margin-bottom: 4px;
+    color: {{text}};
+}
+QListWidget#PipeQueue::item:selected {
+    border-color: {{amber}};
+    background: {{amber_soft}};
+}
+
+QScrollArea#PipeDetScroll {
+    background: {{bg}};
+    border: none;
+    border-top: 1px solid {{line}};
+}
+QScrollArea#PipeDetScroll > QWidget > QWidget {
+    background: {{bg}};
+}
+QScrollArea#ClassDistScroll {
+    background: {{bg}};
+    border: none;
+    border-top: 1px solid {{line}};
+}
+QScrollArea#ClassDistScroll QWidget {
+    background: {{bg}};
+}
+QWidget#ClassDistHost,
+QWidget#ClassBarRow {
+    background-color: {{bg}};
+    color: {{text}};
+}
+QWidget#PipeDetHost,
+QWidget#PipeDetRow {
+    background-color: {{bg}};
+    color: {{text}};
+}
+QWidget#PipeDetHost QLabel {
+    background: transparent;
+    color: {{text}};
+}
+QLabel#PipeDetMuted {
+    background: transparent;
+    color: {{muted}};
+    font-size: 11px;
+}
+QLabel#PipeDetConf {
+    background: {{panel}};
+    color: {{text}};
+    font-family: {{mono}};
+    border: 1px solid {{line}};
+    border-radius: 4px;
+    padding: 1px 5px;
+}
+
+QPlainTextEdit#PipeLog,
+QPlainTextEdit#training_log_box {
+    background: {{bg}};
+    color: #c8cec4;
+    border: 1px solid {{line}};
+    border-radius: {{radius}};
+    font-family: {{mono}};
+    font-size: 11px;
+    padding: 6px;
+}
+
+QProgressBar#ShellProgress,
+QProgressBar#PipeProgress {
+    background-color: {{bg}};
+    border: 1px solid {{line}};
+    border-radius: 999px;
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 11px;
+    text-align: center;
+    min-height: 8px;
+    max-height: 12px;
+}
+QProgressBar#ShellProgress::chunk,
+QProgressBar#PipeProgress::chunk {
+    background-color: {{amber}};
+    border-radius: 999px;
+}
+
+QComboBox,
+QSpinBox,
+QLineEdit,
+QLineEdit#PipeSearch {
+    background: {{bg}};
+    color: {{text}};
+    border: 1px solid {{line}};
+    border-radius: 4px;
+    padding: 3px 6px;
+    min-height: 24px;
+    max-height: 28px;
+    font-size: 11px;
+}
+QComboBox:hover,
+QLineEdit:hover {
+    border-color: {{line2}};
+}
+QComboBox::drop-down {
+    border: none;
+    width: 18px;
+}
+
+QSlider#PipeQueueConf::groove:horizontal,
+QSlider::groove:horizontal {
+    height: 5px;
+    background: {{bg}};
+    border: 1px solid {{line}};
+    border-radius: 999px;
+}
+QSlider#PipeQueueConf::handle:horizontal,
+QSlider::handle:horizontal {
+    width: 12px;
+    margin: -4px 0;
+    background: {{amber}};
+    border-radius: 6px;
+}
+
+QCheckBox {
+    color: {{text}};
+    font-size: 11px;
+    spacing: 6px;
+}
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+}
+
+QScrollArea#PipeReviewScroll,
+QScrollArea#PipePrepareScroll {
+    background: transparent;
+    border: none;
+}
+QScrollArea#PipeSidebarScroll {
+    background: {{bg}};
+    border: none;
+    border-right: 1px solid {{line}};
+}
+QScrollArea#PipeSidebarScroll > QWidget {
+    background: {{bg}};
+}
+
+QLabel#PipeMainTitle {
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: {{text}};
+    font-family: {{font}};
+}
+QLabel#PipeUiBuildStamp {
+    color: {{muted2}};
+    font-size: 11px;
+    font-family: {{mono}};
+}
+QLabel#PipeConfVal {
+    font-family: {{mono}};
+    font-size: 11px;
+    background: {{bg}};
+    border: 1px solid {{line}};
+    border-radius: 4px;
+    padding: 2px 5px;
+}
+QLabel#PipeRailHdr {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    color: {{muted}};
+    background: transparent;
+}

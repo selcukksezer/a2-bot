@@ -2152,7 +2152,7 @@ class GatherionShell(QMainWindow):
         body_lay.addWidget(self._rail)
 
         right_column = QWidget(body)
-        right_lay = QVBoxLayout(right_column)
+        right_lay = QHBoxLayout(right_column)
         right_lay.setContentsMargins(0, 0, 0, 0)
         right_lay.setSpacing(0)
 
@@ -2189,14 +2189,16 @@ class GatherionShell(QMainWindow):
         stage_grid.addWidget(self._f9_overlay, 0, 0)
         right_lay.addWidget(self._stage, stretch=1)
 
-        # Bottom Live Log Card (.logcard)
+        # Vertical Live Log Card (.logcard) — full-height right column
         self._log_source = _LogSource(_resolve_log_path(log_path))
         log_card = self._build_log_card(right_column)
         log_wrap = QWidget(right_column)
+        log_wrap.setObjectName("ShellLogWrap")
+        log_wrap.setFixedWidth(360)
         log_wrap_lay = QVBoxLayout(log_wrap)
-        log_wrap_lay.setContentsMargins(18, 0, 18, 14)
+        log_wrap_lay.setContentsMargins(0, 10, 12, 12)
         log_wrap_lay.setSpacing(0)
-        log_wrap_lay.addWidget(log_card)
+        log_wrap_lay.addWidget(log_card, stretch=1)
         right_lay.addWidget(log_wrap)
 
         body_lay.addWidget(right_column, stretch=1)
@@ -2383,22 +2385,24 @@ class GatherionShell(QMainWindow):
     def _build_log_card(self, parent: QWidget) -> QFrame:
         card = QFrame(parent)
         card.setObjectName("ShellLogCard")
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         card_lay = QVBoxLayout(card)
         card_lay.setContentsMargins(0, 0, 0, 0)
         card_lay.setSpacing(0)
 
         head = QFrame(card)
         head.setObjectName("ShellLogHead")
-        head.setFixedHeight(32)
-        head_lay = QHBoxLayout(head)
-        head_lay.setContentsMargins(12, 0, 12, 0)
+        head_lay = QVBoxLayout(head)
+        head_lay.setContentsMargins(12, 8, 12, 8)
         head_lay.setSpacing(8)
 
         title = QLabel("CANLI GÜNLÜK", head)
         title.setObjectName("ShellLogTitle")
         head_lay.addWidget(title)
-        head_lay.addStretch(1)
 
+        filters = QHBoxLayout()
+        filters.setContentsMargins(0, 0, 0, 0)
+        filters.setSpacing(6)
         self._log_filter_group = QButtonGroup(head)
         self._log_filter_group.setExclusive(True)
         for mode_id, caption, checked in (
@@ -2414,27 +2418,30 @@ class GatherionShell(QMainWindow):
             pill.setMinimumHeight(24)
             pill.clicked.connect(lambda _c=False, m=mode_id: self._log_source.set_filter_mode(m))
             self._log_filter_group.addButton(pill)
-            head_lay.addWidget(pill)
+            filters.addWidget(pill)
 
         clear_btn = QPushButton("Temizle", head)
         clear_btn.setObjectName("ShellLogClearBtn")
         clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         clear_btn.setMinimumHeight(28)
         clear_btn.clicked.connect(self._log_source.clear_views)
-        head_lay.addWidget(clear_btn)
+        filters.addWidget(clear_btn)
+        filters.addStretch(1)
+        head_lay.addLayout(filters)
         card_lay.addWidget(head)
 
         self.log_view = QPlainTextEdit(card)
         self.log_view.setObjectName("ShellLogDock")
         self.log_view.setReadOnly(True)
-        self.log_view.setFixedHeight(80)
-        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.log_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.log_view.setMinimumHeight(120)
+        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.log_view.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         log_font = QFont("Consolas")
         log_font.setPixelSize(11)
         self.log_view.setFont(log_font)
         self._log_source.attach(self.log_view, follow=True)
-        card_lay.addWidget(self.log_view)
+        card_lay.addWidget(self.log_view, stretch=1)
         return card
 
     def _embed(self, widget: QWidget) -> QWidget:

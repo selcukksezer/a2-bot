@@ -35,7 +35,6 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import cv2
 import numpy as np
 import pytest
 from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt
@@ -46,7 +45,11 @@ from dataset_factory.approved_pool import ApprovedDatasetPool
 import dataset_factory.approved_pool as approved_pool_mod
 import dataset_factory.exemplar_memory as exemplar_memory_mod
 from dataset_factory.exemplar_memory import ExemplarMemory
-from ui.yolo_factory_dialog import YOLOFactoryDialog, YOLOPreviewCanvas
+from ui.yolo_factory_dialog import (
+    YOLOFactoryDialog,
+    YOLOPreviewCanvas,
+    _safe_imwrite_unicode,
+)
 
 
 @pytest.fixture(scope="module")
@@ -297,7 +300,8 @@ def test_step2_approve_guarantees_disk_and_pool_persistence(
     # Real frame (not a 1x1 stub): textured so the real exemplar crop path
     # extracts features and records a positive exemplar.
     rng = np.random.default_rng(7)
-    assert cv2.imwrite(str(img_p), rng.integers(0, 256, (240, 320, 3), dtype=np.uint8))
+    # Windows: cv2.imwrite fails on non-ASCII paths (e.g. Users\selçuk); use Unicode-safe writer.
+    assert _safe_imwrite_unicode(img_p, rng.integers(0, 256, (240, 320, 3), dtype=np.uint8))
 
     dlg = YOLOFactoryDialog()
     try:
@@ -379,7 +383,7 @@ def test_step2_approve_guarantees_disk_and_pool_persistence(
 
 
 def test_large_canvas_dimensions_and_sidebar_structure(qapp: QApplication) -> None:
-    """5. Test that the review canvas is large (minHeight >= 600) and sidebar exists with width 420 (v14 layout fix: 340 -> 420)."""
+    """5. Large canvas (minHeight >= 600) + thin left filter rail (280 px, mockup redesign)."""
     dlg = YOLOFactoryDialog()
     try:
         # Check minimum dialog size
@@ -389,9 +393,9 @@ def test_large_canvas_dimensions_and_sidebar_structure(qapp: QApplication) -> No
         # Check review_preview minimum height
         assert dlg.review_preview.minimumHeight() >= 600
 
-        # Check sidebar scroll exists
+        # Check sidebar scroll exists — thin rail leaves room for center canvas
         sidebar = dlg.findChild(object, "PipeSidebarScroll")
         assert sidebar is not None
-        assert sidebar.width() == 420  # v14: YOLO layout fix sol panel 340 -> 420 px
+        assert sidebar.width() == 280
     finally:
         dlg.close()

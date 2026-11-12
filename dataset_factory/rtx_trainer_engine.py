@@ -14,6 +14,7 @@ Exclusive Owner: Sub-Agent 6 (`dataset_factory/rtx_trainer_engine.py`)
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import json
 import logging
@@ -864,7 +865,9 @@ class RTXTrainerEngine:
             "cls": 0.5,
             "dfl": 1.5,
             "workers": 4,
-            "cache": "ram",
+            # disk: onay havuzu (~1.4k kare) ile cache=ram süreçte +10–12 GB RSS
+            # biriktiriyordu; Gatherion botu ile aynı süreçte segfault riski.
+            "cache": "disk",
             "device": 0,
             "deterministic": True,
             "seed": 42,
@@ -1591,6 +1594,7 @@ class RTXTrainerEngine:
                     bat_path=bat_path,
                     progress_callback=progress_callback,
                     model=model,
+                    use_approved_only=effective_approved,
                 )
                 res_a["use_approved_only"] = effective_approved
                 res_a["data_yaml_path"] = str(yaml_path)
@@ -1672,6 +1676,7 @@ class RTXTrainerEngine:
         bat_path: Path,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]],
         model: str = "yolo11n.pt",
+        use_approved_only: bool = False,
     ) -> Dict[str, Any]:
         from ultralytics import YOLO  # type: ignore
 
@@ -1752,10 +1757,13 @@ class RTXTrainerEngine:
                     pass
 
         _last_batch_ui_update = 0.0
+        _last_rss_check = 0.0
+        _stopped_for_rss = False
         _batch_counter = _BatchStepCounter()
+        _rss_abort_mb = float(train_cfg.get("rss_abort_mb", 10240.0))
 
         def _on_train_batch_end(trainer: Any) -> None:
-            nonlocal _last_batch_ui_update
+            nonlocal _last_batch_ui_update, _last_rss_check, _stopped_for_rss
             if self._stop_event.is_set():
                 setattr(trainer, "stop", True)
                 try:
@@ -1763,6 +1771,25 @@ class RTXTrainerEngine:
                 except Exception:
                     pass
                 return
+            now_rss = time.monotonic()
+            if _rss_abort_mb > 0 and now_rss - _last_rss_check >= 30.0:
+                _last_rss_check = now_rss
+                try:
+                    from core.crash_evidence import _read_rss_mb
+
+                    rss = _read_rss_mb()
+                except Exception:
+                    rss = None
+                if rss is not None and rss >= _rss_abort_mb:
+                    _stopped_for_rss = True
+                    logger.warning(
+                        "RTX eğitimi RSS eşiği aşıldı (%.1f MB >= %.1f MB) — güvenli durdurma.",
+                        rss,
+                        _rss_abort_mb,
+                    )
+                    self._stop_event.set()
+                    setattr(trainer, "stop", True)
+                    return
             # v19 telemetri: sayaç HER batch_end çağrısında ilerler —
             # throttle (2.5 sn) yalnızca UI gönderimini seyreltir, sayımı değil.
             # Eski kod `trainer.batch` okuyordu; o öznitelik yok, cur_b hep 1'di.
@@ -1831,7 +1858,7 @@ class RTXTrainerEngine:
             patience=int(train_cfg["patience"]),
             device=0 if use_cuda_device else "cpu",
             workers=0,
-            cache=str(train_cfg.get("cache", "ram")),
+            cache=str(train_cfg.get("cache", "disk")),
             deterministic=bool(train_cfg.get("deterministic", True)),
             seed=int(train_cfg.get("seed", 42)),
             single_cls=bool(train_cfg.get("single_cls", False)),
@@ -1845,7 +1872,15 @@ class RTXTrainerEngine:
         )
 
         if self._stop_event.is_set():
-            logger.info("RTX eğitimi kullanıcı tarafından durduruldu.")
+            if _stopped_for_rss:
+                stop_reason = (
+                    f"Eğitim bellek eşiği nedeniyle durduruldu (RSS >= {_rss_abort_mb:.0f} MB). "
+                    "Uygulamayı yeniden başlatıp eğitimi ayrı süreçte (train_rtx_yolo.bat) deneyin."
+                )
+                logger.warning("RTX eğitimi RSS eşiğiyle durduruldu.")
+            else:
+                stop_reason = "Eğitim kullanıcı tarafından durduruldu."
+                logger.info("RTX eğitimi kullanıcı tarafından durduruldu.")
             total_elapsed = round(time.perf_counter() - start_time, 3)
             epochs_completed = int(self._count_results_csv_epochs(run_dir) or 0)
             payload = {
@@ -1854,17 +1889,25 @@ class RTXTrainerEngine:
                 "interrupted": True,
                 "state": "stopped",
                 "status": "stopped",
-                "reason": "Eğitim kullanıcı tarafından durduruldu.",
+                "reason": stop_reason,
                 "mode": "ultralytics_cuda_fp16",
                 "elapsed_sec": total_elapsed,
                 "epoch": epochs_completed,
                 "epochs": epochs,
                 "epochs_completed": epochs_completed,
-                "use_approved_only": effective_approved,
+                "use_approved_only": use_approved_only,
                 "data_yaml_path": str(yaml_path),
             }
             with self._lock:
                 self._latest_status.update(payload)
+            try:
+                gc.collect()
+                import torch  # type: ignore
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
             return payload
 
         # Export trained weights to ONNX (FP16 when on GPU)

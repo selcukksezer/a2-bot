@@ -795,6 +795,6 @@ def test_5_end_to_end_pipeline_to_approved_dataset_pool_and_yaml(isolated_env) -
     assert parsed_yaml["path"] == yaml_path.parent.resolve().as_posix()
     assert parsed_yaml["train"] == "images/train"
     assert parsed_yaml["val"] == "images/val"
-    assert parsed_yaml["nc"] == 27
+    assert parsed_yaml["nc"] == len(CANONICAL_NAMES) == 29
     for cid, cname in CANONICAL_NAMES.items():
         assert parsed_yaml["names"][cid] == cname

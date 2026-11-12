@@ -16,7 +16,7 @@ YOLO Fabrikası inceleme/onay ekranının (Adım 2 — Onayla) HTML prototipteki
   Onayla (n)" — hepsi gerçek kuyruk verisini süzüp onaylar.
 - Fotoğraf üstü: canlı önizleme satırı, Hız/Kalan göstergesi, Tam Ekran
   (Lightbox); fotoğraf altı: tıklayınca sınıf filtresi uygulayan renk lejantı.
-- Alt aksiyonlar ONAYLA VE SONRAKİ (A), REDDET (R), Atla (S),
+- Alt aksiyonlar ONAYLA (A), REDDET (R), Atla (S),
   Karakterimi Etiketle (K) + klavye kısayolları.
 - Sağ panel (Sıradaki İş / Engeller / Çalıştırmalar / Canlı Log) görünür;
   altta filtreli Canlı Günlük şeridi (Tümü/INFO/Önizleme/Temizle).
@@ -44,17 +44,22 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import cv2
 import numpy as np
 import pytest
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, QPointF, Qt
+from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 
 from dataset_factory.approved_pool import ApprovedDatasetPool
 import dataset_factory.approved_pool as approved_pool_mod
 import dataset_factory.exemplar_memory as exemplar_memory_mod
 from dataset_factory.exemplar_memory import ExemplarMemory
-from ui.yolo_factory_dialog import YOLOFactoryDialog, YOLOPreviewCanvas
+from dataset_factory.class_taxonomy import CANONICAL_NAMES
+from ui.yolo_factory_dialog import (
+    YOLOFactoryDialog,
+    YOLOPreviewCanvas,
+    _safe_imwrite_unicode,
+)
 
 
 @pytest.fixture(scope="module")
@@ -130,11 +135,18 @@ def test_review_controls_exist_and_canvas_is_large(qapp: QApplication) -> None:
             "all", "pending", "ok", "no", "high", "low",
         ]
         assert dlg.queue_conf_slider.minimum() == 0
-        assert dlg.queue_conf_slider.maximum() == 95
+        assert dlg.queue_conf_slider.maximum() == 100
         assert dlg.queue_conf_val.text() == "≥ 0,00"
+        # Tek güven: bulk_range alias aynı kaydırıcıya bağlı.
+        assert dlg.bulk_range is dlg.queue_conf_slider
+        assert dlg.bulk_val is dlg.queue_conf_val
         assert dlg.btn_clear_filters.text() == "Filtreleri temizle"
         assert dlg.chk_only_approved.isChecked() is True
         assert dlg.lbl_approved_count is not None
+        # Kompakt CTA (~24–28px); şişkin inline padding yok.
+        assert dlg.btn_approve.maximumHeight() <= 28
+        assert dlg.btn_approve.styleSheet() == ""
+        assert dlg.btn_reject.maximumHeight() <= 28
 
         # Sınıf filtresi tüm sınıfları içerir (player_character = 26 dahil).
         class_data = [dlg.review_class_filter.itemData(i) for i in range(dlg.review_class_filter.count())]
@@ -152,19 +164,39 @@ def test_review_controls_exist_and_canvas_is_large(qapp: QApplication) -> None:
         assert dlg.preview_canvas.objectName() == "PipeCapturePreview"
         assert "Hız:" in dlg.lbl_speed_meter.text() and "Kalan:" in dlg.lbl_speed_meter.text()
         assert "Tam Ekran (Lightbox)" in dlg.btn_open_lightbox.text()
+        # Zoom araç çubuğu (Adım 2 etiketleme önizlemesi)
+        assert dlg.btn_zoom_in.text() == "+"
+        assert dlg.btn_zoom_out.text() == "−"
+        assert dlg.btn_zoom_reset.text() == "100%"
+        assert dlg.btn_zoom_in.accessibleName() == "Yakınlaştır"
+        assert dlg.review_preview.accessibleName() == "YOLO etiket önizleme tuvali"
 
-        # Fotoğraf altı renk lejantı: tüm sınıflar + Tümü
+        # Fotoğraf altı renk lejantı: tüm kanonik sınıflar + Tümü (eksik düğme yok)
         assert -1 in dlg._legend_buttons
-        assert 0 in dlg._legend_buttons and 26 in dlg._legend_buttons
+        for cid, cname in CANONICAL_NAMES.items():
+            assert cid in dlg._legend_buttons, f"lejant eksik: {cid} {cname}"
+            assert cname in dlg._legend_buttons[cid].text()
         assert "herb_aria" in dlg._legend_buttons[0].text()
         assert "player_character" in dlg._legend_buttons[26].text()
+        assert "other_ore" in dlg._legend_buttons[27].text()
+        assert "other_odyle" in dlg._legend_buttons[28].text()
 
-        # Alt aksiyonlar + kısayollar
-        assert "ONAYLA VE SONRAKİ" in dlg.btn_approve.text()
+        # Alt aksiyonlar + kısayollar (mockup: amber ONAYLA, ince 280px sol ray)
+        assert dlg.btn_approve.text().replace(" ", "") == "ONAYLA(A)"
+        assert "ONAYLA VE SONRAKİ" not in dlg.btn_approve.text()
         assert "REDDET" in dlg.btn_reject.text()
         assert "Atla" in dlg.btn_skip.text()
         assert "Karakterimi Etiketle" in dlg.btn_add_player_char.text()
+        assert "(K)" in dlg.btn_add_player_char.text()
         assert dlg.btn_goto_train.text() == "Eğit adımına git →"
+        from PyQt6.QtWidgets import QWidget
+        film = dlg.findChild(QWidget, "PipeFilmstripHost")
+        assert film is not None
+        title = dlg.findChild(QLabel, "PipeMainTitle")
+        assert title is not None and title.text() == "YOLO fabrikası"
+        assert "iş akışı" not in title.text()
+        stamp = dlg.findChild(QLabel, "PipeUiBuildStamp")
+        assert stamp is not None and "onayla-r4" in stamp.text()
         for name in ("_shortcut_approve_a", "_shortcut_reject_r", "_shortcut_skip_s", "_shortcut_player_k"):
             assert hasattr(dlg, name), f"eksik kısayol: {name}"
 
@@ -174,9 +206,21 @@ def test_review_controls_exist_and_canvas_is_large(qapp: QApplication) -> None:
         assert dlg.run_list_host is not None
         assert dlg.training_log_box is not None
 
-        # Alttaki filtreli Canlı Günlük şeridi
+        # Journal API durur ama sayfada görünmez (kabuk CANLI GÜNLÜK tek kaynak)
         assert dlg.live_journal_box is not None
+        assert dlg.live_journal_strip is not None
+        assert not dlg.live_journal_strip.isVisible()
         assert [b.text() for b in dlg._journal_filter_group.buttons()] == ["Tümü", "INFO", "Önizleme"]
+        # Hazırla kaydırma alanı (üst üste binmeyi önler)
+        assert getattr(dlg, "_prepare_scroll", None) is not None
+        assert dlg.step_stack.indexOf(dlg._prepare_scroll) == 2
+        # r4: thin chrome keeps compact KPI host; cards exist for step switches.
+        dlg._go_step(1)
+        assert "frames" in dlg._stat_cards and "empty" in dlg._stat_cards
+        dlg._go_step(2)
+        assert "pending" in dlg._stat_cards and "frames" in dlg._stat_cards
+        stamp2 = dlg.findChild(QLabel, "PipeUiBuildStamp")
+        assert stamp2 is not None and "onayla-r4" in stamp2.text()
     finally:
         dlg.close()
 
@@ -228,6 +272,10 @@ def test_status_filter_modes(qapp: QApplication, mode: str, label: str, expected
     dlg = YOLOFactoryDialog()
     try:
         _load_synthetic(dlg)
+        # Tek güven kaydırıcısı high/low eşiğini de sürer — varsayılan 0 iken
+        # ayrım kaybolur; klasik %90 eşiğini kur.
+        if mode in ("high", "low"):
+            dlg.queue_conf_slider.setValue(90)
         # Combo üzerinden seç (gerçek wiring): veri değişince kuyruk yenilenir.
         dlg.queue_filter.setCurrentIndex(dlg.queue_filter.findData(mode))
         assert dlg._queue_filter_mode == mode
@@ -346,7 +394,9 @@ def test_bulk_approve_filtered_end_to_end(
     rng = np.random.default_rng(11)
     for stem, cid, conf in (("bulk_high_0001", 0, 0.95), ("bulk_low_0002", 3, 0.70)):
         img_p = dataset_dir / "images" / "train" / f"{stem}.jpg"
-        assert cv2.imwrite(str(img_p), rng.integers(0, 256, (240, 320, 3), dtype=np.uint8))
+        assert _safe_imwrite_unicode(
+            img_p, rng.integers(0, 256, (240, 320, 3), dtype=np.uint8)
+        )
         rev = {
             "weak": [{"class_id": cid, "class_name": "herb_aria" if cid == 0 else "ore_orichalcum",
                       "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2,
@@ -372,6 +422,7 @@ def test_bulk_approve_filtered_end_to_end(
         assert len(dlg._review_items) == 2
 
         # Yüksek güvenli filtresi yalnızca 0,95'lik kareyi bırakır.
+        dlg.queue_conf_slider.setValue(90)  # tek güven eşiği (bulk + high)
         dlg.queue_filter.setCurrentIndex(dlg.queue_filter.findData("high"))
         assert _visible_queue_stems(dlg) == ["bulk_high_0001"]
         assert dlg.btn_approve_filtered.text() == "✓ Filtredekileri Onayla (1)"
@@ -394,6 +445,7 @@ def test_bulk_approve_filtered_end_to_end(
 def test_live_journal_strip_filters(qapp: QApplication) -> None:
     dlg = YOLOFactoryDialog()
     try:
+        assert not dlg.live_journal_strip.isVisible()
         dlg._append_log("[ÖNİZLEME] journal-preview-probe")
         dlg._append_log("[BİLGİ] journal-info-probe")
         dlg._set_journal_filter("all")
@@ -408,6 +460,8 @@ def test_live_journal_strip_filters(qapp: QApplication) -> None:
         dlg._clear_journal()
         assert "journal-info-probe" not in dlg.live_journal_box.toPlainText()
         assert dlg.live_journal_box.toPlainText().strip() == "[HAZIR] Canlı günlük açık."
+        # Sağ rail log hâlâ görünür YOLO akışı
+        assert dlg.training_log_box.isVisible() or dlg.training_log_box.parent() is not None
     finally:
         dlg.close()
 
@@ -430,5 +484,58 @@ def test_only_approved_toggle_logs_and_train_goto(qapp: QApplication) -> None:
         dlg._pipeline["frozen"] = False
         dlg.btn_goto_train.click()
         assert dlg.step_stack.currentIndex() == 2  # Adım 3 — Hazırla
+    finally:
+        dlg.close()
+
+
+# ----------------------------------------------------------------------
+# 9. Önizleme zoom/pan: clamp, araç çubuğu, kare değişince sıfır
+# ----------------------------------------------------------------------
+
+def test_preview_canvas_zoom_clamp_and_toolbar(qapp: QApplication) -> None:
+    dlg = YOLOFactoryDialog()
+    try:
+        canvas = dlg.review_preview
+        assert canvas.user_zoom() == 1.0
+
+        canvas.zoom_in()
+        assert canvas.user_zoom() == pytest.approx(YOLOPreviewCanvas.ZOOM_STEP)
+        assert dlg.btn_zoom_reset.text() == f"{int(round(canvas.user_zoom() * 100))}%"
+
+        canvas.set_user_zoom(9.0)
+        assert canvas.user_zoom() == pytest.approx(YOLOPreviewCanvas.MAX_USER_ZOOM)
+        canvas.set_user_zoom(0.01)
+        assert canvas.user_zoom() == pytest.approx(YOLOPreviewCanvas.MIN_USER_ZOOM)
+
+        dlg.btn_zoom_reset.click()
+        assert canvas.user_zoom() == pytest.approx(1.0)
+        assert dlg.btn_zoom_reset.text() == "100%"
+
+        # Tekerlek: imleç merkezli yakınlaştır
+        canvas.resize(640, 400)
+        before = canvas.user_zoom()
+        wheel = QWheelEvent(
+            QPointF(320, 200),
+            QPointF(320, 200),
+            QPoint(0, 0),
+            QPoint(0, 120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.ControlModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        canvas.wheelEvent(wheel)
+        assert canvas.user_zoom() > before
+
+        # Aynı kaynak anahtarı: zoom korunur; yeni kaynak: sıfırlanır
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        canvas.set_user_zoom(2.0)
+        assert canvas.set_live_frame(frame, "a", source_key="zoom-test-a")
+        assert canvas.user_zoom() == pytest.approx(1.0)  # yeni kare → sıfır
+        canvas.set_user_zoom(2.0)
+        assert canvas.set_live_frame(frame, "a2", annotations=[{"cx": 0.5, "cy": 0.5, "w": 0.1, "h": 0.1, "class_id": 0}], source_key="zoom-test-a")
+        assert canvas.user_zoom() == pytest.approx(2.0)  # aynı kare, etiket yenilemesi
+        assert canvas.set_live_frame(frame, "b", source_key="zoom-test-b")
+        assert canvas.user_zoom() == pytest.approx(1.0)
     finally:
         dlg.close()

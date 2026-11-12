@@ -20,7 +20,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QPushButton
+from PyQt6.QtWidgets import QApplication, QPushButton, QSizePolicy, QWidget
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -286,6 +286,11 @@ def test_log_card_filters_present(shell_with_menu):
     shell, _menu, _mgr = shell_with_menu
     labels = {b.text() for b in shell.findChildren(QPushButton)}
     assert {"Tümü", "INFO", "Önizleme", "Temizle"} <= labels
+    wrap = shell.findChild(QWidget, "ShellLogWrap")
+    assert wrap is not None
+    assert wrap.minimumWidth() == 360 and wrap.maximumWidth() == 360
+    assert shell.log_view.minimumHeight() >= 120
+    assert shell.log_view.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Expanding
 
 
 def test_avoid_combat_toggle_writes_settings(shell_with_menu, tmp_path):

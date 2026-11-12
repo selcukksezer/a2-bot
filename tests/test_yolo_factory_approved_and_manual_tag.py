@@ -30,6 +30,7 @@ if _app is None:
     _app = QApplication(sys.argv)
 
 from dataset_factory.approved_pool import ApprovedDatasetPool, get_approved_pool
+from dataset_factory.class_taxonomy import CANONICAL_NAMES
 from ui.yolo_factory_dialog import (
     CLASS_COLORS_MAP,
     CLASS_ID_TO_SPEC,
@@ -39,6 +40,8 @@ from ui.yolo_factory_dialog import (
     YOLOFactoryDialog,
     YOLOPreviewCanvas,
 )
+
+_CANONICAL_CLASS_COUNT = len(CANONICAL_NAMES)
 
 
 @pytest.fixture
@@ -279,13 +282,13 @@ def test_only_approved_checkbox_and_training_wiring(factory_dialog: YOLOFactoryD
 # ============================================================================
 
 def test_searchable_tag_list_panel_coverage_and_filtering(factory_dialog: YOLOFactoryDialog):
-    """Verifies SearchableTagListPanel has all 27 classes (0..26 including kinah and player_character), QCompleter, and search filtering."""
+    """Verifies SearchableTagListPanel has all canonical classes (incl. kinah, player, F4 generics), QCompleter, and search filtering."""
     panel = factory_dialog.tag_panel
     assert isinstance(panel, SearchableTagListPanel)
-    assert panel.list_widget.count() == 27
-    assert panel.combo.count() == 27
+    assert panel.list_widget.count() == _CANONICAL_CLASS_COUNT
+    assert panel.combo.count() == _CANONICAL_CLASS_COUNT
 
-    # Check that canonical classes exist, including pots, scroll, kinah, and player
+    # Check that canonical classes exist, including pots, scroll, kinah, player, F4
     cnames = [panel.combo.itemText(i) for i in range(panel.combo.count())]
     assert any("herb_aria" in s for s in cnames)
     assert any("ore_orichalcum" in s for s in cnames)
@@ -294,6 +297,8 @@ def test_searchable_tag_list_panel_coverage_and_filtering(factory_dialog: YOLOFa
     assert any("buff_scroll" in s for s in cnames)
     assert any("kinah" in s for s in cnames)
     assert any("player_character" in s for s in cnames)
+    assert any("other_ore" in s for s in cnames)
+    assert any("other_odyle" in s for s in cnames)
 
     # Check completer attached
     assert panel.combo.completer() is not None
@@ -311,7 +316,7 @@ def test_searchable_tag_list_panel_coverage_and_filtering(factory_dialog: YOLOFa
 
     panel.search_edit.setText("")
     visible_all = sum(1 for i in range(panel.list_widget.count()) if not panel.list_widget.item(i).isHidden())
-    assert visible_all == 27
+    assert visible_all == _CANONICAL_CLASS_COUNT
 
 
 def test_drawing_class_selection_and_signals(factory_dialog: YOLOFactoryDialog):
@@ -468,7 +473,7 @@ def test_detail_row_cls_combo_has_completer(factory_dialog: YOLOFactoryDialog):
     assert combo is not None
     assert combo.isEditable() is True
     assert combo.completer() is not None
-    assert combo.count() == 27
+    assert combo.count() == _CANONICAL_CLASS_COUNT
 
 
 def test_manual_box_drawn_only_on_target_frame_and_persisted(factory_dialog: YOLOFactoryDialog, tmp_path: Path):
@@ -551,9 +556,9 @@ def test_manual_box_drawn_only_on_target_frame_and_persisted(factory_dialog: YOL
 
 
 def test_class_select_dialog_coverage_and_filtering():
-    """Verifies ClassSelectDialog lists 27 classes (0..26), filters on text input, and returns selected class."""
+    """Verifies ClassSelectDialog lists all canonical classes, filters on text input, and returns selected class."""
     dlg = ClassSelectDialog(parent=None, initial_class_id=3)
-    assert dlg.list_widget.count() == 27
+    assert dlg.list_widget.count() == _CANONICAL_CLASS_COUNT
     assert dlg.selected_class_id() == 3
 
     # Test filtering
