@@ -1248,12 +1248,21 @@ class PanicAlertSystem:
         # değil/bilinmiyor. Simge durumundayken idle + savaş sayacı
         # donar (oyun-yokluğu ile aynı kural).
         self._game_window_minimized_detector: Optional[Callable[[], Optional[bool]]] = None
+        # fix/v20-egitim-idle: eğitim-aktif detektörü — True = süreç
+        # içinde RTX eğitimi sürüyor (bot eğitim için duraklatılmış,
+        # toplanamaz). Eğitim sürerken YALNIZCA idle sayacı donar;
+        # savaş/istem/ölüm/GM yollarına dokunulmaz (Selçuk kararı:
+        # her duraklatmada değil, yalnızca eğitim sırasında).
+        self._training_active_detector: Optional[Callable[[], Optional[bool]]] = None
         # fix/panik-kilit-oyun-yok: idle sayacının oyun-yokluğu yüzünden
         # duraklatıldığının son durumu — geçişte tek debug satırı için.
         self._idle_paused_for_game_window: bool = False
         # fix/v20-rss-panik: idle sayacının simge-durumu yüzünden
         # duraklatıldığının son durumu (aynı geçiş logu deseni).
         self._idle_paused_for_minimized: bool = False
+        # fix/v20-egitim-idle: idle sayacının eğitim yüzünden
+        # duraklatıldığının son durumu (aynı geçiş logu deseni).
+        self._idle_paused_for_training: bool = False
         # fix/v20-panic-combat: bot duraklatıldı mı (BotWorker.pause() /
         # resume() set_paused ile bildirir). Duraklatılıyken savaş sayacı
         # donar — poll bayat in_combat okusa bile COMBAT_TIMEOUT_2M
@@ -2143,6 +2152,7 @@ class PanicAlertSystem:
         game_window_present: Optional[bool] = None,
         game_window_minimized: Optional[bool] = None,
         paused: Optional[bool] = None,
+        training_active: Optional[bool] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Periyodik olarak çağrılarak 4 ana acil durum koşulunu denetler:
@@ -2180,6 +2190,12 @@ class PanicAlertSystem:
         (is_game_window_present True döner), o yüzden simge durumu
         ayrı sinyalle gelir; oyun-yokluğu ile aynı donma uygulanır.
         Ölüm/GM/istem yolları simge durumundayken de aynen çalışır.
+        fix/v20-egitim-idle: eğitim sürerken de (training_active=True)
+        YALNIZCA idle sayacı donar — canlı 22:09:42: bot eğitim için
+        duraklatılmış, oyun görünürken IDLE_TIMEOUT_15M haksız yere
+        attı. Savaş sayacı duraklatmada zaten donar; istem sayacı da
+        duraklatmada donar; ölüm/GM aynen çalışır. Her duraklatma
+        değil, yalnızca eğitim donmayı açar (Selçuk kararı).
         None (bilinmiyor / verilmedi) = eski davranış.
         """
         now = time.monotonic()
@@ -2196,17 +2212,22 @@ class PanicAlertSystem:
             # aşağıdaki idle koşulu tutmaz; oyun geri gelince sayaç
             # sıfırdan başlar. Diğer zamanlayıcılara dokunulmaz.
             # fix/v20-rss-panik: simge durumu da aynı donmayı uygular.
+            # fix/v20-egitim-idle: eğitim de YALNIZCA idle donmasını
+            # uygular (savaş/istem duraklatma kuralında zaten donar).
             window_absent = game_window_present is False
             window_minimized = game_window_minimized is True
-            idle_paused = window_absent or window_minimized
+            training = training_active is True
+            idle_paused = window_absent or window_minimized or training
             if idle_paused:
                 self._last_gather_ts = now
                 idle_elapsed = 0.0
             was_idle_paused = (
                 self._idle_paused_for_game_window or self._idle_paused_for_minimized
+                or self._idle_paused_for_training
             )
             self._idle_paused_for_game_window = window_absent
             self._idle_paused_for_minimized = window_minimized
+            self._idle_paused_for_training = training
             # fix/v20-panic-combat: savaş sayacı donar — oyun yokken
             # VEYA bot duraklatılıyken. _combat_start_ts temizlenir
             # (sıfırlanır); oyun geri gelince / devam edilince sayaç
@@ -2236,12 +2257,18 @@ class PanicAlertSystem:
 
         if idle_paused and not was_idle_paused:
             logger.debug(
-                "[PANIC] Oyun penceresi %s — boşta sayacı duraklatıldı "
+                "[PANIC] %s — boşta sayacı duraklatıldı "
                 "(IDLE_TIMEOUT_15M tetiklenmez).",
-                "simge durumunda" if window_minimized else "yok",
+                "Eğitim sürüyor"
+                if training
+                else (
+                    "Oyun penceresi simge durumunda"
+                    if window_minimized
+                    else "Oyun penceresi yok"
+                ),
             )
         elif not idle_paused and was_idle_paused:
-            logger.debug("[PANIC] Oyun penceresi geri geldi — boşta sayacı yeniden çalışıyor.")
+            logger.debug("[PANIC] Boşta sayacı yeniden çalışıyor (sıfırdan).")
         _was_combat_frozen = (
             was_combat_frozen_pause or was_combat_frozen_window or was_combat_frozen_minimized
         )
@@ -2368,6 +2395,7 @@ class PanicAlertSystem:
         prompt_visible_detector: Optional[Callable[[], bool]] = None,
         game_window_present_detector: Optional[Callable[[], Optional[bool]]] = None,
         game_window_minimized_detector: Optional[Callable[[], Optional[bool]]] = None,
+        training_active_detector: Optional[Callable[[], Optional[bool]]] = None,
     ) -> None:
         """
         F-0163: _poll_loop'un her turda danışacağı dış sinyal detektörlerini
@@ -2390,6 +2418,10 @@ class PanicAlertSystem:
           penceresi simge durumundaysa True döner — poll bunu
           check_watchdog_conditions'a geçirir; True iken idle sayacı
           VE savaş sayacı durur (oyun-yokluğu ile aynı kural).
+        - training_active_detector (fix/v20-egitim-idle): süreç içinde
+          RTX eğitimi sürüyorsa True döner — poll bunu
+          check_watchdog_conditions'a geçirir; True iken YALNIZCA
+          idle sayacı durur (savaş/istem/ölüm/GM aynen çalışır).
         """
         with self._lock:
             if character_dead_detector is not None:
@@ -2408,12 +2440,15 @@ class PanicAlertSystem:
                 self._game_window_present_detector = game_window_present_detector
             if game_window_minimized_detector is not None:
                 self._game_window_minimized_detector = game_window_minimized_detector
+            if training_active_detector is not None:
+                self._training_active_detector = training_active_detector
 
     def bind_production_watchdog_sources(
         self,
         worker: Any = None,
         combat_recovery: Any = None,
         gm_whisper_detector: Optional[Callable[[], bool]] = None,
+        training_active_detector: Optional[Callable[[], Optional[bool]]] = None,
     ) -> Dict[str, Any]:
         """
         F-0163 (2. tur): üretimdeki canlı kaynakları (BotWorker /
@@ -2452,6 +2487,13 @@ class PanicAlertSystem:
         - game_window_minimized (fix/v20-rss-panik): worker.watchdog
           .is_game_window_minimized — simge durumundaysa True döner.
           "Zorunlu" sayılmaz (aynı gerekçe).
+        - training_active (fix/v20-egitim-idle): süreç-içi eğitim
+          slotu (dataset_factory.rtx_trainer_engine.is_training_active)
+          — tembel import ile okunur, bu dosya üretim modüllerini
+          üstte import etmez. Açıkça detektör verilirse o kullanılır;
+          verilmezse slot okuyucusu bağlanır. Import/okuma hatası
+          None döner (bilinmiyor = eski davranış). "Zorunlu"
+          sayılmaz (aynı gerekçe).
 
         Döner: {"wired": {sinyal: bool, ...}, "missing": [sinyal, ...]}.
         Eksik sinyal varsa warning loglanır — sessiz eksik bağlama yok.
@@ -2469,7 +2511,38 @@ class PanicAlertSystem:
             "prompt_stuck": False,
             "game_window_present": False,
             "game_window_minimized": False,
+            "training_active": False,
         }
+
+        # fix/v20-egitim-idle: eğitim sinyali worker'dan bağımsızdır —
+        # süreç-içi slot modül düzeyinde tutulur. Açık detektör
+        # verilmezse tembel slot okuyucusu bağlanır (import hatası
+        # None döner, poll o turda eski davranışla denetler).
+        if training_active_detector is not None:
+            self.register_watchdog_detectors(
+                training_active_detector=training_active_detector
+            )
+            wired["training_active"] = True
+        else:
+
+            def _training_active() -> Optional[bool]:
+                try:
+                    import importlib
+
+                    mod = importlib.import_module(
+                        "dataset_factory.rtx_trainer_engine"
+                    )
+                    fn = getattr(mod, "is_training_active", None)
+                    if not callable(fn):
+                        return None
+                    return bool(fn())
+                except Exception:
+                    return None
+
+            self.register_watchdog_detectors(
+                training_active_detector=_training_active
+            )
+            wired["training_active"] = True
 
         if cr is not None and hasattr(cr, "is_dead"):
             self.register_watchdog_detectors(
@@ -2653,6 +2726,7 @@ class PanicAlertSystem:
                 "prompt_visible": self._prompt_visible_detector is not None,
                 "game_window_present": self._game_window_present_detector is not None,
                 "game_window_minimized": self._game_window_minimized_detector is not None,
+                "training_active": self._training_active_detector is not None,
             }
             polling = self._watchdog_thread is not None and self._watchdog_thread.is_alive()
             failures = dict(self._detector_failures)
@@ -2665,10 +2739,14 @@ class PanicAlertSystem:
         # aynı gerekçeyle missing_required'a girmez.
         # fix/v20-rss-panik: game_window_minimized de aynı gerekçeyle
         # "zorunlu" sayılmaz.
+        # fix/v20-egitim-idle: training_active de aynı gerekçeyle
+        # "zorunlu" sayılmaz — detektör kayıtlı olsa bile sinyal
+        # bilinmiyor (None) dönebilir; yokluğu alarm yorgunluğu
+        # yapmaz.
         required = [
             name
             for name in detectors
-            if name not in ("gm_whisper", "game_window_present", "game_window_minimized")
+            if name not in ("gm_whisper", "game_window_present", "game_window_minimized", "training_active")
         ]
         missing_required = [name for name in required if not detectors[name]]
         faulted = [name for name, count in failures.items() if count >= 3]
@@ -2758,6 +2836,7 @@ class PanicAlertSystem:
         prompt_visible_detector: Optional[Callable[[], bool]] = None,
         game_window_present_detector: Optional[Callable[[], Optional[bool]]] = None,
         game_window_minimized_detector: Optional[Callable[[], Optional[bool]]] = None,
+        training_active_detector: Optional[Callable[[], Optional[bool]]] = None,
     ) -> bool:
         """
         F-0163 (dilim-içi kısım): check_watchdog_conditions'ı periyodik
@@ -2780,6 +2859,7 @@ class PanicAlertSystem:
             or prompt_visible_detector is not None
             or game_window_present_detector is not None
             or game_window_minimized_detector is not None
+            or training_active_detector is not None
         ):
             self.register_watchdog_detectors(
                 character_dead_detector=character_dead_detector,
@@ -2790,6 +2870,7 @@ class PanicAlertSystem:
                 prompt_visible_detector=prompt_visible_detector,
                 game_window_present_detector=game_window_present_detector,
                 game_window_minimized_detector=game_window_minimized_detector,
+                training_active_detector=training_active_detector,
             )
         with self._lock:
             if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
@@ -2846,6 +2927,11 @@ class PanicAlertSystem:
                     game_window_minimized = self._call_detector(
                         self._game_window_minimized_detector, "game_window_minimized"
                     )
+                    # fix/v20-egitim-idle: eğitim sürerken YALNIZCA
+                    # idle sayacı donar (check_watchdog_conditions).
+                    training_active = self._call_detector(
+                        self._training_active_detector, "training_active"
+                    )
                     self.check_watchdog_conditions(
                         input_ctrl=input_ctrl,
                         character_dead=bool(
@@ -2869,6 +2955,9 @@ class PanicAlertSystem:
                             None
                             if game_window_minimized is None
                             else bool(game_window_minimized)
+                        ),
+                        training_active=(
+                            None if training_active is None else bool(training_active)
                         ),
                     )
                 except Exception as exc:

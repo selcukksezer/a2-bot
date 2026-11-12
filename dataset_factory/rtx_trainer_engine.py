@@ -469,6 +469,18 @@ def _train_slot_busy() -> bool:
     with _TRAIN_SLOT_LOCK:
         return bool(_TRAIN_SLOT_HELD)
 
+
+def is_training_active() -> bool:
+    """fix/v20-egitim-idle: süreç içinde RTX eğitimi sürüyor mu?
+
+    Eğitim slotu sürecin tamamında tektir: start_training_async slotu
+    alıp worker thread'i başlatır, worker'ın finally'si bırakır;
+    senkron yol _begin/_end_training_session ile aynı slotu tutar.
+    Panik watchdog'u bu okumayla eğitim sürerken idle sayacını
+    dondurur (Selçuk kararı, 2026-11-12: yalnızca eğitim sırasında).
+    """
+    return _train_slot_busy()
+
 # F-0814: canonical 27-class taxonomy (0..26), not a generic 12-class list.
 # P1-1: the ceiling comes from the same single source as the hygiene
 # gate / augmentor (dataset/data.yaml via
