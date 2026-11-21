@@ -66,8 +66,18 @@ class _MonsterNegativeMemory:
     def is_negative_patch(self, crop, class_id=None, threshold=None, feats=None):
         return (True, 0.88, {"class_name": "monster_3d_negative", "class_id": 10})
 
-    def classify_patch(self, crop, min_sim=0.70, feats=None):
+    def classify_patch(self, crop, min_sim=0.70, feats=None, allowed_classes=None, same_category_as=None):
         return (None, None, 0.0)
+
+
+class _MonsterNegWithHerbPositiveMemory:
+    """Canlı çakışma: monster_3d neg + herb family positive (aria/mela)."""
+
+    def is_negative_patch(self, crop, class_id=None, threshold=None, feats=None):
+        return (True, 0.86, {"class_name": "monster_3d", "class_id": 10})
+
+    def classify_patch(self, crop, min_sim=0.70, feats=None, allowed_classes=None, same_category_as=None):
+        return (0, "herb_aria", 0.80)
 
 
 class _CleanMemory:
@@ -76,7 +86,7 @@ class _CleanMemory:
     def is_negative_patch(self, crop, class_id=None, threshold=None, feats=None):
         return (False, 0.0, None)
 
-    def classify_patch(self, crop, min_sim=0.70, feats=None):
+    def classify_patch(self, crop, min_sim=0.70, feats=None, allowed_classes=None, same_category_as=None):
         return (2, "targena", 0.75)
 
 
@@ -116,6 +126,42 @@ class TestRefineGateDropsMonsterTargena:
             frame, [det], exemplar_memory=_MonsterNegativeMemory()
         )
         assert kept == []
+
+    def test_monster_neg_overruled_by_herb_positive(self, monkeypatch):
+        """Herb family positive varsa monster_3d neg gerçek Targena'yı ezmez."""
+        scanner = MaterialScanner()
+        monkeypatch.setattr(
+            "core.node_quality_gate.is_fake_gray_rock_or_ground",
+            lambda *a, **k: (False, 0.0, ""),
+        )
+        monkeypatch.setattr(
+            "core.material_scanner.discriminate_3d_material",
+            lambda *a, **k: MaterialDiscriminationResult(
+                is_authentic_node=True,
+                material_type="Targena",
+                class_name="herb_targena",
+                category="Herbs",
+                calibrated_confidence=0.9,
+                class_id=2,
+            ),
+        )
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        det = DetectedMaterial(
+            material_type="Targena",
+            source="3d_world",
+            screen_x=960,
+            screen_y=540,
+            bbox=(900, 400, 120, 120),
+            rel_map_dx=10.0,
+            rel_map_dy=5.0,
+            estimated_distance_m=8.0,
+            confidence=0.88,
+        )
+        kept = scanner._refine_candidates_with_exemplars(
+            frame, [det], exemplar_memory=_MonsterNegWithHerbPositiveMemory()
+        )
+        assert len(kept) == 1
+        assert kept[0].material_type in ("Targena", "Aria", "herb_aria")
 
     def test_clean_targena_candidate_kept(self, monkeypatch):
         """Negatif eşleşme yoksa (pozitif Targena örneği var) aday kalır."""

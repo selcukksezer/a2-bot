@@ -1250,14 +1250,28 @@ class MaterialScanner:
                 except Exception as exc_neg:
                     logger.debug("is_negative_patch check error: %s", exc_neg)
 
-            if is_neg:
-                cname = neg_ex.get("class_name", "negative") if neg_ex else "negative"
+            neg_cname = ""
+            if isinstance(neg_ex, dict):
+                neg_cname = str(neg_ex.get("class_name", "") or "")
+            try:
+                neg_cid = int((neg_ex or {}).get("class_id", -1) or -1) if isinstance(neg_ex, dict) else -1
+            except (TypeError, ValueError):
+                neg_cid = -1
+            # monster_3d negatives are broad (91 of 150 live negs) and
+            # falsely match real herb/gem crops at sim 0.82–0.89. Terrain /
+            # UI / empty negatives still hard-drop immediately; monster
+            # negatives wait for the positive-family rescue below (MADDE 8
+            # still drops when there is no material-family positive hit).
+            is_monster_neg = is_neg and (
+                neg_cid == 10 or "monster" in neg_cname.lower()
+            )
+            if is_neg and not is_monster_neg:
                 logger.info(
                     "MaterialScanner filtered candidate '%s' @ (%d, %d): matched learned negative exemplar '%s' (sim=%.2f)",
                     mat.material_type,
                     mat.screen_x,
                     mat.screen_y,
-                    cname,
+                    neg_cname or "negative",
                     neg_sim,
                 )
                 continue
@@ -1295,8 +1309,7 @@ class MaterialScanner:
             # drop below (step 2 still refines its class/confidence from
             # the same match). The classifier itself has no exemplar shield
             # anymore; this rescue lives only in the exemplar gate, whose
-            # job is exactly to apply learned identities. A negative
-            # exemplar match (step 1) still wins over a positive one.
+            # job is exactly to apply learned identities.
             # The verdict is measured ONCE here and reused by step 1c
             # (via PrecomputedExemplarVerdict) and step 2 below, instead
             # of running the same feature extraction three times per crop.
@@ -1317,6 +1330,33 @@ class MaterialScanner:
             except Exception:
                 pos_match = False
                 _pos_result = None
+
+            # 1b2b. monster_3d neg vs material-family positive arbitration.
+            # Live session_2026-11-21_143000: 45× Targena/Diamond filtered as
+            # monster_3d while herb positives (aria/mela) exist → IDLE_TIMEOUT.
+            if is_monster_neg:
+                if pos_match:
+                    _psim = float((_pos_result or (None, None, 0.0))[2] or 0.0)
+                    logger.info(
+                        "MaterialScanner kept candidate '%s' @ (%d, %d): monster neg '%s' "
+                        "(sim=%.2f) overruled by positive family match (sim=%.2f)",
+                        mat.material_type,
+                        mat.screen_x,
+                        mat.screen_y,
+                        neg_cname or "monster_3d",
+                        neg_sim,
+                        _psim,
+                    )
+                else:
+                    logger.info(
+                        "MaterialScanner filtered candidate '%s' @ (%d, %d): matched learned negative exemplar '%s' (sim=%.2f)",
+                        mat.material_type,
+                        mat.screen_x,
+                        mat.screen_y,
+                        neg_cname or "monster_3d",
+                        neg_sim,
+                    )
+                    continue
 
             # 1c. Multi-layered 3D material discrimination & background terrain rejection
             disc_res = None

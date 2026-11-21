@@ -159,6 +159,40 @@ def test_watchdog_stall_candidate_never_resumes():
     assert wd._stall_resume_candidate_unlocked() is None
 
 
+def test_route_resume_enters_walking_even_without_held_w(monkeypatch):
+    """TOPLAMA resume must not land in WAITING when W is not held after pause."""
+    from core.state_machine import BotMode, BotState, BotWorker
+
+    worker = BotWorker.__new__(BotWorker)
+    worker._lock = __import__("threading").RLock()
+    worker._paused = True
+    worker._pause_reason = "test"
+    worker._mode = BotMode.ROUTE_MODE.value
+    worker._state = BotState.PAUSED.value
+    worker._break_end_timestamp = 0.0
+    worker.input_driver = None
+    worker.panic_system = None
+    worker._walking_is_real = lambda: False  # type: ignore[method-assign]
+    worker._player_driven_mapping_mode = lambda: False  # type: ignore[method-assign]
+    worker._unlock_panic_lock = lambda: None  # type: ignore[method-assign]
+    worker._notify_panic_paused = lambda *_a, **_k: None  # type: ignore[method-assign]
+    worker._schedule_next_break = lambda: None  # type: ignore[method-assign]
+    worker._sync_input_driver_state = lambda: None  # type: ignore[method-assign]
+    worker._emit_log = lambda *_a, **_k: None  # type: ignore[method-assign]
+    worker._emit_hud_snapshot = lambda *_a, **_k: None  # type: ignore[method-assign]
+    states = []
+
+    def _set(state):
+        worker._state = state
+        states.append(state)
+
+    worker._set_state_internal = _set  # type: ignore[method-assign]
+    BotWorker.resume(worker)
+    assert worker._paused is False
+    assert states == [BotState.WALKING.value]
+    assert worker._state == BotState.WALKING.value
+
+
 def test_f10_shortcut_label_mentions_durdur():
     """High #7: F10 shortcut chip still labeled Durdur (Başlat is btn_run)."""
     from ui.overlay_hud import OverlayHUD
