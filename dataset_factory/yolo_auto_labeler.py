@@ -714,6 +714,108 @@ class YOLOAutoLabeler:
         return kept
 
     # ------------------------------------------------------------------
+    # Stage 6: Eğitilmiş YOLO ONNX — tüm sınıf tespitleri (yolo_model_v2)
+    # ------------------------------------------------------------------
+    def _scan_yolo_model_v2(
+        self,
+        frame_bgr: np.ndarray,
+        img_w: int,
+        img_h: int,
+    ) -> List[Dict[str, Any]]:
+        """Eğitilmiş gather ONNX modelinin karedeki TÜM tespitlerini kutu yap.
+
+        MaterialScanner.scan_3d_yolo_materials yalnızca kaynak/maden
+        adaylarını süzer (canavar/HUD/yol anahtar kelimeleri elenir,
+        discriminate_3d_material ikinci eleme). Foto çekimi ve onay
+        kuyruğu için modelin döndürdüğü her kanonik sınıf kutusu
+        review'a düşmeli — bu yol o eksikti (kaynak: yolo_model_v2).
+        """
+        try:
+            detector = self.material_scanner.get_yolo_detector()
+        except Exception as exc:
+            logger.debug("yolo_model_v2: dedektör yok: %s", exc)
+            return []
+        if detector is None:
+            return []
+
+        raw_dets: List[Dict[str, Any]] = []
+        try:
+            if hasattr(detector, "detect_3d_objects"):
+                raw_dets = list(detector.detect_3d_objects(frame_bgr) or [])
+            elif hasattr(detector, "detect"):
+                raw_dets = list(detector.detect(frame_bgr) or [])
+            elif hasattr(detector, "predict"):
+                raw_dets = list(detector.predict(frame_bgr) or [])
+        except Exception as exc:
+            logger.warning("yolo_model_v2: çıkarım başarısız: %s", exc)
+            return []
+
+        if not raw_dets:
+            return []
+
+        out: List[Dict[str, Any]] = []
+        _onnx_backend_tokens = ("onnxruntime", "opencv_dnn")
+        for det in raw_dets:
+            if not isinstance(det, dict):
+                continue
+            backend = str(det.get("backend", "")).lower()
+            if not any(tok in backend for tok in _onnx_backend_tokens):
+                continue
+
+            cid = det.get("class_id")
+            if cid is None:
+                cname_raw = str(det.get("class_name", "")).strip().lower()
+                if cname_raw in YOLO_NAME_TO_ID:
+                    cid = YOLO_NAME_TO_ID[cname_raw]
+                else:
+                    continue
+            try:
+                cid_int = int(cid)
+            except (TypeError, ValueError):
+                continue
+            if cid_int not in YOLO_CLASSES:
+                continue
+
+            bbox = det.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            bx, by, bw, bh = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+            if bw < 1.0 or bh < 1.0:
+                continue
+
+            conf = float(det.get("confidence", 0.0))
+            mat = str(
+                det.get("sub_type")
+                or det.get("class_name")
+                or YOLO_CLASSES.get(cid_int, "")
+            )
+            try:
+                out.append(
+                    self._make_annotation(
+                        class_id=cid_int,
+                        x=bx,
+                        y=by,
+                        w=bw,
+                        h=bh,
+                        img_w=img_w,
+                        img_h=img_h,
+                        confidence=conf,
+                        source="yolo_model_v2",
+                        material_name=mat,
+                    )
+                )
+            except ValueError:
+                continue
+
+        if out:
+            logger.debug(
+                "yolo_model_v2: %d ONNX kutusu yazıldı (ham %d)",
+                len(out),
+                len(raw_dets),
+            )
+        return out
+
+    # ------------------------------------------------------------------
     # 1. 3D Mesh Segmentation & Classification Below `world_gather_crest`
     # ------------------------------------------------------------------
     def _segment_and_classify_3d_mesh_below_crest(
@@ -2303,6 +2405,12 @@ class YOLOAutoLabeler:
                             weak=True,
                         )
                     )
+
+        # Stage 6: eğitilmiş YOLO ONNX — MaterialScanner filtresi olmadan
+        # tüm sınıflar (canavar/HUD/yol dahil) review kutusu olarak eklenir.
+        annotations.extend(
+            self._scan_yolo_model_v2(frame_bgr=bgr, img_w=img_w, img_h=img_h)
+        )
 
         deduped = self._deduplicate_annotations(annotations)
         if self.exemplar_memory is not None:

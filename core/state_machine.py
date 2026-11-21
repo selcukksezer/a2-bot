@@ -3012,7 +3012,7 @@ class BotWorker(QThread):
         if not keys:
             return False
         now = time.time()
-        burst_gap = self._combat_skill_burst_sec()
+        burst_gap = self._combat_skill_burst_sec() + random.uniform(-0.015, 0.025)
         last_burst = float(self._plain_attr("_combat_last_skill_burst_ts", 0.0) or 0.0)
         if last_burst > 0.0 and (now - last_burst) < (burst_gap - 1e-4):
             return False
@@ -3033,7 +3033,7 @@ class BotWorker(QThread):
                 break
             key = keys[(start + offset) % len(keys)]
             last = float(used.get(key, 0.0) or 0.0)
-            if last > 0.0 and (now - last) < self._combat_skill_cooldown_sec(key):
+            if last > 0.0 and (now - last) < (self._combat_skill_cooldown_sec(key) + random.uniform(-0.020, 0.020)):
                 continue
             # P0-6: cooldown damgası gönderimden SONRA — _cast_one False
             # dönerse (kapı engeli / basış başarısız) damga yok, burst
@@ -3047,8 +3047,8 @@ class BotWorker(QThread):
             pressed += 1
             pressed_keys.append(key)
             if pressed < per_burst:
-                # Inter-skill settle: ~35–50ms trusted, slightly slower soft path.
-                time.sleep(0.035 if trusted else 0.06)
+                # Inter-skill settle: variable sub-second delay (saliselik değişken)
+                time.sleep(random.uniform(0.025, 0.055) if trusted else random.uniform(0.045, 0.075))
         # v20/madde 2 tanı: her burst'te hazır liste + havuz sırası +
         # gerçekten basılan tuşlar (tek tuşa kilitlenme canlı logdan okunur).
         logger.debug(
@@ -3111,6 +3111,30 @@ class BotWorker(QThread):
         if bool(self._plain_attr("_combat_was_targeting", False)):
             return True
         return bool(self._plain_attr("_route_saw_target_bar", False))
+
+    def _maybe_press_combat_f(self, frame_bgr: Any = None) -> None:
+        """Periodic variable F press during combat (2 to 6 seconds: bazen 2, bazen 3, bazen 6)."""
+        if self.is_paused or bool(self._get_cfg("test_mode", False)):
+            return
+        now = time.time()
+        last_f = float(self._plain_attr("_combat_last_f_press_ts", 0.0) or 0.0)
+        gap = float(self._plain_attr("_combat_next_f_interval_sec", 0.0) or 0.0)
+        if gap <= 0.0 or last_f <= 0.0:
+            self._combat_last_f_press_ts = now
+            self._combat_next_f_interval_sec = random.choice([2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0])
+            return
+        if (now - last_f) >= gap:
+            self._combat_last_f_press_ts = now
+            self._combat_next_f_interval_sec = random.choice([2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0])
+            try:
+                self._emit_log(f"⚔️ Savaş içi F basımı (aralık: {gap:.1f}s)")
+                bus = self._plain_attr("action_bus")
+                if bus is not None and hasattr(bus, "cast_skill"):
+                    bus.cast_skill("f", frame=frame_bgr)
+                elif hasattr(self, "_press_key"):
+                    self._press_key("f", min_hold=0.08, max_hold=0.12, release_mouse=True)
+            except Exception as exc:
+                logger.debug("Combat F press error: %s", exc)
 
     def _step_combat_mode(self) -> None:
         """
@@ -3494,6 +3518,9 @@ class BotWorker(QThread):
                 is_regen = (
                     player_mp_ratio is not None and player_mp_ratio < mp_thresh
                 )
+
+            # Periodic variable F press in combat mode (bazen 2, bazen 3, bazen 6 sn)
+            self._maybe_press_combat_f(frame_bgr)
 
             combat_mouse_btn = "left" if is_regen else "right"
             self._spam_combat_mouse(combat_mouse_btn)
@@ -4907,7 +4934,7 @@ class BotWorker(QThread):
             used[key] = now
             pressed += 1
             if pressed < per_burst:
-                time.sleep(0.035 if trusted else 0.06)
+                time.sleep(random.uniform(0.025, 0.055) if trusted else random.uniform(0.045, 0.075))
         if pressed <= 0:
             return False
         # P0-6: burst damgası yalnızca >=1 tuş gerçekten gönderildiyse
@@ -5440,6 +5467,7 @@ class BotWorker(QThread):
                         route_fb = self._is_route_fight_back_enabled()
                         allow_fight_back = (not is_route) or route_fb
                         if allow_fight_back:
+                            self._maybe_press_combat_f(frame_bgr)
                             try:
                                 if self._real_target_for_skills(route_bar):
                                     self._send_configured_combat_skill()
@@ -5829,7 +5857,13 @@ class BotWorker(QThread):
                 ):
                     cast_finished = True
                 elif elapsed_cast >= cast_dur:
-                    self._current_node_stage_retries += 1
+                    # Prompt disappeared -> harvest completed successfully
+                    prompt_now, _ = self._detect_gather_prompt()
+                    if not prompt_now:
+                        self._emit_log(f"Cast duration reached & prompt cleared on node {node_id}: harvest stage finished")
+                        cast_finished = True
+                    else:
+                        self._current_node_stage_retries += 1
                     # F-23-05: şema varsayılanı 2 (config/schema.py).
                     max_retries = int(self._get_cfg("max_retries_per_harvest_stage", 2) or 2)
                     if self._current_node_stage_retries > max_retries:
@@ -7025,7 +7059,10 @@ class BotWorker(QThread):
             )
             if os.path.exists(patch_path):
                 try:
-                    patch_gray = cv2.imread(patch_path, cv2.IMREAD_GRAYSCALE)
+                    try:
+                        patch_gray = cv2.imdecode(np.fromfile(patch_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+                    except Exception:
+                        patch_gray = cv2.imread(patch_path, cv2.IMREAD_GRAYSCALE)
                     map_gray = self._grab_frame(grayscale=True)
                     if patch_gray is not None and map_gray is not None:
                         res = cv2.matchTemplate(map_gray, patch_gray, cv2.TM_CCOEFF_NORMED)
@@ -8302,6 +8339,10 @@ class BotWorker(QThread):
         # Y7: bus'un {"ok": False, "method": "failed"} dönüşü artık okunur —
         # başarısız basış sayaçta "basıldı" görünmez. Döner: gönderim
         # gerçekten denendiyse True, aksi halde False.
+        try:
+            self._focus_game_window()
+        except Exception:
+            pass
         target_key = self._get_active_interaction_key()
         frame_bgr = self.__dict__.get("_last_color_frame")
         if not bool(self._get_cfg("test_mode", False)) and self.input_driver is None:

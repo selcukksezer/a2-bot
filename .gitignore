@@ -59,3 +59,10 @@ android/**/.gradle/
 android/**/build/
 android/**/local.properties
 
+ 
+# Worktrees and runtime backups
+_wt_combat/
+backups/
+config/mobile_url.txt
+*.sqlite-shm
+*.sqlite-wal

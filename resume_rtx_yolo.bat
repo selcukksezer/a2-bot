@@ -21,7 +21,7 @@ if not defined LAST_PT (
     echo [INFO] Ilk egitim icin train_rtx_yolo.bat kullanin.
     exit /b 1
 )
-set "PYTHON_EXE=C:\Users\selçuk\AppData\Local\Programs\Python\Python310\python.exe"
+set "PYTHON_EXE=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
 if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"
 if exist "%~dp0.venv\Scripts\python.exe" set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
 if exist "%~dp0venv\Scripts\python.exe" set "PYTHON_EXE=%~dp0venv\Scripts\python.exe"

@@ -25,18 +25,20 @@ if not exist "%TORCH_HOME%" mkdir "%TORCH_HOME%"
 if not exist "%PIP_CACHE_DIR%" mkdir "%PIP_CACHE_DIR%"
 if not exist "%GATHERION_HOME%\logs" mkdir "%GATHERION_HOME%\logs"
 
-set "PYTHONW_EXE=C:\Users\selçuk\AppData\Local\Programs\Python\Python310\pythonw.exe"
+set "PYTHONW_EXE=%LOCALAPPDATA%\Programs\Python\Python310\pythonw.exe"
 if not exist "%PYTHONW_EXE%" set "PYTHONW_EXE=pythonw"
 if exist "%~dp0.venv\Scripts\pythonw.exe" set "PYTHONW_EXE=%~dp0.venv\Scripts\pythonw.exe"
 if exist "%~dp0venv\Scripts\pythonw.exe" set "PYTHONW_EXE=%~dp0venv\Scripts\pythonw.exe"
 
 echo [MCP] Gatherion unelevated (no UAC). Cursor computer-use can click this window.
 echo [MCP] If AION2 is elevated, Tab/skills will NOT reach the game — run game without admin.
+if exist "%PYTHONW_EXE%" goto :PYW_OK
 where "%PYTHONW_EXE%" >nul 2>&1
-if errorlevel 1 (
-    echo [HATA] pythonw.exe bulunamadi: "%PYTHONW_EXE%"
-    exit /b 1
-)
+if %errorLevel% == 0 goto :PYW_OK
+echo [HATA] pythonw.exe bulunamadi: "%PYTHONW_EXE%"
+exit /b 1
+
+:PYW_OK
 start "" /D "%~dp0" "%PYTHONW_EXE%" "%~dp0main.py" %*
 timeout /t 3 /nobreak >nul
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$root='%~dp0'; $root=$root.TrimEnd('\'); $p=Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and ($_.CommandLine -like '*main.py*') -and ($_.CommandLine -like ('*'+$root+'*')) }; if ($p) { exit 0 } else { exit 1 }" >nul 2>&1

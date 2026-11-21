@@ -755,13 +755,17 @@ class NetworkHidAdapter(_LineHidMixin):
                     sock.close()
                     self._sock = None
                     self._available = False
-                    logger.warning(
-                        "NetworkHidAdapter UDP no PONG %s:%d "
-                        "(start tools/rootless_hid_bridge.py or phone KEY server; "
-                        "cascade will use Interception if ready)",
-                        self.host,
-                        self.port,
-                    )
+                    now_ts = time.time()
+                    last_w = float(getattr(self, "_last_udp_warn_ts", 0.0) or 0.0)
+                    if (now_ts - last_w) >= 120.0:
+                        self._last_udp_warn_ts = now_ts
+                        logger.warning(
+                            "NetworkHidAdapter UDP no PONG %s:%d "
+                            "(start tools/rootless_hid_bridge.py or phone KEY server; "
+                            "cascade will use Interception if ready)",
+                            self.host,
+                            self.port,
+                        )
                     return
                 sock.settimeout(0.5)
                 self._sock = sock

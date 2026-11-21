@@ -277,7 +277,9 @@ def test_relabel_batch_passes_full_scan(tmp_path):
     img_path = curator.images_train_dir / "learn_monsters_001.jpg"
     img_path.parent.mkdir(parents=True, exist_ok=True)
     img = np.zeros((64, 64, 3), dtype=np.uint8)
-    assert cv2.imwrite(str(img_path), img)
+    ok, buf = cv2.imencode(".jpg", img)
+    buf.tofile(str(img_path))
+    assert img_path.is_file()
 
     seen: Dict[str, Any] = {}
 
@@ -324,3 +326,61 @@ def test_curator_wrapper_forwards_full_scan(tmp_path):
     )
     assert seen.get("full_scan") is True, f"wrapper full_scan geçirmeli: {seen}"
     assert any(int(a["class_id"]) == 10 for a in out)
+
+
+# ---------------------------------------------------------------------------
+# 9. yolo_model_v2: ONNX tüm sınıflar MaterialScanner filtresinden geçmez
+# ---------------------------------------------------------------------------
+
+class _FakeOnnxDetector:
+    def detect_3d_objects(self, frame):
+        return [
+            {
+                "class_id": 10,
+                "class_name": "monster_3d",
+                "confidence": 0.91,
+                "bbox": (100, 120, 80, 90),
+                "backend": "onnxruntime:CPUExecutionProvider",
+            },
+            {
+                "class_id": 16,
+                "class_name": "player_hp_bar",
+                "confidence": 0.88,
+                "bbox": (400, 900, 200, 16),
+                "backend": "onnxruntime:CPUExecutionProvider",
+            },
+            {
+                "class_id": 0,
+                "class_name": "herb_aria",
+                "confidence": 0.77,
+                "bbox": (300, 400, 60, 80),
+                "backend": "onnxruntime:CPUExecutionProvider",
+            },
+            {
+                "class_id": 10,
+                "class_name": "monster_3d",
+                "confidence": 0.5,
+                "bbox": (50, 50, 40, 40),
+                "backend": "fast_3d_mesh_tensor_fallback",
+            },
+        ]
+
+
+def test_yolo_model_v2_emits_all_onnx_detections_not_one():
+    frame = _noise_frame(shape=(1080, 1920, 3))
+    labeler = YOLOAutoLabeler(exemplar_memory=False)
+    labeler.material_scanner.set_yolo_detector(_FakeOnnxDetector())
+
+    with (
+        patch.object(labeler.vision_engine, "detect_3d_gather_crests", return_value=[]),
+        patch.object(labeler.material_scanner, "scan_frame_for_materials", return_value=[]),
+        patch.object(labeler, "_scan_3d_monsters", return_value=[]),
+        patch.object(labeler, "_scan_hud_and_skills", return_value=[]),
+        patch.object(labeler, "_scan_path_and_obstacles", return_value=[]),
+    ):
+        anns = labeler.auto_label_frame(frame, full_scan=True)
+
+    yolo_v2 = [a for a in anns if a.get("source") == "yolo_model_v2"]
+    assert len(yolo_v2) == 3, f"ONNX'ten 3 kutu bekleniyordu, gelen: {len(yolo_v2)}"
+    cids = {int(a["class_id"]) for a in yolo_v2}
+    assert cids == {0, 10, 16}, f"beklenen sınıflar 0/10/16, gelen: {cids}"

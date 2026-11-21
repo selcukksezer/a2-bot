@@ -874,7 +874,7 @@ class GameHUDReader:
                 cyan_count >= min_active_cols
                 and not has_secondary_target
                 and olive_count < min_active_cols
-                and (has_red_badge or has_dark_frame)
+                and (has_red_badge or has_dark_frame or cyan_count >= min_active_cols)
             ):
                 # v20: cast bar boş başlar — dolgu soldan büyür. Sağda
                 # yalnız cyan leke/çerçeve (dolu başlama illüzyonu) ise 0.

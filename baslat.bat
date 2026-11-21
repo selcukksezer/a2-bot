@@ -26,8 +26,8 @@ if not exist "%PIP_CACHE_DIR%" mkdir "%PIP_CACHE_DIR%"
 if not exist "%GATHERION_HOME%\logs" mkdir "%GATHERION_HOME%\logs"
 set "GATHERION_LOG=%GATHERION_HOME%\logs\gatherion.log"
 
-set "PYTHON_EXE=C:\Users\selçuk\AppData\Local\Programs\Python\Python310\python.exe"
-set "PYTHONW_EXE=C:\Users\selçuk\AppData\Local\Programs\Python\Python310\pythonw.exe"
+set "PYTHON_EXE=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
+set "PYTHONW_EXE=%LOCALAPPDATA%\Programs\Python\Python310\pythonw.exe"
 if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"
 if not exist "%PYTHONW_EXE%" set "PYTHONW_EXE=pythonw"
 if exist "%~dp0.venv\Scripts\python.exe" set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
@@ -46,13 +46,16 @@ echo [UYARI] Yonetici yetkisi alinamadi, mevcut yetkilerle devam ediliyor...
 
 :ADMIN_OK
 cd /d "%~dp0"
+if exist "%PYTHONW_EXE%" goto :PYW_OK
 where "%PYTHONW_EXE%" >nul 2>&1
-if errorlevel 1 (
-    echo [HATA] pythonw.exe bulunamadi: "%PYTHONW_EXE%"
-    echo        Konsol ile baslatmak icin baslat-konsol.bat kullanin.
-    pause
-    exit /b 1
-)
+if %errorLevel% == 0 goto :PYW_OK
+
+echo [HATA] pythonw.exe bulunamadi: "%PYTHONW_EXE%"
+echo        Konsol ile baslatmak icin baslat-konsol.bat kullanin.
+pause
+exit /b 1
+
+:PYW_OK
 
 "%PYTHON_EXE%" -c "import PyQt6, cv2, mss, numpy, pydirectinput, keyboard, yaml, onnxruntime, psutil, serial" >nul 2>&1
 if %errorLevel% == 0 goto :RUN_BOT

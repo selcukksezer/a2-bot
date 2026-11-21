@@ -346,13 +346,14 @@ class ScreenCapture:
             sct = None
         if sct is None:
             try:
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", DeprecationWarning)
-                    sct = mss.mss()
+                mss_cls = getattr(mss, "MSS", mss.mss)
+                sct = mss_cls()
                 self._thread_local.sct = sct
                 # F-0416: close() bu thread'in dışındaki örnekleri de kapatabilsin.
                 with self._sct_lock:
+                    # Prune stale/closed instances to prevent unbounded GDI leaks
+                    if len(self._sct_instances) > 8:
+                        self._sct_instances = {inst for inst in self._sct_instances if getattr(inst, "monitors", None)}
                     self._sct_instances.add(sct)
             except Exception as exc:
                 logger.error("Failed to initialize thread-local mss instance: %s", exc)
@@ -557,7 +558,7 @@ class ScreenCapture:
                 self._thread_local.sct = None
             # Re-initialize thread-local mss handle once in case GDI context was reset
             try:
-                new_sct = mss.mss()
+                new_sct = getattr(mss, 'MSS', mss.mss)()
                 self._thread_local.sct = new_sct
                 with self._sct_lock:
                     self._sct_instances.add(new_sct)

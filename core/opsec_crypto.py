@@ -2791,7 +2791,23 @@ class PanicAlertSystem:
             except Exception as exc:  # noqa: BLE001 — detektör hatası poll'u öldürmez
                 box["error"] = exc
 
+        # S-Leak: Prevent spawning unbounded threads if a previous check is still running/blocked
+        if not hasattr(self, "_active_detector_threads"):
+            self._active_detector_threads = {}
+        prev = self._active_detector_threads.get(name)
+        if prev is not None and prev.is_alive():
+            with self._lock:
+                count = int(self._detector_failures.get(name, 0)) + 1
+                self._detector_failures[name] = count
+            if count == 1 or count % 6 == 0:
+                logger.warning(
+                    "Watchdog detektörü '%s' hala önceki turdan yanıt bekliyor — yeni thread açılmadı, atlandı.",
+                    name,
+                )
+            return None
+
         thread = threading.Thread(target=_run, name=f"WatchdogDetector-{name}", daemon=True)
+        self._active_detector_threads[name] = thread
         thread.start()
         thread.join(timeout=self._detector_timeout_sec())
         if thread.is_alive():

@@ -1813,7 +1813,10 @@ class MaterialScanner:
         """Load an optional grayscale template from the templates directory if present."""
         path = os.path.join(self.templates_dir, filename)
         if os.path.isfile(path):
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            try:
+                img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            except Exception:
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
             if img is not None and img.size > 0:
                 return img
         return None
@@ -3552,6 +3555,12 @@ class MaterialScanner:
             rock_px = int(np.count_nonzero(dark_rock_mask))
             if warm_px >= 12 and rock_px >= 30:
                 return "Orichalcum Ore", in_air
+
+            # 5b. Metallic grey / silver / iron / ore vein signatures on dark rock
+            metallic_ore_mask = cv2.inRange(mesh_hsv, (0, 0, 140), (180, 50, 240))
+            metallic_px = int(np.count_nonzero(metallic_ore_mask))
+            if metallic_px >= 25 and rock_px >= 30:
+                return "Iron Ore", in_air
 
             # 6. Woody brown trunk signature for Yggdrasil Log / Asvata Log
             wood_brown_mask = cv2.inRange(mesh_hsv, (10, 65, 45), (22, 180, 145))

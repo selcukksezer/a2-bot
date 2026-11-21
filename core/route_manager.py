@@ -4793,7 +4793,12 @@ class RouteManager:
         node.consecutive_failures += 1
         self.consecutive_failures += 1
 
-        effective_limit = int(remove_after_failures) if int(remove_after_failures or 0) > 0 else 3
+        # User setting: remove_node_after_failures == 0 means disabled (never remove/blacklist)
+        if int(remove_after_failures or 0) <= 0:
+            logger.info("Node #%d fail (%dx) — auto-removal disabled (remove_node_after_failures=0)", node.id, node.consecutive_failures)
+            self._emit_log(f"Node #{node.id} failed ({node.consecutive_failures}x) — auto-remove disabled")
+            return
+        effective_limit = int(remove_after_failures)
         curr_route = str(active_route or self.active_route or "").strip()
 
         # Durum 1: 3 kez üst üste başarısız -> YZ İnceleme + Kara Liste + Kalıcı Silme

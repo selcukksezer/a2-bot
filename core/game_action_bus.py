@@ -840,6 +840,17 @@ class GameActionBus:
         self.begin_exclusive(reason=f"gather:{key}")
         try:
             time.sleep(0.03)
+            trusted = self._keyboard_trusted()
+            # In AION 2 mouse-look mode, moving mouse swings the camera and clicking does not gather.
+            # Key 'F' is the official extraction interaction key.
+            if self.mouse_look_mode:
+                if self._key_fallback(key, min_hold=0.08, max_hold=0.14, trusted=trusted):
+                    result["ok"] = True
+                    result["method"] = "key_fallback"
+                    msg = f"GATHER KEY '{key}'"
+                    self._emit(msg)
+                    self._audit(result)
+                    return result
             click_target = self._resolve_gather_click(frame, key)
             if click_target is not None:
                 x, y = click_target
@@ -851,7 +862,7 @@ class GameActionBus:
                     self._emit(msg)
                     self._audit(result)
                     return result
-            if self._key_fallback(key):
+            if self._key_fallback(key, min_hold=0.08, max_hold=0.14, trusted=trusted):
                 result["ok"] = True
                 result["method"] = "key_fallback"
                 msg = f"GATHER KEY_FALLBACK '{key}'"
