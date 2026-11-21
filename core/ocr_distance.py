@@ -1021,18 +1021,25 @@ class GameHUDReader:
 
             mp_roi = frame[mp_y1:mp_y2, mp_x1:mp_x2]
             mp_hsv = cv2.cvtColor(mp_roi, cv2.COLOR_BGR2HSV)
-            # F-0159: HP ile aynı düzeltme — yalnızca camgöbeği/mavi dolgu
-            # ölçülür, beyaz sayı katmanı orana katılmaz.
+            # F-0159 + High #3: yalnızca camgöbeği/mavi/teal dolgu ölçülür,
+            # beyaz sayı katmanı (3814/3814) orana katılmaz. Hue üst sınırı
+            # 135'e açıldı — Aion 2 dolu MP çubuğu bazen daha mavi okunur
+            # ve dar aralık %20–40 sahte düşüğe yol açıyordu.
             mp_fill_mask = (
-                (mp_hsv[:, :, 0] >= 78) & (mp_hsv[:, :, 0] <= 118) & (mp_hsv[:, :, 1] >= 75) & (mp_hsv[:, :, 2] >= 85)
+                (mp_hsv[:, :, 0] >= 75)
+                & (mp_hsv[:, :, 0] <= 135)
+                & (mp_hsv[:, :, 1] >= 70)
+                & (mp_hsv[:, :, 2] >= 70)
             )
             inner_mp_width = max(1, int(round(w * (0.634 - 0.520))))
             mp_inner_mask = mp_fill_mask[:, :inner_mp_width] if inner_mp_width <= mp_fill_mask.shape[1] else mp_fill_mask
-            mp_col_active = mp_inner_mask.mean(axis=0) >= 0.25
+            mp_col_active = mp_inner_mask.mean(axis=0) >= 0.20
             mp_inner_cols = max(1, mp_inner_mask.shape[1])
             mp_end = _robust_fill_end(mp_col_active)
             if mp_end > 0:
                 mp_ratio = min(1.0, max(0.0, float(mp_end) / float(mp_inner_cols)))
+                if mp_ratio >= 0.97:
+                    mp_ratio = 1.0
             else:
                 mp_ratio = 0.0
 

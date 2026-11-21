@@ -66,13 +66,19 @@ class HotkeyChordTests(unittest.TestCase):
         custom = HotkeysSettings.from_dict({"toggle_menu_f9": "ctrl+shift+f9"})
         self.assertEqual(custom.toggle_menu_f9, "ctrl+shift+f9")
 
-    def test_bare_keys_do_not_call_handlers(self) -> None:
-        for key in ("f8", "f9", "f10"):
-            decision = self.listener.handle_bot_chord(key, frozenset())
-            self.assertEqual(decision, "ignored")
-        self.assertEqual(self.hits, [])
-        self.assertEqual(self.controller.freed, 0)
+    def test_bare_f8_f10_ignored_classic_f9_opens_menu(self) -> None:
+        # F8/F10 yalın oyuna gider; klasik F9 menüyü açar (README/HUD).
+        self.assertEqual(self.listener.handle_bot_chord("f8", frozenset()), "ignored")
+        self.assertEqual(self.listener.handle_bot_chord("f10", frozenset()), "ignored")
+        self.assertEqual(self.listener.handle_bot_chord("f9", frozenset()), "handled")
+        self.assertEqual(self.hits, ["f9"])
+        self.assertEqual(self.controller.freed, 1)
         self.assertEqual(self.controller.released, 0)
+        # Native klasik F9 aldıysa hook yalın F9'u tekrarlamaz.
+        self.hits.clear()
+        self.listener.set_classic_f9_via_native(True)
+        self.assertEqual(self.listener.handle_bot_chord("f9", frozenset()), "ignored")
+        self.assertEqual(self.hits, [])
 
     def test_ctrl_alt_chords_call_handlers(self) -> None:
         mods = frozenset({"ctrl", "alt"})
@@ -92,6 +98,10 @@ class HotkeyChordTests(unittest.TestCase):
         self.assertEqual(NativeWin32HotkeyManager.chord_binding("f8"), (0, 0))
         self.assertEqual(NativeWin32HotkeyManager.chord_binding("f9"), (0, 0))
         self.assertEqual(NativeWin32HotkeyManager.chord_binding("f10"), (0, 0))
+        # Klasik menü F9: allow_bare=True ile RegisterHotKey bağlanabilir.
+        vk9, mods9 = NativeWin32HotkeyManager.chord_binding("f9", allow_bare=True)
+        self.assertEqual(vk9, NativeWin32HotkeyManager.VK_F9)
+        self.assertTrue(mods9 & NativeWin32HotkeyManager.MOD_NOREPEAT)
 
     def test_register_and_unregister_do_not_raise(self) -> None:
         # Exercises the real register()/unregister() hook-install path
@@ -105,13 +115,27 @@ class HotkeyChordTests(unittest.TestCase):
         self.listener.unregister()  # double unregister must stay safe
 
     def test_hook_callback_dispatches_bare_keys_without_handlers(self) -> None:
-        # _on_key_event is the real keyboard-hook callback: a bare F8/F9/F10
-        # arriving through the hook must not call any bot handler.
-        for key in ("f8", "f9", "f10"):
-            self.listener._on_key_event(SimpleNamespace(name=key, scan_code=0))
+        # Yalın F8/F10 handler çağırmaz; klasik F9 menüyü açar.
+        self.listener._on_key_event(SimpleNamespace(name="f8", scan_code=0))
+        self.listener._on_key_event(SimpleNamespace(name="f10", scan_code=0))
         self.assertEqual(self.hits, [])
-        self.assertEqual(self.controller.freed, 0)
+        self.listener._on_key_event(SimpleNamespace(name="f9", scan_code=0))
+        self.assertEqual(self.hits, ["f9"])
+        self.assertEqual(self.controller.freed, 1)
         self.assertEqual(self.controller.released, 0)
+
+    def test_esc_invokes_emergency_callback(self) -> None:
+        esc_hits = []
+        self.listener.on_esc_emergency = lambda: esc_hits.append("esc")
+        self.listener._on_key_event(SimpleNamespace(name="esc", scan_code=0))
+        self.assertEqual(esc_hits, ["esc"])
+        # Menü açıkken ESC yalnız menüyü kapatır, acil stop yok.
+        esc_hits.clear()
+        self.listener.set_f9_menu_open(True)
+        self.listener._last_esc_ts = 0.0
+        self.listener._on_key_event(SimpleNamespace(name="escape", scan_code=0))
+        self.assertEqual(esc_hits, [])
+        self.assertFalse(self.listener._f9_menu_open)
 
     def test_hook_callback_dispatches_ctrl_alt_chord(self) -> None:
         # Same real hook callback, but with Ctrl+Alt held. Only the OS

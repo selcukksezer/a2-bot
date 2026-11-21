@@ -243,6 +243,13 @@ class ManaPhaseCombat:
         self._hp_confirm_ts: Optional[float] = None
         self._hp_confirm_hp: Optional[float] = None
         self._hp_confirm_verdict: bool = True
+        # High #3: same confirm gate for MP — full bar OCR/HSV flicker
+        # (20–40% while game shows 3814/3814) must not fire F2/F4.
+        self._mp_confirm_prev: Optional[float] = None
+        self._mp_confirm_streak: int = 0
+        self._mp_confirm_ts: Optional[float] = None
+        self._mp_confirm_mp: Optional[float] = None
+        self._mp_confirm_verdict: bool = True
 
         # Smart Consumables & Emergency Recovery (F-0540 tek kaynak: smart yol
         # düz yolla aynı 65/45 değerine çözülür; ayrı smart sabiti yoktur.)
@@ -699,6 +706,44 @@ class ManaPhaseCombat:
         self._hp_confirm_verdict = bool(verdict)
         return self._hp_confirm_verdict
 
+    def _mp_low_reading_confirmed(self, mp: float, now: Optional[float] = None) -> bool:
+        """High #3: single-frame low-MP OCR/HSV flicker must not pot.
+
+        Same consecutive-sample rule as `_hp_low_reading_confirmed`: a drop
+        from above the MP potion threshold to below it needs a second
+        confirming sample before F2/F4 may fire.
+        """
+        mp_f = max(0.0, min(1.0, float(mp)))
+        if (
+            now is not None
+            and self._mp_confirm_ts is not None
+            and float(now) == self._mp_confirm_ts
+            and self._mp_confirm_mp is not None
+            and mp_f == self._mp_confirm_mp
+        ):
+            return self._mp_confirm_verdict
+        baseline = float(
+            getattr(self, "smart_mp_potion_threshold", None)
+            or self.mp_potion_threshold
+        )
+        prev = self._mp_confirm_prev
+        if mp_f >= baseline:
+            self._mp_confirm_streak = 0
+            verdict = True
+        elif prev is None:
+            verdict = True
+        elif prev >= baseline:
+            self._mp_confirm_streak += 1
+            verdict = self._mp_confirm_streak >= 2
+        else:
+            self._mp_confirm_streak += 1
+            verdict = True
+        self._mp_confirm_prev = mp_f
+        self._mp_confirm_ts = float(now) if now is not None else None
+        self._mp_confirm_mp = mp_f
+        self._mp_confirm_verdict = bool(verdict)
+        return self._mp_confirm_verdict
+
     def check_auto_potions(
         self,
         player_hp: Optional[float] = None,
@@ -733,6 +778,7 @@ class ManaPhaseCombat:
         # bilinmiyorsa (None) 1.0 varsayımı zaten yukarıda yapılır;
         # buradaki kapı yalnızca ölçülen düşük değerin doğrulanmasıdır.
         hp_low_confirmed = self._hp_low_reading_confirmed(hp, now=t)
+        mp_low_confirmed = self._mp_low_reading_confirmed(mp, now=t)
 
         hp_trigger = False
         mp_trigger = False
@@ -750,7 +796,11 @@ class ManaPhaseCombat:
                     reasons.append(f"HP {hp*100:.1f}% < {self.hp_potion_threshold*100:.0f}%")
                     self._log_info(f"AUTO_POTION: HP triggered [{self.hp_potion_key}] (hp={hp:.2f})")
 
-        if getattr(self, "auto_use_mp_potion", True) and mp < self.mp_potion_threshold:
+        if (
+            getattr(self, "auto_use_mp_potion", True)
+            and mp < self.mp_potion_threshold
+            and mp_low_confirmed
+        ):
             if (t - self._last_mp_potion_ts) >= self.mp_potion_cd_sec:
                 if str(self.mp_potion_key).lower() not in FORBIDDEN_CONSUMABLE_KEYS:
                     mp_trigger = True
@@ -980,7 +1030,13 @@ class ManaPhaseCombat:
 
         # 3. MP Potion Check (< 45%)
         # P1-13: route.auto_use_mp_potion kapalıyken iksir basılmaz.
-        if mp_potion_needed and getattr(self, "auto_use_mp_potion", True):
+        # High #3: flicker gate — full-bar OCR at 20–40% needs 2 samples.
+        mp_low_confirmed = self._mp_low_reading_confirmed(mp, now=t)
+        if (
+            mp_potion_needed
+            and getattr(self, "auto_use_mp_potion", True)
+            and mp_low_confirmed
+        ):
             learned_mp = self.consumable_manager.get_best_mp_potion(now=t) if self.consumable_manager is not None else None
             candidate_key = learned_mp or self.mp_potion_key
             if candidate_key and str(candidate_key).lower() in FORBIDDEN_CONSUMABLE_KEYS:
@@ -1995,14 +2051,44 @@ class ManaPhaseCombat:
                 col_fill = np.mean(red_mask, axis=0) > 0.25
                 hp_ratio = round(float(np.sum(col_fill)) / float(max(1, len(col_fill))), 3)
 
-            # Player MP
-            # Player MP — same crop-first HSV helper as HP above.
+            # Player MP — left-to-right cyan/teal fill (High #3). White digit
+            # overlays on a full 3814/3814 bar must not punch the ratio down
+            # to 20–40%; use saturated fill end, not column density.
             mp_crop = self._hsv_roi_crop(frame, rois.get("player_mp_bar") or (0.515, 0.880, 0.655, 0.915), h, w)
             mp_ratio = 1.0
             if mp_crop is not None:
-                blue_mask = (mp_crop[:, :, 0] > 85) & (mp_crop[:, :, 0] < 135) & (mp_crop[:, :, 1] > 100) & (mp_crop[:, :, 2] > 80)
-                col_fill_mp = np.mean(blue_mask, axis=0) > 0.25
-                mp_ratio = round(float(np.sum(col_fill_mp)) / float(max(1, len(col_fill_mp))), 3)
+                blue_mask = (
+                    (mp_crop[:, :, 0] >= 75)
+                    & (mp_crop[:, :, 0] <= 135)
+                    & (mp_crop[:, :, 1] >= 70)
+                    & (mp_crop[:, :, 2] >= 70)
+                )
+                col_fill_mp = np.mean(blue_mask, axis=0) > 0.20
+                # Left-to-right end of the contiguous fill (same idea as
+                # GameHUDReader._robust_fill_end) — holes from white text
+                # in the middle do not shrink a full bar to ~30%.
+                active = np.asarray(col_fill_mp, dtype=bool)
+                mp_end = 0
+                run = 0
+                for idx in range(len(active) - 1, -1, -1):
+                    if active[idx]:
+                        run += 1
+                        if run >= 3:
+                            j = idx
+                            while j + 1 < len(active) and active[j + 1]:
+                                j += 1
+                            mp_end = j + 1
+                            break
+                    else:
+                        run = 0
+                if mp_end > 0:
+                    mp_ratio = round(
+                        min(1.0, float(mp_end) / float(max(1, len(active)))), 3
+                    )
+                    if mp_ratio >= 0.97:
+                        mp_ratio = 1.0
+                else:
+                    mp_ratio = 0.0
 
             # Target HP
             # Target HP — same crop-first HSV helper as HP above.

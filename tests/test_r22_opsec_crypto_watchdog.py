@@ -155,13 +155,19 @@ def test_r22_poll_combat_detector_triggers_timeout():
 def test_r22_poll_prompt_visible_detector_triggers_stuck():
     panic = PanicAlertSystem(prompt_stuck_sec=0.3, enable_sound=False)
     try:
+        with panic._lock:
+            panic._prompt_stuck_grace_until = 0.0
         panic.start_watchdog_polling(
             interval_sec=0.5,
             play_siren=False,
             prompt_visible_detector=lambda: True,
         )
         assert _wait_until(lambda: panic.get_last_panic_event() is not None, timeout=5.0)
-        assert panic.get_last_panic_event()["reason"] == "PROMPT_STUCK_10S"
+        event = panic.get_last_panic_event()
+        assert event["reason"] == "PROMPT_STUCK_10S"
+        # F-0049: soft-pause — hard panik kilidi yok.
+        assert event.get("soft_pause") is True
+        assert panic.panic_triggered is False
     finally:
         panic.stop_watchdog_polling()
 

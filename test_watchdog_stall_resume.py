@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Stall pause resumes on heartbeat. Ctrl+Alt+F10 pause does not.
+"""Stall pause stays paused on heartbeat. Ctrl+Alt+F10 pause does not resume.
+
+High #2: watchdog must NEVER auto-resume after a stall/panic pause. Only an
+explicit user Başlat / Devam / F10-start may resume. Heartbeat return clears
+the stall flag but leaves the worker paused.
 
 NOTE (D89/F-1554): an earlier draft tested the watchdog against a hand-made
 `_GatherRoute` fake whose pause/resume/state surface was invented for the
@@ -128,10 +132,9 @@ class WatchdogStallResumeTests(unittest.TestCase):
         worker.resume = _counting_resume  # type: ignore[method-assign]
         return calls
 
-    def test_stall_pause_resumes_when_heartbeat_returns(self) -> None:
+    def test_stall_pause_stays_paused_when_heartbeat_returns(self) -> None:
+        """High #2: stall pause must NOT auto-resume on heartbeat."""
         worker = _shared_worker()
-        # The real worker starts PAUSED; walk it first so the stall has a
-        # live route to pause.
         worker.resume()
         self.assertEqual(worker.state, "WALKING")
         resume_calls = self._count_resumes(worker)
@@ -155,10 +158,10 @@ class WatchdogStallResumeTests(unittest.TestCase):
 
         watchdog.record_heartbeat(state=worker.state, mode=worker.mode)
 
-        self.assertFalse(worker.is_paused)
-        self.assertEqual(worker.state, "WALKING")
-        self.assertEqual(worker._pause_reason, "")
-        self.assertEqual(len(resume_calls), 1)
+        self.assertTrue(worker.is_paused)
+        self.assertEqual(worker.state, "PAUSED")
+        self.assertEqual(worker._pause_reason, BotWatchdog.STALL_PAUSE_REASON)
+        self.assertEqual(len(resume_calls), 0)
 
     def test_user_chord_pause_stays_paused_after_heartbeat(self) -> None:
         reasons = ("Ctrl+Alt+F10", "Durduruldu (Ctrl+Alt+F10)")
@@ -180,6 +183,31 @@ class WatchdogStallResumeTests(unittest.TestCase):
                 self.assertEqual(worker._pause_reason, reason)
                 self.assertEqual(len(resume_calls), 0)
                 self.assertNotEqual(worker.state, "WALKING")
+
+
+class SetModePreservesPauseTests(unittest.TestCase):
+    """High #1/#4/#5/#6: set_mode must not unpause / resume."""
+
+    def test_set_mode_auto_record_keeps_paused(self) -> None:
+        worker = _shared_worker()
+        worker.pause("Durduruldu (Ctrl+Alt+F10)")
+        self.assertTrue(worker.is_paused)
+        resume_calls = []
+        original = worker.resume
+
+        def _spy() -> None:
+            resume_calls.append(1)
+            original()
+
+        worker.resume = _spy  # type: ignore[method-assign]
+        try:
+            worker.set_mode("auto_record")
+            self.assertTrue(worker.is_paused)
+            self.assertEqual(worker.mode, "auto_record")
+            self.assertEqual(worker.state, "PAUSED")
+            self.assertEqual(resume_calls, [])
+        finally:
+            worker.resume = original  # type: ignore[method-assign]
 
 
 if __name__ == "__main__":

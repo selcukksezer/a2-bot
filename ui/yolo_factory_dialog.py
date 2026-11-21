@@ -8959,11 +8959,13 @@ class YOLOFactoryDialog(QDialog):
             pass
 
     def showEvent(self, event: Any) -> None:  # noqa: N802
+        # High #6: opening the YOLO page / sidebar must not pause or resume
+        # the bot. Training still pauses via _pause_bot_for_training.
         super().showEvent(event)
-        self._pause_bot_for_factory()
 
     def hideEvent(self, event: Any) -> None:  # noqa: N802
-        self._resume_bot_if_paused_by_factory()
+        # High #6: leaving YOLO must not auto-resume. Only an explicit user
+        # Başlat / Devam / F10 may resume after factory browsing.
         super().hideEvent(event)
 
     # NOT: closeEvent bu sınıfta dosya sonunda ayrıca tanımlıdır
@@ -16437,10 +16439,9 @@ class YOLOFactoryDialog(QDialog):
             pass
 
     def closeEvent(self, event: Any) -> None:  # noqa: N802
-        # [P2-19/F044-02] Kapanışta yalnızca dialogun duraklattığı bot
-        # devam ettirilir (bayrak korumalı — hideEvent de ateşlenir, çift
-        # resume olmaz).
-        self._resume_bot_if_paused_by_factory()
+        # High #6: browsing/closing YOLO must not auto-resume the bot.
+        # Training still resumes via _resume_bot_after_training only.
+        self._bot_paused_by_factory = False
         self._save_pipeline_disk_state()
         if self._refresh_timer.isActive():
             self._refresh_timer.stop()

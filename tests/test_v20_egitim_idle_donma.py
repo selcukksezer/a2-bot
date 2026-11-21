@@ -132,7 +132,20 @@ def test_training_does_not_suppress_prompt_stuck():
         prompt_stuck_sec=10.0,
         enable_sound=False,
     )
-    panic._prompt_appear_ts = time.monotonic() - 20.0
+    with panic._lock:
+        panic._prompt_appear_ts = time.monotonic() - 20.0
+        panic._prompt_stuck_grace_until = 0.0
+        panic._prompt_stuck_confirm_streak = 0
+    # Confirm streak: iki poll (eğitim idle'ı dondurur, istemi değil).
+    assert (
+        panic.check_watchdog_conditions(
+            play_siren=False,
+            game_window_present=True,
+            paused=False,
+            training_active=True,
+        )
+        is None
+    )
     event = panic.check_watchdog_conditions(
         play_siren=False,
         game_window_present=True,
@@ -141,6 +154,8 @@ def test_training_does_not_suppress_prompt_stuck():
     )
     assert event is not None
     assert event["reason"] == "PROMPT_STUCK_10S"
+    assert event.get("soft_pause") is True
+    assert panic.panic_triggered is False
 
 
 def test_training_does_not_suppress_death():
