@@ -2060,6 +2060,17 @@ class BotWorker(QThread):
                     # F-0499: combat must win over walking — otherwise a
                     # combat-mode resume lands in WALKING and never fights.
                     target_state = BotState.FIGHTING.value
+                elif self._mode in (
+                    BotMode.ROUTE_MODE.value,
+                    BotMode.AUTO_RECORD.value,
+                    BotMode.EXPLORER_MODE.value,
+                ):
+                    # Live: after pause, abort_motion clears held W so
+                    # _walking_is_real() is False — ROUTE/AUTO/EXPLORER
+                    # resume must still enter WALKING (set_mode mapping),
+                    # not idle WAITING. Session 143000: last_state=WAITING
+                    # + mode=route stalls with GATHERING=0.
+                    target_state = BotState.WALKING.value
                 elif self._player_driven_mapping_mode() or self._walking_is_real():
                     target_state = BotState.WALKING.value
                 else:
