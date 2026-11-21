@@ -152,11 +152,24 @@ def test_game_window_absent_other_triggers_still_fire(setup, kwargs, expected_re
     )
     _age_idle_clock(panic)  # idle de tutardı — ama oyun yokken bastırılır.
     setup(panic)
+    with panic._lock:
+        panic._prompt_stuck_grace_until = 0.0
+        panic._prompt_stuck_confirm_streak = 0
     event = panic.check_watchdog_conditions(
         play_siren=False, game_window_present=False, **kwargs
     )
+    # PROMPT_STUCK confirm streak (2 poll) — ilk tur None olabilir.
+    if event is None and expected_reason == "PROMPT_STUCK_10S":
+        event = panic.check_watchdog_conditions(
+            play_siren=False, game_window_present=False, **kwargs
+        )
     assert event is not None, "tetikleyici oyun yokken ateşlenmedi"
     assert event["reason"] == expected_reason
+    if expected_reason == "PROMPT_STUCK_10S":
+        assert event.get("soft_pause") is True
+        assert panic.panic_triggered is False
+    else:
+        assert panic.panic_triggered is True
 
 
 # --- 3) Poll döngüsü ---------------------------------------------------------

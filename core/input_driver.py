@@ -16,7 +16,7 @@ Mimari Katmanlar (klavye + fare; yumuşak yedek YOK — P0-5/K-04):
 - Çözünürlükten bağımsız (1920x1080, 2560x1440 vb.) normalize ve piksel koordinat desteği
 - Humanizer: ±2 piksel rastgele sapma, 40ms-90ms (0.04s-0.09s) basılı tutma süresi, Bezier/yumuşak imleç geçişi
 - Test Modu (test_mode=True): Fiziksel girdi göndermeden detaylı logging üretimi
-- Global Hotkey Dinleyici: Ctrl+Alt+F9 (Menü, duraklatmaz), Ctrl+Alt+F8 (Node), Ctrl+Alt+F10 (Duraklat/Devam). Yalın F8/F9/F10 oyuna gider.
+- Global Hotkey Dinleyici: F9 + Ctrl+Alt+F9 (Menü), Ctrl+Alt+F8 (Node), Ctrl+Alt+F10 (Duraklat/Devam), ESC (acil stop). Yalın F8/F10 oyuna gider.
   Rota aktifken kullanıcı tuş müdahalesiyle otomatik PAUSED geçişi (_bot_pressing kilidi korumalı)
 """
 
@@ -1026,6 +1026,7 @@ class HotkeyListener:
         self.on_f9_enter: Optional[Callable[[], None]] = None
         self.on_f8: Optional[Callable[[], None]] = None
         self.on_f10: Optional[Callable[[], None]] = None
+        self.on_esc_emergency: Optional[Callable[[], None]] = None
         self.on_user_key_interrupt: Optional[Callable[[str], None]] = None
         self._hook_handle = None
         self._release_hook_handle = None
@@ -1036,6 +1037,7 @@ class HotkeyListener:
         self._last_f9_ts: float = 0.0
         self._last_f8_ts: float = 0.0
         self._last_f10_ts: float = 0.0
+        self._last_esc_ts: float = 0.0
         self._last_resume_ts: float = 0.0
         self._last_f9_time: float = 0.0
         self._last_f8_time: float = 0.0
@@ -1048,6 +1050,8 @@ class HotkeyListener:
         self._key_down_ts: Dict[str, float] = {}
         self._async_invoke: bool = True
         self._hook_actions: Set[str] = {"f8", "f9", "f10"}
+        # Native RegisterHotKey klasik F9'u aldıysa hook yalın F9'u tekrarlamaz.
+        self._classic_f9_via_native: bool = False
         self._node_spec: str = DEFAULT_NODE_CHORD
         self._menu_spec: str = DEFAULT_MENU_CHORD
         self._pause_spec: str = DEFAULT_PAUSE_CHORD
@@ -1060,6 +1064,7 @@ class HotkeyListener:
         on_f10: Optional[Callable[[], None]] = None,
         on_user_key_interrupt: Optional[Callable[[str], None]] = None,
         on_any_key_pause: Optional[Callable[[str], None]] = None,
+        on_esc_emergency: Optional[Callable[[], None]] = None,
     ) -> bool:
         """
         Kısayol callback fonksiyonlarını kaydeder ve global klavye kancasını başlatır.
@@ -1069,6 +1074,7 @@ class HotkeyListener:
             self.on_f9_enter = on_f9_enter
             self.on_f8 = on_f8
             self.on_f10 = on_f10
+            self.on_esc_emergency = on_esc_emergency
             self.on_user_key_interrupt = on_user_key_interrupt or on_any_key_pause
 
             self.unregister()
@@ -1080,7 +1086,8 @@ class HotkeyListener:
             self._hook_handle = keyboard.on_press(self._on_key_event, suppress=False)
             self._release_hook_handle = keyboard.on_release(self._on_key_release, suppress=False)
             logger.info(
-                "Global kısayol dinleyicisi aktif (menü=%s, nokta=%s, duraklat=%s, yalın F8/F9/F10 yok).",
+                "Global kısayol dinleyicisi aktif (menü=%s|+F9 klasik, nokta=%s, "
+                "duraklat=%s, ESC=acil stop).",
                 self._menu_spec,
                 self._node_spec,
                 self._pause_spec,
@@ -1155,6 +1162,10 @@ class HotkeyListener:
         """Which chords this keyboard hook may fire. Native RegisterHotKey owns the rest."""
         self._hook_actions = {str(item) for item in actions}
 
+    def set_classic_f9_via_native(self, enabled: bool) -> None:
+        """Native bare-F9 RegisterHotKey claimed → hook must not double-fire classic F9."""
+        self._classic_f9_via_native = bool(enabled)
+
     def _chord_specs(self) -> Dict[str, str]:
         return {"f8": self._node_spec, "f9": self._menu_spec, "f10": self._pause_spec}
 
@@ -1218,7 +1229,9 @@ class HotkeyListener:
                 self._last_f9_ts = now
                 self._last_f9_time = now
                 self.controller._last_f9_ts = now
-                self._f9_menu_open = True
+                # High #4: do NOT force _f9_menu_open=True here. Closing F9
+                # used to leave the flag True so the next Enter/R in-game
+                # falsely resumed. panel_open_changed owns the real state.
             elif action == "f8":
                 last = max(
                     self._last_f8_ts,
@@ -1292,13 +1305,28 @@ class HotkeyListener:
     def handle_bot_chord(self, key_name: str, modifiers, now: Optional[float] = None) -> str:
         """
         'handled' or 'ignored' stops the hook. 'pass' lets resume/interrupt run.
-        Bare F8/F9/F10 are 'ignored': no bot handler, key is not swallowed (suppress=False).
+        Bare F8/F10 stay 'ignored' (game/Windows). Classic bare F9 opens the menu
+        when Native RegisterHotKey did not already claim it (README / HUD).
         """
         key_name = str(key_name or "").strip().lower()
         if key_name not in self._watched_keys():
             return "pass"
-        action = match_hotkey_action(key_name, modifiers, self._chord_specs())
-        if action is None or action not in self._hook_actions:
+        held = frozenset(str(m).strip().lower() for m in (modifiers or ()) if m)
+        action = match_hotkey_action(key_name, held, self._chord_specs())
+        classic_f9 = False
+        # Klasik F9: native RegisterHotKey yoksa hook yalın F9 ile menüyü açar
+        # (akor native'de olsa bile — aksi halde oyun F9'u yutar).
+        if (
+            action is None
+            and key_name == "f9"
+            and not held
+            and not self._classic_f9_via_native
+        ):
+            action = "f9"
+            classic_f9 = True
+        if action is None:
+            return "ignored"
+        if action not in self._hook_actions and not classic_f9:
             return "ignored"
         if now is None:
             now = time.time()
@@ -1320,11 +1348,34 @@ class HotkeyListener:
 
             now = time.time()
 
-            # ESC closes the F9 menu: keep the flag in sync when the menu is
-            # dismissed by keyboard instead of the resume path.
+            # ESC: menü açıksa kapat; bot aktifken acil pause + girdi kes.
+            # suppress=False — oyun ESC'yi de alabilir (pencere kapatma);
+            # bot tarafı önce güvenli stop uygular.
             if key_name in ("esc", "escape"):
+                menu_was_open = False
                 with self._lock:
+                    menu_was_open = self._f9_menu_open
                     self._f9_menu_open = False
+                    last_esc = self._last_esc_ts
+                    if now - last_esc < HOTKEY_DEBOUNCE_SEC:
+                        return
+                    self._last_esc_ts = now
+                if menu_was_open:
+                    logger.info("[Hotkey] ESC -> F9 menü kapatıldı.")
+                    return
+                # Callback (main/worker) karar verir: zaten paused ise no-op
+                # (oyun ESC'yi alır), aktifken pause+girdi kes.
+                if self.on_esc_emergency is not None:
+                    logger.info("[Hotkey] ESC -> acil durdurma yolu.")
+                    if self._async_invoke:
+                        threading.Thread(
+                            target=self._safe_invoke,
+                            args=(self.on_esc_emergency,),
+                            daemon=True,
+                        ).start()
+                    else:
+                        self._safe_invoke(self.on_esc_emergency)
+                return
 
             # Botun kendi gönderdiği sanal tuş basımı ise kesinlikle müdahale sayma.
             # Emergency chords (F8/F9/F10) are exempt: a bot keypress landing in
@@ -4451,17 +4502,19 @@ class InputController:
         on_f10: Optional[Callable[[], None]] = None,
         on_user_key_interrupt: Optional[Callable[[str], None]] = None,
         on_any_key_pause: Optional[Callable[[str], None]] = None,
+        on_esc_emergency: Optional[Callable[[], None]] = None,
     ) -> bool:
         """
         Global kısayolları kaydeder:
-        - Ctrl+Alt+F9: menüyü aç/kapa, yürüyüşü duraklatmaz (on_f9)
+        - Ctrl+Alt+F9 (+ klasik yalın F9): menüyü aç/kapa, yürüyüşü duraklatmaz (on_f9)
         - Menü açıkken Enter / R: aktif modda devam et (on_f9_enter)
         - Ctrl+Alt+F8: mevcut konumu yeni Node olarak kaydet (on_f8)
-        - Ctrl+Alt+F10: duraklat / devam (on_f10). Yalın F8/F9/F10 botu uyandırmaz.
+        - Ctrl+Alt+F10: duraklat / devam (on_f10). Yalın F8/F10 oyuna gider.
+        - ESC: menü kapalıyken acil pause + girdi kes (on_esc_emergency); oyun ESC'yi de alabilir.
         - Rota çalışırken (route_active == True ve pause_on_any_key == True ise)
           hareket/oynanış beyaz listesi (WHITELISTED_GAMEPLAY_KEYS) haricinde tuşa basılırsa
           botu PAUSED durumuna geçirir (on_user_key_interrupt(key_name)).
-          Varsayılan olarak pause_on_any_key == False. F9 yalnız menüyü açar/kapatır; duraklatma F10 ile olur.
+          Varsayılan olarak pause_on_any_key == False.
         """
         return self.hotkey_listener.register(
             on_f9=on_f9,
@@ -4470,6 +4523,7 @@ class InputController:
             on_f10=on_f10,
             on_user_key_interrupt=on_user_key_interrupt,
             on_any_key_pause=on_any_key_pause,
+            on_esc_emergency=on_esc_emergency,
         )
 
     def unregister_hotkeys(self) -> None:

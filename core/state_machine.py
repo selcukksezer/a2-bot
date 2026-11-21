@@ -1745,17 +1745,18 @@ class BotWorker(QThread):
             else:
                 self._release_route_motion()
 
+            # High #1/#4/#5/#6: set_mode asla pause'u bozmaz / resume etmez.
+            # Mod seçimi (F9 / dişli / YOLO / Toplam) yalnız modu değiştirir;
+            # çalıştırma açıkça Başlat / Devam / F10 ile yapılır.
             with self._lock:
+                was_paused = bool(self._paused)
                 if normalized == BotMode.MANUAL_RECORD.value:
-                    self._paused = False
-                    self._set_state_internal(BotState.WAITING.value)
+                    target_state = BotState.WAITING.value
                 elif normalized in (BotMode.AUTO_RECORD.value, BotMode.EXPLORER_MODE.value):
-                    self._paused = False
-                    self._set_state_internal(BotState.WALKING.value)
+                    target_state = BotState.WALKING.value
                 elif normalized == BotMode.COMBAT_MODE.value:
-                    self._paused = False
                     self._combat_skill_knobs_logged = False
-                    self._set_state_internal(BotState.FIGHTING.value)
+                    target_state = BotState.FIGHTING.value
                 else:
                     # When entering ROUTE_MODE: if called from GUI thread while worker is running,
                     # defer heavy sequential route sorting to the background worker thread so F9Menu never freezes!
@@ -1763,15 +1764,16 @@ class BotWorker(QThread):
                         self._pending_route_sort = True
                     else:
                         self._auto_sort_sequential_route()
-                    if not self._paused:
-                        self._set_state_internal(BotState.WALKING.value)
+                    target_state = BotState.WALKING.value
+                if was_paused:
+                    self._set_state_internal(BotState.PAUSED.value)
+                else:
+                    self._set_state_internal(target_state)
 
-            # pause() calls abort_motion(); modes that force-run must clear the input gate again.
-            # v20-loop: ROUTE_MODE eksikti — duraklatma sonrası TOPLAMA'ya
-            # geçince girdi kapısı (motion_abort/aim_blocked) kilitli
-            # kalıyor, hold_movement_key hep False dönüyor, karakter hiç
-            # yürümüyordu. Rota da force-run modudur.
-            if normalized in (
+            # pause() calls abort_motion(); running modes must clear the input
+            # gate again. Never reopen the gate while the user still has the
+            # bot paused — that was the silent AUTO RECORD resume path.
+            if not was_paused and normalized in (
                 BotMode.MANUAL_RECORD.value,
                 BotMode.AUTO_RECORD.value,
                 BotMode.EXPLORER_MODE.value,
@@ -2089,6 +2091,37 @@ class BotWorker(QThread):
                 self.pause("Paused by user")
         except Exception as exc:
             logger.error("Error in toggle_pause(): %s", exc, exc_info=True)
+
+    def emergency_stop_from_esc(self) -> None:
+        """ESC acil stop: savaş/rota sırasında girdi kes + pause. Zaten paused ise no-op."""
+        try:
+            if self.is_paused:
+                return
+            self._release_route_motion()
+            driver = self.input_driver
+            if driver is not None:
+                for name in ("abort_motion", "release_all_movement_keys", "release_all_held_keys"):
+                    fn = getattr(driver, name, None)
+                    if not callable(fn):
+                        continue
+                    try:
+                        if name == "release_all_held_keys":
+                            fn(reason="esc_emergency")
+                        else:
+                            fn()
+                    except Exception:
+                        pass
+                freer = getattr(driver, "free_mouse_cursor", None)
+                if callable(freer):
+                    try:
+                        freer()
+                    except Exception:
+                        pass
+            self._release_all_combat_inputs()
+            self.pause("ESC acil durdurma")
+            self._emit_log("🛑 ESC acil durdurma — hareket/savaş girdileri kesildi.")
+        except Exception as exc:
+            logger.error("emergency_stop_from_esc hatası: %s", exc, exc_info=True)
 
     def trigger_f8_record(self) -> Optional[Dict[str, Any]]:
         """
@@ -4851,7 +4884,16 @@ class BotWorker(QThread):
                         pot_triggered = True
 
         # 2. MP Potion Check (skipped when MP is unknown)
-        if mp_enabled and mp is not None and mp < mp_thresh:
+        # High #3: require consecutive low-MP confirmation (same gate as
+        # ManaPhaseCombat) so a full 3814/3814 bar OCR flicker at 20–40%
+        # cannot fire F2/F4 on a single bad frame.
+        mp_confirmed = True
+        if mana_brain is not None and hasattr(mana_brain, "_mp_low_reading_confirmed") and mp is not None:
+            try:
+                mp_confirmed = bool(mana_brain._mp_low_reading_confirmed(mp, now=now))
+            except Exception:
+                mp_confirmed = True
+        if mp_enabled and mp is not None and mp < mp_thresh and mp_confirmed:
             if (now - last_mp) >= mp_cd:
                 chosen_mp = None
                 consumable_mgr = getattr(mana_brain, "consumable_manager", None) if mana_brain else None
@@ -9102,6 +9144,8 @@ class BotWorker(QThread):
             state_age_sec = round(max(0.0, time.time() - _entered), 1)
         except Exception:
             state_age_sec = 0.0
+        with self._lock:
+            paused_now = bool(self._paused)
         payload: Dict[str, Any] = {
             "badge": curr_state,
             "mode_badge": resolved_mode_badge,
@@ -9119,6 +9163,7 @@ class BotWorker(QThread):
             "learned_frames": learned_cnt,
             # Legacy compatibility keys for older UI callers
             "state": curr_state,
+            "paused": paused_now,
             "movement_active": movement_active,
             "sub": subtitle if subtitle is not None else default_sub,
             "gathered": self.gathered_count,

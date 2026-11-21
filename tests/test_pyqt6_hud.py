@@ -283,15 +283,20 @@ class TestPyQt6HudPrototype(unittest.TestCase):
 
     # -- HUD ayarları paneli ---------------------------------------------------
 
-    def test_settings_panel_toggle(self):
+    def test_settings_gear_emits_settings_clicked(self):
+        """High #5: overlay dişli opens main Ayarlar (signal), does not
+        auto-toggle the in-HUD panel or resume the bot."""
+        fired = []
+        self.hud.settings_clicked.connect(lambda: fired.append("settings"))
         self.assertFalse(self.hud.settings_panel.isVisible())
         self.hud.btn_hud_settings.click()
+        app.processEvents()
+        self.assertEqual(fired, ["settings"])
+        self.assertFalse(self.hud.settings_panel.isVisible())
+        # Panel can still be opened programmatically for HUD-local toggles.
+        self.hud.toggle_settings_panel()
         app.processEvents()
         self.assertTrue(self.hud.settings_panel.isVisible())
-        self.assertFalse(self.hud.is_minimized)
-        self.hud.btn_hud_settings.click()
-        app.processEvents()
-        self.assertFalse(self.hud.settings_panel.isVisible())
 
     def test_settings_live_toggles(self):
         self.hud.chk_detection_boxes.setChecked(False)

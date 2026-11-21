@@ -664,6 +664,8 @@ class OverlayHUD(QWidget):
 
     f9_clicked = pyqtSignal()
     f10_clicked = pyqtSignal()
+    stop_clicked = pyqtSignal()  # Durdur only — never resume
+    settings_clicked = pyqtSignal()  # Overlay gear → main Ayarlar (no resume)
     f8_clicked = pyqtSignal()
     quit_requested = pyqtSignal()
     harvest_stage_updated = pyqtSignal(int, int)
@@ -1322,7 +1324,7 @@ class OverlayHUD(QWidget):
             self.btn_hud_settings.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             self.btn_hud_settings.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             self.btn_hud_settings.setFixedSize(26, 24)
-            self.btn_hud_settings.setToolTip("HUD ayarları")
+            self.btn_hud_settings.setToolTip("Ayarlar")
             self.btn_hud_settings.setStyleSheet(
                 """
                 QPushButton {
@@ -1343,7 +1345,7 @@ class OverlayHUD(QWidget):
                 }
                 """
             )
-            self.btn_hud_settings.clicked.connect(self.toggle_settings_panel)
+            self.btn_hud_settings.clicked.connect(self._on_settings_clicked)
 
             header_layout.addWidget(self.badge_label)
             header_layout.addWidget(self.mode_label)
@@ -1699,14 +1701,14 @@ class OverlayHUD(QWidget):
             self.btn_quit = action_button("Kapat", "HudQuitButton")
             self.btn_run.setToolTip("Başlat / devam (Ctrl+Alt+F10)")
             self.btn_stop.setToolTip("Durdur (Ctrl+Alt+F10)")
-            self.btn_menu.setToolTip("Menü (Ctrl+Alt+F9)")
+            self.btn_menu.setToolTip("Menü (F9 veya Ctrl+Alt+F9)")
             self.btn_node.setToolTip("Nokta kaydet (Ctrl+Alt+F8)")
             self.btn_resume.setToolTip("Devam: Toplama modu")
             self.btn_combat.setToolTip("Savaş modu")
             self.btn_gather.setToolTip("Toplam: Toplama modu")
             self.btn_quit.setToolTip("Uygulamayı kapatır")
             self.btn_run.clicked.connect(self._on_f10_clicked)
-            self.btn_stop.clicked.connect(self._on_f10_clicked)
+            self.btn_stop.clicked.connect(self._on_stop_clicked)
             self.btn_menu.clicked.connect(self._on_f9_clicked)
             self.btn_node.clicked.connect(self._on_f8_clicked)
             self.btn_resume.clicked.connect(lambda _checked=False: self._dispatch_f9_action("resume"))
@@ -1827,7 +1829,7 @@ class OverlayHUD(QWidget):
             self.f10_shortcut.clicked.connect(self._on_f10_clicked)
 
             self.f9_shortcut = ClickableShortcutWidget("F9", "Menü", self.card)
-            self.f9_shortcut.setToolTip("F9: Hızlı Kontrol Menüsünü Aç")
+            self.f9_shortcut.setToolTip("F9 (klasik) veya Ctrl+Alt+F9: Hızlı Kontrol Menüsü")
             self.f9_shortcut.clicked.connect(self._on_f9_clicked)
 
             self.f8_shortcut = ClickableShortcutWidget("F8", "Nokta", self.card)
@@ -2438,22 +2440,35 @@ class OverlayHUD(QWidget):
             logger.debug("Mod düğmesi vurgusu güncellenemedi: %s", exc)
 
     def _sync_control_buttons(self) -> None:
-        """Prototip düğme durumları: çalışırken Başlat kapalı, duraklatılınca
-        Durdur kapalı, Devam Et yalnızca (bir kez başlamış +) duraklatılıyken açık."""
+        """Prototip düğme durumları: çalışırken Başlat kapalı, Durdur açık;
+        paused iken Durdur kapalı, Başlat/Devam açık. Oto-Kayıt WAITING
+        değil WALKING sayılır ama paused bayrağı önceliklidir (High #7)."""
         try:
             key = getattr(self, "_current_state_key", "WAITING")
-            running = key in (
+            paused = key in ("PAUSED", "DURAKLATILDI") or bool(
+                getattr(self, "_paused_flag", False)
+            )
+            running = (not paused) and key in (
                 "WALKING", "GATHERING", "FIGHTING", "COMBAT", "RUNNING",
                 "YÜRÜYOR", "TOPLANIYOR", "SAVAŞTA", "ÇALIŞIYOR",
+                # Player-driven mapping modes idle as WAITING while still live.
+                "WAITING", "BEKLEMEDE", "READY", "IDLE",
             )
-            resting = key in ("BREAK", "RESTING", "RESTING_BREAK", "MOLA", "DİNLENİYOR")
-            paused = key in ("PAUSED", "DURAKLATILDI")
-            if running or resting:
+            resting = (not paused) and key in (
+                "BREAK", "RESTING", "RESTING_BREAK", "MOLA", "DİNLENİYOR",
+            )
+            # WAITING only counts as "live" once the bot has been started at
+            # least once (avoids enabling Durdur on cold boot).
+            if key in (
+                "WALKING", "GATHERING", "FIGHTING", "COMBAT", "RUNNING",
+                "YÜRÜYOR", "TOPLANIYOR", "SAVAŞTA", "ÇALIŞIYOR",
+            ) or resting:
                 self._ever_started = True
+            live = bool((running or resting) and self._ever_started)
             if hasattr(self, "btn_run"):
-                self.btn_run.setEnabled(not (running or resting))
+                self.btn_run.setEnabled(not live)
             if hasattr(self, "btn_stop"):
-                self.btn_stop.setEnabled(bool(running or resting))
+                self.btn_stop.setEnabled(bool(live))
             if hasattr(self, "btn_resume"):
                 self.btn_resume.setEnabled(bool(paused and self._ever_started))
         except Exception as exc:
@@ -2683,9 +2698,12 @@ class OverlayHUD(QWidget):
                                 if isinstance(elapsed, (int, float))
                                 else ""
                             )
+                            unlock = ""
+                            if str(reason or "") == "PROMPT_STUCK_10S":
+                                unlock = " · Açmak: Başlat/Devam veya Ctrl+Alt+F10"
                             text = (
                                 f"⛔ PANİK KİLİT: {reason or 'sebep bilinmiyor'}"
-                                f"{elapsed_txt}"
+                                f"{elapsed_txt}{unlock}"
                             )
                             if details:
                                 text += f" — {details}"
@@ -2699,7 +2717,40 @@ class OverlayHUD(QWidget):
                 return
             if triggered:
                 elapsed_txt = f" ({elapsed:.0f} sn)" if isinstance(elapsed, (int, float)) else ""
-                text = f"⛔ PANİK KİLİT: {reason or 'sebep bilinmiyor'}{elapsed_txt}"
+                unlock = ""
+                soft = bool(status.get("soft_pause")) if isinstance(status, dict) else False
+                if soft or str(reason or "") == "PROMPT_STUCK_10S":
+                    unlock = " · Açmak: Başlat/Devam veya Ctrl+Alt+F10"
+                    if soft:
+                        text = (
+                            f"⚠ Takılı istem (PROMPT_STUCK): bot duraklatıldı"
+                            f"{elapsed_txt}{unlock}"
+                        )
+                        if details:
+                            text += f" — {details}"
+                        label.setText(text)
+                        label.setStyleSheet(
+                            """
+                            QLabel {
+                                background-color: rgba(255, 193, 7, 0.14);
+                                color: #e7c45a;
+                                border: 1px solid rgba(255, 193, 7, 0.40);
+                                border-radius: 6px;
+                                font-family: 'Barlow', 'Segoe UI', sans-serif;
+                                font-size: 12px;
+                                font-weight: 700;
+                                padding: 3px 8px;
+                            }
+                            """
+                        )
+                        label.setVisible(True)
+                        logger.warning("HUD prompt-stuck soft şeridi: %s", text)
+                        try:
+                            self.panic_status_updated.emit(dict(status))
+                        except Exception:
+                            pass
+                        return
+                text = f"⛔ PANİK KİLİT: {reason or 'sebep bilinmiyor'}{elapsed_txt}{unlock}"
                 if details:
                     text += f" — {details}"
                 label.setText(text)
@@ -3015,6 +3066,22 @@ class OverlayHUD(QWidget):
             logger.error("f10_clicked sinyali gönderilemedi: %s", exc)
 
     @pyqtSlot()
+    def _on_stop_clicked(self) -> None:
+        """Durdur: pause only. Never toggles into resume."""
+        try:
+            self.stop_clicked.emit()
+        except Exception as exc:
+            logger.error("stop_clicked sinyali gönderilemedi: %s", exc)
+
+    @pyqtSlot()
+    def _on_settings_clicked(self) -> None:
+        """Overlay dişli: Ayarlar aç; bot pause/resume'a dokunma (High #5)."""
+        try:
+            self.settings_clicked.emit()
+        except Exception as exc:
+            logger.error("settings_clicked sinyali gönderilemedi: %s", exc)
+
+    @pyqtSlot()
     def _on_quit_clicked(self) -> None:
         try:
             self.quit_requested.emit()
@@ -3059,15 +3126,15 @@ class OverlayHUD(QWidget):
             if hasattr(self, "f9_shortcut"):
                 self.f9_shortcut.setToolTip(f"{menu}: Menü")
             if hasattr(self, "f10_shortcut"):
-                self.f10_shortcut.setToolTip(f"{pause}: Durdur / Başlat")
+                self.f10_shortcut.setToolTip(f"{pause}: çalışırken Durdur, duraklatılınca Başlat")
             if hasattr(self, "btn_node"):
                 self.btn_node.setToolTip(f"{node}: Nokta kaydet")
             if hasattr(self, "btn_menu"):
-                self.btn_menu.setToolTip(f"{menu}: Menü")
+                self.btn_menu.setToolTip(f"{menu}: Menü (duraklatmaz / devam ettirmez)")
             if hasattr(self, "btn_run"):
                 self.btn_run.setToolTip(f"{pause}: Başlat / devam")
             if hasattr(self, "btn_stop"):
-                self.btn_stop.setToolTip(f"{pause}: Durdur")
+                self.btn_stop.setToolTip(f"{pause}: yalnızca Durdur (devam etmez)")
         except Exception as exc:
             logger.error("HUD kısayol etiketleri güncellenemedi: %s", exc)
 
@@ -3291,6 +3358,15 @@ class OverlayHUD(QWidget):
             # 1. Durum Rozeti & Sol Vurgu Kenarlığı
             raw_state = data.get("state", data.get("badge", self._current_state or "WAITING"))
             state_val = str(raw_state).upper()
+            if "paused" in data:
+                self._paused_flag = bool(data.get("paused"))
+            elif state_val in ("PAUSED", "DURAKLATILDI"):
+                self._paused_flag = True
+            elif state_val in (
+                "WALKING", "GATHERING", "FIGHTING", "COMBAT", "RUNNING",
+                "YÜRÜYOR", "TOPLANIYOR", "SAVAŞTA", "ÇALIŞIYOR",
+            ):
+                self._paused_flag = False
             self._apply_state_theme(state_val)
             if state_val in (
                 "WALKING", "GATHERING", "FIGHTING", "COMBAT", "RUNNING",

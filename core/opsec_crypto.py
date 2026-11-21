@@ -672,6 +672,9 @@ class NativeWin32HotkeyManager:
     HOTKEY_ID_F8: int = 108
     HOTKEY_ID_F9: int = 109
     HOTKEY_ID_F10: int = 110
+    # README / HUD "F9: Menü" — oyun odağındayken de menüyü açmak için
+    # yalın F9 RegisterHotKey (Ctrl+Alt+F9 akoruna ek, tasarımı bozmaz).
+    HOTKEY_ID_F9_CLASSIC: int = 111
 
     # Win32 hata kodu: kısayol başka bir program tarafından zaten kayıtlı.
     ERROR_HOTKEY_ALREADY_REGISTERED: int = 1409
@@ -736,6 +739,7 @@ class NativeWin32HotkeyManager:
             self.HOTKEY_ID_F8: "F8",
             self.HOTKEY_ID_F9: "F9",
             self.HOTKEY_ID_F10: "F10",
+            self.HOTKEY_ID_F9_CLASSIC: "F9_CLASSIC",
         }
         with self._lock:
             return {
@@ -796,15 +800,19 @@ class NativeWin32HotkeyManager:
         return 0
 
     @staticmethod
-    def chord_binding(spec: str, no_repeat: bool = True) -> Tuple[int, int]:
+    def chord_binding(
+        spec: str, no_repeat: bool = True, allow_bare: bool = False
+    ) -> Tuple[int, int]:
         """
-        Map a chord spec to (vk, modifiers). Bare F8/F9/F10 and modifier-less specs return (0, 0)
-        so RegisterHotKey never consumes the game's own keys.
+        Map a chord spec to (vk, modifiers). Bare F8/F9/F10 return (0, 0) unless
+        allow_bare=True (used only for classic menu F9 RegisterHotKey).
         """
         from config.schema import parse_hotkey_chord
 
         key, mods = parse_hotkey_chord(spec)
-        if not key or not mods:
+        if not key:
+            return 0, 0
+        if not mods and not allow_bare:
             return 0, 0
         vk = NativeWin32HotkeyManager.vk_for_key(key)
         if not vk:
@@ -831,10 +839,13 @@ class NativeWin32HotkeyManager:
         node_chord: Optional[str] = None,
         menu_chord: Optional[str] = None,
         pause_chord: Optional[str] = None,
+        classic_f9: bool = True,
     ) -> Dict[str, bool]:
         """
         Register Ctrl+Alt+F8/F9/F10 (or the given chords) with MOD_NOREPEAT.
-        Does not register bare F8/F9/F10, so those keys still reach the game and Windows.
+        Also registers classic bare F9 → same on_f9 when classic_f9=True so the
+        menu opens while the game has focus (RegisterHotKey steals F9 from the game).
+        Bare F8/F10 stay with the game.
         """
         from config.schema import DEFAULT_MENU_CHORD, DEFAULT_NODE_CHORD, DEFAULT_PAUSE_CHORD
 
@@ -858,6 +869,30 @@ class NativeWin32HotkeyManager:
             with self._lock:
                 self._last_register_chords[hotkey_id] = str(chord)
             results[name] = self.register_native_hotkey(hotkey_id, vk_code, modifiers, callback)
+
+        # Klasik F9: Ctrl+Alt+F9 yanında yalın F9 de menüyü açar (oyun odağında
+        # da çalışır). F8/F10 yalın kalır — oyuna gider.
+        results["F9_CLASSIC"] = False
+        if classic_f9 and on_f9 is not None:
+            vk_bare, mods_bare = self.chord_binding(
+                "f9", no_repeat=no_repeat, allow_bare=True
+            )
+            if vk_bare:
+                with self._lock:
+                    self._last_register_chords[self.HOTKEY_ID_F9_CLASSIC] = "f9"
+                results["F9_CLASSIC"] = self.register_native_hotkey(
+                    self.HOTKEY_ID_F9_CLASSIC, vk_bare, mods_bare, on_f9
+                )
+                if results["F9_CLASSIC"]:
+                    logger.info(
+                        "Klasik F9 (yalın) RegisterHotKey ile menüye bağlandı "
+                        "(Ctrl+Alt+F9 akoru korunur)."
+                    )
+                else:
+                    logger.warning(
+                        "Klasik F9 RegisterHotKey kaydı başarısız; menü için "
+                        "klavye kancası / Ctrl+Alt+F9 yedek kalır."
+                    )
         return results
 
     def unregister_native_hotkey(self, hotkey_id: int) -> bool:
@@ -1209,6 +1244,16 @@ class PanicAlertSystem:
         self._last_gather_ts: float = now
         self._combat_start_ts: Optional[float] = None
         self._prompt_appear_ts: Optional[float] = None
+        # Başlat/Devam sonrası PROMPT_STUCK yanlış pozitif: unlock sonrası
+        # grace süresi boyunca istem paniği yeniden kurulmaz; gerçek stuck
+        # grace bitince yine tetiklenir.
+        self._prompt_stuck_grace_until: float = 0.0
+        self._prompt_stuck_confirm_streak: int = 0
+        self.PROMPT_STUCK_GRACE_SEC: float = 15.0
+        self.PROMPT_STUCK_CONFIRM_POLLS: int = 2
+        # Soft pause callback (worker.pause) — F-0049: prompt stuck panik
+        # kilidi değil, rutin duraklatmadır.
+        self._prompt_stuck_pause_callback: Optional[Callable[[str], None]] = None
         self._inputs_halted: bool = False
         self._panic_triggered: bool = False
         self._panic_history: List[Dict[str, Any]] = []
@@ -1486,12 +1531,17 @@ class PanicAlertSystem:
         if paused:
             with self._lock:
                 self._prompt_appear_ts = None
+                self._prompt_stuck_confirm_streak = 0
         if paused and not was_paused:
             logger.debug(
                 "[PANIC] Bot duraklatıldı — savaş ve istem sayaçları sıfırlandı/donduruldu."
             )
         elif not paused and was_paused:
-            logger.debug("[PANIC] Bot devam ediyor — savaş sayacı sıfırdan başlıyor.")
+            # Başlat/Devam: eski istem sayacıyla anında PROMPT_STUCK kilidi olmasın.
+            self.arm_prompt_stuck_grace()
+            logger.debug(
+                "[PANIC] Bot devam ediyor — savaş/istem sayacı sıfırdan + grace."
+            )
 
     def set_interact_prompt_visible(self, visible: bool) -> None:
         """Etkileşim ([F]) isteminin ekranda takılı kalma süresini takip eder."""
@@ -1501,6 +1551,106 @@ class PanicAlertSystem:
                     self._prompt_appear_ts = time.monotonic()
             else:
                 self._prompt_appear_ts = None
+                self._prompt_stuck_confirm_streak = 0
+
+    def arm_prompt_stuck_grace(self, sec: Optional[float] = None) -> None:
+        """Başlat/Devam sonrası PROMPT_STUCK yeniden tetiklenmesini geciktirir."""
+        grace = float(self.PROMPT_STUCK_GRACE_SEC if sec is None else sec)
+        with self._lock:
+            self._prompt_appear_ts = None
+            self._prompt_stuck_confirm_streak = 0
+            self._prompt_stuck_grace_until = time.monotonic() + max(0.0, grace)
+
+    def set_prompt_stuck_pause_callback(
+        self, callback: Optional[Callable[[str], None]]
+    ) -> None:
+        """PROMPT_STUCK soft yolunda worker.pause(reason) çağrısı bağlanır."""
+        self._prompt_stuck_pause_callback = callback if callable(callback) else None
+
+    def _prompt_stuck_in_grace(self, now: Optional[float] = None) -> bool:
+        ts = time.monotonic() if now is None else float(now)
+        with self._lock:
+            return ts < float(self._prompt_stuck_grace_until or 0.0)
+
+    def _release_inputs_soft(self, input_ctrl: Any) -> None:
+        """Panik monkey-patch olmadan hareket/girdi kes (ESC / prompt stuck)."""
+        if input_ctrl is None:
+            return
+        for name in ("abort_motion", "release_all_movement_keys", "release_all_held_keys"):
+            fn = getattr(input_ctrl, name, None)
+            if not callable(fn):
+                continue
+            try:
+                if name == "release_all_held_keys":
+                    fn(reason="prompt_stuck_soft")
+                else:
+                    fn()
+            except Exception as exc:
+                logger.debug("soft input release %s failed: %s", name, exc)
+
+    def _handle_prompt_stuck_soft(
+        self,
+        details: str,
+        input_ctrl: Any = None,
+    ) -> Dict[str, Any]:
+        """
+        F-0049: takılı gather istemi güvenlik paniği değil — girdiyi kes,
+        botu duraklat, grace kur. Başlat/Devam (resume → reset_panic yolu
+        veya doğrudan grace) ile devam edilir; gerçek stuck grace sonrası
+        yeniden uyarı verir.
+        """
+        self._release_inputs_soft(input_ctrl)
+        reason_txt = str(details or "Prompt stuck for 10s")
+        cb = self._prompt_stuck_pause_callback
+        if callable(cb):
+            try:
+                cb(reason_txt)
+            except Exception as exc:
+                logger.warning("prompt_stuck pause callback failed: %s", exc)
+        self.arm_prompt_stuck_grace()
+        event = {
+            "timestamp": time.time(),
+            "reason": "PROMPT_STUCK_10S",
+            "details": reason_txt,
+            "inputs_halted": False,
+            "soft_pause": True,
+            "unlock_hint": "Başlat / Devam veya Ctrl+Alt+F10 ile devam",
+            "siren_played": False,
+            "siren_started": False,
+            "remote_notified": False,
+            "concurrent_reasons": [],
+        }
+        # Gözlemlenebilirlik: panik bayrağı kalkmadan son soft olay kaydı
+        # (get_last_panic_event / testler). Hard kilit değildir.
+        with self._lock:
+            self._last_panic_event = dict(event)
+        logger.warning(
+            "[PANIC] PROMPT_STUCK soft-pause (panik kilidi yok): %s — %s",
+            reason_txt,
+            event["unlock_hint"],
+        )
+        return event
+
+    def maybe_auto_recover_prompt_stuck(
+        self, prompt_visible: Optional[bool], input_ctrl: Any = None
+    ) -> bool:
+        """PROMPT_STUCK panik kilidi varken istem kaybolduysa otomatik unlock."""
+        with self._lock:
+            panicked = self._panic_triggered
+            event = dict(self._last_panic_event) if self._last_panic_event else None
+        if not panicked or not event:
+            return False
+        if str(event.get("reason") or "") != "PROMPT_STUCK_10S":
+            return False
+        if prompt_visible is not False:
+            return False
+        ok = self.reset_panic(input_ctrl=input_ctrl)
+        if ok:
+            self.arm_prompt_stuck_grace()
+            logger.info(
+                "[PANIC] PROMPT_STUCK otomatik recovery: istem kayboldu, kilit açıldı."
+            )
+        return bool(ok)
 
     def emergency_halt_inputs(
         self, input_ctrl: Any = None, reason: str = "", details: str = ""
@@ -1674,8 +1824,10 @@ class PanicAlertSystem:
                 self._combat_start_ts = None
                 self._combat_poll_streak = 0
                 self._prompt_appear_ts = None
+                self._prompt_stuck_confirm_streak = 0
                 self._suppressed_reasons_logged = set()
                 self._halt_retry_due_mono = 0.0
+            self.arm_prompt_stuck_grace()
             return True
 
         if ctrl is None:
@@ -1715,8 +1867,10 @@ class PanicAlertSystem:
             self._combat_start_ts = None
             self._combat_poll_streak = 0
             self._prompt_appear_ts = None
+            self._prompt_stuck_confirm_streak = 0
             self._suppressed_reasons_logged = set()
             self._halt_retry_due_mono = 0.0
+        self.arm_prompt_stuck_grace()
         logger.info("[PANIC] Panik kilidi geri alındı; girdiler yeniden açıldı.")
         return True
 
@@ -2288,23 +2442,34 @@ class PanicAlertSystem:
             hits.append(("CHARACTER_DEAD", "Karakter ölüm ekranı algılandı!"))
         if gm_whisper_detected:
             hits.append(("GM_INSPECTION_ALERT", "Olası GM mesajı veya ışınlanma anomalisi algılandı!"))
-        prompt_frozen = paused_effective
-        if prompt_stuck_msg and "Prompt stuck for 10s" in prompt_stuck_msg and not prompt_frozen:
-            hits.append(("PROMPT_STUCK_10S", prompt_stuck_msg))
-            prompt_hit_by_message = True
-        else:
-            prompt_hit_by_message = False
+        prompt_frozen = paused_effective or self._prompt_stuck_in_grace(now)
+        prompt_hit_by_message = False
         if (
-            not prompt_frozen
-            and prompt_elapsed >= self.prompt_stuck_sec
-            and not prompt_hit_by_message
+            prompt_stuck_msg
+            and "Prompt stuck for 10s" in prompt_stuck_msg
+            and not prompt_frozen
         ):
-            hits.append(
-                (
-                    "PROMPT_STUCK_10S",
-                    f"Prompt stuck for 10s ({prompt_elapsed:.1f}s boyunca etkileşim istemi kapanmadı).",
+            with self._lock:
+                self._prompt_stuck_confirm_streak += 1
+                streak = self._prompt_stuck_confirm_streak
+            if streak >= max(1, int(self.PROMPT_STUCK_CONFIRM_POLLS)):
+                hits.append(("PROMPT_STUCK_10S", prompt_stuck_msg))
+                prompt_hit_by_message = True
+        elif not prompt_frozen and prompt_elapsed >= self.prompt_stuck_sec:
+            with self._lock:
+                self._prompt_stuck_confirm_streak += 1
+                streak = self._prompt_stuck_confirm_streak
+            if streak >= max(1, int(self.PROMPT_STUCK_CONFIRM_POLLS)):
+                hits.append(
+                    (
+                        "PROMPT_STUCK_10S",
+                        f"Prompt stuck for 10s ({prompt_elapsed:.1f}s boyunca etkileşim istemi kapanmadı).",
+                    )
                 )
-            )
+        else:
+            with self._lock:
+                if not prompt_stuck_msg and prompt_elapsed < self.prompt_stuck_sec:
+                    self._prompt_stuck_confirm_streak = 0
         if combat_elapsed >= self.combat_limit_sec:
             hits.append(
                 (
@@ -2375,6 +2540,23 @@ class PanicAlertSystem:
             return None
 
         first_reason, first_details = hits[0]
+        # F-0049 / smoke Başlat-Devam: PROMPT_STUCK panik kilidi değil —
+        # soft-pause + grace. Diğer sebepler (ölüm/GM/savaş/idle) tam panik.
+        if first_reason == "PROMPT_STUCK_10S":
+            soft = self._handle_prompt_stuck_soft(
+                details=first_details, input_ctrl=input_ctrl
+            )
+            # Eşzamanlı daha ağır sebepler varsa onlar panik kilidine gider.
+            hard = [(r, d) for r, d in hits[1:] if r != "PROMPT_STUCK_10S"]
+            if hard:
+                return self.trigger_panic(
+                    reason=hard[0][0],
+                    details=hard[0][1],
+                    input_ctrl=input_ctrl,
+                    play_siren=play_siren,
+                    extra_reasons=hard[1:] + [("PROMPT_STUCK_10S", first_details)],
+                )
+            return soft
         # sweep-21 B-13: aynı turda doğru olan diğer koşullar olay
         # kaydının concurrent_reasons alanına girer.
         return self.trigger_panic(
@@ -2575,7 +2757,19 @@ class PanicAlertSystem:
             _prompt_detector = getattr(worker, "_detect_gather_prompt", None)
             if callable(_prompt_detector):
 
+                def _gathering_context() -> bool:
+                    # Yürürken yanlış pozitif F-istemi panik üretmesin —
+                    # yalnızca aktif toplama / seçili düğümde say.
+                    if bool(getattr(worker, "_is_gathering_active", False)):
+                        return True
+                    if getattr(worker, "active_node", None) is not None:
+                        return True
+                    state = str(getattr(worker, "state", "") or "").upper()
+                    return state in ("GATHERING", "HARVESTING", "INTERACTING")
+
                 def _prompt_visible() -> Optional[bool]:
+                    if not _gathering_context():
+                        return False
                     result = _prompt_detector()
                     if isinstance(result, (tuple, list)) and result:
                         return bool(result[0])
@@ -2586,11 +2780,17 @@ class PanicAlertSystem:
                 self.register_watchdog_detectors(prompt_visible_detector=_prompt_visible)
                 wired["prompt_visible"] = True
 
+            pause_fn = getattr(worker, "pause", None)
+            if callable(pause_fn):
+                self.set_prompt_stuck_pause_callback(
+                    lambda reason: pause_fn(reason or "Prompt stuck for 10s")
+                )
+
         # sweep-21 B-04: prompt_stuck bind'de hiç yoktu — worker'ın
         # behavioral_guard.check_prompt_stuck() üretim kaynağıdır. Poll
         # bu detektörü her turda çağırır; 10 sn takılı istem "Prompt stuck
         # for 10s" mesajıyla döner (check_watchdog_conditions'un aradığı
-        # tam alt-dize budur).
+        # tam alt-dize budur). Soft-pause yoluna gider (F-0049).
         if worker is not None:
             _guard = getattr(worker, "behavioral_guard", None)
             _prompt_fn = getattr(worker, "_detect_gather_prompt", None)
@@ -2599,6 +2799,10 @@ class PanicAlertSystem:
 
                 def _prompt_stuck() -> Optional[str]:
                     try:
+                        if not bool(getattr(worker, "_is_gathering_active", False)) and getattr(
+                            worker, "active_node", None
+                        ) is None:
+                            return None
                         _vis = _prompt_fn()
                         if isinstance(_vis, (tuple, list)) and _vis:
                             visible = bool(_vis[0])
@@ -2929,6 +3133,14 @@ class PanicAlertSystem:
                     )
                     if prompt_visible is not None:
                         self.set_interact_prompt_visible(bool(prompt_visible))
+                        # PROMPT_STUCK panik kilidi varken istem kaybolduysa
+                        # otomatik unlock (Başlat/Devam beklemeden recovery).
+                        try:
+                            self.maybe_auto_recover_prompt_stuck(
+                                bool(prompt_visible), input_ctrl=input_ctrl
+                            )
+                        except Exception as _rec_exc:
+                            logger.debug("prompt_stuck auto-recover skipped: %s", _rec_exc)
                     stuck_msg = self._call_detector(
                         self._prompt_stuck_detector, "prompt_stuck"
                     )

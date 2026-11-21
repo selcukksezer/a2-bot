@@ -318,15 +318,15 @@ class BotWatchdog:
     loop latency/FPS, memory consumption, and screen/window display validity.
     Triggers automatic warnings and safe recovery callbacks when BotWorker stalls
     for longer than stall_timeout_sec (default 15.0 seconds).
-    A stall pause is marked with STALL_PAUSE_REASON and is resumed when the
-    worker heartbeat returns. A pause whose reason is the Ctrl+Alt+F10 user
-    chord is never resumed.
+    A stall pause is marked with STALL_PAUSE_REASON. Heartbeat return does NOT
+    auto-resume (High #2): only an explicit user Başlat / Devam / F10-start may
+    resume. User-chord pauses are likewise never auto-resumed.
     Never reports a stall or triggers recovery while the bot is PAUSED, IDLE,
     STOPPED, or in RESTING_BREAK.
     """
 
-    # Exact pause reason this watchdog sets for a stall. Heartbeat recovery
-    # resumes the route only when the worker is paused for this reason.
+    # Exact pause reason this watchdog sets for a stall. Kept for detection /
+    # tests; heartbeat must never resume from it (user must press F10).
     STALL_PAUSE_REASON = "Watchdog safety pause: worker stalled"
     # Ctrl+Alt+F10 chord. Never auto-resume a pause that carries this label.
     USER_PAUSE_CHORD = "Ctrl+Alt+F10"
@@ -645,47 +645,16 @@ class BotWatchdog:
         return self._worker_is_paused(worker) and self._is_stall_pause_reason(reason_after)
 
     def _stall_resume_candidate_unlocked(self) -> Optional[Any]:
-        """Worker to resume, if it is paused for this watchdog's stall reason."""
-        worker = self.worker
-        if worker is None or not callable(getattr(worker, "resume", None)):
-            return None
-        if self._worker_paused_by_user_chord(worker):
-            return None
-        if not self._worker_is_paused(worker):
-            return None
-        if not self._is_stall_pause_reason(self._read_worker_pause_reason(worker)):
-            return None
-        return worker
+        """Always None — stall pauses never auto-resume (High #2)."""
+        return None
 
     def _resume_after_stall(self, worker: Any) -> None:
-        """Resume a stall pause once the worker heartbeat is alive again."""
-        try:
-            if self._worker_paused_by_user_chord(worker):
-                return
-            reason = self._read_worker_pause_reason(worker)
-            if not self._is_stall_pause_reason(reason) or not self._worker_is_paused(worker):
-                return
-            worker.resume()
-            logger.info(
-                "Watchdog resumed route after stall heartbeat (%s).",
-                self.STALL_PAUSE_REASON,
-            )
-        except Exception as exc:
-            logger.error("Watchdog stall resume failed: %s", exc, exc_info=True)
-            return
-
-        with self._lock:
-            now = time.time()
-            self._is_paused = False
-            self._is_frozen = False
-            self._frozen_since_ts = None
-            self._is_stalled = False
-            self._last_heartbeat_ts = now
-            state = getattr(worker, "state", "WALKING")
-            state_name = str(getattr(state, "name", state) or "WALKING").strip().upper()
-            if state_name in self.PAUSED_OR_IDLE_STATES or not state_name:
-                state_name = "WALKING"
-            self._last_state = state_name
+        """No-op: watchdog must never resume; user presses Başlat/F10."""
+        logger.info(
+            "Watchdog stall heartbeat recovered — staying paused until user resume "
+            "(%s).",
+            self.STALL_PAUSE_REASON,
+        )
 
     def record_heartbeat(
         self,
@@ -696,12 +665,10 @@ class BotWatchdog:
         """
         Records a live heartbeat from the main BotWorker loop.
         Updates state, mode, FPS/loop latency metrics, and clears any active stall flag.
-        If the worker is paused for STALL_PAUSE_REASON, the returning heartbeat
-        resumes the route. A Ctrl+Alt+F10 pause is left paused.
+        Never auto-resumes a stall or user pause (High #2).
         """
         try:
             now = time.time()
-            resume_target: Optional[Any] = None
             with self._lock:
                 if self._heartbeat_count > 0:
                     delta = max(0.0001, now - self._last_heartbeat_ts)
@@ -728,18 +695,12 @@ class BotWatchdog:
                 if was_stalled:
                     msg = (
                         f"BotWorker heartbeat recovered in state={self._last_state}, "
-                        f"mode={self._last_mode}."
+                        f"mode={self._last_mode} (no auto-resume)."
                     )
                     logger.info(msg)
                     self._add_notification("HEARTBEAT_RECOVERED", msg)
 
                 metrics = self._build_metrics_unlocked(now)
-                resume_target = self._stall_resume_candidate_unlocked()
-
-            if resume_target is not None:
-                self._resume_after_stall(resume_target)
-                with self._lock:
-                    metrics = self._build_metrics_unlocked(time.time())
             return metrics
         except Exception as exc:
             logger.error("Error recording heartbeat: %s", exc, exc_info=True)
@@ -1497,8 +1458,9 @@ class BotWatchdog:
     def _execute_safe_recovery(self, payload: Dict[str, Any]) -> bool:
         """Invokes the registered recovery callback and pauses a stalled worker.
 
-        The pause reason is STALL_PAUSE_REASON so a later heartbeat can resume
-        the route. A worker already paused by Ctrl+Alt+F10 is not paused again.
+        The pause reason is STALL_PAUSE_REASON. A later heartbeat does NOT
+        resume — the user must press Başlat / F10. A worker already paused by
+        Ctrl+Alt+F10 is not paused again.
         """
         recovered = False
         worker: Optional[Any] = None

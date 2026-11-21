@@ -578,12 +578,13 @@ _MENU_MODE_ACTIONS: Dict[str, tuple] = {
 
 
 class HotkeyBridge(QObject):
-    """Thread-safe Qt signal bridge for global hotkeys (F9, F9+Enter, F8, F10, user interrupt)."""
+    """Thread-safe Qt signal bridge for global hotkeys (F9, F9+Enter, F8, F10, ESC, user interrupt)."""
 
     f9_pressed = pyqtSignal()
     f9_resume_pressed = pyqtSignal()
     f8_pressed = pyqtSignal()
     f10_pressed = pyqtSignal()
+    esc_emergency_pressed = pyqtSignal()
     user_key_interrupted = pyqtSignal(str)
 
 
@@ -1326,6 +1327,10 @@ class GatherionOrchestrator(QObject):
 
         self.overlay.f9_clicked.connect(self.on_f9_hotkey)
         self.overlay.f10_clicked.connect(self.on_f10_hotkey)
+        if hasattr(self.overlay, "stop_clicked"):
+            self.overlay.stop_clicked.connect(self.on_stop_clicked)
+        if hasattr(self.overlay, "settings_clicked"):
+            self.overlay.settings_clicked.connect(self.open_settings_window)
         self.overlay.f8_clicked.connect(self._on_f8_record_node)
         self.overlay.quit_requested.connect(self.shutdown)
 
@@ -1345,6 +1350,7 @@ class GatherionOrchestrator(QObject):
         self.hotkey_bridge.f9_resume_pressed.connect(self.on_f9_enter_hotkey)
         self.hotkey_bridge.f8_pressed.connect(self._on_f8_record_node)
         self.hotkey_bridge.f10_pressed.connect(self.on_f10_hotkey)
+        self.hotkey_bridge.esc_emergency_pressed.connect(self.on_esc_emergency_hotkey)
         self.hotkey_bridge.user_key_interrupted.connect(self.worker.on_user_key_pressed)
 
         # F-0569 [O1]: F9 menüsünü worker/overlay/route_manager ile bağla
@@ -1483,10 +1489,24 @@ class GatherionOrchestrator(QObject):
             logger.warning("Yerel kısayol akorları kısmen kaydedildi; eksik: %s", sorted(missing))
         listener = getattr(self.input_ctrl, "hotkey_listener", None)
         if listener is not None and hasattr(listener, "set_hook_actions"):
-            listener.set_hook_actions({"f8", "f9", "f10"} - claimed)
+            # Klasik F9 native alındıysa chord F9 de native'de — hook'tan F9 çıkar.
+            # Native klasik F9 başarısızsa hook yalın F9'u menüye bağlar.
+            hook_actions = {"f8", "f9", "f10"} - claimed
+            if results.get("F9_CLASSIC") and "f9" not in claimed:
+                # Chord native değil ama klasik F9 native: hook yalın F9 atlar,
+                # chord (ctrl+alt) hâlâ hook'ta kalmalı.
+                pass
+            listener.set_hook_actions(hook_actions)
+            if hasattr(listener, "set_classic_f9_via_native"):
+                listener.set_classic_f9_via_native(bool(results.get("F9_CLASSIC")))
+        if results.get("F9_CLASSIC"):
+            try:
+                self.overlay.add_log("F9 (klasik) menüye bağlandı · Ctrl+Alt+F9 yedek.")
+            except Exception:
+                pass
 
     def _setup_hotkeys(self) -> None:
-        """Register Ctrl+Alt chords. Bare F8/F9/F10 stay with the game and Windows."""
+        """Register Ctrl+Alt chords + classic F9 menu + ESC emergency stop."""
         self._apply_hotkey_labels()
         try:
             registered = self.input_ctrl.register_hotkeys(
@@ -1495,6 +1515,7 @@ class GatherionOrchestrator(QObject):
                 on_f8=lambda: self.hotkey_bridge.f8_pressed.emit(),
                 on_f10=lambda: self.hotkey_bridge.f10_pressed.emit(),
                 on_user_key_interrupt=lambda k: self.hotkey_bridge.user_key_interrupted.emit(str(k)),
+                on_esc_emergency=lambda: self.hotkey_bridge.esc_emergency_pressed.emit(),
             )
             if not registered:
                 raise RuntimeError("keyboard hook unavailable")
@@ -2202,17 +2223,10 @@ class GatherionOrchestrator(QObject):
 
     @pyqtSlot()
     def on_f10_hotkey(self) -> None:
-        """Toggles bot pause/resume or stops the bot cleanly (F10 hotkey)."""
+        """Toggles bot pause/resume (F10 chord / Başlat). Running → pause; paused → resume."""
         try:
             if not self.worker.is_paused:
-                pause_name = getattr(self, "_pause_chord_label", "Ctrl+Alt+F10")
-                self.worker.pause(f"Durduruldu ({pause_name})")
-                self.overlay.add_log(f"🛑 [{pause_name}] Bot Durduruldu!")
-                logger.info("[Hotkey] %s -> bot kullanıcı tarafından durduruldu.", pause_name)
-                try:
-                    winsound.Beep(700, 180)
-                except Exception as exc:
-                    logger.debug("Bip sesi çalınamadı: %s", exc)
+                self._pause_bot_from_user()
             else:
                 pause_name = getattr(self, "_pause_chord_label", "Ctrl+Alt+F10")
                 self.worker.resume()
@@ -2224,6 +2238,49 @@ class GatherionOrchestrator(QObject):
                     logger.debug("Bip sesi çalınamadı: %s", exc)
         except Exception as exc:
             logger.error("F10 kısayolu işlenirken hata: %s", exc)
+
+    @pyqtSlot()
+    def on_stop_clicked(self) -> None:
+        """HUD Durdur: yalnızca pause. Paused iken resume etmez (High #7)."""
+        try:
+            self._pause_bot_from_user()
+        except Exception as exc:
+            logger.error("Durdur düğmesi işlenirken hata: %s", exc)
+
+    def _pause_bot_from_user(self) -> None:
+        """User pause/stop: always cut input; no-op log spam if already paused."""
+        pause_name = getattr(self, "_pause_chord_label", "Ctrl+Alt+F10")
+        already = bool(getattr(self.worker, "is_paused", False))
+        self.worker.pause(f"Durduruldu ({pause_name})")
+        if not already:
+            self.overlay.add_log(f"🛑 [{pause_name}] Bot Durduruldu!")
+            logger.info("[Hotkey] %s -> bot kullanıcı tarafından durduruldu.", pause_name)
+            try:
+                winsound.Beep(700, 180)
+            except Exception as exc:
+                logger.debug("Bip sesi çalınamadı: %s", exc)
+
+    @pyqtSlot()
+    def on_esc_emergency_hotkey(self) -> None:
+        """ESC: aktif botu güvenli durdur (pause + girdi kes). Paused iken no-op (oyun ESC)."""
+        try:
+            if getattr(self.worker, "is_paused", False):
+                return
+            stop = getattr(self.worker, "emergency_stop_from_esc", None)
+            if callable(stop):
+                stop()
+            else:
+                self.worker.pause("ESC acil durdurma")
+            try:
+                self.overlay.add_log("🛑 [ESC] Acil durdurma — bot duraklatıldı.")
+            except Exception:
+                pass
+            try:
+                winsound.Beep(650, 120)
+            except Exception:
+                logger.debug("Beep skipped")
+        except Exception as exc:
+            logger.error("ESC acil durdurma işlenirken hata: %s", exc)
 
     @pyqtSlot()
     def _on_f8_record_node(self) -> None:
@@ -2276,12 +2333,17 @@ class GatherionOrchestrator(QObject):
         self.handle_menu_action(action)
 
     def _activate_bot_mode(self, mode_value: Optional[str], watchdog_state: str) -> None:
-        """Shared resume/set_mode sequence for the menu mode actions listed
-        in _MENU_MODE_ACTIONS (mode_value None = plain resume, no set_mode)."""
-        if hasattr(self.watchdog, "set_paused"):
-            self.watchdog.set_paused(False, state=watchdog_state)
+        """Menu mode / resume dispatcher.
+
+        mode_value None (= Devam Et): explicit resume only.
+        mode_value set (auto_record / route / combat / …): switch mode only —
+        never auto-resume. Start/continue requires Başlat, Devam, or F10.
+        """
         if mode_value is not None:
             self.worker.set_mode(mode_value)
+            return
+        if hasattr(self.watchdog, "set_paused"):
+            self.watchdog.set_paused(False, state=watchdog_state)
         self.worker.resume()
 
     @pyqtSlot(str)
