@@ -1,32 +1,29 @@
 {
-  "step": 1,
+  "step": 2,
   "trained": false,
   "validated": false,
   "published": false,
   "scanned": true,
   "imbalance_fixed": false,
   "frozen": true,
-  "last_train_metrics": {
-    "mAP50": 0.31961,
-    "mAP50_95": 0.13715,
-    "precision": 0.75402,
-    "recall": 0.30556,
-    "box_loss": 2.00184,
-    "cls_loss": 2.08871,
-    "epochs": 100,
-    "epoch": 33,
-    "mode": "ultralytics_cuda_fp16",
-    "status": "interrupted",
-    "artifacts": {
-      "onnx_model": "models/yolov8n_gatherion.onnx",
-      "custom_detector_json": "models/gatherion_custom_detector.json",
-      "train_bat_script": "train_rtx_yolo.bat",
-      "ultralytics_best_pt": "models/rtx_runs/gatherion_rtx_fp16/weights/best.pt",
-      "run_dir": "models/rtx_runs/gatherion_rtx_fp16",
-      "results_csv": "models/rtx_runs/gatherion_rtx_fp16/results.csv"
-    }
-  },
   "model_stale": true,
-  "stale_reason": "Etiketler güncellendi: gather_t2s_aria_s1_9743714_0001_aug06_night_fog_hflip (train)",
-  "stale_at": "2026-11-08T12:22:24.850215"
+  "stale_reason": "Etiketler güncellendi: learn_skills_1794513664589411100_183 (train)",
+  "stale_at": "2026-11-12T23:01:04.612482",
+  "last_train_metrics": {
+    "mAP50": 0.63565,
+    "mAP50_95": 0.48365,
+    "precision": 0.66835,
+    "recall": 0.58771,
+    "box_loss": 0.75373,
+    "cls_loss": 0.69203,
+    "epochs_completed": 30,
+    "mode": "ultralytics_artifact",
+    "status": "completed",
+    "artifacts": {
+      "ultralytics_best_pt": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16\\weights\\best.pt",
+      "run_dir": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16"
+    },
+    "metrics_source": "F:\\a2\\models\\rtx_runs\\gatherion_rtx_fp16\\results.csv"
+  },
+  "train_completed_at": ""
 }

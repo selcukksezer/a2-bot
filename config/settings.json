@@ -45,7 +45,12 @@
         "auto_use_mp_potion": true,
         "mp_potion_threshold_pct": 45,
         "auto_refresh_buff_scroll": true,
-        "buff_scroll_interval_sec": 300
+        "buff_scroll_interval_sec": 300,
+        "hp_potion_key": "F1",
+        "mp_potion_key": "F2",
+        "buff_scroll_key": "F7",
+        "minimap_meters_per_px": null,
+        "world_map_meters_per_px": null
     },
     "breaks": {
         "break_every_min": 0,
@@ -61,11 +66,25 @@
     },
     "display": {
         "monitor_idx": 1,
-        "last_tab": "home"
+        "last_tab": "settings"
     },
     "active_region": "Altgard",
     "active_route": "Dredgion Crash Site",
     "version": "2.0.0",
     "reflex_model": "yolov8",
-    "blacklist": []
+    "blacklist": [],
+    "input": {
+        "hid_tcp": "udp://127.0.0.1:18766"
+    },
+    "combat_skill_keys": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "e",
+        "q",
+        "r",
+        "t"
+    ]
 }
